@@ -8,6 +8,14 @@
   chunk `(cx, cy, cz)` corresponds to vertex `k` in the same chunk (in
   fragment order).
 
+**Per-fragment attribute**
+: A named array stored under `fragment_attributes/<name>/` whose per-chunk
+  byte length equals `num_fragments_in_chunk × dtype.itemsize × ncols`.
+  Element `k` corresponds to fragment `k` as encoded in
+  `vertex_fragments/<chunk>`. Opt-in; the common use case is materializing
+  the OID owning each fragment without round-tripping the
+  `object_index/manifests` reverse lookup.
+
 **Per-object attribute**
 : A named array stored under `object_attributes/<name>/` whose length
   equals `n_objects`. Element `k` corresponds to object ID `k`.
@@ -25,15 +33,18 @@
 
 ## Introduction
 
-ZVF supports two levels of attribute granularity: per-vertex and per-object.
-Per-vertex attributes assign one value (or vector) to each vertex
-independently. Per-object attributes assign one value to each discrete
-object as a whole (a streamline, a skeleton, a mesh surface).
+ZVF supports three levels of attribute granularity: per-vertex,
+per-fragment, and per-object. Per-vertex attributes assign one value (or
+vector) to each vertex independently. Per-fragment attributes assign one
+value per fragment within a chunk (opt-in; useful for materializing
+parent-IDs like the OID owning each fragment). Per-object attributes
+assign one value to each discrete object as a whole (a streamline, a
+skeleton, a mesh surface).
 
-Both levels are optional. A store may have no attributes, only per-vertex
-attributes, only per-object attributes, or both. The two levels are
-independent: a store may have per-object `mean_fa` without any per-vertex FA
-values, or vice versa.
+All three levels are optional and independent. A store may have any
+subset: only per-vertex, only per-object, only per-fragment, or any
+combination. A store may carry per-object `mean_fa` without any per-vertex
+FA values, or vice versa.
 
 This page documents the array schemas for both attribute types, naming rules,
 dtype recommendations, and behaviour during multi-resolution coarsening.

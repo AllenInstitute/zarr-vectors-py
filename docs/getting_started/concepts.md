@@ -38,6 +38,7 @@ scan.zarrvectors/
 │   ├── links/
 │   ├── link_fragments/      ← per-chunk fragment index for delta-0 links
 │   ├── attributes/
+│   ├── fragment_attributes/ ← per-fragment attribute arrays (opt-in)
 │   ├── object_index/        ← per-object manifest blobs (data + offsets)
 │   └── cross_chunk_links/
 ├── 1/        ← coarser level (bin_ratio = [2,2,2])

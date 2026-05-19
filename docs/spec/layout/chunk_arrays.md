@@ -167,6 +167,30 @@ in the corresponding `vertices/` chunk exactly. That is, attribute value `k`
 in chunk `(i,j,l)` of `attributes/intensity/` corresponds to vertex `k` in
 chunk `(i,j,l)` of `vertices/`.
 
+### `fragment_attributes/<name>/`
+
+One sub-group per named **per-fragment** attribute. Opt-in; absent unless
+the writer was given explicit per-chunk values. Each chunk stores a dense
+byte blob whose row count equals the number of fragments encoded in
+`vertex_fragments/<chunk>`; the row count is derived at read time from the
+byte length and the row stride (`dtype.itemsize * K`), so no sibling
+offsets blob is written.
+
+| Property | Value |
+|----------|-------|
+| Dtype | Any numeric dtype declared in `zarr.json` |
+| Logical shape | `(F,)` for scalar attributes; `(F, K)` for vector attributes of width K, where `F = num_fragments_in_chunk` |
+| Zarr chunk shape | One file per spatial chunk key (same key scheme as `vertices/`) |
+| Fill value | `0` or `NaN` (declared per array) |
+| Codec | `bytes → blosc(zstd, byteshuffle)` (same default as `attributes/`) |
+
+Element `k` corresponds to fragment `k` as encoded in
+`vertex_fragments/<chunk>`. Replace-only at the chunk level; not
+auto-downsampled in the pyramid. The canonical opt-in use case is
+materializing parent-IDs (e.g. the `object_id` owning each fragment) so
+joins on fragment → object don't have to round-trip
+`object_index/manifests`.
+
 ### `object_index/`
 
 Present for: polyline, streamline, graph, skeleton, mesh.
