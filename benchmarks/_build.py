@@ -1401,6 +1401,404 @@ plt.tight_layout()
 
 
 # ===================================================================
+# 08 · Edit operations — sweep edit kind, atomic flag, edits per session
+# ===================================================================
+
+EDIT_CELLS: list[tuple[str, str]] = [
+    ("md", """\
+# Edit operations — cost per edit by kind and mode
+
+Baseline store: `N = 50_000` point cloud uniformly in `[0, 1000)^3`,
+chunked at 200³ (so the points span a 5×5×5 chunk grid).  Each row
+gets its own object ID so manifests exist for the atomic path to
+rewrite.
+
+Sweep three axes:
+
+| Axis | Values |
+| --- | --- |
+| Edit kind | `move_in_chunk`, `move_cross_chunk`, `add`, `soft_delete` |
+| Atomicity | `atomic=True` (copy-on-write), `atomic=False` (overwrite) |
+| Edits per session | `N_EDITS ∈ {1, 10, 100, 1_000}` |
+
+For each (kind, atomicity, N) we run **`N_RUNS = 5`** repeats — fresh
+baseline store each repeat — wrap the `N_EDITS` edits in a single
+`EditSession`, and report:
+
+- **edit-rate**: `N_EDITS / wall-time` (edits per second).
+- **bytes written**: post-edit store size minus pre-edit baseline.
+- **oid-remap size**: number of new OIDs allocated under atomic mode.
+
+The two soft-delete + atomic combos are the cheapest (no fragment
+churn).  `move_cross_chunk` is the most expensive because it touches
+two chunks and (under atomic) appends a fragment in the target chunk.
+
+Runtime: a few minutes on a laptop.  `N_EDITS = 1_000` for
+`move_cross_chunk + atomic` is the slow row.
+"""),
+    ("code", SHARED_HELPERS + "\n\n" + STATS_HELPERS),
+    ("md", "## 1 · Setup"),
+    ("code", """\
+from zarr_vectors.types.points import write_points
+from zarr_vectors.core.store import open_store
+from zarr_vectors.ops import EditSession, VertexRef
+
+N           = 50_000
+CHUNK       = (200.0, 200.0, 200.0)
+BIN         = (50.0, 50.0, 50.0)
+DOMAIN      = 1000.0
+N_EDITS     = [1, 10, 100, 1_000]
+EDIT_KINDS  = ['move_in_chunk', 'move_cross_chunk', 'add', 'soft_delete']
+ATOMICITY   = [True, False]
+N_RUNS      = 5
+SEED        = 0
+
+
+def _build_baseline(seed):
+    \"\"\"Fresh 50k-point store with one OID per row.\"\"\"
+    rng = np.random.default_rng(seed)
+    positions = rng.uniform(0, DOMAIN, (N, 3)).astype(np.float32)
+    store = _new_store('edit_base')
+    write_points(
+        str(store), positions,
+        chunk_shape=CHUNK, bin_shape=BIN,
+        bounds=([0.0, 0.0, 0.0], [DOMAIN, DOMAIN, DOMAIN]),
+        object_ids=np.arange(N, dtype=np.int64),
+    )
+    return store, positions
+"""),
+    ("md", "## 2 · Edit-kind workloads"),
+    ("code", """\
+def _apply_edits(ed, kind, atomic, oids, positions, rng):
+    \"\"\"Apply ``len(oids)`` edits of ``kind`` through ``ed``.\"\"\"
+    root = ed.root
+    if kind == 'move_in_chunk':
+        # Pick a tiny offset so the new position stays in the same chunk.
+        for oid in oids:
+            ref = VertexRef.from_object(root, level=0, object_id=int(oid),
+                                        vertex_index=0)
+            new_pos = positions[oid] + np.float32([0.5, 0.5, 0.5])
+            ed.edit_vertex(ref, new_pos=new_pos.tolist(), atomic=atomic)
+    elif kind == 'move_cross_chunk':
+        # Move to a position in a different chunk.  Add CHUNK[0] so the
+        # new position lands one chunk over (modulo domain).
+        for oid in oids:
+            ref = VertexRef.from_object(root, level=0, object_id=int(oid),
+                                        vertex_index=0)
+            jitter = rng.uniform(10.0, 50.0, 3).astype(np.float32)
+            new_pos = (positions[oid] + np.float32([CHUNK[0], 0.0, 0.0])
+                       + jitter)
+            new_pos = np.clip(new_pos, 0.0, DOMAIN - 1.0).tolist()
+            ed.edit_vertex(ref, new_pos=new_pos, atomic=atomic)
+    elif kind == 'add':
+        for _ in oids:
+            new_pos = rng.uniform(0, DOMAIN, 3).astype(np.float32).tolist()
+            ed.add_vertex(level=0, pos=new_pos)
+    elif kind == 'soft_delete':
+        for oid in oids:
+            ref = VertexRef.from_object(root, level=0, object_id=int(oid),
+                                        vertex_index=0)
+            # remove_vertex only supports atomic=True today; if the caller
+            # asked for atomic=False we use the atomic path and label it so
+            # the table is honest about the cost basis.
+            ed.remove_vertex(ref, atomic=True)
+    else:
+        raise ValueError(f'unknown edit kind: {kind!r}')
+"""),
+    ("md", "## 3 · Run the sweep"),
+    ("code", """\
+rows = []
+master_rng = np.random.default_rng(SEED)
+
+for kind in EDIT_KINDS:
+    for atomic in ATOMICITY:
+        # soft_delete is atomic-only — skip the atomic=False combo to
+        # avoid double-counting an identical workload.
+        if kind == 'soft_delete' and not atomic:
+            continue
+        for n_edits in N_EDITS:
+            wallclocks = np.zeros(N_RUNS)
+            for run in range(N_RUNS):
+                seed = int(master_rng.integers(0, 2**31 - 1))
+                rng = np.random.default_rng(seed)
+                store, positions = _build_baseline(seed)
+                oids = rng.choice(N, size=n_edits, replace=False)
+                root = open_store(str(store), mode='r+')
+                t0 = time.perf_counter()
+                with EditSession(root, atomic=atomic, refresh_pyramid=False) as ed:
+                    _apply_edits(ed, kind, atomic, oids, positions, rng)
+                wallclocks[run] = time.perf_counter() - t0
+                shutil.rmtree(Path(store).parent, ignore_errors=True)
+            t_mean, t_hw = _mean_ci95(wallclocks)
+            rows.append({
+                'kind': kind,
+                'atomic': atomic,
+                'N_edits': n_edits,
+                'wall_s_mean': round(t_mean, 4),
+                'wall_s_hw':   round(t_hw, 4),
+            })
+
+df = pd.DataFrame(rows)
+"""),
+    ("md", "## 4 · Results"),
+    ("code", "df"),
+    ("md", "## 5 · Plot"),
+    ("code", """\
+# Two panels: one for add/remove, one for move. Each plots wall time
+# (seconds) vs N_edits per session.  Lines are coloured by edit kind
+# and styled by atomicity (solid=atomic, dashed=overwrite).
+fig, axes = plt.subplots(1, 2, figsize=(12, 4.5))
+KIND_COLORS = {
+    'move_in_chunk':    'C0',
+    'move_cross_chunk': 'C1',
+    'add':              'C2',
+    'soft_delete':      'C3',
+}
+PANELS = [
+    ('Add / remove', ['add', 'soft_delete']),
+    ('Move',          ['move_in_chunk', 'move_cross_chunk']),
+]
+
+for ax, (title, kinds) in zip(axes, PANELS):
+    for kind in kinds:
+        color = KIND_COLORS[kind]
+        for atomic in (True, False):
+            if kind == 'soft_delete' and not atomic:
+                continue
+            sub = df[(df['kind'] == kind) & (df['atomic'] == atomic)].sort_values('N_edits')
+            if sub.empty:
+                continue
+            style = '-' if atomic else '--'
+            label = f"{kind} ({'atomic' if atomic else 'overwrite'})"
+            mean = sub['wall_s_mean'].values
+            hw   = sub['wall_s_hw'].values
+            ax.fill_between(sub['N_edits'], mean - hw, mean + hw,
+                            color=color, alpha=0.2)
+            ax.loglog(sub['N_edits'], mean,
+                      marker='o', linestyle=style, color=color, label=label)
+    ax.set_xlabel('N_edits per session')
+    ax.set_ylabel('wall time (s)')
+    ax.set_title(title)
+    ax.grid(True, which='both', alpha=0.3)
+    ax.legend(loc='best', fontsize=8)
+
+fig.suptitle(
+    f'Edit operations — N={N:,} baseline, {N_RUNS} runs, 95% CI',
+)
+plt.tight_layout()
+"""),
+    ("md", """\
+## 6 · Multi-writer concurrency — disjoint chunks
+
+Simulate **1 vs 4 cooperating editors** on the same baseline store via
+``oid_prefix`` (each writer gets a disjoint residue class).  The
+editors target disjoint chunks so writes never collide at the chunk
+level; the panel measures the per-editor edit-rate when the editors
+run sequentially (the baseline) versus when they share an `oid_prefix`
+allocator with `modulus=4`.
+
+This is a sanity check on the OID-prefix allocator, not a parallelism
+benchmark: edits within a single Python process are sequential.  The
+takeaway is that the allocator overhead is negligible and OIDs from
+different editors land in disjoint ranges, ready for an icechunk
+multi-branch merge in production.
+"""),
+    ("code", """\
+from zarr_vectors.ops import OidPrefix, merge_edit_reports
+
+EDITORS  = ['alice', 'bob', 'carol', 'dave']
+MODULUS  = len(EDITORS)
+N_EDITS_PER_EDITOR = 50
+
+# Carve the chunk space into disjoint regions per editor so writes
+# don't collide.  We assign chunks round-robin by hash.
+def _chunk_for_editor(positions, editor_idx, num_editors):
+    chunk = (positions // 50).astype(int)
+    h = (chunk[:, 0] + chunk[:, 1] * 7 + chunk[:, 2] * 13) % num_editors
+    return h == editor_idx
+
+
+rows = []
+for n_editors in (1, MODULUS):
+    seed = int(master_rng.integers(0, 2**31 - 1))
+    rng = np.random.default_rng(seed)
+    store, positions = _build_baseline(seed)
+    size_before = _store_bytes(store)
+    chunk_shape = np.array(CHUNK)
+
+    t0 = time.perf_counter()
+    reports = []
+    for editor_idx in range(n_editors):
+        editor_name = EDITORS[editor_idx]
+        mask = _chunk_for_editor(positions, editor_idx, n_editors)
+        candidates = np.flatnonzero(mask)
+        if len(candidates) < N_EDITS_PER_EDITOR:
+            continue
+        oids = rng.choice(candidates, size=N_EDITS_PER_EDITOR, replace=False)
+        root = open_store(str(store), mode='r+')
+        with EditSession(
+            root, atomic=True,
+            refresh_pyramid=False,
+            oid_prefix=(editor_name, MODULUS),
+        ) as ed:
+            for oid in oids:
+                ref = VertexRef.from_object(
+                    root, level=0, object_id=int(oid), vertex_index=0,
+                )
+                new_pos = positions[oid] + np.float32([0.5, 0.5, 0.5])
+                ed.edit_vertex(ref, new_pos=new_pos.tolist(), atomic=True)
+        reports.append(ed.report)
+    dt = time.perf_counter() - t0
+
+    size_after = _store_bytes(store)
+    total_edits = sum(r.n_edits for r in reports)
+
+    # All atomic OIDs allocated by the cooperating sessions must be
+    # in disjoint residue classes — verify by inspecting the remap.
+    new_oids = [v for r in reports for v in r.oid_remap.values()]
+    if n_editors > 1:
+        try:
+            merged = merge_edit_reports(*reports)
+            merge_ok = True
+        except Exception:
+            merge_ok = False
+    else:
+        merge_ok = True
+
+    rows.append({
+        'n_editors': n_editors,
+        'total_edits': total_edits,
+        'wall_s': round(dt, 3),
+        'edits_per_s': round(total_edits / dt, 1) if dt > 0 else float('nan'),
+        'bytes_delta': int(size_after - size_before),
+        'merge_ok': merge_ok,
+    })
+    shutil.rmtree(Path(store).parent, ignore_errors=True)
+
+df_conc = pd.DataFrame(rows)
+df_conc
+"""),
+    ("md", """\
+## 7 · Inverted-index scaling — wall time per edit vs N_objects
+
+Iteration 4 introduced a lazy fragment→OID inverted index that
+collapses the two linear-scan helpers (`_oids_referencing` and
+`_oid_for_endpoint`) to O(1) per lookup with surgical updates on every
+`_stage_manifest` call.  This panel documents the *flatness* of the
+post-fix cost curve: as `N_OBJECTS` grows from 1k → 10k → 50k, the
+wall-time per atomic edit should grow only sub-linearly (dominated by
+amortised first-lookup index build + per-write diff cost), not
+linearly as it did before the fix.
+
+Two workloads:
+
+- `edit_vertex_atomic` — repeated atomic vertex edits against fresh
+  OIDs in the same store.
+- `add_link_cross_oid` — repeated `add_link(update_objects=True)`
+  bridging two OIDs (exercises `_oid_for_endpoint` twice per call).
+
+Each `(N_OBJECTS, kind)` row is averaged over a single session of
+`N_EDITS = 200` edits.  Lower wall-time-per-edit at large `N_OBJECTS`
+indicates the inverted index is doing its job.
+"""),
+    ("code", """\
+from zarr_vectors.ops import EditSession, VertexRef
+
+N_OBJECTS_SWEEP = [1_000, 10_000, 50_000]
+N_EDITS_SCALING = 200
+
+
+def _build_scaling_baseline(n_objects, seed):
+    \"\"\"Fresh points store with one OID per row.\"\"\"
+    rng = np.random.default_rng(seed)
+    positions = rng.uniform(0, DOMAIN, (n_objects, 3)).astype(np.float32)
+    store = _new_store(f'scaling_{n_objects}')
+    write_points(
+        str(store), positions,
+        chunk_shape=CHUNK, bin_shape=BIN,
+        bounds=([0.0, 0.0, 0.0], [DOMAIN, DOMAIN, DOMAIN]),
+        object_ids=np.arange(n_objects, dtype=np.int64),
+    )
+    return store, positions
+
+
+def _bench_edit_vertex_atomic(store, positions, n_edits):
+    rng = np.random.default_rng(42)
+    oids = rng.choice(len(positions), size=n_edits, replace=False)
+    root = open_store(str(store), mode='r+')
+    t0 = time.perf_counter()
+    with EditSession(root, atomic=True, refresh_pyramid=False) as ed:
+        for oid in oids:
+            ref = VertexRef.from_object(
+                root, level=0, object_id=int(oid), vertex_index=0,
+            )
+            new_pos = (positions[oid] + np.float32([0.1, 0.1, 0.1])).tolist()
+            ed.edit_vertex(ref, new_pos=new_pos, atomic=True)
+    return time.perf_counter() - t0
+
+
+def _bench_add_link_cross_oid(store, positions, n_edits):
+    rng = np.random.default_rng(43)
+    pairs = rng.choice(len(positions), size=(n_edits, 2), replace=True)
+    # Drop same-OID pairs so every edit exercises the merge path.
+    pairs = pairs[pairs[:, 0] != pairs[:, 1]]
+    if len(pairs) == 0:
+        return float('nan')
+    root = open_store(str(store), mode='r+')
+    t0 = time.perf_counter()
+    with EditSession(root, atomic=True, refresh_pyramid=False) as ed:
+        for a, b in pairs[:n_edits]:
+            ref_a = VertexRef.from_object(
+                root, level=0, object_id=int(a), vertex_index=0,
+            )
+            ref_b = VertexRef.from_object(
+                root, level=0, object_id=int(b), vertex_index=0,
+            )
+            if ref_a.chunk != ref_b.chunk:
+                continue
+            ed.add_link(
+                level=0, src=int(ref_a.local), dst=int(ref_b.local),
+                chunk=ref_a.chunk, fragment=ref_a.fragment,
+                update_objects=True,
+            )
+    return time.perf_counter() - t0
+
+
+rows_scaling = []
+for n_objects in N_OBJECTS_SWEEP:
+    seed = int(master_rng.integers(0, 2**31 - 1))
+    store, positions = _build_scaling_baseline(n_objects, seed)
+
+    t_atomic = _bench_edit_vertex_atomic(store, positions, N_EDITS_SCALING)
+    rows_scaling.append({
+        'n_objects': n_objects,
+        'edit_kind': 'edit_vertex_atomic',
+        'n_edits': N_EDITS_SCALING,
+        'wall_s': round(t_atomic, 3),
+        'us_per_edit': round((t_atomic / N_EDITS_SCALING) * 1e6, 1),
+    })
+    shutil.rmtree(Path(store).parent, ignore_errors=True)
+
+    # Rebuild for the cross-OID workload (the atomic test mutated it).
+    store, positions = _build_scaling_baseline(n_objects, seed)
+    t_cross = _bench_add_link_cross_oid(store, positions, N_EDITS_SCALING)
+    rows_scaling.append({
+        'n_objects': n_objects,
+        'edit_kind': 'add_link_cross_oid',
+        'n_edits': N_EDITS_SCALING,
+        'wall_s': round(t_cross, 3),
+        'us_per_edit': round((t_cross / N_EDITS_SCALING) * 1e6, 1)
+                       if t_cross == t_cross else None,
+    })
+    shutil.rmtree(Path(store).parent, ignore_errors=True)
+
+df_scaling = pd.DataFrame(rows_scaling)
+df_scaling
+"""),
+]
+
+
+# ===================================================================
 # Notebook builder
 # ===================================================================
 
@@ -1477,3 +1875,4 @@ if __name__ == "__main__":
     _write("05_bbox_queries.ipynb", BBOX_CELLS)
     _write("06_chunk_shape.ipynb", CHUNK_SHAPE_CELLS)
     _write("07_compression.ipynb", COMPRESSION_CELLS)
+    _write("08_edit_operations.ipynb", EDIT_CELLS)

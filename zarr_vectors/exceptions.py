@@ -57,6 +57,23 @@ class DracoError(ZVError):
     """Raised when Draco encoding or decoding fails."""
 
 
+class EditError(ZVError):
+    """Raised when an edit cannot be applied: unresolved reference,
+    invalid option combination, or a constraint violation in the
+    change-set engine (e.g. ``refresh_pyramid`` outside the accepted
+    set ``{True, False, "batch"}``).
+    """
+
+
+class ConcurrentEditError(ZVError):
+    """Raised when the edit API cannot guarantee single-writer
+    semantics on the current backend.  Edit on shared datasets is
+    supported only under icechunk; non-transactional backends
+    (``LocalStore``, plain S3) raise this when a session is opened with
+    ``concurrent_writers=True``.
+    """
+
+
 # Deprecated alias.  Kept for one release for code that imported the old
 # name; remove in 0.4.  Aliasing the class object means ``isinstance``
 # checks against either name keep working.

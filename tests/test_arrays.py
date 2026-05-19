@@ -6,9 +6,11 @@ from pathlib import Path
 
 import numpy as np
 
+from zarr_vectors.constants import LINK_FRAGMENTS, VERTEX_FRAGMENTS, VERTICES
 from zarr_vectors.core.arrays import (
     count_fragments,
     create_attribute_array,
+    create_cross_chunk_link_attributes_array,
     create_cross_chunk_links_array,
     create_groupings_array,
     create_groupings_attributes_array,
@@ -21,19 +23,25 @@ from zarr_vectors.core.arrays import (
     read_all_groupings,
     read_all_object_manifests,
     read_chunk_attributes,
+    read_chunk_link_fragment,
     read_chunk_links,
     read_chunk_vertices,
+    read_cross_chunk_link_attributes,
     read_cross_chunk_links,
+    read_fragment,
     read_group_object_ids,
     read_groupings_attributes,
+    read_link_fragment_index,
     read_object_attributes,
     read_object_manifest,
     read_object_vertices,
-    read_fragment,
+    read_vertex_fragment_index,
     write_chunk_attributes,
+    write_chunk_fragments,
     write_chunk_link_attributes,
     write_chunk_links,
     write_chunk_vertices,
+    write_cross_chunk_link_attributes,
     write_cross_chunk_links,
     write_groupings,
     write_groupings_attributes,
@@ -41,6 +49,7 @@ from zarr_vectors.core.arrays import (
     write_object_index,
 )
 from zarr_vectors.core.store import FsGroup
+from zarr_vectors.encoding.fragments import encode_fragments
 from zarr_vectors.exceptions import ArrayError
 
 
@@ -566,3 +575,719 @@ class TestObjectReconstruction:
         full_b = np.concatenate(verts_b)
         assert full_b.shape == (3, 3)  # 1 + 2 vertices
         np.testing.assert_array_equal(full_b[0], [5, 5, 5])
+
+
+# ===================================================================
+# Explicit-mode fragments (CSR-backed, non-contiguous indices)
+# ===================================================================
+
+class TestExplicitFragments:
+    """Readers must handle explicit fragments — not just contiguous ranges.
+
+    The writers always emit range fragments today, so these tests lay down
+    the raw chunk buffer via the regular writer and then overwrite the
+    sibling fragment-index blob with an explicit-mode encoding.
+    """
+
+    def _write_vertex_explicit_index(
+        self,
+        lg: FsGroup,
+        chunk_coords: tuple[int, ...],
+        fragments: list,
+    ) -> None:
+        key = ".".join(str(c) for c in chunk_coords)
+        lg.write_bytes(
+            VERTEX_FRAGMENTS, key, encode_fragments(fragments),
+        )
+
+    def _write_link_explicit_index(
+        self,
+        lg: FsGroup,
+        chunk_coords: tuple[int, ...],
+        fragments: list,
+    ) -> None:
+        key = ".".join(str(c) for c in chunk_coords)
+        lg.write_bytes(
+            LINK_FRAGMENTS, key, encode_fragments(fragments),
+        )
+
+    # --- Vertices: single fragment via read_fragment -----------------
+
+    def test_read_fragment_explicit(self, tmp_path: Path) -> None:
+        lg = _make_level_group(tmp_path)
+        create_vertices_array(lg)
+
+        # Lay down 6 vertex rows via the writer (range fragments).
+        buf = np.array(
+            [[i, i, i] for i in range(6)], dtype=np.float32,
+        )
+        write_chunk_vertices(lg, (0, 0, 0), [buf])
+
+        # Overwrite the fragment index with: range(0,2), explicit[3,5,4].
+        self._write_vertex_explicit_index(
+            lg, (0, 0, 0),
+            [(0, 2), np.array([3, 5, 4], dtype=np.int64)],
+        )
+
+        # Range branch.
+        frag0 = read_fragment(lg, (0, 0, 0), 0, dtype=np.float32, ndim=3)
+        np.testing.assert_array_equal(frag0, buf[0:2])
+
+        # Explicit branch.
+        frag1 = read_fragment(lg, (0, 0, 0), 1, dtype=np.float32, ndim=3)
+        np.testing.assert_array_equal(frag1, buf[[3, 5, 4]])
+
+    # --- Vertices: whole chunk via read_chunk_vertices ---------------
+
+    def test_read_chunk_vertices_mixed(self, tmp_path: Path) -> None:
+        lg = _make_level_group(tmp_path)
+        create_vertices_array(lg)
+
+        buf = np.array(
+            [[i, i, i] for i in range(6)], dtype=np.float32,
+        )
+        write_chunk_vertices(lg, (0, 0, 0), [buf])
+
+        # Mixed: range, explicit, range.
+        self._write_vertex_explicit_index(
+            lg, (0, 0, 0),
+            [
+                (0, 2),
+                np.array([3, 5, 4], dtype=np.int64),
+                (5, 1),
+            ],
+        )
+
+        groups = read_chunk_vertices(lg, (0, 0, 0), dtype=np.float32, ndim=3)
+        assert len(groups) == 3
+        np.testing.assert_array_equal(groups[0], buf[0:2])
+        np.testing.assert_array_equal(groups[1], buf[[3, 5, 4]])
+        np.testing.assert_array_equal(groups[2], buf[5:6])
+
+    # --- Links: single fragment via read_chunk_link_fragment ---------
+
+    def test_read_chunk_link_fragment_explicit(self, tmp_path: Path) -> None:
+        lg = _make_level_group(tmp_path)
+        create_vertices_array(lg)
+        create_links_array(lg, link_width=2)
+
+        # Need a single vertex fragment that covers all referenced rows so
+        # the writer's vertex/link fragment-count check passes.
+        write_chunk_vertices(
+            lg, (0, 0, 0), [np.zeros((10, 3), dtype=np.float32)],
+        )
+
+        # Lay down 6 link rows in one fragment.
+        links = np.array(
+            [[i, i + 1] for i in range(6)], dtype=np.int64,
+        )
+        write_chunk_links(lg, (0, 0, 0), [links])
+
+        # Overwrite link fragment index: range(0,2), explicit[3,5,4].
+        self._write_link_explicit_index(
+            lg, (0, 0, 0),
+            [(0, 2), np.array([3, 5, 4], dtype=np.int64)],
+        )
+
+        # Range branch.
+        f0 = read_chunk_link_fragment(lg, (0, 0, 0), 0, link_width=2)
+        np.testing.assert_array_equal(f0, links[0:2])
+
+        # Explicit branch.
+        f1 = read_chunk_link_fragment(lg, (0, 0, 0), 1, link_width=2)
+        np.testing.assert_array_equal(f1, links[[3, 5, 4]])
+
+    def test_read_chunk_link_fragment_auto_link_width(
+        self, tmp_path: Path,
+    ) -> None:
+        # link_width=None should auto-detect from array metadata.
+        lg = _make_level_group(tmp_path)
+        create_vertices_array(lg)
+        create_links_array(lg, link_width=3)
+
+        write_chunk_vertices(
+            lg, (0, 0, 0), [np.zeros((5, 3), dtype=np.float32)],
+        )
+        links = np.array(
+            [[i, i + 1, i + 2] for i in range(4)], dtype=np.int64,
+        )
+        write_chunk_links(lg, (0, 0, 0), [links])
+        self._write_link_explicit_index(
+            lg, (0, 0, 0),
+            [np.array([2, 0, 3], dtype=np.int64)],
+        )
+
+        out = read_chunk_link_fragment(lg, (0, 0, 0), 0)
+        np.testing.assert_array_equal(out, links[[2, 0, 3]])
+        assert out.shape == (3, 3)
+
+    # --- Links: whole chunk via read_chunk_links ---------------------
+
+    def test_read_chunk_links_mixed(self, tmp_path: Path) -> None:
+        lg = _make_level_group(tmp_path)
+        create_vertices_array(lg)
+        create_links_array(lg, link_width=2)
+
+        write_chunk_vertices(
+            lg, (0, 0, 0), [np.zeros((10, 3), dtype=np.float32)],
+        )
+        links = np.array(
+            [[i, i + 1] for i in range(6)], dtype=np.int64,
+        )
+        write_chunk_links(lg, (0, 0, 0), [links])
+
+        self._write_link_explicit_index(
+            lg, (0, 0, 0),
+            [
+                (0, 2),
+                np.array([3, 5, 4], dtype=np.int64),
+                (5, 1),
+            ],
+        )
+
+        groups = read_chunk_links(lg, (0, 0, 0), link_width=2)
+        assert len(groups) == 3
+        np.testing.assert_array_equal(groups[0], links[0:2])
+        np.testing.assert_array_equal(groups[1], links[[3, 5, 4]])
+        np.testing.assert_array_equal(groups[2], links[5:6])
+
+    # --- Error parity ------------------------------------------------
+
+    def test_read_chunk_link_fragment_out_of_range(
+        self, tmp_path: Path,
+    ) -> None:
+        lg = _make_level_group(tmp_path)
+        create_vertices_array(lg)
+        create_links_array(lg, link_width=2)
+        write_chunk_vertices(
+            lg, (0, 0, 0), [np.zeros((1, 3), dtype=np.float32)],
+        )
+        write_chunk_links(
+            lg, (0, 0, 0), [np.array([[0, 0]], dtype=np.int64)],
+        )
+        try:
+            read_chunk_link_fragment(lg, (0, 0, 0), 5, link_width=2)
+            assert False, "Should raise"
+        except ArrayError:
+            pass
+
+
+# ===================================================================
+# R1: write_chunk_fragments — direct fragment-index writer + append
+# ===================================================================
+
+class TestWriteChunkFragments:
+    """Covers the new public ``write_chunk_fragments`` (R1).
+
+    Verifies both replace and append modes for vertex and link
+    fragment-index blobs.
+    """
+
+    def test_replace_vertex(self, tmp_path: Path) -> None:
+        lg = _make_level_group(tmp_path)
+        create_vertices_array(lg)
+        # Need a vertex buffer present so the resulting fragment-index is
+        # interpretable, but write_chunk_fragments itself doesn't require it.
+        write_chunk_vertices(
+            lg, (0, 0, 0), [np.zeros((6, 3), dtype=np.float32)],
+        )
+
+        ret = write_chunk_fragments(
+            lg, (0, 0, 0),
+            [(0, 2), np.array([3, 5, 4], dtype=np.int64), (5, 1)],
+            target="vertex",
+            mode="replace",
+        )
+        assert ret == [0, 1, 2]
+
+        fi = read_vertex_fragment_index(lg, (0, 0, 0))
+        assert fi.num_fragments == 3
+        assert fi.is_range(0)
+        assert fi.range(0) == (0, 2)
+        assert not fi.is_range(1)
+        np.testing.assert_array_equal(fi.indices(1), [3, 5, 4])
+        assert fi.is_range(2)
+        assert fi.range(2) == (5, 1)
+
+    def test_append_vertex(self, tmp_path: Path) -> None:
+        lg = _make_level_group(tmp_path)
+        create_vertices_array(lg)
+
+        buf = np.array(
+            [[i, i, i] for i in range(6)], dtype=np.float32,
+        )
+        # Range fragment 0 covers rows [0, 2).
+        write_chunk_vertices(lg, (0, 0, 0), [buf[0:2]])
+
+        # Rewrite the chunk vertex buffer to hold all 6 rows so the new
+        # explicit indices reference real positions.
+        lg.write_bytes(VERTICES, "0.0.0", buf.tobytes())
+
+        ret = write_chunk_fragments(
+            lg, (0, 0, 0),
+            [np.array([1, 3, 2], dtype=np.int64)],
+            target="vertex",
+            mode="append",
+        )
+        assert ret == [1]
+
+        fi = read_vertex_fragment_index(lg, (0, 0, 0))
+        assert fi.num_fragments == 2
+        assert fi.is_range(0)
+        assert fi.range(0) == (0, 2)
+        assert not fi.is_range(1)
+        np.testing.assert_array_equal(fi.indices(1), [1, 3, 2])
+
+    def test_append_link(self, tmp_path: Path) -> None:
+        lg = _make_level_group(tmp_path)
+        create_vertices_array(lg)
+        create_links_array(lg, link_width=2)
+        write_chunk_vertices(
+            lg, (0, 0, 0), [np.zeros((5, 3), dtype=np.float32)],
+        )
+        write_chunk_links(
+            lg, (0, 0, 0),
+            [np.array([[0, 1], [1, 2]], dtype=np.int64)],
+        )
+
+        ret = write_chunk_fragments(
+            lg, (0, 0, 0),
+            [np.array([1, 0], dtype=np.int64)],
+            target="link",
+            mode="append",
+        )
+        assert ret == [1]
+
+        fi = read_link_fragment_index(lg, (0, 0, 0))
+        assert fi.num_fragments == 2
+        assert fi.is_range(0)
+        assert not fi.is_range(1)
+        np.testing.assert_array_equal(fi.indices(1), [1, 0])
+
+    def test_append_to_missing(self, tmp_path: Path) -> None:
+        # Append to a chunk that has no fragment-index blob yet.
+        lg = _make_level_group(tmp_path)
+        # Note: we don't even call create_vertices_array; write_chunk_fragments
+        # should just write the blob directly.
+        ret = write_chunk_fragments(
+            lg, (0, 0, 0),
+            [(0, 3), np.array([2, 5], dtype=np.int64)],
+            target="vertex",
+            mode="append",
+        )
+        # First append to missing: existing=[], so new fragments are at 0,1.
+        assert ret == [0, 1]
+
+        fi = read_vertex_fragment_index(lg, (0, 0, 0))
+        assert fi.num_fragments == 2
+        assert fi.is_range(0)
+        assert fi.range(0) == (0, 3)
+        np.testing.assert_array_equal(fi.indices(1), [2, 5])
+
+    def test_append_empty_noop(self, tmp_path: Path) -> None:
+        lg = _make_level_group(tmp_path)
+        create_vertices_array(lg)
+        write_chunk_vertices(
+            lg, (0, 0, 0), [np.zeros((2, 3), dtype=np.float32)],
+        )
+        before = lg.read_bytes(VERTEX_FRAGMENTS, "0.0.0")
+
+        ret = write_chunk_fragments(
+            lg, (0, 0, 0), [], target="vertex", mode="append",
+        )
+        assert ret == []
+
+        after = lg.read_bytes(VERTEX_FRAGMENTS, "0.0.0")
+        assert before == after
+
+    def test_invalid_target(self, tmp_path: Path) -> None:
+        lg = _make_level_group(tmp_path)
+        try:
+            write_chunk_fragments(
+                lg, (0, 0, 0), [(0, 1)], target="invalid",
+            )
+            assert False, "Should raise"
+        except ArrayError:
+            pass
+
+    def test_invalid_mode(self, tmp_path: Path) -> None:
+        lg = _make_level_group(tmp_path)
+        try:
+            write_chunk_fragments(
+                lg, (0, 0, 0), [(0, 1)], target="vertex", mode="invalid",
+            )
+            assert False, "Should raise"
+        except ArrayError:
+            pass
+
+
+# ===================================================================
+# R2: write_object_attributes append mode
+# ===================================================================
+
+class TestWriteObjectAttributesAppend:
+    """Covers ``mode="append"`` on ``write_object_attributes`` (R2)."""
+
+    def test_append_1d(self, tmp_path: Path) -> None:
+        lg = _make_level_group(tmp_path)
+        create_object_attributes_array(lg, "labels", dtype="int32")
+        write_object_attributes(
+            lg, "labels",
+            np.array([1, 2, 3], dtype=np.int32),
+        )
+        write_object_attributes(
+            lg, "labels",
+            np.array([4, 5], dtype=np.int32),
+            mode="append",
+        )
+        back = read_object_attributes(lg, "labels")
+        np.testing.assert_array_equal(back, [1, 2, 3, 4, 5])
+
+    def test_append_2d(self, tmp_path: Path) -> None:
+        lg = _make_level_group(tmp_path)
+        create_object_attributes_array(lg, "vecs", dtype="float32", num_channels=3)
+        write_object_attributes(
+            lg, "vecs",
+            np.array([[1, 2, 3], [4, 5, 6]], dtype=np.float32),
+        )
+        write_object_attributes(
+            lg, "vecs",
+            np.array([[7, 8, 9]], dtype=np.float32),
+            mode="append",
+        )
+        back = read_object_attributes(lg, "vecs")
+        assert back.shape == (3, 3)
+        np.testing.assert_array_equal(
+            back, [[1, 2, 3], [4, 5, 6], [7, 8, 9]],
+        )
+
+    def test_append_to_missing(self, tmp_path: Path) -> None:
+        # First append acts like a replace when the attribute doesn't
+        # exist yet.
+        lg = _make_level_group(tmp_path)
+        create_object_attributes_array(lg, "scores", dtype="int64")
+        write_object_attributes(
+            lg, "scores",
+            np.array([10, 20], dtype=np.int64),
+            mode="append",
+        )
+        back = read_object_attributes(lg, "scores")
+        np.testing.assert_array_equal(back, [10, 20])
+
+    def test_append_dtype_cast(self, tmp_path: Path) -> None:
+        lg = _make_level_group(tmp_path)
+        create_object_attributes_array(lg, "vals", dtype="int32")
+        write_object_attributes(
+            lg, "vals",
+            np.array([1, 2], dtype=np.int32),
+        )
+        # Append float32 values that round-trip safely to int32.
+        write_object_attributes(
+            lg, "vals",
+            np.array([3.0, 4.0], dtype=np.float32),
+            mode="append",
+        )
+        back = read_object_attributes(lg, "vals")
+        assert back.dtype == np.int32
+        np.testing.assert_array_equal(back, [1, 2, 3, 4])
+
+    def test_append_shape_mismatch(self, tmp_path: Path) -> None:
+        lg = _make_level_group(tmp_path)
+        create_object_attributes_array(lg, "vecs", dtype="float32", num_channels=2)
+        write_object_attributes(
+            lg, "vecs",
+            np.array([[1, 2], [3, 4], [5, 6]], dtype=np.float32),
+        )
+        # Tail-shape mismatch: existing (3, 2), append (2, 3).
+        try:
+            write_object_attributes(
+                lg, "vecs",
+                np.array([[1, 2, 3], [4, 5, 6]], dtype=np.float32),
+                mode="append",
+            )
+            assert False, "Should raise"
+        except ArrayError:
+            pass
+
+    def test_append_invalid_mode(self, tmp_path: Path) -> None:
+        lg = _make_level_group(tmp_path)
+        create_object_attributes_array(lg, "x", dtype="int32")
+        try:
+            write_object_attributes(
+                lg, "x",
+                np.array([1], dtype=np.int32),
+                mode="invalid",
+            )
+            assert False, "Should raise"
+        except ArrayError:
+            pass
+
+
+# ===================================================================
+# R3: write_cross_chunk_links / write_cross_chunk_link_attributes append
+# ===================================================================
+
+class TestWriteCrossChunkLinksAppend:
+    """Covers ``mode="append"`` on cross-chunk-link writers (R3)."""
+
+    def _records(self, n: int, base: int = 0) -> list:
+        # Build n simple 2-endpoint records with distinct vertex indices.
+        return [
+            [((0, 0, 0), base + i), ((1, 0, 0), base + i + 100)]
+            for i in range(n)
+        ]
+
+    def test_append_records(self, tmp_path: Path) -> None:
+        lg = _make_level_group(tmp_path)
+        create_cross_chunk_links_array(lg, delta=0)
+
+        ret0 = write_cross_chunk_links(
+            lg, self._records(2), sid_ndim=3, delta=0,
+        )
+        assert ret0 == 0   # replace returns 0
+
+        ret1 = write_cross_chunk_links(
+            lg, self._records(1, base=10), sid_ndim=3,
+            delta=0, mode="append",
+        )
+        assert ret1 == 2   # row index of first appended record
+
+        records = read_cross_chunk_links(lg, delta=0)
+        assert len(records) == 3
+        assert records[0][0] == ((0, 0, 0), 0)
+        assert records[2][0] == ((0, 0, 0), 10)
+
+    def test_append_to_empty(self, tmp_path: Path) -> None:
+        lg = _make_level_group(tmp_path)
+        create_cross_chunk_links_array(lg, delta=0)
+
+        ret = write_cross_chunk_links(
+            lg, self._records(2), sid_ndim=3, delta=0, mode="append",
+        )
+        assert ret == 0
+
+        records = read_cross_chunk_links(lg, delta=0)
+        assert len(records) == 2
+
+    def test_append_attributes(self, tmp_path: Path) -> None:
+        lg = _make_level_group(tmp_path)
+        create_cross_chunk_links_array(lg, delta=0)
+        create_cross_chunk_link_attributes_array(
+            lg, "weight", delta=0, dtype="float32",
+        )
+
+        write_cross_chunk_links(
+            lg, self._records(2), sid_ndim=3, delta=0,
+        )
+        write_cross_chunk_link_attributes(
+            lg, "weight", np.array([0.1, 0.2], dtype=np.float32),
+            num_links=2, delta=0,
+        )
+
+        # Append one more record + its attribute.
+        write_cross_chunk_links(
+            lg, self._records(1, base=10), sid_ndim=3,
+            delta=0, mode="append",
+        )
+        write_cross_chunk_link_attributes(
+            lg, "weight", np.array([0.3], dtype=np.float32),
+            num_links=3, delta=0, mode="append",
+        )
+
+        back = read_cross_chunk_link_attributes(lg, "weight", delta=0)
+        assert back.shape == (3,)
+        np.testing.assert_allclose(back, [0.1, 0.2, 0.3])
+
+    def test_append_attributes_misaligned(self, tmp_path: Path) -> None:
+        lg = _make_level_group(tmp_path)
+        create_cross_chunk_links_array(lg, delta=0)
+        create_cross_chunk_link_attributes_array(
+            lg, "weight", delta=0, dtype="float32",
+        )
+        write_cross_chunk_links(
+            lg, self._records(2), sid_ndim=3, delta=0,
+        )
+        write_cross_chunk_link_attributes(
+            lg, "weight", np.array([0.1, 0.2], dtype=np.float32),
+            num_links=2, delta=0,
+        )
+        try:
+            # Append one row, but pass num_links=5 (does not match
+            # post-append length of 3).
+            write_cross_chunk_link_attributes(
+                lg, "weight", np.array([0.3], dtype=np.float32),
+                num_links=5, delta=0, mode="append",
+            )
+            assert False, "Should raise"
+        except ArrayError:
+            pass
+
+    def test_append_invalid_mode(self, tmp_path: Path) -> None:
+        lg = _make_level_group(tmp_path)
+        create_cross_chunk_links_array(lg, delta=0)
+        try:
+            write_cross_chunk_links(
+                lg, self._records(1), sid_ndim=3, delta=0, mode="invalid",
+            )
+            assert False, "Should raise"
+        except ArrayError:
+            pass
+
+
+# ===================================================================
+# R4: Idempotent create_*_array helpers
+# ===================================================================
+
+class TestCreateArraysIdempotent:
+    """Covers ``exist_ok=True`` (default) and ``exist_ok=False`` on the
+    ``create_*_array`` family (R4)."""
+
+    def test_vertices_idempotent(self, tmp_path: Path) -> None:
+        lg = _make_level_group(tmp_path)
+        create_vertices_array(lg)
+        # Second call must be a no-op (default exist_ok=True).
+        create_vertices_array(lg)
+
+    def test_vertices_strict(self, tmp_path: Path) -> None:
+        lg = _make_level_group(tmp_path)
+        create_vertices_array(lg)
+        try:
+            create_vertices_array(lg, exist_ok=False)
+            assert False, "Should raise"
+        except ArrayError:
+            pass
+
+    def test_links_idempotent(self, tmp_path: Path) -> None:
+        lg = _make_level_group(tmp_path)
+        create_links_array(lg, link_width=2)
+        create_links_array(lg, link_width=2)   # no-op
+
+    def test_links_strict(self, tmp_path: Path) -> None:
+        lg = _make_level_group(tmp_path)
+        create_links_array(lg, link_width=2)
+        try:
+            create_links_array(lg, link_width=2, exist_ok=False)
+            assert False, "Should raise"
+        except ArrayError:
+            pass
+
+    def test_object_attributes_idempotent(self, tmp_path: Path) -> None:
+        lg = _make_level_group(tmp_path)
+        create_object_attributes_array(lg, "labels", dtype="int32")
+        # Second call must not error.
+        create_object_attributes_array(lg, "labels", dtype="int32")
+
+    def test_object_attributes_strict(self, tmp_path: Path) -> None:
+        lg = _make_level_group(tmp_path)
+        create_object_attributes_array(lg, "labels", dtype="int32")
+        try:
+            create_object_attributes_array(
+                lg, "labels", dtype="int32", exist_ok=False,
+            )
+            assert False, "Should raise"
+        except ArrayError:
+            pass
+
+
+# ===================================================================
+# R5: default kwarg on read_fragment and read_chunk_link_fragment
+# ===================================================================
+
+class TestReadFragmentDefault:
+    """Covers ``default=...`` soft-fail on single-fragment readers (R5)."""
+
+    # --- read_fragment ----------------------------------------------
+
+    def test_read_fragment_default_on_missing_chunk(
+        self, tmp_path: Path,
+    ) -> None:
+        lg = _make_level_group(tmp_path)
+        create_vertices_array(lg)
+        # Chunk doesn't exist — soft-fail returns the default.
+        out = read_fragment(
+            lg, (99, 99, 99), 0,
+            dtype=np.float32, ndim=3,
+            default=None,
+        )
+        assert out is None
+
+    def test_read_fragment_default_on_out_of_range(
+        self, tmp_path: Path,
+    ) -> None:
+        lg = _make_level_group(tmp_path)
+        create_vertices_array(lg)
+        write_chunk_vertices(
+            lg, (0, 0, 0), [np.zeros((1, 3), dtype=np.float32)],
+        )
+        sentinel = np.empty((0, 3), dtype=np.float32)
+        out = read_fragment(
+            lg, (0, 0, 0), 5,
+            dtype=np.float32, ndim=3,
+            default=sentinel,
+        )
+        assert out is sentinel
+
+    def test_read_fragment_no_default_still_raises(
+        self, tmp_path: Path,
+    ) -> None:
+        lg = _make_level_group(tmp_path)
+        create_vertices_array(lg)
+        write_chunk_vertices(
+            lg, (0, 0, 0), [np.zeros((1, 3), dtype=np.float32)],
+        )
+        try:
+            read_fragment(lg, (0, 0, 0), 5, dtype=np.float32, ndim=3)
+            assert False, "Should raise"
+        except ArrayError:
+            pass
+
+    # --- read_chunk_link_fragment -----------------------------------
+
+    def test_link_fragment_default_on_missing_chunk(
+        self, tmp_path: Path,
+    ) -> None:
+        lg = _make_level_group(tmp_path)
+        create_vertices_array(lg)
+        create_links_array(lg, link_width=2)
+        out = read_chunk_link_fragment(
+            lg, (99, 99, 99), 0, link_width=2, default=None,
+        )
+        assert out is None
+
+    def test_link_fragment_default_on_out_of_range(
+        self, tmp_path: Path,
+    ) -> None:
+        lg = _make_level_group(tmp_path)
+        create_vertices_array(lg)
+        create_links_array(lg, link_width=2)
+        write_chunk_vertices(
+            lg, (0, 0, 0), [np.zeros((1, 3), dtype=np.float32)],
+        )
+        write_chunk_links(
+            lg, (0, 0, 0), [np.array([[0, 0]], dtype=np.int64)],
+        )
+        sentinel = np.empty((0, 2), dtype=np.int64)
+        out = read_chunk_link_fragment(
+            lg, (0, 0, 0), 5, link_width=2, default=sentinel,
+        )
+        assert out is sentinel
+
+    def test_link_fragment_no_default_still_raises(
+        self, tmp_path: Path,
+    ) -> None:
+        lg = _make_level_group(tmp_path)
+        create_vertices_array(lg)
+        create_links_array(lg, link_width=2)
+        write_chunk_vertices(
+            lg, (0, 0, 0), [np.zeros((1, 3), dtype=np.float32)],
+        )
+        write_chunk_links(
+            lg, (0, 0, 0), [np.array([[0, 0]], dtype=np.int64)],
+        )
+        try:
+            read_chunk_link_fragment(
+                lg, (0, 0, 0), 5, link_width=2,
+            )
+            assert False, "Should raise"
+        except ArrayError:
+            pass

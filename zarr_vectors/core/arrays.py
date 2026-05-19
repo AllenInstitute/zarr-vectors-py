@@ -14,7 +14,7 @@ from __future__ import annotations
 
 import warnings
 from contextlib import contextmanager
-from typing import Any
+from typing import Any, Literal
 
 import numpy as np
 import numpy.typing as npt
@@ -60,12 +60,18 @@ from zarr_vectors.encoding.ragged import (
     encode_ragged_floats,
     encode_ragged_ints,
 )
-from zarr_vectors.exceptions import ArrayError
+from zarr_vectors.exceptions import ArrayError, StoreError
 from zarr_vectors.typing import (
     ChunkCoords,
     CrossChunkLink,
     ObjectManifest,
 )
+
+
+# Sentinel for read-side ``default=...`` soft-fail kwargs.  Lets callers
+# distinguish "did not pass default" (caller wants the raise) from
+# "passed default=None" (caller wants None back on miss).
+_UNSET: Any = object()
 
 
 # Discriminator written into ``object_index`` group attrs to identify
@@ -121,6 +127,24 @@ def _maybe_batched_reads(
         yield
 
 
+def _short_circuit_existing(
+    level_group: FsGroup,
+    full_name: str,
+    exist_ok: bool,
+) -> bool:
+    """Return True when ``create_*_array`` should no-op because the array
+    already exists and ``exist_ok=True``.  Raises :class:`ArrayError` when
+    the array exists and ``exist_ok=False``.
+    """
+    if not level_group.array_exists(full_name):
+        return False
+    if exist_ok:
+        return True
+    raise ArrayError(
+        f"{full_name!r} already exists; pass exist_ok=True to ignore"
+    )
+
+
 def _ensure_array_dir(level_group: FsGroup, array_name: str) -> None:
     """Ensure an array subdirectory exists within a level group.
 
@@ -155,6 +179,8 @@ def create_vertices_array(
     level_group: FsGroup,
     dtype: str = "float32",
     encoding: str = "raw",
+    *,
+    exist_ok: bool = True,
 ) -> None:
     """Create the ``vertices/`` array within a resolution level.
 
@@ -162,7 +188,11 @@ def create_vertices_array(
         level_group: The resolution level FsGroup.
         dtype: Numpy dtype string for vertex positions.
         encoding: ``"raw"`` or ``"draco"``.
+        exist_ok: When True (default), no-op if the array already exists.
+            When False, raise :class:`ArrayError` on conflict.
     """
+    if _short_circuit_existing(level_group, VERTICES, exist_ok):
+        return
     _ensure_array_dir(level_group, VERTICES)
     _ensure_array_dir(level_group, VERTEX_FRAGMENTS)
     level_group.write_array_meta(VERTICES, {
@@ -182,6 +212,7 @@ def create_links_array(
     dtype: str = "int64",
     *,
     delta: int = 0,
+    exist_ok: bool = True,
 ) -> None:
     """Create a ``links/<delta>/`` array.
 
@@ -196,8 +227,12 @@ def create_links_array(
             1 for skeleton parents, 2 for edges, 3 for triangle faces.
         dtype: Integer dtype.
         delta: Level delta; see :mod:`zarr_vectors.core.paths`.
+        exist_ok: When True (default), no-op if the array already exists.
+            When False, raise :class:`ArrayError` on conflict.
     """
     full_name = links_path(delta)
+    if _short_circuit_existing(level_group, full_name, exist_ok):
+        return
     _ensure_array_dir(level_group, full_name)
     level_group.write_array_meta(full_name, {
         "zv_array": "links",
@@ -213,6 +248,8 @@ def create_attribute_array(
     dtype: str = "float32",
     channel_names: list[str] | None = None,
     extra_meta: dict[str, Any] | None = None,
+    *,
+    exist_ok: bool = True,
 ) -> None:
     """Create a vertex attribute array ``attributes/<name>/``.
 
@@ -229,6 +266,8 @@ def create_attribute_array(
             (``zv_array``, ``name``, ``dtype``, ``channel_names``).
     """
     full_name = f"{VERTEX_ATTRIBUTES}/{name}"
+    if _short_circuit_existing(level_group, full_name, exist_ok):
+        return
     _ensure_array_dir(level_group, full_name)
     meta: dict[str, Any] = {
         "zv_array": "attribute",
@@ -248,8 +287,20 @@ def create_attribute_array(
     level_group.write_array_meta(full_name, meta)
 
 
-def create_object_index_array(level_group: FsGroup) -> None:
-    """Create the ``object_index/`` array."""
+def create_object_index_array(
+    level_group: FsGroup,
+    *,
+    exist_ok: bool = True,
+) -> None:
+    """Create the ``object_index/`` array.
+
+    Args:
+        level_group: Resolution level group.
+        exist_ok: When True (default), no-op if the array already exists.
+            When False, raise :class:`ArrayError` on conflict.
+    """
+    if _short_circuit_existing(level_group, OBJECT_INDEX, exist_ok):
+        return
     _ensure_array_dir(level_group, OBJECT_INDEX)
     level_group.write_array_meta(OBJECT_INDEX, {
         "zv_array": "object_index",
@@ -261,6 +312,8 @@ def create_object_attributes_array(
     name: str,
     dtype: str = "float32",
     num_channels: int = 1,
+    *,
+    exist_ok: bool = True,
 ) -> None:
     """Create an object attribute array ``object_attributes/<name>/``.
 
@@ -269,8 +322,12 @@ def create_object_attributes_array(
         name: Attribute name.
         dtype: Numpy dtype string.
         num_channels: Number of channels (C dimension).
+        exist_ok: When True (default), no-op if the array already exists.
+            When False, raise :class:`ArrayError` on conflict.
     """
     full_name = f"{OBJECT_ATTRIBUTES}/{name}"
+    if _short_circuit_existing(level_group, full_name, exist_ok):
+        return
     _ensure_array_dir(level_group, full_name)
     level_group.write_array_meta(full_name, {
         "zv_array": "object_attribute",
@@ -280,8 +337,20 @@ def create_object_attributes_array(
     })
 
 
-def create_groupings_array(level_group: FsGroup) -> None:
-    """Create the ``groupings/`` array."""
+def create_groupings_array(
+    level_group: FsGroup,
+    *,
+    exist_ok: bool = True,
+) -> None:
+    """Create the ``groupings/`` array.
+
+    Args:
+        level_group: Resolution level group.
+        exist_ok: When True (default), no-op if the array already exists.
+            When False, raise :class:`ArrayError` on conflict.
+    """
+    if _short_circuit_existing(level_group, GROUPS, exist_ok):
+        return
     _ensure_array_dir(level_group, GROUPS)
     level_group.write_array_meta(GROUPS, {
         "zv_array": "groups",
@@ -293,9 +362,22 @@ def create_groupings_attributes_array(
     name: str,
     dtype: str = "float32",
     num_channels: int = 1,
+    *,
+    exist_ok: bool = True,
 ) -> None:
-    """Create a groupings attribute array ``groupings_attributes/<name>/``."""
+    """Create a groupings attribute array ``groupings_attributes/<name>/``.
+
+    Args:
+        level_group: Resolution level group.
+        name: Attribute name.
+        dtype: Numpy dtype string.
+        num_channels: Number of channels (C dimension).
+        exist_ok: When True (default), no-op if the array already exists.
+            When False, raise :class:`ArrayError` on conflict.
+    """
     full_name = f"{GROUP_ATTRIBUTES}/{name}"
+    if _short_circuit_existing(level_group, full_name, exist_ok):
+        return
     _ensure_array_dir(level_group, full_name)
     level_group.write_array_meta(full_name, {
         "zv_array": "groupings_attribute",
@@ -310,6 +392,7 @@ def create_cross_chunk_links_array(
     *,
     delta: int = 0,
     link_width: int = 2,
+    exist_ok: bool = True,
 ) -> None:
     """Create a ``cross_chunk_links/<delta>/`` array.
 
@@ -322,8 +405,12 @@ def create_cross_chunk_links_array(
         link_width: Number of vertex refs per record.  2 for edges
             (the default — chunk pairs straddling a boundary), 3 for
             triangle faces, 1 for parent→child metanode references.
+        exist_ok: When True (default), no-op if the array already exists.
+            When False, raise :class:`ArrayError` on conflict.
     """
     full_name = cross_chunk_links_path(delta)
+    if _short_circuit_existing(level_group, full_name, exist_ok):
+        return
     _ensure_array_dir(level_group, full_name)
     level_group.write_array_meta(full_name, {
         "zv_array": "cross_chunk_links",
@@ -338,10 +425,17 @@ def create_link_attributes_array(
     dtype: str = "float32",
     *,
     delta: int = 0,
+    exist_ok: bool = True,
 ) -> None:
     """Create a ``link_attributes/<name>/<delta>/`` array (parallel to
-    the matching ``links/<delta>/`` array)."""
+    the matching ``links/<delta>/`` array).
+
+    ``exist_ok=True`` (default) makes the call idempotent; pass
+    ``exist_ok=False`` to raise :class:`ArrayError` on conflict.
+    """
     full_name = link_attributes_path(name, delta)
+    if _short_circuit_existing(level_group, full_name, exist_ok):
+        return
     _ensure_array_dir(level_group, full_name)
     level_group.write_array_meta(full_name, {
         "zv_array": "link_attribute",
@@ -357,14 +451,20 @@ def create_cross_chunk_link_attributes_array(
     dtype: str = "float32",
     *,
     delta: int = 0,
+    exist_ok: bool = True,
 ) -> None:
     """Create a ``cross_chunk_link_attributes/<name>/<delta>/`` array.
 
     Parallel attribute storage for the matching
     ``cross_chunk_links/<delta>/`` array; one value (or one ``C``-vector
     row) per cross-chunk link in path order.
+
+    ``exist_ok=True`` (default) makes the call idempotent; pass
+    ``exist_ok=False`` to raise :class:`ArrayError` on conflict.
     """
     full_name = cross_chunk_link_attributes_path(name, delta)
+    if _short_circuit_existing(level_group, full_name, exist_ok):
+        return
     _ensure_array_dir(level_group, full_name)
     level_group.write_array_meta(full_name, {
         "zv_array": "cross_chunk_link_attribute",
@@ -509,6 +609,91 @@ def write_chunk_links(
     level_group.write_bytes(full_name, key, blob)
     _, link_byte_offsets = encode_ragged_ints(link_groups, dtype)
     return link_byte_offsets
+
+
+def write_chunk_fragments(
+    level_group: FsGroup,
+    chunk_coords: ChunkCoords,
+    new_fragments: list,
+    *,
+    target: Literal["vertex", "link"] = "vertex",
+    mode: Literal["replace", "append"] = "replace",
+) -> list[int]:
+    """Write fragment-index entries to a chunk's vertex_fragments/<chunk>
+    or link_fragments/<chunk> blob.
+
+    Args:
+        level_group: Resolution level group.
+        chunk_coords: Spatial chunk coordinates.
+        new_fragments: Mix of ``(start, count)`` range tuples and
+            ``np.ndarray[int64]`` explicit index arrays. Order is
+            preserved in the output index.
+        target: ``"vertex"`` writes to ``vertex_fragments/<chunk>``;
+            ``"link"`` writes to ``link_fragments/<chunk>``.
+        mode: ``"replace"`` writes ``new_fragments`` as the whole blob.
+            ``"append"`` reads the existing blob, decodes its fragments,
+            concatenates ``new_fragments``, re-encodes, writes back.
+            If the blob does not yet exist, ``"append"`` behaves like a
+            first-time ``"replace"``.
+
+    Returns:
+        Fragment-index values assigned to the newly-written entries.
+        ``"replace"`` returns ``list(range(len(new_fragments)))``.
+        ``"append"`` returns
+        ``list(range(n_existing, n_existing + len(new_fragments)))``;
+        existing fragment_index values are stable. An empty
+        ``new_fragments`` in append mode returns ``[]`` and does not
+        write the blob.
+
+    Raises:
+        ArrayError: If ``target`` or ``mode`` is invalid.
+
+    Concurrency:
+        Read-modify-write. ``write_bytes`` is delete-then-create — last
+        writer wins. This is NOT cross-writer-safe; callers must
+        serialise concurrent appends to the same chunk's fragment-index
+        (per-chunk sharding satisfies this).
+    """
+    if target == "vertex":
+        constant = VERTEX_FRAGMENTS
+    elif target == "link":
+        constant = LINK_FRAGMENTS
+    else:
+        raise ArrayError(
+            f"target must be 'vertex' or 'link', got {target!r}"
+        )
+    if mode not in ("replace", "append"):
+        raise ArrayError(
+            f"mode must be 'replace' or 'append', got {mode!r}"
+        )
+
+    key = _chunk_key(chunk_coords)
+    new_list = list(new_fragments)
+
+    if mode == "replace":
+        level_group.write_bytes(constant, key, encode_fragments(new_list))
+        return list(range(len(new_list)))
+
+    # append
+    if not new_list:
+        return []   # no-op append — don't touch the blob
+
+    def _fi_to_list(raw: bytes) -> list:
+        fi = decode_fragments(raw)
+        return [
+            fi.range(i) if fi.is_range(i) else fi.indices(i)
+            for i in range(fi.num_fragments)
+        ]
+
+    _, existing = _read_modify_write_blob(
+        level_group, constant, key,
+        decode_fn=_fi_to_list,
+        merge_fn=lambda ex: ex + new_list,
+        encode_fn=encode_fragments,
+        initial=[],
+    )
+    n_before = len(existing)
+    return list(range(n_before, n_before + len(new_list)))
 
 
 def write_chunk_attributes(
@@ -672,37 +857,122 @@ def write_object_attributes(
     data: npt.NDArray,
     *,
     present_mask: npt.NDArray | None = None,
+    mode: Literal["replace", "append"] = "replace",
 ) -> None:
     """Write dense O×C object attribute data.
 
     Args:
         level_group: Resolution level group.
         attr_name: Attribute name.
-        data: ``(O,)`` or ``(O, C)`` array.
+        data: ``(O,)`` or ``(O, C)`` array.  In ``mode="append"`` this is
+            interpreted as the NEW rows to append.
         present_mask: Optional ``(O,)`` byte array (``0``/``1`` per
             object) marking which rows are real.  Required for levels
             that use ID-preserving sparsification — rows for dropped
             objects have ``mask[i] == 0`` and the corresponding
             ``data[i]`` row is dtype-zero padding.  When omitted, every
-            row is assumed real (backwards compatible).
+            row is assumed real (backwards compatible).  In append mode,
+            this is the mask for the NEW rows; existing rows get
+            ``1`` backfilled if the existing array had no mask.
+        mode: ``"replace"`` (default, current behaviour) writes ``data``
+            as the full array.  ``"append"`` reads the existing array,
+            concatenates ``data`` along axis 0, writes back.  Existing
+            dtype wins on dtype mismatch (new rows are cast).  If the
+            attribute does not exist yet, the first append behaves like
+            a ``"replace"``.
+
+    Raises:
+        ArrayError: If ``mode`` is invalid, or if the appended row shape
+            (everything beyond axis 0) does not match the existing array.
+
+    Concurrency:
+        ``mode="append"`` is read-modify-write and NOT cross-writer-safe.
+        Callers must serialise concurrent appends to the same attribute.
     """
+    if mode == "replace":
+        full_name = f"{OBJECT_ATTRIBUTES}/{attr_name}"
+        _ensure_array_dir(level_group, full_name)
+        level_group.write_bytes(full_name, "data", data.tobytes())
+        if present_mask is not None:
+            mask = np.asarray(present_mask, dtype=np.uint8)
+            if mask.shape[0] != data.shape[0]:
+                raise ArrayError(
+                    f"present_mask length {mask.shape[0]} != data row count "
+                    f"{data.shape[0]}"
+                )
+            level_group.write_bytes(full_name, "present_mask", mask.tobytes())
+        level_group.write_array_meta(full_name, {
+            "zv_array": "object_attribute",
+            "name": attr_name,
+            "dtype": str(data.dtype),
+            "shape": list(data.shape),
+            "has_present_mask": bool(present_mask is not None),
+        })
+        return
+
+    if mode != "append":
+        raise ArrayError(
+            f"mode must be 'replace' or 'append', got {mode!r}"
+        )
+
+    # Append branch ------------------------------------------------------
     full_name = f"{OBJECT_ATTRIBUTES}/{attr_name}"
-    _ensure_array_dir(level_group, full_name)
-    level_group.write_bytes(full_name, "data", data.tobytes())
-    if present_mask is not None:
-        mask = np.asarray(present_mask, dtype=np.uint8)
-        if mask.shape[0] != data.shape[0]:
+    data = np.asarray(data)
+
+    meta = level_group.read_array_meta(full_name)
+    if meta and "shape" in meta and level_group.chunk_exists(full_name, "data"):
+        existing = read_object_attributes(level_group, attr_name)
+        had_existing_mask = bool(meta.get("has_present_mask"))
+    else:
+        existing = None
+        had_existing_mask = False
+
+    if existing is None:
+        combined = data
+    else:
+        # Tail-shape (everything beyond axis 0) must match.
+        if existing.shape[1:] != data.shape[1:]:
             raise ArrayError(
-                f"present_mask length {mask.shape[0]} != data row count "
-                f"{data.shape[0]}"
+                f"append shape mismatch: existing {existing.shape} vs "
+                f"new {data.shape} — tail dimensions must match"
             )
-        level_group.write_bytes(full_name, "present_mask", mask.tobytes())
+        new_cast = data.astype(existing.dtype, copy=False)
+        combined = np.concatenate([existing, new_cast], axis=0)
+
+    _ensure_array_dir(level_group, full_name)
+    level_group.write_bytes(
+        full_name, "data", np.ascontiguousarray(combined).tobytes(),
+    )
+
+    has_mask = had_existing_mask or (present_mask is not None)
+    if present_mask is not None:
+        new_mask = np.asarray(present_mask, dtype=np.uint8)
+        if new_mask.shape[0] != data.shape[0]:
+            raise ArrayError(
+                f"present_mask length {new_mask.shape[0]} != appended row "
+                f"count {data.shape[0]}"
+            )
+        if had_existing_mask:
+            old_mask = np.frombuffer(
+                level_group.read_bytes(full_name, "present_mask"),
+                dtype=np.uint8,
+            )
+        elif existing is not None:
+            # First-time mask introduction — backfill existing rows.
+            old_mask = np.ones(existing.shape[0], dtype=np.uint8)
+        else:
+            old_mask = np.empty(0, dtype=np.uint8)
+        combined_mask = np.concatenate([old_mask, new_mask])
+        level_group.write_bytes(
+            full_name, "present_mask", combined_mask.tobytes(),
+        )
+
     level_group.write_array_meta(full_name, {
         "zv_array": "object_attribute",
         "name": attr_name,
-        "dtype": str(data.dtype),
-        "shape": list(data.shape),
-        "has_present_mask": bool(present_mask is not None),
+        "dtype": str(combined.dtype),
+        "shape": list(combined.shape),
+        "has_present_mask": has_mask,
     })
 
 
@@ -787,7 +1057,8 @@ def write_cross_chunk_links(
     *,
     delta: int = 0,
     link_width: int | None = None,
-) -> None:
+    mode: Literal["replace", "append"] = "replace",
+) -> int:
     """Write cross-chunk link records under ``cross_chunk_links/<delta>/``.
 
     Each record is ``link_width`` ``(chunk_coords, vertex_idx)``
@@ -817,9 +1088,28 @@ def write_cross_chunk_links(
         delta: Level delta; see :mod:`zarr_vectors.core.paths`.
         link_width: Endpoints per record.  Defaults to 2 (or to the
             arity of the first record if it's a list).
+        mode: ``"replace"`` (default) overwrites the existing records.
+            ``"append"`` reads existing records, concatenates ``links``,
+            writes back.  ``link_width`` of the appended records must
+            match the existing ``link_width``.
+
+    Returns:
+        ``"replace"`` returns ``0``.  ``"append"`` returns the row index
+        of the first newly-appended record (``len(existing)`` before
+        the append).  Callers can stamp this index onto downstream
+        attribute tables that reference records by row.
+
+    Concurrency:
+        ``mode="append"`` is read-modify-write and NOT cross-writer-safe.
+        Callers must serialise concurrent appends to the same
+        cross_chunk_links/<delta>/ blob.
     """
+    if mode not in ("replace", "append"):
+        raise ArrayError(
+            f"mode must be 'replace' or 'append', got {mode!r}"
+        )
     if not links:
-        return
+        return 0
 
     # Normalise input to a list-of-lists shape; resolve link_width.
     normalised: list[list[tuple[ChunkCoords, int]]] = []
@@ -840,8 +1130,26 @@ def write_cross_chunk_links(
             )
 
     full_name = cross_chunk_links_path(delta)
+
+    if mode == "append":
+        existing = read_cross_chunk_links(level_group, delta=delta)
+        if existing:
+            existing_meta = level_group.read_array_meta(full_name)
+            existing_link_width = int(existing_meta.get("link_width", 2))
+            if existing_link_width != link_width:
+                raise ArrayError(
+                    f"cross_chunk_links/{format_delta(delta)}: cannot "
+                    f"append records of link_width {link_width} onto "
+                    f"existing array of link_width {existing_link_width}"
+                )
+        first_new = len(existing)
+        combined = [list(rec) for rec in existing] + normalised
+    else:
+        first_new = 0
+        combined = normalised
+
     flat: list[int] = []
-    for rec in normalised:
+    for rec in combined:
         for chunk, vi in rec:
             if len(chunk) != sid_ndim:
                 raise ArrayError(
@@ -856,11 +1164,12 @@ def write_cross_chunk_links(
     level_group.write_bytes(full_name, "data", arr.tobytes())
     level_group.write_array_meta(full_name, {
         "zv_array": "cross_chunk_links",
-        "num_links": len(normalised),
+        "num_links": len(combined),
         "sid_ndim": sid_ndim,
         "level_delta": int(delta),
         "link_width": int(link_width),
     })
+    return first_new
 
 
 def write_cross_chunk_link_attributes(
@@ -870,6 +1179,7 @@ def write_cross_chunk_link_attributes(
     *,
     num_links: int,
     delta: int = 0,
+    mode: Literal["replace", "append"] = "replace",
 ) -> None:
     """Write per-edge attribute data parallel to ``cross_chunk_links/<delta>/data``.
 
@@ -883,27 +1193,71 @@ def write_cross_chunk_link_attributes(
     Args:
         level_group: Resolution level group.
         attr_name: Attribute name.
-        attr_data: ``(num_links,)`` or ``(num_links, C)`` array.
-        num_links: Expected length (the ``num_links`` value on the
-            parallel ``cross_chunk_links/<delta>/`` array).
+        attr_data: ``(num_links,)`` or ``(num_links, C)`` array.  In
+            ``mode="append"`` this is interpreted as the NEW rows to
+            append; the post-append length must equal ``num_links``.
+        num_links: Expected post-write length (the ``num_links`` value
+            on the parallel ``cross_chunk_links/<delta>/`` array).
         delta: Level delta; see :mod:`zarr_vectors.core.paths`.
+        mode: ``"replace"`` (default) writes ``attr_data`` as the whole
+            attribute array.  ``"append"`` reads the existing attribute,
+            concatenates ``attr_data`` along axis 0, writes back, and
+            validates that the resulting length equals ``num_links``.
+
+    Raises:
+        ArrayError: If ``mode`` is invalid, if the post-write length
+            does not equal ``num_links``, or if the appended row shape
+            does not match the existing array.
+
+    Concurrency:
+        ``mode="append"`` is read-modify-write and NOT cross-writer-safe.
+        Callers must serialise concurrent appends to the same attribute.
     """
-    if attr_data.shape[0] != num_links:
+    if mode not in ("replace", "append"):
+        raise ArrayError(
+            f"mode must be 'replace' or 'append', got {mode!r}"
+        )
+
+    full_name = cross_chunk_link_attributes_path(attr_name, delta)
+
+    if mode == "append":
+        meta = level_group.read_array_meta(full_name)
+        if meta and "shape" in meta and level_group.chunk_exists(full_name, "data"):
+            existing = read_cross_chunk_link_attributes(
+                level_group, attr_name, delta=delta,
+            )
+            if existing.shape[1:] != np.asarray(attr_data).shape[1:]:
+                raise ArrayError(
+                    f"cross_chunk_link_attributes[{attr_name}] append "
+                    f"shape mismatch: existing {existing.shape} vs new "
+                    f"{np.asarray(attr_data).shape} — tail dimensions "
+                    f"must match"
+                )
+            new_cast = np.asarray(attr_data).astype(existing.dtype, copy=False)
+            combined = np.concatenate([existing, new_cast], axis=0)
+        else:
+            combined = np.asarray(attr_data)
+    else:
+        combined = np.asarray(attr_data)
+
+    if combined.shape[0] != num_links:
         raise ArrayError(
             f"cross_chunk_link_attributes[{attr_name}] row count "
-            f"{attr_data.shape[0]} != num_links {num_links} "
+            f"{combined.shape[0]} != num_links {num_links} "
             f"(delta={format_delta(delta)})"
         )
-    full_name = cross_chunk_link_attributes_path(attr_name, delta)
+
     _ensure_array_dir(level_group, full_name)
-    level_group.write_bytes(full_name, "data", np.ascontiguousarray(attr_data).tobytes())
+    level_group.write_bytes(
+        full_name, "data", np.ascontiguousarray(combined).tobytes(),
+    )
     level_group.write_array_meta(full_name, {
         "zv_array": "cross_chunk_link_attribute",
         "name": attr_name,
-        "dtype": str(attr_data.dtype),
+        "dtype": str(combined.dtype),
         "level_delta": int(delta),
         "num_links": int(num_links),
-        "shape": list(attr_data.shape),
+        "shape": list(combined.shape),
     })
 
 
@@ -918,6 +1272,11 @@ def read_chunk_vertices(
     ndim: int = 3,
 ) -> list[npt.NDArray[np.floating]]:
     """Read all fragments from a spatial chunk.
+
+    Handles both range and explicit fragments: the full chunk buffer is read
+    once and dispatched per fragment based on the ``vertex_fragments/<chunk>``
+    index — range fragments are returned as contiguous slices, explicit
+    fragments via ``fi.indices(f)`` gather.
 
     Args:
         level_group: Resolution level group.
@@ -943,11 +1302,19 @@ def read_chunk_vertices(
         except Exception as e:
             raise ArrayError(f"Cannot read vertices chunk {key}: {e}") from e
 
-        bytes_per_vertex = int(dtype.itemsize) * int(ndim)
-        offsets = _read_vertex_offsets(
-            level_group, chunk_coords, bytes_per_vertex=bytes_per_vertex,
-        )
-    return decode_ragged_floats(raw, offsets, dtype, ndim)
+        fi = read_vertex_fragment_index(level_group, chunk_coords)
+
+    if fi.num_fragments == 0:
+        return []
+    full = _reshape_vertex_buffer(raw, dtype, ndim)
+    groups: list[npt.NDArray[np.floating]] = []
+    for f in range(fi.num_fragments):
+        if fi.is_range(f):
+            start, count = fi.range(f)
+            groups.append(full[start : start + count])
+        else:
+            groups.append(full[fi.indices(f)])
+    return groups
 
 
 def read_fragment(
@@ -956,8 +1323,14 @@ def read_fragment(
     fragment_index: int,
     dtype: np.dtype | str = np.float32,
     ndim: int = 3,
-) -> npt.NDArray[np.floating]:
-    """Read a single fragment using byte offsets for efficient access.
+    *,
+    default: Any = _UNSET,
+) -> npt.NDArray[np.floating] | Any:
+    """Read a single vertex fragment from a chunk.
+
+    Dispatches on the ``vertex_fragments/<chunk>`` index: range fragments
+    use a byte-slice fast path; explicit fragments reshape the full chunk
+    buffer and gather rows via ``fi.indices(fragment_index)``.
 
     Args:
         level_group: Resolution level group.
@@ -965,37 +1338,43 @@ def read_fragment(
         fragment_index: Index of the fragment within the chunk.
         dtype: Numpy dtype.
         ndim: Number of coordinate dimensions.
+        default: When supplied, returned on read failure (missing chunk
+            or out-of-range ``fragment_index``) instead of raising.  Pass
+            ``None`` for the common "soft-fail with None" pattern.  Only
+            :class:`ArrayError` and :class:`StoreError` are caught;
+            programming errors propagate.
 
     Returns:
-        Array of shape ``(N, D)``.
+        Array of shape ``(N, D)`` (or ``(N,)`` when ``ndim == 1``), or
+        ``default`` when supplied and the read fails.
     """
     key = _chunk_key(chunk_coords)
     dtype = np.dtype(dtype)
 
-    with _maybe_batched_reads(level_group, [
-        (VERTICES, [key]),
-        (VERTEX_FRAGMENTS, [key]),
-    ]):
-        raw = level_group.read_bytes(VERTICES, key)
-        bytes_per_vertex = int(dtype.itemsize) * int(ndim)
-        offsets = _read_vertex_offsets(
-            level_group, chunk_coords, bytes_per_vertex=bytes_per_vertex,
-        )
+    try:
+        with _maybe_batched_reads(level_group, [
+            (VERTICES, [key]),
+            (VERTEX_FRAGMENTS, [key]),
+        ]):
+            raw = level_group.read_bytes(VERTICES, key)
+            fi = read_vertex_fragment_index(level_group, chunk_coords)
 
-    if fragment_index < 0 or fragment_index >= len(offsets):
-        raise ArrayError(
-            f"Fragment index {fragment_index} out of range "
-            f"(chunk {key} has {len(offsets)} groups)"
-        )
+        if fragment_index < 0 or fragment_index >= fi.num_fragments:
+            raise ArrayError(
+                f"Fragment index {fragment_index} out of range "
+                f"(chunk {key} has {fi.num_fragments} groups)"
+            )
 
-    start = int(offsets[fragment_index])
-    end = int(offsets[fragment_index + 1]) if fragment_index + 1 < len(offsets) else len(raw)
-    segment = raw[start:end]
+        if fi.is_range(fragment_index):
+            start, count = fi.range(fragment_index)
+            return _slice_vertex_range(raw, start, count, dtype, ndim)
 
-    arr = np.frombuffer(segment, dtype=dtype)
-    if ndim > 1:
-        arr = arr.reshape(-1, ndim)
-    return arr
+        full = _reshape_vertex_buffer(raw, dtype, ndim)
+        return full[fi.indices(fragment_index)]
+    except (ArrayError, StoreError):
+        if default is _UNSET:
+            raise
+        return default
 
 
 def read_chunk_links(
@@ -1044,28 +1423,99 @@ def read_chunk_links(
         if delta == 0:
             # v0.6 intra-level layout: raw is the flat concatenated link
             # data; per-group row counts live in link_fragments/<chunk>.
+            # Handles both range and explicit fragments by reshaping once
+            # and dispatching per fragment.
             fi = read_link_fragment_index(level_group, chunk_coords)
+            if fi.num_fragments == 0:
+                return []
+            full = _reshape_link_buffer(raw, dtype, link_width)
             groups: list[npt.NDArray[np.integer]] = []
-            row_size = int(dtype.itemsize) * int(link_width)
             for f in range(fi.num_fragments):
-                if not fi.is_range(f):
-                    raise ArrayError(
-                        f"link_fragments/{key} fragment {f} is non-contiguous; "
-                        "read_chunk_links requires every fragment to be a "
-                        "contiguous range over rows of links/0/<chunk>.",
-                    )
-                start, count = fi.range(f)
-                byte_lo = int(start) * row_size
-                byte_hi = byte_lo + int(count) * row_size
-                segment = raw[byte_lo:byte_hi]
-                arr = np.frombuffer(segment, dtype=dtype)
-                if link_width > 1:
-                    arr = arr.reshape(-1, link_width)
-                groups.append(arr)
+                if fi.is_range(f):
+                    start, count = fi.range(f)
+                    groups.append(full[start : start + count])
+                else:
+                    groups.append(full[fi.indices(f)])
             return groups
 
         # Cross-level delta != 0: v0.5 inline self-describing layout.
         return decode_ragged_blob(raw, dtype, ncols=link_width)
+
+
+def read_chunk_link_fragment(
+    level_group: FsGroup,
+    chunk_coords: ChunkCoords,
+    fragment_index: int,
+    dtype: np.dtype | str = np.int64,
+    link_width: int | None = None,
+    *,
+    default: Any = _UNSET,
+) -> npt.NDArray[np.integer] | Any:
+    """Read a single link fragment from a chunk's ``links/0/<chunk>`` array.
+
+    Intra-level only (``delta == 0``). Dispatches on the
+    ``link_fragments/<chunk>`` index: range fragments use a byte-slice
+    fast path; explicit fragments reshape the full chunk buffer and gather
+    rows via ``fi.indices(fragment_index)``.
+
+    Args:
+        level_group: Resolution level group.
+        chunk_coords: Spatial chunk coordinates.
+        fragment_index: Index of the fragment within the chunk.
+        dtype: Integer dtype.
+        link_width: Number of columns per link (L). If None, read from
+            array metadata.
+        default: When supplied, returned on read failure (missing chunk
+            or out-of-range ``fragment_index``) instead of raising.  Pass
+            ``None`` for the common "soft-fail with None" pattern.  Only
+            :class:`ArrayError` and :class:`StoreError` are caught;
+            programming errors propagate.
+
+    Returns:
+        Array of shape ``(M, L)`` (or ``(M,)`` when ``link_width == 1``),
+        or ``default`` when supplied and the read fails.
+
+    Raises:
+        ArrayError: If the chunk does not exist or ``fragment_index`` is
+            out of range, AND ``default`` was not supplied.
+    """
+    key = _chunk_key(chunk_coords)
+    dtype = np.dtype(dtype)
+    full_name = links_path(0)
+
+    try:
+        if link_width is None:
+            meta = level_group.read_array_meta(full_name)
+            link_width = meta.get("link_width", 2)
+
+        with _maybe_batched_reads(level_group, [
+            (full_name, [key]),
+            (LINK_FRAGMENTS, [key]),
+        ]):
+            try:
+                raw = level_group.read_bytes(full_name, key)
+            except Exception as e:
+                raise ArrayError(
+                    f"Cannot read links chunk {key} (delta=0): {e}"
+                ) from e
+            fi = read_link_fragment_index(level_group, chunk_coords)
+
+        if fragment_index < 0 or fragment_index >= fi.num_fragments:
+            raise ArrayError(
+                f"Fragment index {fragment_index} out of range "
+                f"(chunk {key} has {fi.num_fragments} groups)"
+            )
+
+        if fi.is_range(fragment_index):
+            start, count = fi.range(fragment_index)
+            return _slice_link_range(raw, start, count, dtype, link_width)
+
+        full = _reshape_link_buffer(raw, dtype, link_width)
+        return full[fi.indices(fragment_index)]
+    except (ArrayError, StoreError):
+        if default is _UNSET:
+            raise
+        return default
 
 
 def read_chunk_attributes(
@@ -1134,6 +1584,81 @@ def read_chunk_attributes(
             total_attr_bytes=len(raw),
         )
     return decode_ragged_floats(raw, attr_offsets, dtype, ncols)
+
+
+def read_chunk_link_attributes(
+    level_group: FsGroup,
+    attr_name: str,
+    chunk_coords: ChunkCoords,
+    dtype: np.dtype | str = np.float32,
+    ncols: int = 1,
+    *,
+    delta: int = 0,
+) -> list[npt.NDArray]:
+    """Read per-link attribute data for a chunk.
+
+    Mirrors :func:`read_chunk_attributes` for the per-link case: the
+    ragged bytes live under ``link_attributes/<name>/<delta>/<chunk>``
+    and align 1:1 with the link fragments under ``link_fragments/<chunk>``
+    (intra-level only, ``delta == 0``).  Per-link group ``k`` has the
+    same row count as link group ``k`` in ``links/<delta>/<chunk>``.
+
+    Args:
+        level_group: Resolution level group.
+        attr_name: Attribute name (e.g. ``"weight"``).
+        chunk_coords: Spatial chunk coordinates.
+        dtype: Numpy dtype of the attribute.
+        ncols: Number of columns (channels).  Use 1 for scalars.
+        delta: Level delta; cross-level link attributes are stored
+            differently and must be read via the global
+            ``cross_chunk_link_attributes`` path — this helper handles
+            only the per-chunk ``delta == 0`` case.
+
+    Returns:
+        List of arrays aligned with the link fragments in the chunk.
+    """
+    if delta != 0:
+        raise ArrayError(
+            f"read_chunk_link_attributes only supports delta=0 "
+            f"(per-chunk intra-level); got delta={delta}.  Use "
+            f"read_cross_chunk_link_attributes for cross-level "
+            f"link attributes.",
+        )
+    key = _chunk_key(chunk_coords)
+    dtype = np.dtype(dtype)
+    full_name = link_attributes_path(attr_name, delta)
+
+    try:
+        raw = level_group.read_bytes(full_name, key)
+    except Exception as e:
+        raise ArrayError(
+            f"Cannot read link attribute '{attr_name}' chunk {key} "
+            f"(delta={format_delta(delta)}): {e}"
+        ) from e
+
+    # Per-link group `k` has N_k rows where N_k = link_fragments[k].count.
+    # Derive byte offsets from the link-fragment sidecar.
+    fi = read_link_fragment_index(level_group, chunk_coords)
+    if fi.num_fragments == 0:
+        return []
+    row_bytes = int(dtype.itemsize) * int(ncols)
+    cursor = 0
+    out: list[npt.NDArray] = []
+    for f in range(fi.num_fragments):
+        if not fi.is_range(f):
+            raise ArrayError(
+                f"link_fragments/{key} fragment {f} is non-contiguous; "
+                "read_chunk_link_attributes requires every fragment to be "
+                "a contiguous range of link rows.",
+            )
+        _start, count = fi.range(f)
+        seg = raw[cursor : cursor + int(count) * row_bytes]
+        cursor += int(count) * row_bytes
+        arr = np.frombuffer(seg, dtype=dtype)
+        if ncols > 1:
+            arr = arr.reshape(-1, ncols)
+        out.append(arr.copy())
+    return out
 
 
 def _infer_vert_ndim(level_group: FsGroup) -> int:
@@ -1714,6 +2239,35 @@ def count_fragments(
 # Internal helpers
 # ===================================================================
 
+def _read_modify_write_blob(
+    level_group: FsGroup,
+    full_name: str,
+    key: str,
+    *,
+    decode_fn,
+    merge_fn,
+    encode_fn,
+    initial,
+) -> tuple[Any, Any]:
+    """Read-modify-write a single blob with caller-supplied codec hooks.
+
+    Returns ``(combined, existing)`` — callers need ``existing`` to compute
+    the row-index of the newly-appended portion.
+
+    Atomicity: ``write_bytes`` is delete-then-create, not strictly atomic;
+    treat it as last-writer-wins.  The pattern is NOT cross-writer-safe.
+    Callers MUST serialise concurrent writes to the same blob.
+    """
+    try:
+        raw = level_group.read_bytes(full_name, key)
+        existing = decode_fn(raw)
+    except StoreError:
+        existing = initial
+    combined = merge_fn(existing)
+    level_group.write_bytes(full_name, key, encode_fn(combined))
+    return combined, existing
+
+
 def read_vertex_fragment_index(
     level_group: FsGroup,
     chunk_coords: ChunkCoords,
@@ -1736,6 +2290,60 @@ def read_link_fragment_index(
     key = _chunk_key(chunk_coords)
     raw = level_group.read_bytes(LINK_FRAGMENTS, key)
     return decode_fragments(raw)
+
+
+def _reshape_link_buffer(
+    raw: bytes,
+    dtype: np.dtype,
+    link_width: int,
+) -> npt.NDArray[np.integer]:
+    """Return a ``(M_total, link_width)`` view onto a ``links/0/<chunk>`` blob.
+
+    Falls back to a 1-D array when ``link_width == 1``.
+    """
+    arr = np.frombuffer(raw, dtype=dtype)
+    return arr.reshape(-1, link_width) if link_width > 1 else arr
+
+
+def _slice_link_range(
+    raw: bytes,
+    start: int,
+    count: int,
+    dtype: np.dtype,
+    link_width: int,
+) -> npt.NDArray[np.integer]:
+    """Return rows ``[start, start+count)`` from a ``links/0/<chunk>`` blob."""
+    row_size = int(dtype.itemsize) * int(link_width)
+    seg = raw[int(start) * row_size : (int(start) + int(count)) * row_size]
+    arr = np.frombuffer(seg, dtype=dtype)
+    return arr.reshape(-1, link_width) if link_width > 1 else arr
+
+
+def _reshape_vertex_buffer(
+    raw: bytes,
+    dtype: np.dtype,
+    ndim: int,
+) -> npt.NDArray[np.floating]:
+    """Return a ``(N_total, ndim)`` view onto a ``vertices/<chunk>`` blob.
+
+    Falls back to a 1-D array when ``ndim == 1``.
+    """
+    arr = np.frombuffer(raw, dtype=dtype)
+    return arr.reshape(-1, ndim) if ndim > 1 else arr
+
+
+def _slice_vertex_range(
+    raw: bytes,
+    start: int,
+    count: int,
+    dtype: np.dtype,
+    ndim: int,
+) -> npt.NDArray[np.floating]:
+    """Return rows ``[start, start+count)`` from a ``vertices/<chunk>`` blob."""
+    bytes_per_vertex = int(dtype.itemsize) * int(ndim)
+    seg = raw[int(start) * bytes_per_vertex : (int(start) + int(count)) * bytes_per_vertex]
+    arr = np.frombuffer(seg, dtype=dtype)
+    return arr.reshape(-1, ndim) if ndim > 1 else arr
 
 
 def _read_vertex_offsets(

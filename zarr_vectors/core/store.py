@@ -1086,6 +1086,72 @@ def discard_changes(group: Group) -> None:
         discard()
 
 
+# ===================================================================
+# icechunk branch / rebase / merge wrappers (Iteration 2)
+# ===================================================================
+
+def branch(group: Group, name: str, *, from_snapshot_id: str | None = None) -> str:
+    """Create a new icechunk branch off the current session's tip.
+
+    Returns the snapshot id the branch was anchored at.  Raises
+    :class:`StoreError` on non-icechunk backends.
+    """
+    session = session_for(group)
+    if session is None:
+        raise StoreError(
+            "branch() requires an icechunk-backed store; this store "
+            "has no icechunk session."
+        )
+    from zarr_vectors.core.backends.icechunk_backend import create_branch_wrapper
+    return create_branch_wrapper(session, name, from_snapshot_id=from_snapshot_id)
+
+
+def switch_branch(group: Group, name: str) -> None:
+    """Swap the group's underlying session to a writable session on
+    branch ``name``.
+
+    Existing references to ``group`` continue to work; the swap is
+    transparent.  Pending uncommitted edits on the previous session are
+    discarded — caller should commit() first if they want to keep them.
+    """
+    session = session_for(group)
+    if session is None:
+        raise StoreError(
+            "switch_branch() requires an icechunk-backed store."
+        )
+    from zarr_vectors.core.backends.icechunk_backend import switch_branch_wrapper
+    new_session = switch_branch_wrapper(session, name)
+    # Replace the session on the underlying Zarr store + rewire the
+    # zarr.Group so future writes go through the new session's store.
+    store = new_session.store
+    store._zv_icechunk_session = new_session  # type: ignore[attr-defined]
+    new_zg = zarr.open_group(store, mode="r+")
+    group._zarr = new_zg
+
+
+def rebase(group: Group, base: str = "main") -> None:
+    """Rebase the group's session's branch onto ``base``."""
+    session = session_for(group)
+    if session is None:
+        raise StoreError("rebase() requires an icechunk-backed store.")
+    from zarr_vectors.core.backends.icechunk_backend import rebase_wrapper
+    rebase_wrapper(session, base)
+
+
+def merge_branch(
+    group: Group,
+    name: str,
+    *,
+    message: str = "merge branch",
+) -> str | None:
+    """Merge branch ``name`` into the group's current branch."""
+    session = session_for(group)
+    if session is None:
+        raise StoreError("merge_branch() requires an icechunk-backed store.")
+    from zarr_vectors.core.backends.icechunk_backend import merge_branch_wrapper
+    return merge_branch_wrapper(session, name, message=message)
+
+
 def rebind(
     group: Group,
     backend: str | Any,

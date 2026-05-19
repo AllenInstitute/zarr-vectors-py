@@ -181,3 +181,179 @@ def make_icechunk_session(
         session = repo.writable_session(branch=branch)
 
     return session.store, session
+
+
+# ===================================================================
+# Branch / rebase / merge wrappers (Iteration 2)
+# ===================================================================
+
+def _icechunk_version() -> str:
+    """Best-effort version string of the installed icechunk package."""
+    try:
+        ic = _import_icechunk()
+        return getattr(ic, "__version__", "unknown")
+    except StoreError:
+        return "not-installed"
+
+
+def create_branch_wrapper(
+    session: Any,
+    name: str,
+    *,
+    from_snapshot_id: str | None = None,
+) -> str:
+    """Create a new branch at ``from_snapshot_id`` (defaulting to the
+    session's current tip).
+
+    Returns the snapshot id the branch was created at.
+    """
+    ic = _import_icechunk()
+    repo = _session_repo(session)
+    create_fn = getattr(repo, "create_branch", None)
+    if create_fn is None:
+        raise StoreError(
+            f"icechunk {_icechunk_version()} lacks Repository.create_branch; "
+            f"upgrade to a version that exposes branch APIs."
+        )
+    snapshot = from_snapshot_id
+    if snapshot is None:
+        # Fall back to the session's snapshot accessor (varies by version).
+        snapshot = (
+            getattr(session, "snapshot_id", None)
+            or getattr(session, "current_snapshot_id", None)
+        )
+        if callable(snapshot):
+            snapshot = snapshot()
+        if snapshot is None:
+            # Last resort: ask the repo for the branch tip.
+            lookup = getattr(repo, "lookup_branch", None)
+            if lookup is not None:
+                try:
+                    snapshot = lookup("main")
+                except Exception:
+                    snapshot = None
+    if snapshot is None:
+        raise StoreError(
+            "create_branch: could not resolve a base snapshot id; "
+            "pass from_snapshot_id explicitly."
+        )
+    try:
+        create_fn(name, snapshot)
+    except TypeError:
+        # Some versions take keyword args.
+        create_fn(name, snapshot_id=snapshot)
+    del ic  # silence unused import warning
+    return str(snapshot)
+
+
+def switch_branch_wrapper(
+    session: Any,
+    name: str,
+) -> Any:
+    """Open a new writable session against ``name`` and return it.
+
+    The caller is responsible for swapping the new session onto the
+    group's underlying Zarr store so subsequent writes route through it.
+    """
+    repo = _session_repo(session)
+    writable = getattr(repo, "writable_session", None)
+    if writable is None:
+        raise StoreError(
+            f"icechunk {_icechunk_version()} lacks Repository.writable_session"
+        )
+    return writable(branch=name)
+
+
+def rebase_wrapper(session: Any, base: str = "main") -> None:
+    """Rebase the session's branch onto ``base``.
+
+    Tries ``session.rebase()`` first (icechunk's standard API), falling
+    back to ``session.commit_with_rebase()`` on older versions.
+    """
+    rebase_fn = getattr(session, "rebase", None)
+    if rebase_fn is not None:
+        try:
+            rebase_fn()
+            return
+        except TypeError:
+            # Older signature wants an explicit solver.
+            ic = _import_icechunk()
+            solver = getattr(ic, "BasicConflictSolver", None)
+            if solver is None:
+                raise StoreError(
+                    "icechunk session.rebase requires a conflict solver "
+                    "and BasicConflictSolver is not exported by this "
+                    "version; rebase manually."
+                ) from None
+            rebase_fn(solver())
+            return
+    raise StoreError(
+        f"icechunk {_icechunk_version()} lacks Session.rebase; "
+        f"call commit_with_rebase from the live session yourself."
+    )
+
+
+def merge_branch_wrapper(
+    session: Any,
+    name: str,
+    *,
+    message: str = "merge branch",
+) -> str | None:
+    """Merge branch ``name`` into the session's current branch.
+
+    icechunk's merge story is in flux across versions.  The wrapper:
+
+    1. Looks up the latest snapshot of ``name`` via ``Repository.lookup_branch``.
+    2. Calls ``session.merge(snapshot_id, message)`` if available.
+    3. Falls back to a fast-forward: if the current branch's tip is an
+       ancestor of ``name``'s tip, resets the current branch to ``name``'s
+       tip via ``Repository.reset_branch``.
+    """
+    repo = _session_repo(session)
+    lookup = getattr(repo, "lookup_branch", None)
+    if lookup is None:
+        raise StoreError(
+            f"icechunk {_icechunk_version()} lacks Repository.lookup_branch"
+        )
+    src_snap = lookup(name)
+
+    merge_fn = getattr(session, "merge", None)
+    if merge_fn is not None:
+        try:
+            return merge_fn(src_snap, message)
+        except TypeError:
+            return merge_fn(src_snap)
+
+    reset = getattr(repo, "reset_branch", None)
+    if reset is None:
+        raise StoreError(
+            f"icechunk {_icechunk_version()} exposes neither Session.merge "
+            f"nor Repository.reset_branch; cannot complete merge_branch."
+        )
+    # Determine the current branch name via the session if available.
+    cur_branch = (
+        getattr(session, "branch", None)
+        or getattr(session, "branch_name", None)
+        or "main"
+    )
+    if callable(cur_branch):
+        cur_branch = cur_branch()
+    reset(cur_branch, src_snap)
+    return str(src_snap)
+
+
+def _session_repo(session: Any) -> Any:
+    """Pull the underlying ``icechunk.Repository`` off a session.
+
+    Different icechunk releases expose this attribute under different
+    names; we try the known ones in order.
+    """
+    for attr in ("repository", "repo", "_repository", "_repo"):
+        repo = getattr(session, attr, None)
+        if repo is not None:
+            return repo
+    raise StoreError(
+        f"icechunk {_icechunk_version()} session does not expose its "
+        f"Repository through any of repository / repo / _repository / "
+        f"_repo; branch wrappers cannot proceed."
+    )
