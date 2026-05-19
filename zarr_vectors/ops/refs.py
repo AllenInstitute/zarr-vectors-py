@@ -244,9 +244,9 @@ class ObjectRef:
     object_id: int
 
 
-# Attribute scope literals: identify which of the three ragged
-# attribute kinds the edit targets.
-AttrScope = Literal["vertex", "object", "link"]
+# Attribute scope literals: identify which of the four attribute kinds
+# the edit targets.
+AttrScope = Literal["vertex", "fragment", "object", "link"]
 
 
 @dataclass(frozen=True)
@@ -258,6 +258,10 @@ class AttributeRef:
     - ``"vertex"``: per-vertex attribute.  ``target`` is a
       :class:`VertexRef`.  Indexed inside
       ``attributes/<name>/<chunk>`` at the row aligned with the vertex.
+    - ``"fragment"``: per-fragment attribute.  ``target`` is a
+      :class:`FragmentRef`.  Indexed inside
+      ``fragment_attributes/<name>/<chunk>`` at the row aligned with the
+      fragment.
     - ``"object"``: per-object attribute.  ``target`` is an
       :class:`ObjectRef`.  Indexed inside
       ``object_attributes/<name>/data`` at row ``object_id``.
@@ -267,4 +271,4 @@ class AttributeRef:
 
     scope: AttrScope
     name: str
-    target: VertexRef | ObjectRef | LinkRef
+    target: VertexRef | FragmentRef | ObjectRef | LinkRef

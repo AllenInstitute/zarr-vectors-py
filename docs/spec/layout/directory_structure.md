@@ -72,11 +72,16 @@ dataset.zarrvectors/
 │   │   ├── zarr.json
 │   │   └── c/ …
 │   │
-│   └── attributes/              # per-vertex attribute arrays
-│       ├── intensity/           # one sub-group per named attribute
-│       │   ├── zarr.json
-│       │   └── c/ …
-│       └── label/
+│   ├── attributes/              # per-vertex attribute arrays
+│   │   ├── intensity/           # one sub-group per named attribute
+│   │   │   ├── zarr.json
+│   │   │   └── c/ …
+│   │   └── label/
+│   │       ├── zarr.json
+│   │       └── c/ …
+│   │
+│   └── fragment_attributes/     # per-fragment attribute arrays (opt-in)
+│       └── object_id/           # e.g. OID owning each fragment
 │           ├── zarr.json
 │           └── c/ …
 │
@@ -133,6 +138,9 @@ tracts.zarrvectors/
     │           └── data
     │
     ├── attributes/              # per-vertex attributes (e.g. FA, MD)
+    │
+    ├── fragment_attributes/     # per-fragment attributes (opt-in)
+    │   └── object_id/           # e.g. OID owning each fragment in a chunk
     │
     ├── object_index/            # per-object manifest blobs
     │   ├── data                 # concatenated manifest bytes

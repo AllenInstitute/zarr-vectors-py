@@ -148,6 +148,13 @@ enums:
           uniformly with vertex bytes.
       links:
       attribute:
+      fragment_attribute:
+        description: >
+          Per-fragment attribute array (``fragment_attributes/<name>/<chunk>``).
+          Dense per-chunk byte blob with one row per fragment in that
+          chunk; row count is derived from ``vertex_fragments/<chunk>``.
+          Optional; common opt-in use case is materializing parent-IDs
+          (e.g. the OID owning each fragment) as a fragment attribute.
       object_index:
       object_attribute:
       groupings:
@@ -276,6 +283,20 @@ classes:
     slot_usage:
       zv_array:
         equals_string: attribute
+        required: true
+
+  FragmentAttributeMeta:
+    description: >
+      ``.zattrs`` for each ``fragment_attributes/<name>/`` array.  Stored
+      as a dense per-chunk byte blob; each chunk holds a row per
+      fragment, with shape ``(num_fragments_in_chunk,)`` or
+      ``(num_fragments_in_chunk, len(channel_names))``.  Per-chunk
+      fragment counts are derived from ``vertex_fragments/<chunk>`` at
+      read time.  Replace-only at the chunk level.
+    slots: [zv_array, name, dtype, channel_names]
+    slot_usage:
+      zv_array:
+        equals_string: fragment_attribute
         required: true
 
   ObjectIndexMeta:

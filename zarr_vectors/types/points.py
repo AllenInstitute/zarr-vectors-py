@@ -21,6 +21,7 @@ import numpy.typing as npt
 
 from zarr_vectors.constants import (
     CROSS_CHUNK_EXPLICIT,
+    FRAGMENT_ATTRIBUTES,
     GEOM_POINT_CLOUD,
     LINKS_IMPLICIT_SEQUENTIAL,
     OBJIDX_IDENTITY,
@@ -31,6 +32,7 @@ from zarr_vectors.constants import (
 )
 from zarr_vectors.core.arrays import (
     create_attribute_array,
+    create_fragment_attribute_array,
     create_groupings_array,
     create_groupings_attributes_array,
     create_object_attributes_array,
@@ -49,6 +51,7 @@ from zarr_vectors.core.arrays import (
     read_object_vertices,
     read_fragment,
     write_chunk_attributes,
+    write_chunk_fragment_attributes,
     write_chunk_vertices,
     write_groupings,
     write_groupings_attributes,
@@ -111,6 +114,7 @@ def write_points(
     vertex_attributes: dict[str, npt.NDArray] | None = None,
     object_ids: npt.NDArray[np.integer] | None = None,
     object_attributes: dict[str, npt.NDArray] | None = None,
+    fragment_attributes: dict[str, dict[ChunkCoords, npt.NDArray]] | None = None,
     groups: dict[int, list[int]] | None = None,
     group_attributes: dict[str, npt.NDArray] | None = None,
     dtype: str = "float32",
@@ -134,6 +138,13 @@ def write_points(
             (Spec name; replaces the deprecated ``attributes`` kwarg.)
         object_ids: ``(N,)`` integer per-point object assignment.
         object_attributes: Per-object attributes ``{name: array}``.
+        fragment_attributes: Per-fragment attributes, keyed per chunk:
+            ``{name: {chunk_coords: ndarray}}``.  Each per-chunk ndarray
+            has shape ``(num_fragments_in_chunk,)`` or
+            ``(num_fragments_in_chunk, C)`` and is aligned with the
+            fragment ordering this writer produces for that chunk.
+            Use case (opt-in): materialize per-fragment parent-IDs
+            (e.g. the OID owning each fragment as ``object_id``).
         groups: Group memberships ``{group_id: [object_id, ...]}``.
         group_attributes: Per-group attributes ``{name: array}``.
         dtype: Numpy dtype string for vertex positions.
@@ -273,6 +284,8 @@ def write_points(
     arrays_present = [VERTICES]
     if attributes:
         arrays_present.append(VERTEX_ATTRIBUTES)
+    if fragment_attributes:
+        arrays_present.append(FRAGMENT_ATTRIBUTES)
     if needs_objects:
         arrays_present.append("object_index")
 
@@ -346,6 +359,26 @@ def write_points(
                     extra_meta=attr_extra_meta.get(attr_name),
                 )
 
+        fragment_attr_dtypes: dict[str, np.dtype] = {}
+        if fragment_attributes:
+            for fname, per_chunk in fragment_attributes.items():
+                if not per_chunk:
+                    raise ArrayError(
+                        f"fragment_attributes[{fname!r}] is empty; pass at "
+                        f"least one chunk_coords -> ndarray entry or omit "
+                        f"the attribute"
+                    )
+                sample = np.asarray(next(iter(per_chunk.values())))
+                fragment_attr_dtypes[fname] = sample.dtype
+                channel_names = None
+                if sample.ndim == 2:
+                    channel_names = [f"ch{i}" for i in range(sample.shape[1])]
+                create_fragment_attribute_array(
+                    level_group, fname,
+                    dtype=str(sample.dtype),
+                    channel_names=channel_names,
+                )
+
         if needs_objects:
             create_object_index_array(level_group)
 
@@ -400,6 +433,11 @@ def write_points(
                     for attr_name, groups_list in attr_groups_per_name.items():
                         write_chunk_attributes(level_group, attr_name, chunk_coords, groups_list,
                                                dtype=attributes[attr_name].dtype)
+                if fragment_attributes:
+                    _write_fragment_attrs_for_chunk(
+                        level_group, fragment_attributes, fragment_attr_dtypes,
+                        chunk_coords, num_fragments=len(vert_groups),
+                    )
         else:
             # Undifferentiated: use per-bin fragments
             for chunk_coords, fragment_dict in sorted(chunked_bins.items()):
@@ -426,6 +464,11 @@ def write_points(
                     for attr_name, groups_list in attr_groups_per_name_bin.items():
                         write_chunk_attributes(level_group, attr_name, chunk_coords, groups_list,
                                                dtype=attributes[attr_name].dtype)
+                if fragment_attributes:
+                    _write_fragment_attrs_for_chunk(
+                        level_group, fragment_attributes, fragment_attr_dtypes,
+                        chunk_coords, num_fragments=len(vert_groups_bin),
+                    )
 
         if needs_objects and object_manifests:
             idx_ndim = ndim + 1 if attr_bins is not None else ndim
@@ -829,3 +872,32 @@ def _empty_result(ndim: int) -> dict[str, Any]:
         "vertex_attributes": {},
         "vertex_count": 0,
     }
+
+
+def _write_fragment_attrs_for_chunk(
+    level_group: FsGroup,
+    fragment_attributes: dict[str, dict[ChunkCoords, npt.NDArray]],
+    fragment_attr_dtypes: dict[str, np.dtype],
+    chunk_coords: ChunkCoords,
+    num_fragments: int,
+) -> None:
+    """Emit per-chunk fragment-attribute blobs for one chunk.
+
+    Validates that each per-chunk array's leading dim matches the
+    number of fragments this writer produced for the chunk; mismatches
+    surface at write time rather than as cryptic byte-length errors
+    later.
+    """
+    for fname, per_chunk in fragment_attributes.items():
+        if chunk_coords not in per_chunk:
+            continue
+        arr = np.asarray(per_chunk[chunk_coords])
+        if arr.shape[0] != num_fragments:
+            raise ArrayError(
+                f"fragment_attributes[{fname!r}][{chunk_coords!r}] has "
+                f"{arr.shape[0]} rows but chunk has {num_fragments} fragments"
+            )
+        write_chunk_fragment_attributes(
+            level_group, fname, chunk_coords, arr,
+            dtype=fragment_attr_dtypes[fname],
+        )

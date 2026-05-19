@@ -12,6 +12,7 @@ from zarr_vectors.core.arrays import (
     create_attribute_array,
     create_cross_chunk_link_attributes_array,
     create_cross_chunk_links_array,
+    create_fragment_attribute_array,
     create_groupings_array,
     create_groupings_attributes_array,
     create_link_attributes_array,
@@ -23,6 +24,7 @@ from zarr_vectors.core.arrays import (
     read_all_groupings,
     read_all_object_manifests,
     read_chunk_attributes,
+    read_chunk_fragment_attributes,
     read_chunk_link_fragment,
     read_chunk_links,
     read_chunk_vertices,
@@ -37,6 +39,7 @@ from zarr_vectors.core.arrays import (
     read_object_vertices,
     read_vertex_fragment_index,
     write_chunk_attributes,
+    write_chunk_fragment_attributes,
     write_chunk_fragments,
     write_chunk_link_attributes,
     write_chunk_links,
@@ -273,6 +276,124 @@ class TestAttributeArrays:
         assert len(read_back) == 2
         np.testing.assert_array_equal(read_back[0], r0)
         np.testing.assert_array_equal(read_back[1], r1)
+
+
+# ===================================================================
+# Fragment attribute write/read
+# ===================================================================
+
+class TestFragmentAttributes:
+
+    def test_scalar_roundtrip(self, tmp_path: Path) -> None:
+        lg = _make_level_group(tmp_path)
+        create_vertices_array(lg)
+        create_fragment_attribute_array(lg, "object_id", dtype="int64")
+
+        v0 = np.zeros((2, 3), dtype=np.float32)
+        v1 = np.zeros((3, 3), dtype=np.float32)
+        write_chunk_vertices(lg, (0, 0, 0), [v0, v1])
+
+        data = np.array([42, 99], dtype=np.int64)
+        write_chunk_fragment_attributes(
+            lg, "object_id", (0, 0, 0), data, dtype=np.int64,
+        )
+
+        read_back = read_chunk_fragment_attributes(
+            lg, "object_id", (0, 0, 0), dtype=np.int64, ncols=1,
+        )
+        assert read_back.shape == (2,)
+        np.testing.assert_array_equal(read_back, data)
+
+    def test_multichannel_roundtrip(self, tmp_path: Path) -> None:
+        lg = _make_level_group(tmp_path)
+        create_vertices_array(lg)
+        create_fragment_attribute_array(
+            lg, "embedding", dtype="float32",
+            channel_names=["x", "y", "z"],
+        )
+
+        v0 = np.zeros((1, 3), dtype=np.float32)
+        v1 = np.zeros((1, 3), dtype=np.float32)
+        write_chunk_vertices(lg, (0, 0, 0), [v0, v1])
+
+        data = np.array(
+            [[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]], dtype=np.float32,
+        )
+        write_chunk_fragment_attributes(
+            lg, "embedding", (0, 0, 0), data, dtype=np.float32,
+        )
+
+        read_back = read_chunk_fragment_attributes(
+            lg, "embedding", (0, 0, 0), dtype=np.float32, ncols=3,
+        )
+        assert read_back.shape == (2, 3)
+        np.testing.assert_array_equal(read_back, data)
+
+    def test_int_dtype_for_parent_id(self, tmp_path: Path) -> None:
+        """The opt-in 'parent-IDs as attributes' use case: per-fragment
+        OID lookup table without consulting object_index/manifests."""
+        lg = _make_level_group(tmp_path)
+        create_vertices_array(lg)
+        create_fragment_attribute_array(lg, "owner_oid", dtype="int64")
+
+        write_chunk_vertices(lg, (0, 0, 0), [
+            np.zeros((2, 3), dtype=np.float32),
+            np.zeros((3, 3), dtype=np.float32),
+            np.zeros((1, 3), dtype=np.float32),
+        ])
+
+        oids = np.array([7, 7, 13], dtype=np.int64)
+        write_chunk_fragment_attributes(
+            lg, "owner_oid", (0, 0, 0), oids, dtype=np.int64,
+        )
+
+        read_back = read_chunk_fragment_attributes(
+            lg, "owner_oid", (0, 0, 0), dtype=np.int64,
+        )
+        np.testing.assert_array_equal(read_back, oids)
+
+    def test_byte_length_mismatch_raises(self, tmp_path: Path) -> None:
+        lg = _make_level_group(tmp_path)
+        create_vertices_array(lg)
+        create_fragment_attribute_array(lg, "x", dtype="float32")
+
+        # Write an int8 buffer of length 3 — not a multiple of 4 bytes
+        # so reading as float32 must raise.
+        lg.write_bytes("fragment_attributes/x", "0.0.0", b"\x00\x01\x02")
+        try:
+            read_chunk_fragment_attributes(
+                lg, "x", (0, 0, 0), dtype=np.float32, ncols=1,
+            )
+        except ArrayError:
+            pass
+        else:
+            raise AssertionError("expected ArrayError on byte-length mismatch")
+
+    def test_create_idempotent(self, tmp_path: Path) -> None:
+        lg = _make_level_group(tmp_path)
+        create_fragment_attribute_array(lg, "a", dtype="float32")
+        # exist_ok=True (default) — second call is a no-op
+        create_fragment_attribute_array(lg, "a", dtype="float32")
+        # exist_ok=False raises
+        try:
+            create_fragment_attribute_array(
+                lg, "a", dtype="float32", exist_ok=False,
+            )
+        except ArrayError:
+            pass
+        else:
+            raise AssertionError(
+                "expected ArrayError on duplicate create when exist_ok=False"
+            )
+
+    def test_soft_fail_default(self, tmp_path: Path) -> None:
+        lg = _make_level_group(tmp_path)
+        create_fragment_attribute_array(lg, "missing", dtype="float32")
+        # No chunk written — default returns the supplied sentinel.
+        result = read_chunk_fragment_attributes(
+            lg, "missing", (5, 5, 5), dtype=np.float32, default=None,
+        )
+        assert result is None
 
 
 # ===================================================================

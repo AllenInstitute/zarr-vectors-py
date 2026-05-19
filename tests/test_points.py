@@ -460,3 +460,93 @@ class TestRemoteUrlPreservesMetadata:
             assert ax.get("unit") == "micrometer", (
                 f"write_points clobbered axis unit; got {axes_after}"
             )
+
+
+# ===================================================================
+# fragment_attributes integration
+# ===================================================================
+
+class TestFragmentAttributesIntegration:
+
+    def test_per_chunk_fragment_attrs_roundtrip(self, tmp_path: Path) -> None:
+        """Pass per-chunk fragment attributes through write_points and
+        confirm they roundtrip via read_chunk_fragment_attributes."""
+        from zarr_vectors.core.arrays import (
+            list_chunk_keys,
+            read_chunk_fragment_attributes,
+            read_object_manifest,
+        )
+
+        # Two chunks (100^3 each), one object per point — 4 points → 2 in
+        # each chunk → 2 fragments per chunk (one per object_id).
+        positions = np.array([
+            [10, 10, 10],
+            [20, 20, 20],
+            [110, 110, 110],
+            [120, 120, 120],
+        ], dtype=np.float32)
+        object_ids = np.array([0, 1, 2, 3], dtype=np.int64)
+        store_path = str(tmp_path / "frag_attrs.zarr")
+
+        # Build per-chunk fragment-attribute arrays by mirroring the
+        # writer's ordering: each chunk holds one fragment per unique
+        # object_id, sorted by oid.  We materialize the OID as a
+        # fragment_attribute — the canonical opt-in parent-ID use case.
+        per_chunk_oids: dict = {
+            (0, 0, 0): np.array([0, 1], dtype=np.int64),
+            (1, 1, 1): np.array([2, 3], dtype=np.int64),
+        }
+
+        write_points(
+            store_path, positions,
+            chunk_shape=(100.0, 100.0, 100.0),
+            bounds=([0.0, 0.0, 0.0], [200.0, 200.0, 200.0]),
+            object_ids=object_ids,
+            fragment_attributes={"owner_oid": per_chunk_oids},
+        )
+
+        root = open_store(store_path)
+        lg = root["0"]
+
+        keys = sorted(list_chunk_keys(lg))
+        assert (0, 0, 0) in keys and (1, 1, 1) in keys
+
+        for chunk, expected_oids in per_chunk_oids.items():
+            data = read_chunk_fragment_attributes(
+                lg, "owner_oid", chunk, dtype=np.int64,
+            )
+            np.testing.assert_array_equal(data, expected_oids)
+
+        # Cross-check against object_index: the OID we materialized as
+        # a per-fragment attribute must match the manifest reverse-lookup.
+        for oid in range(4):
+            manifest = read_object_manifest(lg, oid)
+            assert len(manifest) == 1
+            chunk, fragment_idx = manifest[0]
+            data = read_chunk_fragment_attributes(
+                lg, "owner_oid", chunk, dtype=np.int64,
+            )
+            assert int(data[fragment_idx]) == oid
+
+    def test_fragment_count_mismatch_raises(self, tmp_path: Path) -> None:
+        from zarr_vectors.exceptions import ArrayError
+        positions = np.array([[10, 10, 10], [20, 20, 20]], dtype=np.float32)
+        store_path = str(tmp_path / "bad_frag_attrs.zarr")
+        # Two points, two distinct OIDs → two fragments in one chunk, but
+        # caller supplies only one row.
+        try:
+            write_points(
+                store_path, positions,
+                chunk_shape=(100.0, 100.0, 100.0),
+                bounds=([0.0, 0.0, 0.0], [100.0, 100.0, 100.0]),
+                object_ids=np.array([0, 1], dtype=np.int64),
+                fragment_attributes={
+                    "owner_oid": {(0, 0, 0): np.array([0], dtype=np.int64)},
+                },
+            )
+        except ArrayError:
+            pass
+        else:
+            raise AssertionError(
+                "expected ArrayError on fragment-count mismatch"
+            )

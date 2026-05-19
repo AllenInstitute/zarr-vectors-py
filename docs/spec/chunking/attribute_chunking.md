@@ -77,6 +77,13 @@ existing dot-separated order. Object index entries store the same
 extended tuple — `sid_ndim` on the `object_index` `.zattrs` is `ndim +
 1` for attribute-chunked stores.
 
+`fragment_attributes/<name>/` follows the **same** extended key scheme:
+each per-chunk blob is keyed by the same combined coords the type-writer
+uses for `vertices/`. Callers passing `fragment_attributes={name:
+{chunk_coords: ndarray}}` to a writer must key by the post-prefix
+combined coords (the leading `attr_bin` plus the spatial coords), not
+the raw spatial coords.
+
 ### Level metadata fields
 
 Three new keys on the level `.zattrs`:

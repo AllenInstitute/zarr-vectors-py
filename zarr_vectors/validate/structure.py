@@ -104,8 +104,8 @@ def validate_structure(store_path: str | Path) -> ValidationResult:
         else:
             result.add_warning(f"{ln}/ has no metadata file")
 
-        for opt in ["vertex_attributes", "object_index", "object_attributes",
-                     "groups"]:
+        for opt in ["vertex_attributes", "fragment_attributes",
+                     "object_index", "object_attributes", "groups"]:
             if (level_dir / opt).exists():
                 result.add_pass(f"{ln}/{opt}/ exists")
         # Multiscale link layout (0.4+): list every <delta> segment.
