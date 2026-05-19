@@ -83,3 +83,71 @@ class TestMeshEdgeCases:
         write_mesh(str(tmp_path / "m.zv"), v, f, chunk_shape=(100.,100.,100.))
         r = read_mesh(str(tmp_path / "m.zv"))
         assert r["vertex_count"] == 3 and r["face_count"] == 1
+
+
+class TestMeshNonDefaultDtypes:
+    """Spec §7.1 vertices accept any numeric dtype (float or integer);
+    spec §7.5 links accept any unsigned/signed integer dtype.  This
+    class round-trips both to verify the spec relaxation lands at the
+    impl layer."""
+
+    def test_uint16_link_dtype(self, tmp_path: Path) -> None:
+        """Writer ``link_dtype="uint16"`` shrinks face storage 4× vs the
+        default ``int64`` and the reader honours the on-disk dtype via
+        the ``links/0`` zattrs.  The shape and values must round-trip."""
+        v = np.array([[0,0,0],[10,0,0],[5,10,0],[5,5,10]], dtype=np.float32)
+        f = np.array([[0,1,2],[0,1,3],[1,2,3],[0,2,3]], dtype=np.int64)
+        store = str(tmp_path / "m_uint16.zv")
+        write_mesh(store, v, f, chunk_shape=(100.,100.,100.), link_dtype="uint16")
+
+        # Verify the on-disk dtype is recorded in the array meta.
+        from zarr_vectors.core.store import get_resolution_level, open_store
+        root = open_store(store)
+        lg = get_resolution_level(root, 0)
+        lmeta = lg.read_array_meta("links/0")
+        assert lmeta["dtype"] == "uint16"
+
+        # Read back with the new (metadata-honoring) reader.
+        r = read_mesh(store)
+        assert r["vertex_count"] == 4
+        assert r["face_count"] == 4
+        assert r["faces"].shape == (4, 3)
+        # Output is widened to int64 (correct — chunk_offset arithmetic
+        # may exceed uint16 for large stores); values themselves still
+        # match the input.
+        assert sorted(map(tuple, r["faces"].tolist())) == sorted(
+            map(tuple, f.tolist())
+        )
+
+    def test_integer_voxel_vertices(self, tmp_path: Path) -> None:
+        """Vertices declared with an integer dtype (voxel indices) must
+        round-trip through write_mesh / read_mesh without being silently
+        coerced to float."""
+        # Voxel-indexed positions: a uint32 grid of vertex coordinates.
+        v = np.array(
+            [[10, 20, 30], [40, 50, 60], [70, 80, 90], [100, 110, 120]],
+            dtype=np.uint32,
+        )
+        f = np.array([[0, 1, 2], [1, 2, 3]], dtype=np.int64)
+        store = str(tmp_path / "m_voxel.zv")
+        write_mesh(
+            store, v, f,
+            chunk_shape=(1000., 1000., 1000.),
+            dtype="uint32",
+            # Explicit bounds — auto-inferred bounds default to a 128³
+            # box, which our voxel coords would overflow.
+            bounds=([0, 0, 0], [1000, 1000, 1000]),
+        )
+
+        from zarr_vectors.core.store import get_resolution_level, open_store
+        root = open_store(store)
+        vmeta = get_resolution_level(root, 0).read_array_meta("vertices")
+        assert vmeta["dtype"] == "uint32"
+
+        r = read_mesh(store)
+        assert r["vertices"].dtype == np.uint32
+        assert r["vertex_count"] == 4
+        # Values match exactly — no float roundtrip damage.
+        assert sorted(map(tuple, r["vertices"].tolist())) == sorted(
+            map(tuple, v.tolist())
+        )

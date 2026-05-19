@@ -126,6 +126,7 @@ def write_graph(
     chunk_by_attribute: str | None = None,
     out_of_bounds: str = DEFAULT_OOB_POLICY,
     compressor: Any = None,
+    link_dtype: str = "int64",
     # Deprecated aliases (will be removed):
     is_tree: bool | None = None,
     node_attributes: dict[str, npt.NDArray] | None = None,
@@ -384,7 +385,9 @@ def write_graph(
     # asyncio.gather (mirrors points.py:300).
     with level_group.batched_writes(compressor=compressor):
         create_vertices_array(level_group, dtype=dtype)
-        create_links_array(level_group, link_width=link_width, delta=0)
+        create_links_array(
+            level_group, link_width=link_width, dtype=link_dtype, delta=0,
+        )
         create_object_index_array(level_group)
         create_cross_chunk_links_array(level_group, delta=0)
         if node_attributes:
@@ -473,7 +476,10 @@ def write_graph(
             if chunk_coords in intra_edges:
                 local_edges = intra_edges[chunk_coords]
                 # One link group per chunk (all edges in one group)
-                write_chunk_links(level_group, chunk_coords, [local_edges], delta=0)
+                write_chunk_links(
+                    level_group, chunk_coords, [local_edges],
+                    dtype=link_dtype, delta=0,
+                )
 
                 if edge_attr_to_store and edge_attributes:
                     orig_idx = intra_edge_orig_indices.get(chunk_coords)
@@ -565,11 +571,15 @@ def read_graph(
     except Exception:
         pass
 
-    # Get link width
+    # Get link width and on-disk dtype (writers may pick a narrow uint
+    # dtype to save storage — see §7.5 of the spec).  Falls back to the
+    # universally-safe int64 when metadata is missing or unreadable.
     link_width = 2
+    link_dtype: np.dtype = np.dtype(np.int64)
     try:
         lmeta = level_group.read_array_meta("links/0")
         link_width = lmeta.get("link_width", 2)
+        link_dtype = np.dtype(lmeta.get("dtype", "int64"))
     except Exception:
         pass
 
@@ -653,7 +663,8 @@ def read_graph(
         for chunk_coords in chunk_keys:
             try:
                 link_groups = read_chunk_links(
-                    level_group, chunk_coords, link_width=link_width, delta=0,
+                    level_group, chunk_coords, link_width=link_width,
+                    dtype=link_dtype, delta=0,
                 )
             except ArrayError:
                 continue

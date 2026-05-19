@@ -110,6 +110,7 @@ def write_mesh(
     chunk_by_attribute: str | None = None,
     out_of_bounds: str = DEFAULT_OOB_POLICY,
     compressor: Any = None,
+    link_dtype: str = "int64",
 ) -> dict[str, Any]:
     """Write a mesh to a new zarr vectors store.
 
@@ -261,7 +262,9 @@ def write_mesh(
     # asyncio.gather (mirrors points.py:300).
     with level_group.batched_writes(compressor=compressor):
         create_vertices_array(level_group, dtype=dtype, encoding=encoding)
-        create_links_array(level_group, link_width=link_width, delta=0)
+        create_links_array(
+            level_group, link_width=link_width, dtype=link_dtype, delta=0,
+        )
         create_object_index_array(level_group)
         create_cross_chunk_links_array(level_group, delta=0)
         if vertex_attributes:
@@ -309,7 +312,9 @@ def write_mesh(
             for chunk_coords in chunk_list:
                 if chunk_coords in intra_faces:
                     write_chunk_links(
-                        level_group, chunk_coords, [intra_faces[chunk_coords]], delta=0,
+                        level_group, chunk_coords,
+                        [intra_faces[chunk_coords]],
+                        dtype=link_dtype, delta=0,
                     )
 
         # Write cross-chunk faces as variable-width records under
@@ -399,9 +404,11 @@ def read_mesh(
         pass
 
     link_width = 3
+    link_dtype: np.dtype = np.dtype(np.int64)
     try:
         lmeta = level_group.read_array_meta("links/0")
         link_width = lmeta.get("link_width", 3)
+        link_dtype = np.dtype(lmeta.get("dtype", "int64"))
     except Exception:
         pass
 
@@ -481,7 +488,8 @@ def read_mesh(
         for chunk_coords in chunk_keys:
             try:
                 link_groups = read_chunk_links(
-                    level_group, chunk_coords, link_width=link_width, delta=0,
+                    level_group, chunk_coords, link_width=link_width,
+                    dtype=link_dtype, delta=0,
                 )
                 offset = chunk_offsets.get(chunk_coords, 0)
                 for lg in link_groups:
