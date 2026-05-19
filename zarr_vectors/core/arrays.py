@@ -25,6 +25,7 @@ from zarr.errors import UnstableSpecificationWarning
 from zarr_vectors.constants import (
     CROSS_CHUNK_LINK_ATTRIBUTES,
     CROSS_CHUNK_LINKS,
+    FRAGMENT_ATTRIBUTES,
     GROUP_ATTRIBUTES,
     GROUPS,
     LINK_ATTRIBUTES,
@@ -282,6 +283,59 @@ def create_attribute_array(
         if clobber:
             raise ArrayError(
                 f"extra_meta cannot override core attribute fields: {sorted(clobber)}"
+            )
+        meta.update(extra_meta)
+    level_group.write_array_meta(full_name, meta)
+
+
+def create_fragment_attribute_array(
+    level_group: FsGroup,
+    name: str,
+    dtype: str = "float32",
+    channel_names: list[str] | None = None,
+    extra_meta: dict[str, Any] | None = None,
+    *,
+    exist_ok: bool = True,
+) -> None:
+    """Create a fragment attribute array ``fragment_attributes/<name>/``.
+
+    Per-chunk dense byte blob storing one row per fragment in the chunk;
+    row count is derived from ``vertex_fragments/<chunk>`` at read time.
+    Optional storage layer — the common opt-in use case is materializing
+    parent-IDs as attributes (e.g. the OID owning each fragment as a
+    fragment attribute ``object_id``).
+
+    Args:
+        level_group: The resolution level FsGroup.
+        name: Attribute name (e.g. ``"object_id"``).
+        dtype: Numpy dtype string.
+        channel_names: Optional list of channel names.  When provided,
+            row shape becomes ``(num_fragments, len(channel_names))``;
+            otherwise rows are scalar.
+        extra_meta: Additional JSON-serialisable fields merged into the
+            array metadata.  Same collision rules as
+            :func:`create_attribute_array`.
+        exist_ok: When True (default), no-op if the array already exists.
+            When False, raise :class:`ArrayError` on conflict.
+    """
+    full_name = f"{FRAGMENT_ATTRIBUTES}/{name}"
+    if _short_circuit_existing(level_group, full_name, exist_ok):
+        return
+    _ensure_array_dir(level_group, full_name)
+    meta: dict[str, Any] = {
+        "zv_array": "fragment_attribute",
+        "name": name,
+        "dtype": dtype,
+    }
+    if channel_names is not None:
+        meta["channel_names"] = channel_names
+    if extra_meta:
+        reserved = {"zv_array", "name", "dtype", "channel_names"}
+        clobber = reserved & set(extra_meta)
+        if clobber:
+            raise ArrayError(
+                f"extra_meta cannot override core fragment_attribute fields: "
+                f"{sorted(clobber)}"
             )
         meta.update(extra_meta)
     level_group.write_array_meta(full_name, meta)
@@ -723,6 +777,36 @@ def write_chunk_attributes(
     full_name = f"{VERTEX_ATTRIBUTES}/{attr_name}"
     raw_bytes, _ = encode_ragged_floats(attr_groups, dtype)
     level_group.write_bytes(full_name, key, raw_bytes)
+
+
+def write_chunk_fragment_attributes(
+    level_group: FsGroup,
+    attr_name: str,
+    chunk_coords: ChunkCoords,
+    data: npt.NDArray,
+    dtype: np.dtype | str = np.float32,
+) -> None:
+    """Write per-fragment attribute data for a spatial chunk.
+
+    The on-disk layout is a single dense byte blob whose row count
+    equals ``num_fragments_in_chunk``.  Fragment count is not validated
+    against ``vertex_fragments/<chunk>`` at write time — the read side
+    fails loudly on byte-length mismatch, so callers are trusted to
+    pass a correctly-sized array.  Replace-only at the chunk level.
+
+    Args:
+        level_group: Resolution level group.
+        attr_name: Attribute name (e.g. ``"object_id"``).
+        chunk_coords: Spatial chunk coordinates.
+        data: ``(F,)`` for scalar or ``(F, C)`` for multi-channel,
+            where ``F`` is the number of fragments in this chunk.
+        dtype: Numpy dtype to cast ``data`` to before writing.
+    """
+    dtype = np.dtype(dtype)
+    key = _chunk_key(chunk_coords)
+    full_name = f"{FRAGMENT_ATTRIBUTES}/{attr_name}"
+    arr = np.ascontiguousarray(np.asarray(data).astype(dtype, copy=False))
+    level_group.write_bytes(full_name, key, arr.tobytes())
 
 
 def write_chunk_link_attributes(
@@ -1584,6 +1668,68 @@ def read_chunk_attributes(
             total_attr_bytes=len(raw),
         )
     return decode_ragged_floats(raw, attr_offsets, dtype, ncols)
+
+
+def read_chunk_fragment_attributes(
+    level_group: FsGroup,
+    attr_name: str,
+    chunk_coords: ChunkCoords,
+    dtype: np.dtype | str = np.float32,
+    ncols: int = 1,
+    *,
+    default: Any = _UNSET,
+) -> npt.NDArray | Any:
+    """Read per-fragment attribute data for a spatial chunk.
+
+    The on-disk layout is a dense per-chunk byte blob; ``F`` (number of
+    fragments) is derived from the byte length and the row stride
+    (``dtype.itemsize * ncols``).  No round-trip to ``vertex_fragments``
+    is needed.
+
+    Args:
+        level_group: Resolution level group.
+        attr_name: Attribute name.
+        chunk_coords: Spatial chunk coordinates.
+        dtype: Numpy dtype of the attribute.
+        ncols: Number of columns (channels).  Use 1 for scalars.
+        default: When supplied, returned on read failure (missing chunk,
+            byte-length mismatch) instead of raising.  Pass ``None`` for
+            the common "soft-fail with None" pattern.  Only
+            :class:`ArrayError` and :class:`StoreError` are caught;
+            programming errors propagate.
+
+    Returns:
+        Array of shape ``(F,)`` (when ``ncols == 1``) or ``(F, ncols)``
+        (when ``ncols > 1``).  Empty 1-D array when the blob is empty.
+    """
+    key = _chunk_key(chunk_coords)
+    dtype = np.dtype(dtype)
+    full_name = f"{FRAGMENT_ATTRIBUTES}/{attr_name}"
+    row_bytes = dtype.itemsize * ncols
+
+    try:
+        try:
+            raw = level_group.read_bytes(full_name, key)
+        except Exception as e:
+            raise ArrayError(
+                f"Cannot read fragment_attribute '{attr_name}' chunk {key}: {e}"
+            ) from e
+
+        if row_bytes <= 0 or len(raw) % row_bytes != 0:
+            raise ArrayError(
+                f"fragment_attribute '{attr_name}' chunk {key}: byte length "
+                f"{len(raw)} is not a multiple of row stride "
+                f"{row_bytes} (dtype={dtype}, ncols={ncols})"
+            )
+
+        flat = np.frombuffer(raw, dtype=dtype)
+        if ncols == 1:
+            return flat.copy()
+        return flat.reshape(-1, ncols).copy()
+    except (ArrayError, StoreError):
+        if default is _UNSET:
+            raise
+        return default
 
 
 def read_chunk_link_attributes(

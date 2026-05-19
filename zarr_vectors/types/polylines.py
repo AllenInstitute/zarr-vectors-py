@@ -20,6 +20,7 @@ import numpy.typing as npt
 
 from zarr_vectors.constants import (
     CROSS_CHUNK_EXPLICIT,
+    FRAGMENT_ATTRIBUTES,
     GEOM_POLYLINE,
     GEOM_STREAMLINE,
     LINKS_IMPLICIT_SEQUENTIAL,
@@ -31,6 +32,7 @@ from zarr_vectors.constants import (
 from zarr_vectors.core.arrays import (
     create_attribute_array,
     create_cross_chunk_links_array,
+    create_fragment_attribute_array,
     create_groupings_array,
     create_groupings_attributes_array,
     create_object_attributes_array,
@@ -47,6 +49,7 @@ from zarr_vectors.core.arrays import (
     read_object_vertices,
     read_fragment,
     write_chunk_attributes,
+    write_chunk_fragment_attributes,
     write_chunk_vertices,
     write_cross_chunk_links,
     write_groupings,
@@ -107,6 +110,7 @@ def write_polylines(
     bounds: tuple[list[float], list[float]] | None = None,
     vertex_attributes: dict[str, list[npt.NDArray]] | None = None,
     object_attributes: dict[str, npt.NDArray] | None = None,
+    fragment_attributes: dict[str, dict[ChunkCoords, npt.NDArray]] | None = None,
     groups: dict[int, list[int]] | None = None,
     group_attributes: dict[str, npt.NDArray] | None = None,
     dtype: str = "float32",
@@ -127,6 +131,11 @@ def write_polylines(
             where each array is ``(N_k,)`` or ``(N_k, C)``.
         object_attributes: Per-polyline attributes.
             ``{name: (O,) or (O, C)}`` where O = number of polylines.
+        fragment_attributes: Per-fragment attributes, keyed per chunk:
+            ``{name: {chunk_coords: ndarray}}``.  Each per-chunk ndarray
+            has shape ``(num_fragments_in_chunk,)`` or
+            ``(num_fragments_in_chunk, C)`` and is aligned with the
+            fragment ordering this writer produces for that chunk.
         groups: Group memberships ``{group_id: [polyline_indices]}``.
         group_attributes: Per-group attributes ``{name: (G,) or (G,C)}``.
         dtype: Numpy dtype for positions.
@@ -219,6 +228,8 @@ def write_polylines(
         }
 
     arrays_present = [VERTICES, "object_index"]
+    if fragment_attributes:
+        arrays_present.append(FRAGMENT_ATTRIBUTES)
     level_chunk_dims: list[str] | None = None
     if chunk_by_attribute is not None:
         level_chunk_dims = compute_chunk_dim_names(
@@ -331,6 +342,24 @@ def write_polylines(
             for name in object_attributes:
                 create_object_attributes_array(level_group, name)
 
+        fragment_attr_dtypes: dict[str, np.dtype] = {}
+        if fragment_attributes:
+            for fname, per_chunk in fragment_attributes.items():
+                if not per_chunk:
+                    raise ArrayError(
+                        f"fragment_attributes[{fname!r}] is empty"
+                    )
+                sample = np.asarray(next(iter(per_chunk.values())))
+                fragment_attr_dtypes[fname] = sample.dtype
+                channel_names = None
+                if sample.ndim == 2:
+                    channel_names = [f"ch{i}" for i in range(sample.shape[1])]
+                create_fragment_attribute_array(
+                    level_group, fname,
+                    dtype=str(sample.dtype),
+                    channel_names=channel_names,
+                )
+
         for chunk_coords in sorted(chunk_data.keys()):
             entries = chunk_data[chunk_coords]
             vert_groups = [e[1] for e in entries]
@@ -349,6 +378,23 @@ def write_polylines(
                             level_group, attr_name, chunk_coords, attr_groups,
                             dtype=attr_groups[0].dtype,
                         )
+
+            if fragment_attributes:
+                num_fragments = len(vert_groups)
+                for fname, per_chunk in fragment_attributes.items():
+                    if chunk_coords not in per_chunk:
+                        continue
+                    arr = np.asarray(per_chunk[chunk_coords])
+                    if arr.shape[0] != num_fragments:
+                        raise ArrayError(
+                            f"fragment_attributes[{fname!r}][{chunk_coords!r}] "
+                            f"has {arr.shape[0]} rows but chunk has "
+                            f"{num_fragments} fragments"
+                        )
+                    write_chunk_fragment_attributes(
+                        level_group, fname, chunk_coords, arr,
+                        dtype=fragment_attr_dtypes[fname],
+                    )
 
         # Write object index — chunk coords gain a leading dim when
         # attribute-chunked, so widen sid_ndim accordingly.

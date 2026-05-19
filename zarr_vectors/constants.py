@@ -144,6 +144,12 @@ header."""
 
 LINKS: str = "links"
 VERTEX_ATTRIBUTES: str = "vertex_attributes"
+FRAGMENT_ATTRIBUTES: str = "fragment_attributes"
+"""Per-fragment attribute arrays.  Dense per-chunk blob with one row per
+fragment in that chunk (``(F,)`` or ``(F, C)``).  Optional — used when
+callers want to materialize per-fragment data, including parent-IDs
+(e.g. an ``object_id`` fragment attribute carrying the OID that owns
+each fragment)."""
 OBJECT_INDEX: str = "object_index"
 OBJECT_ATTRIBUTES: str = "object_attributes"
 GROUPS: str = "groups"
@@ -164,6 +170,7 @@ ALL_ARRAY_NAMES: frozenset[str] = frozenset({
     LINK_FRAGMENTS,
     LINKS,
     VERTEX_ATTRIBUTES,
+    FRAGMENT_ATTRIBUTES,
     OBJECT_INDEX,
     OBJECT_ATTRIBUTES,
     GROUPS,

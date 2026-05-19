@@ -8,12 +8,17 @@ import numpy as np
 import pytest
 
 from zarr_vectors.core.arrays import (
+    create_fragment_attribute_array,
     read_chunk_attributes,
+    read_chunk_fragment_attributes,
     read_object_attributes,
+    write_chunk_fragment_attributes,
 )
-from zarr_vectors.core.store import open_store
+from zarr_vectors.core.store import get_resolution_level, open_store
+from zarr_vectors.exceptions import EditError
 from zarr_vectors.ops import (
     AttributeRef,
+    FragmentRef,
     ObjectRef,
     VertexRef,
     add_attribute,
@@ -127,3 +132,83 @@ class TestObjectAttribute:
         # Other rows are zero-filled defaults.
         assert arr[0] == 0
         assert arr[2] == 0
+
+
+class TestFragmentAttribute:
+
+    def _seed_fragment_attr(
+        self, path: str, name: str, values: np.ndarray,
+    ) -> tuple:
+        """Open level 0 of an existing store, create a fragment attribute
+        and stamp ``values`` into the first chunk.  Returns the level
+        group and the chunk_coords used."""
+        root = open_store(path, mode="r+")
+        lg = get_resolution_level(root, 0)
+        from zarr_vectors.core.arrays import list_chunk_keys
+        chunk = list_chunk_keys(lg)[0]
+        create_fragment_attribute_array(lg, name, dtype=str(values.dtype))
+        write_chunk_fragment_attributes(
+            lg, name, chunk, values, dtype=values.dtype,
+        )
+        return root, lg, chunk
+
+    def test_edit_per_fragment_in_place(
+        self, attr_store: tuple[str, np.ndarray, np.ndarray],
+    ) -> None:
+        path, _, _ = attr_store
+        oids = np.array([10, 20, 30], dtype=np.int64)
+        root, lg, chunk = self._seed_fragment_attr(path, "owner_oid", oids)
+
+        # Edit the middle fragment's value.
+        edit_attribute(
+            root,
+            AttributeRef(
+                scope="fragment", name="owner_oid",
+                target=FragmentRef(level=0, chunk=chunk, fragment=1),
+            ),
+            value=999,
+        )
+
+        read_back = read_chunk_fragment_attributes(
+            lg, "owner_oid", chunk, dtype=np.int64,
+        )
+        assert read_back.shape == (3,)
+        # Edited row updated; siblings untouched.
+        assert read_back[0] == 10
+        assert read_back[1] == 999
+        assert read_back[2] == 30
+
+    def test_edit_out_of_range_raises(
+        self, attr_store: tuple[str, np.ndarray, np.ndarray],
+    ) -> None:
+        path, _, _ = attr_store
+        root, _, chunk = self._seed_fragment_attr(
+            path, "owner_oid",
+            np.array([10, 20, 30], dtype=np.int64),
+        )
+        with pytest.raises(EditError):
+            edit_attribute(
+                root,
+                AttributeRef(
+                    scope="fragment", name="owner_oid",
+                    target=FragmentRef(level=0, chunk=chunk, fragment=99),
+                ),
+                value=42,
+            )
+
+    def test_remove_per_fragment_refused(
+        self, attr_store: tuple[str, np.ndarray, np.ndarray],
+    ) -> None:
+        path, _, _ = attr_store
+        root, _, chunk = self._seed_fragment_attr(
+            path, "owner_oid",
+            np.array([10, 20, 30], dtype=np.int64),
+        )
+        with pytest.raises(EditError):
+            remove_attribute(
+                root,
+                AttributeRef(
+                    scope="fragment", name="owner_oid",
+                    target=FragmentRef(level=0, chunk=chunk, fragment=0),
+                ),
+            )

@@ -28,9 +28,15 @@ from typing import TYPE_CHECKING
 import numpy as np
 import numpy.typing as npt
 
-from zarr_vectors.constants import OBJECT_ATTRIBUTES
+from zarr_vectors.constants import FRAGMENT_ATTRIBUTES, OBJECT_ATTRIBUTES
 from zarr_vectors.exceptions import EditError
-from zarr_vectors.ops.refs import AttributeRef, LinkRef, ObjectRef, VertexRef
+from zarr_vectors.ops.refs import (
+    AttributeRef,
+    FragmentRef,
+    LinkRef,
+    ObjectRef,
+    VertexRef,
+)
 
 if TYPE_CHECKING:
     from zarr_vectors.ops.edit import EditSession
@@ -44,6 +50,8 @@ def edit_attribute_in_session(
     """Dispatch to the right scope-specific edit path."""
     if ref.scope == "vertex":
         return _edit_vertex_attr(session, ref, value)
+    if ref.scope == "fragment":
+        return _edit_fragment_attr(session, ref, value)
     if ref.scope == "object":
         return _edit_object_attr(session, ref, value)
     if ref.scope == "link":
@@ -102,7 +110,7 @@ def remove_attribute_in_session(
     raise EditError(
         f"remove_attribute is only supported for per-object scope this "
         f"iteration; got scope={ref.scope!r}.  Use edit_attribute(value=...) "
-        f"with an explicit sentinel value for vertex / link scopes."
+        f"with an explicit sentinel value for vertex / fragment / link scopes."
     )
 
 
@@ -319,6 +327,81 @@ def _edit_link_attr(
         dtype=dtype, delta=0,
     )
     session._mark_edit(lref.level)
+
+
+# ---------------------------------------------------------------------
+# Per-fragment (per-chunk dense RMW)
+# ---------------------------------------------------------------------
+
+def _edit_fragment_attr(
+    session: EditSession,
+    ref: AttributeRef,
+    value: npt.ArrayLike,
+) -> None:
+    if not isinstance(ref.target, FragmentRef):
+        raise EditError(
+            f"AttributeRef(scope='fragment') requires target to be a "
+            f"FragmentRef; got {type(ref.target).__name__}"
+        )
+    fref = ref.target
+    from zarr_vectors.core.arrays import (
+        read_chunk_fragment_attributes,
+        write_chunk_fragment_attributes,
+    )
+    from zarr_vectors.core.store import get_resolution_level
+
+    level_group = get_resolution_level(session.root, fref.level)
+    full_name = f"{FRAGMENT_ATTRIBUTES}/{ref.name}"
+    try:
+        meta = level_group.read_array_meta(full_name)
+        dtype = np.dtype(meta.get("dtype", "float32"))
+        channel_names = meta.get("channel_names")
+        ncols = len(channel_names) if channel_names else 1
+    except Exception as e:
+        raise EditError(
+            f"edit_attribute(scope='fragment'): {ref.name!r} not present "
+            f"at level {fref.level}: {e}"
+        ) from None
+
+    try:
+        arr = read_chunk_fragment_attributes(
+            level_group, ref.name, fref.chunk,
+            dtype=dtype, ncols=ncols,
+        )
+    except Exception as e:
+        raise EditError(
+            f"edit_attribute(scope='fragment'): {ref.name!r} chunk "
+            f"{fref.chunk} unreadable: {e}"
+        ) from None
+
+    if fref.fragment < 0 or fref.fragment >= arr.shape[0]:
+        raise EditError(
+            f"fragment_attributes/{ref.name}: fragment {fref.fragment} "
+            f"out of range in chunk {fref.chunk} (has {arr.shape[0]} "
+            f"fragment rows)"
+        )
+
+    val = np.asarray(value, dtype=dtype)
+    if ncols == 1:
+        if val.shape not in ((), (1,)):
+            raise EditError(
+                f"per-fragment attribute {ref.name!r} expects scalar rows; "
+                f"got shape {val.shape}"
+            )
+        arr = arr.copy()
+        arr[fref.fragment] = val.reshape(())
+    else:
+        if val.shape != (ncols,):
+            raise EditError(
+                f"per-fragment attribute {ref.name!r} expects row shape "
+                f"({ncols},); got {val.shape}"
+            )
+        arr = arr.copy()
+        arr[fref.fragment] = val
+    write_chunk_fragment_attributes(
+        level_group, ref.name, fref.chunk, arr, dtype=dtype,
+    )
+    session._mark_edit(fref.level)
 
 
 # Module-export marker — referenced by ops/__init__.py.

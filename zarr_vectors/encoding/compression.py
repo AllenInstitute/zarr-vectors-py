@@ -16,6 +16,7 @@ from zarr_vectors.constants import (
     GROUPS,
     LINK_ATTRIBUTES,
     LINK_FRAGMENTS,
+    FRAGMENT_ATTRIBUTES,
     LINKS,
     OBJECT_ATTRIBUTES,
     OBJECT_INDEX,
@@ -153,7 +154,7 @@ def get_default_compressor(array_type: str) -> dict[str, object]:
         }
 
     # Vertex positions and attributes — byte shuffle works well on floats
-    if array_type in (VERTICES, VERTEX_ATTRIBUTES):
+    if array_type in (VERTICES, VERTEX_ATTRIBUTES, FRAGMENT_ATTRIBUTES):
         return {
             "id": "blosc",
             "cname": "zstd",

@@ -24,6 +24,7 @@ import numpy.typing as npt
 from zarr_vectors.constants import (
     CROSS_CHUNK_EXPLICIT,
     CROSS_CHUNK_LINKS,
+    FRAGMENT_ATTRIBUTES,
     GEOM_GRAPH,
     GEOM_SKELETON,
     LINK_FRAGMENTS,
@@ -37,6 +38,7 @@ from zarr_vectors.constants import (
 from zarr_vectors.core.arrays import (
     create_attribute_array,
     create_cross_chunk_links_array,
+    create_fragment_attribute_array,
     create_link_attributes_array,
     create_links_array,
     create_object_attributes_array,
@@ -50,6 +52,7 @@ from zarr_vectors.core.arrays import (
     read_cross_chunk_links,
     read_object_vertices,
     write_chunk_attributes,
+    write_chunk_fragment_attributes,
     write_chunk_link_attributes,
     write_chunk_links,
     write_chunk_vertices,
@@ -116,6 +119,7 @@ def write_graph(
     vertex_attributes: dict[str, npt.NDArray] | None = None,
     link_attributes: dict[str, npt.NDArray] | None = None,
     object_attributes: dict[str, npt.NDArray] | None = None,
+    fragment_attributes: dict[str, dict[ChunkCoords, npt.NDArray]] | None = None,
     object_ids: npt.NDArray[np.integer] | None = None,
     dtype: str = "float32",
     backend: str | None = None,
@@ -142,6 +146,11 @@ def write_graph(
             (Spec name; replaces ``node_attributes``.)
         link_attributes: Per-edge attributes ``{name: (M,) or (M,C)}``.
             (Spec name; replaces ``edge_attributes``.)
+        fragment_attributes: Per-fragment attributes, keyed per chunk:
+            ``{name: {chunk_coords: ndarray}}``.  Each per-chunk ndarray
+            has shape ``(num_fragments_in_chunk,)`` or
+            ``(num_fragments_in_chunk, C)`` and is aligned with the
+            fragment ordering this writer produces for that chunk.
         object_ids: ``(N,)`` array assigning nodes to objects.  If None,
             all nodes belong to object 0.
         dtype: Numpy dtype for positions.
@@ -296,10 +305,13 @@ def write_graph(
             spatial_dim_names=[a["name"] for a in axes],
         )
 
+    arrays_present_list = [VERTICES, "links", "object_index"]
+    if fragment_attributes:
+        arrays_present_list.append(FRAGMENT_ATTRIBUTES)
     level_meta = LevelMetadata(
         level=0,
         vertex_count=n_nodes,
-        arrays_present=[VERTICES, "links", "object_index"],
+        arrays_present=arrays_present_list,
         chunk_dims=level_chunk_dims,
         chunk_attribute_name=chunk_by_attribute,
         chunk_attribute_values=attr_bin_values,
@@ -387,6 +399,24 @@ def write_graph(
             for _name in object_attributes:
                 create_object_attributes_array(level_group, _name)
 
+        fragment_attr_dtypes: dict[str, np.dtype] = {}
+        if fragment_attributes:
+            for fname, per_chunk in fragment_attributes.items():
+                if not per_chunk:
+                    raise ArrayError(
+                        f"fragment_attributes[{fname!r}] is empty"
+                    )
+                sample = np.asarray(next(iter(per_chunk.values())))
+                fragment_attr_dtypes[fname] = sample.dtype
+                channel_names = None
+                if sample.ndim == 2:
+                    channel_names = [f"ch{i}" for i in range(sample.shape[1])]
+                create_fragment_attribute_array(
+                    level_group, fname,
+                    dtype=str(sample.dtype),
+                    channel_names=channel_names,
+                )
+
         for chunk_idx, chunk_coords in enumerate(chunk_list):
             global_indices = chunk_assignments[chunk_coords]
             chunk_positions = positions[global_indices]
@@ -419,6 +449,23 @@ def write_graph(
                     write_chunk_attributes(
                         level_group, name, chunk_coords, groups_list,
                         dtype=node_attributes[name].dtype,
+                    )
+
+            if fragment_attributes:
+                num_fragments = len(vert_groups)
+                for fname, per_chunk in fragment_attributes.items():
+                    if chunk_coords not in per_chunk:
+                        continue
+                    arr = np.asarray(per_chunk[chunk_coords])
+                    if arr.shape[0] != num_fragments:
+                        raise ArrayError(
+                            f"fragment_attributes[{fname!r}][{chunk_coords!r}] "
+                            f"has {arr.shape[0]} rows but chunk has "
+                            f"{num_fragments} fragments"
+                        )
+                    write_chunk_fragment_attributes(
+                        level_group, fname, chunk_coords, arr,
+                        dtype=fragment_attr_dtypes[fname],
                     )
 
         # Write intra-chunk links
