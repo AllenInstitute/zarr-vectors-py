@@ -88,7 +88,6 @@ from zarr_vectors.spatial.boundary import (
 from zarr_vectors.spatial.chunking import (
     chunks_intersecting_bbox,
     compute_bounds,
-    bin_to_chunk,
 )
 from zarr_vectors.typing import (
     BinShape,
@@ -162,10 +161,10 @@ def write_polylines(
         bounds_list = (list(bounds[0]), list(bounds[1]))
     total_vertices = len(all_pts)
 
-    effective_bin = bin_shape if bin_shape is not None else chunk_shape
-    bins_per_chunk = tuple(
-        int(round(cs / bs)) for cs, bs in zip(chunk_shape, effective_bin)
-    )
+    # bin_shape is retained in the store metadata (``base_bin_shape``)
+    # for downstream attribute-chunking / spatial-index sub-binning, but
+    # the polyline writer itself splits at chunk boundaries only — see
+    # the call to ``split_polyline_at_boundaries`` below.
 
     root = _create_or_open_store(
         store_path,
@@ -260,11 +259,27 @@ def write_polylines(
             out[attr_name] = attr_list[poly_id][start:end]
         return out
 
+    # Per-chunk running offset into the chunk's vertices array — used
+    # to compute chunk-local vertex indices for cross_chunk_links
+    # endpoints below.  Each new fragment's first local vertex is the
+    # current offset; its last local vertex is offset + len - 1.
+    chunk_vertex_offsets: dict[ChunkCoords, int] = {}
+
     for poly_id, poly_verts in enumerate(polylines):
         poly_verts = np.asarray(poly_verts, dtype=np_dtype)
 
-        # Split at bin boundaries (finer than chunk boundaries when bin_shape < chunk_shape)
-        segments = split_polyline_at_boundaries(poly_verts, effective_bin)
+        # Split at SPATIAL CHUNK boundaries, not bin boundaries.  Per the
+        # zarr-vectors spec, each (object, chunk) contributes ONE
+        # fragment with implicit_sequential edges; intra-chunk vertices
+        # are connected by implicit edges, and cross-chunk transitions
+        # go in cross_chunk_links with real chunk-local vertex indices.
+        # Splitting at bin boundaries would create multiple same-chunk
+        # fragments per object, leaving no place for the intra-chunk
+        # bin-boundary edges (implicit_sequential has no explicit links
+        # array to hold them).  bin_shape remains in effect for
+        # attribute-bin partitioning (poly_attr_bins) when that is
+        # configured.
+        segments = split_polyline_at_boundaries(poly_verts, chunk_shape)
 
         if not segments:
             object_manifests[poly_id] = []
@@ -283,8 +298,7 @@ def write_polylines(
         seg_offsets = np.cumsum([0, *seg_lengths[:-1]]).astype(np.int64)
 
         sub_entries: list[tuple[ChunkCoords, npt.NDArray, dict[str, npt.NDArray]]] = []
-        for seg_idx, (bin_coords, seg_verts) in enumerate(segments):
-            spatial_cc = bin_to_chunk(bin_coords, bins_per_chunk)
+        for seg_idx, (spatial_cc, seg_verts) in enumerate(segments):
             seg_off = int(seg_offsets[seg_idx])
             seg_len = seg_lengths[seg_idx]
 
@@ -305,24 +319,42 @@ def write_polylines(
                 )
                 sub_entries.append((prefixed, seg_verts[int(s):int(e)], sa))
 
+        # manifest_with_indices augments each manifest entry with the
+        # chunk-local vertex range of its fragment, used by the
+        # cross_chunk_links writer below to record proper endpoints.
         manifest: ObjectManifest = []
+        manifest_with_indices: list[
+            tuple[ChunkCoords, int, int, int]
+        ] = []  # (chunk_coords, fragment_idx, first_local_vert, last_local_vert)
         for chunk_coords, sub_verts, sa in sub_entries:
             if chunk_coords not in chunk_data:
                 chunk_data[chunk_coords] = []
+                chunk_vertex_offsets[chunk_coords] = 0
             fragment_idx = len(chunk_data[chunk_coords])
+            first_local = chunk_vertex_offsets[chunk_coords]
+            last_local = first_local + len(sub_verts) - 1
+            chunk_vertex_offsets[chunk_coords] = first_local + len(sub_verts)
             chunk_data[chunk_coords].append((poly_id, sub_verts, sa))
             manifest.append((chunk_coords, fragment_idx))
+            manifest_with_indices.append(
+                (chunk_coords, fragment_idx, first_local, last_local)
+            )
 
         object_manifests[poly_id] = manifest
 
-        # Cross-chunk links: between consecutive sub-segments that
-        # ended up in different chunk keys.
-        if len(manifest) > 1:
-            for i in range(len(manifest) - 1):
-                cc_a, _ = manifest[i]
-                cc_b, _ = manifest[i + 1]
+        # Cross-chunk links: one record per consecutive-fragment pair in
+        # different chunks.  Endpoint vertex indices are real chunk-
+        # local indices (last vertex of segment k → first vertex of
+        # segment k+1) so a reader can resolve the bridge without
+        # consulting the manifest.  With the per-chunk-only fragment
+        # split above, consecutive same-chunk entries cannot occur for
+        # a single polyline (would be merged into one fragment).
+        if len(manifest_with_indices) > 1:
+            for i in range(len(manifest_with_indices) - 1):
+                cc_a, _, _, last_a = manifest_with_indices[i]
+                cc_b, _, first_b, _ = manifest_with_indices[i + 1]
                 if cc_a != cc_b:
-                    all_cross_links.append(((cc_a, 0), (cc_b, 0)))
+                    all_cross_links.append(((cc_a, last_a), (cc_b, first_b)))
 
     idx_ndim = ndim + 1 if per_poly_attr_bins is not None else ndim
     # Collapse all per-array zarr.json + per-chunk byte writes into one
