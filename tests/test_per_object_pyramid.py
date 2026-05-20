@@ -78,14 +78,16 @@ def test_per_object_level_metadata(tmp_path):
     root = open_store(str(store))
     lm = read_level_metadata(root, 1)
     assert lm.preserves_object_ids is True
-    assert lm.shared_fragments is True
+    # implicit_sequential path writes per-(object, coarsened-chunk)
+    # fragments, so fragments aren't shared between objects.
+    assert lm.shared_fragments is False
     assert lm.coarsening_method == COARSEN_PER_OBJECT
     assert lm.inherited_num_objects == 10
     assert lm.parent_level == 0
 
     rm = read_root_metadata(root)
     assert CAP_PRESERVED_OBJECT_IDS in rm.format_capabilities
-    assert CAP_SHARED_FRAGMENTS in rm.format_capabilities
+    assert CAP_SHARED_FRAGMENTS not in rm.format_capabilities
 
 
 # ===================================================================
@@ -167,10 +169,13 @@ def test_chunk_halo_containment(tmp_path):
 # ===================================================================
 
 
-def test_shared_metavertices(tmp_path):
-    """In a 30-polyline test with spatial overlap, at least one
-    metavertex is referenced by ≥ 2 objects' manifests, and the
-    on-disk fragment count is strictly less than total ref count."""
+def test_per_object_fragments_layout(tmp_path):
+    """On the implicit_sequential path each (object, coarsened-chunk)
+    visit is one fragment.  Manifest entries are not shared between
+    objects; the on-disk fragment count equals the total manifest
+    entry count.  Bin centroids ARE shared across fragments at the
+    position level — multiple fragments in one chunk may include a
+    row at the same centroid coordinates."""
     store = _build_store(tmp_path, seed=5, n=30)
     coarsen_level(str(store), source_level=0, target_level=1,
                   coarsen_factor=2.0, sparsity_factor=1.0, sparsity_seed=42)
@@ -181,19 +186,36 @@ def test_shared_metavertices(tmp_path):
 
     all_refs = [r for m in mans for r in m]
     unique_refs = set(all_refs)
-    assert len(all_refs) > len(unique_refs), (
-        "Expected at least one shared metavertex but every manifest entry "
-        "is unique."
+    # Each (chunk, fragment_idx) belongs to exactly one object.
+    assert len(all_refs) == len(unique_refs), (
+        "Per-(object, chunk) fragments must not be shared between objects."
     )
 
-    # The on-disk fragment count equals the number of unique refs (one fragment per
-    # metavertex).
     from zarr_vectors.core.arrays import list_chunk_keys
     on_disk = 0
     for cc in list_chunk_keys(lvl1):
         fragments = read_chunk_vertices(lvl1, cc, dtype=np.float32, ndim=3)
         on_disk += len(fragments)
     assert on_disk == len(unique_refs)
+
+    # Centroid-position sharing across fragments: at least one pair of
+    # fragments inside the same chunk must contain a row at the same
+    # coordinates (different streamlines crossing the same bin).
+    from zarr_vectors.core.arrays import list_chunk_keys as _lc
+    found_position_overlap = False
+    for cc in _lc(lvl1):
+        fragments = read_chunk_vertices(lvl1, cc, dtype=np.float32, ndim=3)
+        if len(fragments) < 2:
+            continue
+        all_rows = np.concatenate(fragments, axis=0)
+        unique_rows = np.unique(all_rows, axis=0)
+        if len(unique_rows) < len(all_rows):
+            found_position_overlap = True
+            break
+    assert found_position_overlap, (
+        "Expected at least one shared metavertex POSITION across "
+        "per-object fragments in some chunk."
+    )
 
 
 # ===================================================================

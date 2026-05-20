@@ -29,6 +29,7 @@ from zarr_vectors.constants import (
     DEFAULT_CROSS_LEVEL_DEPTH,
     DEFAULT_CROSS_LEVEL_STORAGE,
     LINKS,
+    LINKS_IMPLICIT_SEQUENTIAL,
     OBJECT_ATTRIBUTES,
     VERTICES,
     XLEVEL_EXPLICIT,
@@ -66,6 +67,11 @@ from zarr_vectors.core.store import (
     read_root_metadata,
 )
 from zarr_vectors.exceptions import ArrayError, CoarseningError
+from zarr_vectors.multiresolution.coarsen_implicit import (
+    coarse_chunks_of,
+    positions_in_run,
+    segment_object_by_coarse_chunk,
+)
 from zarr_vectors.multiresolution.object_selection import apply_sparsity
 from zarr_vectors.spatial.boundary import (
     build_vertex_chunk_mapping,
@@ -322,19 +328,179 @@ def _per_object_coarsen(
     # --- Step 4: chunk-assign metavertices ------------------------------
     chunk_assignments = assign_chunks(meta_positions, chunk_shape)
 
-    # --- Step 5: per-chunk fragment layout (one fragment per metavertex) ------------
-    metavertex_to_ref: dict[int, tuple[ChunkCoords, int]] = {}
-    per_chunk_groups: dict[ChunkCoords, list[np.ndarray]] = {}
-    for cc, indices in sorted(chunk_assignments.items()):
-        # ``indices`` are metavertex indices that fell in this chunk.
-        for fragment_idx, mv_idx in enumerate(indices.tolist()):
-            metavertex_to_ref[int(mv_idx)] = (cc, fragment_idx)
-            per_chunk_groups.setdefault(cc, []).append(
-                meta_positions[mv_idx:mv_idx + 1]
+    # --- Step 5-9b: branch on links_convention --------------------------
+    # The ``implicit_sequential`` (streamline / polyline) path keeps each
+    # object's path in a single multi-vertex fragment per coarsened chunk,
+    # so consecutive metavertices belong to the same fragment and their
+    # implicit edges encode the connectivity.  Other conventions stay on
+    # the legacy "one fragment per metavertex" layout where Step 9b
+    # records same-chunk bridges as ``cross_chunk_links/0`` rows.
+    use_implicit_sequential = (
+        root_meta.links_convention == LINKS_IMPLICIT_SEQUENTIAL
+    )
+
+    if use_implicit_sequential:
+        # Pass 1: per-(oid, coarsened chunk) segmentation.  Each surviving
+        # object's source vertex sequence is split at coarsened-chunk
+        # boundaries; within each per-chunk run, consecutive same-bin
+        # vertices collapse to a single metavertex.  Source cross-chunk
+        # edges whose endpoints both fall in the same coarsened chunk are
+        # absorbed into the merged run for that chunk.
+        per_object_runs: dict[int, list[tuple[ChunkCoords, list[int]]]] = {}
+        per_object_aux: dict[int, tuple[np.ndarray, np.ndarray]] = {}
+        cursor = 0
+        for oid in keep_oids:
+            n_obj = per_object_positions[oid].shape[0]
+            if n_obj == 0:
+                per_object_runs[oid] = []
+                per_object_aux[oid] = (
+                    np.empty(0, dtype=np.int64), np.empty(0, dtype=np.int64),
+                )
+                continue
+            mv_seq = inverse[cursor:cursor + n_obj].astype(np.int64, copy=False)
+            cursor += n_obj
+            coarse_cc_seq = coarse_chunks_of(
+                per_object_positions[oid], target_chunk_shape,
             )
+            runs = segment_object_by_coarse_chunk(mv_seq, coarse_cc_seq)
+            run_idx, pos_in_run = positions_in_run(
+                n_obj, mv_seq, coarse_cc_seq,
+            )
+            per_object_runs[oid] = runs
+            per_object_aux[oid] = (run_idx, pos_in_run)
+
+        # Per-chunk assembly: deterministic order — by oid (keep_oids
+        # order), then by run index within the object.
+        per_chunk_assembly: dict[
+            ChunkCoords, list[tuple[int, int, list[int]]]
+        ] = {}
+        for oid in keep_oids:
+            for r_idx, (coarse_cc, mv_list) in enumerate(per_object_runs[oid]):
+                per_chunk_assembly.setdefault(coarse_cc, []).append(
+                    (oid, r_idx, mv_list),
+                )
+
+        # Fragment index + chunk-local start per run.  Both quantities are
+        # determined once the per-chunk run order is fixed.
+        run_to_fragment: dict[
+            tuple[int, int], tuple[ChunkCoords, int, int]
+        ] = {}
+        for coarse_cc, entries in per_chunk_assembly.items():
+            cum = 0
+            for fragment_idx, (oid, r_idx, mv_list) in enumerate(entries):
+                run_to_fragment[(oid, r_idx)] = (coarse_cc, fragment_idx, cum)
+                cum += len(mv_list)
+
+        # Per-object manifest at the coarse level: one entry per run.
+        new_manifests = {}
+        for oid in keep_oids:
+            manifest: list[tuple[ChunkCoords, int]] = []
+            for r_idx, _ in enumerate(per_object_runs[oid]):
+                cc_out, frag_idx_out, _ = run_to_fragment[(oid, r_idx)]
+                manifest.append((cc_out, frag_idx_out))
+            new_manifests[oid] = manifest
+
+        # Vertex groups for write_chunk_vertices (range fragments).
+        per_chunk_groups = {}
+        for coarse_cc, entries in per_chunk_assembly.items():
+            groups: list[np.ndarray] = []
+            for (_oid, _r_idx, mv_list) in entries:
+                if mv_list:
+                    groups.append(
+                        meta_positions[np.asarray(mv_list, dtype=np.int64)],
+                    )
+                else:
+                    groups.append(np.zeros((0, ndim), dtype=np.float32))
+            per_chunk_groups[coarse_cc] = groups
+
+        # Source-vertex → coarse endpoint map for Pass 2 (cross-chunk
+        # link remapping) and for cross-level link emission.  Built by
+        # walking the source manifest in fragment order and pairing each
+        # source vertex with its (run_idx, pos_in_run) so we know which
+        # coarse fragment owns it.
+        src_chunk_fragment_starts: dict[ChunkCoords, dict[int, int]] = {}
+        src_chunks_seen = {c for (c, _) in src_fragment_positions.keys()}
+        for cc in src_chunks_seen:
+            fids = sorted(
+                fid for (c, fid) in src_fragment_positions.keys() if c == cc
+            )
+            starts_map: dict[int, int] = {}
+            cum = 0
+            for fid in fids:
+                starts_map[fid] = cum
+                cum += len(src_fragment_positions[(cc, fid)])
+            src_chunk_fragment_starts[cc] = starts_map
+
+        src_endpoint_map: dict[
+            tuple[ChunkCoords, int], tuple[ChunkCoords, int]
+        ] = {}
+        for oid in keep_oids:
+            n_obj_total = per_object_positions[oid].shape[0]
+            if n_obj_total == 0:
+                continue
+            run_idx_arr, pos_in_run_arr = per_object_aux[oid]
+            obj_runs = per_object_runs[oid]
+            src_vidx_within_obj = 0
+            for (m_cc, m_fid) in src_manifests[oid]:
+                fragment_arr = src_fragment_positions.get((m_cc, m_fid))
+                if fragment_arr is None or len(fragment_arr) == 0:
+                    continue
+                n_frag = len(fragment_arr)
+                f_start = src_chunk_fragment_starts[m_cc][m_fid]
+                for i in range(n_frag):
+                    src_local_vi = f_start + i
+                    r_idx = int(run_idx_arr[src_vidx_within_obj])
+                    pos = int(pos_in_run_arr[src_vidx_within_obj])
+                    coarse_cc = obj_runs[r_idx][0]
+                    _, _, chunk_start = run_to_fragment[(oid, r_idx)]
+                    coarse_local_vi = chunk_start + pos
+                    # First write wins: multiple source vertices in the
+                    # same source-chunk row are impossible, but multiple
+                    # source vertices may map to the same coarse row.
+                    # The (src_cc, src_local_vi) key is unique by
+                    # construction so simple assignment is fine.
+                    src_endpoint_map[(m_cc, src_local_vi)] = (
+                        coarse_cc, coarse_local_vi,
+                    )
+                    src_vidx_within_obj += 1
+
+        # mv_to_chunk_first_row: for each metavertex, the (chunk, first
+        # chunk-local row) it lives in.  Used by cross-level link
+        # emission since a single metavertex can now occupy multiple
+        # rows (one per per-object fragment that visits it).
+        mv_first_row_chunk: dict[int, ChunkCoords] = {}
+        mv_first_row_local: dict[int, int] = {}
+        for coarse_cc, entries in per_chunk_assembly.items():
+            cum = 0
+            for (_oid, _r_idx, mv_list) in entries:
+                for p, mv in enumerate(mv_list):
+                    mv_int = int(mv)
+                    if mv_int not in mv_first_row_chunk:
+                        mv_first_row_chunk[mv_int] = coarse_cc
+                        mv_first_row_local[mv_int] = cum + p
+                cum += len(mv_list)
+    # else: legacy path computes its own per_chunk_groups / new_manifests
+    # below.
+
+    # --- Step 5 (legacy): per-chunk fragment layout (one fragment per metavertex)
+    if not use_implicit_sequential:
+        metavertex_to_ref: dict[int, tuple[ChunkCoords, int]] = {}
+        per_chunk_groups: dict[ChunkCoords, list[np.ndarray]] = {}
+        for cc, indices in sorted(chunk_assignments.items()):
+            for fragment_idx, mv_idx in enumerate(indices.tolist()):
+                metavertex_to_ref[int(mv_idx)] = (cc, fragment_idx)
+                per_chunk_groups.setdefault(cc, []).append(
+                    meta_positions[mv_idx:mv_idx + 1]
+                )
 
     # --- Step 6: write per-chunk fragments --------------------------
     arrays_present = [VERTICES, "object_index"] if src_has_objects else [VERTICES]
+    # ``shared_fragments`` is False on the implicit_sequential path:
+    # fragments are per-(object, coarsened-chunk), not shared between
+    # objects.  Legacy path keeps the historical True so the existing
+    # CAP_SHARED_FRAGMENTS contract is preserved for non-streamline
+    # geometries.
+    shared_fragments_flag = not use_implicit_sequential
     level_meta_initial = LevelMetadata(
         level=target_level,
         vertex_count=int(n_metavertices),
@@ -347,7 +513,7 @@ def _per_object_coarsen(
         parent_level=source_level,
         preserves_object_ids=src_has_objects,
         inherited_num_objects=n_src_objects if src_has_objects else 0,
-        shared_fragments=True,
+        shared_fragments=shared_fragments_flag,
     )
     level_group = create_resolution_level(root, target_level, level_meta_initial)
     create_vertices_array(level_group, dtype="float32")
@@ -357,28 +523,26 @@ def _per_object_coarsen(
     for cc, groups in sorted(per_chunk_groups.items()):
         write_chunk_vertices(level_group, cc, groups, dtype=np.float32)
 
-    # --- Step 7: emit per-object manifests ------------------------------
-    # We need to map each source vertex back to its metavertex_index.
-    # Walk per-object slices of the flat ``inverse`` array.
-    cursor = 0
-    new_manifests: dict[int, list[tuple[ChunkCoords, int]]] = {}
-    for oid in keep_oids:
-        n = per_object_positions[oid].shape[0]
-        if n == 0:
-            cursor += 0
-            new_manifests[oid] = []
-            continue
-        mv_seq = inverse[cursor:cursor + n].tolist()
-        cursor += n
-        # Deduplicate consecutive duplicates while preserving order.
-        manifest: list[tuple[ChunkCoords, int]] = []
-        prev = -1
-        for mv_idx in mv_seq:
-            if mv_idx == prev:
+    # --- Step 7 (legacy): emit per-object manifests ---------------------
+    if not use_implicit_sequential:
+        cursor = 0
+        new_manifests = {}
+        for oid in keep_oids:
+            n = per_object_positions[oid].shape[0]
+            if n == 0:
+                new_manifests[oid] = []
                 continue
-            prev = mv_idx
-            manifest.append(metavertex_to_ref[int(mv_idx)])
-        new_manifests[oid] = manifest
+            mv_seq = inverse[cursor:cursor + n].tolist()
+            cursor += n
+            # Deduplicate consecutive duplicates while preserving order.
+            manifest = []
+            prev = -1
+            for mv_idx in mv_seq:
+                if mv_idx == prev:
+                    continue
+                prev = mv_idx
+                manifest.append(metavertex_to_ref[int(mv_idx)])
+            new_manifests[oid] = manifest
 
     # --- Step 9: emit object_index (gap-fill for dropped OIDs) ----------
     if src_has_objects:
@@ -386,6 +550,53 @@ def _per_object_coarsen(
             level_group, new_manifests, sid_ndim=ndim,
             total_objects=n_src_objects,
         )
+
+    # --- Step 9b: cross_chunk_links/0 ----------------------------------
+    if use_implicit_sequential:
+        # Pass 2: remap source-level ``cross_chunk_links/0`` records to
+        # the new coarse-chunk-local indices.  Drop records whose
+        # endpoints both fell into the same coarsened chunk — those were
+        # absorbed by Pass 1's merged fragments.
+        src_cross_records = read_cross_chunk_links(src_group, delta=0)
+        new_cross_links = []
+        for record in src_cross_records:
+            if len(record) != 2:
+                continue
+            (cc_a, vi_a), (cc_b, vi_b) = record  # type: ignore[misc]
+            new_a = src_endpoint_map.get((cc_a, int(vi_a)))
+            new_b = src_endpoint_map.get((cc_b, int(vi_b)))
+            if new_a is None or new_b is None:
+                continue
+            new_cc_a, new_vi_a = new_a
+            new_cc_b, new_vi_b = new_b
+            if new_cc_a == new_cc_b:
+                continue
+            new_cross_links.append(
+                ((new_cc_a, new_vi_a), (new_cc_b, new_vi_b)),
+            )
+        create_cross_chunk_links_array(level_group, delta=0)
+        if new_cross_links:
+            write_cross_chunk_links(
+                level_group, new_cross_links, sid_ndim=ndim, delta=0,
+            )
+    else:
+        # Legacy Step 9b: one fragment per metavertex, so consecutive
+        # same-chunk manifest entries are bridged via cross_chunk_links/0
+        # (with delta=0 same-chunk records being intentional).
+        cross_links = []
+        for oid, manifest in new_manifests.items():
+            if len(manifest) < 2:
+                continue
+            for i in range(len(manifest) - 1):
+                cc_a, frag_a = manifest[i]
+                cc_b, frag_b = manifest[i + 1]
+                # vi_a == frag_a, vi_b == frag_b (one metavertex per fragment).
+                cross_links.append(((cc_a, frag_a), (cc_b, frag_b)))
+        create_cross_chunk_links_array(level_group, delta=0)
+        if cross_links:
+            write_cross_chunk_links(
+                level_group, cross_links, sid_ndim=ndim, delta=0,
+            )
 
     # --- Step 10: per-object attributes with present_mask ---------------
     src_obj_attr_group_name = f"{OBJECT_ATTRIBUTES}"
@@ -415,21 +626,44 @@ def _per_object_coarsen(
     # --- Step 12: stamp root capability tokens --------------------------
     if src_has_objects:
         _stamp_root_capability(root, CAP_PRESERVED_OBJECT_IDS)
-    _stamp_root_capability(root, CAP_SHARED_FRAGMENTS)
+    if not use_implicit_sequential:
+        # On the implicit_sequential path fragments are per-(object,
+        # coarsened-chunk) — not shared between objects — so we don't
+        # claim the shared-fragments capability.
+        _stamp_root_capability(root, CAP_SHARED_FRAGMENTS)
 
     # --- Step 13: emit inline ±1 cross-level link arrays ----------------
     if cross_level_storage != XLEVEL_NONE and n_metavertices > 0:
-        _emit_inline_cross_level_links(
-            root,
-            src_group=src_group,
-            level_group=level_group,
-            source_level=source_level,
-            ndim=ndim,
-            bin_shape_arr=bin_shape_arr,
-            bin_keys=bin_keys,
-            coarse_chunk_assignments_mv=chunk_assignments,
-            storage=cross_level_storage,
-        )
+        if use_implicit_sequential:
+            # A metavertex may occupy multiple rows in its chunk (one per
+            # per-object fragment that visits it).  Pass the precomputed
+            # "first row per metavertex" map so cross-level edges point
+            # to a canonical row.
+            _emit_inline_cross_level_links(
+                root,
+                src_group=src_group,
+                level_group=level_group,
+                source_level=source_level,
+                ndim=ndim,
+                bin_shape_arr=bin_shape_arr,
+                bin_keys=bin_keys,
+                coarse_chunk_assignments_mv=None,
+                storage=cross_level_storage,
+                mv_first_row_chunk=mv_first_row_chunk,
+                mv_first_row_local=mv_first_row_local,
+            )
+        else:
+            _emit_inline_cross_level_links(
+                root,
+                src_group=src_group,
+                level_group=level_group,
+                source_level=source_level,
+                ndim=ndim,
+                bin_shape_arr=bin_shape_arr,
+                bin_keys=bin_keys,
+                coarse_chunk_assignments_mv=chunk_assignments,
+                storage=cross_level_storage,
+            )
 
     return {
         "vertex_count": int(n_metavertices),
@@ -438,7 +672,7 @@ def _per_object_coarsen(
         "source_objects": n_src_objects,
         "method": COARSEN_PER_OBJECT,
         "preserves_object_ids": True,
-        "shared_fragments": True,
+        "shared_fragments": shared_fragments_flag,
     }
 
 
@@ -451,8 +685,10 @@ def _emit_inline_cross_level_links(
     ndim: int,
     bin_shape_arr: npt.NDArray[np.float64],
     bin_keys: npt.NDArray,
-    coarse_chunk_assignments_mv: dict[ChunkCoords, npt.NDArray[np.int64]],
+    coarse_chunk_assignments_mv: dict[ChunkCoords, npt.NDArray[np.int64]] | None,
     storage: str,
+    mv_first_row_chunk: dict[int, ChunkCoords] | None = None,
+    mv_first_row_local: dict[int, int] | None = None,
 ) -> None:
     """Emit ``±1`` link/cross_chunk_link arrays for one coarsen step.
 
@@ -463,6 +699,16 @@ def _emit_inline_cross_level_links(
     metavertex IDs to chunk-major-flat coarse indices via the
     just-written coarse-level chunks, then dispatches to
     :func:`_write_cross_level_edges`.
+
+    Two modes for the metavertex → coarse-row lookup:
+
+    * **Legacy** (one fragment per metavertex): pass
+      ``coarse_chunk_assignments_mv``.  Position k in the per-chunk array
+      is the chunk-local row of metavertex ``coarse_chunk_assignments_mv[cc][k]``.
+    * **Per-(object, chunk) fragments**: pass ``mv_first_row_chunk`` +
+      ``mv_first_row_local``.  Each metavertex maps to its canonical
+      first row in its chunk (multiple per-object fragments may include
+      the same metavertex, but cross-level links use the first).
     """
     # bin_key_bytes → mv_idx (bin-key-ordered, matches np.unique output).
     unique_keys = np.unique(bin_keys)
@@ -475,11 +721,24 @@ def _emit_inline_cross_level_links(
         level_group, ndim,
     )
     mv_to_coarse_global: dict[int, int] = {}
-    for cc, mv_indices_for_chunk in sorted(coarse_chunk_assignments_mv.items()):
-        for local_vg, mv_idx in enumerate(mv_indices_for_chunk.tolist()):
-            mv_to_coarse_global[int(mv_idx)] = int(
-                coarse_chunk_assignments[cc][local_vg]
-            )
+    if mv_first_row_chunk is not None and mv_first_row_local is not None:
+        for mv_idx, cc in mv_first_row_chunk.items():
+            local_row = mv_first_row_local[mv_idx]
+            chunk_rows = coarse_chunk_assignments.get(cc)
+            if chunk_rows is None or local_row >= len(chunk_rows):
+                continue
+            mv_to_coarse_global[int(mv_idx)] = int(chunk_rows[local_row])
+    elif coarse_chunk_assignments_mv is not None:
+        for cc, mv_indices_for_chunk in sorted(coarse_chunk_assignments_mv.items()):
+            for local_vg, mv_idx in enumerate(mv_indices_for_chunk.tolist()):
+                mv_to_coarse_global[int(mv_idx)] = int(
+                    coarse_chunk_assignments[cc][local_vg]
+                )
+    else:
+        raise ValueError(
+            "Either coarse_chunk_assignments_mv or "
+            "(mv_first_row_chunk, mv_first_row_local) must be supplied",
+        )
 
     # Build fine→coarse parent[] by re-walking source in chunk-major order.
     fine_chunk_assignments, n_fine = _reconstruct_chunk_assignments(
