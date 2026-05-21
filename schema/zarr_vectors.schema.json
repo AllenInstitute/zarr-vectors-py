@@ -103,10 +103,15 @@
     },
     "CrossChunkLinkAttributeMeta": {
       "additionalProperties": false,
-      "description": "``.zattrs`` for each ``cross_chunk_link_attributes/<name>/<delta>/`` array.  Stored as a flat blob parallel to the ``data`` blob of the matching ``cross_chunk_links/<delta>/`` array; ``num_links`` MUST equal the parallel CCL array's ``num_links``.",
+      "description": "``.zattrs`` for each ``cross_chunk_link_attributes/<name>/<delta>/`` group (0.8 partitioned layout).  Attribute leaves at ``cross_chunk_link_attributes/<name>/<delta>/<chunk_sorted_0>/.../<chunk_sorted_{K-1}>/data`` are parallel to the matching ``cross_chunk_links/<delta>/<same path>/data`` leaves; each attribute leaf has one row per cross-chunk record in the matching link leaf.  Per-leaf parity invariant: attribute leaf record count equals the link leaf record count.  ``num_links`` is no longer stored at the group level.  ``layout`` discriminates between layout versions; ``\"partitioned_v1\"`` is the only legal value in 0.8.",
       "properties": {
         "dtype": {
           "description": "Numpy dtype string of the array's value type (e.g. \"float32\").",
+          "type": "string"
+        },
+        "layout": {
+          "const": "partitioned_v1",
+          "description": "On-disk layout discriminator for partitioned cross-chunk-link arrays.  ``\"partitioned_v1\"`` is the only legal value in 0.8 and signals the K-deep sorted-chunks leaf layout described in :class:`CrossChunkLinksMeta`.  Stamped on both ``cross_chunk_links/<delta>/`` and ``cross_chunk_link_attributes/<name>/<delta>/`` groups.\n",
           "type": "string"
         },
         "level_delta": {
@@ -116,11 +121,6 @@
         "name": {
           "description": "NGFF axis or attribute name (e.g. \"x\", \"intensity\").",
           "type": "string"
-        },
-        "num_links": {
-          "description": "Total cross-chunk link count.",
-          "minimum": 0,
-          "type": "integer"
         },
         "zv_array": {
           "$ref": "#/$defs/ZvArrayTag",
@@ -133,15 +133,20 @@
         "name",
         "dtype",
         "level_delta",
-        "num_links"
+        "layout"
       ],
       "title": "CrossChunkLinkAttributeMeta",
       "type": "object"
     },
     "CrossChunkLinksMeta": {
       "additionalProperties": false,
-      "description": "``.zattrs`` for a ``cross_chunk_links/<delta>/`` array.  Each delta segment carries its own meta block; ``level_delta=0`` is the intra-level array.  Each record is ``link_width`` ``(chunk_coords, vertex_idx)`` endpoints \u2014 ``link_width=2`` encodes a cross-chunk edge, ``link_width=3`` a triangle face record, and so on.  Source-side endpoint (endpoint 0) lives at the array's own resolution level; target-side endpoints live at ``this_level + level_delta``.",
+      "description": "``.zattrs`` for a ``cross_chunk_links/<delta>/`` group (0.8 partitioned layout).  Records live in leaves at ``cross_chunk_links/<delta>/<chunk_sorted_0>/.../<chunk_sorted_{K-1}>/data`` where the K segments are the lex-sorted unique chunks each record's endpoints touch (1 \u2264 K \u2264 link_width).  Each record is ``link_width`` chunk-indices (uint8) followed by ``link_width`` vertex indices (int64) \u2014 exactly ``9 * link_width`` bytes per record.  ``link_width=2`` encodes a cross-chunk edge, ``link_width=3`` a triangle face record, ``link_width=4`` a quad face, ``link_width=1`` a single parent\u2192child reference.  The source-side endpoint (endpoint 0) lives at the array's own resolution level; target-side endpoints live at ``this_level + level_delta``.  ``num_links`` is no longer stored at the group level \u2014 per-leaf counts are derivable from leaf byte length.  ``layout`` discriminates between layout versions; ``\"partitioned_v1\"`` is the only legal value in 0.8.",
       "properties": {
+        "layout": {
+          "const": "partitioned_v1",
+          "description": "On-disk layout discriminator for partitioned cross-chunk-link arrays.  ``\"partitioned_v1\"`` is the only legal value in 0.8 and signals the K-deep sorted-chunks leaf layout described in :class:`CrossChunkLinksMeta`.  Stamped on both ``cross_chunk_links/<delta>/`` and ``cross_chunk_link_attributes/<name>/<delta>/`` groups.\n",
+          "type": "string"
+        },
         "level_delta": {
           "description": "Pyramid-level delta between the source side (the level that owns this array) and the target side of the edges.  ``0`` for intra-level arrays (the only kind written pre-0.4), ``+N`` for edges from this level to ``this_level + N`` (coarser), ``-N`` for edges to ``this_level - N`` (finer).\n",
           "type": "integer"
@@ -149,11 +154,6 @@
         "link_width": {
           "description": "Width of a links row (1 for parent\u2192child metanode references, 2 for edges, 3 for triangle faces, 4 for quads).\n",
           "minimum": 1,
-          "type": "integer"
-        },
-        "num_links": {
-          "description": "Total cross-chunk link count.",
-          "minimum": 0,
           "type": "integer"
         },
         "sid_ndim": {
@@ -169,10 +169,10 @@
       },
       "required": [
         "zv_array",
-        "num_links",
         "sid_ndim",
         "level_delta",
-        "link_width"
+        "link_width",
+        "layout"
       ],
       "title": "CrossChunkLinksMeta",
       "type": "object"
@@ -212,10 +212,47 @@
         "preserved_object_ids",
         "shared_fragments",
         "fragment_index",
-        "multiscale_links"
+        "multiscale_links",
+        "partitioned_cross_chunk_links"
       ],
       "title": "FormatCapability",
       "type": "string"
+    },
+    "FragmentAttributeMeta": {
+      "additionalProperties": false,
+      "description": "``.zattrs`` for each ``fragment_attributes/<name>/`` array.  Stored as a dense per-chunk byte blob; each chunk holds a row per fragment, with shape ``(num_fragments_in_chunk,)`` or ``(num_fragments_in_chunk, len(channel_names))``.  Per-chunk fragment counts are derived from ``vertex_fragments/<chunk>`` at read time.  Replace-only at the chunk level.",
+      "properties": {
+        "channel_names": {
+          "description": "For multi-channel per-vertex attributes, the channel labels.",
+          "items": {
+            "type": "string"
+          },
+          "type": [
+            "array",
+            "null"
+          ]
+        },
+        "dtype": {
+          "description": "Numpy dtype string of the array's value type (e.g. \"float32\").",
+          "type": "string"
+        },
+        "name": {
+          "description": "NGFF axis or attribute name (e.g. \"x\", \"intensity\").",
+          "type": "string"
+        },
+        "zv_array": {
+          "$ref": "#/$defs/ZvArrayTag",
+          "const": "fragment_attribute",
+          "description": "Discriminator slot identifying the kind of per-array ``.zattrs`` block.  Each writer in ``core/arrays.py`` stamps the corresponding token from :class:`ZvArrayTag`.\n"
+        }
+      },
+      "required": [
+        "zv_array",
+        "name",
+        "dtype"
+      ],
+      "title": "FragmentAttributeMeta",
+      "type": "object"
     },
     "GeometryType": {
       "description": "The kind of geometry a store (or one of its sub-types) holds.",
@@ -648,7 +685,7 @@
           ]
         },
         "zv_version": {
-          "description": "ZV spec version this store was written against (e.g. \"0.5.0\"). Renamed from ``format_version`` in 0.5.0 to disambiguate from Zarr v3's ``zarr_format`` field.\n",
+          "description": "ZV spec version this store was written against (e.g. \"0.8.0\"). Renamed from ``format_version`` in 0.5.0 to disambiguate from Zarr v3's ``zarr_format`` field.  ``0.8`` introduced the partitioned cross-chunk-link layout (``cross_chunk_links/<delta>/<chunk_sorted_0>/.../<chunk_sorted_{K-1}>/data``); stores at that version MUST carry the ``partitioned_cross_chunk_links`` capability token alongside ``multiscale_links``.\n",
           "pattern": "^\\d+\\.\\d+(\\.\\d+)?$",
           "type": "string"
         }
@@ -695,6 +732,7 @@
         "link_fragments",
         "links",
         "attribute",
+        "fragment_attribute",
         "object_index",
         "object_attribute",
         "groupings",
@@ -707,10 +745,10 @@
       "type": "string"
     }
   },
-  "$id": "https://w3id.org/zarr-vectors/schema/0.5",
+  "$id": "https://w3id.org/zarr-vectors/schema/0.8",
   "$schema": "https://json-schema.org/draft/2019-09/schema",
   "additionalProperties": true,
-  "metamodel_version": "1.7.0",
+  "metamodel_version": "1.11.0",
   "title": "zarr_vectors",
   "type": "object",
   "version": null

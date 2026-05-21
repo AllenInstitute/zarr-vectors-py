@@ -102,13 +102,18 @@ and validates each independently.
 
 | Check | Rule | Failure type |
 |-------|------|--------------|
-| `ccl_chunk_coords_arity` | Every endpoint's chunk-coord tuple has length `sid_ndim` | Error |
-| `ccl_src_chunk_exists` | For every `<delta>`: endpoint A's chunk_coords name a chunk present in the owning level's chunk grid (i.e. exists in `vertex_fragments/`) | Error |
-| `ccl_tgt_chunk_exists` | For `delta == 0` only: endpoint B's chunk_coords name a chunk present in the owning level's chunk grid | Error |
-| `ccl_tgt_chunk_at_offset_level` | For `delta != 0`: endpoint B's chunk_coords are validated when the walker reaches level `source_level + delta` | Error |
-| `ccl_attribute_length` | For every `cross_chunk_link_attributes/<name>/<delta>/`: meta `num_links` matches the parallel `cross_chunk_links/<delta>/` meta | Error |
+| `ccl_path_chunk_arity` | Each K-deep leaf path segment under `cross_chunk_links/<delta>/` parses to a chunk-coord tuple of length `sid_ndim` | Error |
+| `ccl_path_lex_sorted` | The K segments under `<delta>` are in strict lex order: `chunk_sorted_0 < chunk_sorted_1 < … < chunk_sorted_{K-1}` | Error |
+| `ccl_leaf_record_size` | Every leaf's byte length is a multiple of `9 * link_width` | Error |
+| `ccl_ci_range` | For every record, every `ci_i ∈ [0, K-1]` | Error |
+| `ccl_coverage` | For every record, the set `{ci_0, …, ci_{L-1}}` equals `{0, 1, …, K-1}` — every chunk listed in the leaf path is referenced by at least one endpoint.  Records that don't use every path-listed chunk belong in a smaller-K leaf. | Error |
+| `ccl_canonical_l2_delta0` | For `delta=0, L=2` leaves, every record has `ci = [0, 1]` (canonical undirected orientation) | Error |
+| `ccl_src_chunk_exists` | For every `<delta>`: the chunk segment(s) used by the owning-level side (`ci_0`'s chunk) name chunks present in the owning level's `vertex_fragments/` | Error |
+| `ccl_tgt_chunk_exists` | For `delta == 0` only: every path segment names a chunk present in the owning level's chunk grid | Error |
+| `ccl_tgt_chunk_at_offset_level` | For `delta != 0`: chunk segments used by target-side endpoints (`ci_{i>0}`) are validated when the walker reaches level `source_level + delta` | Error |
+| `ccl_attribute_parity` | For every `cross_chunk_link_attributes/<name>/<delta>/<…>/data` leaf, record count equals the parallel `cross_chunk_links/<delta>/<same path>/data` leaf record count | Error |
+| `ccl_same_chunk_warning` | K=1 leaves (`cross_chunk_links/<delta>/<X>/data`) are allowed but trigger a warning recommending `links/<delta>/<X>` for natural intra-chunk edges; reserve K=1 cross-chunk-link leaves for special-case bridges | Warning |
 | `ccl_no_polyline_cycles` | For polyline/streamline stores at `delta == 0`: the directed graph formed by intra-level cross-chunk links contains no cycles | Error |
-| `ccl_no_duplicate_undirected` | For undirected graph stores at `delta == 0`: no link `[a, b]` co-exists with `[b, a]` | Error |
 
 ### Edge index checks
 

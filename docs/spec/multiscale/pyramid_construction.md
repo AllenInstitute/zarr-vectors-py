@@ -293,7 +293,9 @@ which:
 4. Partitions via
    [`partition_cross_level_edges`](../../../zarr_vectors/spatial/boundary.py)
    into chunk-aligned (`links/+delta/<chunk>`) and cross-chunk
-   (`cross_chunk_links/+delta/data`) buckets.
+   (`cross_chunk_links/+delta/<chunk_sorted_0>/.../<chunk_sorted_{K-1}>/data`,
+   one leaf per sorted unique chunk set) buckets — see the
+   [partitioned cross-chunk-link layout](../object_model/cross_chunk_links.md).
 5. Writes the `+delta` arrays at the fine level; if
    `cross_level_storage="explicit"`, also writes the swapped-endpoint
    `-delta` arrays at the coarse level.

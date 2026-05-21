@@ -120,10 +120,14 @@ tracts.zarrvectors/
     │   ├── zarr.json
     │   └── c/ …
     │
-    ├── cross_chunk_links/       # inter-chunk edges (global flat blob)
+    ├── cross_chunk_links/       # inter-chunk edges (partitioned by sorted-unique chunks)
     │   └── 0/
-    │       ├── zarr.json        # num_links, sid_ndim, level_delta=0
-    │       └── data             # 2*(sid_ndim+1) int64s per link
+    │       ├── zarr.json        # sid_ndim, level_delta=0, link_width, layout="partitioned_v1"
+    │       ├── 0.0.0/
+    │       │   ├── data         # K=1 leaf: same-chunk records, 9*link_width B per record
+    │       │   └── 1.0.0/
+    │       │       └── data     # K=2 leaf: (0.0.0, 1.0.0) records, 9*link_width B per record
+    │       └── …                # one nested chunk subtree per (sorted unique chunks) set
     │
     ├── link_attributes/         # per-edge attrs, parallel to links/<delta>/
     │   └── weight/
@@ -131,11 +135,13 @@ tracts.zarrvectors/
     │           ├── zarr.json
     │           └── c/ …
     │
-    ├── cross_chunk_link_attributes/    # per-CCL attrs (NEW in 0.4)
-    │   └── weight/                     # parallel to cross_chunk_links/<delta>/data
+    ├── cross_chunk_link_attributes/    # per-CCL attrs (partitioned same as CCL)
+    │   └── weight/                     # parallel leaf-for-leaf to cross_chunk_links/<delta>/<...>/data
     │       └── 0/
-    │           ├── zarr.json           # num_links matches CCL meta
-    │           └── data
+    │           ├── zarr.json           # dtype, layout="partitioned_v1"
+    │           └── 0.0.0/
+    │               └── 1.0.0/
+    │                   └── data        # one row per matching CCL record
     │
     ├── attributes/              # per-vertex attributes (e.g. FA, MD)
     │
@@ -264,7 +270,7 @@ Per-vertex and per-object custom attributes must be placed under
 | `links/<delta>/` | polyline, streamline, graph, skeleton (`link_width=2`); mesh (`link_width=3`) | `<delta>=0` for intra-level edges; `<delta>=±N` for cross-pyramid-level edges (0.4+) |
 | `cross_chunk_links/<delta>/` | Any geometry whose objects can span multiple chunks | `<delta>=0` always; `±N` when `cross_level_depth > 0` |
 | `link_attributes/<name>/<delta>/` | Any geometry that wrote `edge_attributes` | Parallel to `links/<delta>/` |
-| `cross_chunk_link_attributes/<name>/<delta>/` | Any geometry with cross-chunk per-edge attrs (0.4+) | Parallel to `cross_chunk_links/<delta>/data` |
+| `cross_chunk_link_attributes/<name>/<delta>/` | Any geometry with cross-chunk per-edge attrs (0.4+) | Partitioned leaves parallel to `cross_chunk_links/<delta>/<chunk_sorted_0>/.../<chunk_sorted_{K-1}>/data` (0.6+) |
 | `attributes/` | All types | Optional if no per-vertex attributes |
 | `object_index/` | polyline, streamline, graph, skeleton, mesh | |
 | `object_attributes/` | Any type | Optional |
