@@ -194,3 +194,39 @@ Sharding requires Zarr v3 ≥ 2.18 (where `sharding_indexed` is built in).
 Readers that use an older Zarr version will fail to open sharded arrays.
 Document the use of sharding in the store's root `.zattrs` `"notes"` field
 to ensure consumers are aware of the requirement.
+
+### Implementation notes (zarr-vectors-py)
+
+* Each ZVF logical array (`vertices`, `vertex_fragments`, `links/<delta>`,
+  `link_fragments`, `cross_chunk_links/<delta>/<cell>`, attribute arrays,
+  ...) maps to a single Zarr v3 vlen-bytes array whose shape is the
+  level's chunk grid. One cell of that array holds one ZVF spatial
+  chunk's payload bytes; absent chunks are vlen-bytes `b""` (the codec's
+  fill value).
+* The sharding codec is configured with `chunk_shape = (1,)*ndim`
+  (one ZVF chunk per inner Zarr chunk) and an outer chunk shape equal
+  to `shard_shape`. zarr-python ≥ 3.2 exposes this directly via the
+  `shards=` kwarg on `create_array`.
+* A per-array `nonempty_chunks` attribute (a sorted list of chunk
+  keys) is maintained as a side-channel manifest so `list_chunks` and
+  `chunk_exists` stay O(1) — without it, those calls would have to
+  fetch every shard index to find non-empty cells.
+* No custom space-filling-curve (Morton/Hilbert) mapping is used.
+  The native codec already clusters spatially-adjacent inner chunks
+  into the same shard via the C-order outer grid, which delivers the
+  same read-locality benefit without a ZV-specific indirection.
+
+### Conversion API
+
+```python
+from zarr_vectors.sharding import shard_store, unshard_store, reshard
+
+shard_store("scan.zv", shard_shape=8)          # 8x8x8 = 512 chunks/shard
+shard_store("scan.zv", shard_shape=(4, 4, 16)) # anisotropic
+unshard_store("scan.zv")                       # back to per-chunk objects
+reshard("scan.zv", 4)                          # change shard shape in place
+reshard("scan.zv", None)                       # equivalent to unshard_store
+```
+
+Both conversion functions are idempotent: shards already in the
+requested layout are skipped, and unsharding a flat store is a no-op.

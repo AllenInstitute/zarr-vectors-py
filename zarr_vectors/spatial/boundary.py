@@ -8,9 +8,13 @@ and split ordered polylines at chunk boundaries.
 
 from __future__ import annotations
 
+import math
+from typing import Sequence
+
 import numpy as np
 import numpy.typing as npt
 
+from zarr_vectors.core.paths import format_cell_key
 from zarr_vectors.exceptions import ChunkingError
 from zarr_vectors.spatial.chunking import compute_chunk_coords
 from zarr_vectors.typing import ChunkCoords, ChunkShape, CrossChunkLink
@@ -318,6 +322,156 @@ def partition_faces(
     ]
 
     return intra, cross
+
+
+# ===================================================================
+# Canonical chunk-tuple sort + Lehmer-coded permutation
+# ===================================================================
+#
+# A cross-chunk record is a list of L (chunk_coords, vertex_idx)
+# endpoints.  For the per-tuple cell layout we lex-sort those L
+# endpoints by ``(chunk_coords, vertex_idx)`` and store the records
+# under the dotted concatenation of the sorted chunk_coords (see
+# :func:`zarr_vectors.core.paths.format_cell_key`).
+#
+# The sort is destructive of the input endpoint order — but mesh
+# face winding and directed-graph edge direction depend on that
+# order.  We preserve it by storing one ``perm_idx`` int per record:
+# the Lehmer code of the permutation ``sorted_idx`` that maps
+# canonical position i back to the original input position
+# (``input[sorted_idx[i]] == canonical[i]``).
+#
+# Lehmer codes pack a permutation of length L into an integer in
+# ``[0, L!)``.  L=1 → 1 code, L=2 → 2, L=3 → 6, L=4 → 24 — all fit
+# comfortably in an int64 slot.
+
+
+def canonical_sort(
+    record: Sequence[tuple[ChunkCoords, int]],
+) -> tuple[list[tuple[ChunkCoords, int]], int]:
+    """Lex-sort a record's endpoints and return ``(sorted, perm_idx)``.
+
+    ``perm_idx`` is the Lehmer code of the permutation
+    ``sorted_idx`` such that ``input[sorted_idx[i]] == sorted[i]``
+    for all ``i``.  Pass it to :func:`apply_perm_inverse` on read
+    to recover the original endpoint order.
+    """
+    L = len(record)
+    if L == 0:
+        raise ValueError("canonical_sort requires a non-empty record")
+    sort_keys = [(tuple(c), int(v)) for c, v in record]
+    indexed = sorted(range(L), key=lambda i: sort_keys[i])
+    sorted_record = [(tuple(record[j][0]), int(record[j][1])) for j in indexed]
+    perm_idx = _lehmer_encode(indexed)
+    return sorted_record, perm_idx
+
+
+def apply_perm_inverse(
+    sorted_vals: Sequence, perm_idx: int, L: int,
+) -> list:
+    """Recover the original input order from canonical-sorted values.
+
+    Given ``sorted_vals`` of length L and the ``perm_idx`` produced
+    by :func:`canonical_sort`, returns the values in their original
+    input order.
+    """
+    if len(sorted_vals) != L:
+        raise ValueError(
+            f"apply_perm_inverse: len(sorted_vals)={len(sorted_vals)} "
+            f"!= L={L}"
+        )
+    sorted_idx = _lehmer_decode(perm_idx, L)
+    # sorted_idx[i] = original input position of canonical-position-i.
+    # Therefore input[sorted_idx[i]] = sorted_vals[i].
+    out = [None] * L
+    for i in range(L):
+        out[sorted_idx[i]] = sorted_vals[i]
+    return out
+
+
+def _lehmer_encode(perm: Sequence[int]) -> int:
+    """Encode a permutation of ``range(L)`` as an integer in ``[0, L!)``."""
+    L = len(perm)
+    available = list(range(L))
+    code = 0
+    fact = math.factorial(L)
+    for i in range(L):
+        fact //= (L - i)
+        idx = available.index(perm[i])
+        code += idx * fact
+        available.pop(idx)
+    return code
+
+
+def _lehmer_decode(code: int, L: int) -> list[int]:
+    """Inverse of :func:`_lehmer_encode`."""
+    if L < 1:
+        raise ValueError(f"L must be >= 1, got {L}")
+    upper = math.factorial(L)
+    if not (0 <= code < upper):
+        raise ValueError(
+            f"perm_idx {code} out of range [0, {L}!) = [0, {upper})"
+        )
+    available = list(range(L))
+    perm = [0] * L
+    fact = upper
+    for i in range(L):
+        fact //= (L - i)
+        idx = code // fact
+        code %= fact
+        perm[i] = available[idx]
+        available.pop(idx)
+    return perm
+
+
+def partition_cross_records_by_tuple(
+    records: Sequence[Sequence[tuple[ChunkCoords, int]]],
+    link_width: int,
+    sid_ndim: int,
+) -> dict[str, list[tuple[list[int], int]]]:
+    """Group cross-chunk records by canonical chunk-tuple key.
+
+    For each record:
+    - canonical-sort its endpoints with :func:`canonical_sort`,
+    - build the cell key from the sorted chunk coords via
+      :func:`zarr_vectors.core.paths.format_cell_key`,
+    - emit ``(vi_canonical_list, perm_idx)`` into that key's bucket.
+
+    Within a bucket, records preserve their input ordering — callers
+    relying on row-aligned attribute arrays can depend on this.
+
+    Args:
+        records: List of records; each record is a sequence of
+            ``(chunk_coords, vertex_idx)`` tuples of length
+            ``link_width``.
+        link_width: Endpoints per record.  Records of any other
+            arity raise ``ChunkingError``.
+        sid_ndim: Number of spatial index dimensions; every
+            ``chunk_coords`` must have this arity.
+
+    Returns:
+        Dict mapping ``cell_key`` → list of ``(vi_canonical, perm_idx)``
+        tuples.  ``vi_canonical`` is a length-L list of int vertex
+        indices in canonical (sorted) order.
+    """
+    buckets: dict[str, list[tuple[list[int], int]]] = {}
+    for rec in records:
+        if len(rec) != link_width:
+            raise ChunkingError(
+                f"partition_cross_records_by_tuple: record arity "
+                f"{len(rec)} != link_width {link_width}"
+            )
+        for chunk, _vi in rec:
+            if len(chunk) != sid_ndim:
+                raise ChunkingError(
+                    f"partition_cross_records_by_tuple: chunk_coords "
+                    f"arity {len(chunk)} != sid_ndim {sid_ndim}"
+                )
+        sorted_rec, perm_idx = canonical_sort(rec)
+        key = format_cell_key([c for c, _ in sorted_rec])
+        vi_canonical = [int(v) for _, v in sorted_rec]
+        buckets.setdefault(key, []).append((vi_canonical, perm_idx))
+    return buckets
 
 
 # ===================================================================

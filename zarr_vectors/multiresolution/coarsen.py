@@ -391,7 +391,9 @@ def _per_object_coarsen(
     src_obj_attr_group_name = f"{OBJECT_ATTRIBUTES}"
     if src_obj_attr_group_name in src_group:
         src_obj_attr_group = src_group[src_obj_attr_group_name]
-        attr_names = [n for n in src_obj_attr_group]
+        # children() covers both layouts: Option-G groups under
+        # group_keys() and 0.8.1 standalone arrays under array_keys().
+        attr_names = src_obj_attr_group.children()
     else:
         attr_names = []
     for attr_name in attr_names:

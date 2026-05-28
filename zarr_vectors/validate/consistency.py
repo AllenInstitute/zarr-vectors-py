@@ -177,28 +177,76 @@ def validate_consistency(store_path: str | Path) -> ValidationResult:
         except Exception:
             pass
 
-        # Walk every cross_chunk_links/<delta>/ array.  For delta=0
-        # both endpoints must live in this level's chunk grid; for
-        # delta != 0 only the source side (endpoint A) is constrained
-        # here (endpoint B lives at this_level + delta and is validated
-        # when that level is reached).
+        # Walk every cross_chunk_links/<delta>/ family.  Two passes:
+        #
+        # (a) Structural pass — for each cell key, parse the dotted
+        #     canonical chunk-tuple and check the cell-key arity
+        #     (sid_ndim * link_width) and the canonical-sort
+        #     invariant (chunks non-decreasing in lex order).
+        # (b) Endpoint-presence pass — read records in input order
+        #     via read_cross_chunk_links so endpoint 0 is the
+        #     owning-level source.  For delta=0 every endpoint must
+        #     exist in this level's chunk grid; for delta != 0 only
+        #     endpoint 0 is constrained here.
         from zarr_vectors.core.arrays import list_cross_link_deltas
+        from zarr_vectors.core.paths import (
+            cross_chunk_links_path, parse_cell_key,
+        )
         for d in list_cross_link_deltas(lg):
+            family = cross_chunk_links_path(d)
+            try:
+                family_meta = lg.read_array_meta(family) or {}
+                link_width = int(family_meta.get("link_width", 2))
+                ccl_sid_ndim = int(family_meta.get("sid_ndim", 0))
+            except Exception:
+                continue
+            if ccl_sid_ndim == 0:
+                continue
+
+            cell_keys = sorted(lg.list_chunks(family))
+            for ckey in cell_keys:
+                try:
+                    canonical_chunks = parse_cell_key(
+                        ckey, sid_ndim=ccl_sid_ndim, link_width=link_width,
+                    )
+                except ValueError as exc:
+                    result.add_error(
+                        f"{prefix}: ccl[delta={d}] cell {ckey!r} "
+                        f"malformed: {exc}"
+                    )
+                    continue
+                for i in range(1, link_width):
+                    if canonical_chunks[i] < canonical_chunks[i - 1]:
+                        result.add_error(
+                            f"{prefix}: ccl[delta={d}] cell {ckey!r} "
+                            f"violates canonical-sort invariant"
+                        )
+                        break
+
             try:
                 ccl = read_cross_chunk_links(lg, delta=d)
             except Exception:
-                continue
-            for (ca, _), (cb, _) in ccl:
-                if ca not in chunk_fragment_counts:
+                ccl = []
+            for record in ccl:
+                # record is a tuple of (chunk_coords, vi) endpoints
+                # in input order; endpoint 0 is the owning-level
+                # source side.
+                src_chunk = record[0][0]
+                if src_chunk not in chunk_fragment_counts:
                     result.add_error(
-                        f"{prefix}: ccl[delta={d}] refs non-existent chunk {ca}"
+                        f"{prefix}: ccl[delta={d}] refs non-existent "
+                        f"source chunk {src_chunk}"
                     )
-                if d == 0 and cb not in chunk_fragment_counts:
-                    result.add_error(
-                        f"{prefix}: ccl[delta=0] refs non-existent chunk {cb}"
-                    )
+                if d == 0:
+                    for ep_chunk, _ in record[1:]:
+                        if ep_chunk not in chunk_fragment_counts:
+                            result.add_error(
+                                f"{prefix}: ccl[delta=0] refs "
+                                f"non-existent chunk {ep_chunk}"
+                            )
             result.add_pass(
-                f"{prefix}: ccl[delta={d}] validated ({len(ccl)} links)"
+                f"{prefix}: ccl[delta={d}] validated "
+                f"({len(ccl)} links across {len(cell_keys)} cells)"
             )
 
     return result

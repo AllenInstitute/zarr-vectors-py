@@ -1,16 +1,35 @@
-"""Configurable shard layouts for zarr vectors stores.
+"""Native-codec sharding for ZV stores.
 
-Supports packing multiple chunks into shard files with spatial
-ordering (octree/Morton, Hilbert snake) or flat index-table layout.
+Sharding packs many ZVF per-chunk byte blobs into a single storage
+object via Zarr v3's built-in ``sharding_indexed`` codec.  The result
+is a fully spec-compliant Zarr store readable by any standards-compliant
+Zarr v3 implementation.
 
-Usage::
+Public API:
 
-    from zarr_vectors.sharding import ShardLayout, ShardCodec
+    from zarr_vectors.sharding import shard_store, unshard_store, reshard
 
-    codec = ShardCodec(ShardLayout.OCTREE, shard_size=64, ndim=3)
-    shard_id = codec.chunk_to_shard_id((2, 3, 1))
+    shard_store("scan.zv", shard_shape=8)        # 8x8x8 = 512 chunks/shard
+    info = get_shard_info("scan.zv")
+    unshard_store("scan.zv")                     # back to flat
+
+See :doc:`/spec/chunking/sharding` for the full design rationale.
 """
 
-from zarr_vectors.sharding.layout import ShardLayout, ShardCodec
+from zarr_vectors.sharding.io import (
+    get_shard_info,
+    is_sharded,
+    reshard,
+    shard_store,
+    unshard_store,
+)
+from zarr_vectors.sharding.layout import ShardLayout
 
-__all__ = ["ShardLayout", "ShardCodec"]
+__all__ = [
+    "ShardLayout",
+    "get_shard_info",
+    "is_sharded",
+    "reshard",
+    "shard_store",
+    "unshard_store",
+]

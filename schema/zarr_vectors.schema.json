@@ -103,7 +103,7 @@
     },
     "CrossChunkLinkAttributeMeta": {
       "additionalProperties": false,
-      "description": "``.zattrs`` for each ``cross_chunk_link_attributes/<name>/<delta>/`` array.  Stored as a flat blob parallel to the ``data`` blob of the matching ``cross_chunk_links/<delta>/`` array; ``num_links`` MUST equal the parallel CCL array's ``num_links``.",
+      "description": "``.zattrs`` for each ``cross_chunk_link_attributes/<name>/<delta>/`` parent group.  In 0.8 the parallel link family was split into per-cell arrays keyed on the canonical-sorted L-tuple of endpoint chunks.  This attribute family mirrors that layout: per-cell byte blobs with one row per record, in the same write order as the matching cell.  ``num_links`` MUST equal the parallel CCL family's ``num_links``.",
       "properties": {
         "dtype": {
           "description": "Numpy dtype string of the array's value type (e.g. \"float32\").",
@@ -140,7 +140,7 @@
     },
     "CrossChunkLinksMeta": {
       "additionalProperties": false,
-      "description": "``.zattrs`` for a ``cross_chunk_links/<delta>/`` array.  Each delta segment carries its own meta block; ``level_delta=0`` is the intra-level array.  Each record is ``link_width`` ``(chunk_coords, vertex_idx)`` endpoints \u2014 ``link_width=2`` encodes a cross-chunk edge, ``link_width=3`` a triangle face record, and so on.  Source-side endpoint (endpoint 0) lives at the array's own resolution level; target-side endpoints live at ``this_level + level_delta``.",
+      "description": "``.zattrs`` for a ``cross_chunk_links/<delta>/`` parent group. In 0.8 the family stores per-cell arrays keyed on the canonical-sorted L-tuple of endpoint chunks (``cross_chunk_links/<delta>/<x.y.z...>`` \u2014 exactly ``sid_ndim * link_width`` dotted components).  Each cell holds records spanning that exact L-tuple of chunks; each record is ``[perm_idx, vi_0, ..., vi_{L-1}]`` int64s, where ``perm_idx`` is the Lehmer code of the canonical\u2192input-order permutation (so readers can recover original endpoint order \u2014 mesh-face winding, directed-edge direction).  Source-side endpoint (input endpoint 0) lives at the array's own resolution level; target-side endpoints live at ``this_level + level_delta``.  ``num_links`` is the family- wide total record count.",
       "properties": {
         "level_delta": {
           "description": "Pyramid-level delta between the source side (the level that owns this array) and the target side of the edges.  ``0`` for intra-level arrays (the only kind written pre-0.4), ``+N`` for edges from this level to ``this_level + N`` (coarser), ``-N`` for edges to ``this_level - N`` (finer).\n",
@@ -216,6 +216,42 @@
       ],
       "title": "FormatCapability",
       "type": "string"
+    },
+    "FragmentAttributeMeta": {
+      "additionalProperties": false,
+      "description": "``.zattrs`` for each ``fragment_attributes/<name>/`` array.  Stored as a dense per-chunk byte blob; each chunk holds a row per fragment, with shape ``(num_fragments_in_chunk,)`` or ``(num_fragments_in_chunk, len(channel_names))``.  Per-chunk fragment counts are derived from ``vertex_fragments/<chunk>`` at read time.  Replace-only at the chunk level.",
+      "properties": {
+        "channel_names": {
+          "description": "For multi-channel per-vertex attributes, the channel labels.",
+          "items": {
+            "type": "string"
+          },
+          "type": [
+            "array",
+            "null"
+          ]
+        },
+        "dtype": {
+          "description": "Numpy dtype string of the array's value type (e.g. \"float32\").",
+          "type": "string"
+        },
+        "name": {
+          "description": "NGFF axis or attribute name (e.g. \"x\", \"intensity\").",
+          "type": "string"
+        },
+        "zv_array": {
+          "$ref": "#/$defs/ZvArrayTag",
+          "const": "fragment_attribute",
+          "description": "Discriminator slot identifying the kind of per-array ``.zattrs`` block.  Each writer in ``core/arrays.py`` stamps the corresponding token from :class:`ZvArrayTag`.\n"
+        }
+      },
+      "required": [
+        "zv_array",
+        "name",
+        "dtype"
+      ],
+      "title": "FragmentAttributeMeta",
+      "type": "object"
     },
     "GeometryType": {
       "description": "The kind of geometry a store (or one of its sub-types) holds.",
@@ -695,6 +731,7 @@
         "link_fragments",
         "links",
         "attribute",
+        "fragment_attribute",
         "object_index",
         "object_attribute",
         "groupings",
@@ -710,7 +747,7 @@
   "$id": "https://w3id.org/zarr-vectors/schema/0.5",
   "$schema": "https://json-schema.org/draft/2019-09/schema",
   "additionalProperties": true,
-  "metamodel_version": "1.7.0",
+  "metamodel_version": "1.11.0",
   "title": "zarr_vectors",
   "type": "object",
   "version": null

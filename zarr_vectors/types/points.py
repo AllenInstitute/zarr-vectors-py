@@ -122,6 +122,7 @@ def write_points(
     chunk_by_attribute: str | None = None,
     out_of_bounds: str = DEFAULT_OOB_POLICY,
     compressor: Any = None,
+    shard_shape: int | tuple[int, ...] | None = None,
     # Deprecated alias for ``vertex_attributes``; will be removed.
     attributes: dict[str, npt.NDArray] | None = None,
 ) -> dict[str, Any]:
@@ -344,7 +345,17 @@ def write_points(
     # stores.  ``create_*_array`` calls only queue metadata while
     # batching is active.  See
     # :meth:`zarr_vectors.core.group.Group.batched_writes`.
-    with level_group.batched_writes(compressor=compressor):
+    #
+    # When ``shard_shape`` is set, also activate the native-sharded
+    # context — per-chunk-array creations route through Zarr v3's
+    # ``sharding_indexed`` codec, and per-chunk writes land directly in
+    # the array's grid cells (bypassing the batched queue).  See
+    # :meth:`zarr_vectors.core.group.Group.native_sharded_arrays`.
+    from zarr_vectors.core.arrays import open_write_session
+    with open_write_session(
+        level_group, compressor=compressor, shard_shape=shard_shape,
+        bounds=bounds_list, chunk_shape=chunk_shape,
+    ):
         create_vertices_array(level_group, dtype=dtype)
 
         if attributes:

@@ -9,8 +9,34 @@ everywhere in the package.
 # Format version
 # ---------------------------------------------------------------------------
 
-FORMAT_VERSION: str = "0.7.0"
+FORMAT_VERSION: str = "0.8.1"
 """Current ZV specification version.
+
+0.8.1: flat single-array layout for dense / ragged blobs.  Removes the
+``group-with-data-child`` pattern used by every non-spatial array
+(object_attributes, group_attributes, groups, parametric blobs,
+composite links) and writes each logical array as a single standard
+Zarr v3 array at its logical path.  Sparse coverage is expressed via
+the array's ``fill_value`` (NaN for floats, sentinel for integers)
+instead of a sibling ``present_mask`` child array.  Ragged arrays move
+to vlen-bytes codec, matching the layout ``object_index/manifests``
+already used.  Custom per-array attrs move from the parent group's
+``attributes`` into the array's own ``attributes`` block.  Hard break:
+0.8.0 stores are not readable; rewrite from source.
+
+0.8.0: per-tuple ``cross_chunk_links`` layout.  The global flat
+``cross_chunk_links/<delta>/data`` blob is replaced by per-cell
+arrays keyed on the canonical-sorted L-tuple of endpoint chunks
+(``cross_chunk_links/<delta>/<chunk_0.x.y.z>.<chunk_1.x.y.z>...``)
+where L = ``link_width``.  Each cell stores only the records
+spanning that exact chunk-tuple — readers scale with cell size,
+not store size.  Endpoint order is preserved via a Lehmer-coded
+``perm_idx`` int64 per record so mesh-face winding and directed-
+edge direction survive the canonical sort.  ``write_cross_chunk_links``
+returns a :class:`CrossChunkLinkPartition` instead of an ``int``;
+legacy callers can still ``int(partition)`` for the ``first_new``
+field.  Hard break: 0.7.x stores are not readable; rewrite from
+source.
 
 0.7.0: per-level ``chunk_shape``.  ``RootMetadata.chunk_shape`` remains
 the level-0 default; ``LevelMetadata`` gains an optional

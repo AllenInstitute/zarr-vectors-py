@@ -31,12 +31,15 @@ Public surface mirrors the legacy :class:`FsGroup` for back-compat:
 
 from __future__ import annotations
 
+import warnings
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Any, Iterator
+from typing import Any, Iterator, Sequence
 
 import numpy as np
 import zarr
+from zarr.codecs import VLenBytesCodec
+from zarr.errors import UnstableSpecificationWarning
 from zarr.storage import LocalStore
 
 from zarr_vectors.exceptions import StoreError
@@ -57,6 +60,12 @@ class Group:
     # Consumed by :meth:`write_bytes` and the batched flush in
     # :mod:`zarr_vectors.core._batch_writer`.
     _active_codecs: list[dict[str, Any]] | None = None
+    # When set, per-chunk-array creations route through the native
+    # ``sharding_indexed`` codec instead of the legacy Option-G layout.
+    # Set by :meth:`native_sharded_arrays`; the dict holds ``shard_shape``
+    # and ``grid_shape``.  Used by ``arrays._ensure_array_dir`` and the
+    # ``write_bytes`` / ``write_array_meta`` dispatch on this class.
+    _native_sharded_config: dict[str, tuple[int, ...]] | None = None
 
     def __init__(self, zarr_group: zarr.Group) -> None:
         self._zarr = zarr_group
@@ -71,6 +80,7 @@ class Group:
         # :meth:`read_bytes` looks here first before hitting the store.
         self._prefetch_cache = None
         self._active_codecs = None
+        self._native_sharded_config = None
 
     @classmethod
     def _from_zarr(cls, zarr_group: zarr.Group) -> Group:
@@ -135,14 +145,63 @@ class Group:
     def __iter__(self) -> Iterator[str]:
         yield from sorted(self._zarr.group_keys())
 
-    # ---------------- chunk I/O (Option G: 1 tiny array per chunk) ----------------
+    def children(self) -> list[str]:
+        """Return every immediate child name — both arrays and groups.
+
+        Use this when iterating a parent path that may contain a mix of
+        Option-G chunk-group children (vertex / link attributes) and
+        flat-array children (object / group attributes after the 0.8.1
+        migration).  ``__iter__`` deliberately yields groups only to
+        preserve back-compat for callers that predate the migration.
+        """
+        return sorted(
+            set(self._zarr.group_keys()) | set(self._zarr.array_keys())
+        )
+
+    # ---------------- chunk I/O ------------------------------------------
+    #
+    # Two physical layouts share this surface:
+    #
+    # * **Legacy "Option G"** — ``<array_name>`` is a Zarr Group whose
+    #   children are single-chunk ``uint8`` arrays, one per chunk key.
+    # * **Native sharded** — ``<array_name>`` is a single multidim Zarr
+    #   array (vlen-bytes) whose shape is the level's chunk grid; the
+    #   Zarr v3 ``sharding_indexed`` codec packs many cells into one
+    #   storage object.  Created via :meth:`create_sharded_chunk_array`
+    #   or by the migration tool in :mod:`zarr_vectors.sharding.io`.
+    #
+    # ``read_bytes`` / ``write_bytes`` / ``chunk_exists`` / ``list_chunks``
+    # dispatch on the node type at runtime so callers don't care which
+    # layout they're talking to.
 
     def write_bytes(self, array_name: str, chunk_key: str, data: bytes) -> None:
+        # Native-sharded fast path: a single Zarr Array at ``array_name``
+        # means we're talking to the standard ``sharding_indexed`` layout.
+        # The chunk's bytes live in one cell of that multidim vlen-bytes
+        # array; the sharding codec packs many such cells per shard file.
+        # Checked BEFORE the batched-write queue so that writers running
+        # under :meth:`native_sharded_arrays` always reach the array
+        # cells, even if an outer :meth:`batched_writes` is open.
+        sharded_arr = self._sharded_chunk_array(array_name)
+        if sharded_arr is not None:
+            coords = _parse_chunk_coords(chunk_key)
+            if coords is None:
+                raise StoreError(
+                    f"Cannot write to native-sharded array {array_name!r}: "
+                    f"chunk_key {chunk_key!r} is not a coord tuple"
+                )
+            _check_coords_in_bounds(coords, sharded_arr.shape, array_name)
+            _vlen_set_cell(sharded_arr, coords, bytes(data))
+            _record_nonempty_chunk(sharded_arr, chunk_key, present=bool(data))
+            return
+
         # Batched-write mode (see :meth:`batched_writes`): defer until
         # the context manager flushes all queued PUTs concurrently.
+        # Batched writes target the legacy Option-G layout only.
         if self._pending_writes is not None:
             self._pending_writes.append((array_name, chunk_key, bytes(data)))
             return
+
         arr_group = self._zarr.require_group(array_name)
         if chunk_key in arr_group:
             del arr_group[chunk_key]
@@ -284,6 +343,54 @@ class Group:
             self._pending_array_metas = None
             self._active_codecs = None
 
+    @contextmanager
+    def native_sharded_arrays(
+        self,
+        shard_shape: tuple[int, ...],
+        grid_shape: tuple[int, ...],
+    ) -> Iterator[None]:
+        """Make subsequent per-chunk-array creations native-sharded.
+
+        Inside this block, every :func:`zarr_vectors.core.arrays._ensure_array_dir`
+        call for a per-spatial-chunk array (vertices, vertex_fragments,
+        links/<delta>, link_fragments, vertex_attributes/<name>,
+        fragment_attributes/<name>) allocates a single multidim
+        vlen-bytes Zarr array at that path using Zarr v3's
+        ``sharding_indexed`` codec — instead of the legacy Option-G
+        group-of-tiny-arrays.  Subsequent
+        :meth:`write_bytes` calls go through the grid-coord write
+        dispatch on this class, so callers don't need to change.
+
+        Args:
+            shard_shape: Outer-chunk shape in *inner-chunk* units, e.g.
+                ``(8, 8, 8)``.  Length must match ``grid_shape``.
+            grid_shape: Number of spatial chunks along each axis at
+                this level.  Compute via
+                :func:`zarr_vectors.spatial.chunking.compute_grid_shape`.
+
+        Nesting is not supported; an inner call raises :class:`StoreError`.
+        The legacy ``batched_writes`` context can be active concurrently
+        — writes still route through the sharded path (the batched
+        queue's flush is a no-op when nothing is queued).
+        """
+        if self._native_sharded_config is not None:
+            raise StoreError(
+                "native_sharded_arrays() does not support nesting"
+            )
+        if len(shard_shape) != len(grid_shape):
+            raise StoreError(
+                f"shard_shape rank {len(shard_shape)} != grid_shape "
+                f"rank {len(grid_shape)}"
+            )
+        self._native_sharded_config = {
+            "shard_shape": tuple(int(s) for s in shard_shape),
+            "grid_shape": tuple(int(g) for g in grid_shape),
+        }
+        try:
+            yield
+        finally:
+            self._native_sharded_config = None
+
     def read_bytes(self, array_name: str, chunk_key: str) -> bytes:
         # Batched-read mode (see :meth:`batched_reads`): serve from the
         # prefetch cache when possible.  Cache misses fall through to
@@ -294,13 +401,20 @@ class Group:
             if cached is not None:
                 return cached
 
+        sharded_arr = self._sharded_chunk_array(array_name)
+        if sharded_arr is not None:
+            coords = _parse_chunk_coords(chunk_key)
+            if coords is None or not _coords_in_bounds(coords, sharded_arr.shape):
+                raise StoreError(
+                    f"Chunk {array_name!r}/{chunk_key!r} not found in "
+                    f"{self._zarr.path or '<root>'}"
+                )
+            return _vlen_get_cell(sharded_arr, coords)
+
         path = f"{array_name}/{chunk_key}"
         try:
             arr = self._zarr[path]
         except KeyError:
-            shard_bytes = _read_from_shard(self._zarr, array_name, chunk_key)
-            if shard_bytes is not None:
-                return shard_bytes
             raise StoreError(
                 f"Chunk {array_name!r}/{chunk_key!r} not found in "
                 f"{self._zarr.path or '<root>'}"
@@ -314,9 +428,19 @@ class Group:
         return bytes(np.asarray(arr[:]).tobytes())
 
     def chunk_exists(self, array_name: str, chunk_key: str) -> bool:
-        if f"{array_name}/{chunk_key}" in self._zarr:
-            return True
-        return _shard_index_contains(self._zarr, array_name, chunk_key)
+        sharded_arr = self._sharded_chunk_array(array_name)
+        if sharded_arr is not None:
+            present = sharded_arr.attrs.get(_NONEMPTY_CHUNKS_ATTR)
+            if present is not None:
+                return chunk_key in present
+            # Fall back to inspecting the cell — slow path used when the
+            # presence manifest is missing (e.g. mid-migration).
+            coords = _parse_chunk_coords(chunk_key)
+            if coords is None or not _coords_in_bounds(coords, sharded_arr.shape):
+                return False
+            return _vlen_get_cell(sharded_arr, coords) != b""
+
+        return f"{array_name}/{chunk_key}" in self._zarr
 
     def list_chunks(self, array_name: str) -> list[str]:
         if array_name not in self._zarr:
@@ -325,22 +449,27 @@ class Group:
             node = self._zarr[array_name]
         except KeyError:
             return []
+        if isinstance(node, zarr.Array):
+            # Native-sharded layout.  Trust the per-array presence
+            # manifest written by ``write_bytes``; without it we'd have
+            # to fetch every shard index to find non-empty cells.
+            present = node.attrs.get(_NONEMPTY_CHUNKS_ATTR)
+            return sorted(present) if present else []
         if not isinstance(node, zarr.Group):
             return []
-        keys: set[str] = set()
-        for k in node.array_keys():
-            if k.startswith("__shard_"):
-                shard_arr = node[k]
-                index = shard_arr.attrs.get("shard_index", None)
-                if index:
-                    keys.update(index.keys())
-            else:
-                keys.add(k)
-        return sorted(keys)
+        return sorted(node.array_keys())
 
     # ---------------- array metadata ----------------
 
     def write_array_meta(self, array_name: str, meta: dict[str, Any]) -> None:
+        # Native-sharded fast path: write directly to the multidim
+        # array's ``attrs`` (the Zarr-spec location for per-array user
+        # metadata).  Checked BEFORE the batched queue so that writers
+        # under :meth:`native_sharded_arrays` always land on the array.
+        sharded_arr = self._sharded_chunk_array(array_name)
+        if sharded_arr is not None:
+            sharded_arr.attrs.update(_json_safe(meta))
+            return
         # Batched-write mode (see :meth:`batched_writes`): queue the
         # full parent-group ``zarr.json`` content so it flushes in the
         # gather instead of paying a per-array sync ``require_group +
@@ -363,7 +492,7 @@ class Group:
             node = self._zarr[array_name]
         except KeyError:
             return {}
-        if not isinstance(node, zarr.Group):
+        if not isinstance(node, (zarr.Group, zarr.Array)):
             return {}
         return dict(node.attrs)
 
@@ -374,7 +503,290 @@ class Group:
             node = self._zarr[array_name]
         except KeyError:
             return False
-        return isinstance(node, zarr.Group)
+        return isinstance(node, (zarr.Group, zarr.Array))
+
+    # ---------------- standard Zarr v3 arrays (single array per path) ----------------
+    #
+    # The methods above (``write_bytes`` / ``read_bytes``) implement the
+    # legacy "Option G" layout where every logical array is a Zarr group
+    # holding single-chunk ``uint8`` arrays.  The methods below write a
+    # single standard Zarr v3 array at the given path — the target of
+    # the v0.7 format migration (see plan
+    # ``can-you-do-an-compressed-wilkes.md``).  Both layouts coexist
+    # during the transition; new sites should prefer these.
+    #
+    # Batched-writes / batched-reads queues only cover the Option-G
+    # path; these methods always execute synchronously.
+
+    def write_array(
+        self,
+        path: str,
+        data: Any,
+        *,
+        chunks: tuple[int, ...] | None = None,
+        fill_value: Any = None,
+        attributes: dict[str, Any] | None = None,
+        compressors: Any = None,
+    ) -> None:
+        """Write a chunked Zarr v3 array at ``path``.
+
+        Args:
+            path: Logical path of the array within this group, e.g.
+                ``"object_attributes/intensity"``.  Intermediate path
+                segments become Zarr groups if absent.
+            data: Numpy-coercible array.  ``dtype`` and ``shape`` set
+                the array's dtype and shape.
+            chunks: Chunk shape.  Defaults to ``data.shape`` (single
+                chunk).
+            fill_value: Value Zarr returns for unwritten chunk positions.
+                Special floats are JSON-string-encoded per spec
+                (``"NaN"``, ``"Infinity"``, ``"-Infinity"``).
+            attributes: Dict applied to the array's ``attributes`` block
+                in its own ``zarr.json`` — the spec-blessed location for
+                per-array user metadata.
+            compressors: Override the codec pipeline.  ``None`` uses the
+                active session codec (from :meth:`batched_writes`) or
+                zarr v3's default (``bytes`` + ``zstd``).
+        """
+        arr_data = np.asarray(data)
+        if chunks is None:
+            chunks = arr_data.shape if arr_data.shape else (1,)
+
+        parent_path, _, leaf = path.rpartition("/")
+        parent = self._zarr.require_group(parent_path) if parent_path else self._zarr
+        if leaf in parent:
+            del parent[leaf]
+
+        create_kwargs: dict[str, Any] = {
+            "name": leaf,
+            "shape": arr_data.shape,
+            "chunks": chunks,
+            "dtype": arr_data.dtype,
+        }
+        if fill_value is not None:
+            create_kwargs["fill_value"] = fill_value
+
+        resolved = self._resolve_codecs(compressors)
+        if resolved is not None:
+            from zarr_vectors.encoding.compression import codecs_for_create_array
+            create_kwargs["compressors"] = codecs_for_create_array(resolved)
+
+        arr = parent.create_array(**create_kwargs)
+        arr[:] = arr_data
+
+        if attributes:
+            arr.attrs.update(_json_safe(attributes))
+
+    def read_array(self, path: str) -> np.ndarray:
+        """Read a chunked Zarr array at ``path`` as a numpy array."""
+        node = self._require_array_node(path)
+        return np.asarray(node[:])
+
+    def write_vlen_array(
+        self,
+        path: str,
+        blobs: Sequence[bytes],
+        *,
+        chunks: int | None = None,
+        attributes: dict[str, Any] | None = None,
+    ) -> None:
+        """Write a 1D variable-length-bytes Zarr v3 array at ``path``.
+
+        Each element of ``blobs`` becomes one row of the resulting
+        array.  Mirrors the layout used by ``object_index/manifests``.
+
+        Args:
+            path: Logical path of the array.
+            blobs: Iterable of bytes blobs.  Empty input writes no
+                array (caller's responsibility to check).
+            chunks: Elements per chunk.  Defaults to ``len(blobs)``
+                (single chunk).
+            attributes: Dict applied to the array's ``attributes`` block.
+        """
+        blob_list = list(blobs)
+        n = len(blob_list)
+        if n == 0:
+            return
+
+        parent_path, _, leaf = path.rpartition("/")
+        parent = self._zarr.require_group(parent_path) if parent_path else self._zarr
+        if leaf in parent:
+            del parent[leaf]
+
+        chunk_size = chunks if chunks is not None else n
+
+        with warnings.catch_warnings():
+            # vlen-bytes lacks a finalised V3 spec — see the matching
+            # suppression in `_write_object_index_manifests`.
+            warnings.simplefilter("ignore", UnstableSpecificationWarning)
+            arr = parent.create_array(
+                leaf,
+                shape=(n,),
+                chunks=(chunk_size,),
+                dtype="bytes",
+                serializer=VLenBytesCodec(),
+            )
+            obj = np.empty(n, dtype=object)
+            for i, blob in enumerate(blob_list):
+                obj[i] = blob
+            arr[:] = obj
+
+        if attributes:
+            arr.attrs.update(_json_safe(attributes))
+
+    def read_vlen_array(self, path: str) -> list[bytes]:
+        """Read a vlen-bytes Zarr array at ``path`` as a list of bytes."""
+        node = self._require_array_node(path)
+        return [bytes(b) for b in node[:]]
+
+    # ---------------- native-sharded chunk array (sharding_indexed) -------
+
+    def create_sharded_chunk_array(
+        self,
+        array_name: str,
+        grid_shape: tuple[int, ...],
+        *,
+        shard_shape: tuple[int, ...] | None = None,
+        attributes: dict[str, Any] | None = None,
+    ) -> None:
+        """Allocate a sharded vlen-bytes Zarr array for per-chunk blobs.
+
+        Replaces the legacy "Option G" group-of-tiny-arrays layout with
+        a single Zarr v3 array whose shape equals the level's chunk
+        grid.  Each cell holds one ZVF spatial chunk's payload.  When
+        ``shard_shape`` is provided the ``sharding_indexed`` codec packs
+        many cells into a single storage object — the standard cloud
+        layout described in
+        :doc:`/spec/chunking/sharding`.
+
+        Args:
+            array_name: Logical path of the array, e.g. ``"vertices"``
+                or ``"links/0"``.  Intermediate path segments become
+                Zarr sub-groups if absent.
+            grid_shape: Number of chunks along each spatial axis at
+                this level.  Computed via
+                :func:`zarr_vectors.spatial.chunking.compute_grid_shape`.
+            shard_shape: Outer-chunk shape in *inner-chunk* units.
+                ``None`` (default) creates an unsharded array — one
+                storage object per ZVF chunk, same I/O cost as the
+                legacy layout but already in the new structural form.
+                A typical cloud workload uses ``(8, 8, 8)``: 512 ZVF
+                chunks per storage object.
+            attributes: Per-array metadata merged into the array's
+                ``zarr.json`` ``attributes`` block (the standard Zarr
+                v3 location for user metadata).
+        """
+        ndim = len(grid_shape)
+        if shard_shape is not None and len(shard_shape) != ndim:
+            raise StoreError(
+                f"shard_shape rank {len(shard_shape)} != grid_shape "
+                f"rank {ndim} for array {array_name!r}"
+            )
+
+        parent_path, _, leaf = array_name.rpartition("/")
+        parent = (
+            self._zarr.require_group(parent_path) if parent_path else self._zarr
+        )
+        # Replace whatever sat at this path (legacy group, prior array)
+        # before creating the new sharded array.
+        if leaf in parent:
+            del parent[leaf]
+
+        create_kwargs: dict[str, Any] = {
+            "shape": grid_shape,
+            "chunks": (1,) * ndim,
+            "dtype": "bytes",
+            "serializer": VLenBytesCodec(),
+        }
+        if shard_shape is not None:
+            # Zarr 3.2 high-level ``shards=`` kwarg: wraps the inner
+            # ``chunks=`` codec in ``sharding_indexed`` automatically.
+            create_kwargs["shards"] = tuple(shard_shape)
+
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", UnstableSpecificationWarning)
+            arr = parent.create_array(leaf, **create_kwargs)
+            arr.attrs[_NONEMPTY_CHUNKS_ATTR] = []
+            if attributes:
+                arr.attrs.update(_json_safe(attributes))
+
+    def _sharded_chunk_array(self, array_name: str) -> zarr.Array | None:
+        """Return the multidim Zarr array at ``array_name`` when the
+        native-sharded layout is in use, else ``None``.
+
+        The legacy "Option G" layout has a Zarr Group at the same path
+        with single-chunk uint8 children — this returns ``None`` for
+        that case so callers fall back to the per-chunk logic.
+        """
+        if array_name not in self._zarr:
+            return None
+        try:
+            node = self._zarr[array_name]
+        except KeyError:
+            return None
+        return node if isinstance(node, zarr.Array) else None
+
+    def read_array_attrs(self, path: str) -> dict[str, Any]:
+        """Read the ``attributes`` block of a Zarr array at ``path``.
+
+        Returns ``{}`` for missing paths or paths that point at a group
+        rather than an array.
+        """
+        if path not in self._zarr:
+            return {}
+        try:
+            node = self._zarr[path]
+        except KeyError:
+            return {}
+        if not isinstance(node, zarr.Array):
+            return {}
+        return dict(node.attrs)
+
+    def read_array_fill_value(self, path: str) -> Any:
+        """Return the ``fill_value`` of the standard Zarr array at ``path``.
+
+        ``fill_value`` lives at the top level of the array's ``zarr.json``
+        (not in the user ``attributes`` block), so this helper exists
+        alongside :meth:`read_array_attrs` rather than being folded into
+        it.  Raises :class:`StoreError` if ``path`` is missing or points
+        at a group.
+        """
+        return self._require_array_node(path).fill_value
+
+    def standalone_array_exists(self, path: str) -> bool:
+        """``True`` when ``path`` points at a Zarr array (not a group).
+
+        Counterpart to :meth:`array_exists`, which reports ``True`` for
+        the legacy Option-G layout (a group containing chunk arrays).
+        """
+        if path not in self._zarr:
+            return False
+        try:
+            node = self._zarr[path]
+        except KeyError:
+            return False
+        return isinstance(node, zarr.Array)
+
+    def _require_array_node(self, path: str) -> zarr.Array:
+        if path not in self._zarr:
+            raise StoreError(
+                f"Array {path!r} not found in {self._zarr.path or '<root>'}"
+            )
+        node = self._zarr[path]
+        if not isinstance(node, zarr.Array):
+            raise StoreError(
+                f"{path!r} is a {type(node).__name__}, not an Array"
+            )
+        return node
+
+    def _resolve_codecs(
+        self, compressors: Any,
+    ) -> list[dict[str, Any]] | None:
+        """Pick effective codecs: explicit override > session codec > None."""
+        if compressors is not None:
+            from zarr_vectors.encoding.compression import resolve_compressor
+            return resolve_compressor(compressors)
+        return self._active_codecs
 
     # ---------------- delete ----------------
 
@@ -515,54 +927,93 @@ def _local_root(store: LocalStore) -> Path:
     return raw if isinstance(raw, Path) else Path(raw)
 
 
-# ---------------- shard fallback (transparent read of packed chunks) ----------
+# Per-array attribute name listing which chunk keys hold non-empty
+# payload in a native-sharded array.  Vlen-bytes fill_value is ``b""``
+# (indistinguishable from an explicitly-empty write), so we keep a
+# tiny sidecar so ``list_chunks`` / ``chunk_exists`` stay O(1) without
+# scanning every shard tail.
+_NONEMPTY_CHUNKS_ATTR = "nonempty_chunks"
 
-def _read_from_shard(
-    zarr_group: zarr.Group, array_name: str, chunk_key: str,
-) -> bytes | None:
-    """Locate ``chunk_key`` inside any ``__shard_<id>`` array under
-    ``array_name`` and return its bytes.  Returns ``None`` when no
-    shard contains the key.
+
+def _parse_chunk_coords(key: str) -> tuple[int, ...] | None:
+    """Parse a dot-separated chunk key into integer coords.
+
+    ``"0.1.2"`` → ``(0, 1, 2)``.  Returns ``None`` if any segment is
+    not an integer.
     """
-    if array_name not in zarr_group:
-        return None
+    parts = key.split(".")
     try:
-        arr_group = zarr_group[array_name]
-    except KeyError:
+        return tuple(int(p) for p in parts)
+    except ValueError:
         return None
-    if not isinstance(arr_group, zarr.Group):
-        return None
-    for name in arr_group.array_keys():
-        if not name.startswith("__shard_"):
-            continue
-        shard_arr = arr_group[name]
-        index = shard_arr.attrs.get("shard_index", None)
-        if not index or chunk_key not in index:
-            continue
-        offset, nbytes = index[chunk_key]
-        packed = np.asarray(shard_arr[offset:offset + nbytes])
-        return bytes(packed.tobytes())
-    return None
 
 
-def _shard_index_contains(
-    zarr_group: zarr.Group, array_name: str, chunk_key: str,
-) -> bool:
-    if array_name not in zarr_group:
+def _format_chunk_key(coords: tuple[int, ...]) -> str:
+    return ".".join(str(int(c)) for c in coords)
+
+
+def _coords_in_bounds(coords: tuple[int, ...], shape: tuple[int, ...]) -> bool:
+    if len(coords) != len(shape):
         return False
-    try:
-        arr_group = zarr_group[array_name]
-    except KeyError:
-        return False
-    if not isinstance(arr_group, zarr.Group):
-        return False
-    for name in arr_group.array_keys():
-        if not name.startswith("__shard_"):
-            continue
-        index = arr_group[name].attrs.get("shard_index", None)
-        if index and chunk_key in index:
-            return True
-    return False
+    return all(0 <= c < s for c, s in zip(coords, shape))
+
+
+def _check_coords_in_bounds(
+    coords: tuple[int, ...], shape: tuple[int, ...], array_name: str,
+) -> None:
+    if not _coords_in_bounds(coords, shape):
+        raise StoreError(
+            f"Chunk coords {coords} out of grid {shape} for "
+            f"array {array_name!r}"
+        )
+
+
+def _vlen_get_cell(
+    arr: zarr.Array, coords: tuple[int, ...],
+) -> bytes:
+    """Read one vlen-bytes cell as ``bytes``.
+
+    Zarr 3.x vlen-bytes scalar indexing returns a 0-d object array; we
+    slice-then-extract so the result is always a ``bytes`` instance.
+    """
+    slices = tuple(slice(c, c + 1) for c in coords)
+    region = np.asarray(arr[slices])
+    if region.size == 0:
+        return b""
+    val = region.flat[0]
+    if val is None:
+        return b""
+    return bytes(val)
+
+
+def _vlen_set_cell(
+    arr: zarr.Array, coords: tuple[int, ...], data: bytes,
+) -> None:
+    obj = np.empty((1,) * len(coords), dtype=object)
+    obj.flat[0] = bytes(data)
+    slices = tuple(slice(c, c + 1) for c in coords)
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", UnstableSpecificationWarning)
+        arr[slices] = obj
+
+
+def _record_nonempty_chunk(
+    arr: zarr.Array, chunk_key: str, *, present: bool,
+) -> None:
+    """Update the per-array ``nonempty_chunks`` manifest.
+
+    The manifest is a sorted list of dot-separated chunk keys —
+    consulted by :meth:`Group.list_chunks` and :meth:`chunk_exists` so
+    those calls don't have to scan every shard tail just to enumerate
+    non-empty cells.
+    """
+    current = arr.attrs.get(_NONEMPTY_CHUNKS_ATTR)
+    keys = set(current) if current else set()
+    if present:
+        keys.add(chunk_key)
+    else:
+        keys.discard(chunk_key)
+    arr.attrs[_NONEMPTY_CHUNKS_ATTR] = sorted(keys)
 
 
 def _json_safe(d: dict[str, Any]) -> dict[str, Any]:

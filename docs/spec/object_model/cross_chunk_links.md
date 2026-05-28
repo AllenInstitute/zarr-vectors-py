@@ -8,10 +8,13 @@
   indices in `links/<delta>/<chunk_key>` with `delta=0`.
 
 **Cross-chunk link**
-: An edge whose two endpoints live in **different** spatial chunks
-  (possibly at different resolution levels). Stored as
-  `((chunk_a, local_a), (chunk_b, local_b))` in
-  `cross_chunk_links/<delta>/data`.
+: An edge / face / parent-ref whose ``link_width`` endpoints span
+  **different** spatial chunks (possibly at different resolution
+  levels). In 0.8+ stored under
+  `cross_chunk_links/<delta>/<cell_key>`, where ``<cell_key>`` is
+  the dotted concatenation of the L canonical-sorted endpoint
+  chunks. Each cell contains only the records spanning exactly
+  that L-tuple of chunks.
 
 **Level delta** (`<delta>`)
 : A signed integer path segment that says how many pyramid levels the
@@ -132,53 +135,105 @@ self-describing ragged blob: an int64 header with `K` followed by the
 recover the per-vertex-group partition without consulting any sibling
 table.
 
-### `cross_chunk_links/<delta>/data` — global flat blob
+### `cross_chunk_links/<delta>/<cell_key>` — per-tuple ragged blob
 
-Each record is `link_width * (sid_ndim + 1)` int64s laid out as
-`link_width` back-to-back `(chunk_coords, vertex_idx)` endpoints:
+Each cell lives at a path whose key is the dotted concatenation of
+L canonical-sorted endpoint chunks (`sid_ndim * link_width` dotted
+components total — 6-D for edges, 9-D for triangle faces, 12-D for
+quads, 3-D for parent refs at `link_width=1`):
 
 ```
-[chunk_0_0, ..., chunk_0_{ndim-1}, vi_0,
- chunk_1_0, ..., chunk_1_{ndim-1}, vi_1,
- ...
- chunk_{L-1}_0, ..., vi_{L-1}]
+cross_chunk_links/<delta>/<chunk_0.x.y.z>.<chunk_1.x.y.z>...
 ```
+
+**Canonical ordering rule.** The L `(chunk_coords, vi)` endpoints
+of a record are lex-sorted by `chunk_coords` (tie-break by `vi` so
+records with two endpoints in the same chunk are still
+deterministic). The cell key is the dotted concatenation of the L
+sorted `chunk_coords`.
+
+**Cell body** — same self-describing ragged-header convention as
+`links/<delta>/<chunk_key>`:
+
+```
+int64 K                       # number of records in this cell
+K × int64 byte-offsets        # per-record offset table
+for each record:
+  int64 perm_idx              # Lehmer code of the canonical→input-order
+                              # permutation (0..L!-1)
+  L × int64 vi_canonical      # vertex indices in canonical chunk order
+                              # — slot i = vi inside the i-th canonical
+                              # chunk
+```
+
+`perm_idx` lets readers recover original endpoint order so mesh-
+face winding and directed-edge direction survive the canonical
+sort. `perm_idx = 0` is identity; geometry-types that don't care
+about winding (undirected graphs, parent refs) may write `0` and
+ignore on read. For `link_width=1`, `perm_idx` is always `0`.
 
 `link_width=2` (the default) encodes a classic cross-chunk edge;
-`link_width=3` encodes a triangle face spanning chunks (used by mesh
-writers); `link_width=1` encodes a single parent→child reference for
-pyramid metanode drill-down. Endpoint 0 lives at the **owning level**;
-endpoints 1..L-1 live at the **target level** (`owning_level +
-level_delta`).
+`link_width=3` encodes a triangle face spanning chunks (used by
+mesh writers); `link_width=1` encodes a single parent→child
+reference for pyramid metanode drill-down. **Input endpoint 0**
+lives at the owning level; **input endpoints 1..L-1** live at the
+target level (`owning_level + level_delta`). On disk the canonical
+ordering may reshuffle these — readers reverse it via `perm_idx`.
 
-**`.zattrs` schema** (see
+**Family `.zattrs`** (on the `cross_chunk_links/<delta>/` parent
+group — see
 [`zarr_vectors/core/arrays.py:write_cross_chunk_links`](../../../zarr_vectors/core/arrays.py)):
 
 ```jsonc
 {
   "zv_array":    "cross_chunk_links",
-  "num_links":   12,
+  "num_links":   12,         // family-wide total record count
   "sid_ndim":    3,
   "level_delta": 1,
   "link_width":  2
 }
 ```
 
+Per-cell arrays carry no extra metadata — `K` in this cell is
+recoverable from the ragged blob header, mirroring how
+`links/<delta>/<chunk_key>` works today.
+
 **Sid-ndim assumption.** Source and target levels share `sid_ndim`
-(uniform per store). The writer asserts both endpoints' chunk-coord
-arities match `sid_ndim`; mismatched callers fail loudly with an
+(uniform per store). The writer asserts every endpoint's chunk-coord
+arity matches `sid_ndim`; mismatched callers fail loudly with an
 `ArrayError`. Chunk *spacing* may differ between levels (coarser
 chunks are larger in physical units), but the chunk-key arity does
 not.
+
+**Mixed-resolution faces — current limitation.** Today `<delta>` is
+**uniform** across non-owner endpoints of a record: input endpoints
+1..L-1 all live at `owning_level + delta`. A triangle with vertices
+at e.g. levels `(N, N, N+1)` cannot be expressed in this model.
+The future-work section sketches a per-endpoint-level extension
+that the variable-D cell layout accommodates without reorganising
+the on-disk arrangement.
 
 **Why two arrays?** The writer routes a fine→coarse edge into
 `links/<delta>/<chunk_key>` when the source chunk_key equals the
 chunk_key in the coarser level that contains the target vertex —
 i.e. the two endpoints share a chunk-key string after re-evaluating
-against the coarser chunk grid. Otherwise the edge goes into
-`cross_chunk_links/<delta>/data`. The split keeps per-chunk reads
-cheap (no global scan needed for the common chunk-aligned case)
-while still expressing arbitrary cross-grid edges.
+against the coarser chunk grid. Otherwise the record goes into a
+per-tuple cell under `cross_chunk_links/<delta>/`. The split keeps
+per-chunk reads cheap (no global scan needed for the common chunk-
+aligned case) while the per-tuple bucketing makes cross-chunk pair
+queries direct.
+
+### Future work — per-endpoint level encoding
+
+The single per-array `<delta>` constrains every non-owner endpoint
+to the same target level. To support mixed-resolution records
+(e.g. a triangle face whose 3 vertices straddle two pyramid
+levels), a future revision can promote each endpoint to a
+`(level_delta, chunk_coords, vi)` triple — extending the canonical
+sort key by one extra dotted component per endpoint (one more
+component in the cell key per endpoint) and dropping the per-array
+`<delta>` segment in favour of per-record level deltas. The
+`perm_idx` and ragged-blob conventions carry over unchanged.
 
 ### `link_attributes/<name>/<delta>/<chunk_key>` — intra-chunk attrs
 

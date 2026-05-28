@@ -86,12 +86,18 @@ class TestLazyDaskParallel:
 
 
 class TestShardReshardChain:
-    """Shard → reshard → unshard round-trip with data integrity."""
+    """Shard → reshard → unshard round-trip with data integrity.
+
+    Asserts the resulting layout uses Zarr v3's native
+    ``sharding_indexed`` codec — the on-disk format is readable by
+    any standards-compliant Zarr v3 reader, not just zarr-vectors-py.
+    """
 
     def test_shard_chain(self, tmp_path: Path) -> None:
+        import json
+        import zarr
         from zarr_vectors.types.points import write_points, read_points
-        from zarr_vectors.sharding.io import reshard, is_sharded, get_shard_info
-        from zarr_vectors.sharding.layout import ShardLayout
+        from zarr_vectors.sharding import reshard, is_sharded, get_shard_info
         from zarr_vectors.validate import validate
 
         rng = np.random.default_rng(42)
@@ -100,21 +106,29 @@ class TestShardReshardChain:
         write_points(store, positions, chunk_shape=(100., 100., 100.))
         r_before = read_points(store)
 
-        # flat → octree
-        reshard(store, ShardLayout.OCTREE, shard_size=8)
+        # flat → sharded (8x8x8 = 512 chunks per shard)
+        reshard(store, 8)
         assert is_sharded(store)
-        assert get_shard_info(store)["layout"] == "octree"
+        info = get_shard_info(store)
+        assert info["sharded"] and info["arrays"], info
+        # Every sharded array uses the native codec.
+        zg = zarr.open_group(store)
+        vertices_arr = zg["0/vertices"]
+        assert isinstance(vertices_arr, zarr.Array)
+        codec_names = {
+            c.to_dict().get("name") for c in vertices_arr.metadata.codecs
+        }
+        assert "sharding_indexed" in codec_names, codec_names
 
-        # octree → snake
-        reshard(store, ShardLayout.SNAKE, shard_size=16)
-        assert get_shard_info(store)["layout"] == "snake"
+        # Reshard to a different shape — still native.
+        reshard(store, 4)
+        info4 = get_shard_info(store)
+        assert info4["sharded"]
+        for entry in info4["arrays"]:
+            assert all(s == 4 for s in entry["shard_shape"])
 
-        # snake → index_table
-        reshard(store, ShardLayout.INDEX_TABLE, shard_size=4)
-        assert get_shard_info(store)["layout"] == "index_table"
-
-        # index_table → flat
-        reshard(store, ShardLayout.FLAT)
+        # sharded → flat
+        reshard(store, None)
         assert not is_sharded(store)
 
         # Data survives
@@ -130,14 +144,85 @@ class TestShardReshardChain:
         assert validate(store, level=4).ok
 
 
+class TestBornShardedWrites:
+    """Type writers can produce native-sharded stores directly via
+    ``shard_shape=`` — no post-hoc ``shard_store`` conversion needed.
+    """
+
+    def test_points_born_sharded(self, tmp_path: Path) -> None:
+        import zarr
+        from zarr_vectors.types.points import write_points, read_points
+
+        rng = np.random.default_rng(0)
+        store = str(tmp_path / "pts.zv")
+        positions = rng.uniform(0, 400, (500, 3)).astype(np.float32)
+        write_points(
+            store, positions,
+            chunk_shape=(100., 100., 100.),
+            shard_shape=2,
+        )
+
+        # vertices and vertex_fragments are sharded Zarr arrays at
+        # creation time — no migration step needed.
+        zg = zarr.open_group(store)
+        for name in ("0/vertices", "0/vertex_fragments"):
+            node = zg[name]
+            assert isinstance(node, zarr.Array), (name, type(node))
+            codec_names = {
+                c.to_dict().get("name") for c in node.metadata.codecs
+            }
+            assert "sharding_indexed" in codec_names, (name, codec_names)
+            assert node.shards == (2, 2, 2)
+
+        r = read_points(store)
+        assert r["vertex_count"] == 500
+        np.testing.assert_allclose(
+            np.sort(r["positions"], 0), np.sort(positions, 0), atol=1e-5,
+        )
+
+    def test_graph_born_sharded(self, tmp_path: Path) -> None:
+        import zarr
+        from zarr_vectors.types.graphs import write_graph, read_graph
+
+        store = str(tmp_path / "g.zv")
+        # Three clusters of nodes in three distinct chunks, with edges
+        # inside each cluster (guarantees intra-chunk edges so the
+        # ``link_fragments`` array is materialised) plus one cross-chunk
+        # edge.
+        nodes = np.array([
+            [10., 10., 10.], [20., 20., 20.], [30., 30., 30.],   # chunk (0,0,0)
+            [110., 110., 110.], [120., 120., 120.],              # chunk (1,1,1)
+            [210., 210., 210.], [220., 220., 220.],              # chunk (2,2,2)
+        ], dtype=np.float32)
+        edges = np.array([
+            [0, 1], [1, 2],   # intra (0,0,0)
+            [3, 4],           # intra (1,1,1)
+            [5, 6],           # intra (2,2,2)
+            [2, 3],           # cross (0,0,0) -> (1,1,1)
+        ], dtype=np.int64)
+        write_graph(
+            store, nodes, edges,
+            chunk_shape=(100., 100., 100.),
+            shard_shape=(2, 2, 2),
+        )
+
+        zg = zarr.open_group(store)
+        for name in ("0/vertices", "0/vertex_fragments",
+                     "0/links/0", "0/link_fragments"):
+            node = zg[name]
+            assert isinstance(node, zarr.Array), (name, type(node))
+
+        r = read_graph(store)
+        assert r["node_count"] == 7
+
+
 class TestShardedPyramid:
     """Build pyramid then shard — all levels survive."""
 
     def test_pyramid_then_shard(self, tmp_path: Path) -> None:
         from zarr_vectors.types.points import write_points, read_points
         from zarr_vectors.multiresolution.coarsen import build_pyramid
-        from zarr_vectors.sharding.io import reshard, is_sharded
-        from zarr_vectors.sharding.layout import ShardLayout
+        from zarr_vectors.sharding import reshard, is_sharded
         from zarr_vectors.core.store import open_store, list_resolution_levels
         from zarr_vectors.validate import validate
 
@@ -151,16 +236,13 @@ class TestShardedPyramid:
         build_pyramid(store, factors=[(2.0, 1.0), (2.0, 1.0)])
         levels_before = list_resolution_levels(open_store(store))
 
-        # Shard
-        reshard(store, ShardLayout.OCTREE, shard_size=8)
+        reshard(store, 8)
         assert is_sharded(store)
 
-        # Unshard
-        reshard(store, ShardLayout.FLAT)
+        reshard(store, None)
         levels_after = list_resolution_levels(open_store(store))
         assert levels_after == levels_before
 
-        # All levels readable
         for lvl in levels_after:
             r = read_points(store, level=lvl)
             assert r["vertex_count"] > 0

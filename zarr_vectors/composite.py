@@ -458,14 +458,27 @@ def _write_namespaced_links(
     array_name: str,
     links: npt.NDArray[np.integer],
 ) -> None:
-    """Write links (edges/faces) to a namespaced array."""
+    """Write links (edges/faces) as a single chunked Zarr v3 array.
+
+    The array lives at ``<array_name>`` as a 2D int64 array with shape
+    ``(N, link_width)``.  Per-array attrs carry ``link_count`` and
+    ``link_width`` for reader convenience (both also derivable from the
+    array's own shape).
+    """
     links = np.asarray(links, dtype=np.int64)
-    level_group.write_bytes(array_name, "data", links.tobytes())
-    link_group = level_group.require_group(array_name)
-    link_group.attrs.update({
-        "link_count": len(links),
-        "link_width": links.shape[1] if links.ndim == 2 else 2,
-    })
+    link_width = int(links.shape[1]) if links.ndim == 2 else 2
+    if links.size == 0:
+        # Reader returns an empty array when the path is missing; mirror
+        # that by deleting any prior array at the same path.
+        level_group.delete_subtree(array_name)
+        return
+    level_group.write_array(
+        array_name, links,
+        attributes={
+            "link_count": int(links.shape[0]),
+            "link_width": link_width,
+        },
+    )
 
 
 def _read_namespaced_links(
@@ -473,14 +486,11 @@ def _read_namespaced_links(
     array_name: str,
 ) -> npt.NDArray[np.int64]:
     """Read links from a namespaced array."""
-    if not level_group.array_exists(array_name):
+    if not level_group.standalone_array_exists(array_name):
         return np.zeros((0, 2), dtype=np.int64)
-    if not level_group.chunk_exists(array_name, "data"):
-        return np.zeros((0, 2), dtype=np.int64)
-    raw = level_group.read_bytes(array_name, "data")
-    try:
-        link_group = level_group[array_name]
-        link_width = link_group.attrs.to_dict().get("link_width", 2)
-    except Exception:
-        link_width = 2
-    return np.frombuffer(raw, dtype=np.int64).reshape(-1, link_width)
+    arr = level_group.read_array(array_name)
+    if arr.ndim == 1:
+        attrs = level_group.read_array_attrs(array_name)
+        link_width = int(attrs.get("link_width", 2))
+        return arr.reshape(-1, link_width).astype(np.int64, copy=False)
+    return arr.astype(np.int64, copy=False)

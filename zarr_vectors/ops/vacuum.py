@@ -126,9 +126,11 @@ def vacuum(
             total_objects=len(live_oids),
         )
 
-        # Compact every per-object attribute array.
+        # Compact every per-object attribute array.  Use ``children()``
+        # to cover both layouts: legacy Option-G arrays appear under
+        # ``group_keys()``, 0.8.1 standalone arrays under ``array_keys()``.
         if OBJECT_ATTRIBUTES in level_group:
-            for name in level_group[OBJECT_ATTRIBUTES]:
+            for name in level_group[OBJECT_ATTRIBUTES].children():
                 try:
                     arr = read_object_attributes(level_group, name)
                 except Exception:
