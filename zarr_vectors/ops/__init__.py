@@ -40,7 +40,10 @@ from zarr_vectors.ops.edit import (
     remove_vertex,
     split_fragment,
 )
-from zarr_vectors.ops.links import materialise_object_links_explicit
+from zarr_vectors.ops.links import (
+    materialise_object_links_explicit,
+    reorder_vertices_implicit,
+)
 from zarr_vectors.ops.merge import allocate_oid, merge_edit_reports
 from zarr_vectors.ops.refresh import rebuild_pyramid_from_level
 from zarr_vectors.ops.vacuum import vacuum
@@ -78,6 +81,7 @@ __all__ = [
     "edit_vertex",
     "materialise_object_links_explicit",
     "merge_edit_reports",
+    "reorder_vertices_implicit",
     "rebuild_pyramid_from_level",
     "remove_attribute",
     "remove_cross_chunk_link",

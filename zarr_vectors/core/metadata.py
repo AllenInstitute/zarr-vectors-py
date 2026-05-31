@@ -305,10 +305,21 @@ class RootMetadata:
         #                 ``vertex_fragments``; links carried an inline
         #                 self-describing header; ``object_index`` used
         #                 the flat quad encoding.
-        #   - pre-0.7.0 : ``chunk_shape`` was root-only.  0.7 lets
-        #                 each level override.  Stores using a
-        #                 per-level override could be silently
-        #                 misread by 0.6.x → version cut.
+        #   - pre-0.7.0 : ``chunk_shape`` was root-only.
+        #   - pre-0.8.0 : ``cross_chunk_links`` was a single global flat
+        #                 blob.  0.8 split it into per-tuple cells keyed
+        #                 on canonical-sorted endpoint chunks and
+        #                 introduced the ``perm_idx`` record header.
+        #                 Old layout cannot be read by this build.
+        #   - pre-0.8.1 : every non-spatial array was stored as a Zarr
+        #                 group containing single-chunk ``uint8`` child
+        #                 arrays (``data``, ``offsets``, ``present_mask``).
+        #                 0.8.1 collapses each to a single standard Zarr
+        #                 v3 array at the logical path, expresses sparse
+        #                 coverage via ``fill_value`` instead of a
+        #                 ``present_mask`` sibling, and moves ragged
+        #                 arrays to vlen-bytes.  Old layout cannot be
+        #                 read by this build.
         # No shims ship; older stores must be rewritten from source.
         parts = self.zv_version.split(".")
         try:
@@ -319,13 +330,16 @@ class RootMetadata:
             raise MetadataError(
                 f"zv_version {self.zv_version!r} is not a valid X.Y[.Z] string"
             ) from exc
-        if (major, minor, patch) < (0, 7, 0):
+        if (major, minor, patch) < (0, 8, 1):
             raise MetadataError(
                 f"store zv_version is {self.zv_version}; this build "
                 f"requires {FORMAT_VERSION} — no backwards-compat shim. "
-                f"Pre-0.7 stores keyed chunk_shape at the root only and "
-                f"could be silently misread under a per-level override; "
-                f"rewrite from source."
+                f"Pre-0.8.1 stores wrote each non-spatial array as a Zarr "
+                f"group containing single-chunk ``data``/``offsets``/"
+                f"``present_mask`` child arrays; 0.8.1 collapses each to "
+                f"a single standard Zarr v3 array with ``fill_value`` "
+                f"sparsity — the old layout cannot be read.  Rewrite "
+                f"from source."
             )
 
         if self.cross_level_storage not in VALID_XLEVEL_STORAGE:

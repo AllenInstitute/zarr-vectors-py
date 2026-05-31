@@ -215,11 +215,11 @@ def _minimal_root_md(**overrides):
     return RootMetadata(**base)
 
 
-def test_default_zv_version_is_07():
+def test_default_zv_version_is_08():
     md = _minimal_root_md()
     md.validate()
     assert md.zv_version == FORMAT_VERSION
-    assert FORMAT_VERSION.startswith("0.7")
+    assert FORMAT_VERSION.startswith("0.8")
 
 
 def test_pre_05_zv_version_rejected():

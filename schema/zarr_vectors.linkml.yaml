@@ -333,14 +333,20 @@ classes:
 
   CrossChunkLinksMeta:
     description: >
-      ``.zattrs`` for a ``cross_chunk_links/<delta>/`` array.  Each
-      delta segment carries its own meta block; ``level_delta=0`` is
-      the intra-level array.  Each record is ``link_width``
-      ``(chunk_coords, vertex_idx)`` endpoints — ``link_width=2``
-      encodes a cross-chunk edge, ``link_width=3`` a triangle face
-      record, and so on.  Source-side endpoint (endpoint 0) lives at
-      the array's own resolution level; target-side endpoints live at
-      ``this_level + level_delta``.
+      ``.zattrs`` for a ``cross_chunk_links/<delta>/`` parent group.
+      In 0.8 the family stores per-cell arrays keyed on the
+      canonical-sorted L-tuple of endpoint chunks
+      (``cross_chunk_links/<delta>/<x.y.z...>`` — exactly
+      ``sid_ndim * link_width`` dotted components).  Each cell
+      holds records spanning that exact L-tuple of chunks; each
+      record is ``[perm_idx, vi_0, ..., vi_{L-1}]`` int64s, where
+      ``perm_idx`` is the Lehmer code of the canonical→input-order
+      permutation (so readers can recover original endpoint order
+      — mesh-face winding, directed-edge direction).  Source-side
+      endpoint (input endpoint 0) lives at the array's own
+      resolution level; target-side endpoints live at
+      ``this_level + level_delta``.  ``num_links`` is the family-
+      wide total record count.
     slots: [zv_array, num_links, sid_ndim, level_delta, link_width]
     slot_usage:
       zv_array:
@@ -360,9 +366,12 @@ classes:
   CrossChunkLinkAttributeMeta:
     description: >
       ``.zattrs`` for each ``cross_chunk_link_attributes/<name>/<delta>/``
-      array.  Stored as a flat blob parallel to the ``data`` blob of the
-      matching ``cross_chunk_links/<delta>/`` array; ``num_links`` MUST
-      equal the parallel CCL array's ``num_links``.
+      parent group.  In 0.8 the parallel link family was split into
+      per-cell arrays keyed on the canonical-sorted L-tuple of
+      endpoint chunks.  This attribute family mirrors that layout:
+      per-cell byte blobs with one row per record, in the same
+      write order as the matching cell.  ``num_links`` MUST equal
+      the parallel CCL family's ``num_links``.
     slots: [zv_array, name, dtype, level_delta, num_links]
     slot_usage:
       zv_array:

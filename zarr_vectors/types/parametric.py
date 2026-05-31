@@ -172,64 +172,67 @@ def write_parametric_objects(
         while len(r) < max_len:
             r.append(float("nan"))
 
-    # Write encoded objects as a dense float64 array
+    # Write encoded objects as a dense chunked Zarr v3 array.
     if encoded_rows:
         data = np.array(encoded_rows, dtype=np.float64)
-        para.write_bytes("objects", "data", data.tobytes())
-        para.write_array_meta("objects", {
-            "zv_array": "parametric_objects",
-            "num_objects": n_objects,
-            "max_row_length": max_len,
-            "dtype": "float64",
-        })
+        para.write_array(
+            "objects", data,
+            attributes={
+                "zv_array": "parametric_objects",
+                "num_objects": n_objects,
+                "max_row_length": max_len,
+                "dtype": "float64",
+            },
+        )
 
-    # Write names as object attribute
+    # Write names as a 1D vlen-bytes array, one element per name.
     if names:
-        # Store names as a newline-joined byte string
-        names_str = "\n".join(names)
-        para.write_bytes("names", "data", names_str.encode("utf-8"))
-        para.write_array_meta("names", {
-            "zv_array": "parametric_names",
-            "num_objects": n_objects,
-        })
+        para.write_vlen_array(
+            "names", [n.encode("utf-8") for n in names],
+            attributes={
+                "zv_array": "parametric_names",
+                "num_objects": n_objects,
+            },
+        )
 
-    # Write additional object attributes
+    # Write additional object attributes — each one a standalone
+    # chunked Zarr v3 array under ``object_attributes/<name>``.
     if object_attributes:
         for attr_name, attr_data in object_attributes.items():
             arr = np.asarray(attr_data)
             full_name = f"object_attributes/{attr_name}"
-            para.require_group("object_attributes")
-            para.write_bytes(full_name, "data", arr.tobytes())
-            para.write_array_meta(full_name, {
-                "dtype": str(arr.dtype),
-                "shape": list(arr.shape),
-            })
+            para.write_array(
+                full_name, arr,
+                attributes={
+                    "dtype": str(arr.dtype),
+                    "shape": list(arr.shape),
+                },
+            )
 
-    # Write groups
+    # Write groups as a 1D vlen-bytes array (each blob = the int64
+    # member list of one group).
     if groups:
-        from zarr_vectors.encoding.ragged import encode_ragged_ints
         max_gid = max(groups.keys())
-        group_list = [
-            np.array(groups.get(gid, []), dtype=np.int64)
+        blobs = [
+            np.array(groups.get(gid, []), dtype=np.int64).tobytes()
             for gid in range(max_gid + 1)
         ]
-        raw, offsets = encode_ragged_ints(group_list)
-        para.write_bytes("groups", "data", raw)
-        para.write_bytes("groups", "offsets", offsets.tobytes())
-        para.write_array_meta("groups", {
-            "num_groups": max_gid + 1,
-        })
+        para.write_vlen_array(
+            "groups", blobs,
+            attributes={"num_groups": max_gid + 1},
+        )
 
     if group_attributes:
-        para.require_group("group_attributes")
         for attr_name, attr_data in group_attributes.items():
             arr = np.asarray(attr_data)
             full_name = f"group_attributes/{attr_name}"
-            para.write_bytes(full_name, "data", arr.tobytes())
-            para.write_array_meta(full_name, {
-                "dtype": str(arr.dtype),
-                "shape": list(arr.shape),
-            })
+            para.write_array(
+                full_name, arr,
+                attributes={
+                    "dtype": str(arr.dtype),
+                    "shape": list(arr.shape),
+                },
+            )
 
     return {
         "object_count": n_objects,
@@ -263,28 +266,19 @@ def read_parametric_objects(
     types = read_parametric_types(root)
     type_by_id = {t.type_id: t for t in types}
 
-    # Read encoded objects
-    try:
-        meta = para.read_array_meta("objects")
-    except Exception:
+    # Read encoded objects from the standalone chunked array.
+    if not para.standalone_array_exists("objects"):
         return []
-
-    if "num_objects" not in meta:
+    data = para.read_array("objects")
+    attrs = para.read_array_attrs("objects")
+    if "num_objects" not in attrs:
         return []
+    n_objects = int(attrs["num_objects"])
 
-    n_objects = meta["num_objects"]
-    max_row_len = meta["max_row_length"]
-    dtype = np.dtype(meta.get("dtype", "float64"))
-
-    raw = para.read_bytes("objects", "data")
-    data = np.frombuffer(raw, dtype=dtype).reshape(n_objects, max_row_len)
-
-    # Read names if available
-    names: list[str] = []
-    try:
-        names_raw = para.read_bytes("names", "data")
-        names = names_raw.decode("utf-8").split("\n")
-    except Exception:
+    # Read names from the vlen-bytes array if present.
+    if para.standalone_array_exists("names"):
+        names = [b.decode("utf-8") for b in para.read_vlen_array("names")]
+    else:
         names = [f"object_{i}" for i in range(n_objects)]
 
     # Decode objects

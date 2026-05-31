@@ -94,6 +94,7 @@ def write_lines(
     chunk_by_attribute: str | None = None,
     out_of_bounds: str = DEFAULT_OOB_POLICY,
     compressor: Any = None,
+    shard_shape: int | tuple[int, ...] | None = None,
     # Deprecated aliases (will be removed):
     attributes: dict[str, npt.NDArray] | None = None,
     line_attributes: dict[str, npt.NDArray] | None = None,
@@ -299,8 +300,13 @@ def write_lines(
     idx_ndim = ndim + 1 if line_attr_bins is not None else ndim
     # Collapse all per-array zarr.json PUTs + per-chunk byte writes into
     # one asyncio.gather (mirrors points.py:300).  Smaller win on local
-    # FS, large win against object stores.
-    with level_group.batched_writes(compressor=compressor):
+    # FS, large win against object stores.  ``shard_shape`` also
+    # activates native ``sharding_indexed`` for per-chunk arrays.
+    from zarr_vectors.core.arrays import open_write_session
+    with open_write_session(
+        level_group, compressor=compressor, shard_shape=shard_shape,
+        bounds=bounds_list, chunk_shape=chunk_shape,
+    ):
         create_vertices_array(level_group, dtype=dtype)
         create_object_index_array(level_group)
         create_cross_chunk_links_array(level_group, delta=0)

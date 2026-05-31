@@ -126,6 +126,7 @@ def write_graph(
     chunk_by_attribute: str | None = None,
     out_of_bounds: str = DEFAULT_OOB_POLICY,
     compressor: Any = None,
+    shard_shape: int | tuple[int, ...] | None = None,
     # Deprecated aliases (will be removed):
     is_tree: bool | None = None,
     node_attributes: dict[str, npt.NDArray] | None = None,
@@ -381,8 +382,13 @@ def write_graph(
     idx_ndim = ndim + 1 if node_attr_bins is not None else ndim
 
     # Collapse all per-array zarr.json + per-chunk byte writes into one
-    # asyncio.gather (mirrors points.py:300).
-    with level_group.batched_writes(compressor=compressor):
+    # asyncio.gather (mirrors points.py:300).  ``shard_shape`` also
+    # activates native ``sharding_indexed`` for per-chunk arrays.
+    from zarr_vectors.core.arrays import open_write_session
+    with open_write_session(
+        level_group, compressor=compressor, shard_shape=shard_shape,
+        bounds=bounds_list, chunk_shape=chunk_shape,
+    ):
         create_vertices_array(level_group, dtype=dtype)
         create_links_array(level_group, link_width=link_width, delta=0)
         create_object_index_array(level_group)
@@ -613,12 +619,17 @@ def read_graph(
     # edges in one async gather.  Subsequent ``read_bytes`` calls below
     # hit the cache instead of paying one round-trip per chunk.
     _chunk_key_strs = [".".join(str(c) for c in cc) for cc in chunk_keys]
+    _ccl_family = f"{CROSS_CHUNK_LINKS}/0"
+    _ccl_cell_keys = (
+        level_group.list_chunks(_ccl_family)
+        if level_group.array_exists(_ccl_family) else []
+    )
     _prefetch_plan: list[tuple[str, list[str]]] = [
         (VERTICES, _chunk_key_strs),
         (VERTEX_FRAGMENTS, _chunk_key_strs),
         (f"{LINKS}/0", _chunk_key_strs),
         (LINK_FRAGMENTS, _chunk_key_strs),
-        (f"{CROSS_CHUNK_LINKS}/0", ["data"]),
+        (_ccl_family, _ccl_cell_keys),
     ]
     _batched_reads_cm = level_group.batched_reads(_prefetch_plan)
     _batched_reads_cm.__enter__()

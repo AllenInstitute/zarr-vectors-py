@@ -1165,13 +1165,13 @@ class TestWriteCrossChunkLinksAppend:
         ret0 = write_cross_chunk_links(
             lg, self._records(2), sid_ndim=3, delta=0,
         )
-        assert ret0 == 0   # replace returns 0
+        assert int(ret0) == 0   # replace returns first_new=0
 
         ret1 = write_cross_chunk_links(
             lg, self._records(1, base=10), sid_ndim=3,
             delta=0, mode="append",
         )
-        assert ret1 == 2   # row index of first appended record
+        assert int(ret1) == 2   # row index of first appended record
 
         records = read_cross_chunk_links(lg, delta=0)
         assert len(records) == 3
@@ -1185,7 +1185,7 @@ class TestWriteCrossChunkLinksAppend:
         ret = write_cross_chunk_links(
             lg, self._records(2), sid_ndim=3, delta=0, mode="append",
         )
-        assert ret == 0
+        assert int(ret) == 0
 
         records = read_cross_chunk_links(lg, delta=0)
         assert len(records) == 2
@@ -1197,22 +1197,22 @@ class TestWriteCrossChunkLinksAppend:
             lg, "weight", delta=0, dtype="float32",
         )
 
-        write_cross_chunk_links(
+        p0 = write_cross_chunk_links(
             lg, self._records(2), sid_ndim=3, delta=0,
         )
         write_cross_chunk_link_attributes(
             lg, "weight", np.array([0.1, 0.2], dtype=np.float32),
-            num_links=2, delta=0,
+            num_links=2, delta=0, partition=p0,
         )
 
         # Append one more record + its attribute.
-        write_cross_chunk_links(
+        p1 = write_cross_chunk_links(
             lg, self._records(1, base=10), sid_ndim=3,
             delta=0, mode="append",
         )
         write_cross_chunk_link_attributes(
             lg, "weight", np.array([0.3], dtype=np.float32),
-            num_links=3, delta=0, mode="append",
+            num_links=3, delta=0, mode="append", partition=p1,
         )
 
         back = read_cross_chunk_link_attributes(lg, "weight", delta=0)
@@ -1225,19 +1225,23 @@ class TestWriteCrossChunkLinksAppend:
         create_cross_chunk_link_attributes_array(
             lg, "weight", delta=0, dtype="float32",
         )
-        write_cross_chunk_links(
+        p0 = write_cross_chunk_links(
             lg, self._records(2), sid_ndim=3, delta=0,
         )
         write_cross_chunk_link_attributes(
             lg, "weight", np.array([0.1, 0.2], dtype=np.float32),
-            num_links=2, delta=0,
+            num_links=2, delta=0, partition=p0,
+        )
+        p1 = write_cross_chunk_links(
+            lg, self._records(1, base=10), sid_ndim=3,
+            delta=0, mode="append",
         )
         try:
             # Append one row, but pass num_links=5 (does not match
             # post-append length of 3).
             write_cross_chunk_link_attributes(
                 lg, "weight", np.array([0.3], dtype=np.float32),
-                num_links=5, delta=0, mode="append",
+                num_links=5, delta=0, mode="append", partition=p1,
             )
             assert False, "Should raise"
         except ArrayError:

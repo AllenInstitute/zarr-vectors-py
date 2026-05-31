@@ -14,7 +14,8 @@ from __future__ import annotations
 
 import warnings
 from contextlib import contextmanager
-from typing import Any, Literal
+from dataclasses import dataclass
+from typing import Any, Literal, Sequence
 
 import numpy as np
 import numpy.typing as npt
@@ -40,9 +41,11 @@ from zarr_vectors.constants import (
 from zarr_vectors.core.paths import (
     cross_chunk_link_attributes_path,
     cross_chunk_links_path,
+    format_cell_key,
     format_delta,
     link_attributes_path,
     links_path,
+    parse_cell_key,
     parse_delta,
 )
 from zarr_vectors.core.store import FsGroup
@@ -56,7 +59,6 @@ from zarr_vectors.encoding.fragments import (
 from zarr_vectors.encoding.ragged import (
     decode_ragged_blob,
     decode_ragged_floats,
-    decode_ragged_ints,
     encode_ragged_blob,
     encode_ragged_floats,
     encode_ragged_ints,
@@ -136,9 +138,36 @@ def _short_circuit_existing(
     """Return True when ``create_*_array`` should no-op because the array
     already exists and ``exist_ok=True``.  Raises :class:`ArrayError` when
     the array exists and ``exist_ok=False``.
+
+    Detects both layouts: the legacy Option-G group-with-chunk-arrays
+    (``array_exists``) and the 0.8.1 single-standard-Zarr-v3-array layout
+    (``standalone_array_exists``).
+
+    When the caller is running inside
+    :meth:`Group.native_sharded_arrays` and the existing node is a
+    legacy Option-G group at a per-chunk-array path, *do not*
+    short-circuit — the create call needs to replace the legacy group
+    with a native-sharded Zarr array.  This matters when the store
+    was warmed via :func:`create_store` (which writes an empty
+    ``vertices/`` group) and the caller is the first writer to request
+    sharded layout.
     """
-    if not level_group.array_exists(full_name):
+    exists_as_array = level_group.standalone_array_exists(full_name)
+    exists_as_group = (
+        level_group.array_exists(full_name) and not exists_as_array
+    )
+    if not (exists_as_array or exists_as_group):
         return False
+
+    # Legacy group at a per-chunk-array path, inside a sharded
+    # writer — fall through so ``_ensure_array_dir`` replaces it.
+    if (
+        exists_as_group
+        and level_group._native_sharded_config is not None
+        and _is_per_chunk_array(full_name)
+    ):
+        return False
+
     if exist_ok:
         return True
     raise ArrayError(
@@ -146,19 +175,160 @@ def _short_circuit_existing(
     )
 
 
+def _default_fill_value_for_dtype(dtype: np.dtype) -> Any:
+    """Pick the conventional 'absent' sentinel for a numpy dtype.
+
+    Returns a Python-native value used both as the in-array marker for
+    rows excluded by a caller-supplied ``present_mask`` and as the Zarr
+    array's persisted ``fill_value`` (so unwritten chunks read back as
+    the same value).
+
+    Conventions:
+        * float dtypes → ``NaN``
+        * signed-int dtypes → the dtype's minimum value
+        * unsigned-int dtypes → the dtype's maximum value
+
+    Bool and other dtypes have no in-band sentinel; callers must
+    promote (e.g. ``bool`` → ``int8`` with explicit ``fill_value=-1``)
+    or pass an explicit ``fill_value=`` to the writer.
+    """
+    if dtype.kind == "f":
+        return float("nan")
+    if dtype.kind == "i":
+        return int(np.iinfo(dtype).min)
+    if dtype.kind == "u":
+        return int(np.iinfo(dtype).max)
+    if dtype.kind in ("U", "S"):
+        # Empty string as the absence marker.  Documented caveat:
+        # collides with a legitimate empty value; callers that care
+        # must pass ``fill_value=`` explicitly.
+        return ""
+    raise ArrayError(
+        f"no default 'absent' fill_value for dtype {dtype!r}; "
+        f"pass fill_value= explicitly (or promote bool → int8)"
+    )
+
+
 def _ensure_array_dir(level_group: FsGroup, array_name: str) -> None:
     """Ensure an array subdirectory exists within a level group.
 
-    Inside :meth:`Group.batched_writes` we skip the sync ``require_group``
-    round-trip — the metadata flush will PUT the parent ``zarr.json``
-    directly, including the right attributes, in the same gather as the
-    chunk PUTs.  Outside batched mode we still call ``require_group`` so
-    the parent group exists before any subsequent ``write_array_meta``
-    call (which only ``attrs.update``s — it does not create the group).
+    Three layouts are produced here depending on context:
+
+    * Inside :meth:`Group.native_sharded_arrays` (per-chunk arrays only)
+      — allocate a single multidim vlen-bytes Zarr array at the path
+      using the ``sharding_indexed`` codec.  Subsequent ``write_bytes``
+      calls land in this array's grid-coord cells.
+    * Inside :meth:`Group.batched_writes` — skip the sync
+      ``require_group`` round-trip; the metadata flush will PUT the
+      parent ``zarr.json`` directly, including the right attributes,
+      in the same gather as the chunk PUTs.
+    * Otherwise — create an empty Zarr group at the path so subsequent
+      ``write_array_meta`` (which only ``attrs.update``s, not create)
+      has a target.
     """
+    cfg = level_group._native_sharded_config
+    if cfg is not None and _is_per_chunk_array(array_name):
+        # Idempotent: if the sharded array already exists at this path
+        # (e.g. a second writer pass on the same level), leave it alone.
+        if not level_group.standalone_array_exists(array_name):
+            level_group.create_sharded_chunk_array(
+                array_name,
+                grid_shape=cfg["grid_shape"],
+                shard_shape=cfg["shard_shape"],
+            )
+        return
     if level_group._pending_array_metas is not None:
         return
     level_group.require_group(array_name)
+
+
+@contextmanager
+def open_write_session(
+    level_group: FsGroup,
+    *,
+    compressor: Any = None,
+    shard_shape: int | tuple[int, ...] | None = None,
+    bounds: tuple[list[float], list[float]] | None = None,
+    chunk_shape: tuple[float, ...] | None = None,
+):
+    """Open the batched-write context (and native-sharded context when
+    ``shard_shape`` is set) used by every type writer.
+
+    ``shard_shape`` accepts an int (broadcast to every axis) or an
+    explicit per-axis tuple.  When provided, ``bounds`` and
+    ``chunk_shape`` are required so the grid shape can be computed
+    upfront — that's the size of the multidim vlen-bytes array each
+    per-chunk path is allocated as.
+
+    Args:
+        level_group: The resolution-level group.
+        compressor: Forwarded to :meth:`Group.batched_writes`.
+        shard_shape: When set, activates
+            :meth:`Group.native_sharded_arrays` so per-chunk-array
+            creations route through the ``sharding_indexed`` codec
+            and per-chunk writes land directly in array cells.
+        bounds: ``(min_corner, max_corner)`` for the level — used to
+            compute the chunk grid extent.
+        chunk_shape: Physical chunk size per axis — paired with
+            ``bounds`` for the grid extent.
+    """
+    from contextlib import ExitStack
+
+    stack = ExitStack()
+    with stack:
+        stack.enter_context(level_group.batched_writes(compressor=compressor))
+        if shard_shape is not None:
+            if bounds is None or chunk_shape is None:
+                raise ArrayError(
+                    "shard_shape requires `bounds` and `chunk_shape` so "
+                    "the per-axis chunk-grid extent can be computed"
+                )
+            # Chunk coords are origin-anchored: ``floor(position /
+            # chunk_shape)``.  The grid must therefore size to
+            # ``ceil(max_corner / chunk_shape)``, *not* the extent
+            # ``ceil((max - min) / chunk_shape)`` — bounds that don't
+            # start at zero would otherwise yield coords past the end.
+            max_corner = np.asarray(bounds[1], dtype=np.float64)
+            cs = np.asarray(chunk_shape, dtype=np.float64)
+            grid_shape = tuple(
+                max(1, int(np.ceil(m / c))) for m, c in zip(max_corner, cs)
+            )
+            ss = (
+                (int(shard_shape),) * len(grid_shape)
+                if isinstance(shard_shape, int)
+                else tuple(int(x) for x in shard_shape)
+            )
+            stack.enter_context(
+                level_group.native_sharded_arrays(ss, grid_shape)
+            )
+        yield
+
+
+def _is_per_chunk_array(name: str) -> bool:
+    """Whether ``name`` points to a per-spatial-chunk array container.
+
+    These are the Option-G groups whose children are chunk-key-named
+    byte blobs — the arrays that benefit from native sharding because
+    each spatial chunk is one tiny storage object without it.  Object-
+    level arrays (``object_index``, ``object_attributes/...``, groups,
+    ``group_attributes/...``) use the single-array layout already and
+    do **not** get rewritten.
+
+    ``cross_chunk_links/<delta>`` is excluded for now — its "cell keys"
+    are canonical-sorted endpoint chunk-pair tuples, not single-chunk
+    spatial coords, so the grid shape doesn't match the spatial
+    chunk grid.  Callers who need those sharded can apply
+    :func:`zarr_vectors.sharding.shard_store` post-hoc.
+    """
+    if name in {VERTICES, VERTEX_FRAGMENTS, LINK_FRAGMENTS}:
+        return True
+    prefixes = (
+        VERTEX_ATTRIBUTES + "/",
+        FRAGMENT_ATTRIBUTES + "/",
+        LINKS + "/",
+        LINK_ATTRIBUTES + "/",
+    )
+    return any(name.startswith(p) for p in prefixes)
 
 
 def read_zv_array_tag(meta: dict) -> str | None:
@@ -369,26 +539,31 @@ def create_object_attributes_array(
     *,
     exist_ok: bool = True,
 ) -> None:
-    """Create an object attribute array ``object_attributes/<name>/``.
+    """Reserve the ``object_attributes/<name>/`` slot.
+
+    Under the 0.8.1 layout :func:`write_object_attributes` creates the
+    Zarr array on first write (it needs the shape and dtype of the data
+    in hand), so this function only performs the ``exist_ok`` conflict
+    check — ``dtype`` and ``num_channels`` are accepted for API
+    compatibility but not persisted at create-time.
 
     Args:
         level_group: The resolution level FsGroup.
         name: Attribute name.
-        dtype: Numpy dtype string.
-        num_channels: Number of channels (C dimension).
+        dtype: Numpy dtype string (informational only in 0.8.1).
+        num_channels: Number of channels (informational only in 0.8.1).
         exist_ok: When True (default), no-op if the array already exists.
             When False, raise :class:`ArrayError` on conflict.
     """
+    del dtype, num_channels  # informational only; see docstring.
     full_name = f"{OBJECT_ATTRIBUTES}/{name}"
     if _short_circuit_existing(level_group, full_name, exist_ok):
         return
+    # Reserve the slot as an empty Zarr group; :func:`write_object_attributes`
+    # replaces it with the real chunked array on first write.  The
+    # placeholder lets a subsequent ``exist_ok=False`` create call detect
+    # the conflict.
     _ensure_array_dir(level_group, full_name)
-    level_group.write_array_meta(full_name, {
-        "zv_array": "object_attribute",
-        "name": name,
-        "dtype": dtype,
-        "num_channels": num_channels,
-    })
 
 
 def create_groupings_array(
@@ -396,7 +571,11 @@ def create_groupings_array(
     *,
     exist_ok: bool = True,
 ) -> None:
-    """Create the ``groupings/`` array.
+    """Reserve the ``groups/`` slot.
+
+    Under the 0.8.1 layout :func:`write_groupings` creates the vlen
+    Zarr array on first write, so this function only performs the
+    ``exist_ok`` conflict check.
 
     Args:
         level_group: Resolution level group.
@@ -406,9 +585,6 @@ def create_groupings_array(
     if _short_circuit_existing(level_group, GROUPS, exist_ok):
         return
     _ensure_array_dir(level_group, GROUPS)
-    level_group.write_array_meta(GROUPS, {
-        "zv_array": "groups",
-    })
 
 
 def create_groupings_attributes_array(
@@ -419,26 +595,25 @@ def create_groupings_attributes_array(
     *,
     exist_ok: bool = True,
 ) -> None:
-    """Create a groupings attribute array ``groupings_attributes/<name>/``.
+    """Reserve the ``group_attributes/<name>/`` slot.
+
+    Under the 0.8.1 layout :func:`write_groupings_attributes` creates
+    the Zarr array on first write, so this function only performs the
+    ``exist_ok`` conflict check.
 
     Args:
         level_group: Resolution level group.
         name: Attribute name.
-        dtype: Numpy dtype string.
-        num_channels: Number of channels (C dimension).
+        dtype: Informational only in 0.8.1.
+        num_channels: Informational only in 0.8.1.
         exist_ok: When True (default), no-op if the array already exists.
             When False, raise :class:`ArrayError` on conflict.
     """
+    del dtype, num_channels
     full_name = f"{GROUP_ATTRIBUTES}/{name}"
     if _short_circuit_existing(level_group, full_name, exist_ok):
         return
     _ensure_array_dir(level_group, full_name)
-    level_group.write_array_meta(full_name, {
-        "zv_array": "groupings_attribute",
-        "name": name,
-        "dtype": dtype,
-        "num_channels": num_channels,
-    })
 
 
 def create_cross_chunk_links_array(
@@ -641,16 +816,16 @@ def write_chunk_links(
                 n = int(np.asarray(g).shape[0]) if np.asarray(g).ndim >= 1 else 0
                 link_fragments.append((cumulative, n))
                 cumulative += n
-        # Ensure the sibling array group exists.
-        if not level_group.chunk_exists(LINK_FRAGMENTS, key):
-            level_group.require_group(LINK_FRAGMENTS)
-            try:
-                level_group.read_array_meta(LINK_FRAGMENTS)
-            except Exception:
-                level_group.write_array_meta(LINK_FRAGMENTS, {
-                    "zv_array": LINK_FRAGMENTS,
-                    "encoding": "fragment_index_v1",
-                })
+        # Ensure the sibling array container exists.  Routes through
+        # ``_ensure_array_dir`` so that native-sharded writers allocate
+        # a multidim vlen-bytes array at this path instead of the
+        # legacy Option-G group.
+        if not level_group.array_exists(LINK_FRAGMENTS):
+            _ensure_array_dir(level_group, LINK_FRAGMENTS)
+            level_group.write_array_meta(LINK_FRAGMENTS, {
+                "zv_array": LINK_FRAGMENTS,
+                "encoding": "fragment_index_v1",
+            })
         level_group.write_bytes(
             LINK_FRAGMENTS, key, encode_fragments(link_fragments),
         )
@@ -941,152 +1116,166 @@ def write_object_attributes(
     data: npt.NDArray,
     *,
     present_mask: npt.NDArray | None = None,
+    fill_value: Any = None,
     mode: Literal["replace", "append"] = "replace",
 ) -> None:
-    """Write dense O×C object attribute data.
+    """Write dense O×C object attribute data as a single Zarr v3 array.
+
+    The array is stored at ``object_attributes/<attr_name>`` as a standard
+    chunked Zarr v3 array.  Absent rows (selected by ``present_mask``)
+    are encoded in-band using ``fill_value`` — no sibling
+    ``present_mask`` child array is written.  Stock Zarr v3 tooling can
+    read the array without library-specific decoding; absent positions
+    are visible as the array's ``fill_value`` (also returned for any
+    chunk that was never written).
 
     Args:
         level_group: Resolution level group.
         attr_name: Attribute name.
         data: ``(O,)`` or ``(O, C)`` array.  In ``mode="append"`` this is
-            interpreted as the NEW rows to append.
+            the NEW rows to append.
         present_mask: Optional ``(O,)`` byte array (``0``/``1`` per
-            object) marking which rows are real.  Required for levels
-            that use ID-preserving sparsification — rows for dropped
-            objects have ``mask[i] == 0`` and the corresponding
-            ``data[i]`` row is dtype-zero padding.  When omitted, every
-            row is assumed real (backwards compatible).  In append mode,
-            this is the mask for the NEW rows; existing rows get
-            ``1`` backfilled if the existing array had no mask.
-        mode: ``"replace"`` (default, current behaviour) writes ``data``
-            as the full array.  ``"append"`` reads the existing array,
-            concatenates ``data`` along axis 0, writes back.  Existing
-            dtype wins on dtype mismatch (new rows are cast).  If the
-            attribute does not exist yet, the first append behaves like
-            a ``"replace"``.
+            object) marking real rows.  When provided, absent rows
+            (``mask[i] == 0``) are overwritten with ``fill_value`` before
+            write; callers that already encoded sentinels in ``data``
+            should leave this ``None``.
+        fill_value: Sentinel for absent positions.  Defaults to NaN for
+            floats, dtype-min for signed ints, dtype-max for unsigned
+            ints (see :func:`_default_fill_value_for_dtype`).  Used both
+            as the in-array sentinel for masked rows and as the array's
+            persisted ``fill_value``.
+        mode: ``"replace"`` (default) writes ``data`` as the full array.
+            ``"append"`` reads the existing array, concatenates ``data``
+            along axis 0, writes back.  Existing dtype wins on dtype
+            mismatch (new rows are cast).  ``"append"`` against a
+            missing attribute behaves like ``"replace"``.
 
     Raises:
-        ArrayError: If ``mode`` is invalid, or if the appended row shape
+        ArrayError: If ``mode`` is invalid, ``present_mask`` length
+            mismatches ``data``, the dtype has no default sentinel and
+            no ``fill_value`` is given, or the appended row shape
             (everything beyond axis 0) does not match the existing array.
 
     Concurrency:
         ``mode="append"`` is read-modify-write and NOT cross-writer-safe.
         Callers must serialise concurrent appends to the same attribute.
     """
-    if mode == "replace":
-        full_name = f"{OBJECT_ATTRIBUTES}/{attr_name}"
-        _ensure_array_dir(level_group, full_name)
-        level_group.write_bytes(full_name, "data", data.tobytes())
-        if present_mask is not None:
-            mask = np.asarray(present_mask, dtype=np.uint8)
-            if mask.shape[0] != data.shape[0]:
-                raise ArrayError(
-                    f"present_mask length {mask.shape[0]} != data row count "
-                    f"{data.shape[0]}"
-                )
-            level_group.write_bytes(full_name, "present_mask", mask.tobytes())
-        level_group.write_array_meta(full_name, {
-            "zv_array": "object_attribute",
-            "name": attr_name,
-            "dtype": str(data.dtype),
-            "shape": list(data.shape),
-            "has_present_mask": bool(present_mask is not None),
-        })
-        return
-
-    if mode != "append":
+    if mode not in ("replace", "append"):
         raise ArrayError(
             f"mode must be 'replace' or 'append', got {mode!r}"
         )
 
-    # Append branch ------------------------------------------------------
-    full_name = f"{OBJECT_ATTRIBUTES}/{attr_name}"
     data = np.asarray(data)
+    full_name = f"{OBJECT_ATTRIBUTES}/{attr_name}"
 
-    meta = level_group.read_array_meta(full_name)
-    if meta and "shape" in meta and level_group.chunk_exists(full_name, "data"):
-        existing = read_object_attributes(level_group, attr_name)
-        had_existing_mask = bool(meta.get("has_present_mask"))
-    else:
-        existing = None
-        had_existing_mask = False
-
-    if existing is None:
-        combined = data
-    else:
-        # Tail-shape (everything beyond axis 0) must match.
+    appending = (
+        mode == "append"
+        and level_group.standalone_array_exists(full_name)
+    )
+    if appending:
+        existing = level_group.read_array(full_name)
         if existing.shape[1:] != data.shape[1:]:
             raise ArrayError(
                 f"append shape mismatch: existing {existing.shape} vs "
                 f"new {data.shape} — tail dimensions must match"
             )
-        new_cast = data.astype(existing.dtype, copy=False)
-        combined = np.concatenate([existing, new_cast], axis=0)
+        # Existing dtype wins on conflict; new rows are cast.
+        new_rows = data.astype(existing.dtype, copy=False)
+        target_dtype = existing.dtype
+    else:
+        existing = None
+        new_rows = data
+        target_dtype = data.dtype
 
-    _ensure_array_dir(level_group, full_name)
-    level_group.write_bytes(
-        full_name, "data", np.ascontiguousarray(combined).tobytes(),
-    )
+    if fill_value is None:
+        fill_value = _default_fill_value_for_dtype(target_dtype)
 
-    has_mask = had_existing_mask or (present_mask is not None)
     if present_mask is not None:
-        new_mask = np.asarray(present_mask, dtype=np.uint8)
-        if new_mask.shape[0] != data.shape[0]:
+        mask_arr = np.asarray(present_mask, dtype=bool)
+        if mask_arr.shape[0] != data.shape[0]:
             raise ArrayError(
-                f"present_mask length {new_mask.shape[0]} != appended row "
+                f"present_mask length {mask_arr.shape[0]} != data row "
                 f"count {data.shape[0]}"
             )
-        if had_existing_mask:
-            old_mask = np.frombuffer(
-                level_group.read_bytes(full_name, "present_mask"),
-                dtype=np.uint8,
-            )
-        elif existing is not None:
-            # First-time mask introduction — backfill existing rows.
-            old_mask = np.ones(existing.shape[0], dtype=np.uint8)
-        else:
-            old_mask = np.empty(0, dtype=np.uint8)
-        combined_mask = np.concatenate([old_mask, new_mask])
-        level_group.write_bytes(
-            full_name, "present_mask", combined_mask.tobytes(),
-        )
+        new_rows = new_rows.copy()
+        new_rows[~mask_arr] = fill_value
 
-    level_group.write_array_meta(full_name, {
-        "zv_array": "object_attribute",
-        "name": attr_name,
-        "dtype": str(combined.dtype),
-        "shape": list(combined.shape),
-        "has_present_mask": has_mask,
-    })
+    if appending:
+        write_data = np.concatenate([existing, new_rows], axis=0)
+    else:
+        write_data = new_rows
+
+    level_group.write_array(
+        full_name, write_data,
+        fill_value=fill_value,
+        attributes={
+            "zv_array": "object_attribute",
+            "name": attr_name,
+            "dtype": str(write_data.dtype),
+            "shape": list(write_data.shape),
+            "fill_sentinel_meaning": "absent",
+        },
+    )
 
 
 def read_object_attribute_present_mask(
     level_group: FsGroup,
     attr_name: str,
 ) -> npt.NDArray[np.uint8] | None:
-    """Read the optional ``present_mask`` byte sidecar for an attribute.
+    """Reconstruct the ``(O,)`` byte present-mask for an object attribute.
 
-    Returns ``None`` when the level was written without a mask (every
-    row real) or the array is missing.
+    The 0.8.1 layout stores absence in-band via ``fill_value`` rather
+    than as a sibling ``present_mask`` array, so this reader compares
+    each row against the stored fill on the fly.  A row counts as
+    "absent" only if every channel equals the sentinel.
+
+    Returns:
+        ``uint8`` mask (``1`` = present, ``0`` = absent), or ``None``
+        when every row is present (so callers can skip allocating a
+        full mask).  Also returns ``None`` when the attribute is
+        missing.
     """
     full_name = f"{OBJECT_ATTRIBUTES}/{attr_name}"
-    try:
-        meta = level_group.read_array_meta(full_name)
-    except Exception:
+    if not level_group.standalone_array_exists(full_name):
         return None
-    if not meta.get("has_present_mask"):
+
+    data = level_group.read_array(full_name)
+    fill = level_group.read_array_fill_value(full_name)
+
+    # NaN ≠ NaN, so detect via isnan for any float-like fill (Python
+    # float or numpy float scalar — zarr can return either).
+    fill_is_nan = False
+    if data.dtype.kind == "f":
+        try:
+            fill_is_nan = bool(np.isnan(fill))
+        except (TypeError, ValueError):
+            fill_is_nan = False
+    if fill_is_nan:
+        absent_per_elem = np.isnan(data)
+    else:
+        absent_per_elem = (data == fill)
+
+    if data.ndim == 1:
+        absent = absent_per_elem
+    else:
+        # Row "absent" iff every channel equals the sentinel.
+        absent = absent_per_elem.reshape(data.shape[0], -1).all(axis=1)
+
+    if not absent.any():
         return None
-    if not level_group.chunk_exists(full_name, "present_mask"):
-        return None
-    raw = level_group.read_bytes(full_name, "present_mask")
-    return np.frombuffer(raw, dtype=np.uint8)
+    return (~absent).astype(np.uint8)
 
 
 def write_groupings(
     level_group: FsGroup,
     groups: dict[int, list[int]],
 ) -> None:
-    """Write group memberships: group_id → list of object_ids.
+    """Write group memberships as a single vlen-bytes Zarr v3 array.
+
+    Each row of the array at ``groups/`` is the byte-serialised int64
+    member list of one group, addressable by integer index.  This
+    replaces the legacy ``groups/data`` + ``groups/offsets`` CSR pair
+    with the same vlen layout already used by ``object_index/manifests``.
 
     Args:
         level_group: Resolution level group.
@@ -1097,18 +1286,18 @@ def write_groupings(
         return
 
     max_gid = max(groups.keys())
-    group_list: list[npt.NDArray] = []
+    blobs: list[bytes] = []
     for gid in range(max_gid + 1):
-        members = groups.get(gid, [])
-        group_list.append(np.array(members, dtype=np.int64))
+        members = np.array(groups.get(gid, []), dtype=np.int64)
+        blobs.append(members.tobytes())
 
-    raw_bytes, offsets = encode_ragged_ints(group_list, dtype=np.dtype(np.int64))
-    level_group.write_bytes(GROUPS, "data", raw_bytes)
-    level_group.write_bytes(GROUPS, "offsets", offsets.tobytes())
-    level_group.write_array_meta(GROUPS, {
-        "zv_array": "groups",
-        "num_groups": max_gid + 1,
-    })
+    level_group.write_vlen_array(
+        GROUPS, blobs,
+        attributes={
+            "zv_array": "groups",
+            "num_groups": max_gid + 1,
+        },
+    )
 
 
 def write_groupings_attributes(
@@ -1116,22 +1305,61 @@ def write_groupings_attributes(
     attr_name: str,
     data: npt.NDArray,
 ) -> None:
-    """Write dense G×C groupings attribute data.
+    """Write dense G×C groupings attribute data as a single Zarr v3 array.
+
+    Stored at ``group_attributes/<attr_name>`` as a standard chunked
+    Zarr v3 array.  Unlike :func:`write_object_attributes`, no
+    sentinel / present-mask handling — groupings attributes are always
+    fully populated.
 
     Args:
         level_group: Resolution level group.
         attr_name: Attribute name.
         data: ``(G,)`` or ``(G, C)`` array.
     """
+    data = np.asarray(data)
     full_name = f"{GROUP_ATTRIBUTES}/{attr_name}"
-    _ensure_array_dir(level_group, full_name)
-    level_group.write_bytes(full_name, "data", data.tobytes())
-    level_group.write_array_meta(full_name, {
-        "zv_array": "groupings_attribute",
-        "name": attr_name,
-        "dtype": str(data.dtype),
-        "shape": list(data.shape),
-    })
+    level_group.write_array(
+        full_name, data,
+        attributes={
+            "zv_array": "groupings_attribute",
+            "name": attr_name,
+            "dtype": str(data.dtype),
+            "shape": list(data.shape),
+        },
+    )
+
+
+@dataclass
+class CrossChunkLinkPartition:
+    """Per-input-record cell mapping returned by
+    :func:`write_cross_chunk_links`.
+
+    Pass to :func:`write_cross_chunk_link_attributes` to align
+    per-record attribute data with the per-cell layout used by the
+    link writer.
+
+    Attributes:
+        cell_indices: Maps ``cell_key`` → list of indices into the
+            input ``links`` list (in input order).  Within each
+            bucket, indices preserve input ordering, so attribute
+            data passed in input order partitions deterministically.
+        num_links: Total record count after the write (==
+            ``sum(len(v) for v in cell_indices.values())``).  For
+            ``append`` mode this includes pre-existing records.
+        first_new: Backward-compat — the input-order row index of the
+            first newly-appended record.  ``0`` for ``replace`` mode,
+            ``len(existing)`` for ``append`` mode.
+    """
+
+    cell_indices: dict[str, list[int]]
+    num_links: int
+    first_new: int = 0
+
+    def __int__(self) -> int:
+        # Lets legacy callers that did
+        # ``first_new = int(write_cross_chunk_links(...))`` still work.
+        return self.first_new
 
 
 def write_cross_chunk_links(
@@ -1142,8 +1370,8 @@ def write_cross_chunk_links(
     delta: int = 0,
     link_width: int | None = None,
     mode: Literal["replace", "append"] = "replace",
-) -> int:
-    """Write cross-chunk link records under ``cross_chunk_links/<delta>/``.
+) -> CrossChunkLinkPartition:
+    """Write cross-chunk link records under ``cross_chunk_links/<delta>/<cell_key>``.
 
     Each record is ``link_width`` ``(chunk_coords, vertex_idx)``
     endpoints.  ``link_width=2`` (the default) encodes the classic
@@ -1152,15 +1380,21 @@ def write_cross_chunk_links(
     ``link_width=1`` encodes a single parent→child reference used by
     pyramid metanode drill-down.
 
+    Each record's endpoints are canonical-sorted by ``chunk_coords``
+    (tie-break ``vi``) and the record is stored under the cell
+    keyed by the dotted concatenation of those L sorted chunks (see
+    :func:`zarr_vectors.core.paths.format_cell_key`).  Original
+    endpoint order is preserved via a Lehmer-coded ``perm_idx``
+    stored alongside the canonical vertex indices, so readers can
+    recover the input ordering (mesh-face winding, directed-edge
+    direction).
+
     Records may be passed either as legacy 2-tuples (compatibility
     with the pre-0.6.0 edge-only API) or as a list of endpoint lists
     when ``link_width`` is supplied explicitly.
 
     Endpoint 0 is at the owning resolution level; endpoint k (k>0)
-    is at ``this_level + delta``.  For ``link_width=1`` (metanode
-    drill-down) the single endpoint is at ``this_level + delta`` and
-    is paired with an implicit source defined by the writer (the
-    record stores only the child reference).
+    is at ``this_level + delta``.
 
     Args:
         level_group: Resolution level group.
@@ -1172,33 +1406,52 @@ def write_cross_chunk_links(
         delta: Level delta; see :mod:`zarr_vectors.core.paths`.
         link_width: Endpoints per record.  Defaults to 2 (or to the
             arity of the first record if it's a list).
-        mode: ``"replace"`` (default) overwrites the existing records.
-            ``"append"`` reads existing records, concatenates ``links``,
-            writes back.  ``link_width`` of the appended records must
-            match the existing ``link_width``.
+        mode: ``"replace"`` (default) clears the existing
+            ``cross_chunk_links/<delta>/`` family and writes
+            ``links`` afresh.  ``"append"`` reads existing records
+            cell-by-cell, appends ``links`` (canonical-sorted to
+            their cells), and writes the merged cells back.
+            ``link_width`` of the appended records must match the
+            existing ``link_width``.
 
     Returns:
-        ``"replace"`` returns ``0``.  ``"append"`` returns the row index
-        of the first newly-appended record (``len(existing)`` before
-        the append).  Callers can stamp this index onto downstream
-        attribute tables that reference records by row.
+        :class:`CrossChunkLinkPartition` describing where each input
+        record landed.  ``int(partition)`` recovers the legacy
+        ``first_new`` int for callers that only cared about the
+        append offset.
 
     Concurrency:
-        ``mode="append"`` is read-modify-write and NOT cross-writer-safe.
-        Callers must serialise concurrent appends to the same
-        cross_chunk_links/<delta>/ blob.
+        ``mode="append"`` is read-modify-write per cell — safe
+        across disjoint cells, unsafe within a single cell.
     """
     if mode not in ("replace", "append"):
         raise ArrayError(
             f"mode must be 'replace' or 'append', got {mode!r}"
         )
+
+    # Local import to avoid circular import at module load.
+    from zarr_vectors.encoding.ragged import (
+        decode_ragged_blob,
+        encode_ragged_blob,
+    )
+    from zarr_vectors.spatial.boundary import canonical_sort
+
     if not links:
-        return 0
+        # Honour the empty-input fast-exit; emit an empty partition
+        # so callers don't crash on attribute reflection.
+        return CrossChunkLinkPartition(
+            cell_indices={}, num_links=0, first_new=0,
+        )
 
     # Normalise input to a list-of-lists shape; resolve link_width.
     normalised: list[list[tuple[ChunkCoords, int]]] = []
     for rec in links:
-        if isinstance(rec, tuple) and len(rec) == 2 and isinstance(rec[0], tuple) and not isinstance(rec[0][0], tuple):
+        if (
+            isinstance(rec, tuple)
+            and len(rec) == 2
+            and isinstance(rec[0], tuple)
+            and not isinstance(rec[0][0], tuple)
+        ):
             # Legacy CrossChunkLink: ((chunk_a, vi_a), (chunk_b, vi_b))
             normalised.append([rec[0], rec[1]])
         else:
@@ -1213,47 +1466,126 @@ def write_cross_chunk_links(
                 f"{len(rec)} != link_width {link_width}"
             )
 
-    full_name = cross_chunk_links_path(delta)
-
-    if mode == "append":
-        existing = read_cross_chunk_links(level_group, delta=delta)
-        if existing:
-            existing_meta = level_group.read_array_meta(full_name)
-            existing_link_width = int(existing_meta.get("link_width", 2))
-            if existing_link_width != link_width:
-                raise ArrayError(
-                    f"cross_chunk_links/{format_delta(delta)}: cannot "
-                    f"append records of link_width {link_width} onto "
-                    f"existing array of link_width {existing_link_width}"
-                )
-        first_new = len(existing)
-        combined = [list(rec) for rec in existing] + normalised
-    else:
-        first_new = 0
-        combined = normalised
-
-    flat: list[int] = []
-    for rec in combined:
-        for chunk, vi in rec:
+    # Validate chunk-coord arity up front so partition failures are
+    # caught with a clean message.
+    for rec in normalised:
+        for chunk, _vi in rec:
             if len(chunk) != sid_ndim:
                 raise ArrayError(
                     f"chunk coords arity mismatch in cross_chunk_links/"
                     f"{format_delta(delta)}: sid_ndim={sid_ndim}, "
                     f"got len(chunk)={len(chunk)}"
                 )
-            flat.extend(int(c) for c in chunk)
-            flat.append(int(vi))
 
-    arr = np.array(flat, dtype=np.int64)
-    level_group.write_bytes(full_name, "data", arr.tobytes())
+    full_name = cross_chunk_links_path(delta)
+
+    # Cross-link_width check on existing array before destructive write.
+    if mode == "append" and level_group.array_exists(full_name):
+        existing_meta = level_group.read_array_meta(full_name)
+        if existing_meta:
+            existing_link_width = int(
+                existing_meta.get("link_width", link_width)
+            )
+            if existing_link_width != link_width:
+                raise ArrayError(
+                    f"cross_chunk_links/{format_delta(delta)}: cannot "
+                    f"append records of link_width {link_width} onto "
+                    f"existing array of link_width {existing_link_width}"
+                )
+            existing_sid = int(
+                existing_meta.get("sid_ndim", sid_ndim)
+            )
+            if existing_sid != sid_ndim:
+                raise ArrayError(
+                    f"cross_chunk_links/{format_delta(delta)}: cannot "
+                    f"append with sid_ndim={sid_ndim} onto existing "
+                    f"sid_ndim={existing_sid}"
+                )
+
+    # Build the cell partition in input order: for each input record
+    # canonical-sort the endpoints, derive the cell key, and record
+    # both the canonical (vi list, perm_idx) pair and the input index.
+    # Both per-cell lists preserve input order within the bucket.
+    bucket_entries: dict[str, list[tuple[list[int], int]]] = {}
+    cell_indices: dict[str, list[int]] = {}
+    for i, rec in enumerate(normalised):
+        sorted_rec, perm_idx = canonical_sort(rec)
+        key = format_cell_key([c for c, _ in sorted_rec])
+        vi_canonical = [int(v) for _, v in sorted_rec]
+        bucket_entries.setdefault(key, []).append((vi_canonical, perm_idx))
+        cell_indices.setdefault(key, []).append(i)
+
+    record_len_int64 = 1 + link_width  # [perm_idx, vi_0, ..., vi_{L-1}]
+
+    if mode == "replace":
+        # Drop the whole family — clears stale cells, .zattrs,
+        # everything — and re-create with the new contents.
+        if level_group.array_exists(full_name):
+            level_group.delete_subtree(full_name)
+        first_new = 0
+        existing_total = 0
+
+        # Write each new cell.
+        for cell_key, rows in bucket_entries.items():
+            blob_groups: list[npt.NDArray] = []
+            for vi_canonical, perm_idx in rows:
+                row = np.empty(record_len_int64, dtype=np.int64)
+                row[0] = perm_idx
+                row[1:] = vi_canonical
+                blob_groups.append(row)
+            blob = encode_ragged_blob(blob_groups, np.dtype(np.int64))
+            level_group.write_bytes(full_name, cell_key, blob)
+    else:
+        # Append: per-cell RMW.  Cells not touched by ``links`` keep
+        # their existing contents.
+        existing_total = 0
+        if level_group.array_exists(full_name):
+            for existing_key in level_group.list_chunks(full_name):
+                # Count existing rows in this cell — we don't need the
+                # decoded values unless this cell is also being appended.
+                blob = level_group.read_bytes(full_name, existing_key)
+                existing_rows = decode_ragged_blob(
+                    blob, np.dtype(np.int64), ncols=record_len_int64,
+                )
+                existing_total += len(existing_rows)
+        first_new = existing_total
+
+        for cell_key, rows in bucket_entries.items():
+            # Read existing cell rows (if any).
+            existing_rows: list[npt.NDArray] = []
+            if level_group.chunk_exists(full_name, cell_key):
+                blob = level_group.read_bytes(full_name, cell_key)
+                existing_rows = decode_ragged_blob(
+                    blob, np.dtype(np.int64), ncols=record_len_int64,
+                )
+            new_rows: list[npt.NDArray] = []
+            for vi_canonical, perm_idx in rows:
+                row = np.empty(record_len_int64, dtype=np.int64)
+                row[0] = perm_idx
+                row[1:] = vi_canonical
+                new_rows.append(row)
+            combined = existing_rows + new_rows
+            blob = encode_ragged_blob(combined, np.dtype(np.int64))
+            level_group.write_bytes(full_name, cell_key, blob)
+
+    # Family .zattrs on the parent group.  ``num_links`` is the total
+    # record count after this write — useful for length-invariant
+    # checks on the parallel attribute array.
+    new_total = existing_total + len(normalised)
+    _ensure_array_dir(level_group, full_name)
     level_group.write_array_meta(full_name, {
         "zv_array": "cross_chunk_links",
-        "num_links": len(combined),
-        "sid_ndim": sid_ndim,
+        "sid_ndim": int(sid_ndim),
         "level_delta": int(delta),
         "link_width": int(link_width),
+        "num_links": int(new_total),
     })
-    return first_new
+
+    return CrossChunkLinkPartition(
+        cell_indices=cell_indices,
+        num_links=new_total,
+        first_new=first_new,
+    )
 
 
 def write_cross_chunk_link_attributes(
@@ -1264,38 +1596,50 @@ def write_cross_chunk_link_attributes(
     num_links: int,
     delta: int = 0,
     mode: Literal["replace", "append"] = "replace",
+    partition: CrossChunkLinkPartition | None = None,
 ) -> None:
-    """Write per-edge attribute data parallel to ``cross_chunk_links/<delta>/data``.
+    """Write per-edge attribute data parallel to
+    ``cross_chunk_links/<delta>/<cell_key>``.
 
-    The cross-chunk-link attribute array is a single flat blob whose
-    rows are in the same order as the cross-chunk links written by
-    :func:`write_cross_chunk_links` for the same ``delta``.  Length is
-    runtime-checked against the parallel CCL array's ``num_links`` so a
-    desynchronized write fails loudly instead of producing silent
-    corruption.
+    Attribute rows are stored per-cell, one row per record, matching
+    the row order of the parallel links cell.
+
+    ``attr_data`` is expected in **input order** — the same ordering
+    used for the corresponding ``write_cross_chunk_links`` call.  The
+    ``partition`` returned by that call provides the cell mapping; if
+    omitted, the caller is responsible for ensuring ``attr_data`` is
+    in input order and the writer falls back to re-deriving the
+    partition by reading back the link records.
 
     Args:
         level_group: Resolution level group.
         attr_name: Attribute name.
-        attr_data: ``(num_links,)`` or ``(num_links, C)`` array.  In
-            ``mode="append"`` this is interpreted as the NEW rows to
-            append; the post-append length must equal ``num_links``.
-        num_links: Expected post-write length (the ``num_links`` value
-            on the parallel ``cross_chunk_links/<delta>/`` array).
-        delta: Level delta; see :mod:`zarr_vectors.core.paths`.
-        mode: ``"replace"`` (default) writes ``attr_data`` as the whole
-            attribute array.  ``"append"`` reads the existing attribute,
-            concatenates ``attr_data`` along axis 0, writes back, and
-            validates that the resulting length equals ``num_links``.
+        attr_data: ``(num_links,)`` or ``(num_links, C)`` array in
+            **input order**.  In ``mode="append"`` this represents
+            the NEW rows; the post-append total must equal
+            ``num_links``.
+        num_links: Expected post-write total record count (matches
+            ``CrossChunkLinkPartition.num_links``).
+        delta: Level delta.
+        mode: ``"replace"`` (default) — wipes existing cells and
+            writes the full attribute family afresh.  ``"append"`` —
+            per-cell RMW: existing attribute rows are kept, new rows
+            are appended to their respective cells in the same per-
+            cell order as the link writer used.
+        partition: Optional :class:`CrossChunkLinkPartition` returned
+            by the matching :func:`write_cross_chunk_links` call.
+            Supplying it avoids reading the link records back.
 
     Raises:
-        ArrayError: If ``mode`` is invalid, if the post-write length
-            does not equal ``num_links``, or if the appended row shape
-            does not match the existing array.
+        ArrayError: If ``mode`` is invalid, if the row count of
+            ``attr_data`` does not match the expected ``num_links``
+            (replace) or the new-row count derived from
+            ``partition`` (append), or if the appended row shape
+            does not match an existing array.
 
     Concurrency:
-        ``mode="append"`` is read-modify-write and NOT cross-writer-safe.
-        Callers must serialise concurrent appends to the same attribute.
+        ``mode="append"`` is read-modify-write per cell — safe
+        across disjoint cells, unsafe within a single cell.
     """
     if mode not in ("replace", "append"):
         raise ArrayError(
@@ -1303,46 +1647,152 @@ def write_cross_chunk_link_attributes(
         )
 
     full_name = cross_chunk_link_attributes_path(attr_name, delta)
+    links_family = cross_chunk_links_path(delta)
+    arr = np.ascontiguousarray(np.asarray(attr_data))
 
-    if mode == "append":
-        meta = level_group.read_array_meta(full_name)
-        if meta and "shape" in meta and level_group.chunk_exists(full_name, "data"):
-            existing = read_cross_chunk_link_attributes(
-                level_group, attr_name, delta=delta,
+    # Resolve the partition.  Append mode requires it explicitly —
+    # only the matching write_cross_chunk_links call knows which
+    # cell each new attribute row belongs to.  Replace mode can
+    # fall back to re-deriving from disk (assumes ``attr_data`` is
+    # in cell-key-sorted on-disk order).
+    if partition is None:
+        if mode == "append":
+            raise ArrayError(
+                f"cross_chunk_link_attributes[{attr_name}] append mode "
+                f"requires partition=... from the matching "
+                f"write_cross_chunk_links(mode='append') call so the "
+                f"writer knows which cell each new row belongs to"
             )
-            if existing.shape[1:] != np.asarray(attr_data).shape[1:]:
-                raise ArrayError(
-                    f"cross_chunk_link_attributes[{attr_name}] append "
-                    f"shape mismatch: existing {existing.shape} vs new "
-                    f"{np.asarray(attr_data).shape} — tail dimensions "
-                    f"must match"
-                )
-            new_cast = np.asarray(attr_data).astype(existing.dtype, copy=False)
-            combined = np.concatenate([existing, new_cast], axis=0)
-        else:
-            combined = np.asarray(attr_data)
-    else:
-        combined = np.asarray(attr_data)
-
-    if combined.shape[0] != num_links:
-        raise ArrayError(
-            f"cross_chunk_link_attributes[{attr_name}] row count "
-            f"{combined.shape[0]} != num_links {num_links} "
-            f"(delta={format_delta(delta)})"
+        partition = _derive_partition_from_links(
+            level_group, links_family, delta,
         )
 
+    # Validate counts.
+    if mode == "replace":
+        if arr.shape[0] != num_links:
+            raise ArrayError(
+                f"cross_chunk_link_attributes[{attr_name}] row count "
+                f"{arr.shape[0]} != num_links {num_links} "
+                f"(delta={format_delta(delta)})"
+            )
+        if arr.shape[0] != partition.num_links:
+            raise ArrayError(
+                f"cross_chunk_link_attributes[{attr_name}] attr rows "
+                f"{arr.shape[0]} != link records {partition.num_links} "
+                f"derived from cross_chunk_links/{format_delta(delta)}"
+            )
+        # Wipe + rewrite the whole family.
+        if level_group.array_exists(full_name):
+            level_group.delete_subtree(full_name)
+
+        for cell_key, input_idxs in partition.cell_indices.items():
+            cell_attrs = arr[np.asarray(input_idxs, dtype=np.int64)]
+            level_group.write_bytes(
+                full_name, cell_key,
+                np.ascontiguousarray(cell_attrs).tobytes(),
+            )
+    else:
+        # Append mode.  The post-append total record count must equal
+        # num_links; arr.shape[0] is the new-row count.
+        new_count = sum(len(v) for v in partition.cell_indices.values())
+        if arr.shape[0] != new_count:
+            raise ArrayError(
+                f"cross_chunk_link_attributes[{attr_name}] append: "
+                f"attr_data row count {arr.shape[0]} != new link "
+                f"record count {new_count} "
+                f"(delta={format_delta(delta)})"
+            )
+        if partition.num_links != num_links:
+            raise ArrayError(
+                f"cross_chunk_link_attributes[{attr_name}] row count "
+                f"{partition.num_links} != num_links {num_links} "
+                f"(delta={format_delta(delta)})"
+            )
+
+        for cell_key, input_idxs in partition.cell_indices.items():
+            cell_attrs_new = arr[np.asarray(input_idxs, dtype=np.int64)]
+            if level_group.chunk_exists(full_name, cell_key):
+                existing_meta = level_group.read_array_meta(full_name)
+                existing_blob = level_group.read_bytes(full_name, cell_key)
+                if existing_meta and "dtype" in existing_meta:
+                    existing_dtype = np.dtype(existing_meta["dtype"])
+                else:
+                    existing_dtype = arr.dtype
+                tail_shape = tuple(existing_meta.get(
+                    "row_shape", arr.shape[1:],
+                ))
+                if tail_shape != arr.shape[1:]:
+                    raise ArrayError(
+                        f"cross_chunk_link_attributes[{attr_name}] "
+                        f"append shape mismatch: existing row shape "
+                        f"{tail_shape} vs new {arr.shape[1:]}"
+                    )
+                row_size = int(np.prod(tail_shape)) if tail_shape else 1
+                row_bytes = existing_dtype.itemsize * row_size
+                existing_count = len(existing_blob) // row_bytes
+                existing_arr = np.frombuffer(
+                    existing_blob, dtype=existing_dtype,
+                ).reshape((existing_count, *tail_shape)).copy()
+                new_cast = cell_attrs_new.astype(existing_dtype, copy=False)
+                combined = np.concatenate([existing_arr, new_cast], axis=0)
+            else:
+                combined = cell_attrs_new
+            level_group.write_bytes(
+                full_name, cell_key,
+                np.ascontiguousarray(combined).tobytes(),
+            )
+
+    # Family .zattrs.  Stores ``row_shape`` (the tail dimensions per
+    # row, ``()`` for 1-D arrays) so readers can reconstruct shape
+    # from a per-cell byte blob without ambiguity.
     _ensure_array_dir(level_group, full_name)
-    level_group.write_bytes(
-        full_name, "data", np.ascontiguousarray(combined).tobytes(),
-    )
     level_group.write_array_meta(full_name, {
         "zv_array": "cross_chunk_link_attribute",
         "name": attr_name,
-        "dtype": str(combined.dtype),
+        "dtype": str(arr.dtype),
         "level_delta": int(delta),
         "num_links": int(num_links),
-        "shape": list(combined.shape),
+        "row_shape": list(arr.shape[1:]),
     })
+
+
+def _derive_partition_from_links(
+    level_group: FsGroup,
+    links_family: str,
+    delta: int,
+) -> CrossChunkLinkPartition:
+    """Re-derive a :class:`CrossChunkLinkPartition` by reading the
+    on-disk records under ``links_family``.
+
+    Returns a partition whose ``cell_indices`` is keyed in the same
+    iteration order as the on-disk cell layout (cell-key-sorted),
+    with input indices ``0..num_links-1`` assigned in that read
+    order.  Callers passing ``attr_data`` to
+    :func:`write_cross_chunk_link_attributes` without an explicit
+    partition must supply rows in this same cell-key-sorted order.
+    """
+    cell_indices: dict[str, list[int]] = {}
+    next_idx = 0
+    if level_group.array_exists(links_family):
+        meta = level_group.read_array_meta(links_family) or {}
+        link_width = int(meta.get("link_width", 2))
+        record_len = 1 + link_width
+        # Local import to avoid pulling decode_ragged_blob at module load.
+        from zarr_vectors.encoding.ragged import decode_ragged_blob
+
+        for cell_key in sorted(level_group.list_chunks(links_family)):
+            blob = level_group.read_bytes(links_family, cell_key)
+            rows = decode_ragged_blob(
+                blob, np.dtype(np.int64), ncols=record_len,
+            )
+            n = len(rows)
+            cell_indices[cell_key] = list(range(next_idx, next_idx + n))
+            next_idx += n
+    return CrossChunkLinkPartition(
+        cell_indices=cell_indices,
+        num_links=next_idx,
+        first_new=0,
+    )
 
 
 # ===================================================================
@@ -1507,8 +1957,13 @@ def read_chunk_links(
         if delta == 0:
             # v0.6 intra-level layout: raw is the flat concatenated link
             # data; per-group row counts live in link_fragments/<chunk>.
-            # Handles both range and explicit fragments by reshaping once
-            # and dispatching per fragment.
+            # In the native-sharded layout, ``links/0`` is a single
+            # multidim Zarr array; cells for chunks with no intra-edges
+            # return ``b""`` (the vlen fill value) instead of "chunk not
+            # found".  Short-circuit that case before trying to read
+            # the (likely absent) ``link_fragments`` array.
+            if not raw:
+                return []
             fi = read_link_fragment_index(level_group, chunk_coords)
             if fi.num_fragments == 0:
                 return []
@@ -1896,16 +2351,13 @@ def read_object_manifest(
             f"Object ID {object_id} out of range [0, {num_objects})"
         )
 
-    if meta.get("layout") == OBJECT_INDEX_LAYOUT_V1:
-        manifests_arr = level_group.zarr_group[OBJECT_INDEX]["manifests"]
-        # Slice (then index) instead of scalar indexing: zarr 3.x vlen-bytes
-        # returns a 0-d object ndarray under ``arr[i]``, whose ``bytes()``
-        # is the array header — not the payload.  ``arr[i:i+1][0]`` is the
-        # actual bytes object and still fetches only the chunk holding i.
-        blob = manifests_arr[object_id:object_id + 1][0]
-    else:
-        blob = _legacy_read_object_blob(level_group, object_id, num_objects)
-
+    _require_object_index_v1(meta)
+    manifests_arr = level_group.zarr_group[OBJECT_INDEX]["manifests"]
+    # Slice (then index) instead of scalar indexing: zarr 3.x vlen-bytes
+    # returns a 0-d object ndarray under ``arr[i]``, whose ``bytes()``
+    # is the array header — not the payload.  ``arr[i:i+1][0]`` is the
+    # actual bytes object and still fetches only the chunk holding i.
+    blob = manifests_arr[object_id:object_id + 1][0]
     blocks = decode_object_manifest_blocks(blob, sid_ndim=sid_ndim)
     return _expand_blocks(blocks)
 
@@ -1922,75 +2374,36 @@ def read_all_object_manifests(
     sid_ndim = meta["sid_ndim"]
     num_objects = int(meta.get("num_objects", 0))
 
-    if meta.get("layout") == OBJECT_INDEX_LAYOUT_V1:
-        if num_objects == 0:
-            return []
-        manifests_arr = level_group.zarr_group[OBJECT_INDEX]["manifests"]
-        # Slicing yields a 1-D object ndarray whose elements are bytes
-        # directly (unlike scalar indexing — see read_object_manifest).
-        blobs = manifests_arr[:]
-        return [
-            _expand_blocks(decode_object_manifest_blocks(b, sid_ndim=sid_ndim))
-            for b in blobs
-        ]
-
-    # Legacy layout: single-chunk data + offsets byte blobs.
-    with _maybe_batched_reads(level_group, [
-        (OBJECT_INDEX, ["data", "offsets"]),
-    ]):
-        raw = level_group.read_bytes(OBJECT_INDEX, "data")
-        offsets = np.frombuffer(
-            level_group.read_bytes(OBJECT_INDEX, "offsets"),
-            dtype=np.int64,
-        )
+    _require_object_index_v1(meta)
+    if num_objects == 0:
+        return []
+    manifests_arr = level_group.zarr_group[OBJECT_INDEX]["manifests"]
+    # Slicing yields a 1-D object ndarray whose elements are bytes
+    # directly (unlike scalar indexing — see read_object_manifest).
+    blobs = manifests_arr[:]
     return [
-        _expand_blocks(
-            decode_object_manifest_blocks(
-                _slice_legacy_blob(raw, offsets, i, num_objects),
-                sid_ndim=sid_ndim,
-            ),
-        )
-        for i in range(num_objects)
+        _expand_blocks(decode_object_manifest_blocks(b, sid_ndim=sid_ndim))
+        for b in blobs
     ]
 
 
-def _legacy_read_object_blob(
-    level_group: FsGroup,
-    object_id: int,
-    num_objects: int,
-) -> bytes:
-    """Load one object's encoded manifest blob from the legacy
-    ``object_index/{data,offsets}`` byte-blob layout.
+def _require_object_index_v1(meta: dict[str, Any]) -> None:
+    """Raise if ``object_index`` is not in the 0.8.1 vlen-manifests layout.
 
-    Reads the full ``data`` and ``offsets`` arrays (each a single-chunk
-    blob) and slices to the one object's byte range.  This is the cost
-    the vlen-bytes ``manifests`` layout was introduced to eliminate;
-    kept for backwards-compatible reads of pre-vlen stores.
+    Pre-0.6 stores wrote a single-chunk ``data`` + ``offsets`` pair; the
+    reader for that layout was removed in 0.8.1 alongside the broader
+    flattening migration.  Any store reaching this point with a
+    non-V1 ``layout`` field is therefore older than what this build
+    supports and must be rewritten from source — surfacing that as a
+    clear error here beats decoding garbage out of legacy bytes.
     """
-    with _maybe_batched_reads(level_group, [
-        (OBJECT_INDEX, ["data", "offsets"]),
-    ]):
-        raw = level_group.read_bytes(OBJECT_INDEX, "data")
-        offsets = np.frombuffer(
-            level_group.read_bytes(OBJECT_INDEX, "offsets"),
-            dtype=np.int64,
+    layout = meta.get("layout")
+    if layout != OBJECT_INDEX_LAYOUT_V1:
+        raise ArrayError(
+            f"object_index layout {layout!r} is not the 0.8.1 vlen-manifests "
+            f"layout ({OBJECT_INDEX_LAYOUT_V1!r}); pre-0.6 ``data``+``offsets`` "
+            f"stores are not readable by this build — rewrite from source."
         )
-    return _slice_legacy_blob(raw, offsets, object_id, num_objects)
-
-
-def _slice_legacy_blob(
-    data: bytes,
-    offsets: npt.NDArray[np.int64],
-    object_id: int,
-    num_objects: int,
-) -> bytes:
-    start = int(offsets[object_id])
-    end = (
-        int(offsets[object_id + 1])
-        if object_id + 1 < num_objects
-        else len(data)
-    )
-    return data[start:end]
 
 
 def _expand_blocks(
@@ -2069,24 +2482,24 @@ def read_object_attributes(
 ) -> npt.NDArray:
     """Read dense O×C object attribute data.
 
+    Returns the raw array values, including any sentinel positions for
+    absent rows.  Use :func:`read_object_attribute_present_mask` to
+    reconstruct a 0/1 mask, or compare directly against
+    ``level_group.read_array_fill_value(...)``.
+
     Args:
         level_group: Resolution level group.
         attr_name: Attribute name.
-        dtype: Override dtype. If None, read from metadata.
+        dtype: Optional override applied via ``astype`` after read.
 
     Returns:
         Array of shape ``(O,)`` or ``(O, C)``.
     """
     full_name = f"{OBJECT_ATTRIBUTES}/{attr_name}"
-    meta = level_group.read_array_meta(full_name)
-    if dtype is None:
-        dtype = np.dtype(meta["dtype"])
-    else:
-        dtype = np.dtype(dtype)
-    shape = tuple(meta["shape"])
-
-    raw = level_group.read_bytes(full_name, "data")
-    return np.frombuffer(raw, dtype=dtype).reshape(shape).copy()
+    out = level_group.read_array(full_name)
+    if dtype is not None:
+        out = out.astype(np.dtype(dtype), copy=False)
+    return out
 
 
 def read_group_object_ids(
@@ -2102,22 +2515,12 @@ def read_group_object_ids(
     Returns:
         List of object ID integers.
     """
-    meta = level_group.read_array_meta(GROUPS)
-    num_groups = meta["num_groups"]
-
-    if group_id < 0 or group_id >= num_groups:
+    blobs = level_group.read_vlen_array(GROUPS)
+    if group_id < 0 or group_id >= len(blobs):
         raise ArrayError(
-            f"Group ID {group_id} out of range [0, {num_groups})"
+            f"Group ID {group_id} out of range [0, {len(blobs)})"
         )
-
-    raw = level_group.read_bytes(GROUPS, "data")
-    offsets = np.frombuffer(
-        level_group.read_bytes(GROUPS, "offsets"),
-        dtype=np.int64,
-    )
-
-    all_groups = decode_ragged_ints(raw, offsets, dtype=np.dtype(np.int64), ncols=1)
-    return all_groups[group_id].tolist()
+    return np.frombuffer(blobs[group_id], dtype=np.int64).tolist()
 
 
 def read_all_groupings(
@@ -2128,16 +2531,10 @@ def read_all_groupings(
     Returns:
         List indexed by group_id, each a list of object_id ints.
     """
-    meta = level_group.read_array_meta(GROUPS)
+    blobs = level_group.read_vlen_array(GROUPS)
+    return [np.frombuffer(b, dtype=np.int64).tolist() for b in blobs]
 
-    raw = level_group.read_bytes(GROUPS, "data")
-    offsets = np.frombuffer(
-        level_group.read_bytes(GROUPS, "offsets"),
-        dtype=np.int64,
-    )
 
-    all_groups = decode_ragged_ints(raw, offsets, dtype=np.dtype(np.int64), ncols=1)
-    return [g.tolist() for g in all_groups]
 
 
 def read_groupings_attributes(
@@ -2147,15 +2544,10 @@ def read_groupings_attributes(
 ) -> npt.NDArray:
     """Read dense G×C groupings attribute data."""
     full_name = f"{GROUP_ATTRIBUTES}/{attr_name}"
-    meta = level_group.read_array_meta(full_name)
-    if dtype is None:
-        dtype = np.dtype(meta["dtype"])
-    else:
-        dtype = np.dtype(dtype)
-    shape = tuple(meta["shape"])
-
-    raw = level_group.read_bytes(full_name, "data")
-    return np.frombuffer(raw, dtype=dtype).reshape(shape).copy()
+    out = level_group.read_array(full_name)
+    if dtype is not None:
+        out = out.astype(np.dtype(dtype), copy=False)
+    return out
 
 
 def read_cross_chunk_links(
@@ -2163,54 +2555,112 @@ def read_cross_chunk_links(
     *,
     delta: int = 0,
 ) -> list[tuple[tuple[ChunkCoords, int], ...]]:
-    """Read all cross-chunk link records from ``cross_chunk_links/<delta>/data``.
+    """Read all cross-chunk link records under ``cross_chunk_links/<delta>/``.
 
-    Each record is a list of ``(chunk_coords, vertex_idx)`` endpoints.
-    Endpoint 0 lives at the owning resolution level; endpoints k (k>0)
-    live at ``this_level + delta``.
+    Records are returned in cell-key-sorted order (and within each
+    cell in write order).  Each record is a tuple of
+    ``(chunk_coords, vi)`` endpoints in **original input order** —
+    canonical sorting and ``perm_idx`` encoding are reversed here so
+    callers see the same record shape they wrote.
 
-    Returns ``[]`` when the ``<delta>`` array does not exist or has no
-    records.
-
-    Returns:
-        List of records; each record has length ``link_width``.  For
-        the common ``link_width=2`` edge case callers can unpack each
-        record as ``((chunk_A, vi_A), (chunk_B, vi_B))``.
+    Returns ``[]`` when the ``<delta>`` family is absent or empty.
     """
     full_name = cross_chunk_links_path(delta)
     if not level_group.array_exists(full_name):
         return []
-    try:
-        meta = level_group.read_array_meta(full_name)
-    except Exception:
+    meta = level_group.read_array_meta(full_name) or {}
+    if "link_width" not in meta or "sid_ndim" not in meta:
         return []
-    if "num_links" not in meta or "sid_ndim" not in meta:
+    link_width = int(meta["link_width"])
+    sid_ndim = int(meta["sid_ndim"])
+
+    from zarr_vectors.encoding.ragged import decode_ragged_blob
+    from zarr_vectors.spatial.boundary import apply_perm_inverse
+
+    record_len = 1 + link_width  # [perm_idx, vi_0, ..., vi_{L-1}]
+    out: list[tuple[tuple[ChunkCoords, int], ...]] = []
+    for cell_key in sorted(level_group.list_chunks(full_name)):
+        canonical_chunks = parse_cell_key(
+            cell_key, sid_ndim=sid_ndim, link_width=link_width,
+        )
+        blob = level_group.read_bytes(full_name, cell_key)
+        rows = decode_ragged_blob(
+            blob, np.dtype(np.int64), ncols=record_len,
+        )
+        for row in rows:
+            row_arr = np.asarray(row).reshape(-1)
+            perm_idx = int(row_arr[0])
+            vi_canonical = [int(v) for v in row_arr[1:1 + link_width]]
+            canonical_endpoints = list(zip(canonical_chunks, vi_canonical))
+            input_order = apply_perm_inverse(
+                canonical_endpoints, perm_idx, link_width,
+            )
+            out.append(tuple(input_order))
+    return out
+
+
+def read_cross_chunk_links_for_tuple(
+    level_group: FsGroup,
+    chunk_tuple: Sequence[ChunkCoords],
+    *,
+    delta: int = 0,
+) -> list[tuple[tuple[ChunkCoords, int], ...]]:
+    """Read records that span exactly the L chunks in ``chunk_tuple``.
+
+    The input chunk-tuple is canonical-sorted internally, so callers
+    may pass the chunks in any order.  ``len(chunk_tuple)`` must
+    equal the family's ``link_width``.
+
+    Returns ``[]`` if no records exist for that exact L-tuple.
+    Records are returned in write order, each in original input
+    endpoint order (``perm_idx`` is reversed for the caller).
+    """
+    full_name = cross_chunk_links_path(delta)
+    if not level_group.array_exists(full_name):
         return []
-    num_links = meta["num_links"]
-    sid_ndim = meta["sid_ndim"]
-    link_width = int(meta.get("link_width", 2))
-    if num_links == 0:
+    meta = level_group.read_array_meta(full_name) or {}
+    if "link_width" not in meta or "sid_ndim" not in meta:
         return []
-    if not level_group.chunk_exists(full_name, "data"):
+    link_width = int(meta["link_width"])
+    sid_ndim = int(meta["sid_ndim"])
+    if len(chunk_tuple) != link_width:
+        raise ArrayError(
+            f"chunk_tuple has {len(chunk_tuple)} chunks; expected "
+            f"link_width={link_width}"
+        )
+    for c in chunk_tuple:
+        if len(c) != sid_ndim:
+            raise ArrayError(
+                f"chunk_tuple element {c} has arity {len(c)}; "
+                f"expected sid_ndim={sid_ndim}"
+            )
+
+    canonical_chunks = tuple(
+        sorted(tuple(c) for c in chunk_tuple)
+    )
+    cell_key = format_cell_key(canonical_chunks)
+    if not level_group.chunk_exists(full_name, cell_key):
         return []
 
-    raw = level_group.read_bytes(full_name, "data")
-    arr = np.frombuffer(raw, dtype=np.int64)
+    from zarr_vectors.encoding.ragged import decode_ragged_blob
+    from zarr_vectors.spatial.boundary import apply_perm_inverse
 
-    endpoint_len = sid_ndim + 1
-    record_len = link_width * endpoint_len
-    records: list[tuple[tuple[ChunkCoords, int], ...]] = []
-
-    for i in range(0, len(arr), record_len):
-        endpoints: list[tuple[ChunkCoords, int]] = []
-        for j in range(link_width):
-            base = i + j * endpoint_len
-            chunk = tuple(int(x) for x in arr[base : base + sid_ndim])
-            vi = int(arr[base + sid_ndim])
-            endpoints.append((chunk, vi))
-        records.append(tuple(endpoints))
-
-    return records
+    record_len = 1 + link_width
+    blob = level_group.read_bytes(full_name, cell_key)
+    rows = decode_ragged_blob(
+        blob, np.dtype(np.int64), ncols=record_len,
+    )
+    out: list[tuple[tuple[ChunkCoords, int], ...]] = []
+    for row in rows:
+        row_arr = np.asarray(row).reshape(-1)
+        perm_idx = int(row_arr[0])
+        vi_canonical = [int(v) for v in row_arr[1:1 + link_width]]
+        canonical_endpoints = list(zip(canonical_chunks, vi_canonical))
+        input_order = apply_perm_inverse(
+            canonical_endpoints, perm_idx, link_width,
+        )
+        out.append(tuple(input_order))
+    return out
 
 
 def read_cross_chunk_link_attributes(
@@ -2220,20 +2670,76 @@ def read_cross_chunk_link_attributes(
     *,
     delta: int = 0,
 ) -> npt.NDArray:
-    """Read per-link attribute data parallel to ``cross_chunk_links/<delta>/data``.
+    """Read per-link attribute data under ``cross_chunk_link_attributes/<name>/<delta>/``.
+
+    Returns rows in cell-key-sorted order — the same order as
+    :func:`read_cross_chunk_links` returns records.
 
     Returns:
-        Array of shape ``(num_links,)`` or ``(num_links, C)``.
+        Array of shape ``(num_links,)`` or ``(num_links, *row_shape)``.
     """
     full_name = cross_chunk_link_attributes_path(attr_name, delta)
-    meta = level_group.read_array_meta(full_name)
+    if not level_group.array_exists(full_name):
+        return np.array([], dtype=dtype or np.float32)
+    meta = level_group.read_array_meta(full_name) or {}
     if dtype is None:
         dtype = np.dtype(meta["dtype"])
     else:
         dtype = np.dtype(dtype)
-    shape = tuple(meta.get("shape", [meta["num_links"]]))
-    raw = level_group.read_bytes(full_name, "data")
-    return np.frombuffer(raw, dtype=dtype).reshape(shape).copy()
+    row_shape = tuple(meta.get("row_shape", ()))
+    row_size = int(np.prod(row_shape)) if row_shape else 1
+    row_bytes = dtype.itemsize * row_size
+
+    chunks: list[npt.NDArray] = []
+    for cell_key in sorted(level_group.list_chunks(full_name)):
+        blob = level_group.read_bytes(full_name, cell_key)
+        if not blob:
+            continue
+        n = len(blob) // row_bytes
+        arr = np.frombuffer(blob, dtype=dtype).reshape(
+            (n, *row_shape) if row_shape else (n,),
+        )
+        chunks.append(arr.copy())
+    if not chunks:
+        return np.empty((0, *row_shape), dtype=dtype) if row_shape else np.empty((0,), dtype=dtype)
+    return np.concatenate(chunks, axis=0)
+
+
+def read_cross_chunk_link_attributes_for_tuple(
+    level_group: FsGroup,
+    attr_name: str,
+    chunk_tuple: Sequence[ChunkCoords],
+    dtype: np.dtype | str | None = None,
+    *,
+    delta: int = 0,
+) -> npt.NDArray:
+    """Read per-link attribute rows for the cell spanning ``chunk_tuple``.
+
+    Returns rows in the same order as
+    :func:`read_cross_chunk_links_for_tuple` returns records for the
+    same chunk-tuple (cell write order).
+    """
+    full_name = cross_chunk_link_attributes_path(attr_name, delta)
+    if not level_group.array_exists(full_name):
+        return np.array([], dtype=dtype or np.float32)
+    meta = level_group.read_array_meta(full_name) or {}
+    if dtype is None:
+        dtype = np.dtype(meta["dtype"])
+    else:
+        dtype = np.dtype(dtype)
+    row_shape = tuple(meta.get("row_shape", ()))
+    row_size = int(np.prod(row_shape)) if row_shape else 1
+    row_bytes = dtype.itemsize * row_size
+
+    canonical_chunks = tuple(sorted(tuple(c) for c in chunk_tuple))
+    cell_key = format_cell_key(canonical_chunks)
+    if not level_group.chunk_exists(full_name, cell_key):
+        return np.empty((0, *row_shape), dtype=dtype) if row_shape else np.empty((0,), dtype=dtype)
+    blob = level_group.read_bytes(full_name, cell_key)
+    n = len(blob) // row_bytes
+    return np.frombuffer(blob, dtype=dtype).reshape(
+        (n, *row_shape) if row_shape else (n,),
+    ).copy()
 
 
 # ===================================================================

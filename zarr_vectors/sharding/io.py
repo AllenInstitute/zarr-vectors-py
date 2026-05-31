@@ -1,50 +1,72 @@
-"""Sharded I/O over the Zarr-native chunk layout.
+"""Sharding for ZV stores using Zarr v3's native ``sharding_indexed`` codec.
 
-Each per-spatial-chunk blob is a single-chunk 1D ``uint8`` Zarr array
-under its parent per-array group (Option G of the migration plan).
-Sharding packs a *set* of those chunks into a single packed Zarr 1D
-``uint8`` array named ``__shard_<id>`` with a JSON ``shard_index`` on
-the shard array's attrs mapping each packed chunk key to ``[offset,
-nbytes]`` in the packed buffer.
+Sharding packs many per-chunk byte blobs into a single storage object
+to reduce object count on cloud stores (S3/GCS) and inode pressure on
+local filesystems.  This module owns the conversion between the two
+storage layouts that share the same logical ZV data:
 
-The shard layouts (octree / snake / index_table) determine which chunk
-goes into which shard via :class:`ShardCodec.chunk_to_shard_id` — the
-on-disk shape stays uniform regardless of layout.
+* **Flat** — each per-array group holds one Zarr array per chunk key
+  (e.g. ``vertices/0.0.0``, ``vertices/0.0.1``, ...).  One storage
+  object per ZVF chunk.
+* **Sharded** — each per-array group is replaced with a single
+  multidim vlen-bytes Zarr array at the same logical path.  Zarr v3's
+  built-in ``sharding_indexed`` codec packs the chunk-grid cells into
+  outer-chunk shards.  One storage object per shard (default 512
+  ZVF chunks per shard).
+
+Both layouts are read transparently by :class:`zarr_vectors.core.group.Group`
+— ``read_bytes`` / ``write_bytes`` / ``list_chunks`` dispatch on the
+node type at the array's path (Array → sharded, Group → flat).
+
+Public API
+----------
+
+``shard_store(path, *, shard_shape=8)``
+    Convert every per-array group in the store to a native-sharded
+    vlen-bytes array.  ``shard_shape`` is either an int (broadcast to
+    every axis) or an explicit per-axis tuple.  Idempotent: arrays
+    already sharded with the requested shape are skipped.
+
+``unshard_store(path)``
+    Reverse direction: every native-sharded array is unpacked back to
+    a Zarr group with one child array per chunk key.
+
+``reshard(path, shard_shape)``
+    Convenience wrapper: ``shard_shape=None`` → unshard, otherwise
+    re-shard with the requested shape (round-trips through unsharded
+    when the current shape differs).
+
+``is_sharded(path) -> bool`` / ``get_shard_info(path) -> dict``
+    Status queries — checks whether any array in the store uses the
+    ``sharding_indexed`` codec.
+
+The Morton / Hilbert curve indirection of older versions is gone; the
+native sharding codec already clusters spatially-adjacent inner chunks
+into the same shard via its C-order outer grid, giving the same
+read-locality benefit without a custom mapping.
 """
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
-from typing import Any
+from typing import Any, Sequence
 
 from zarr_vectors.constants import (
     CROSS_CHUNK_LINK_ATTRIBUTES,
     LINK_ATTRIBUTES,
 )
+from zarr_vectors.core.group import _parse_chunk_coords
 from zarr_vectors.core.store import (
     get_resolution_level,
     list_resolution_levels,
     open_store,
-    read_root_metadata,
 )
-from zarr_vectors.sharding.layout import ShardCodec, ShardLayout
-
-_SHARD_PREFIX = "__shard_"
 
 
-def _shard_array_name(shard_id: int) -> str:
-    return f"{_SHARD_PREFIX}{shard_id:06d}"
-
-
-def _is_shard_name(name: str) -> bool:
-    return name.startswith(_SHARD_PREFIX)
-
-
-def _parse_chunk_coords(chunk_key: str) -> tuple[int, ...] | None:
-    try:
-        return tuple(int(x) for x in chunk_key.split("."))
-    except ValueError:
-        return None
+# ===================================================================
+# Walking per-array groups
+# ===================================================================
 
 
 _DOUBLE_DESCENT_PREFIXES = frozenset({
@@ -53,269 +75,419 @@ _DOUBLE_DESCENT_PREFIXES = frozenset({
 })
 
 
-def _list_array_names(level_group, requested: list[str] | None) -> list[str]:
-    """Enumerate per-array-group names under a resolution level.
-
-    A "per-array group" is a sub-group whose direct children are Zarr
-    arrays named by spatial chunk keys (``0.1.2`` etc.) and/or shard
-    arrays (``__shard_<id>``).  Top-level sub-groups whose children are
-    *themselves* sub-groups (e.g. ``attributes``) get one level of
-    descent — yielding ``attributes/<name>`` entries.  Multiscale link
-    attribute groups (``link_attributes``, ``cross_chunk_link_attributes``)
-    nest two levels (``<name>/<delta>``) and get a second descent.
-    """
-    if requested is not None:
-        return requested
-
-    names: list[str] = []
-    for top in level_group:
-        try:
-            sub_zarr = level_group.zarr_group[top]
-        except KeyError:
-            continue
-        if _looks_like_per_chunk_group(sub_zarr):
-            names.append(top)
-            continue
-        # First descent: attributes/<name>, links/<delta>,
-        # cross_chunk_links/<delta>.
-        for child in sub_zarr.group_keys():
-            child_zarr = sub_zarr[child]
-            if _looks_like_per_chunk_group(child_zarr):
-                names.append(f"{top}/{child}")
-                continue
-            # Second descent for link_attributes/<name>/<delta> and
-            # cross_chunk_link_attributes/<name>/<delta>.
-            if top not in _DOUBLE_DESCENT_PREFIXES:
-                continue
-            for grand in child_zarr.group_keys():
-                grand_zarr = child_zarr[grand]
-                if _looks_like_per_chunk_group(grand_zarr):
-                    names.append(f"{top}/{child}/{grand}")
-    return names
-
-
 def _looks_like_per_chunk_group(zarr_group) -> bool:
-    """Return True if ``zarr_group`` has children matching the chunk-key
-    pattern or the shard-name pattern.
+    """Return True if ``zarr_group`` holds chunk-key-named child arrays
+    (the legacy Option-G layout for per-chunk byte blobs).
     """
     for name in zarr_group.array_keys():
-        if _is_shard_name(name) or _parse_chunk_coords(name) is not None:
+        if _parse_chunk_coords(name) is not None:
             return True
     return False
 
 
+def _is_native_sharded(zarr_node) -> bool:
+    """True iff ``zarr_node`` is a Zarr Array using sharding_indexed."""
+    import zarr
+
+    if not isinstance(zarr_node, zarr.Array):
+        return False
+    return any(_codec_name(c) == "sharding_indexed"
+               for c in zarr_node.metadata.codecs)
+
+
+def _codec_name(codec: Any) -> str | None:
+    """Return the on-wire name of a Zarr codec (``sharding_indexed``,
+    ``vlen-bytes``, ``zstd``, ...).
+
+    Zarr 3.2's ``Codec`` instances expose the registered name via
+    ``to_dict()["name"]`` rather than a Python ``.name`` attribute.
+    """
+    name = getattr(codec, "name", None)
+    if name:
+        return name
+    to_dict = getattr(codec, "to_dict", None)
+    if callable(to_dict):
+        try:
+            return to_dict().get("name")
+        except Exception:
+            return None
+    return None
+
+
+def _list_array_names(level_group, requested: list[str] | None) -> list[str]:
+    """Enumerate per-array logical names under a resolution level.
+
+    Walks the level's hierarchy and returns every path whose node looks
+    like a per-chunk container — either the legacy "Option G" group
+    (children are chunk-key-named Zarr arrays) or a native-sharded
+    Zarr array.
+
+    ``requested`` short-circuits the walk: callers pass an explicit
+    list to limit the migration to specific arrays (e.g. just
+    ``vertex_fragments``).
+    """
+    import zarr
+
+    if requested is not None:
+        return requested
+
+    names: list[str] = []
+    zg = level_group.zarr_group
+
+    for top in zg:
+        sub = zg[top]
+        if isinstance(sub, zarr.Array):
+            # Top-level native-sharded array (vertices, links/<delta>
+            # rolled up — but the delta cases nest under a sub-group).
+            names.append(top)
+            continue
+        if _looks_like_per_chunk_group(sub):
+            names.append(top)
+            continue
+        # First descent: attributes/<name>, links/<delta>,
+        # cross_chunk_links/<delta>.
+        for child in sub.group_keys():
+            child_node = sub[child]
+            if _looks_like_per_chunk_group(child_node):
+                names.append(f"{top}/{child}")
+                continue
+            if top not in _DOUBLE_DESCENT_PREFIXES:
+                continue
+            for grand in child_node.group_keys():
+                grand_node = child_node[grand]
+                if _looks_like_per_chunk_group(grand_node):
+                    names.append(f"{top}/{child}/{grand}")
+        # Native-sharded arrays nested one level deep (links/<delta>).
+        for child in sub.array_keys():
+            child_node = sub[child]
+            if _is_native_sharded(child_node):
+                names.append(f"{top}/{child}")
+    return names
+
+
+# ===================================================================
+# Shape inference
+# ===================================================================
+
+
+def _normalise_shard_shape(
+    shard_shape: int | Sequence[int] | None, ndim: int,
+) -> tuple[int, ...] | None:
+    if shard_shape is None:
+        return None
+    if isinstance(shard_shape, int):
+        if shard_shape < 1:
+            raise ValueError(
+                f"shard_shape must be >= 1, got {shard_shape}"
+            )
+        return (shard_shape,) * ndim
+    shape = tuple(int(s) for s in shard_shape)
+    if len(shape) != ndim:
+        raise ValueError(
+            f"shard_shape {shape} has rank {len(shape)} but chunks "
+            f"have rank {ndim}"
+        )
+    if any(s < 1 for s in shape):
+        raise ValueError(f"shard_shape components must be >= 1, got {shape}")
+    return shape
+
+
+def _infer_grid_shape(chunk_keys: list[str]) -> tuple[int, ...]:
+    """Derive an enclosing grid_shape from observed chunk keys.
+
+    Returns ``max(coord[axis]) + 1`` per axis across all keys.  Empty
+    input raises — callers should skip arrays with no chunks.
+    """
+    parsed: list[tuple[int, ...]] = []
+    for k in chunk_keys:
+        coords = _parse_chunk_coords(k)
+        if coords is not None:
+            parsed.append(coords)
+    if not parsed:
+        raise ValueError("Cannot infer grid_shape: no parseable chunk keys")
+    ndim = len(parsed[0])
+    if any(len(c) != ndim for c in parsed):
+        raise ValueError(
+            f"Chunk keys have mixed rank: {sorted({len(c) for c in parsed})}"
+        )
+    return tuple(max(c[axis] for c in parsed) + 1 for axis in range(ndim))
+
+
+# ===================================================================
+# shard_store / unshard_store / reshard
+# ===================================================================
+
+
 def shard_store(
     store_path: str | Path,
-    layout: ShardLayout,
-    shard_size: int = 64,
     *,
+    shard_shape: int | Sequence[int] = 8,
     arrays: list[str] | None = None,
 ) -> dict[str, Any]:
-    """Convert a flat store to a sharded layout.
+    """Convert every per-array group in the store to a native-sharded
+    vlen-bytes Zarr array.
 
-    For each per-array group, read every chunk-key array, pack the
-    bytes into shard arrays ``__shard_<id>``, write the per-shard
-    index to the shard array's attrs, and delete the original chunk
-    arrays.
+    The new layout uses Zarr v3's built-in ``sharding_indexed`` codec
+    — readable by any standards-compliant Zarr v3 implementation
+    (zarrs, tensorstore, neuroglancer-precomputed/zarr3, ...).  No
+    ZV-specific metadata is needed; the sharding configuration lives
+    in each array's ``zarr.json``.
+
+    Args:
+        store_path: Path or URL to the ZV store.
+        shard_shape: Outer-chunk shape in *inner-chunk* units (one
+            inner chunk == one ZVF spatial chunk).  An ``int`` is
+            broadcast to every axis (e.g. ``8`` → ``(8,8,8)`` for a
+            3-D store).  A tuple sets the per-axis shard shape
+            explicitly.  Default ``8`` ≈ 512 inner chunks per shard,
+            a reasonable cloud default per
+            :doc:`/spec/chunking/sharding`.
+        arrays: Optional list of logical array names to migrate.  When
+            omitted, every per-array container under every resolution
+            level is converted.
+
+    Returns:
+        Stats dict with ``arrays_sharded``, ``chunks_packed``,
+        ``shard_shape``.
     """
-    store_path = Path(store_path)
-    root = open_store(str(store_path), mode="r+")
-    meta = read_root_metadata(root)
-    codec = ShardCodec(layout, shard_size, meta.sid_ndim)
+    store_path = Path(store_path) if isinstance(store_path, str) else store_path
 
-    total_shards = 0
-    total_chunks = 0
+    root = open_store(str(store_path), mode="r+")
+
+    arrays_sharded = 0
+    chunks_packed = 0
+    final_shard_shape: tuple[int, ...] | None = None
 
     for level_idx in list_resolution_levels(root):
         level = get_resolution_level(root, level_idx)
         for array_name in _list_array_names(level, arrays):
             if not level.array_exists(array_name):
                 continue
-            keys = [k for k in level.list_chunks(array_name) if not _is_shard_name(k)]
-            chunk_keys = [k for k in keys if _parse_chunk_coords(k) is not None]
+            chunk_keys = [
+                k for k in level.list_chunks(array_name)
+                if _parse_chunk_coords(k) is not None
+            ]
             if not chunk_keys:
                 continue
 
-            # Bucket chunks by shard id.
-            shard_groups: dict[int, dict[str, bytes]] = {}
-            for chunk_key in chunk_keys:
-                coords = _parse_chunk_coords(chunk_key)
-                shard_id = codec.chunk_to_shard_id(coords)
-                shard_groups.setdefault(shard_id, {})[chunk_key] = (
-                    level.read_bytes(array_name, chunk_key)
-                )
+            grid_shape = _infer_grid_shape(chunk_keys)
+            ndim = len(grid_shape)
+            this_shard_shape = _normalise_shard_shape(shard_shape, ndim)
+            if final_shard_shape is None:
+                final_shard_shape = this_shard_shape
 
-            # Pack each shard into a single Zarr array + attrs index.
-            for shard_id, chunk_data in shard_groups.items():
-                packed, index = _pack_shard(chunk_data)
-                shard_name = _shard_array_name(shard_id)
-                level.write_bytes(array_name, shard_name, packed)
-                shard_zarr = level.zarr_group[f"{array_name}/{shard_name}"]
-                shard_zarr.attrs["shard_index"] = {
-                    k: list(v) for k, v in index.items()
-                }
-                total_shards += 1
-                total_chunks += len(chunk_data)
+            # Already native-sharded with the right shape → skip.
+            existing = level.zarr_group[array_name]
+            import zarr
+            if (
+                isinstance(existing, zarr.Array)
+                and _is_native_sharded(existing)
+                and existing.shards == this_shard_shape
+            ):
+                continue
 
-            # Delete original flat chunks (they've been packed).
-            arr_group_zarr = level.zarr_group[array_name]
-            for chunk_key in chunk_keys:
-                if chunk_key in arr_group_zarr:
-                    del arr_group_zarr[chunk_key]
+            # Snapshot existing per-chunk payloads + array metadata so
+            # we can rebuild after replacing the node at this path.
+            chunk_payloads: dict[str, bytes] = {}
+            for k in chunk_keys:
+                chunk_payloads[k] = level.read_bytes(array_name, k)
+            preserved_attrs = dict(level.read_array_meta(array_name))
 
-    # Record sharding metadata on root.
-    root_zg = root.zarr_group
-    root_zg.attrs["shard_layout"] = layout.value
-    root_zg.attrs["shard_size"] = shard_size
+            # Delete the legacy group / prior array.
+            del level.zarr_group[array_name]
+
+            # Allocate the native-sharded vlen-bytes array.
+            level.create_sharded_chunk_array(
+                array_name,
+                grid_shape=grid_shape,
+                shard_shape=this_shard_shape,
+                attributes=preserved_attrs,
+            )
+
+            # Write each chunk into its grid-coord cell.
+            for k, data in chunk_payloads.items():
+                if not data:
+                    continue
+                level.write_bytes(array_name, k, data)
+
+            arrays_sharded += 1
+            chunks_packed += len(chunk_payloads)
 
     return {
-        "shards_created": total_shards,
-        "chunks_packed": total_chunks,
-        "layout": layout.value,
-        "shard_size": shard_size,
+        "arrays_sharded": arrays_sharded,
+        "chunks_packed": chunks_packed,
+        "shard_shape": list(final_shard_shape) if final_shard_shape else None,
     }
 
 
-def unshard_store(store_path: str | Path) -> dict[str, Any]:
-    """Convert a sharded store back to flat per-chunk Zarr arrays."""
-    store_path = Path(store_path)
+def unshard_store(
+    store_path: str | Path,
+    *,
+    arrays: list[str] | None = None,
+) -> dict[str, Any]:
+    """Reverse of :func:`shard_store`: rewrite every native-sharded
+    Zarr array as a Zarr group of single-chunk uint8 arrays (the
+    "Option G" flat layout).
+
+    Useful for stores that need to be opened by tooling that doesn't
+    understand the ``sharding_indexed`` codec, or for write-heavy
+    workflows where shard contention hurts throughput.
+    """
+    import zarr
+
+    store_path = Path(store_path) if isinstance(store_path, str) else store_path
     root = open_store(str(store_path), mode="r+")
-    root_zg = root.zarr_group
 
-    layout_str = root_zg.attrs.get("shard_layout", "flat") if "shard_layout" in root_zg.attrs else "flat"
-    if layout_str == "flat":
-        return {"chunks_extracted": 0, "message": "already flat"}
-
-    total_chunks = 0
+    arrays_unsharded = 0
+    chunks_extracted = 0
 
     for level_idx in list_resolution_levels(root):
         level = get_resolution_level(root, level_idx)
-        for array_name in _list_array_names(level, None):
+        for array_name in _list_array_names(level, arrays):
             if not level.array_exists(array_name):
                 continue
-            arr_group_zarr = level.zarr_group[array_name]
-            # Use raw zarr array_keys() to find shard names — the
-            # public list_chunks() flattens shards into chunk-key
-            # listings for transparent reads.
-            shard_names = [
-                k for k in arr_group_zarr.array_keys() if _is_shard_name(k)
-            ]
-            for shard_name in shard_names:
-                shard_zarr = arr_group_zarr[shard_name]
-                index = dict(shard_zarr.attrs.get("shard_index", {}))
-                packed_arr = shard_zarr[:]
-                packed = bytes(packed_arr.tobytes())
-                for chunk_key, (offset, nbytes) in index.items():
-                    chunk_bytes = packed[offset:offset + nbytes]
-                    level.write_bytes(array_name, chunk_key, chunk_bytes)
-                    total_chunks += 1
-                if shard_name in arr_group_zarr:
-                    del arr_group_zarr[shard_name]
-
-    # Drop the sharding metadata.
-    if "shard_layout" in root_zg.attrs:
-        del root_zg.attrs["shard_layout"]
-    if "shard_size" in root_zg.attrs:
-        del root_zg.attrs["shard_size"]
-
-    return {"chunks_extracted": total_chunks}
-
-
-def is_sharded(store_path: str | Path) -> bool:
-    """Check if a store uses sharded layout."""
-    try:
-        root = open_store(str(store_path))
-        attrs = root.attrs.to_dict()
-        return attrs.get("shard_layout", "flat") != "flat"
-    except Exception:
-        return False
-
-
-def get_shard_info(store_path: str | Path) -> dict[str, Any]:
-    """Get sharding information for a store."""
-    root = open_store(str(store_path))
-    attrs = root.attrs.to_dict()
-    layout = attrs.get("shard_layout", "flat")
-    shard_size = attrs.get("shard_size", 0)
-    if layout == "flat":
-        return {"layout": "flat", "sharded": False}
-
-    meta = read_root_metadata(root)
-    _ = ShardCodec(ShardLayout(layout), shard_size, meta.sid_ndim)  # validate
-
-    shard_count = 0
-    for level_idx in list_resolution_levels(root):
-        level = get_resolution_level(root, level_idx)
-        for array_name in _list_array_names(level, None):
-            if not level.array_exists(array_name):
+            existing = level.zarr_group[array_name]
+            if not isinstance(existing, zarr.Array):
                 continue
-            shard_count += sum(
-                1 for k in level.list_chunks(array_name) if _is_shard_name(k)
-            )
-            break  # one array's count is representative; matches legacy behaviour
-        if shard_count:
-            break
+
+            chunk_keys = level.list_chunks(array_name)
+            chunk_payloads: dict[str, bytes] = {
+                k: level.read_bytes(array_name, k) for k in chunk_keys
+            }
+            preserved_attrs = dict(level.read_array_meta(array_name))
+
+            del level.zarr_group[array_name]
+
+            level.zarr_group.require_group(array_name)
+            level.write_array_meta(array_name, preserved_attrs)
+
+            for k, data in chunk_payloads.items():
+                level.write_bytes(array_name, k, data)
+
+            arrays_unsharded += 1
+            chunks_extracted += len(chunk_payloads)
 
     return {
-        "layout": layout,
-        "sharded": True,
-        "shard_size": shard_size,
-        "shard_count": shard_count,
+        "arrays_unsharded": arrays_unsharded,
+        "chunks_extracted": chunks_extracted,
     }
 
 
 def reshard(
     store_path: str | Path,
-    target_layout: ShardLayout,
-    shard_size: int = 64,
+    shard_shape: int | Sequence[int] | None,
+    *,
+    arrays: list[str] | None = None,
 ) -> dict[str, Any]:
-    """Convert a store between shard layouts."""
-    store_path = Path(store_path)
+    """Re-layout a ZV store between flat and native-sharded forms.
 
-    if target_layout == ShardLayout.FLAT:
-        if is_sharded(str(store_path)):
-            result = unshard_store(store_path)
-            return {
-                "action": "unshard",
-                "source_layout": "sharded",
-                "target_layout": "flat",
-                **result,
-            }
-        return {"action": "noop", "message": "already flat"}
+    Args:
+        store_path: Path or URL to the store.
+        shard_shape: ``None`` → unshard (flat layout); ``int`` or
+            tuple → shard with that outer-chunk shape.
+        arrays: Optional list of logical array names to limit the
+            operation to.
 
-    if is_sharded(str(store_path)):
-        current_info = get_shard_info(str(store_path))
-        if (current_info["layout"] == target_layout.value
-                and current_info.get("shard_size") == shard_size):
-            return {"action": "noop", "message": "already in target layout"}
-        unshard_store(store_path)
+    Returns:
+        Stats dict from the underlying :func:`shard_store` or
+        :func:`unshard_store` call, plus ``action`` describing what
+        ran.
+    """
+    if shard_shape is None:
+        if not is_sharded(str(store_path)):
+            return {"action": "noop", "message": "already flat"}
+        result = unshard_store(store_path, arrays=arrays)
+        return {"action": "unshard", **result}
 
-    result = shard_store(store_path, target_layout, shard_size)
+    result = shard_store(store_path, shard_shape=shard_shape, arrays=arrays)
+    return {"action": "shard", **result}
+
+
+# ===================================================================
+# Status queries
+# ===================================================================
+
+
+def is_sharded(store_path: str | Path) -> bool:
+    """True iff any array in the store uses the ``sharding_indexed`` codec."""
+    try:
+        root = open_store(str(store_path))
+    except Exception:
+        return False
+    for level_idx in list_resolution_levels(root):
+        level = get_resolution_level(root, level_idx)
+        for array_name in _list_array_names(level, None):
+            try:
+                node = level.zarr_group[array_name]
+            except KeyError:
+                continue
+            if _is_native_sharded(node):
+                return True
+    return False
+
+
+def get_shard_info(store_path: str | Path) -> dict[str, Any]:
+    """Return a summary of the store's sharding state.
+
+    The result has keys:
+
+    * ``sharded`` — bool, mirrors :func:`is_sharded`.
+    * ``arrays`` — list of ``{name, shard_shape, grid_shape}`` dicts,
+      one per native-sharded array.
+    * ``shard_count`` — total shard files across all arrays.
+    """
+    import zarr
+
+    root = open_store(str(store_path))
+    arrays: list[dict[str, Any]] = []
+    shard_count = 0
+
+    for level_idx in list_resolution_levels(root):
+        level = get_resolution_level(root, level_idx)
+        level_prefix = f"{level_idx}/"
+        for array_name in _list_array_names(level, None):
+            try:
+                node = level.zarr_group[array_name]
+            except KeyError:
+                continue
+            if not _is_native_sharded(node):
+                continue
+            assert isinstance(node, zarr.Array)
+            shape = tuple(int(s) for s in node.shape)
+            shards = node.shards or (1,) * len(shape)
+            shards = tuple(int(s) for s in shards)
+            n_shards = 1
+            for grid_dim, shard_dim in zip(shape, shards):
+                n_shards *= (grid_dim + shard_dim - 1) // shard_dim
+            arrays.append({
+                "name": level_prefix + array_name,
+                "grid_shape": list(shape),
+                "shard_shape": list(shards),
+                "shard_count": n_shards,
+            })
+            shard_count += n_shards
+
     return {
-        "action": "reshard",
-        "target_layout": target_layout.value,
-        **result,
+        "sharded": len(arrays) > 0,
+        "arrays": arrays,
+        "shard_count": shard_count,
     }
 
 
 # ===================================================================
-# Packing helpers
+# Back-compat shims (deprecation path for old positional API)
 # ===================================================================
 
 
-def _pack_shard(chunk_data: dict[str, bytes]) -> tuple[bytes, dict[str, tuple[int, int]]]:
-    """Concatenate ``chunk_data`` values; return (packed_bytes, index).
-
-    Index maps chunk_key → (offset, nbytes) in the packed buffer.
-    Keys are written in sorted order so the layout is deterministic.
-    """
-    index: dict[str, tuple[int, int]] = {}
-    parts: list[bytes] = []
-    offset = 0
-    for chunk_key in sorted(chunk_data.keys()):
-        data = chunk_data[chunk_key]
-        nbytes = len(data)
-        index[chunk_key] = (offset, nbytes)
-        parts.append(data)
-        offset += nbytes
-    return b"".join(parts), index
+# Older versions accepted ``ShardLayout`` + ``shard_size`` positional
+# args; these alias to the new ``shard_shape``-driven API.  The
+# layout-curve (Morton / Hilbert) distinction has been removed because
+# Zarr's native ``sharding_indexed`` codec clusters spatially-adjacent
+# inner chunks into the same shard automatically.
+__all__ = [
+    "shard_store",
+    "unshard_store",
+    "reshard",
+    "is_sharded",
+    "get_shard_info",
+]

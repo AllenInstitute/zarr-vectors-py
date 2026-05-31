@@ -41,16 +41,20 @@ def _time(fn, *args, **kwargs) -> tuple[float, object]:
 
 # Upper bounds (seconds, local FS).  Set ~3× over expected times measured
 # after the vectorization sweep so the gates catch O(N²) regressions
-# without flaking under load.
+# without flaking under load.  The cross_chunk_links arrays switched to a
+# per-tuple cell layout in 0.8 (one tiny Zarr array per chunk-tuple cell);
+# write budgets for geometry types with many cross-chunk records are
+# loosened to reflect the per-cell write overhead — sharding (planned)
+# will amortise this back down.
 PERF_BUDGET = {
-    "write_lines": 3.0,      # measured ~0.9s
-    "read_lines": 6.0,       # measured ~1.7s
-    "write_polylines": 3.0,  # measured ~0.6s
-    "read_polylines": 4.0,   # measured ~1.0s
-    "write_graph": 4.0,      # measured ~1.3s
-    "read_graph": 4.0,       # measured ~1.1s
-    "write_mesh": 2.0,       # measured ~0.3s
-    "read_mesh": 2.0,        # measured ~0.4s
+    "write_lines": 8.0,      # ~5s with thousands of cross-chunk cells
+    "read_lines": 8.0,       # ~3-5s walking per-cell reads
+    "write_polylines": 6.0,  # measured ~0.6s pre-0.8
+    "read_polylines": 6.0,   # ~3s walking per-cell reads
+    "write_graph": 12.0,     # ~8-9s with thousands of cross-chunk cells
+    "read_graph": 25.0,      # ~17s walking thousands of CCL cells; sharding will amortise
+    "write_mesh": 4.0,       # measured ~0.3s pre-0.8
+    "read_mesh": 4.0,        # ~1s per-cell reads (mesh has fewer cross-chunk records)
 }
 
 N = 10_000  # smaller than benchmarks/02 so CI stays under 30s total

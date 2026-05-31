@@ -241,15 +241,15 @@ def test_constant_set_matches_schema_enum(schema, enum_name, members):
 
 
 # ===================================================================
-# Format-version cutoff (0.7.0 hard break: per-level chunk_shape).
+# Format-version cutoff (0.8.1 hard break: flat single-array layout).
 # ===================================================================
 
 
-def test_format_version_is_0_7_0():
-    """The current ZV writer stamps 0.7.0; bump tests here when bumping."""
+def test_format_version_is_0_8_1():
+    """The current ZV writer stamps 0.8.1; bump tests here when bumping."""
     from zarr_vectors.constants import FORMAT_VERSION
 
-    assert FORMAT_VERSION == "0.7.0", (
+    assert FORMAT_VERSION == "0.8.1", (
         f"FORMAT_VERSION drifted to {FORMAT_VERSION!r}; if intentional "
         f"update this test and the version-cutoff check in "
         f"zarr_vectors.core.metadata.RootMetadata.validate()."
@@ -258,11 +258,11 @@ def test_format_version_is_0_7_0():
 
 @pytest.mark.parametrize(
     "stale_version",
-    ["0.3", "0.3.5", "0.4", "0.4.0", "0.4.1", "0.5.0", "0.6.0"],
+    ["0.3", "0.3.5", "0.4", "0.4.0", "0.4.1", "0.5.0", "0.6.0", "0.7.0", "0.8.0"],
 )
-def test_pre_0_7_0_stores_rejected(stale_version):
-    """Pre-0.7.0 stores must fail validate() with a clear message that
-    mentions the rename so the user knows what changed."""
+def test_pre_0_8_1_stores_rejected(stale_version):
+    """Pre-0.8.1 stores must fail validate() with a clear message that
+    mentions the flat single-array layout change."""
     from zarr_vectors.exceptions import MetadataError
 
     md = _minimal_root_md()
@@ -271,7 +271,7 @@ def test_pre_0_7_0_stores_rejected(stale_version):
         md.validate()
 
 
-def test_0_7_0_store_passes_validate():
+def test_0_8_1_store_passes_validate():
     md = _minimal_root_md()
-    md.zv_version = "0.7.0"
+    md.zv_version = "0.8.1"
     md.validate()  # should not raise

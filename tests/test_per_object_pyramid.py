@@ -292,9 +292,10 @@ def test_object_attribute_present_mask_roundtrip(tmp_path):
     mask = read_object_attribute_present_mask(lvl1, "score")
     assert mask is not None
     assert mask.shape == (20,)
-    # Present rows have their source value; absent rows are zero.
+    # Present rows have their source value; absent rows are the
+    # ``fill_value`` sentinel (NaN for float32 under 0.8.1).
     for oid in range(20):
         if mask[oid]:
             assert out[oid] == oid
         else:
-            assert out[oid] == 0
+            assert np.isnan(out[oid])
