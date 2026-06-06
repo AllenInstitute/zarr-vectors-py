@@ -71,6 +71,7 @@ from zarr_vectors.core.store import (
     open_store,
     read_level_metadata,
     read_root_metadata,
+    stamp_ccl_capabilities,
 )
 from zarr_vectors.exceptions import ArrayError
 from zarr_vectors.spatial.boundary import (
@@ -331,6 +332,7 @@ def write_mesh(
                 delta=0,
                 link_width=face_arities.pop(),
             )
+            stamp_ccl_capabilities(root)
 
         # Write object index
         write_object_index(level_group, object_manifests, sid_ndim=idx_ndim)

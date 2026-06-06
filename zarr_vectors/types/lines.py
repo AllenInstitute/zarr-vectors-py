@@ -61,6 +61,7 @@ from zarr_vectors.core.store import (
     open_store,
     read_level_metadata,
     read_root_metadata,
+    stamp_ccl_capabilities,
 )
 from zarr_vectors.exceptions import ArrayError
 from zarr_vectors.spatial.chunking import (
@@ -320,6 +321,7 @@ def write_lines(
             write_cross_chunk_links(
                 level_group, cross_links, sid_ndim=idx_ndim, delta=0,
             )
+            stamp_ccl_capabilities(root)
 
         if line_attributes:
             for name, data in line_attributes.items():

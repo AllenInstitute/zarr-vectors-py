@@ -41,16 +41,18 @@ def _time(fn, *args, **kwargs) -> tuple[float, object]:
 
 # Upper bounds (seconds, local FS).  Set ~3× over expected times measured
 # after the vectorization sweep so the gates catch O(N²) regressions
-# without flaking under load.
+# without flaking under load.  v0.8 sharded cross-chunk-link layout
+# adds per-K zarr Array + sharding-codec setup overhead vs the legacy
+# single-blob layout — write budgets bumped accordingly.
 PERF_BUDGET = {
-    "write_lines": 3.0,      # measured ~0.9s
-    "read_lines": 6.0,       # measured ~1.7s
-    "write_polylines": 3.0,  # measured ~0.6s
-    "read_polylines": 4.0,   # measured ~1.0s
-    "write_graph": 4.0,      # measured ~1.3s
-    "read_graph": 4.0,       # measured ~1.1s
-    "write_mesh": 2.0,       # measured ~0.3s
-    "read_mesh": 2.0,        # measured ~0.4s
+    "write_lines": 4.0,       # ~0.9s legacy; +~1s for sharded CCL setup
+    "read_lines": 6.0,        # measured ~1.7s
+    "write_polylines": 4.0,   # ~0.6s legacy; +~1s for sharded CCL setup
+    "read_polylines": 4.0,    # measured ~1.0s
+    "write_graph": 5.0,       # ~1.3s legacy; +~1s for sharded CCL setup
+    "read_graph": 4.0,        # measured ~1.1s
+    "write_mesh": 3.0,        # ~0.3s legacy; +~1s for sharded CCL setup
+    "read_mesh": 2.0,         # measured ~0.4s
 }
 
 N = 10_000  # smaller than benchmarks/02 so CI stays under 30s total

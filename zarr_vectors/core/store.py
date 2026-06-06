@@ -22,6 +22,8 @@ if TYPE_CHECKING:
     from zarr.storage import StoreLike
 
 from zarr_vectors.constants import (
+    CAP_MULTISCALE_LINKS,
+    CAP_PARTITIONED_CROSS_CHUNK_LINKS,
     DEFAULT_AXES_NAMES,
     DEFAULT_BOUNDS_SIDE,
     DEFAULT_OOB_POLICY,
@@ -1465,6 +1467,29 @@ def remove_resolution_level(root: Group, level_index: int) -> None:
         raise StoreError(f"Resolution level {level_index} not found")
 
     root.delete_subtree(group_name)
+
+
+def _stamp_root_capability(root_group, cap: str) -> None:
+    attrs = root_group.attrs.to_dict()
+    zv = attrs.get("zarr_vectors", {})
+    caps = list(zv.get("format_capabilities", []))
+    if cap not in caps:
+        caps.append(cap)
+        zv["format_capabilities"] = caps
+        root_group.attrs.update({"zarr_vectors": zv})
+
+
+def stamp_ccl_capabilities(root_group) -> None:
+    """Stamp both cross-chunk-link capability tokens on root.
+
+    Every writer that emits records into ``cross_chunk_links/<delta>/kK``
+    must call this after the write so the resulting store advertises
+    both the multiscale-links token and the v0.8 partitioned-layout
+    token; readers refuse to open a store whose capabilities don't
+    match the on-disk shape.
+    """
+    _stamp_root_capability(root_group, CAP_MULTISCALE_LINKS)
+    _stamp_root_capability(root_group, CAP_PARTITIONED_CROSS_CHUNK_LINKS)
 
 
 def list_available_ratios(root: Group) -> list[tuple[int, ...]]:

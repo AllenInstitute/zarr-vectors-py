@@ -319,13 +319,15 @@ class RootMetadata:
             raise MetadataError(
                 f"zv_version {self.zv_version!r} is not a valid X.Y[.Z] string"
             ) from exc
-        if (major, minor, patch) < (0, 7, 0):
+        if (major, minor, patch) < (0, 8, 0):
             raise MetadataError(
                 f"store zv_version is {self.zv_version}; this build "
-                f"requires {FORMAT_VERSION} — no backwards-compat shim. "
-                f"Pre-0.7 stores keyed chunk_shape at the root only and "
-                f"could be silently misread under a per-level override; "
-                f"rewrite from source."
+                f"requires {FORMAT_VERSION}.  v0.8 partitions "
+                f"``cross_chunk_links/<delta>/`` into K-deep leaves "
+                f"keyed by sorted unique chunks; older monolithic-blob "
+                f"layouts are not readable.  Run "
+                f"``zarr_vectors.migration.partition_legacy_cross_chunk_links"
+                f"(store_path)`` to convert in place."
             )
 
         if self.cross_level_storage not in VALID_XLEVEL_STORAGE:

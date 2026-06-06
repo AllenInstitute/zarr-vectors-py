@@ -338,6 +338,27 @@ class Group:
                 keys.add(k)
         return sorted(keys)
 
+    def list_subgroups(self, array_name: str) -> list[str]:
+        """Return immediate subgroup names under ``array_name`` (sorted).
+
+        Used by the v0.8 partitioned cross-chunk-link layout, which
+        nests K-deep groups (one per sorted-unique-chunk segment) under
+        ``cross_chunk_links/<delta>/``.  ``array_name`` is the parent
+        path; subgroup names are returned without that prefix.
+
+        Returns ``[]`` when ``array_name`` doesn't exist or isn't a
+        Group.
+        """
+        if array_name not in self._zarr:
+            return []
+        try:
+            node = self._zarr[array_name]
+        except KeyError:
+            return []
+        if not isinstance(node, zarr.Group):
+            return []
+        return sorted(node.group_keys())
+
     # ---------------- array metadata ----------------
 
     def write_array_meta(self, array_name: str, meta: dict[str, Any]) -> None:

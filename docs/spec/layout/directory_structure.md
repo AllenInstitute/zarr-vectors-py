@@ -120,14 +120,17 @@ tracts.zarrvectors/
     │   ├── zarr.json
     │   └── c/ …
     │
-    ├── cross_chunk_links/       # inter-chunk edges (partitioned by sorted-unique chunks)
+    ├── cross_chunk_links/       # inter-chunk edges (K-separated sharded vlen-bytes)
     │   └── 0/
-    │       ├── zarr.json        # sid_ndim, level_delta=0, link_width, layout="partitioned_v1"
-    │       ├── 0.0.0/
-    │       │   ├── data         # K=1 leaf: same-chunk records, 9*link_width B per record
-    │       │   └── 1.0.0/
-    │       │       └── data     # K=2 leaf: (0.0.0, 1.0.0) records, 9*link_width B per record
-    │       └── …                # one nested chunk subtree per (sorted unique chunks) set
+    │       ├── zarr.json        # sid_ndim, level_delta=0, link_width, layout="sharded_v1"
+    │       ├── k1/              # same-chunk records — 3-D (sid_ndim-dim) sharded array
+    │       │   ├── zarr.json    # shards=(4,)*3, chunks=(1,)*3, vlen-bytes
+    │       │   └── c/<shard>    # one file per populated outer shard
+    │       ├── k2/              # most common: cross-chunk edges & 2-chunk faces — 6-D
+    │       │   ├── zarr.json
+    │       │   └── c/<shard>
+    │       └── k3/              # optional: faces spanning 3 chunks — 9-D
+    │           └── …
     │
     ├── link_attributes/         # per-edge attrs, parallel to links/<delta>/
     │   └── weight/
@@ -135,13 +138,14 @@ tracts.zarrvectors/
     │           ├── zarr.json
     │           └── c/ …
     │
-    ├── cross_chunk_link_attributes/    # per-CCL attrs (partitioned same as CCL)
-    │   └── weight/                     # parallel leaf-for-leaf to cross_chunk_links/<delta>/<...>/data
+    ├── cross_chunk_link_attributes/    # per-CCL attrs (parallel kN arrays)
+    │   └── weight/
     │       └── 0/
-    │           ├── zarr.json           # dtype, layout="partitioned_v1"
-    │           └── 0.0.0/
-    │               └── 1.0.0/
-    │                   └── data        # one row per matching CCL record
+    │           ├── zarr.json    # dtype, layout="sharded_v1"
+    │           ├── k1/
+    │           │   └── c/<shard>
+    │           └── k2/
+    │               └── c/<shard>
     │
     ├── attributes/              # per-vertex attributes (e.g. FA, MD)
     │
@@ -270,7 +274,7 @@ Per-vertex and per-object custom attributes must be placed under
 | `links/<delta>/` | polyline, streamline, graph, skeleton (`link_width=2`); mesh (`link_width=3`) | `<delta>=0` for intra-level edges; `<delta>=±N` for cross-pyramid-level edges (0.4+) |
 | `cross_chunk_links/<delta>/` | Any geometry whose objects can span multiple chunks | `<delta>=0` always; `±N` when `cross_level_depth > 0` |
 | `link_attributes/<name>/<delta>/` | Any geometry that wrote `edge_attributes` | Parallel to `links/<delta>/` |
-| `cross_chunk_link_attributes/<name>/<delta>/` | Any geometry with cross-chunk per-edge attrs (0.4+) | Partitioned leaves parallel to `cross_chunk_links/<delta>/<chunk_sorted_0>/.../<chunk_sorted_{K-1}>/data` (0.6+) |
+| `cross_chunk_link_attributes/<name>/<delta>/` | Any geometry with cross-chunk per-edge attrs (0.4+) | Parallel sharded vlen-bytes `kK` arrays mirroring `cross_chunk_links/<delta>/kK/` (0.8+) |
 | `attributes/` | All types | Optional if no per-vertex attributes |
 | `object_index/` | polyline, streamline, graph, skeleton, mesh | |
 | `object_attributes/` | Any type | Optional |

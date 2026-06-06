@@ -89,10 +89,10 @@ in the store.
 | `links_level_delta` | `links/<delta>/` `.zattrs` declares `level_delta` matching the path segment | Error |
 | `obj_index_meta` | `object_index/` `.zattrs` declares `zv_array == "object_index"`, `num_objects` (int ≥ 0), and `sid_ndim` (positive int) | Error |
 | `obj_index_offsets_len` | `object_index/offsets` has length equal to `num_objects` and dtype `int64` | Error |
-| `ccl_meta` | `cross_chunk_links/<delta>/` `.zattrs` declares `sid_ndim`, `level_delta`, `link_width`, and `layout == "partitioned_v1"` (0.8+).  `num_links` is no longer at the group level — per-leaf counts are derived from leaf byte length. | Error |
-| `ccl_layout` | Every `cross_chunk_links/<delta>/` group's `.zattrs` carries `layout == "partitioned_v1"`.  Any other value (or absent key, including the 0.7 legacy single-blob layout) is fatal and directs the user to run the 0.7 → 0.8 migration helper. | Error |
-| `ccl_leaf_record_size` | Every `cross_chunk_links/<delta>/<chunk_sorted_0>/.../<chunk_sorted_{K-1}>/data` leaf has byte length divisible by `9 * link_width`. | Error |
-| `ccl_attr_layout` | Every `cross_chunk_link_attributes/<name>/<delta>/` group `.zattrs` carries `layout == "partitioned_v1"` (0.8+). | Error |
+| `ccl_meta` | `cross_chunk_links/<delta>/` `.zattrs` declares `sid_ndim`, `level_delta`, `link_width`, and `layout == "sharded_v1"` (0.8+).  `num_links` is no longer at the group level — per-leaf counts are derived from leaf byte length. | Error |
+| `ccl_layout` | Every `cross_chunk_links/<delta>/` group's `.zattrs` carries `layout == "sharded_v1"`.  Any other value (or absent key, including the 0.7 legacy single-blob layout) is fatal and directs the user to run the 0.7 → 0.8 migration helper. | Error |
+| `ccl_leaf_record_size` | Every `cross_chunk_links/<delta>/kK` cell has byte length divisible by `9 * link_width`. | Error |
+| `ccl_attr_layout` | Every `cross_chunk_link_attributes/<name>/<delta>/` group `.zattrs` carries `layout == "sharded_v1"` (0.8+). | Error |
 | `ccl_attr_parity` | For every attribute leaf at `cross_chunk_link_attributes/<name>/<delta>/<…>/data`, record count equals the parallel `cross_chunk_links/<delta>/<same path>/data` leaf record count. | Error |
 | `partitioned_ccl_capability` | If any `cross_chunk_links/<delta>/` group exists, root metadata `format_capabilities` carries both `multiscale_links` and `partitioned_cross_chunk_links`. | Error |
 

@@ -232,27 +232,33 @@ Maps group IDs to lists of object IDs.
 | Zarr chunk shape | `(1, max_group_size)` |
 | Fill value | `-1` (padding for groups smaller than `max_group_size`) |
 
-### `cross_chunk_links/<delta>/<chunk_sorted_0>/.../<chunk_sorted_{K-1}>/data`
+### `cross_chunk_links/<delta>/kK/` — sharded vlen-bytes Array
 
 Present for: polyline, streamline (and any other geometry with edges
 spanning chunks).
 
-Records are partitioned into leaves by the sorted unique set of chunks
-each record touches; `K` is the path depth under `<delta>`.
+Records are partitioned into K-separated sharded vlen-bytes zarr
+Arrays; `K` is the number of distinct chunks each record touches.
+Each cell of `kK` holds the records for one sorted-unique-chunks
+tuple, indexed at the cell coord `(c_0, ..., c_{K-1})` after applying
+the per-axis `chunk_origin` offset.
 
 | Property | Value |
 |----------|-------|
-| Dtype | `uint8` (raw bytes; record body is `L * uint8 ci` + `L * int64 vi`) |
-| Per-record size | `9 * link_width` bytes |
-| Logical shape | Per-leaf `(num_records,)` of uint8; `num_records = len(leaf_bytes) / (9 * link_width)` |
-| Layout discriminator | `.zattrs.layout == "partitioned_v1"` on the `cross_chunk_links/<delta>/` group |
+| Dtype | `bytes` (vlen-bytes codec) |
+| Logical shape | `(Cx, Cy, Cz) * K` (sid_ndim × K dims) |
+| Inner chunk shape | `(1,) * (sid_ndim * K)` (one cell per inner chunk) |
+| Outer shard shape | `(4,) * (sid_ndim * K)` (default; tunable) |
+| Per-record payload | `9 * link_width` bytes (`L * uint8 ci` + `L * int64 vi`) |
+| Per-cell record count | `len(cell_bytes) // (9 * link_width)` |
+| Layout discriminator | `.zattrs.layout == "sharded_v1"` on the `cross_chunk_links/<delta>/` parent group |
 
-Each record is `L` chunk-indices (`uint8`, one per endpoint) followed by
-`L` local vertex indices (`int64`, one per endpoint). Endpoint `i`
-lives in the chunk at path segment `ci_i`. For a typical polyline edge
-(`L=2, K=2`), `ci = [0, 1]` and the record is the last vertex of the
-segment in `chunk_sorted_0` plus the first vertex of the continuation
-segment in `chunk_sorted_1`.
+Each record's chunk identities are recovered from the cell coord's K
+sorted-chunks tuple via the per-endpoint `ci_i ∈ [0, K-1]` index.
+For a typical polyline edge (`L=2, K=2`), `ci = [0, 1]` (canonical
+for `delta=0`) and the record is the last vertex of the segment in
+the lex-smaller chunk plus the first vertex of the continuation
+segment in the lex-larger chunk.
 
 See [Cross-chunk links](../object_model/cross_chunk_links.md) for the
 full encoding, canonicalization, and validation rules, and the

@@ -155,19 +155,19 @@ def test_level_metadata_with_attribute_chunking_validates(schema):
           "dtype": "int32", "shape": [5]}),
         ("CrossChunkLinksMeta",
          {"zv_array": "cross_chunk_links", "sid_ndim": 3,
-          "level_delta": 0, "link_width": 2, "layout": "partitioned_v1"}),
+          "level_delta": 0, "link_width": 2}),
         ("CrossChunkLinksMeta",
          {"zv_array": "cross_chunk_links", "sid_ndim": 3,
-          "level_delta": -1, "link_width": 1, "layout": "partitioned_v1"}),
+          "level_delta": -1, "link_width": 1}),
         ("CrossChunkLinksMeta",
          {"zv_array": "cross_chunk_links", "sid_ndim": 3,
-          "level_delta": 0, "link_width": 3, "layout": "partitioned_v1"}),
+          "level_delta": 0, "link_width": 3}),
         ("LinkAttributeMeta",
          {"zv_array": "link_attribute", "name": "weight", "dtype": "float32",
           "level_delta": 0}),
         ("CrossChunkLinkAttributeMeta",
          {"zv_array": "cross_chunk_link_attribute", "name": "weight",
-          "dtype": "float32", "level_delta": 1, "layout": "partitioned_v1"}),
+          "dtype": "float32", "level_delta": 1}),
     ],
 )
 def test_per_array_zattrs_shapes_validate(schema, defs_name, instance):
@@ -241,15 +241,16 @@ def test_constant_set_matches_schema_enum(schema, enum_name, members):
 
 
 # ===================================================================
-# Format-version cutoff (0.7.0 hard break: per-level chunk_shape).
+# Format-version cutoff (0.8.0 hard break: partitioned cross-chunk-link
+# layout — see Phase B of the v0.8 implementation plan).
 # ===================================================================
 
 
-def test_format_version_is_0_7_0():
-    """The current ZV writer stamps 0.7.0; bump tests here when bumping."""
+def test_format_version_is_0_8_0():
+    """The current ZV writer stamps 0.8.0; bump tests here when bumping."""
     from zarr_vectors.constants import FORMAT_VERSION
 
-    assert FORMAT_VERSION == "0.7.0", (
+    assert FORMAT_VERSION == "0.8.0", (
         f"FORMAT_VERSION drifted to {FORMAT_VERSION!r}; if intentional "
         f"update this test and the version-cutoff check in "
         f"zarr_vectors.core.metadata.RootMetadata.validate()."
@@ -258,11 +259,12 @@ def test_format_version_is_0_7_0():
 
 @pytest.mark.parametrize(
     "stale_version",
-    ["0.3", "0.3.5", "0.4", "0.4.0", "0.4.1", "0.5.0", "0.6.0"],
+    ["0.3", "0.3.5", "0.4", "0.4.0", "0.4.1", "0.5.0", "0.6.0", "0.7.0"],
 )
-def test_pre_0_7_0_stores_rejected(stale_version):
-    """Pre-0.7.0 stores must fail validate() with a clear message that
-    mentions the rename so the user knows what changed."""
+def test_pre_0_8_0_stores_rejected(stale_version):
+    """Pre-0.8.0 stores must fail validate() with a clear message that
+    directs the user at the partition_legacy_cross_chunk_links migration
+    helper."""
     from zarr_vectors.exceptions import MetadataError
 
     md = _minimal_root_md()
@@ -271,7 +273,7 @@ def test_pre_0_7_0_stores_rejected(stale_version):
         md.validate()
 
 
-def test_0_7_0_store_passes_validate():
+def test_0_8_0_store_passes_validate():
     md = _minimal_root_md()
-    md.zv_version = "0.7.0"
+    md.zv_version = "0.8.0"
     md.validate()  # should not raise

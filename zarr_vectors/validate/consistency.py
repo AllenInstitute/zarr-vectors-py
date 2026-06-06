@@ -7,7 +7,19 @@ from pathlib import Path
 import numpy as np
 
 from zarr_vectors.core.arrays import (
-    list_chunk_keys, read_all_object_manifests, read_chunk_vertices, read_cross_chunk_links,
+    _check_not_legacy_ccl_blob,
+    _decode_ccl_cell_payload,
+    _iter_populated_cells_in_shard,
+    _list_kN_arrays,
+    _walk_populated_shards,
+    list_chunk_keys,
+    read_all_object_manifests,
+    read_chunk_vertices,
+    read_cross_chunk_links,
+)
+from zarr_vectors.core.paths import (
+    cross_chunk_links_path,
+    cross_chunk_link_attributes_path,
 )
 from zarr_vectors.core.store import (
     get_resolution_level, list_resolution_levels, open_store, read_root_metadata,
@@ -177,28 +189,209 @@ def validate_consistency(store_path: str | Path) -> ValidationResult:
         except Exception:
             pass
 
-        # Walk every cross_chunk_links/<delta>/ array.  For delta=0
-        # both endpoints must live in this level's chunk grid; for
-        # delta != 0 only the source side (endpoint A) is constrained
-        # here (endpoint B lives at this_level + delta and is validated
-        # when that level is reached).
-        from zarr_vectors.core.arrays import list_cross_link_deltas
+        # Walk every cross_chunk_links/<delta>/ group and verify the
+        # v0.8 kN-array layout's per-cell invariants:
+        #  - no legacy monolithic ``data`` blob present
+        #  - cell-payload byte length % (9 * link_width) == 0
+        #  - ci_i ∈ [0, K-1] and coverage set(ci) == {0..K-1}
+        #  - canonical ci = [0, 1] for delta=0 link_width=2
+        #  - cell-coord K chunk segments are in strict lex order
+        #  - chunk existence at the relevant level
+        #  - same-chunk warning for populated k1 cells
+        from zarr_vectors.core.arrays import (
+            list_cross_chunk_link_attribute_deltas,
+            list_cross_link_deltas,
+        )
         for d in list_cross_link_deltas(lg):
-            try:
-                ccl = read_cross_chunk_links(lg, delta=d)
-            except Exception:
+            parent_name = cross_chunk_links_path(d)
+            ccl_meta = lg.read_array_meta(parent_name)
+            if not ccl_meta:
+                result.add_error(
+                    f"{prefix}: ccl[delta={d}] missing parent group metadata"
+                )
                 continue
-            for (ca, _), (cb, _) in ccl:
-                if ca not in chunk_fragment_counts:
-                    result.add_error(
-                        f"{prefix}: ccl[delta={d}] refs non-existent chunk {ca}"
+            try:
+                _check_not_legacy_ccl_blob(lg, full_name=parent_name)
+            except Exception as e:
+                result.add_error(f"{prefix}: {e}")
+                continue
+            link_width = int(ccl_meta.get("link_width", 0))
+            sid_ndim_meta = int(ccl_meta.get("sid_ndim", 0)) or ndim
+            if link_width <= 0:
+                # Group exists with no records yet (writer stamps
+                # link_width when first cell is written).  Nothing to
+                # validate.
+                continue
+
+            ccl_cell_count = 0
+            ccl_record_count = 0
+            per_cell_counts: dict[tuple[int, tuple[int, ...]], int] = {}
+            for K, arr in _list_kN_arrays(
+                lg, delta=d, link_width=link_width,
+            ):
+                shard_shape = tuple(int(s) for s in (arr.shards or arr.chunks))
+                origin_attr = tuple(
+                    int(x)
+                    for x in arr.attrs.get(
+                        "chunk_origin", (0,) * sid_ndim_meta,
                     )
-                if d == 0 and cb not in chunk_fragment_counts:
-                    result.add_error(
-                        f"{prefix}: ccl[delta=0] refs non-existent chunk {cb}"
+                )
+                for shard_coord in _walk_populated_shards(arr):
+                    shard_origin = tuple(
+                        shard_coord[i] * shard_shape[i] for i in range(arr.ndim)
                     )
+                    for cell_idx, payload in _iter_populated_cells_in_shard(
+                        arr, shard_origin, shard_shape,
+                    ):
+                        ccl_cell_count += 1
+                        per_cell_counts[(K, tuple(int(x) for x in cell_idx))] = 0
+                        if not isinstance(payload, (bytes, bytearray)):
+                            payload = bytes(payload)
+                        rec_size = 9 * link_width
+                        if len(payload) % rec_size != 0:
+                            result.add_error(
+                                f"{prefix}: ccl[delta={d}] k{K} cell {tuple(cell_idx)} "
+                                f"byte length {len(payload)} not multiple of {rec_size}"
+                            )
+                            continue
+                        # Reconstruct sorted chunks from cell coord.
+                        sorted_chunks = tuple(
+                            tuple(
+                                int(cell_idx[k * sid_ndim_meta + a])
+                                + origin_attr[a]
+                                for a in range(sid_ndim_meta)
+                            )
+                            for k in range(K)
+                        )
+                        if K >= 2:
+                            ordered = all(
+                                sorted_chunks[i] < sorted_chunks[i + 1]
+                                for i in range(K - 1)
+                            )
+                            if not ordered:
+                                result.add_error(
+                                    f"{prefix}: ccl[delta={d}] k{K} cell "
+                                    f"{tuple(cell_idx)} chunk segments not "
+                                    f"strictly lex-sorted: {sorted_chunks}"
+                                )
+                        if K == 1:
+                            result.add_warning(
+                                f"{prefix}: ccl[delta={d}] k1 cell {tuple(cell_idx)} "
+                                f"is legal but consider using "
+                                f"links/{d}/<chunk> for intra-chunk edges"
+                            )
+                        # Decode records and check ci coverage / canonical
+                        # form / chunk existence.
+                        records = _decode_ccl_cell_payload(
+                            bytes(payload),
+                            sorted_chunks,
+                            link_width=link_width,
+                        )
+                        ccl_record_count += len(records)
+                        per_cell_counts[(K, tuple(int(x) for x in cell_idx))] = len(
+                            records
+                        )
+                        for rec in records:
+                            ci_seen = set()
+                            for endpoint_i, (chunk, _vi) in enumerate(rec):
+                                # Recover ci by reverse-lookup in sorted_chunks.
+                                try:
+                                    ci = sorted_chunks.index(chunk)
+                                except ValueError:
+                                    result.add_error(
+                                        f"{prefix}: ccl[delta={d}] k{K} record "
+                                        f"endpoint chunk {chunk} not in "
+                                        f"cell sorted_chunks {sorted_chunks}"
+                                    )
+                                    continue
+                                if not 0 <= ci < K:
+                                    result.add_error(
+                                        f"{prefix}: ccl[delta={d}] k{K} ci={ci} "
+                                        f"out of range [0,{K - 1}]"
+                                    )
+                                ci_seen.add(ci)
+                                # Chunk existence: endpoint 0 lives at owning
+                                # level, others at owning + delta.
+                                if endpoint_i == 0 or d == 0:
+                                    if chunk not in chunk_fragment_counts:
+                                        result.add_error(
+                                            f"{prefix}: ccl[delta={d}] k{K} "
+                                            f"endpoint {endpoint_i} refs "
+                                            f"non-existent chunk {chunk}"
+                                        )
+                            if ci_seen != set(range(K)):
+                                result.add_error(
+                                    f"{prefix}: ccl[delta={d}] k{K} record ci set "
+                                    f"{sorted(ci_seen)} does not cover {{0..{K - 1}}}"
+                                )
+                            if d == 0 and link_width == 2 and K == 2:
+                                # Canonical ci = [0, 1]: endpoint 0 must be at
+                                # smaller chunk, endpoint 1 at larger.
+                                if rec[0][0] != sorted_chunks[0] or rec[1][0] != sorted_chunks[1]:
+                                    result.add_error(
+                                        f"{prefix}: ccl[delta=0] k2 record not "
+                                        f"canonical ci=[0,1]: {rec}"
+                                    )
+
             result.add_pass(
-                f"{prefix}: ccl[delta={d}] validated ({len(ccl)} links)"
+                f"{prefix}: ccl[delta={d}] validated "
+                f"({ccl_cell_count} cells, {ccl_record_count} records)"
             )
+
+            # Per-cell attribute parity: every cross_chunk_link_attributes/
+            # <name>/<delta>/kK cell at the same cell coord has matching
+            # row count.
+            try:
+                attr_root = lg.zarr_group["cross_chunk_link_attributes"]
+            except Exception:
+                attr_root = None
+            if attr_root is not None:
+                for attr_name in list(attr_root):
+                    delta_seg = f"{d:+d}" if d != 0 else "0"
+                    try:
+                        attr_delta_group = attr_root[attr_name][delta_seg]
+                    except Exception:
+                        continue
+                    # Walk kK sub-arrays of attribute group.
+                    for child_name in list(attr_delta_group):
+                        if not child_name.startswith("k"):
+                            continue
+                        try:
+                            arr = attr_delta_group[child_name]
+                        except Exception:
+                            continue
+                        try:
+                            K = int(child_name[1:])
+                        except ValueError:
+                            continue
+                        shard_shape = tuple(
+                            int(s) for s in (arr.shards or arr.chunks)
+                        )
+                        for shard_coord in _walk_populated_shards(arr):
+                            shard_origin = tuple(
+                                shard_coord[i] * shard_shape[i]
+                                for i in range(arr.ndim)
+                            )
+                            for cell_idx, payload in _iter_populated_cells_in_shard(
+                                arr, shard_origin, shard_shape,
+                            ):
+                                cell_key = (K, tuple(int(x) for x in cell_idx))
+                                link_count = per_cell_counts.get(cell_key)
+                                if link_count is None:
+                                    result.add_error(
+                                        f"{prefix}: ccl_attr[{attr_name}/delta={d}] "
+                                        f"k{K} cell {tuple(cell_idx)} has no "
+                                        f"matching link cell"
+                                    )
+                                    continue
+                                # Row count is determined by attribute dtype; we
+                                # cannot recompute without dtype metadata.  At
+                                # least sanity-check payload presence.
+                                if link_count > 0 and not payload:
+                                    result.add_error(
+                                        f"{prefix}: ccl_attr[{attr_name}/delta={d}] "
+                                        f"k{K} cell {tuple(cell_idx)} empty but "
+                                        f"link cell has {link_count} records"
+                                    )
 
     return result

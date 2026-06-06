@@ -22,7 +22,6 @@ import numpy as np
 import numpy.typing as npt
 
 from zarr_vectors.constants import (
-    CAP_MULTISCALE_LINKS,
     CAP_PRESERVED_OBJECT_IDS,
     CAP_SHARED_FRAGMENTS,
     COARSEN_PER_OBJECT,
@@ -65,6 +64,7 @@ from zarr_vectors.core.store import (
     open_store,
     read_level_metadata,
     read_root_metadata,
+    stamp_ccl_capabilities,
 )
 from zarr_vectors.exceptions import ArrayError, CoarseningError
 from zarr_vectors.multiresolution.coarsen_implicit import (
@@ -952,7 +952,7 @@ def _finalize_cross_level_for_store(
     if len(levels) < 2:
         return
 
-    _stamp_root_capability(root, CAP_MULTISCALE_LINKS)
+    stamp_ccl_capabilities(root)
 
     # Build per-level chunk_assignments + total counts once.
     per_level: dict[int, tuple[dict[ChunkCoords, npt.NDArray[np.int64]], int]] = {}

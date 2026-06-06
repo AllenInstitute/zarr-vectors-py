@@ -12,6 +12,7 @@ the store or encoding modules directly.
 
 from __future__ import annotations
 
+import math
 import warnings
 from contextlib import contextmanager
 from typing import Any, Literal
@@ -41,9 +42,16 @@ from zarr_vectors.core.paths import (
     cross_chunk_link_attributes_path,
     cross_chunk_links_path,
     format_delta,
+    leaf_index_key,
     link_attributes_path,
     links_path,
     parse_delta,
+    parse_leaf_index_key,
+)
+from zarr_vectors.core.metadata import (
+    LevelMetadata,
+    RootMetadata,
+    get_level_chunk_shape,
 )
 from zarr_vectors.core.store import FsGroup
 from zarr_vectors.encoding.fragments import (
@@ -446,31 +454,43 @@ def create_cross_chunk_links_array(
     *,
     delta: int = 0,
     link_width: int = 2,
+    sid_ndim: int | None = None,
     exist_ok: bool = True,
 ) -> None:
-    """Create a ``cross_chunk_links/<delta>/`` array.
+    """Create a ``cross_chunk_links/<delta>/`` array (v0.8 vlen-bytes layout).
 
-    Source-side endpoints live at the owning resolution level;
-    target-side endpoints live at ``this_level + delta``.
+    Records are partitioned by the sorted unique chunks each record
+    touches and stored as one cell of a 1-D vlen-bytes zarr Array.  A
+    sidecar ``leaf_index`` in the group's ``.zattrs`` maps the sorted
+    chunks tuple to the cell ordinal so readers can look up "records
+    between A and B" with a single sort + dict lookup.  See
+    :func:`write_cross_chunk_links` for the cell payload format.
+
+    Source-side endpoints (endpoint 0) live at the owning resolution
+    level; target-side endpoints (1..L-1) live at ``this_level + delta``.
 
     Args:
         level_group: Resolution level group.
         delta: Level delta (0 for intra-level, ±N for cross-level).
-        link_width: Number of vertex refs per record.  2 for edges
-            (the default — chunk pairs straddling a boundary), 3 for
-            triangle faces, 1 for parent→child metanode references.
-        exist_ok: When True (default), no-op if the array already exists.
+        link_width: Number of vertex refs per record.  2 for edges,
+            3 for triangle faces, 1 for parent→child metanode refs.
+        sid_ndim: Spatial-index dimension arity, stamped on group meta.
+            Defaulted by writers when omitted here.
+        exist_ok: When True (default), no-op if the group already exists.
             When False, raise :class:`ArrayError` on conflict.
     """
     full_name = cross_chunk_links_path(delta)
     if _short_circuit_existing(level_group, full_name, exist_ok):
         return
     _ensure_array_dir(level_group, full_name)
-    level_group.write_array_meta(full_name, {
+    meta = {
         "zv_array": "cross_chunk_links",
         "level_delta": int(delta),
         "link_width": int(link_width),
-    })
+    }
+    if sid_ndim is not None:
+        meta["sid_ndim"] = int(sid_ndim)
+    level_group.write_array_meta(full_name, meta)
 
 
 def create_link_attributes_array(
@@ -507,11 +527,13 @@ def create_cross_chunk_link_attributes_array(
     delta: int = 0,
     exist_ok: bool = True,
 ) -> None:
-    """Create a ``cross_chunk_link_attributes/<name>/<delta>/`` array.
+    """Create a ``cross_chunk_link_attributes/<name>/<delta>/`` array (v0.8 vlen-bytes).
 
-    Parallel attribute storage for the matching
-    ``cross_chunk_links/<delta>/`` array; one value (or one ``C``-vector
-    row) per cross-chunk link in path order.
+    Parallel attribute storage for the matching ``cross_chunk_links/<delta>/``
+    array.  Attribute rows are partitioned in lockstep with the link
+    cells: each cell holds the rows for the corresponding link leaf.
+    The leaf-ordering and ``leaf_index`` mirror the parent CCL array's
+    sidecar.
 
     ``exist_ok=True`` (default) makes the call idempotent; pass
     ``exist_ok=False`` to raise :class:`ArrayError` on conflict.
@@ -1152,15 +1174,21 @@ def write_cross_chunk_links(
     ``link_width=1`` encodes a single parent→child reference used by
     pyramid metanode drill-down.
 
+    **v0.8 partitioned layout:** records are filed into K-deep leaves
+    keyed by the sorted unique set of chunks each record touches
+    (1 ≤ K ≤ link_width).  Each leaf stores ``L * uint8 ci`` + ``L *
+    int64 vi`` per record (``9 * link_width`` bytes per record); chunk
+    coords come from the leaf path's K sorted segments, not the
+    payload.  For ``delta=0, link_width=2`` (undirected edges) records
+    are canonicalized so ``ci = [0, 1]`` — both orientations of an
+    edge collapse into one.
+
     Records may be passed either as legacy 2-tuples (compatibility
     with the pre-0.6.0 edge-only API) or as a list of endpoint lists
     when ``link_width`` is supplied explicitly.
 
     Endpoint 0 is at the owning resolution level; endpoint k (k>0)
-    is at ``this_level + delta``.  For ``link_width=1`` (metanode
-    drill-down) the single endpoint is at ``this_level + delta`` and
-    is paired with an implicit source defined by the writer (the
-    record stores only the child reference).
+    is at ``this_level + delta``.
 
     Args:
         level_group: Resolution level group.
@@ -1172,21 +1200,25 @@ def write_cross_chunk_links(
         delta: Level delta; see :mod:`zarr_vectors.core.paths`.
         link_width: Endpoints per record.  Defaults to 2 (or to the
             arity of the first record if it's a list).
-        mode: ``"replace"`` (default) overwrites the existing records.
-            ``"append"`` reads existing records, concatenates ``links``,
-            writes back.  ``link_width`` of the appended records must
-            match the existing ``link_width``.
+        mode: ``"replace"`` (default) overwrites every leaf under
+            ``cross_chunk_links/<delta>/``.  ``"append"`` reads every
+            existing leaf, concatenates ``links``, writes back.
+            ``link_width`` of the appended records must match the
+            existing ``link_width``.
 
     Returns:
-        ``"replace"`` returns ``0``.  ``"append"`` returns the row index
-        of the first newly-appended record (``len(existing)`` before
-        the append).  Callers can stamp this index onto downstream
-        attribute tables that reference records by row.
+        ``"replace"`` returns ``0``.  ``"append"`` returns the
+        pre-append total record count (i.e. the index of the first
+        newly-appended record had records been concatenated in
+        canonical-leaf-walk order).  This matches the legacy
+        single-blob API's return semantic for source compatibility,
+        though the actual on-disk layout no longer has a single linear
+        row index.
 
     Concurrency:
-        ``mode="append"`` is read-modify-write and NOT cross-writer-safe.
-        Callers must serialise concurrent appends to the same
-        cross_chunk_links/<delta>/ blob.
+        ``mode="append"`` is read-modify-write across every leaf and
+        NOT cross-writer-safe.  Callers must serialise concurrent
+        appends to the same ``cross_chunk_links/<delta>/`` group.
     """
     if mode not in ("replace", "append"):
         raise ArrayError(
@@ -1198,7 +1230,12 @@ def write_cross_chunk_links(
     # Normalise input to a list-of-lists shape; resolve link_width.
     normalised: list[list[tuple[ChunkCoords, int]]] = []
     for rec in links:
-        if isinstance(rec, tuple) and len(rec) == 2 and isinstance(rec[0], tuple) and not isinstance(rec[0][0], tuple):
+        if (
+            isinstance(rec, tuple)
+            and len(rec) == 2
+            and isinstance(rec[0], tuple)
+            and not isinstance(rec[0][0], tuple)
+        ):
             # Legacy CrossChunkLink: ((chunk_a, vi_a), (chunk_b, vi_b))
             normalised.append([rec[0], rec[1]])
         else:
@@ -1212,13 +1249,20 @@ def write_cross_chunk_links(
                 f"cross_chunk_links/{format_delta(delta)}: record arity "
                 f"{len(rec)} != link_width {link_width}"
             )
-
-    full_name = cross_chunk_links_path(delta)
+        for chunk, _vi in rec:
+            if len(chunk) != sid_ndim:
+                raise ArrayError(
+                    f"chunk coords arity mismatch in cross_chunk_links/"
+                    f"{format_delta(delta)}: sid_ndim={sid_ndim}, "
+                    f"got len(chunk)={len(chunk)}"
+                )
 
     if mode == "append":
         existing = read_cross_chunk_links(level_group, delta=delta)
         if existing:
-            existing_meta = level_group.read_array_meta(full_name)
+            existing_meta = level_group.read_array_meta(
+                cross_chunk_links_path(delta),
+            )
             existing_link_width = int(existing_meta.get("link_width", 2))
             if existing_link_width != link_width:
                 raise ArrayError(
@@ -1230,30 +1274,367 @@ def write_cross_chunk_links(
         combined = [list(rec) for rec in existing] + normalised
     else:
         first_new = 0
+        # Replace mode: clear every kN sub-array (writers may end up
+        # with fewer K-buckets than the previous write).
+        _clear_kN_arrays(level_group, delta=delta)
         combined = normalised
 
-    flat: list[int] = []
-    for rec in combined:
-        for chunk, vi in rec:
-            if len(chunk) != sid_ndim:
-                raise ArrayError(
-                    f"chunk coords arity mismatch in cross_chunk_links/"
-                    f"{format_delta(delta)}: sid_ndim={sid_ndim}, "
-                    f"got len(chunk)={len(chunk)}"
-                )
-            flat.extend(int(c) for c in chunk)
-            flat.append(int(vi))
+    # Apply canonicalization for delta=0, link_width=2 undirected
+    # edges: endpoint 0 must be at the lex-smaller chunk.
+    if delta == 0 and link_width == 2:
+        combined = [_canonicalize_l2_delta0(rec) for rec in combined]
 
-    arr = np.array(flat, dtype=np.int64)
-    level_group.write_bytes(full_name, "data", arr.tobytes())
+    # Re-stamp the group meta with sid_ndim, link_width, layout,
+    # shard_shape.  Drop num_links + leaf_index; per-K arrays carry
+    # their own meta.
+    full_name = cross_chunk_links_path(delta)
+    _ensure_array_dir(level_group, full_name)
     level_group.write_array_meta(full_name, {
         "zv_array": "cross_chunk_links",
-        "num_links": len(combined),
-        "sid_ndim": sid_ndim,
+        "sid_ndim": int(sid_ndim),
         "level_delta": int(delta),
         "link_width": int(link_width),
     })
+
+    # Partition records by K = number of distinct chunks → group by
+    # sorted-unique-chunks key → per-cell ci/vi payload.  The kN array
+    # shape is derived purely from the actual record extent (no bounds
+    # lookup) so the writer works on stores that haven't fully
+    # initialized root metadata yet.
+    cells_by_K: dict[int, dict[tuple[ChunkCoords, ...], tuple[list[list[int]], list[list[int]]]]] = {}
+    max_seen = [0] * sid_ndim
+    min_seen = [0] * sid_ndim
+    saw_any = False
+    for rec in combined:
+        record_chunks: list[ChunkCoords] = [
+            tuple(int(c) for c in ep[0]) for ep in rec
+        ]
+        unique_chunks: list[ChunkCoords] = []
+        for ch in record_chunks:
+            if ch not in unique_chunks:
+                unique_chunks.append(ch)
+        unique_chunks.sort()
+        sorted_unique = tuple(unique_chunks)
+        K = len(sorted_unique)
+        ci_row = [sorted_unique.index(ch) for ch in record_chunks]
+        vi_row = [int(ep[1]) for ep in rec]
+        by_K = cells_by_K.setdefault(K, {})
+        bucket = by_K.get(sorted_unique)
+        if bucket is None:
+            bucket = ([], [])
+            by_K[sorted_unique] = bucket
+        bucket[0].append(ci_row)
+        bucket[1].append(vi_row)
+        for ch in sorted_unique:
+            for a in range(sid_ndim):
+                if not saw_any:
+                    min_seen[a] = ch[a]
+                    max_seen[a] = ch[a]
+                else:
+                    if ch[a] < min_seen[a]:
+                        min_seen[a] = ch[a]
+                    if ch[a] > max_seen[a]:
+                        max_seen[a] = ch[a]
+            saw_any = True
+
+    # Chunk grids may include negative coords (stores with negative
+    # min_corner).  Pick an origin per axis equal to min(0, min_seen)
+    # so cell indices are always non-negative for zarr; readers add
+    # the offset back.
+    chunk_origin = tuple(min(0, min_seen[a]) for a in range(sid_ndim))
+    chunk_grid_shape = tuple(
+        max(1, max_seen[a] - chunk_origin[a] + 1) for a in range(sid_ndim)
+    )
+
+    # For each K-bucket, lazily create kN array + batch-write cells
+    # by shard so multiple cells in one shard are a single
+    # read-modify-write.
+    for K, cells in cells_by_K.items():
+        arr = _open_or_create_kN_array(
+            level_group,
+            delta=delta,
+            K=K,
+            sid_ndim=sid_ndim,
+            link_width=link_width,
+            chunk_grid_shape=chunk_grid_shape,
+            chunk_origin=chunk_origin,
+        )
+        encoded: dict[tuple[ChunkCoords, ...], bytes] = {}
+        for sorted_chunks, (ci_rows, vi_rows) in cells.items():
+            encoded[sorted_chunks] = _encode_cell_payload(
+                ci_rows, vi_rows, link_width=link_width,
+            )
+        _write_cells_batched(arr, encoded, chunk_origin=chunk_origin)
+
     return first_new
+
+
+def _canonicalize_l2_delta0(
+    rec: list[tuple[ChunkCoords, int]],
+) -> list[tuple[ChunkCoords, int]]:
+    """Normalize a ``delta=0, link_width=2`` undirected edge so endpoint 0
+    is at the lex-smaller chunk.  Same-chunk records are left as-is.
+    """
+    (ca, va), (cb, vb) = rec
+    ca_t = tuple(int(x) for x in ca)
+    cb_t = tuple(int(x) for x in cb)
+    if ca_t <= cb_t:
+        return [(ca_t, int(va)), (cb_t, int(vb))]
+    return [(cb_t, int(vb)), (ca_t, int(va))]
+
+
+# Default shard-shape axis for kN sharded vlen-bytes arrays.  Each
+# shard holds shard_size^(sid_ndim*K) cells.  Tuned for concurrent
+# writers touching different spatial regions — different writers
+# typically hit different shard files; same-region edits do
+# read-modify-write at the shard level (cheap for typical record
+# counts but not cross-writer-safe).
+CROSS_CHUNK_LINK_SHARD_AXIS = 4
+
+
+def _level_chunk_grid_shape(level_group: FsGroup) -> tuple[int, ...]:
+    """Return the per-axis chunk-grid extent for the level group's parent
+    store, computed from root bounds + effective chunk_shape.
+
+    Used by the v0.8 sharded CCL writer to size each ``kN`` array's
+    chunk grid: shape = ``chunk_grid_shape * K``.  Inherits the
+    per-level ``chunk_shape`` override (v0.7) when present.
+    """
+    level_zg = level_group.zarr_group
+    # Navigate to the root zarr Group via the underlying store.  zarr 3.x
+    # doesn't expose a ``.parent`` on Group, so we open the same store at
+    # path "" to fetch the root.
+    root_zg = zarr.open_group(store=level_zg.store_path.store, path="")
+    root_meta = RootMetadata.from_dict(dict(root_zg.attrs))
+    try:
+        level_meta = LevelMetadata.from_dict(dict(level_zg.attrs))
+    except Exception:
+        level_meta = None
+    chunk_shape = get_level_chunk_shape(root_meta, level_meta)
+    min_corner, max_corner = root_meta.bounds
+    extents = [
+        float(max_corner[i]) - float(min_corner[i])
+        for i in range(len(chunk_shape))
+    ]
+    return tuple(
+        max(1, int(math.ceil(extents[i] / chunk_shape[i])))
+        for i in range(len(chunk_shape))
+    )
+
+
+def _kN_array_path(delta: int, K: int) -> str:
+    """On-disk path for the ``cross_chunk_links/<delta>/k{K}`` sub-array."""
+    return f"{cross_chunk_links_path(delta)}/k{K}"
+
+
+def _kN_attr_array_path(name: str, delta: int, K: int) -> str:
+    """Path for the parallel attribute sub-array
+    ``cross_chunk_link_attributes/<name>/<delta>/k{K}``.
+    """
+    return f"{cross_chunk_link_attributes_path(name, delta)}/k{K}"
+
+
+def _clear_kN_arrays(level_group: FsGroup, *, delta: int) -> None:
+    """Delete every ``kN`` sub-array under ``cross_chunk_links/<delta>/``."""
+    parent = cross_chunk_links_path(delta)
+    if not level_group.array_exists(parent):
+        return
+    for sub in level_group.list_subgroups(parent):
+        if sub.startswith("k"):
+            level_group.delete_subtree(f"{parent}/{sub}")
+
+
+def _open_or_create_kN_array(
+    level_group: FsGroup,
+    *,
+    delta: int,
+    K: int,
+    sid_ndim: int,
+    link_width: int,
+    chunk_grid_shape: tuple[int, ...],
+    chunk_origin: tuple[int, ...],
+):
+    """Lazily create (or open) the ``kN`` sharded vlen-bytes Array.
+
+    Shape is ``chunk_grid_shape * K`` — each axis-group represents one
+    of the K sorted-unique chunks the leaf records touch.  Inner chunks
+    are ``(1,) * (sid_ndim * K)``; outer shards pack
+    ``CROSS_CHUNK_LINK_SHARD_AXIS``-wide blocks per axis.
+
+    ``chunk_origin`` is the per-axis offset applied to record chunk
+    coords when computing cell index: cell index = ``chunk - origin``.
+    Stored on the array meta so readers can invert.
+    """
+    ndim = sid_ndim * K
+    zg = level_group.zarr_group
+    parent_path = cross_chunk_links_path(delta)
+    parent_group = zg.require_group(parent_path)
+    child_name = f"k{K}"
+    if child_name in parent_group:
+        node = parent_group[child_name]
+        try:
+            shape_ok = (
+                tuple(int(s) for s in node.shape) == tuple(chunk_grid_shape) * K
+            )
+            existing_origin = tuple(
+                int(x) for x in node.attrs.get("chunk_origin", (0,) * sid_ndim)
+            )
+            origin_ok = existing_origin == tuple(chunk_origin)
+        except AttributeError:
+            shape_ok = origin_ok = False
+        if shape_ok and origin_ok:
+            return node
+        del parent_group[child_name]
+
+    shape = tuple(chunk_grid_shape) * K
+    chunks = (1,) * ndim
+    shards = tuple(
+        min(CROSS_CHUNK_LINK_SHARD_AXIS, shape[i]) for i in range(ndim)
+    )
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", UnstableSpecificationWarning)
+        arr = parent_group.create_array(
+            child_name,
+            shape=shape,
+            chunks=chunks,
+            shards=shards,
+            dtype="bytes",
+            serializer=VLenBytesCodec(),
+        )
+        arr.attrs.update({
+            "zv_array": "cross_chunk_links_k",
+            "level_delta": int(delta),
+            "K": int(K),
+            "sid_ndim": int(sid_ndim),
+            "link_width": int(link_width),
+            "shard_shape": list(shards),
+            "chunk_origin": list(chunk_origin),
+        })
+    return arr
+
+
+def _encode_cell_payload(
+    ci_rows: list[list[int]],
+    vi_rows: list[list[int]],
+    *,
+    link_width: int,
+) -> bytes:
+    """Encode N records into one cell payload.
+
+    Layout per record:
+        ``L * uint8 ci`` (L bytes) + ``L * int64 vi`` (8L bytes) =
+        ``9 * L`` bytes per record.  Records concatenated.
+    """
+    n = len(ci_rows)
+    if n == 0:
+        return b""
+    ci_arr = np.asarray(ci_rows, dtype=np.uint8)
+    vi_arr = np.asarray(vi_rows, dtype=np.int64)
+    vi_bytes = vi_arr.astype("<i8", copy=False).view(np.uint8).reshape(
+        n, 8 * link_width,
+    )
+    return np.concatenate([ci_arr, vi_bytes], axis=1).tobytes()
+
+
+def _write_cells_batched(
+    arr,
+    encoded: dict[tuple[ChunkCoords, ...], bytes],
+    *,
+    chunk_origin: tuple[int, ...],
+) -> None:
+    """Write multiple cells of a kN sharded vlen-bytes Array, batching
+    by shard so cells in one shard are a single read-modify-write.
+
+    ``encoded`` maps sorted-chunks tuples to payload bytes.
+    """
+    if not encoded:
+        return
+    ndim = arr.ndim
+    shard_shape = tuple(int(s) for s in (arr.shards or arr.chunks))
+    # Per-cell absolute cell index + payload, grouped by shard origin.
+    by_shard: dict[
+        tuple[int, ...], list[tuple[tuple[int, ...], bytes]]
+    ] = {}
+    for sorted_chunks, payload in encoded.items():
+        # Compute the flat cell index.
+        cell_index: list[int] = []
+        for ch in sorted_chunks:
+            for a, c in enumerate(ch):
+                cell_index.append(int(c) - chunk_origin[a])
+        cell_t = tuple(cell_index)
+        if any(c < 0 or c >= arr.shape[i] for i, c in enumerate(cell_t)):
+            raise ArrayError(
+                f"cell write: cell index {cell_t} out of array shape "
+                f"{arr.shape} (chunk_origin={chunk_origin})"
+            )
+        shard_origin = tuple(
+            (cell_t[i] // shard_shape[i]) * shard_shape[i]
+            for i in range(ndim)
+        )
+        by_shard.setdefault(shard_origin, []).append((cell_t, payload))
+
+    for shard_origin, items in by_shard.items():
+        # Build a (shard_shape) object slab populated with empty bytes,
+        # then fill in our cells.  We need to preserve cells from this
+        # shard that already have data (read-modify-write semantics) —
+        # so we read the existing slab first.
+        slab_slices = tuple(
+            slice(shard_origin[i], shard_origin[i] + shard_shape[i])
+            for i in range(ndim)
+        )
+        existing = arr[slab_slices]
+        # Ensure object dtype for vlen assignment.
+        if existing.dtype != object:
+            slab = np.empty(shard_shape, dtype=object)
+            for idx in np.ndindex(*shard_shape):
+                v = existing[idx]
+                slab[idx] = bytes(v) if v else b""
+        else:
+            slab = existing.copy()
+        for cell_t, payload in items:
+            local = tuple(cell_t[i] - shard_origin[i] for i in range(ndim))
+            slab[local] = payload
+        arr[slab_slices] = slab
+
+
+def _write_one_cell(
+    arr,
+    sorted_chunks: tuple[ChunkCoords, ...],
+    payload: bytes,
+    *,
+    chunk_origin: tuple[int, ...] | None = None,
+) -> None:
+    """Assign one cell of a kN sharded vlen-bytes Array.
+
+    ``sorted_chunks`` is the K-tuple of chunk-coord tuples; cell index
+    is the flat concatenation of those K coords minus ``chunk_origin``
+    (offset that the array meta declares).  When ``chunk_origin`` is
+    ``None``, it's read from ``arr.attrs.chunk_origin`` (default all-0).
+    """
+    K = len(sorted_chunks)
+    ndim = arr.ndim
+    sid_ndim = ndim // K
+    if chunk_origin is None:
+        chunk_origin = tuple(
+            int(x) for x in arr.attrs.get("chunk_origin", (0,) * sid_ndim)
+        )
+    cell_index: list[int] = []
+    for ch in sorted_chunks:
+        if len(ch) != sid_ndim:
+            raise ArrayError(
+                f"cell write: chunk arity {len(ch)} != sid_ndim {sid_ndim}"
+            )
+        cell_index.extend(int(c) - chunk_origin[a] for a, c in enumerate(ch))
+    for i, c in enumerate(cell_index):
+        if c < 0 or c >= arr.shape[i]:
+            raise ArrayError(
+                f"cell write: cell index {cell_index} dim {i} out of "
+                f"range [0, {arr.shape[i]}) (chunk_origin={chunk_origin})"
+            )
+    slab_idx = tuple(slice(c, c + 1) for c in cell_index)
+    obj = np.empty((1,) * ndim, dtype=object)
+    obj[(0,) * ndim] = payload
+    arr[slab_idx] = obj
 
 
 def write_cross_chunk_link_attributes(
@@ -1265,33 +1646,43 @@ def write_cross_chunk_link_attributes(
     delta: int = 0,
     mode: Literal["replace", "append"] = "replace",
 ) -> None:
-    """Write per-edge attribute data parallel to ``cross_chunk_links/<delta>/data``.
+    """Write per-edge attribute data parallel to ``cross_chunk_links/<delta>/``.
 
-    The cross-chunk-link attribute array is a single flat blob whose
-    rows are in the same order as the cross-chunk links written by
-    :func:`write_cross_chunk_links` for the same ``delta``.  Length is
-    runtime-checked against the parallel CCL array's ``num_links`` so a
-    desynchronized write fails loudly instead of producing silent
-    corruption.
+    **v0.8 partitioned layout:** attribute rows are partitioned into
+    K-deep leaves under
+    ``cross_chunk_link_attributes/<name>/<delta>/<chunk_sorted_0>/.../<chunk_sorted_{K-1}>/data``,
+    in lockstep with the link leaves at
+    ``cross_chunk_links/<delta>/<same path>/data``.  Each attribute
+    leaf has one row per link record in the matching link leaf.  The
+    writer reads the existing link leaves in canonical (sorted-chunks)
+    lex order to know how many rows go into each attribute leaf, and
+    slices ``attr_data`` accordingly.
+
+    Length is runtime-checked: the post-write total row count must
+    equal ``num_links`` (the total record count returned by
+    :func:`write_cross_chunk_links`).  A desynchronized write fails
+    loudly instead of producing silent corruption.
 
     Args:
         level_group: Resolution level group.
         attr_name: Attribute name.
         attr_data: ``(num_links,)`` or ``(num_links, C)`` array.  In
             ``mode="append"`` this is interpreted as the NEW rows to
-            append; the post-append length must equal ``num_links``.
-        num_links: Expected post-write length (the ``num_links`` value
-            on the parallel ``cross_chunk_links/<delta>/`` array).
+            append; the post-append total must equal ``num_links``.
+        num_links: Expected post-write total row count.
         delta: Level delta; see :mod:`zarr_vectors.core.paths`.
-        mode: ``"replace"`` (default) writes ``attr_data`` as the whole
-            attribute array.  ``"append"`` reads the existing attribute,
-            concatenates ``attr_data`` along axis 0, writes back, and
-            validates that the resulting length equals ``num_links``.
+        mode: ``"replace"`` (default) overwrites every attribute leaf.
+            ``"append"`` reads existing rows in canonical order,
+            concatenates ``attr_data``, then redistributes across
+            leaves.  Tail dimensions must match the existing array.
 
     Raises:
-        ArrayError: If ``mode`` is invalid, if the post-write length
-            does not equal ``num_links``, or if the appended row shape
-            does not match the existing array.
+        ArrayError: If ``mode`` is invalid; if the post-write length
+            does not equal ``num_links``; if the appended row shape
+            does not match the existing array; or if the canonical
+            walk of link leaves shows row counts that don't sum to
+            ``num_links`` (i.e. the link table the attribute attaches
+            to was modified mid-write).
 
     Concurrency:
         ``mode="append"`` is read-modify-write and NOT cross-writer-safe.
@@ -1303,26 +1694,36 @@ def write_cross_chunk_link_attributes(
         )
 
     full_name = cross_chunk_link_attributes_path(attr_name, delta)
+    new_arr = np.asarray(attr_data)
 
     if mode == "append":
         meta = level_group.read_array_meta(full_name)
-        if meta and "shape" in meta and level_group.chunk_exists(full_name, "data"):
+        # kN attribute sub-nodes are zarr Arrays, so list_chunks (which
+        # returns Array children) is the right primitive — list_subgroups
+        # would always return [].
+        existing_present = (
+            bool(meta) and level_group.array_exists(full_name)
+            and any(
+                child.startswith("k")
+                for child in level_group.list_chunks(full_name)
+            )
+        )
+        if existing_present:
             existing = read_cross_chunk_link_attributes(
                 level_group, attr_name, delta=delta,
             )
-            if existing.shape[1:] != np.asarray(attr_data).shape[1:]:
+            if existing.shape[1:] != new_arr.shape[1:]:
                 raise ArrayError(
                     f"cross_chunk_link_attributes[{attr_name}] append "
                     f"shape mismatch: existing {existing.shape} vs new "
-                    f"{np.asarray(attr_data).shape} — tail dimensions "
-                    f"must match"
+                    f"{new_arr.shape} — tail dimensions must match"
                 )
-            new_cast = np.asarray(attr_data).astype(existing.dtype, copy=False)
+            new_cast = new_arr.astype(existing.dtype, copy=False)
             combined = np.concatenate([existing, new_cast], axis=0)
         else:
-            combined = np.asarray(attr_data)
+            combined = new_arr
     else:
-        combined = np.asarray(attr_data)
+        combined = new_arr
 
     if combined.shape[0] != num_links:
         raise ArrayError(
@@ -1331,18 +1732,170 @@ def write_cross_chunk_link_attributes(
             f"(delta={format_delta(delta)})"
         )
 
+    # Look up the parallel link array's per-cell record counts so we can
+    # slice the flat attribute array.
+    links_name = cross_chunk_links_path(delta)
+    if not level_group.array_exists(links_name):
+        raise ArrayError(
+            f"cross_chunk_link_attributes[{attr_name}] (delta={format_delta(delta)}): "
+            f"no parallel link array at {links_name} — write the link "
+            f"records via write_cross_chunk_links() first"
+        )
+    link_meta = level_group.read_array_meta(links_name)
+    if "link_width" not in link_meta:
+        raise ArrayError(
+            f"cross_chunk_link_attributes[{attr_name}] (delta={format_delta(delta)}): "
+            f"parallel link array {links_name} has no link_width meta"
+        )
+    _check_not_legacy_ccl_blob(level_group, full_name=links_name)
+    link_width = int(link_meta["link_width"])
+    sid_ndim = int(link_meta.get("sid_ndim", 0))
+
+    # Collect per-cell record counts across all kN link arrays in the
+    # canonical (K, lex(sorted-chunks)) walk order that
+    # read_cross_chunk_links uses.
+    per_cell_plan: list[tuple[int, tuple[ChunkCoords, ...], int]] = []
+    # Each entry: (K, sorted_chunks_tuple, n_records).
+    for K, link_arr in _list_kN_arrays(
+        level_group, delta=delta, link_width=link_width,
+    ):
+        shard_shape = tuple(int(s) for s in (link_arr.shards or link_arr.chunks))
+        cells: list[tuple[tuple[int, ...], bytes]] = []
+        for shard_coord in _walk_populated_shards(link_arr):
+            shard_origin = tuple(
+                shard_coord[i] * shard_shape[i] for i in range(link_arr.ndim)
+            )
+            cells.extend(_iter_populated_cells_in_shard(
+                link_arr, shard_origin, shard_shape,
+            ))
+        cells.sort(key=lambda p: p[0])
+        for cell_idx, payload in cells:
+            sorted_chunks = tuple(
+                tuple(int(x) for x in cell_idx[k * sid_ndim : (k + 1) * sid_ndim])
+                for k in range(K)
+            )
+            n_records = len(payload) // (9 * link_width)
+            per_cell_plan.append((K, sorted_chunks, n_records))
+
+    total_link_records = sum(n for _, _, n in per_cell_plan)
+    if total_link_records != num_links:
+        raise ArrayError(
+            f"cross_chunk_link_attributes[{attr_name}] (delta={format_delta(delta)}): "
+            f"parallel link array has {total_link_records} records but "
+            f"caller passed num_links={num_links}"
+        )
+
+    # Clear stale attribute kN arrays under replace mode.
+    if mode == "replace":
+        parent_path = full_name
+        if level_group.array_exists(parent_path):
+            for sub in level_group.list_subgroups(parent_path):
+                if sub.startswith("k"):
+                    level_group.delete_subtree(f"{parent_path}/{sub}")
+
+    # Stamp the parent group meta.
     _ensure_array_dir(level_group, full_name)
-    level_group.write_bytes(
-        full_name, "data", np.ascontiguousarray(combined).tobytes(),
-    )
     level_group.write_array_meta(full_name, {
         "zv_array": "cross_chunk_link_attribute",
         "name": attr_name,
         "dtype": str(combined.dtype),
         "level_delta": int(delta),
-        "num_links": int(num_links),
+        "link_width": link_width,
+        "sid_ndim": sid_ndim,
         "shape": list(combined.shape),
     })
+
+    # Slice the flat attribute array and write into per-K attribute
+    # arrays, mirroring the link arrays' shapes (incl. chunk_origin).
+    combined_c = np.ascontiguousarray(combined)
+    cursor = 0
+    by_K: dict[int, list[tuple[tuple[ChunkCoords, ...], bytes]]] = {}
+    for K, sorted_chunks, n_records in per_cell_plan:
+        slab = combined_c[cursor : cursor + n_records]
+        cursor += n_records
+        payload = slab.tobytes()
+        by_K.setdefault(K, []).append((sorted_chunks, payload))
+    # Open each parallel link kN array to inherit its shape +
+    # chunk_origin (so the attr-kN array has matching cell indices).
+    parent_link_group = level_group.zarr_group[cross_chunk_links_path(delta)]
+    for K, cells in by_K.items():
+        link_arr = parent_link_group[f"k{K}"]
+        link_shape = tuple(int(s) for s in link_arr.shape)
+        link_grid_shape = link_shape[:sid_ndim]
+        link_origin = tuple(
+            int(x) for x in link_arr.attrs.get("chunk_origin", (0,) * sid_ndim)
+        )
+        attr_arr = _open_or_create_kN_attr_array(
+            level_group,
+            attr_name=attr_name,
+            delta=delta,
+            K=K,
+            sid_ndim=sid_ndim,
+            link_width=link_width,
+            chunk_grid_shape=link_grid_shape,
+            chunk_origin=link_origin,
+        )
+        encoded = {sc: payload for sc, payload in cells}
+        _write_cells_batched(attr_arr, encoded, chunk_origin=link_origin)
+
+
+def _open_or_create_kN_attr_array(
+    level_group: FsGroup,
+    *,
+    attr_name: str,
+    delta: int,
+    K: int,
+    sid_ndim: int,
+    link_width: int,
+    chunk_grid_shape: tuple[int, ...],
+    chunk_origin: tuple[int, ...] = (),
+):
+    """Lazily create the parallel attribute ``kN`` sharded vlen-bytes Array
+    under ``cross_chunk_link_attributes/<name>/<delta>/``.
+    """
+    ndim = sid_ndim * K
+    parent_path = cross_chunk_link_attributes_path(attr_name, delta)
+    zg = level_group.zarr_group
+    parent_group = zg.require_group(parent_path)
+    child_name = f"k{K}"
+    shape = tuple(chunk_grid_shape) * K
+    if child_name in parent_group:
+        node = parent_group[child_name]
+        try:
+            shape_ok = tuple(int(s) for s in node.shape) == shape
+        except AttributeError:
+            shape_ok = False
+        if shape_ok:
+            return node
+        del parent_group[child_name]
+
+    chunks = (1,) * ndim
+    shards = tuple(
+        min(CROSS_CHUNK_LINK_SHARD_AXIS, shape[i]) for i in range(ndim)
+    )
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", UnstableSpecificationWarning)
+        arr = parent_group.create_array(
+            child_name,
+            shape=shape,
+            chunks=chunks,
+            shards=shards,
+            dtype="bytes",
+            serializer=VLenBytesCodec(),
+        )
+        attrs_meta = {
+            "zv_array": "cross_chunk_link_attribute_k",
+            "name": attr_name,
+            "level_delta": int(delta),
+            "K": int(K),
+            "sid_ndim": int(sid_ndim),
+            "link_width": int(link_width),
+            "shard_shape": list(shards),
+        }
+        if chunk_origin:
+            attrs_meta["chunk_origin"] = list(chunk_origin)
+        arr.attrs.update(attrs_meta)
+    return arr
 
 
 # ===================================================================
@@ -2158,59 +2711,377 @@ def read_groupings_attributes(
     return np.frombuffer(raw, dtype=dtype).reshape(shape).copy()
 
 
+def _check_not_legacy_ccl_blob(
+    level_group: FsGroup, *, full_name: str,
+) -> None:
+    """Refuse pre-v0.8 monolithic CCL blobs.
+
+    The v0.8 partitioning scheme stores records in ``kK`` sub-arrays
+    under the ``cross_chunk_links/<delta>/`` (or attribute) parent
+    group; pre-v0.8 stores instead held a single ``data`` byte blob
+    directly under the parent group.  Detect the legacy shape
+    structurally — by the presence of that ``data`` zarr Array child
+    — and raise with a pointer at the migration helper.
+
+    Codec choice (sharded vs unsharded vlen-bytes) is intentionally
+    NOT a check here; that's a writer-side performance/operational
+    decision encapsulated by zarr itself.
+    """
+    try:
+        parent_node = level_group.zarr_group[full_name]
+    except KeyError:
+        return
+    if not isinstance(parent_node, zarr.Group):
+        return
+    if "data" not in parent_node:
+        return
+    data_child = parent_node["data"]
+    if isinstance(data_child, zarr.Array):
+        raise ArrayError(
+            f"{full_name}: found a legacy monolithic ``data`` blob "
+            f"under the parent group; v0.8 readers expect ``kK`` "
+            f"sub-arrays instead.  Run "
+            f"``zarr_vectors.migration.partition_legacy_cross_chunk_links"
+            f"(store_path)`` to convert in place."
+        )
+
+
+def _decode_ccl_cell_payload(
+    raw: bytes,
+    sorted_chunks: tuple[ChunkCoords, ...],
+    *,
+    link_width: int,
+) -> list[tuple[tuple[ChunkCoords, int], ...]]:
+    """Decode one cell's bytes into legacy-shape records.
+
+    Per record: ``L * uint8 ci`` + ``L * int64 vi`` = ``9 * L`` bytes.
+    """
+    record_size = 9 * link_width
+    if len(raw) == 0:
+        return []
+    if len(raw) % record_size != 0:
+        raise ArrayError(
+            f"cross_chunk_links cell payload length {len(raw)} not a "
+            f"multiple of 9 * link_width = {record_size}"
+        )
+    n_records = len(raw) // record_size
+    out: list[tuple[tuple[ChunkCoords, int], ...]] = []
+    for r in range(n_records):
+        base = r * record_size
+        ci = np.frombuffer(raw[base : base + link_width], dtype=np.uint8)
+        vi = np.frombuffer(
+            raw[base + link_width : base + record_size], dtype=np.int64,
+        )
+        endpoints: list[tuple[ChunkCoords, int]] = []
+        for j in range(link_width):
+            ci_j = int(ci[j])
+            if ci_j < 0 or ci_j >= len(sorted_chunks):
+                raise ArrayError(
+                    f"cross_chunk_links cell record {r} has ci[{j}]="
+                    f"{ci_j} out of range [0, {len(sorted_chunks)})"
+                )
+            endpoints.append((sorted_chunks[ci_j], int(vi[j])))
+        out.append(tuple(endpoints))
+    return out
+
+
+def _walk_populated_shards(arr) -> list[tuple[int, ...]]:
+    """Return outer-shard coords that have on-disk data for ``arr``.
+
+    Walks the array's underlying zarr Store for ``c/...`` keys whose
+    coord-segments exist (sharded layout: one file per populated
+    outer shard).  Returns coords in lex order so the read order is
+    deterministic.
+    """
+    try:
+        store_path = arr.store_path
+    except AttributeError:
+        return []
+    # The async-array's store iterates keys under the array's own
+    # path; filter to chunk-data keys and parse the coord suffix.
+    try:
+        store = store_path.store
+    except AttributeError:
+        return []
+    prefix = (store_path.path or "").rstrip("/")
+    seek = f"{prefix}/c/" if prefix else "c/"
+
+    import asyncio
+
+    async def _gather() -> list[str]:
+        keys: list[str] = []
+        async for k in store.list_prefix(seek):
+            keys.append(k)
+        return keys
+
+    try:
+        loop = asyncio.new_event_loop()
+        try:
+            keys = loop.run_until_complete(_gather())
+        finally:
+            loop.close()
+    except Exception:
+        return []
+
+    shard_coords: list[tuple[int, ...]] = []
+    for k in keys:
+        # Strip the prefix; split remaining segments.
+        rel = k[len(seek):]
+        if not rel:
+            continue
+        segs = rel.split("/")
+        try:
+            coord = tuple(int(s) for s in segs)
+        except ValueError:
+            continue
+        shard_coords.append(coord)
+    return sorted(set(shard_coords))
+
+
+def _iter_populated_cells_in_shard(
+    arr,
+    shard_origin: tuple[int, ...],
+    shard_shape: tuple[int, ...],
+) -> list[tuple[tuple[int, ...], bytes]]:
+    """Read one outer shard slab and yield ``(cell_index, payload)`` for
+    every non-empty cell in it.
+
+    The cell_index is the absolute coord (origin + local).
+    """
+    slab_slices = tuple(
+        slice(shard_origin[i], shard_origin[i] + shard_shape[i])
+        for i in range(len(shard_shape))
+    )
+    slab = arr[slab_slices]
+    out: list[tuple[tuple[int, ...], bytes]] = []
+    for local in np.ndindex(*slab.shape):
+        val = slab[local]
+        if val is None or len(val) == 0:
+            continue
+        coord = tuple(int(shard_origin[i] + local[i]) for i in range(len(local)))
+        out.append((coord, bytes(val)))
+    return out
+
+
+def _list_kN_arrays(
+    level_group: FsGroup,
+    *,
+    delta: int,
+    link_width: int,
+) -> list[tuple[int, "zarr.Array"]]:
+    """Return ``[(K, kN_array), ...]`` for every ``kN`` sub-array that
+    exists under ``cross_chunk_links/<delta>/``.
+
+    K ranges from 1 to ``link_width``.  Missing sub-arrays are skipped
+    (lazy allocation — only K-buckets with records exist on disk).
+    """
+    parent_name = cross_chunk_links_path(delta)
+    if not level_group.array_exists(parent_name):
+        return []
+    out: list[tuple[int, zarr.Array]] = []
+    parent_group = level_group.zarr_group[parent_name]
+    for K in range(1, link_width + 1):
+        child = f"k{K}"
+        if child not in parent_group:
+            continue
+        node = parent_group[child]
+        if isinstance(node, zarr.Array):
+            out.append((K, node))
+    return out
+
+
+def list_cross_chunk_link_leaves(
+    level_group: FsGroup,
+    *,
+    delta: int = 0,
+    involves: ChunkCoords | None = None,
+) -> list[tuple[ChunkCoords, ...]]:
+    """Enumerate every populated cell across all ``kN`` arrays under
+    ``cross_chunk_links/<delta>/``.
+
+    Returns each cell's K-tuple of chunk-coord tuples (the sorted
+    unique chunks the record touches), in (K, lex(chunks)) order.
+    ``involves``, if given, filters to cells containing that chunk
+    anywhere — useful for "all records touching chunk X" neighbourhood
+    queries.
+    """
+    parent_name = cross_chunk_links_path(delta)
+    if not level_group.array_exists(parent_name):
+        return []
+    _check_not_legacy_ccl_blob(level_group, full_name=parent_name)
+    meta = level_group.read_array_meta(parent_name)
+    if not meta or "link_width" not in meta:
+        return []
+    sid_ndim = int(meta.get("sid_ndim", 0))
+    link_width = int(meta["link_width"])
+    target = tuple(int(c) for c in involves) if involves is not None else None
+
+    out: list[tuple[ChunkCoords, ...]] = []
+    for K, arr in _list_kN_arrays(
+        level_group, delta=delta, link_width=link_width,
+    ):
+        shard_shape = tuple(int(s) for s in (arr.shards or arr.chunks))
+        origin_attr = tuple(
+            int(x) for x in arr.attrs.get("chunk_origin", (0,) * sid_ndim)
+        )
+        for shard_coord in _walk_populated_shards(arr):
+            shard_origin = tuple(
+                shard_coord[i] * shard_shape[i] for i in range(arr.ndim)
+            )
+            for cell_idx, _payload in _iter_populated_cells_in_shard(
+                arr, shard_origin, shard_shape,
+            ):
+                # Split cell_idx into K chunk-coord tuples of arity sid_ndim,
+                # adding back the per-axis origin offset.
+                chunks_tuple = tuple(
+                    tuple(
+                        int(cell_idx[k * sid_ndim + a]) + origin_attr[a]
+                        for a in range(sid_ndim)
+                    )
+                    for k in range(K)
+                )
+                if target is not None and target not in chunks_tuple:
+                    continue
+                out.append(chunks_tuple)
+    return sorted(out, key=lambda t: (len(t), t))
+
+
+def read_cross_chunk_link_leaf(
+    level_group: FsGroup,
+    chunks: tuple[ChunkCoords, ...],
+    *,
+    delta: int = 0,
+) -> list[tuple[tuple[ChunkCoords, int], ...]]:
+    """Read every record stored in a single cell (kN array lookup).
+
+    ``chunks`` is the K-tuple of chunk-coord tuples the cell represents
+    — does NOT need to be pre-sorted; the helper sorts + dedupes
+    internally.  Returns ``[]`` when no such cell exists.
+    """
+    parent_name = cross_chunk_links_path(delta)
+    if not level_group.array_exists(parent_name):
+        return []
+    _check_not_legacy_ccl_blob(level_group, full_name=parent_name)
+    meta = level_group.read_array_meta(parent_name)
+    if not meta or "link_width" not in meta:
+        return []
+    link_width = int(meta["link_width"])
+
+    # Dedupe + lex-sort the caller's chunks.
+    seen: set[ChunkCoords] = set()
+    deduped: list[ChunkCoords] = []
+    for ch in chunks:
+        ch_t = tuple(int(c) for c in ch)
+        if ch_t in seen:
+            continue
+        seen.add(ch_t)
+        deduped.append(ch_t)
+    deduped.sort()
+    sorted_unique = tuple(deduped)
+    K = len(sorted_unique)
+    if K == 0:
+        return []
+    # The kN node is a zarr Array (not Group), so FsGroup.array_exists
+    # (which checks "is this a Group?") would return False — go through
+    # the underlying zarr Group directly.
+    zg = level_group.zarr_group
+    if parent_name not in zg:
+        return []
+    parent_group = zg[parent_name]
+    child = f"k{K}"
+    if child not in parent_group:
+        return []
+    arr = parent_group[child]
+    if not isinstance(arr, zarr.Array):
+        return []
+    sid_ndim = int(meta.get("sid_ndim", 0))
+    origin_attr = tuple(
+        int(x) for x in arr.attrs.get("chunk_origin", (0,) * sid_ndim)
+    )
+    cell_index = tuple(
+        int(c) - origin_attr[a]
+        for ch in sorted_unique
+        for a, c in enumerate(ch)
+    )
+    for i, c in enumerate(cell_index):
+        if c < 0 or c >= arr.shape[i]:
+            return []
+    # Slice a 1-cell slab so the result is an object array (not a
+    # 0-D scalar) — extract the single payload from local index (0,)*ndim.
+    slab = arr[tuple(slice(c, c + 1) for c in cell_index)]
+    payload = slab[(0,) * arr.ndim]
+    if payload is None or len(payload) == 0:
+        return []
+    return _decode_ccl_cell_payload(
+        bytes(payload), sorted_unique, link_width=link_width,
+    )
+
+
 def read_cross_chunk_links(
     level_group: FsGroup,
     *,
     delta: int = 0,
 ) -> list[tuple[tuple[ChunkCoords, int], ...]]:
-    """Read all cross-chunk link records from ``cross_chunk_links/<delta>/data``.
+    """Read every cross-chunk-link record under ``cross_chunk_links/<delta>/``.
 
-    Each record is a list of ``(chunk_coords, vertex_idx)`` endpoints.
+    **v0.8 sharded layout:** walks each ``kN`` sub-array's populated
+    shards, decodes each non-empty cell's records, and concatenates
+    them across all K-buckets.  Each record comes back as
+    ``((chunk_0, vi_0), (chunk_1, vi_1), …)`` (length ``link_width``);
+    endpoint chunks are recovered from the cell index via the
+    per-endpoint ``ci`` byte.
+
     Endpoint 0 lives at the owning resolution level; endpoints k (k>0)
     live at ``this_level + delta``.
 
-    Returns ``[]`` when the ``<delta>`` array does not exist or has no
-    records.
+    Returns ``[]`` when the ``<delta>`` group is absent or has no
+    populated cells.  Raises :class:`ArrayError` for pre-v0.8 layouts
+    (run the migration helper).
 
     Returns:
-        List of records; each record has length ``link_width``.  For
-        the common ``link_width=2`` edge case callers can unpack each
-        record as ``((chunk_A, vi_A), (chunk_B, vi_B))``.
+        List of records.  Order: K ascending; lex over sorted-chunks
+        within each K; record-order within each cell.
     """
-    full_name = cross_chunk_links_path(delta)
-    if not level_group.array_exists(full_name):
+    parent_name = cross_chunk_links_path(delta)
+    if not level_group.array_exists(parent_name):
         return []
-    try:
-        meta = level_group.read_array_meta(full_name)
-    except Exception:
+    _check_not_legacy_ccl_blob(level_group, full_name=parent_name)
+    meta = level_group.read_array_meta(parent_name)
+    if not meta or "link_width" not in meta:
         return []
-    if "num_links" not in meta or "sid_ndim" not in meta:
-        return []
-    num_links = meta["num_links"]
-    sid_ndim = meta["sid_ndim"]
-    link_width = int(meta.get("link_width", 2))
-    if num_links == 0:
-        return []
-    if not level_group.chunk_exists(full_name, "data"):
-        return []
+    sid_ndim = int(meta.get("sid_ndim", 0))
+    link_width = int(meta["link_width"])
 
-    raw = level_group.read_bytes(full_name, "data")
-    arr = np.frombuffer(raw, dtype=np.int64)
-
-    endpoint_len = sid_ndim + 1
-    record_len = link_width * endpoint_len
-    records: list[tuple[tuple[ChunkCoords, int], ...]] = []
-
-    for i in range(0, len(arr), record_len):
-        endpoints: list[tuple[ChunkCoords, int]] = []
-        for j in range(link_width):
-            base = i + j * endpoint_len
-            chunk = tuple(int(x) for x in arr[base : base + sid_ndim])
-            vi = int(arr[base + sid_ndim])
-            endpoints.append((chunk, vi))
-        records.append(tuple(endpoints))
-
-    return records
+    out: list[tuple[tuple[ChunkCoords, int], ...]] = []
+    for K, arr in _list_kN_arrays(
+        level_group, delta=delta, link_width=link_width,
+    ):
+        shard_shape = tuple(int(s) for s in (arr.shards or arr.chunks))
+        origin_attr = tuple(
+            int(x) for x in arr.attrs.get("chunk_origin", (0,) * sid_ndim)
+        )
+        # Collect (cell_index, payload) pairs across all populated shards.
+        cells: list[tuple[tuple[int, ...], bytes]] = []
+        for shard_coord in _walk_populated_shards(arr):
+            shard_origin = tuple(
+                shard_coord[i] * shard_shape[i] for i in range(arr.ndim)
+            )
+            cells.extend(_iter_populated_cells_in_shard(
+                arr, shard_origin, shard_shape,
+            ))
+        cells.sort(key=lambda p: p[0])
+        for cell_idx, payload in cells:
+            sorted_chunks = tuple(
+                tuple(
+                    int(cell_idx[k * sid_ndim + a]) + origin_attr[a]
+                    for a in range(sid_ndim)
+                )
+                for k in range(K)
+            )
+            out.extend(_decode_ccl_cell_payload(
+                payload, sorted_chunks, link_width=link_width,
+            ))
+    return out
 
 
 def read_cross_chunk_link_attributes(
@@ -2220,20 +3091,75 @@ def read_cross_chunk_link_attributes(
     *,
     delta: int = 0,
 ) -> npt.NDArray:
-    """Read per-link attribute data parallel to ``cross_chunk_links/<delta>/data``.
+    """Read per-link attribute data parallel to ``cross_chunk_links/<delta>/``.
 
-    Returns:
-        Array of shape ``(num_links,)`` or ``(num_links, C)``.
+    **v0.8 sharded layout:** walks the attribute kN sub-arrays in the
+    same (K, lex(sorted-chunks)) order as :func:`read_cross_chunk_links`
+    and concatenates each cell's row block into a single flat
+    ``(num_records_total,)`` or ``(num_records_total, C)`` array.
+
+    Args:
+        level_group: Resolution level group.
+        attr_name: Attribute name (e.g. ``"weight"``).
+        dtype: Override the on-disk dtype.  ``None`` (default) reads it
+            from the array group's ``.zattrs``.
+        delta: Level delta.
     """
-    full_name = cross_chunk_link_attributes_path(attr_name, delta)
-    meta = level_group.read_array_meta(full_name)
+    parent_name = cross_chunk_link_attributes_path(attr_name, delta)
+    fallback_dtype = np.float32 if dtype is None else np.dtype(dtype)
+    if not level_group.array_exists(parent_name):
+        return np.empty(0, dtype=fallback_dtype)
+    _check_not_legacy_ccl_blob(level_group, full_name=parent_name)
+    meta = level_group.read_array_meta(parent_name)
+    if not meta:
+        return np.empty(0, dtype=fallback_dtype)
     if dtype is None:
         dtype = np.dtype(meta["dtype"])
     else:
         dtype = np.dtype(dtype)
-    shape = tuple(meta.get("shape", [meta["num_links"]]))
-    raw = level_group.read_bytes(full_name, "data")
-    return np.frombuffer(raw, dtype=dtype).reshape(shape).copy()
+    sid_ndim = int(meta.get("sid_ndim", 0))
+    link_width = int(meta.get("link_width", 0))
+    if link_width <= 0:
+        # Fall back to parallel link-group link_width.
+        link_meta = level_group.read_array_meta(cross_chunk_links_path(delta))
+        link_width = int(link_meta.get("link_width", 0))
+
+    out_rows: list[npt.NDArray] = []
+    parent_group = level_group.zarr_group[parent_name]
+    for K in range(1, link_width + 1):
+        child = f"k{K}"
+        if child not in parent_group:
+            continue
+        attr_arr = parent_group[child]
+        if not isinstance(attr_arr, zarr.Array):
+            continue
+        shard_shape = tuple(int(s) for s in (attr_arr.shards or attr_arr.chunks))
+        cells: list[tuple[tuple[int, ...], bytes]] = []
+        for shard_coord in _walk_populated_shards(attr_arr):
+            shard_origin = tuple(
+                shard_coord[i] * shard_shape[i] for i in range(attr_arr.ndim)
+            )
+            cells.extend(_iter_populated_cells_in_shard(
+                attr_arr, shard_origin, shard_shape,
+            ))
+        cells.sort(key=lambda p: p[0])
+        for _idx, payload in cells:
+            out_rows.append(np.frombuffer(payload, dtype=dtype))
+
+    if not out_rows:
+        return np.empty(0, dtype=dtype)
+    flat = np.concatenate(out_rows, axis=0).copy()
+    shape_meta = meta.get("shape")
+    if shape_meta is not None and len(shape_meta) == 2:
+        channels = int(shape_meta[1])
+        if flat.size % channels != 0:
+            raise ArrayError(
+                f"cross_chunk_link_attributes[{attr_name}] (delta="
+                f"{format_delta(delta)}): flat size {flat.size} not "
+                f"divisible by channels {channels}"
+            )
+        flat = flat.reshape(-1, channels)
+    return flat
 
 
 # ===================================================================

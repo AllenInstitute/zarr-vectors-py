@@ -9,8 +9,31 @@ everywhere in the package.
 # Format version
 # ---------------------------------------------------------------------------
 
-FORMAT_VERSION: str = "0.7.0"
+FORMAT_VERSION: str = "0.8.0"
 """Current ZV specification version.
+
+0.8.0: partitioned cross-chunk-link layout.  The single monolithic
+``cross_chunk_links/<delta>/data`` int64 blob (and its parallel
+``cross_chunk_link_attributes/<name>/<delta>/data``) is replaced by
+**K-deep leaves keyed by the sorted unique chunks each record touches**:
+``cross_chunk_links/<delta>/<chunk_sorted_0>/.../<chunk_sorted_{K-1}>/data``
+where ``K`` is the number of distinct chunks the record involves
+(``1 ≤ K ≤ link_width``).  Each record's encoding drops from
+``link_width * (sid_ndim + 1) * 8`` bytes to ``9 * link_width`` bytes by
+recovering each endpoint's chunk identity from the leaf path's K
+segments via a per-endpoint ``uint8`` chunk-index in the record (no
+chunk coords in the payload).  Canonicalization rule: ``delta=0,
+link_width=2`` records MUST emit ``ci = [0, 1]`` (one orientation per
+undirected edge).  New ``layout = "partitioned_v1"`` discriminator
+stamped on every ``cross_chunk_links/<delta>/`` group ``.zattrs``; new
+``CAP_PARTITIONED_CROSS_CHUNK_LINKS`` capability token, coupled with
+``CAP_MULTISCALE_LINKS`` (any store with a ``cross_chunk_links/<delta>/``
+group MUST carry both).  ``num_links`` is no longer at the group level
+— per-leaf counts are derivable from leaf byte length.  Migration:
+**in-place helper** ``zarr_vectors.migration.partition_legacy_cross_chunk_links``
+regroups records by their sorted unique chunks and rewrites the leaves.
+Hard break: 0.7.x stores require migration before a 0.8 reader can
+open them.
 
 0.7.0: per-level ``chunk_shape``.  ``RootMetadata.chunk_shape`` remains
 the level-0 default; ``LevelMetadata`` gains an optional
@@ -92,6 +115,19 @@ CAP_MULTISCALE_LINKS: str = "multiscale_links"
 ``cross_chunk_links/<delta>/``, ``link_attributes/<name>/<delta>/`` and
 ``cross_chunk_link_attributes/<name>/<delta>/``) and may contain
 cross-pyramid-level edges (``delta != 0``)."""
+
+CAP_PARTITIONED_CROSS_CHUNK_LINKS: str = "partitioned_cross_chunk_links"
+"""Store uses the v0.8 partitioned cross-chunk-link layout:
+``cross_chunk_links/<delta>/<chunk_sorted_0>/.../<chunk_sorted_{K-1}>/data``
+leaves keyed by the sorted unique set of chunks each record touches;
+each record is ``L * uint8`` chunk-indices followed by ``L * int64``
+vertex indices (``9 * link_width`` bytes per record).  Coupled with
+``multiscale_links``: any store with a ``cross_chunk_links/<delta>/``
+group in the partitioned layout MUST carry both tokens.  Stores tagged
+only with ``multiscale_links`` (without ``partitioned_cross_chunk_links``)
+are v0.7-era monolithic-blob stores and require migration before a v0.8
+reader can open them; see
+:func:`zarr_vectors.migration.partition_legacy_cross_chunk_links`."""
 
 DEFAULT_AXES_NAMES: tuple[str, ...] = ("x", "y", "z", "w")
 """Default axis names used when ``create_store`` is called without an

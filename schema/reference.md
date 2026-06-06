@@ -56,7 +56,6 @@ Name: zarr_vectors
 | [format_capabilities](format_capabilities.md) | Optional 0 |
 | [geometry_types](geometry_types.md) | One or more geometry kinds present in the store |
 | [inherited_num_objects](inherited_num_objects.md) | OID-space size inherited from the parent level (= ``parent_level |
-| [layout](layout.md) | On-disk layout discriminator for partitioned cross-chunk-link arrays |
 | [level](level.md) | Resolution level index (0 = full resolution) |
 | [level_delta](level_delta.md) | Pyramid-level delta between the source side (the level that owns this array) ... |
 | [link_width](link_width.md) | Width of a links row (1 for parent→child metanode references, 2 for edges, 3 ... |
@@ -856,7 +855,7 @@ search:
 # Class: CrossChunkLinkAttributeMeta 
 
 
-_``.zattrs`` for each ``cross_chunk_link_attributes/<name>/<delta>/`` group (0.8 partitioned layout).  Attribute leaves at ``cross_chunk_link_attributes/<name>/<delta>/<chunk_sorted_0>/.../<chunk_sorted_{K-1}>/data`` are parallel to the matching ``cross_chunk_links/<delta>/<same path>/data`` leaves; each attribute leaf has one row per cross-chunk record in the matching link leaf.  Per-leaf parity invariant: attribute leaf record count equals the link leaf record count.  ``num_links`` is no longer stored at the group level.  ``layout`` discriminates between layout versions; ``"partitioned_v1"`` is the only legal value in 0.8._
+_``.zattrs`` for each ``cross_chunk_link_attributes/<name>/<delta>/`` parent group (0.8 ``kN``-array layout).  Parallel ``kK`` zarr arrays mirror the link arrays; each cell holds the dtype-typed row block matching the link cell's records, in record order. Per-cell parity invariant: attribute cell row count equals the link cell record count.  ``num_links`` is no longer stored at the group level.  Codec choice (sharded vs unsharded ``vlen_bytes``) is a writer-side decision encapsulated by zarr._
 
 __
 
@@ -877,8 +876,6 @@ URI: [zv:CrossChunkLinkAttributeMeta](https://w3id.org/zarr-vectors/schema/0.8/C
     class CrossChunkLinkAttributeMeta
     click CrossChunkLinkAttributeMeta href "../CrossChunkLinkAttributeMeta/"
       CrossChunkLinkAttributeMeta : dtype
-        
-      CrossChunkLinkAttributeMeta : layout
         
       CrossChunkLinkAttributeMeta : level_delta
         
@@ -911,7 +908,6 @@ URI: [zv:CrossChunkLinkAttributeMeta](https://w3id.org/zarr-vectors/schema/0.8/C
 | [name](name.md) | 1 <br/> [String](String.md) | NGFF axis or attribute name (e | direct |
 | [dtype](dtype.md) | 1 <br/> [String](String.md) | Numpy dtype string of the array's value type (e | direct |
 | [level_delta](level_delta.md) | 1 <br/> [Integer](Integer.md) | Pyramid-level delta between the source side (the level that owns this array) ... | direct |
-| [layout](layout.md) | 1 <br/> [String](String.md) | On-disk layout discriminator for partitioned cross-chunk-link arrays | direct |
 
 
 
@@ -961,12 +957,12 @@ URI: [zv:CrossChunkLinkAttributeMeta](https://w3id.org/zarr-vectors/schema/0.8/C
 ```yaml
 name: CrossChunkLinkAttributeMeta
 description: '``.zattrs`` for each ``cross_chunk_link_attributes/<name>/<delta>/``
-  group (0.8 partitioned layout).  Attribute leaves at ``cross_chunk_link_attributes/<name>/<delta>/<chunk_sorted_0>/.../<chunk_sorted_{K-1}>/data``
-  are parallel to the matching ``cross_chunk_links/<delta>/<same path>/data`` leaves;
-  each attribute leaf has one row per cross-chunk record in the matching link leaf.  Per-leaf
-  parity invariant: attribute leaf record count equals the link leaf record count.  ``num_links``
-  is no longer stored at the group level.  ``layout`` discriminates between layout
-  versions; ``"partitioned_v1"`` is the only legal value in 0.8.
+  parent group (0.8 ``kN``-array layout).  Parallel ``kK`` zarr arrays mirror the
+  link arrays; each cell holds the dtype-typed row block matching the link cell''s
+  records, in record order. Per-cell parity invariant: attribute cell row count equals
+  the link cell record count.  ``num_links`` is no longer stored at the group level.  Codec
+  choice (sharded vs unsharded ``vlen_bytes``) is a writer-side decision encapsulated
+  by zarr.
 
   '
 from_schema: https://w3id.org/zarr-vectors/schema/0.8
@@ -976,16 +972,11 @@ slots:
 - name
 - dtype
 - level_delta
-- layout
 slot_usage:
   zv_array:
     name: zv_array
     required: true
     equals_string: cross_chunk_link_attribute
-  layout:
-    name: layout
-    required: true
-    equals_string: partitioned_v1
 
 ```
 </details>
@@ -996,12 +987,12 @@ slot_usage:
 ```yaml
 name: CrossChunkLinkAttributeMeta
 description: '``.zattrs`` for each ``cross_chunk_link_attributes/<name>/<delta>/``
-  group (0.8 partitioned layout).  Attribute leaves at ``cross_chunk_link_attributes/<name>/<delta>/<chunk_sorted_0>/.../<chunk_sorted_{K-1}>/data``
-  are parallel to the matching ``cross_chunk_links/<delta>/<same path>/data`` leaves;
-  each attribute leaf has one row per cross-chunk record in the matching link leaf.  Per-leaf
-  parity invariant: attribute leaf record count equals the link leaf record count.  ``num_links``
-  is no longer stored at the group level.  ``layout`` discriminates between layout
-  versions; ``"partitioned_v1"`` is the only legal value in 0.8.
+  parent group (0.8 ``kN``-array layout).  Parallel ``kK`` zarr arrays mirror the
+  link arrays; each cell holds the dtype-typed row block matching the link cell''s
+  records, in record order. Per-cell parity invariant: attribute cell row count equals
+  the link cell record count.  ``num_links`` is no longer stored at the group level.  Codec
+  choice (sharded vs unsharded ``vlen_bytes``) is a writer-side decision encapsulated
+  by zarr.
 
   '
 from_schema: https://w3id.org/zarr-vectors/schema/0.8
@@ -1011,10 +1002,6 @@ slot_usage:
     name: zv_array
     required: true
     equals_string: cross_chunk_link_attribute
-  layout:
-    name: layout
-    required: true
-    equals_string: partitioned_v1
 attributes:
   zv_array:
     name: zv_array
@@ -1093,23 +1080,6 @@ attributes:
     - CrossChunkLinkAttributeMeta
     range: integer
     required: true
-  layout:
-    name: layout
-    description: 'On-disk layout discriminator for partitioned cross-chunk-link arrays.  ``"partitioned_v1"``
-      is the only legal value in 0.8 and signals the K-deep sorted-chunks leaf layout
-      described in :class:`CrossChunkLinksMeta`.  Stamped on both ``cross_chunk_links/<delta>/``
-      and ``cross_chunk_link_attributes/<name>/<delta>/`` groups.
-
-      '
-    from_schema: https://w3id.org/zarr-vectors/schema/0.8
-    rank: 1000
-    owner: CrossChunkLinkAttributeMeta
-    domain_of:
-    - CrossChunkLinksMeta
-    - CrossChunkLinkAttributeMeta
-    range: string
-    required: true
-    equals_string: partitioned_v1
 
 ```
 </details></div>
@@ -1125,7 +1095,7 @@ search:
 # Class: CrossChunkLinksMeta 
 
 
-_``.zattrs`` for a ``cross_chunk_links/<delta>/`` group (0.8 partitioned layout).  Records live in leaves at ``cross_chunk_links/<delta>/<chunk_sorted_0>/.../<chunk_sorted_{K-1}>/data`` where the K segments are the lex-sorted unique chunks each record's endpoints touch (1 ≤ K ≤ link_width).  Each record is ``link_width`` chunk-indices (uint8) followed by ``link_width`` vertex indices (int64) — exactly ``9 * link_width`` bytes per record.  ``link_width=2`` encodes a cross-chunk edge, ``link_width=3`` a triangle face record, ``link_width=4`` a quad face, ``link_width=1`` a single parent→child reference.  The source-side endpoint (endpoint 0) lives at the array's own resolution level; target-side endpoints live at ``this_level + level_delta``.  ``num_links`` is no longer stored at the group level — per-leaf counts are derivable from leaf byte length.  ``layout`` discriminates between layout versions; ``"partitioned_v1"`` is the only legal value in 0.8._
+_``.zattrs`` for a ``cross_chunk_links/<delta>/`` parent group (0.8 ``kN``-array layout).  Records live in K-separated zarr Arrays at ``cross_chunk_links/<delta>/kK``, where K is the number of distinct chunks a record touches (1 ≤ K ≤ link_width).  Each cell at coord ``(sorted_chunks[0] - origin) ⧺ … ⧺ (sorted_chunks[K-1] - origin)`` holds a ragged byte blob; each record in the blob is ``link_width`` chunk-indices (uint8) followed by ``link_width`` vertex indices (int64) — exactly ``9 * link_width`` bytes per record.  ``link_width=2`` encodes a cross-chunk edge, ``link_width=3`` a triangle face record, ``link_width=4`` a quad face, ``link_width=1`` a single parent→child reference.  The source-side endpoint (endpoint 0) lives at the owning resolution level; target-side endpoints live at ``this_level + level_delta``. ``num_links`` is no longer stored — per-cell counts are derivable from cell byte length.  Codec choice for each ``kK`` array (sharded ``vlen_bytes`` vs unsharded ``vlen_bytes``) is a writer-side performance decision encapsulated by zarr itself; the reference writer uses ``sharding_indexed + vlen_bytes`` by default to keep file count bounded on blob backends._
 
 __
 
@@ -1145,8 +1115,6 @@ URI: [zv:CrossChunkLinksMeta](https://w3id.org/zarr-vectors/schema/0.8/CrossChun
  classDiagram
     class CrossChunkLinksMeta
     click CrossChunkLinksMeta href "../CrossChunkLinksMeta/"
-      CrossChunkLinksMeta : layout
-        
       CrossChunkLinksMeta : level_delta
         
       CrossChunkLinksMeta : link_width
@@ -1180,7 +1148,6 @@ URI: [zv:CrossChunkLinksMeta](https://w3id.org/zarr-vectors/schema/0.8/CrossChun
 | [sid_ndim](sid_ndim.md) | 1 <br/> [Integer](Integer.md) | Number of spatial-index dimensions encoded in chunk keys | direct |
 | [level_delta](level_delta.md) | 1 <br/> [Integer](Integer.md) | Pyramid-level delta between the source side (the level that owns this array) ... | direct |
 | [link_width](link_width.md) | 1 <br/> [Integer](Integer.md) | Width of a links row (1 for parent→child metanode references, 2 for edges, 3 ... | direct |
-| [layout](layout.md) | 1 <br/> [String](String.md) | On-disk layout discriminator for partitioned cross-chunk-link arrays | direct |
 
 
 
@@ -1229,18 +1196,21 @@ URI: [zv:CrossChunkLinksMeta](https://w3id.org/zarr-vectors/schema/0.8/CrossChun
 <details>
 ```yaml
 name: CrossChunkLinksMeta
-description: '``.zattrs`` for a ``cross_chunk_links/<delta>/`` group (0.8 partitioned
-  layout).  Records live in leaves at ``cross_chunk_links/<delta>/<chunk_sorted_0>/.../<chunk_sorted_{K-1}>/data``
-  where the K segments are the lex-sorted unique chunks each record''s endpoints touch
-  (1 ≤ K ≤ link_width).  Each record is ``link_width`` chunk-indices (uint8) followed
-  by ``link_width`` vertex indices (int64) — exactly ``9 * link_width`` bytes per
-  record.  ``link_width=2`` encodes a cross-chunk edge, ``link_width=3`` a triangle
-  face record, ``link_width=4`` a quad face, ``link_width=1`` a single parent→child
-  reference.  The source-side endpoint (endpoint 0) lives at the array''s own resolution
-  level; target-side endpoints live at ``this_level + level_delta``.  ``num_links``
-  is no longer stored at the group level — per-leaf counts are derivable from leaf
-  byte length.  ``layout`` discriminates between layout versions; ``"partitioned_v1"``
-  is the only legal value in 0.8.
+description: '``.zattrs`` for a ``cross_chunk_links/<delta>/`` parent group (0.8 ``kN``-array
+  layout).  Records live in K-separated zarr Arrays at ``cross_chunk_links/<delta>/kK``,
+  where K is the number of distinct chunks a record touches (1 ≤ K ≤ link_width).  Each
+  cell at coord ``(sorted_chunks[0] - origin) ⧺ … ⧺ (sorted_chunks[K-1] - origin)``
+  holds a ragged byte blob; each record in the blob is ``link_width`` chunk-indices
+  (uint8) followed by ``link_width`` vertex indices (int64) — exactly ``9 * link_width``
+  bytes per record.  ``link_width=2`` encodes a cross-chunk edge, ``link_width=3``
+  a triangle face record, ``link_width=4`` a quad face, ``link_width=1`` a single
+  parent→child reference.  The source-side endpoint (endpoint 0) lives at the owning
+  resolution level; target-side endpoints live at ``this_level + level_delta``. ``num_links``
+  is no longer stored — per-cell counts are derivable from cell byte length.  Codec
+  choice for each ``kK`` array (sharded ``vlen_bytes`` vs unsharded ``vlen_bytes``)
+  is a writer-side performance decision encapsulated by zarr itself; the reference
+  writer uses ``sharding_indexed + vlen_bytes`` by default to keep file count bounded
+  on blob backends.
 
   '
 from_schema: https://w3id.org/zarr-vectors/schema/0.8
@@ -1250,16 +1220,11 @@ slots:
 - sid_ndim
 - level_delta
 - link_width
-- layout
 slot_usage:
   zv_array:
     name: zv_array
     required: true
     equals_string: cross_chunk_links
-  layout:
-    name: layout
-    required: true
-    equals_string: partitioned_v1
 
 ```
 </details>
@@ -1269,18 +1234,21 @@ slot_usage:
 <details>
 ```yaml
 name: CrossChunkLinksMeta
-description: '``.zattrs`` for a ``cross_chunk_links/<delta>/`` group (0.8 partitioned
-  layout).  Records live in leaves at ``cross_chunk_links/<delta>/<chunk_sorted_0>/.../<chunk_sorted_{K-1}>/data``
-  where the K segments are the lex-sorted unique chunks each record''s endpoints touch
-  (1 ≤ K ≤ link_width).  Each record is ``link_width`` chunk-indices (uint8) followed
-  by ``link_width`` vertex indices (int64) — exactly ``9 * link_width`` bytes per
-  record.  ``link_width=2`` encodes a cross-chunk edge, ``link_width=3`` a triangle
-  face record, ``link_width=4`` a quad face, ``link_width=1`` a single parent→child
-  reference.  The source-side endpoint (endpoint 0) lives at the array''s own resolution
-  level; target-side endpoints live at ``this_level + level_delta``.  ``num_links``
-  is no longer stored at the group level — per-leaf counts are derivable from leaf
-  byte length.  ``layout`` discriminates between layout versions; ``"partitioned_v1"``
-  is the only legal value in 0.8.
+description: '``.zattrs`` for a ``cross_chunk_links/<delta>/`` parent group (0.8 ``kN``-array
+  layout).  Records live in K-separated zarr Arrays at ``cross_chunk_links/<delta>/kK``,
+  where K is the number of distinct chunks a record touches (1 ≤ K ≤ link_width).  Each
+  cell at coord ``(sorted_chunks[0] - origin) ⧺ … ⧺ (sorted_chunks[K-1] - origin)``
+  holds a ragged byte blob; each record in the blob is ``link_width`` chunk-indices
+  (uint8) followed by ``link_width`` vertex indices (int64) — exactly ``9 * link_width``
+  bytes per record.  ``link_width=2`` encodes a cross-chunk edge, ``link_width=3``
+  a triangle face record, ``link_width=4`` a quad face, ``link_width=1`` a single
+  parent→child reference.  The source-side endpoint (endpoint 0) lives at the owning
+  resolution level; target-side endpoints live at ``this_level + level_delta``. ``num_links``
+  is no longer stored — per-cell counts are derivable from cell byte length.  Codec
+  choice for each ``kK`` array (sharded ``vlen_bytes`` vs unsharded ``vlen_bytes``)
+  is a writer-side performance decision encapsulated by zarr itself; the reference
+  writer uses ``sharding_indexed + vlen_bytes`` by default to keep file count bounded
+  on blob backends.
 
   '
 from_schema: https://w3id.org/zarr-vectors/schema/0.8
@@ -1290,10 +1258,6 @@ slot_usage:
     name: zv_array
     required: true
     equals_string: cross_chunk_links
-  layout:
-    name: layout
-    required: true
-    equals_string: partitioned_v1
 attributes:
   zv_array:
     name: zv_array
@@ -1365,23 +1329,6 @@ attributes:
     range: integer
     required: true
     minimum_value: 1
-  layout:
-    name: layout
-    description: 'On-disk layout discriminator for partitioned cross-chunk-link arrays.  ``"partitioned_v1"``
-      is the only legal value in 0.8 and signals the K-deep sorted-chunks leaf layout
-      described in :class:`CrossChunkLinksMeta`.  Stamped on both ``cross_chunk_links/<delta>/``
-      and ``cross_chunk_link_attributes/<name>/<delta>/`` groups.
-
-      '
-    from_schema: https://w3id.org/zarr-vectors/schema/0.8
-    rank: 1000
-    owner: CrossChunkLinksMeta
-    domain_of:
-    - CrossChunkLinksMeta
-    - CrossChunkLinkAttributeMeta
-    range: string
-    required: true
-    equals_string: partitioned_v1
 
 ```
 </details></div>
@@ -2139,14 +2086,16 @@ permissible_values:
       '
   partitioned_cross_chunk_links:
     text: partitioned_cross_chunk_links
-    description: 'Store uses the 0.8 partitioned cross-chunk-link layout: ``cross_chunk_links/<delta>/<chunk_sorted_0>/.../<chunk_sorted_{K-1}>/data``
-      leaves keyed by the sorted unique set of chunks each record touches; each record
-      is ``L * uint8`` chunk-indices followed by ``L * int64`` vertex indices (``9
-      * link_width`` bytes per record).  Coupled with ``multiscale_links``: any store
-      with a ``cross_chunk_links/<delta>/`` group in the partitioned layout MUST carry
-      both capability tokens.  Stores tagged only with ``multiscale_links`` (without
-      ``partitioned_cross_chunk_links``) are 0.7-era monolithic-blob stores and require
-      migration before a 0.8 reader can open them; see the 0.7 → 0.8 migration guide.
+    description: 'Store uses the 0.8 K-separated sharded vlen-bytes cross-chunk-link
+      layout: one ``cross_chunk_links/<delta>/kK`` sharded zarr Array per distinct
+      K (number of unique chunks a record touches; 1 ≤ K ≤ link_width).  Each cell
+      holds a ragged byte blob of records, where each record is ``L * uint8`` chunk-indices
+      followed by ``L * int64`` vertex indices (``9 * link_width`` bytes per record).  Coupled
+      with ``multiscale_links``: any store with a ``cross_chunk_links/<delta>/`` group
+      MUST carry both capability tokens.  Stores tagged only with ``multiscale_links``
+      (without ``partitioned_cross_chunk_links``) are 0.7-era monolithic-blob stores
+      and require migration before a 0.8 reader can open them; see the 0.7 → 0.8 migration
+      guide.
 
       '
 
@@ -4919,7 +4868,7 @@ attributes:
     name: zv_version
     description: 'ZV spec version this store was written against (e.g. "0.8.0"). Renamed
       from ``format_version`` in 0.5.0 to disambiguate from Zarr v3''s ``zarr_format``
-      field.  ``0.8`` introduced the partitioned cross-chunk-link layout (``cross_chunk_links/<delta>/<chunk_sorted_0>/.../<chunk_sorted_{K-1}>/data``);
+      field.  ``0.8`` introduced the sharded cross-chunk-link layout (``cross_chunk_links/<delta>/kK``);
       stores at that version MUST carry the ``partitioned_cross_chunk_links`` capability
       token alongside ``multiscale_links``.
 
@@ -7708,116 +7657,6 @@ search:
   boost: 5.0
 ---
 
-# Slot: layout 
-
-
-_On-disk layout discriminator for partitioned cross-chunk-link arrays.  ``"partitioned_v1"`` is the only legal value in 0.8 and signals the K-deep sorted-chunks leaf layout described in :class:`CrossChunkLinksMeta`.  Stamped on both ``cross_chunk_links/<delta>/`` and ``cross_chunk_link_attributes/<name>/<delta>/`` groups._
-
-__
-
-
-
-<div data-search-exclude markdown="1">
-
-
-
-URI: [zv:layout](https://w3id.org/zarr-vectors/schema/0.8/layout)
-<!-- no inheritance hierarchy -->
-
-
-
-
-
-## Applicable Classes
-
-| Name | Description | Modifies Slot |
-| --- | --- | --- |
-| [CrossChunkLinksMeta](CrossChunkLinksMeta.md) | `` |  yes  |
-| [CrossChunkLinkAttributeMeta](CrossChunkLinkAttributeMeta.md) | `` |  yes  |
-
-
-
-
-
-
-## Properties
-
-### Type and Range
-
-| Property | Value |
-| --- | --- |
-| Range | [String](String.md) |
-| Domain Of | [CrossChunkLinksMeta](CrossChunkLinksMeta.md), [CrossChunkLinkAttributeMeta](CrossChunkLinkAttributeMeta.md) |
-
-### Cardinality and Requirements
-
-| Property | Value |
-| --- | --- |
-| Required | Yes |
-
-
-
-
-
-
-
-
-
-
-## Identifier and Mapping Information
-
-
-
-
-
-### Schema Source
-
-
-* from schema: https://w3id.org/zarr-vectors/schema/0.8
-
-
-
-
-## Mappings
-
-| Mapping Type | Mapped Value |
-| ---  | ---  |
-| self | zv:layout |
-| native | zv:layout |
-
-
-
-
-## LinkML Source
-
-<details>
-```yaml
-name: layout
-description: 'On-disk layout discriminator for partitioned cross-chunk-link arrays.  ``"partitioned_v1"``
-  is the only legal value in 0.8 and signals the K-deep sorted-chunks leaf layout
-  described in :class:`CrossChunkLinksMeta`.  Stamped on both ``cross_chunk_links/<delta>/``
-  and ``cross_chunk_link_attributes/<name>/<delta>/`` groups.
-
-  '
-from_schema: https://w3id.org/zarr-vectors/schema/0.8
-rank: 1000
-domain_of:
-- CrossChunkLinksMeta
-- CrossChunkLinkAttributeMeta
-range: string
-required: true
-
-```
-</details></div>
-
-
----
-
----
-search:
-  boost: 5.0
----
-
 # Slot: level 
 
 
@@ -10080,7 +9919,7 @@ search:
 # Slot: zv_version 
 
 
-_ZV spec version this store was written against (e.g. "0.8.0"). Renamed from ``format_version`` in 0.5.0 to disambiguate from Zarr v3's ``zarr_format`` field.  ``0.8`` introduced the partitioned cross-chunk-link layout (``cross_chunk_links/<delta>/<chunk_sorted_0>/.../<chunk_sorted_{K-1}>/data``); stores at that version MUST carry the ``partitioned_cross_chunk_links`` capability token alongside ``multiscale_links``._
+_ZV spec version this store was written against (e.g. "0.8.0"). Renamed from ``format_version`` in 0.5.0 to disambiguate from Zarr v3's ``zarr_format`` field.  ``0.8`` introduced the sharded cross-chunk-link layout (``cross_chunk_links/<delta>/kK``); stores at that version MUST carry the ``partitioned_cross_chunk_links`` capability token alongside ``multiscale_links``._
 
 __
 
@@ -10171,7 +10010,7 @@ URI: [schema:version](http://schema.org/version)
 name: zv_version
 description: 'ZV spec version this store was written against (e.g. "0.8.0"). Renamed
   from ``format_version`` in 0.5.0 to disambiguate from Zarr v3''s ``zarr_format``
-  field.  ``0.8`` introduced the partitioned cross-chunk-link layout (``cross_chunk_links/<delta>/<chunk_sorted_0>/.../<chunk_sorted_{K-1}>/data``);
+  field.  ``0.8`` introduced the sharded cross-chunk-link layout (``cross_chunk_links/<delta>/kK``);
   stores at that version MUST carry the ``partitioned_cross_chunk_links`` capability
   token alongside ``multiscale_links``.
 

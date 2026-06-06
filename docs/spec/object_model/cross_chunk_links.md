@@ -12,7 +12,7 @@
   different resolution levels). Stored as a fixed-size `(ci, vi)` row
   inside a leaf whose path lists the **sorted unique chunks** the
   record touches:
-  `cross_chunk_links/<delta>/<chunk_sorted_0>/.../<chunk_sorted_{K-1}>/data`.
+  the `cross_chunk_links/<delta>/kK` sharded vlen-bytes array.
 
 **Level delta** (`<delta>`)
 : A signed integer path segment that says how many pyramid levels the
@@ -29,32 +29,46 @@ depth `K` under `<delta>`.
 : Per-edge scalar or vector data parallel to a `links/<delta>/` array.
   Lives at `link_attributes/<name>/<delta>/<chunk_key>` for intra-chunk
   edges and at
-  `cross_chunk_link_attributes/<name>/<delta>/<chunk_sorted_0>/.../<chunk_sorted_{K-1}>/data`
+  the `cross_chunk_link_attributes/<name>/<delta>/kK` sharded array
   for cross-chunk edges.
 
 ---
 
 ## Introduction
 
-The 0.8 link layout is a family of four arrays, each parameterised by a
-level delta and (for cross-chunk records) by the sorted-unique chunk
-path:
+The 0.8 link layout is a family of four array trees, each parameterised
+by a level delta and (for cross-chunk records) **partitioned by K**,
+the number of distinct chunks the records touch:
 
 ```
 /N/links/<delta>/<chunk_key>
-/N/cross_chunk_links/<delta>/<chunk_sorted_0>/.../<chunk_sorted_{K-1}>/data
+/N/cross_chunk_links/<delta>/kK/                # sharded (sid_ndim*K)-D vlen-bytes zarr Array
 /N/link_attributes/<name>/<delta>/<chunk_key>
-/N/cross_chunk_link_attributes/<name>/<delta>/<chunk_sorted_0>/.../<chunk_sorted_{K-1}>/data
+/N/cross_chunk_link_attributes/<name>/<delta>/kK/  # parallel sharded vlen-bytes
 ```
 
 When an edge's two endpoints share a chunk_key (after re-evaluation
 against the target level's chunk grid), the edge goes into the
 per-chunk `links/<delta>/<chunk_key>` array. Otherwise it goes into a
-**leaf partitioned by the sorted unique set of chunks it touches**.
+**cell of the `kK` array** keyed by the sorted unique chunks the record
+touches; each cell holds a ragged vlen-bytes payload encoding all
+records for that chunk set. Zarr v3 sharding packs many adjacent cells
+into one outer shard file so the file count scales with the data,
+**not** with the chunk-grid size.
+
+This addresses two scaling concerns at once:
+
+- **Many writers without conflict.** Two writers touching cells in
+  different shards write to different files. A K=2 shard typically
+  holds `4^(2*sid_ndim)` cells (e.g. 4096 for 3-D), so adjacent edits
+  often share a shard but writers working in different spatial regions
+  don't.
+- **Variable-length per cell.** vlen-bytes lets each cell carry as many
+  or as few records as it actually has — empty cells consume zero
+  bytes inside their shard.
+
 The level delta is encoded in the path — readers never need to inspect
-the edge to know which level its target side lives at — and the K-deep
-sorted-chunks path lets readers go straight to the relevant leaf
-without scanning every cross-chunk record at the level.
+the edge to know which level its target side lives at.
 
 This page documents:
 
@@ -143,50 +157,77 @@ self-describing ragged blob: an int64 header with `K` followed by the
 recover the per-vertex-group partition without consulting any sibling
 table.
 
-### `cross_chunk_links/<delta>/<chunk_sorted_0>/.../<chunk_sorted_{K-1}>/data` — partitioned leaves
+### `cross_chunk_links/<delta>/kK/` — sharded vlen-bytes Array
 
-Cross-chunk records are partitioned into leaves by the **sorted unique
-set of chunks each record touches**. Path depth under `<delta>` equals
-`K`, the number of distinct chunks the record involves.
+Cross-chunk records are partitioned across **K-separated sharded
+vlen-bytes zarr Arrays**.  Each `kK` array's logical shape is
+`(Cx, Cy, Cz)^K` (where `(Cx, Cy, Cz)` is the per-axis chunk-grid
+extent and the same coords are repeated K times) and each cell holds a
+ragged byte blob: the payload for one sorted-unique-chunks tuple.
 
-**Path segment encoding.** Each `<chunk_sorted_i>` is the dot-separated
-chunk-coord string produced by `_chunk_key()` (e.g. `(0, 1, 2)` →
-`"0.1.2"`). The K segments are emitted in **lex order**:
-
-```
-chunk_sorted_0 < chunk_sorted_1 < … < chunk_sorted_{K-1}
-```
-
-where `a < b` is element-wise integer-tuple comparison
-(`a[0] < b[0]`, or equal at index 0 and `a[1] < b[1]`, etc.).
-
-**Per-record encoding.** Each leaf is a 1-D uint8 byte array containing
-zero or more **fixed-size records**:
+**Cell index encoding.**  For a record whose sorted-unique chunks are
+`(chunk_sorted_0, …, chunk_sorted_{K-1})`, the cell coord into the
+`kK` array is the flat concatenation:
 
 ```
-record = [ ci_0, ci_1, ..., ci_{L-1},         # L * uint8   (1 byte each)
-           vi_0, vi_1, ..., vi_{L-1} ]        # L * int64   (8 bytes each, little-endian)
-       = 9 * L bytes per record
+cell_coord = (chunk_sorted_0 - origin) ⧺ … ⧺ (chunk_sorted_{K-1} - origin)
 ```
 
-- `L = link_width` (declared on the `cross_chunk_links/<delta>/` group).
-- `ci_i ∈ [0, K-1]` picks one of the K segments listed in the leaf
-  path; that's the chunk endpoint `i` lives in.
+where `origin` is the per-axis `chunk_origin` from the array's
+`.zattrs` (defaults to all-zero; stores with negative chunk coords use
+a negative `origin` so cell coords stay non-negative).
+
+The chunk segments are in lex order: `chunk_sorted_0 < … <
+chunk_sorted_{K-1}`, element-wise integer-tuple comparison.
+
+**Per-cell payload.**  Each populated cell is a single byte blob:
+
+```
+cell = [ rec_0, rec_1, ..., rec_{N-1} ]            # N records, back-to-back
+each record =
+  [ ci_0, ci_1, ..., ci_{L-1},        # L * uint8   (chunk-index per endpoint)
+    vi_0, vi_1, ..., vi_{L-1} ]       # L * int64   (vertex index, little-endian)
+  = 9 * L bytes per record
+```
+
+- `L = link_width`, declared on the `cross_chunk_links/<delta>/` group
+  (uniform across all K-buckets).
+- `ci_i ∈ [0, K-1]` picks one of the K chunks listed in the cell coord;
+  that's the chunk endpoint `i` lives in.
 - `vi_i` is endpoint `i`'s local vertex index inside its chunk's
   vertex array.
-- The two blocks are concatenated: all L chunk-indices first, then all
-  L vertex indices. This keeps bulk reads cache-friendly (vi's are
-  contiguous int64s; ci's are contiguous bytes).
+- The two blocks are concatenated: all L chunk-indices first
+  (contiguous uint8), then all L vertex indices (contiguous int64).
+  Bulk reads see cache-friendly stride.
 
-**Per-leaf count.** Per-leaf record count is derivable from leaf byte
-length:
+**Per-cell record count** is derivable from the cell's byte length:
+`num_records = len(cell_bytes) / (9 * link_width)`.  No separate
+`num_links` counter is stored anywhere (key change from 0.7).
 
+**Sharding.**  Each `kK` array uses zarr v3's
+`sharding_indexed` codec with **outer shards of size `4^(sid_ndim*K)`
+cells** (default; tunable via the `shard_shape` field in the array's
+`.zattrs`).  Inner chunks are `(1,)^(sid_ndim*K)` — one cell per
+inner chunk — so a single-cell read fetches exactly one shard.
+
+**Lazy per-K allocation.**  Only `kK` arrays for K values that have
+records exist on disk.  A graph store (`link_width=2`) typically has
+`k1` + `k2`; a mesh store may grow `k3` if any triangle face spans
+three distinct chunks.
+
+**Per-K array `.zattrs` schema:**
+
+```jsonc
+{
+  "zv_array":     "cross_chunk_links_k",
+  "level_delta":  0,
+  "K":            2,
+  "sid_ndim":     3,
+  "link_width":   2,
+  "shard_shape":  [4, 4, 4, 4, 4, 4],
+  "chunk_origin": [0, 0, 0]
+}
 ```
-num_records = len(leaf_bytes) / (9 * link_width)
-```
-
-No separate `num_links` counter is written at the group level (one of
-the key changes from 0.7).
 
 ### Endpoint level convention
 
@@ -207,10 +248,10 @@ coarse metanode; etc.
 writers); `link_width=4` a quad face; `link_width=1` a single
 parent→child reference for pyramid metanode drill-down.
 
-### Group `.zattrs` schema
+### Parent group `.zattrs` schema
 
-Stored on the `cross_chunk_links/<delta>/` group itself (one level up
-from the K-deep chunk path):
+Stored on the `cross_chunk_links/<delta>/` group itself (above all the
+`kK` sub-arrays):
 
 ```jsonc
 {
@@ -218,67 +259,71 @@ from the K-deep chunk path):
   "sid_ndim":    3,
   "level_delta": 1,
   "link_width":  2,
-  "layout":      "partitioned_v1"
+  "layout":      "sharded_v1"
 }
 ```
 
-`layout = "partitioned_v1"` is the only legal value in 0.8 and is the
-on-disk discriminator that signals "this group uses the K-deep sorted-
-chunks path layout described above" — readers that see any other value
-(including a legacy 0.7-era store that wrote `cross_chunk_links/<delta>/data`
-with no `layout` key) fail with a clear "run the migration helper"
-error. See [Migration from 0.7 →
-0.8](../migration/0.7_to_0.8.md).
+`layout = "sharded_v1"` is the only legal value in 0.8 and is the
+on-disk discriminator that signals "this group contains `kK`
+sub-arrays in the sharded vlen-bytes layout described above" —
+readers that see any other value (including a legacy 0.7-era store
+that wrote `cross_chunk_links/<delta>/data` directly) fail with a
+clear "run the migration helper" error.  See
+[Migration from 0.7 → 0.8](../migration/0.7_to_0.8.md).
 
 **Sid-ndim assumption.** Source and target levels share `sid_ndim`
-(uniform per store). The writer asserts every path segment's
-chunk-coord arity equals `sid_ndim`; mismatched callers fail loudly
-with an `ArrayError`. Chunk *spacing* may differ between levels
-(coarser chunks are larger in physical units), but the chunk-key arity
-does not.
+(uniform per store). The writer asserts every cell coord's chunk-tuple
+arity equals `sid_ndim`; mismatched callers fail loudly with an
+`ArrayError`. Chunk *spacing* may differ between levels (coarser chunks
+are larger in physical units), but the chunk-coord arity does not.
 
 ### Worked examples
 
 #### L=2, K=2, delta=0 — graph edge between two chunks
 
-Edge between `(0,0,0):5` and `(1,0,0):2`. Sorted chunks `(0,0,0) < (1,0,0)`:
+Edge between `(0,0,0):5` and `(1,0,0):2`. Sorted chunks
+`(0,0,0) < (1,0,0)`, so the record lands in the **k2** array:
 
 ```
-path:    cross_chunk_links/0/0.0.0/1.0.0/data
-record:  ci = [0, 1]   ← endpoint 0 at first sorted chunk, endpoint 1 at second
-         vi = [5, 2]
-bytes:   18 per record
+array:        cross_chunk_links/0/k2  (6-D shape (Cx,Cy,Cz, Cx,Cy,Cz))
+cell coord:   (0, 0, 0,   1, 0, 0)
+cell payload: ci = [0, 1]         ← endpoint 0 at first sorted chunk, endpoint 1 at second
+              vi = [5, 2]
+              total = 18 bytes
 ```
 
-Today's 0.5 encoding spends 64 bytes per record for the same case
-(sid_ndim=3, link_width=2, both endpoint chunk-coords baked into the
-record). The new layout drops it to 18.
+Today's 0.7 single-blob encoding spends 64 bytes per record for the
+same case (sid_ndim=3, link_width=2, both endpoint chunk-coords baked
+into the record). The new layout drops it to 18 plus per-shard
+overhead, and many records share a shard file.
 
 #### L=2, K=2, delta=+1 — cross-level edge
 
 Fine vertex at `(2,3,1):7` (owning level) parents to coarse metanode
-at `(1,1,0):3` (level + 1). The coarse chunk happens to sort first:
+at `(1,1,0):3` (level + 1). Sorted: `(1,1,0) < (2,3,1)`.
 
 ```
-path:    cross_chunk_links/+1/1.1.0/2.3.1/data
-record:  ci = [1, 0]   ← endpoint 0 (fine) in chunk (2,3,1); endpoint 1 (coarse) in chunk (1,1,0)
-         vi = [7, 3]
-bytes:   18 per record
+array:        cross_chunk_links/+1/k2
+cell coord:   (1, 1, 0,   2, 3, 1)
+cell payload: ci = [1, 0]   ← endpoint 0 (fine) is at sorted-chunk index 1
+              vi = [7, 3]
+              total = 18 bytes
 ```
 
-The `ci` permutation encodes which side is owning vs target — the
-sorted path stays canonical for the lookup `"records between
-(2,3,1) and (1,1,0)?"`.
+The `ci` permutation encodes which side is owning vs target — the cell
+coord stays canonical for the lookup "records between (2,3,1) and
+(1,1,0)?".
 
 #### L=2, K=1, delta=0 — same-chunk bridge
 
 Both endpoints in chunk `(0,0,0)`, local indices 2 and 5:
 
 ```
-path:    cross_chunk_links/0/0.0.0/data       ← K=1, depth-1 path
-record:  ci = [0, 0]   ← both endpoints at the only listed chunk
-         vi = [2, 5]
-bytes:   18 per record
+array:        cross_chunk_links/0/k1  (3-D shape (Cx,Cy,Cz))
+cell coord:   (0, 0, 0)
+cell payload: ci = [0, 0]
+              vi = [2, 5]
+              total = 18 bytes
 ```
 
 (K=1 records are also storable in `links/0/<chunk>` — see
@@ -289,26 +334,27 @@ bytes:   18 per record
 Triangle V0→V1→V2 in winding order:
 - V0 at `(0,0,0):5`, V1 at `(1,0,0):3`, V2 at `(0,0,0):7`
 
-Sorted chunks: `(0,0,0) < (1,0,0)`. K=2.
-
 ```
-path:    cross_chunk_links/0/0.0.0/1.0.0/data
-record:  ci = [0, 1, 0]    ← V0→chunk 0 of path, V1→chunk 1, V2→chunk 0
-         vi = [5, 3, 7]
-bytes:   27 per record
+array:        cross_chunk_links/0/k2
+cell coord:   (0, 0, 0,   1, 0, 0)
+cell payload: ci = [0, 1, 0]    ← V0→sorted_0, V1→sorted_1, V2→sorted_0
+              vi = [5, 3, 7]
+              total = 27 bytes
 ```
 
 A second triangle with vertices `(1,0,0):4`, `(0,0,0):8`, `(0,0,0):9`
-lands in the **same leaf** under a different `ci` permutation:
+lands in the **same cell** under a different `ci` permutation:
 
 ```
-same path
-record:  ci = [1, 0, 0]
-         vi = [4, 8, 9]
+same cell coord
+appended payload: ci = [1, 0, 0]
+                  vi = [4, 8, 9]
+total cell bytes: 54 (two 27-byte records concatenated)
 ```
 
 Triangles with the same chunk pair but different winding orientations
-share storage — there is **no** permutation fan-out in the directory.
+share a single cell — there is **no** permutation fan-out in the
+directory tree.
 
 #### L=3, K=3, delta=0 — triangle face spanning three chunks
 
@@ -316,10 +362,11 @@ V0 at `(0,0,0):2`, V1 at `(1,0,0):4`, V2 at `(0,1,0):5`. Sorted:
 `(0,0,0) < (0,1,0) < (1,0,0)`.
 
 ```
-path:    cross_chunk_links/0/0.0.0/0.1.0/1.0.0/data
-record:  ci = [0, 2, 1]    ← V0→sorted_0, V1→sorted_2, V2→sorted_1
-         vi = [2, 4, 5]
-bytes:   27 per record
+array:        cross_chunk_links/0/k3  (9-D shape (Cx,Cy,Cz)^3)
+cell coord:   (0, 0, 0,   0, 1, 0,   1, 0, 0)
+cell payload: ci = [0, 2, 1]   ← V0→sorted_0, V1→sorted_2, V2→sorted_1
+              vi = [2, 4, 5]
+              total = 27 bytes
 ```
 
 #### L=4, K=2, delta=0 — quad face spanning two chunks
@@ -327,10 +374,11 @@ bytes:   27 per record
 Quad with vertices `(0,0,0):2`, `(0,0,0):3`, `(1,0,0):8`, `(1,0,0):7`:
 
 ```
-path:    cross_chunk_links/0/0.0.0/1.0.0/data
-record:  ci = [0, 0, 1, 1]
-         vi = [2, 3, 8, 7]
-bytes:   36 per record
+array:        cross_chunk_links/0/k2
+cell coord:   (0, 0, 0,   1, 0, 0)
+cell payload: ci = [0, 0, 1, 1]
+              vi = [2, 3, 8, 7]
+              total = 36 bytes
 ```
 
 ### Canonicalization
@@ -363,47 +411,48 @@ L1 (structural) — walks every `<delta>` subdir under both `links/` and
 - `links/0/` exists for every geometry type that declares it in its
   `arrays_present` capability list (graph, polyline, streamline,
   skeleton, mesh).
-- Any `links/<delta != 0>/` or any leaf under `cross_chunk_links/<delta>/`
-  triggers the `CAP_MULTISCALE_LINKS` capability check on root
-  metadata, **and**, since 0.8, also the
+- Any `links/<delta != 0>/` or any `kK` sub-array under
+  `cross_chunk_links/<delta>/` triggers the `CAP_MULTISCALE_LINKS`
+  capability check on root metadata, **and**, since 0.8, also the
   `CAP_PARTITIONED_CROSS_CHUNK_LINKS` check.
 - The `layout` key in every `cross_chunk_links/<delta>/` group's
-  `.zattrs` equals `"partitioned_v1"`. Any other value (or absence) is
+  `.zattrs` equals `"sharded_v1"`. Any other value (or absence) is
   a fatal error directing the user to the 0.7 → 0.8 migration helper.
 
 L3 (consistency) — see
 [`zarr_vectors/validate/consistency.py`](../../../zarr_vectors/validate/consistency.py):
 
-- **Per-leaf byte-length.** `len(leaf_bytes) % (9 * link_width) == 0`.
+- **Per-cell byte-length.** For every populated cell:
+  `len(cell_bytes) % (9 * link_width) == 0`.
 - **Per-record ci range.** Every `ci_i ∈ [0, K-1]`.
-- **Coverage invariant.** For every record in a leaf at depth K, the
-  set `{ci_0, …, ci_{L-1}}` equals `{0, 1, …, K-1}` — every chunk
-  listed in the path is referenced by at least one endpoint. Records
-  that don't use every path-listed chunk belong in a strictly-shallower
-  leaf (smaller K).
-- **Lex-sorted path.** The K path segments under `<delta>` are in
-  strict lex order.
-- **Canonical `ci` for delta=0 L=2 leaves.** Every record has
+- **Coverage invariant.** For every record in a cell of the `kK`
+  array, the set `{ci_0, …, ci_{L-1}}` equals `{0, 1, …, K-1}` —
+  every chunk listed in the cell coord is referenced by at least one
+  endpoint. Records that don't use every cell-listed chunk belong in
+  a smaller-K array.
+- **Lex-sorted cell coord.** In a `kK` array, the cell coord's K
+  chunk-tuples are in strict lex order.
+- **Canonical `ci` for `k2` at `delta=0`.** Every record has
   `ci = [0, 1]`.
-- **Chunk-coord arity.** Every path segment parses to a chunk-coord of
-  arity `sid_ndim`.
+- **Chunk-coord arity.** Each chunk-tuple in a cell coord has arity
+  `sid_ndim` (verified against the array's declared shape).
 - **Existence of chunks at each side's level.** For `delta != 0`, the
-  validator checks that each path segment names a chunk that exists at
-  the appropriate level (segment used only by `ci_0` ⇒ owning level;
-  segment used by any `ci_{i>0}` ⇒ target level). For `delta == 0`,
-  every segment must name a chunk present at the level's chunk grid.
-- **Attribute parity.** For every `cross_chunk_link_attributes/<name>/<delta>/<…>/data`
-  leaf, the record count matches the parallel
-  `cross_chunk_links/<delta>/<same path>/data` leaf.
-- **Same-chunk overlap warning.** K=1 leaves under `cross_chunk_links/<delta>/`
-  are legal but the validator emits a warning recommending the writer
-  use `links/<delta>/<X>` for natural intra-chunk edges; reserve K=1
-  cross-chunk-link leaves for special-case bridges (e.g. legacy Step 9b
-  records on non-streamline coarsening paths).
+  validator checks that the chunk referenced by `ci_0` exists at the
+  owning level and the chunks referenced by `ci_{i>0}` exist at level
+  + delta.  For `delta == 0`, every chunk in the cell coord must name
+  a chunk present at the level's chunk grid.
+- **Attribute parity.** For every populated cell in
+  `cross_chunk_link_attributes/<name>/<delta>/kK`, the row count
+  matches the record count in the parallel
+  `cross_chunk_links/<delta>/kK` cell at the same coord.
+- **Same-chunk overlap warning.** Records in `kK=1` (same-chunk
+  records) are legal but the validator emits a warning recommending
+  `links/<delta>/<X>` for natural intra-chunk edges; reserve `k1`
+  cells for special-case bridges.
 
 L4 (semantic, opt-in): for each `delta > 0`, the union of source-side
-endpoints in `links/+delta/*` and across every
-`cross_chunk_links/+delta/<…>/data` leaf must cover every vertex at the
+endpoints in `links/+delta/*` and across every populated cell in every
+`cross_chunk_links/+delta/kK` array must cover every vertex at the
 source level — i.e. every fine vertex has at least one parent at level
 `source_level + delta`. Useful as an ID-preservation cross-check for
 stores written with the per-object pyramid regime; off by default
@@ -426,14 +475,14 @@ the link rows.
 }
 ```
 
-### `cross_chunk_link_attributes/<name>/<delta>/<chunk_sorted_0>/.../<chunk_sorted_{K-1}>/data` — partitioned attrs
+### `cross_chunk_link_attributes/<name>/<delta>/kK/` — parallel sharded attrs
 
-Parallel to `cross_chunk_links/<delta>/<same path>/data`. One flat row
-per cross-chunk link in **record order** within that leaf. Scalar
-attrs are stored as a flat `(num_records,)` array of `dtype`;
-multi-channel attrs as `(num_records, C)`.
+Parallel sharded vlen-bytes arrays mirroring the link `kK` arrays.
+Each cell holds the dtype-typed row block for the matching link cell —
+`num_records_in_link_cell` rows of either scalar (`dtype`) or
+multi-channel (`dtype × C`) data, packed back-to-back.
 
-**Group `.zattrs` schema** (stored on
+**Parent group `.zattrs` schema** (stored on
 `cross_chunk_link_attributes/<name>/<delta>/`):
 
 ```jsonc
@@ -442,16 +491,18 @@ multi-channel attrs as `(num_records, C)`.
   "name":        "weight",
   "dtype":       "float32",
   "level_delta": 1,
-  "shape":       null,        // or [C] for multi-channel
-  "layout":      "partitioned_v1"
+  "link_width":  2,
+  "sid_ndim":    3,
+  "shape":       [num_links_total],   // or [num_links_total, C] for multi-channel
+  "layout":      "sharded_v1"
 }
 ```
 
-**Per-leaf parity invariant.** For every leaf at
-`cross_chunk_link_attributes/<name>/<delta>/<…>/data` the record count
-equals the parallel `cross_chunk_links/<delta>/<same …>/data` leaf's
-record count. The writer enforces this at runtime; a desynchronised
-write fails with an `ArrayError`.
+**Per-cell parity invariant.** For every populated cell in
+`cross_chunk_link_attributes/<name>/<delta>/kK` the row count equals
+the record count of the parallel `cross_chunk_links/<delta>/kK` cell
+at the same coord. The writer enforces this at runtime; a
+desynchronised write fails with an `ArrayError`.
 
 ### Generation algorithm
 
@@ -464,12 +515,18 @@ chunk → bucket into per-chunk `(M_local, link_width)` rows for
 
 1. Compute `chunks_used = sorted(set(endpoint_i.chunk for i in range(L)))`.
 2. `K = len(chunks_used)`.
-3. Build the leaf path: `cross_chunk_links/0/<chunks_used[0]>/…/<chunks_used[K-1]>/data`.
-4. Compute the record `ci`: for endpoint `i`, `ci_i = chunks_used.index(endpoint_i.chunk)`.
-5. Build `vi`: `vi_i = endpoint_i.vertex_index`.
-6. For `L = 2` undirected edges, normalise `ci = [0, 1]` (swap `vi` if
-   needed).
-7. Append the `9 * L`-byte record to the leaf.
+3. Locate (or lazily create) the `cross_chunk_links/0/kK` sharded
+   vlen-bytes array.
+4. Compute the cell coord:
+   `(chunks_used[0] - origin) ⧺ … ⧺ (chunks_used[K-1] - origin)`.
+5. Compute the record `ci`: for endpoint `i`,
+   `ci_i = chunks_used.index(endpoint_i.chunk)`.
+6. Build `vi`: `vi_i = endpoint_i.vertex_index`.
+7. For `L = 2` undirected edges, normalise `ci = [0, 1]` (swap `vi`
+   if needed).
+8. Append the `9 * L`-byte record to the cell's existing payload
+   (read-modify-write at the shard level — multiple cells in one shard
+   become one shard write when the writer batches per-shard).
 
 **Cross-level (`delta != 0`).** Emitted by
 [`_write_cross_level_edges`](../../../zarr_vectors/multiresolution/coarsen.py)
@@ -480,12 +537,13 @@ metanode. The edges are partitioned via
 chunk-aligned edges (source chunk_key == target chunk_key when
 re-evaluated against the coarser grid) become rows in
 `links/+1/<chunk_key>`; the rest follow the same sorted-unique-chunks
-bucketing as above. No canonicalization step for cross-level (endpoint
-0 = fine is semantically distinguished from endpoint 1 = coarse).
++ `kK` bucketing as above. No canonicalization step for cross-level
+(endpoint 0 = fine is semantically distinguished from endpoint 1 =
+coarse).
 
 When `cross_level_storage="explicit"`, the same edges are also mirrored
 at the coarse level under `<-delta>` with endpoint roles swapped —
-`links/-1/<chunk_key>` and `cross_chunk_links/-1/…/data` leaves. When
+`links/-1/<chunk_key>` and `cross_chunk_links/-1/kK/` arrays. When
 `cross_level_storage="implicit"`, only the `+delta` side is
 materialised; readers reconstruct the `-delta` direction by walking
 the `+delta` arrays at the target level.
@@ -494,6 +552,12 @@ See [Pyramid construction](../multiscale/pyramid_construction.md) for
 the `cross_level_depth` / `cross_level_storage` API and
 [`examples/07_multiscale_links.ipynb`](../../../examples/07_multiscale_links.ipynb)
 for a full walkthrough.
+
+**Concurrency.** Two writers writing records whose cells fall in
+different outer shards write to **different shard files** and don't
+conflict.  Writers whose cells share a shard collide at the shard
+level (read-modify-write semantics).  Tune `shard_shape` smaller for
+heavier write-contention workloads; larger for fewer total files.
 
 ### Reader access patterns
 
@@ -527,33 +591,38 @@ according to the writer's winding-order convention.
 **All records involving chunk `X` (any L, K and delta unknown):**
 
 ```python
-from zarr_vectors.spatial.chunking import neighbouring_chunk_keys
 from zarr_vectors.core.arrays import list_cross_chunk_link_leaves
 
-# Bounded by spatial neighbourhood — same pattern as today's per-chunk reads.
-for leaf_chunks in list_cross_chunk_link_leaves(lg, involves=X, delta=0):
-    records = read_cross_chunk_link_leaf(lg, chunks=leaf_chunks, delta=0)
+# Walks every populated cell across all kN arrays at this delta,
+# filtering to cells whose sorted-chunks tuple contains X.
+for sorted_chunks in list_cross_chunk_link_leaves(lg, involves=X, delta=0):
+    records = read_cross_chunk_link_leaf(lg, chunks=sorted_chunks, delta=0)
     ...
 ```
 
 **Whole-level scan (delta given):**
 
 ```python
-for leaf_chunks in list_cross_chunk_link_leaves(lg, delta=0):
-    records = read_cross_chunk_link_leaf(lg, chunks=leaf_chunks, delta=0)
+from zarr_vectors.core.arrays import read_cross_chunk_links
+
+for record in read_cross_chunk_links(lg, delta=0):
+    # record is ((chunk_0, vi_0), (chunk_1, vi_1), ...) in canonical order
     ...
 ```
 
-Total work is comparable to scanning the legacy single blob but
-restartable per leaf and far more cache-friendly: a reader working in
-one spatial region sees only the relevant subtrees.
+Internally this walks each `kK` array's populated shards (cheap —
+file count scales with data), then decodes each cell's records.  Sharding
+keeps cold-storage random access reasonable: a reader interested in
+one spatial region fetches only the shards covering that region.
 
-Parallel CCL attributes use the same leaf addressing:
+Parallel CCL attributes use `read_cross_chunk_link_attributes`:
 
 ```python
-weights = read_cross_chunk_link_attribute_leaf(
-    lg, "weight", chunks=(smaller, larger), delta=1,
-)
+from zarr_vectors.core.arrays import read_cross_chunk_link_attributes
+
+weights = read_cross_chunk_link_attributes(lg, "weight", delta=1)
+# Returns a flat (num_links_total,) or (num_links_total, C) array in
+# the same canonical walk order as read_cross_chunk_links.
 ```
 
 ### Listing available deltas
@@ -574,10 +643,10 @@ print(list_cross_link_deltas(lg))   # e.g. [0, +1]
 ## Migration from 0.7
 
 The 0.7 monolithic-blob layout (`cross_chunk_links/<delta>/data` as a
-single int64 byte array) is **not readable** by 0.8 readers. A
-one-shot migration utility regroups records by their sorted-unique
-chunks and writes the K-deep leaves, then stamps
-`CAP_PARTITIONED_CROSS_CHUNK_LINKS` on root metadata. See the
+single int64 byte array) is **not readable** by 0.8 readers.  A
+one-shot migration utility re-bins records into the `kK` sharded
+vlen-bytes arrays, applies the `delta=0, L=2` canonicalization, and
+stamps `CAP_PARTITIONED_CROSS_CHUNK_LINKS` on root metadata.  See the
 [0.7 → 0.8 migration guide](../migration/0.7_to_0.8.md) for details.
 
 ---
