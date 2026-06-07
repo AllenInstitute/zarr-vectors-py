@@ -28,6 +28,7 @@ from zarr_vectors.constants import (
     DEFAULT_CROSS_LEVEL_DEPTH,
     DEFAULT_CROSS_LEVEL_STORAGE,
     LINKS,
+    LINKS_IMPLICIT_BRANCHES,
     LINKS_IMPLICIT_SEQUENTIAL,
     OBJECT_ATTRIBUTES,
     VERTICES,
@@ -132,7 +133,31 @@ def coarsen_level(
     Returns:
         Summary dict.  Always includes ``method``,
         ``preserves_object_ids``, ``vertex_count``.
+
+    Skeleton stores (``links_convention =
+    "implicit_sequential_with_branches"``) are routed to the
+    skeleton-aware decimator
+    (:func:`zarr_vectors.multiresolution.strategies.skeletons.coarsen_skeleton_level`);
+    for those stores ``coarsen_factor`` is interpreted as the decimation
+    ``stride`` (keep every k-th vertex) rather than a vertex aggregation
+    factor, and ``chunk_scale_factor`` defaults to 2.
     """
+    root_meta = read_root_metadata(open_store(str(store_path), mode="r"))
+    if root_meta.links_convention == LINKS_IMPLICIT_BRANCHES:
+        from zarr_vectors.multiresolution.strategies.skeletons import (
+            coarsen_skeleton_level,
+        )
+        csf = chunk_scale_factor if chunk_scale_factor != 1 else 2
+        return coarsen_skeleton_level(
+            store_path, source_level, target_level,
+            stride=max(1, int(round(coarsen_factor))),
+            sparsity_factor=sparsity_factor,
+            chunk_scale_factor=csf,
+            sparsity_strategy=(
+                sparsity_strategy if sparsity_strategy != "random" else "length"
+            ),
+            sparsity_seed=sparsity_seed,
+        )
     return _per_object_coarsen(
         store_path=store_path,
         source_level=source_level,

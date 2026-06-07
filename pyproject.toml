@@ -62,6 +62,15 @@ icechunk = [
     # accepted — see zarr_vectors/core/_batch_writer.py).
     "icechunk>=2; python_version >= '3.12'",
 ]
+# Ingest adapters for external geometry sources.  Currently the
+# precomputed spatial-index skeleton ETL
+# (zarr_vectors/ingest/precomputed_skeletons.py), which reads ``.frags``
+# MapBuffers of precomputed skeletons.
+ingest = [
+    "cloud-volume>=8.0",
+    "mapbuffer>=0.7",
+    "cloud-files>=4.0",
+]
 # Alias: keep the existing [cloud] extras working; resolves to obstore
 # (the preferred cloud backend).
 cloud = [

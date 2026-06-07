@@ -348,11 +348,18 @@ COARSEN_PER_OBJECT: str = "per_object"
 into bin centroids (metavertices).  Metavertices may be shared between
 objects; OIDs are preserved across levels."""
 
+COARSEN_SKELETON: str = "skeleton_simplify"
+"""Skeleton-aware pyramid: each surviving object's per-chunk tree pieces
+are simplified with RDP path decimation that preserves endpoints and
+branch points; radius/cross-section attributes are aggregated onto the
+survivors.  OIDs are preserved across levels."""
+
 COARSEN_MANUAL: str = "manual"
 COARSEN_NONE: str = "none"
 
 VALID_COARSENING_METHODS: frozenset[str] = frozenset({
     COARSEN_PER_OBJECT,
+    COARSEN_SKELETON,
     COARSEN_MANUAL,
     COARSEN_NONE,
 })
