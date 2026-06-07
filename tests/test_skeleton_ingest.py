@@ -13,6 +13,7 @@ import pytest
 from zarr_vectors.core.arrays import (
     list_chunk_keys,
     read_all_object_manifests,
+    read_chunk_fragment_attributes,
     read_chunk_vertices,
 )
 from zarr_vectors.core.store import get_resolution_level, open_store
@@ -146,6 +147,40 @@ def test_pull_by_segment_id_roundtrip(tmp_store):
     assert len(resY["edges"]) == 4
 
     assert sk.read_skeleton_by_segment_id(tmp_store, 7777) is None
+
+
+def test_segment_id_fragment_attribute_written(tmp_store):
+    """Each fragment carries its owning segment id as a per-fragment
+    attribute, in fragment order — drives the renderer's per-fragment
+    colouring.  A branching (Y) skeleton decomposes into >1 path fragment,
+    all of which must report the same owning segment id."""
+    chunk_shape = (100.0, 100.0, 100.0)
+    bounds = ([0.0, 0.0, 0.0], [100.0, 100.0, 100.0])
+    root, lg = sk.init_skeleton_store(
+        tmp_store, chunk_shape=chunk_shape, bounds=bounds, ndim=3,
+        attribute_dtypes={})
+    big = 720575940612786691  # flywire-scale uint64
+    # A straight chain (one fragment) + a Y (two path fragments).
+    pA = np.array([[10, 10, 10], [20, 10, 10], [30, 10, 10]], np.float32)
+    eA = np.array([[1, 0], [2, 1]])
+    pY = np.array([[20, 20, 20], [30, 20, 20], [40, 20, 20],
+                   [50, 30, 20], [50, 10, 20]], np.float32)
+    eY = np.array([[1, 0], [2, 1], [3, 2], [4, 2]])
+    recs, _ = sk.write_skeleton_chunk(lg, (0, 0, 0), [
+        {"segment_id": 999, "positions": pA, "edges": eA, "attributes": {}},
+        {"segment_id": big, "positions": pY, "edges": eY, "attributes": {}},
+    ])
+    sk.build_object_index(lg, recs, ndim=3)
+    sk.finalize_skeleton_store(root)
+
+    lg2 = get_resolution_level(open_store(tmp_store), 0)
+    seg_ids = read_chunk_fragment_attributes(
+        lg2, "segment_id", (0, 0, 0), dtype=np.uint64)
+    # One fragment per record, in fragment order.
+    assert seg_ids.tolist() == [r[0] for r in recs]
+    # The Y produced two fragments, both owned by `big`.
+    assert (seg_ids == big).sum() == 2
+    assert (seg_ids == 999).sum() == 1
 
 
 def test_segment_id_uint64_preserved(tmp_store):

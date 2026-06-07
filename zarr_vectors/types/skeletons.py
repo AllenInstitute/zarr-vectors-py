@@ -49,6 +49,7 @@ from zarr_vectors.constants import (
 from zarr_vectors.core.arrays import (
     create_attribute_array,
     create_cross_chunk_links_array,
+    create_fragment_attribute_array,
     create_links_array,
     create_object_attributes_array,
     create_object_index_array,
@@ -59,6 +60,7 @@ from zarr_vectors.core.arrays import (
     read_object_attributes,
     read_vertex_fragment_index,
     write_chunk_attributes,
+    write_chunk_fragment_attributes,
     write_chunk_links,
     write_chunk_vertices,
     write_cross_chunk_links,
@@ -354,6 +356,15 @@ def write_skeleton_chunk(
             level_group, name, chunk_coords, attr_groups[name],
             dtype=attr_dtypes.get(name, attr_groups[name][0].dtype),
         )
+    # Per-fragment ``segment_id`` (uint64): one flywire id per fragment, in
+    # fragment order (``records`` is appended in lockstep with
+    # ``fragment_idx``).  Loaded with the chunk so the renderer can colour
+    # each fragment by its owning segment via the normal segment palette.
+    if records:
+        seg_ids = np.asarray([r[0] for r in records], dtype=np.uint64)
+        write_chunk_fragment_attributes(
+            level_group, "segment_id", chunk_coords, seg_ids, dtype=np.uint64,
+        )
     return records, anchor_locs
 
 
@@ -401,7 +412,8 @@ def init_skeleton_store(
     create_vertices_array(level_group, dtype="float32")
     create_links_array(level_group, link_width=2, delta=0)
     create_object_index_array(level_group)
-    create_cross_chunk_links_array(level_group, delta=0, link_width=2)
+    create_cross_chunk_links_array(level_group, delta=0, link_width=2, sid_ndim=ndim)
+    create_fragment_attribute_array(level_group, "segment_id", dtype="uint64")
     for name, dt in attribute_dtypes.items():
         create_attribute_array(level_group, name, dtype=dt)
     if coordinate_offset is not None and any(float(x) != 0 for x in coordinate_offset):

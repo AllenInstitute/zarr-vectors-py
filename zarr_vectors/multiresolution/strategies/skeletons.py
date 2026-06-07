@@ -428,6 +428,7 @@ def coarsen_skeleton_level(
     from zarr_vectors.core.arrays import (
         create_attribute_array,
         create_cross_chunk_links_array,
+        create_fragment_attribute_array,
         create_links_array,
         create_object_attributes_array,
         create_object_index_array,
@@ -813,6 +814,7 @@ def coarsen_skeleton_level(
     create_vertices_array(level_group, dtype="float32")
     create_links_array(level_group, link_width=2, delta=0)
     create_object_index_array(level_group)
+    create_fragment_attribute_array(level_group, "segment_id", dtype="uint64")
     for name in attr_names:
         create_attribute_array(level_group, name, dtype=str(attr_dtypes[name]))
 
@@ -831,7 +833,10 @@ def coarsen_skeleton_level(
             new_manifests[seg].append((cc, fidx))
 
     # --- re-emit cross-chunk links still spanning target chunks ---------
-    create_cross_chunk_links_array(level_group, delta=0, link_width=2)
+    # Stamp ``sid_ndim`` at creation so coarse levels with zero surviving
+    # cross-chunk links still carry it (``write_cross_chunk_links`` only
+    # stamps it when it actually writes records).
+    create_cross_chunk_links_array(level_group, delta=0, link_width=2, sid_ndim=ndim)
     target_links = []
     for p_id, (oid, (tA, mA), (tB, mB)) in enumerate(pending):
         la = anchor_locs.get((p_id, 0))
