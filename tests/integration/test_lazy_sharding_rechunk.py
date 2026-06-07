@@ -63,7 +63,8 @@ class TestLazyDaskParallel:
     """Lazy API with explicit dask.compute parallelism."""
 
     def test_dask_compute_chunks(self, tmp_path: Path) -> None:
-        import dask
+        import pytest
+        dask = pytest.importorskip("dask")  # optional; not a core dependency
         from zarr_vectors.types.points import write_points
         from zarr_vectors.lazy import open_zv
 
