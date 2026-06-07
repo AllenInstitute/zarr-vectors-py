@@ -230,6 +230,7 @@ def write_skeleton_chunk(
     link_groups: list[npt.NDArray] = []
     attr_groups: dict[str, list[npt.NDArray]] = {n: [] for n in attr_names}
     records: list[tuple[int, ChunkCoords, int]] = []
+    frag_seg_ids: list[int] = []
     anchor_locs: dict[Any, tuple[ChunkCoords, int]] = {}
     cc_tuple = tuple(int(c) for c in chunk_coords)
 
@@ -237,7 +238,14 @@ def write_skeleton_chunk(
     fragment_idx = 0
     for piece in pieces:
         opos, oattrs, frag_ranges, blinks, new_of_old = decompose_tree_to_paths(piece)
+        # The per-fragment ``segment_id`` attribute is the original (e.g.
+        # flywire) id.  The object-index *records* are keyed separately by
+        # ``object_id`` when supplied (the coarsener passes the dense OID to
+        # preserve the per-object index), else they fall back to
+        # ``segment_id`` (level 0, where ``build_object_index`` remaps
+        # segment ids → OIDs).
         seg = int(piece["segment_id"])
+        obj_key = int(piece.get("object_id", seg))
         piece_base = chunk_offset
         # Each non-root path's start carries one branch link (chunk-local).
         blink_at_start = {ch_o: (ch_o, par_o) for ch_o, par_o in blinks}
@@ -256,7 +264,8 @@ def write_skeleton_chunk(
             else:
                 lg = []
             link_groups.append(np.asarray(lg, dtype=np.int64).reshape(-1, 2))
-            records.append((seg, cc_tuple, fragment_idx))
+            records.append((obj_key, cc_tuple, fragment_idx))
+            frag_seg_ids.append(seg)
             fragment_idx += 1
         anchors = piece.get("anchors")
         if anchors:
@@ -271,12 +280,13 @@ def write_skeleton_chunk(
             level_group, name, chunk_coords, attr_groups[name],
             dtype=attr_dtypes.get(name, attr_groups[name][0].dtype),
         )
-    # Per-fragment ``segment_id`` (uint64): one flywire id per fragment, in
-    # fragment order (``records`` is appended in lockstep with
-    # ``fragment_idx``).  Loaded with the chunk so the renderer can colour
-    # each fragment by its owning segment via the normal segment palette.
-    if records:
-        seg_ids = np.asarray([r[0] for r in records], dtype=np.uint64)
+    # Per-fragment ``segment_id`` (uint64): one original (flywire) id per
+    # fragment, in fragment order (``frag_seg_ids`` is appended in lockstep
+    # with ``fragment_idx``).  Loaded with the chunk so the renderer can
+    # colour each fragment by its owning segment via the normal segment
+    # palette and surface the global id on pick — at every pyramid level.
+    if frag_seg_ids:
+        seg_ids = np.asarray(frag_seg_ids, dtype=np.uint64)
         write_chunk_fragment_attributes(
             level_group, "segment_id", chunk_coords, seg_ids, dtype=np.uint64,
         )

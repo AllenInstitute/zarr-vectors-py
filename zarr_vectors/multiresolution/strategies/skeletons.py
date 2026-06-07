@@ -724,6 +724,17 @@ def coarsen_skeleton_level(
         anchor_needed[(oid, tA)][mA] = (p_id, 0)
         anchor_needed[(oid, tB)][mB] = (p_id, 1)
 
+    # Map dense OID → original (e.g. flywire) segment id, so coarse-level
+    # fragments carry the SAME per-fragment ``segment_id`` as level 0 (which
+    # drives both colour-matching with the flat segmentation and the picked
+    # global id).  Without this, coarse fragments would be tagged with the
+    # dense OID instead of the real segment id.  Falls back to the OID when
+    # the source level has no ``object_attributes/segment_id``.
+    try:
+        segid_of_oid = read_object_attributes(src, "segment_id")
+    except ArrayError:
+        segid_of_oid = None
+
     # --- merge + simplify per (object, target chunk) --------------------
     pieces_by_tcc: dict[ChunkCoords, list[dict[str, Any]]] = defaultdict(list)
     total_out_vertices = 0
@@ -758,7 +769,13 @@ def coarsen_skeleton_level(
             if len(rpos) == 0:
                 continue
             piece: dict[str, Any] = {
-                "segment_id": oid,
+                # ``object_id`` keys the per-object index (preserve the dense
+                # OID); ``segment_id`` is the original (flywire) id written as
+                # the per-fragment attribute for colour + pick.
+                "object_id": oid,
+                "segment_id": (
+                    int(segid_of_oid[oid]) if segid_of_oid is not None else oid
+                ),
                 "positions": rpos,
                 "edges": simp["edges"],
                 "attributes": simp["attributes"],

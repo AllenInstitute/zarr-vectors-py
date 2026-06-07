@@ -382,6 +382,41 @@ def test_coarse_manifest_maps_correct_fragments(tmp_store):
         assert len(r1["positions"]) >= 2
 
 
+def test_coarse_segment_id_is_flywire_not_oid(tmp_store):
+    """Regression: the per-fragment ``segment_id`` attribute must be the
+    original (flywire) id at EVERY pyramid level — not the dense OID.  The
+    coarsener keys its object index by OID but must still tag fragments with
+    the real segment id (drives colour-matching + picked global id)."""
+    big = 720575940625680074  # > 2**32 and != its OID (0)
+    chunk_shape = (1000.0, 1000.0, 1000.0)
+    bounds = ([0.0, 0.0, 0.0], [2000.0, 1000.0, 1000.0])
+    root, lg = sk.init_skeleton_store(
+        tmp_store, chunk_shape=chunk_shape, bounds=bounds, ndim=3,
+        attribute_dtypes={})
+    pos = np.array([[x, 500, 500] for x in range(10, 200, 10)], np.float32)
+    edges = np.array([[i, i - 1] for i in range(1, len(pos))])
+    recs, _ = sk.write_skeleton_chunk(lg, (0, 0, 0), [
+        {"segment_id": big, "positions": pos, "edges": edges, "attributes": {}}])
+    oid_of = sk.build_object_index(lg, recs, ndim=3)
+    sk.finalize_skeleton_store(root)
+    assert oid_of[big] == 0  # the OID differs from the flywire id
+
+    build_skeleton_pyramid(tmp_store, strides=[2], chunk_scale_factors=[2],
+                           sparsity_factors=[1.0])
+
+    # The skeleton (x 10..190) falls in chunk (0,0,0) at both levels.
+    for level in (0, 1):
+        lvl = get_resolution_level(open_store(tmp_store), level)
+        seg_ids = read_chunk_fragment_attributes(
+            lvl, "segment_id", (0, 0, 0), dtype=np.uint64)
+        assert seg_ids.size >= 1
+        assert all(int(s) == big for s in seg_ids), (
+            f"level {level}: fragment segment_id {seg_ids.tolist()} != flywire {big}"
+        )
+    # pull-by-id still works at the coarse level (object index keyed by OID)
+    assert sk.read_skeleton_by_segment_id(tmp_store, big, level=1) is not None
+
+
 def test_coarsen_level_routes_to_skeleton(tmp_store):
     """The generic coarsen_level dispatches skeleton stores to the
     skeleton coarsener (coarsen_factor interpreted as tolerance)."""
