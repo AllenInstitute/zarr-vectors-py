@@ -16,7 +16,7 @@ between objects, and per-object OIDs are preserved across levels.
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 import numpy as np
 import numpy.typing as npt
@@ -83,6 +83,46 @@ from zarr_vectors.typing import ChunkCoords
 
 
 # ===================================================================
+# Coarsener registry (pluggable per-geometry downsampling strategies)
+# ===================================================================
+
+# A coarsener takes ``(store_path, source_level, target_level)`` plus the
+# uniform keyword set ``coarsen_level`` forwards, and writes the target
+# level, returning a summary dict.  Built-ins are registered at module load
+# (bottom of file); callers/experiments may override or add keys via
+# :func:`register_coarsener` without editing :func:`coarsen_level`.
+Coarsener = Callable[..., dict[str, Any]]
+_COARSENERS: dict[str, Coarsener] = {}
+
+
+def register_coarsener(key: str, fn: Coarsener) -> None:
+    """Register (or override) the coarsener used for a dispatch ``key``."""
+    _COARSENERS[key] = fn
+
+
+def get_coarsener(key: str) -> Coarsener:
+    """Look up a registered coarsener; raise if none is registered."""
+    try:
+        return _COARSENERS[key]
+    except KeyError:
+        raise CoarseningError(
+            f"no coarsener registered for {key!r} "
+            f"(registered: {sorted(_COARSENERS)})"
+        ) from None
+
+
+def select_coarsener_key(root_meta: Any) -> str:
+    """Pick the coarsener key for a store from its root metadata.
+
+    Skeleton stores (``implicit_sequential_with_branches``) use the
+    skeleton-aware decimator; everything else uses the per-object pyramid.
+    """
+    if root_meta.links_convention == LINKS_IMPLICIT_BRANCHES:
+        return "skeleton"
+    return "per_object"
+
+
+# ===================================================================
 # Single-level coarsening
 # ===================================================================
 
@@ -143,25 +183,15 @@ def coarsen_level(
     factor, and ``chunk_scale_factor`` defaults to 2.
     """
     root_meta = read_root_metadata(open_store(str(store_path), mode="r"))
-    if root_meta.links_convention == LINKS_IMPLICIT_BRANCHES:
-        from zarr_vectors.multiresolution.strategies.skeletons import (
-            coarsen_skeleton_level,
-        )
-        csf = chunk_scale_factor if chunk_scale_factor != 1 else 2
-        return coarsen_skeleton_level(
-            store_path, source_level, target_level,
-            stride=max(1, int(round(coarsen_factor))),
-            sparsity_factor=sparsity_factor,
-            chunk_scale_factor=csf,
-            sparsity_strategy=(
-                sparsity_strategy if sparsity_strategy != "random" else "length"
-            ),
-            sparsity_seed=sparsity_seed,
-        )
-    return _per_object_coarsen(
-        store_path=store_path,
-        source_level=source_level,
-        target_level=target_level,
+    # Dispatch via the coarsener registry (see ``register_coarsener``) so new
+    # or improved per-geometry coarseners can be plugged in without editing
+    # this function.  Default keys: ``"skeleton"`` (implicit-branch stores)
+    # and ``"per_object"`` (everything else).
+    coarsener = get_coarsener(select_coarsener_key(root_meta))
+    return coarsener(
+        store_path,
+        source_level,
+        target_level,
         coarsen_factor=coarsen_factor,
         sparsity_factor=sparsity_factor,
         chunk_scale_factor=chunk_scale_factor,
@@ -1239,3 +1269,68 @@ def build_pyramid(
         "cross_level_depth": cross_level_depth,
         "cross_level_storage": cross_level_storage,
     }
+
+
+# ===================================================================
+# Built-in coarsener registrations
+# ===================================================================
+
+def _skeleton_coarsener(
+    store_path: str | Path,
+    source_level: int,
+    target_level: int,
+    *,
+    coarsen_factor: float,
+    sparsity_factor: float,
+    chunk_scale_factor: int | tuple[int, ...],
+    sparsity_strategy: str,
+    sparsity_seed: int | None,
+    cross_level_storage: str,
+) -> dict[str, Any]:
+    """Skeleton stores: route to the skeleton-aware decimator.  ``coarsen_factor``
+    is the decimation stride, ``chunk_scale_factor`` defaults to 2, and the
+    random sparsity strategy degrades to deterministic ``"length"``."""
+    from zarr_vectors.multiresolution.strategies.skeletons import (
+        coarsen_skeleton_level,
+    )
+    csf = chunk_scale_factor if chunk_scale_factor != 1 else 2
+    return coarsen_skeleton_level(
+        store_path, source_level, target_level,
+        stride=max(1, int(round(coarsen_factor))),
+        sparsity_factor=sparsity_factor,
+        chunk_scale_factor=csf,
+        sparsity_strategy=(
+            sparsity_strategy if sparsity_strategy != "random" else "length"
+        ),
+        sparsity_seed=sparsity_seed,
+    )
+
+
+def _per_object_coarsener(
+    store_path: str | Path,
+    source_level: int,
+    target_level: int,
+    *,
+    coarsen_factor: float,
+    sparsity_factor: float,
+    chunk_scale_factor: int | tuple[int, ...],
+    sparsity_strategy: str,
+    sparsity_seed: int | None,
+    cross_level_storage: str,
+) -> dict[str, Any]:
+    """Default geometries: per-object metavertex aggregation."""
+    return _per_object_coarsen(
+        store_path=store_path,
+        source_level=source_level,
+        target_level=target_level,
+        coarsen_factor=coarsen_factor,
+        sparsity_factor=sparsity_factor,
+        chunk_scale_factor=chunk_scale_factor,
+        sparsity_strategy=sparsity_strategy,
+        sparsity_seed=sparsity_seed,
+        cross_level_storage=cross_level_storage,
+    )
+
+
+register_coarsener("skeleton", _skeleton_coarsener)
+register_coarsener("per_object", _per_object_coarsener)

@@ -458,9 +458,9 @@ def coarsen_skeleton_level(
     from zarr_vectors.exceptions import ArrayError
     from zarr_vectors.multiresolution.object_selection import apply_sparsity
     from zarr_vectors.core.multiscale import upsert_level_transform
+    from zarr_vectors.multiresolution.skeleton_graph import split_components
     from zarr_vectors.types.skeletons import (
         get_coordinate_offset,
-        split_components,
         write_skeleton_chunk,
     )
 

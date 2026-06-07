@@ -3,10 +3,6 @@
 These are the scale-out building blocks the ``write_graph`` whole-dataset
 path lacks:
 
-- :func:`split_components` — split one chunk-piece (vertices + undirected
-  edges) into connected components, each rooted as a ``[child, parent]``
-  tree (the storage convention).
-
 - :func:`write_skeleton_chunk` — write one spatial chunk's skeleton
   fragments (one fragment per piece) using the core per-chunk
   primitives.  Links are stored ``[child_local, parent_local]`` in
@@ -33,7 +29,7 @@ contract.
 
 from __future__ import annotations
 
-from collections import defaultdict, deque
+from collections import defaultdict
 from pathlib import Path
 from typing import Any, Sequence
 
@@ -108,87 +104,6 @@ def set_coordinate_offset(root, offset: Sequence[float]) -> None:
     zv[COORDINATE_OFFSET_KEY] = [float(x) for x in offset]
     attrs["zarr_vectors"] = zv
     root.attrs.update(attrs)
-
-
-# ===================================================================
-# Component splitting + rooting
-# ===================================================================
-
-def split_components(
-    positions: npt.NDArray[np.floating],
-    edges: npt.NDArray[np.integer],
-    attributes: dict[str, npt.NDArray] | None = None,
-    vertex_ids: npt.NDArray[np.integer] | None = None,
-) -> list[dict[str, Any]]:
-    """Split a vertex set + undirected edges into rooted-tree pieces.
-
-    Each connected component becomes one piece, re-indexed to a compact
-    ``0..k-1`` local range and oriented as ``[child, parent]`` edges
-    (BFS from the component's lowest-index node as root; the root has no
-    edge row).
-
-    Args:
-        positions: ``(N, D)`` vertex positions.
-        edges: ``(M, 2)`` undirected edges (any orientation).
-        attributes: Optional ``{name: (N,) or (N, C)}`` per-vertex data.
-        vertex_ids: Optional ``(N,)`` opaque ids carried through the
-            re-indexing; each piece gets ``"vertex_ids"`` aligned to its
-            local vertex order, so callers can locate a specific input
-            vertex (e.g. a cross-chunk endpoint) within its component.
-
-    Returns:
-        List of ``{"positions", "edges", "attributes"[, "vertex_ids"]}``
-        dicts, one per connected component.
-    """
-    positions = np.asarray(positions)
-    n = len(positions)
-    attributes = attributes or {}
-    if n == 0:
-        return []
-
-    adj: dict[int, list[int]] = defaultdict(list)
-    e = np.asarray(edges, dtype=np.int64).reshape(-1, 2)
-    for a, b in e:
-        a = int(a); b = int(b)
-        if a == b:
-            continue
-        adj[a].append(b)
-        adj[b].append(a)
-
-    visited = np.zeros(n, dtype=bool)
-    pieces: list[dict[str, Any]] = []
-    for seed in range(n):
-        if visited[seed]:
-            continue
-        # BFS over the component, recording parent (child→parent edges).
-        order: list[int] = []
-        parent_of: dict[int, int] = {seed: -1}
-        dq = deque([seed])
-        visited[seed] = True
-        while dq:
-            u = dq.popleft()
-            order.append(u)
-            for w in adj.get(u, ()):
-                if not visited[w]:
-                    visited[w] = True
-                    parent_of[w] = u
-                    dq.append(w)
-        local_of = {g: i for i, g in enumerate(order)}
-        comp_edges = [
-            (local_of[g], local_of[parent_of[g]])
-            for g in order
-            if parent_of[g] >= 0
-        ]
-        gidx = np.asarray(order, dtype=np.int64)
-        piece = {
-            "positions": positions[gidx],
-            "edges": np.asarray(comp_edges, dtype=np.int64).reshape(-1, 2),
-            "attributes": {k: np.asarray(v)[gidx] for k, v in attributes.items()},
-        }
-        if vertex_ids is not None:
-            piece["vertex_ids"] = np.asarray(vertex_ids)[gidx]
-        pieces.append(piece)
-    return pieces
 
 
 def decompose_tree_to_paths(
