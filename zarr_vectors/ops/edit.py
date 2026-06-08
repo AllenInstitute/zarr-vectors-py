@@ -1075,8 +1075,26 @@ class EditSession:
             )
 
     def _refresh_now(self, source_level: int) -> None:
-        from zarr_vectors.ops.refresh import rebuild_pyramid_from_level
-        rebuild_pyramid_from_level(self.root, source_level)
+        # No pyramid above the edited level → nothing to refresh, so a level-0
+        # edit on a single-level store never needs the coordinator (a user can
+        # edit now and downsample later with no tools dependency).  This check
+        # is core-only and mirrors rebuild_pyramid_from_level's own early-return.
+        from zarr_vectors.core.store import list_resolution_levels
+        if not any(lv > source_level for lv in list_resolution_levels(self.root)):
+            return
+        # There ARE coarser levels: refreshing them is multi-scale coordination,
+        # which lives in zarr-vectors-tools (it registers its implementation via
+        # ``register_pyramid_refresher`` on import).  Core alone cannot refresh.
+        from zarr_vectors.ops.refresh_hook import get_pyramid_refresher
+        refresher = get_pyramid_refresher()
+        if refresher is None:
+            raise EditError(
+                "refresh_pyramid requires the pyramid coordinator from "
+                "zarr-vectors-tools; install it (it registers the refresher on "
+                "import) or use refresh_pyramid=False and rebuild the pyramid "
+                "separately."
+            )
+        refresher(self.root, source_level)
 
     def _discard(self) -> None:
         from zarr_vectors.core.store import discard_changes

@@ -12,10 +12,10 @@ path lacks:
   fragment boundaries.  Returns the ``(segment_id, chunk, fragment_idx)``
   records the object-index reduce consumes.
 
-- :func:`build_object_index` — the reduce step: group per-chunk records
-  by ``segment_id``, assign dense object IDs in sorted-segment-id order,
-  write ``object_index`` plus an ``object_attributes/segment_id`` array
-  so any skeleton can be pulled back out by its original (flywire) ID.
+  (The reduce step that groups those per-chunk records into a dense
+  ``object_index`` + ``object_attributes/segment_id`` is *coordination* and
+  lives in ``zarr_vectors_tools.multiresolution.object_index.build_object_index``,
+  not in this core module.)
 
 - :func:`read_skeleton_by_segment_id` — resolve a segment ID to its
   object, follow the manifest, and reconstruct the skeleton (positions +
@@ -47,7 +47,6 @@ from zarr_vectors.core.arrays import (
     create_cross_chunk_links_array,
     create_fragment_attribute_array,
     create_links_array,
-    create_object_attributes_array,
     create_object_index_array,
     create_vertices_array,
     read_chunk_link_fragment,
@@ -60,8 +59,6 @@ from zarr_vectors.core.arrays import (
     write_chunk_links,
     write_chunk_vertices,
     write_cross_chunk_links,
-    write_object_attributes,
-    write_object_index,
 )
 from zarr_vectors.core.metadata import LevelMetadata
 from zarr_vectors.core.multiscale import upsert_level_transform
@@ -242,8 +239,8 @@ def write_skeleton_chunk(
         # flywire) id.  The object-index *records* are keyed separately by
         # ``object_id`` when supplied (the coarsener passes the dense OID to
         # preserve the per-object index), else they fall back to
-        # ``segment_id`` (level 0, where ``build_object_index`` remaps
-        # segment ids → OIDs).
+        # ``segment_id`` (level 0, where the tools-side object-index reduce
+        # remaps segment ids → OIDs).
         seg = int(piece["segment_id"])
         obj_key = int(piece.get("object_id", seg))
         piece_base = chunk_offset
@@ -312,8 +309,9 @@ def init_skeleton_store(
     to the NGFF ``translation`` transform.
 
     Returns ``(root, level0_group)``.  Callers then stream
-    :func:`write_skeleton_chunk` over chunks and finish with
-    :func:`build_object_index` + :func:`finalize_skeleton_store`.
+    :func:`write_skeleton_chunk` over chunks, reduce the records into an
+    object index (``zarr_vectors_tools.multiresolution.object_index``), and
+    finish with :func:`finalize_skeleton_store`.
     """
     # Tag axes as nanometers so neuroglancer treats positions as physical
     # (not unitless) coordinates.
@@ -371,50 +369,6 @@ def write_skeleton_cross_chunk_links(
 
 def finalize_skeleton_store(root) -> None:
     _finalize_write(root, "write_skeleton_chunked")
-
-
-# ===================================================================
-# Object-index reduce (segment-id preserving)
-# ===================================================================
-
-def build_object_index(
-    level_group,
-    records: list[tuple[int, ChunkCoords, int]],
-    *,
-    ndim: int,
-) -> dict[int, int]:
-    """Group per-chunk records by segment_id → dense object index.
-
-    Writes ``object_index`` (one manifest per object, dense IDs in
-    sorted-segment-id order) and ``object_attributes/segment_id``
-    (uint64) so skeletons can be pulled back out by original ID.
-
-    Args:
-        level_group: Level-0 group.
-        records: ``(segment_id, chunk_coords, fragment_index)`` from
-            every chunk written.
-        ndim: Spatial index dim count.
-
-    Returns:
-        ``{segment_id: object_id}``.
-    """
-    # Deterministic order: by segment_id, then chunk, then fragment.
-    records = sorted(records, key=lambda r: (int(r[0]), tuple(r[1]), int(r[2])))
-    seg_ids = sorted({int(r[0]) for r in records})
-    oid_of_seg = {s: i for i, s in enumerate(seg_ids)}
-
-    manifests: dict[int, list[tuple[ChunkCoords, int]]] = defaultdict(list)
-    for seg, cc, fidx in records:
-        manifests[oid_of_seg[int(seg)]].append((tuple(int(c) for c in cc), int(fidx)))
-
-    write_object_index(
-        level_group, dict(manifests), sid_ndim=ndim,
-        total_objects=len(seg_ids),
-    )
-    seg_arr = np.asarray(seg_ids, dtype=np.uint64)
-    create_object_attributes_array(level_group, SEGMENT_ID_ATTR, dtype="uint64")
-    write_object_attributes(level_group, SEGMENT_ID_ATTR, seg_arr)
-    return oid_of_seg
 
 
 # ===================================================================

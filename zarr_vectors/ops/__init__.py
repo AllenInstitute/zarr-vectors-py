@@ -10,8 +10,10 @@ Public surface:
   :class:`FragmentRef`, :class:`ObjectRef`, :class:`AttributeRef` —
   physical addresses passed to the edit functions.
 - :class:`EditReport` — diff summary returned by every edit.
-- :func:`rebuild_pyramid_from_level` — refresh coarser levels after
-  edits when ``refresh_pyramid=False`` was used.
+- :func:`register_pyramid_refresher` — dependency-injection slot for the
+  pyramid-refresh coordinator (provided by zarr-vectors-tools); used by
+  :class:`EditSession` when ``refresh_pyramid`` is set.  Pyramid refresh
+  itself is multi-scale coordination and no longer lives in core.
 
 The accepted edit semantics (atomic vs minimal, source-row retention
 across chunk boundaries, propagate-to-objects) are documented in the
@@ -42,7 +44,10 @@ from zarr_vectors.ops.edit import (
 )
 from zarr_vectors.ops.links import materialise_object_links_explicit
 from zarr_vectors.ops.merge import allocate_oid, merge_edit_reports
-from zarr_vectors.ops.refresh import rebuild_pyramid_from_level
+from zarr_vectors.ops.refresh_hook import (
+    get_pyramid_refresher,
+    register_pyramid_refresher,
+)
 from zarr_vectors.ops.vacuum import vacuum
 from zarr_vectors.ops.refs import (
     AttributeRef,
@@ -76,9 +81,10 @@ __all__ = [
     "edit_link",
     "edit_object",
     "edit_vertex",
+    "get_pyramid_refresher",
     "materialise_object_links_explicit",
     "merge_edit_reports",
-    "rebuild_pyramid_from_level",
+    "register_pyramid_refresher",
     "remove_attribute",
     "remove_cross_chunk_link",
     "remove_fragment",
