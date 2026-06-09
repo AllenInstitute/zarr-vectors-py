@@ -369,10 +369,13 @@ def write_graph(
             intra_edge_orig_indices[coord] = intra_orig_idx[sel]
 
     # Also partition the full edge set to get cross-chunk links for ALL edges
-    # (not just branch links for skeletons)
+    # (not just branch links for skeletons).  We only need the cross-links
+    # here — the intra branch links come from the partition above — so skip
+    # the redundant intra-dict build over the full edge set.
     if is_tree:
         _, all_cross_links = partition_edges(
-            edges, vertex_chunks, vertex_local, chunk_list
+            edges, vertex_chunks, vertex_local, chunk_list,
+            include_intra=False,
         )
     else:
         all_cross_links = cross_links

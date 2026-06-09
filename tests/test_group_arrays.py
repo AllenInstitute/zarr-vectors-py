@@ -261,3 +261,51 @@ def test_standalone_array_exists_false_for_missing_path(
 ):
     root = create_store(str(tmp_store_path))
     assert not root.standalone_array_exists("does/not/exist")
+
+
+# ---------------------------------------------------------------------------
+# write_groupings — implicit contiguous-range groups
+# ---------------------------------------------------------------------------
+
+def test_write_groupings_range_round_trip(tmp_store_path: Path):
+    """A ``range`` group is stored implicitly and reads back as a range."""
+    from zarr_vectors.core.arrays import (
+        read_all_groupings,
+        read_group_object_ids,
+        write_groupings,
+    )
+
+    root = create_store(str(tmp_store_path))
+    write_groupings(root, {0: [3, 1, 4], 1: range(100, 1000)})
+
+    # Explicit group reads back as a plain list, unchanged.
+    assert read_group_object_ids(root, 0) == [3, 1, 4]
+
+    # Range group reads back as a range — O(1), no materialised int64 list.
+    g1 = read_group_object_ids(root, 1)
+    assert isinstance(g1, range)
+    assert g1 == range(100, 1000)
+    assert list(g1) == list(range(100, 1000))
+
+    # read_all_groupings honours the range too.
+    all_groups = read_all_groupings(root)
+    assert all_groups[0] == [3, 1, 4]
+    assert all_groups[1] == range(100, 1000)
+
+    # The big group costs O(1) on disk: its placeholder row is empty.
+    blobs = root.read_vlen_array("groups")
+    assert blobs[1] == b""
+    assert root.read_array_attrs("groups")["group_ranges"] == {"1": [100, 1000]}
+
+
+def test_write_groupings_explicit_only_unchanged(tmp_store_path: Path):
+    """Explicit-only stores carry no ``group_ranges`` attribute and read
+    back exactly as before (backward compatibility)."""
+    from zarr_vectors.core.arrays import read_group_object_ids, write_groupings
+
+    root = create_store(str(tmp_store_path))
+    write_groupings(root, {0: [0, 1, 2], 1: [5, 6]})
+
+    assert read_group_object_ids(root, 0) == [0, 1, 2]
+    assert read_group_object_ids(root, 1) == [5, 6]
+    assert "group_ranges" not in root.read_array_attrs("groups")
