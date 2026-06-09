@@ -1383,6 +1383,87 @@ def _canonicalize_l2_delta0(
     return [(cb_t, int(vb)), (ca_t, int(va))]
 
 
+def create_cross_chunk_link_kN_arrays(
+    level_group: FsGroup,
+    *,
+    sid_ndim: int,
+    link_width: int,
+    chunk_grid_shape: tuple[int, ...],
+    chunk_origin: tuple[int, ...],
+    max_K: int | None = None,
+) -> None:
+    """Pre-create the ``kN`` sharded cross-chunk-link arrays (``k1..kK``).
+
+    Decentralized writers (:func:`write_cross_chunk_link_cells`) must NOT race to
+    create the same array, and every writer must agree on the array's shape +
+    ``chunk_origin``.  A single coordinator calls this once with the **level-wide**
+    ``chunk_grid_shape`` / ``chunk_origin`` (from the target level's chunk bounds);
+    workers then only *write cells* into the pre-created arrays.
+    """
+    create_cross_chunk_links_array(
+        level_group, delta=0, link_width=link_width, sid_ndim=sid_ndim,
+    )
+    for K in range(1, (max_K or link_width) + 1):
+        _open_or_create_kN_array(
+            level_group, delta=0, K=K, sid_ndim=sid_ndim, link_width=link_width,
+            chunk_grid_shape=chunk_grid_shape, chunk_origin=chunk_origin,
+        )
+
+
+def write_cross_chunk_link_cells(
+    level_group: FsGroup,
+    links: list[list[tuple[ChunkCoords, int]]],
+    *,
+    sid_ndim: int,
+    chunk_grid_shape: tuple[int, ...],
+    chunk_origin: tuple[int, ...],
+    delta: int = 0,
+    link_width: int = 2,
+) -> int:
+    """Write a batch of cross-chunk-link records' cells, leaving other cells intact.
+
+    Unlike :func:`write_cross_chunk_links` (whole-level replace/append), this writes
+    ONLY the cells the given ``links`` fall into — so independent workers can each
+    write their own records concurrently **provided their cells lie in disjoint
+    outer shards** (``_write_cells_batched`` does a per-shard read-modify-write).
+    The ``kN`` arrays must already exist with a matching ``chunk_grid_shape`` /
+    ``chunk_origin`` (see :func:`create_cross_chunk_link_kN_arrays`).  Returns the
+    number of records written.
+    """
+    records = [list(r) for r in links]
+    if not records:
+        return 0
+    if delta == 0 and link_width == 2:
+        records = [_canonicalize_l2_delta0(rec) for rec in records]
+    cells_by_K: dict[int, dict[tuple[ChunkCoords, ...], tuple[list, list]]] = {}
+    for rec in records:
+        record_chunks = [tuple(int(c) for c in ep[0]) for ep in rec]
+        uniq: list[ChunkCoords] = []
+        for ch in record_chunks:
+            if ch not in uniq:
+                uniq.append(ch)
+        uniq.sort()
+        sorted_unique = tuple(uniq)
+        K = len(sorted_unique)
+        ci_row = [sorted_unique.index(ch) for ch in record_chunks]
+        vi_row = [int(ep[1]) for ep in rec]
+        bucket = cells_by_K.setdefault(K, {}).setdefault(sorted_unique, ([], []))
+        bucket[0].append(ci_row)
+        bucket[1].append(vi_row)
+    for K, cells in cells_by_K.items():
+        arr = _open_or_create_kN_array(
+            level_group, delta=delta, K=K, sid_ndim=sid_ndim,
+            link_width=link_width, chunk_grid_shape=chunk_grid_shape,
+            chunk_origin=chunk_origin,
+        )
+        encoded = {
+            sc: _encode_cell_payload(ci, vi, link_width=link_width)
+            for sc, (ci, vi) in cells.items()
+        }
+        _write_cells_batched(arr, encoded, chunk_origin=chunk_origin)
+    return len(records)
+
+
 # Default shard-shape axis for kN sharded vlen-bytes arrays.  Each
 # shard holds shard_size^(sid_ndim*K) cells.  Tuned for concurrent
 # writers touching different spatial regions — different writers
