@@ -127,6 +127,8 @@ def partition_edges(
     vertex_chunks: npt.NDArray[np.int64],
     vertex_local_indices: npt.NDArray[np.int64],
     chunk_coords_list: list[ChunkCoords],
+    *,
+    include_intra: bool = True,
 ) -> tuple[dict[ChunkCoords, npt.NDArray[np.int64]], list[CrossChunkLink]]:
     """Partition edges into intra-chunk and cross-chunk.
 
@@ -139,10 +141,16 @@ def partition_edges(
             within its chunk's fragment.
         chunk_coords_list: Ordered list of unique chunk coordinates.
             ``vertex_chunks[i]`` indexes into this list.
+        include_intra: When ``False``, skip building the per-chunk
+            intra-edge dict and return ``{}`` for it.  Callers that only
+            need ``cross_links`` (e.g. the skeleton writer, which stores
+            intra branch links from a separate partition) avoid the
+            redundant ``np.unique`` grouping over the full edge set.
 
     Returns:
         intra_edges: Dict mapping ``chunk_coords`` → ``(M_local, 2)``
             array of local-index edge pairs (both endpoints in this chunk).
+            Empty when ``include_intra=False``.
         cross_links: List of :data:`CrossChunkLink` for edges spanning
             chunk boundaries.
     """
@@ -155,21 +163,20 @@ def partition_edges(
     same_chunk = src_chunk == dst_chunk  # (M,)
 
     # --- Intra-chunk edges ---
-    intra_mask = same_chunk
-    intra_edges_global = edges[intra_mask]
-    intra_src_chunk = src_chunk[intra_mask]
-
     intra: dict[ChunkCoords, list[tuple[int, int]]] = {}
-    # Vectorised: group by chunk
-    for chunk_idx in np.unique(intra_src_chunk):
-        mask_c = intra_src_chunk == chunk_idx
-        e_global = intra_edges_global[mask_c]
-        # Remap to local indices
-        local_src = vertex_local_indices[e_global[:, 0]]
-        local_dst = vertex_local_indices[e_global[:, 1]]
-        local_edges = np.stack([local_src, local_dst], axis=1)
-        coord = chunk_coords_list[int(chunk_idx)]
-        intra[coord] = local_edges
+    if include_intra:
+        intra_edges_global = edges[same_chunk]
+        intra_src_chunk = src_chunk[same_chunk]
+        # Vectorised: group by chunk
+        for chunk_idx in np.unique(intra_src_chunk):
+            mask_c = intra_src_chunk == chunk_idx
+            e_global = intra_edges_global[mask_c]
+            # Remap to local indices
+            local_src = vertex_local_indices[e_global[:, 0]]
+            local_dst = vertex_local_indices[e_global[:, 1]]
+            local_edges = np.stack([local_src, local_dst], axis=1)
+            coord = chunk_coords_list[int(chunk_idx)]
+            intra[coord] = local_edges
 
     # --- Cross-chunk edges ---
     cross_mask = ~same_chunk

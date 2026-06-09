@@ -532,20 +532,21 @@ def read_mesh(
                 axis=1,
             )
             if not np.all(node_mask):
+                n_total = len(positions_out)
                 keep = np.flatnonzero(node_mask)
-                keep_set = set(keep.tolist())
                 positions_out = positions_out[keep]
 
-                old_to_new = {int(old): new for new, old in enumerate(keep)}
-                filtered: list[npt.NDArray] = []
-                for f in faces_out:
-                    if all(int(v) in keep_set for v in f):
-                        filtered.append(np.array([old_to_new[int(v)] for v in f]))
-                faces_out = (
-                    np.stack(filtered).astype(np.int64)
-                    if filtered
-                    else np.zeros((0, link_width), dtype=np.int64)
-                )
+                # Vectorized remap via a lookup table (mirrors read_graph):
+                # dropped vertices map to -1; a face survives only if every
+                # endpoint survives.
+                if len(faces_out) > 0:
+                    remap = np.full(n_total, -1, dtype=np.int64)
+                    remap[keep] = np.arange(len(keep), dtype=np.int64)
+                    new_faces = remap[faces_out]
+                    keep_mask = (new_faces >= 0).all(axis=1)
+                    faces_out = new_faces[keep_mask].astype(np.int64, copy=False)
+                else:
+                    faces_out = np.zeros((0, link_width), dtype=np.int64)
 
         return {
             "vertices": positions_out,

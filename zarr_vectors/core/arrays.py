@@ -1560,14 +1560,21 @@ def write_cross_chunk_links(
         # their existing contents.
         existing_total = 0
         if level_group.array_exists(full_name):
-            for existing_key in level_group.list_chunks(full_name):
-                # Count existing rows in this cell — we don't need the
-                # decoded values unless this cell is also being appended.
-                blob = level_group.read_bytes(full_name, existing_key)
-                existing_rows = decode_ragged_blob(
-                    blob, np.dtype(np.int64), ncols=record_len_int64,
-                )
-                existing_total += len(existing_rows)
+            # The total existing record count is persisted in the family
+            # meta ``num_links`` — read it in O(1) rather than decoding
+            # every cell (append cost must scale with the batch, not the
+            # whole store).  Fall back to a full scan only for older
+            # stores written before ``num_links`` was recorded.
+            existing_meta = level_group.read_array_meta(full_name) or {}
+            if "num_links" in existing_meta:
+                existing_total = int(existing_meta["num_links"])
+            else:
+                for existing_key in level_group.list_chunks(full_name):
+                    blob = level_group.read_bytes(full_name, existing_key)
+                    existing_rows = decode_ragged_blob(
+                        blob, np.dtype(np.int64), ncols=record_len_int64,
+                    )
+                    existing_total += len(existing_rows)
         first_new = existing_total
 
         for cell_key, rows in bucket_entries.items():
@@ -2625,15 +2632,29 @@ def read_cross_chunk_links(
         rows = decode_ragged_blob(
             blob, np.dtype(np.int64), ncols=record_len,
         )
-        for row in rows:
-            row_arr = np.asarray(row).reshape(-1)
-            perm_idx = int(row_arr[0])
-            vi_canonical = [int(v) for v in row_arr[1:1 + link_width]]
-            canonical_endpoints = list(zip(canonical_chunks, vi_canonical))
-            input_order = apply_perm_inverse(
-                canonical_endpoints, perm_idx, link_width,
-            )
-            out.append(tuple(input_order))
+        if not rows:
+            continue
+        # Decode the whole cell once into an (R, record_len) array and pull
+        # the perm column + vi columns out in two C-level conversions,
+        # instead of ``np.asarray(row).reshape(-1)`` + per-element int casts
+        # per record.
+        rows_arr = np.asarray(rows, dtype=np.int64).reshape(len(rows), record_len)
+        perm_list = rows_arr[:, 0].tolist()
+        vi_list = rows_arr[:, 1:1 + link_width].tolist()
+        if link_width == 2:
+            # The only 2-endpoint perms are identity (0) and swap (1);
+            # avoid the per-row Lehmer decode in apply_perm_inverse.
+            cc0, cc1 = canonical_chunks[0], canonical_chunks[1]
+            for perm_idx, (v0, v1) in zip(perm_list, vi_list):
+                ep0 = (cc0, v0)
+                ep1 = (cc1, v1)
+                out.append((ep0, ep1) if perm_idx == 0 else (ep1, ep0))
+        else:
+            for perm_idx, vi_canonical in zip(perm_list, vi_list):
+                canonical_endpoints = list(zip(canonical_chunks, vi_canonical))
+                out.append(tuple(apply_perm_inverse(
+                    canonical_endpoints, perm_idx, link_width,
+                )))
     return out
 
 

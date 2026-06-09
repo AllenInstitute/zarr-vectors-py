@@ -42,6 +42,7 @@ from zarr_vectors.core.arrays import (
     resolve_chunk_keys,
     read_all_groupings,
     read_all_object_manifests,
+    read_object_manifest,
     read_chunk_vertices,
     read_cross_chunk_links,
     read_group_object_ids,
@@ -564,6 +565,12 @@ def read_polylines(
         except ValueError:
             return _empty_polyline_result()
 
+    # An explicitly-named object/group subset lets us read only those
+    # objects' manifests and the chunks they reference, instead of the
+    # whole store (see the selective path below).  Captured before the
+    # group resolution / range fallback mutates ``object_ids``.
+    explicit_subset = object_ids is not None or group_ids is not None
+
     # Resolve group_ids → object_ids
     if group_ids is not None:
         resolved: set[int] = set()
@@ -605,46 +612,74 @@ def read_polylines(
     result_polylines: list[list[npt.NDArray]] = []
     total_verts = 0
 
-    # Prefetch every vertex chunk (and its offsets sidecar) + the
-    # object_index sidecar in one async gather.  Including OBJECT_INDEX
-    # is critical: without it, ``read_all_object_manifests`` would re-
-    # read it for every call, and ``read_object_vertices`` / the bbox
-    # branch below would re-read it once per oid — making the loop
-    # O(N²).  With prefetch, all subsequent decode calls are cache hits.
-    # The OBJECT_INDEX entry serves legacy ``data``/``offsets`` stores;
-    # ``vlen_manifests_v1`` stores read the ragged ``manifests`` array
-    # directly (one chunk per request) and the prefetch is a harmless
-    # no-op for them.
-    chunk_key_strs = [
-        ".".join(str(c) for c in cc)
-        for cc in list_chunk_keys(level_group, VERTICES)
-    ]
-    prefetch_plan: list[tuple[str, list[str]]] = [
-        (VERTICES, chunk_key_strs),
-        (VERTEX_FRAGMENTS, chunk_key_strs),
-        (OBJECT_INDEX, ["data", "offsets"]),
-    ]
+    # Choose between a selective read (an explicit object/group subset —
+    # read only those objects' manifests and the chunks they reference,
+    # O(subset)) and a full read (decode every manifest + vertex chunk
+    # once, O(store), best when returning the whole store).
+    manifest_by_oid: dict[int, ObjectManifest] = {}
+    if explicit_subset:
+        needed_chunks: set[ChunkCoords] = set()
+        for oid in object_ids:
+            try:
+                m = read_object_manifest(level_group, oid)
+            except Exception:
+                continue  # missing/out-of-range oid — skip
+            manifest_by_oid[oid] = m
+            for cc, _fi in m:
+                needed_chunks.add(cc)
+        # Only whitelist chunks are ever read from the cache in crop mode,
+        # so don't bother materialising the rest.
+        if chunk_whitelist is not None:
+            needed_chunks &= chunk_whitelist
+        chunk_iter = sorted(needed_chunks)
+        chunk_key_strs = [".".join(str(c) for c in cc) for cc in chunk_iter]
+        prefetch_plan: list[tuple[str, list[str]]] = [
+            (VERTICES, chunk_key_strs),
+            (VERTEX_FRAGMENTS, chunk_key_strs),
+        ]
+    else:
+        # Full read: prefetch every vertex chunk (+ offsets sidecar) and the
+        # legacy OBJECT_INDEX ``data``/``offsets`` sidecar in one async
+        # gather.  ``vlen_manifests_v1`` stores read the ragged ``manifests``
+        # array directly (one chunk per request); the OBJECT_INDEX entry is
+        # a harmless no-op for them.
+        chunk_key_strs = [
+            ".".join(str(c) for c in cc)
+            for cc in list_chunk_keys(level_group, VERTICES)
+        ]
+        chunk_iter = [
+            tuple(int(c) for c in cc.split(".")) for cc in chunk_key_strs
+        ]
+        prefetch_plan = [
+            (VERTICES, chunk_key_strs),
+            (VERTEX_FRAGMENTS, chunk_key_strs),
+            (OBJECT_INDEX, ["data", "offsets"]),
+        ]
 
     _batched_reads_cm = level_group.batched_reads(prefetch_plan)
     _batched_reads_cm.__enter__()
     try:
-        # Read all manifests once.  The per-object loop below indexes
-        # into this list — no per-iteration manifest read.
-        try:
-            manifests = read_all_object_manifests(level_group)
-        except Exception:
-            manifests = []
+        if explicit_subset:
+            def _get_manifest(oid: int) -> ObjectManifest | None:
+                return manifest_by_oid.get(oid)
+        else:
+            # Read all manifests once.  The per-object loop indexes into
+            # this list — no per-iteration manifest read.
+            try:
+                manifests = read_all_object_manifests(level_group)
+            except Exception:
+                manifests = []
 
-        # Decode every chunk's fragments exactly once.  The per-
-        # object dispatch then slices from this cache — replacing
-        # O(K_per_chunk · N_per_chunk) per-call ``_read_vertex_offsets``
-        # work with O(K_per_chunk) per chunk.
+            def _get_manifest(oid: int) -> ObjectManifest | None:
+                if 0 <= oid < len(manifests):
+                    return manifests[oid]
+                return None
+
+        # Decode each materialised chunk's fragments exactly once.  The
+        # per-object dispatch then slices from this cache — O(K_per_chunk)
+        # per chunk instead of per-call offset recomputation.
         chunk_cache: dict[ChunkCoords, list[npt.NDArray]] = {}
-        list_chunks = [
-            tuple(int(c) for c in cc.split("."))
-            for cc in chunk_key_strs
-        ]
-        for cc in list_chunks:
+        for cc in chunk_iter:
             try:
                 chunk_cache[cc] = read_chunk_vertices(
                     level_group, cc, dtype=dtype, ndim=ndim,
@@ -664,9 +699,7 @@ def read_polylines(
             # ------------------------------------------------------------------
             # Segment-level crop mode (chunks=).
             # ------------------------------------------------------------------
-            if oid < 0 or oid >= len(manifests):
-                continue
-            obj_manifest = manifests[oid]
+            obj_manifest = _get_manifest(oid)
             if not obj_manifest:
                 continue
 
