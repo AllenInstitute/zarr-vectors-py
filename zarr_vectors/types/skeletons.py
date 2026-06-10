@@ -228,6 +228,8 @@ def write_skeleton_chunk(
     attr_groups: dict[str, list[npt.NDArray]] = {n: [] for n in attr_names}
     records: list[tuple[int, ChunkCoords, int]] = []
     frag_seg_ids: list[int] = []
+    frag_obj_ids: list[int] = []
+    frag_has_obj_id: list[bool] = []
     anchor_locs: dict[Any, tuple[ChunkCoords, int]] = {}
     cc_tuple = tuple(int(c) for c in chunk_coords)
 
@@ -242,7 +244,8 @@ def write_skeleton_chunk(
         # ``segment_id`` (level 0, where the tools-side object-index reduce
         # remaps segment ids → OIDs).
         seg = int(piece["segment_id"])
-        obj_key = int(piece.get("object_id", seg))
+        piece_has_obj_id = "object_id" in piece
+        obj_key = int(piece["object_id"]) if piece_has_obj_id else seg
         piece_base = chunk_offset
         # Each non-root path's start carries one branch link (chunk-local).
         blink_at_start = {ch_o: (ch_o, par_o) for ch_o, par_o in blinks}
@@ -263,6 +266,9 @@ def write_skeleton_chunk(
             link_groups.append(np.asarray(lg, dtype=np.int64).reshape(-1, 2))
             records.append((obj_key, cc_tuple, fragment_idx))
             frag_seg_ids.append(seg)
+            frag_has_obj_id.append(piece_has_obj_id)
+            if piece_has_obj_id:
+                frag_obj_ids.append(obj_key)
             fragment_idx += 1
         anchors = piece.get("anchors")
         if anchors:
@@ -286,6 +292,15 @@ def write_skeleton_chunk(
         seg_ids = np.asarray(frag_seg_ids, dtype=np.uint64)
         write_chunk_fragment_attributes(
             level_group, "segment_id", chunk_coords, seg_ids, dtype=np.uint64,
+        )
+    if any(frag_has_obj_id):
+        if not all(frag_has_obj_id):
+            raise ValueError(
+                "write_skeleton_chunk received mixed pieces with and without object_id"
+            )
+        obj_ids = np.asarray(frag_obj_ids, dtype=np.uint64)
+        write_chunk_fragment_attributes(
+            level_group, "object_id", chunk_coords, obj_ids, dtype=np.uint64,
         )
     return records, anchor_locs
 
