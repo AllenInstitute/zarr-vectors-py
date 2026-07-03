@@ -1008,6 +1008,7 @@ class EditSession:
     def _flush_ccl_ops(self) -> None:
         if not self._ccl_ops:
             return
+        from zarr_vectors.constants import LINKS_IMPLICIT_SEQUENTIAL
         from zarr_vectors.core.arrays import (
             read_cross_chunk_links,
             write_cross_chunk_links,
@@ -1017,6 +1018,9 @@ class EditSession:
 
         meta = RootMetadata.from_dict(self.root.attrs.to_dict())
         sid_ndim = meta.sid_ndim
+        # Walk-order (streamline/polyline) stores must preserve endpoint
+        # order — see the `directed` param on write_cross_chunk_links.
+        directed = meta.links_convention == LINKS_IMPLICIT_SEQUENTIAL
 
         # Group by (level, delta).  Only level 0 is the common edit
         # target today; we still group generically.
@@ -1039,7 +1043,9 @@ class EditSession:
                 elif op.op == "overwrite":
                     if op.index is not None and 0 <= op.index < len(rows):
                         rows[op.index] = list(op.payload or [])
-            write_cross_chunk_links(level_group, rows, sid_ndim, delta=delta)
+            write_cross_chunk_links(
+                level_group, rows, sid_ndim, delta=delta, directed=directed,
+            )
 
     def _flush_manifest_ops(self) -> None:
         if not self._manifest_ops:

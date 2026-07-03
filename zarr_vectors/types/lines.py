@@ -304,7 +304,7 @@ def write_lines(
     with level_group.batched_writes(compressor=compressor):
         create_vertices_array(level_group, dtype=dtype)
         create_object_index_array(level_group)
-        create_cross_chunk_links_array(level_group, delta=0)
+        create_cross_chunk_links_array(level_group, delta=0, sid_ndim=idx_ndim)
         if line_attributes:
             for name in line_attributes:
                 create_object_attributes_array(level_group, name)
@@ -320,6 +320,7 @@ def write_lines(
         if cross_links:
             write_cross_chunk_links(
                 level_group, cross_links, sid_ndim=idx_ndim, delta=0,
+                directed=True,
             )
             stamp_ccl_capabilities(root)
 

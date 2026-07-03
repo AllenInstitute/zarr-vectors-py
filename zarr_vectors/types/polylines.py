@@ -149,6 +149,13 @@ def write_polylines(
 
     if n_polylines == 0:
         raise ArrayError("Cannot write empty polyline list")
+    if fragment_attributes and "segment_id" in fragment_attributes:
+        raise ArrayError(
+            "fragment_attributes cannot supply 'segment_id' — it is "
+            "written automatically (the object/polyline id) and read by "
+            "the chunk-local pyramid coarsener to reconstruct object "
+            "connectivity without a full manifest scan"
+        )
 
     # Determine dimensionality from first polyline
     ndim = polylines[0].shape[1]
@@ -227,9 +234,7 @@ def write_polylines(
             k: v for k, v in vertex_attributes.items() if k != chunk_by_attribute
         }
 
-    arrays_present = [VERTICES, "object_index"]
-    if fragment_attributes:
-        arrays_present.append(FRAGMENT_ATTRIBUTES)
+    arrays_present = [VERTICES, "object_index", FRAGMENT_ATTRIBUTES]
     level_chunk_dims: list[str] | None = None
     if chunk_by_attribute is not None:
         level_chunk_dims = compute_chunk_dim_names(
@@ -363,7 +368,7 @@ def write_polylines(
     with level_group.batched_writes(compressor=compressor):
         create_vertices_array(level_group, dtype=dtype)
         create_object_index_array(level_group)
-        create_cross_chunk_links_array(level_group, delta=0)
+        create_cross_chunk_links_array(level_group, delta=0, sid_ndim=idx_ndim)
         if vertex_attributes:
             for attr_name, attr_list in vertex_attributes.items():
                 sample = attr_list[0]
@@ -374,6 +379,12 @@ def write_polylines(
         if object_attributes:
             for name in object_attributes:
                 create_object_attributes_array(level_group, name)
+
+        # segment_id is always written: it's the dense object id (poly_id)
+        # per fragment, and lets the chunk-local pyramid coarsener recover
+        # object connectivity from local reads alone (no whole-level
+        # manifest scan) — the same convention the TRK ingest path uses.
+        create_fragment_attribute_array(level_group, "segment_id", dtype="uint64")
 
         fragment_attr_dtypes: dict[str, np.dtype] = {}
         if fragment_attributes:
@@ -398,6 +409,10 @@ def write_polylines(
             vert_groups = [e[1] for e in entries]
             write_chunk_vertices(
                 level_group, chunk_coords, vert_groups, dtype=np_dtype,
+            )
+            seg_ids = np.array([e[0] for e in entries], dtype=np.uint64)
+            write_chunk_fragment_attributes(
+                level_group, "segment_id", chunk_coords, seg_ids, dtype=np.uint64,
             )
 
             # Write attributes per chunk
@@ -437,6 +452,7 @@ def write_polylines(
         if all_cross_links:
             write_cross_chunk_links(
                 level_group, all_cross_links, sid_ndim=idx_ndim, delta=0,
+                directed=True,
             )
             stamp_ccl_capabilities(root)
 

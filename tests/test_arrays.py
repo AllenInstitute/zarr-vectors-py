@@ -51,6 +51,7 @@ from zarr_vectors.core.arrays import (
     write_object_attributes,
     write_object_index,
 )
+from zarr_vectors.core.paths import cross_chunk_links_path
 from zarr_vectors.core.store import FsGroup
 from zarr_vectors.encoding.fragments import encode_fragments
 from zarr_vectors.exceptions import ArrayError
@@ -585,6 +586,39 @@ class TestCrossChunkLinks:
 
         read_back = read_cross_chunk_links(lg)
         assert read_back[0] == links[0]
+
+    def test_undirected_canonicalizes_lex_decreasing_record(
+        self, tmp_path: Path,
+    ) -> None:
+        # Predecessor chunk (1,0,0) is lexically GREATER than successor
+        # chunk (0,0,0) — the default (undirected) canonicalization
+        # swaps endpoint order so endpoint 0 is at the lex-smaller chunk.
+        lg = _make_level_group(tmp_path)
+        create_cross_chunk_links_array(lg)
+        links = [(((1, 0, 0), 5), ((0, 0, 0), 2))]
+        write_cross_chunk_links(lg, links, sid_ndim=3)
+
+        read_back = read_cross_chunk_links(lg)
+        assert read_back[0] == (((0, 0, 0), 2), ((1, 0, 0), 5))
+
+    def test_directed_preserves_lex_decreasing_record(
+        self, tmp_path: Path,
+    ) -> None:
+        # Same lex-decreasing crossing as above, but `directed=True`
+        # (walk-order data: streamlines/polylines) must preserve
+        # endpoint 0 = predecessor, endpoint 1 = successor exactly as
+        # given — canonicalizing here would silently flip a synthesized
+        # tangent's direction on the reader side.
+        lg = _make_level_group(tmp_path)
+        create_cross_chunk_links_array(lg)
+        links = [(((1, 0, 0), 5), ((0, 0, 0), 2))]
+        write_cross_chunk_links(lg, links, sid_ndim=3, directed=True)
+
+        read_back = read_cross_chunk_links(lg)
+        assert read_back[0] == links[0]
+
+        meta = lg.read_array_meta(cross_chunk_links_path(0))
+        assert meta.get("directed") is True
 
 
 # ===================================================================

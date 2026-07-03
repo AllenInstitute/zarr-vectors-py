@@ -487,6 +487,7 @@ def create_cross_chunk_links_array(
         "zv_array": "cross_chunk_links",
         "level_delta": int(delta),
         "link_width": int(link_width),
+        "layout": "sharded_v1",
     }
     if sid_ndim is not None:
         meta["sid_ndim"] = int(sid_ndim)
@@ -1164,6 +1165,7 @@ def write_cross_chunk_links(
     delta: int = 0,
     link_width: int | None = None,
     mode: Literal["replace", "append"] = "replace",
+    directed: bool = False,
 ) -> int:
     """Write cross-chunk link records under ``cross_chunk_links/<delta>/``.
 
@@ -1179,9 +1181,15 @@ def write_cross_chunk_links(
     (1 ≤ K ≤ link_width).  Each leaf stores ``L * uint8 ci`` + ``L *
     int64 vi`` per record (``9 * link_width`` bytes per record); chunk
     coords come from the leaf path's K sorted segments, not the
-    payload.  For ``delta=0, link_width=2`` (undirected edges) records
-    are canonicalized so ``ci = [0, 1]`` — both orientations of an
-    edge collapse into one.
+    payload.  For ``delta=0, link_width=2`` **undirected** edges (the
+    default, ``directed=False``) records are canonicalized so ``ci =
+    [0, 1]`` — both orientations of an edge collapse into one.  Pass
+    ``directed=True`` to skip this for walk-order data (streamlines,
+    polylines) where endpoint 0 must remain the predecessor and
+    endpoint 1 the successor — canonicalizing by lexically-smaller
+    chunk would silently swap them whenever a path crosses a boundary
+    in the lexically-decreasing direction, corrupting the direction a
+    reader needs to synthesize a consistent walk-order tangent.
 
     Records may be passed either as legacy 2-tuples (compatibility
     with the pre-0.6.0 edge-only API) or as a list of endpoint lists
@@ -1205,6 +1213,16 @@ def write_cross_chunk_links(
             existing leaf, concatenates ``links``, writes back.
             ``link_width`` of the appended records must match the
             existing ``link_width``.
+        directed: When ``True``, skip the ``delta=0, link_width=2``
+            lex-smaller-chunk canonicalization and preserve each
+            record's endpoint order exactly as passed in.  Set this
+            for walk-order (streamline/polyline) writers; leave the
+            default ``False`` for undirected geometries (graphs,
+            meshes, skeletons).  Must be used consistently for a given
+            ``cross_chunk_links/<delta>/`` group — mixing directed and
+            undirected writes to the same group (e.g. across
+            ``"append"`` calls) reintroduces the corruption this flag
+            avoids.
 
     Returns:
         ``"replace"`` returns ``0``.  ``"append"`` returns the
@@ -1280,13 +1298,16 @@ def write_cross_chunk_links(
         combined = normalised
 
     # Apply canonicalization for delta=0, link_width=2 undirected
-    # edges: endpoint 0 must be at the lex-smaller chunk.
-    if delta == 0 and link_width == 2:
+    # edges: endpoint 0 must be at the lex-smaller chunk.  Skipped for
+    # directed (walk-order) writers — see the `directed` docstring.
+    if delta == 0 and link_width == 2 and not directed:
         combined = [_canonicalize_l2_delta0(rec) for rec in combined]
 
     # Re-stamp the group meta with sid_ndim, link_width, layout,
     # shard_shape.  Drop num_links + leaf_index; per-K arrays carry
-    # their own meta.
+    # their own meta.  `directed` records whether endpoint order was
+    # preserved (skipping delta=0/link_width=2 canonicalization) so
+    # readers/validators don't have to guess — see the `directed` arg.
     full_name = cross_chunk_links_path(delta)
     _ensure_array_dir(level_group, full_name)
     level_group.write_array_meta(full_name, {
@@ -1294,6 +1315,8 @@ def write_cross_chunk_links(
         "sid_ndim": int(sid_ndim),
         "level_delta": int(delta),
         "link_width": int(link_width),
+        "layout": "sharded_v1",
+        "directed": bool(directed),
     })
 
     # Partition records by K = number of distinct chunks → group by
@@ -1419,6 +1442,7 @@ def write_cross_chunk_link_cells(
     chunk_origin: tuple[int, ...],
     delta: int = 0,
     link_width: int = 2,
+    directed: bool = False,
 ) -> int:
     """Write a batch of cross-chunk-link records' cells, leaving other cells intact.
 
@@ -1429,11 +1453,20 @@ def write_cross_chunk_link_cells(
     The ``kN`` arrays must already exist with a matching ``chunk_grid_shape`` /
     ``chunk_origin`` (see :func:`create_cross_chunk_link_kN_arrays`).  Returns the
     number of records written.
+
+    Args:
+        directed: When ``True``, skip the ``delta=0, link_width=2``
+            lex-smaller-chunk canonicalization and preserve each record's
+            endpoint order exactly as passed in — see
+            :func:`write_cross_chunk_links`'s ``directed`` docstring for why
+            this matters for walk-order (streamline/polyline) data.  Must
+            match the ``directed``-ness of whatever wrote (or will write)
+            other cells in the same ``cross_chunk_links/<delta>/`` group.
     """
     records = [list(r) for r in links]
     if not records:
         return 0
-    if delta == 0 and link_width == 2:
+    if delta == 0 and link_width == 2 and not directed:
         records = [_canonicalize_l2_delta0(rec) for rec in records]
     cells_by_K: dict[int, dict[tuple[ChunkCoords, ...], tuple[list, list]]] = {}
     for rec in records:
@@ -3005,10 +3038,35 @@ def list_cross_chunk_link_leaves(
         origin_attr = tuple(
             int(x) for x in arr.attrs.get("chunk_origin", (0,) * sid_ndim)
         )
+        # ``target``, if given, can only appear in a shard whose cell-index
+        # range covers it in AT LEAST ONE of the K per-endpoint axis-blocks
+        # (each block is `sid_ndim` consecutive axes holding one sorted
+        # chunk coordinate).  Testing that from the shard coordinate alone
+        # (no array read) turns this from an O(every populated shard in the
+        # level) scan into O(shards that could plausibly touch `target`) —
+        # essential for callers like the pyramid coarsener that call this
+        # once per chunk across a whole level.
+        target_shifted = (
+            tuple(target[a] - origin_attr[a] for a in range(sid_ndim))
+            if target is not None else None
+        )
         for shard_coord in _walk_populated_shards(arr):
             shard_origin = tuple(
                 shard_coord[i] * shard_shape[i] for i in range(arr.ndim)
             )
+            if target_shifted is not None:
+                hit = False
+                for k in range(K):
+                    lo = shard_origin[k * sid_ndim:(k + 1) * sid_ndim]
+                    hi = shard_shape[k * sid_ndim:(k + 1) * sid_ndim]
+                    if all(
+                        lo[a] <= target_shifted[a] < lo[a] + hi[a]
+                        for a in range(sid_ndim)
+                    ):
+                        hit = True
+                        break
+                if not hit:
+                    continue
             for cell_idx, _payload in _iter_populated_cells_in_shard(
                 arr, shard_origin, shard_shape,
             ):

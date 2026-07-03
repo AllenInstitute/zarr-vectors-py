@@ -194,7 +194,7 @@ def validate_consistency(store_path: str | Path) -> ValidationResult:
         #  - no legacy monolithic ``data`` blob present
         #  - cell-payload byte length % (9 * link_width) == 0
         #  - ci_i ∈ [0, K-1] and coverage set(ci) == {0..K-1}
-        #  - canonical ci = [0, 1] for delta=0 link_width=2
+        #  - canonical ci = [0, 1] for delta=0 link_width=2 (undirected groups only)
         #  - cell-coord K chunk segments are in strict lex order
         #  - chunk existence at the relevant level
         #  - same-chunk warning for populated k1 cells
@@ -217,6 +217,7 @@ def validate_consistency(store_path: str | Path) -> ValidationResult:
                 continue
             link_width = int(ccl_meta.get("link_width", 0))
             sid_ndim_meta = int(ccl_meta.get("sid_ndim", 0)) or ndim
+            ccl_directed = bool(ccl_meta.get("directed", False))
             if link_width <= 0:
                 # Group exists with no records yet (writer stamps
                 # link_width when first cell is written).  Nothing to
@@ -324,9 +325,12 @@ def validate_consistency(store_path: str | Path) -> ValidationResult:
                                     f"{prefix}: ccl[delta={d}] k{K} record ci set "
                                     f"{sorted(ci_seen)} does not cover {{0..{K - 1}}}"
                                 )
-                            if d == 0 and link_width == 2 and K == 2:
+                            if d == 0 and link_width == 2 and K == 2 and not ccl_directed:
                                 # Canonical ci = [0, 1]: endpoint 0 must be at
-                                # smaller chunk, endpoint 1 at larger.
+                                # smaller chunk, endpoint 1 at larger.  Skipped
+                                # for directed (walk-order) groups, which
+                                # intentionally preserve predecessor/successor
+                                # endpoint order instead.
                                 if rec[0][0] != sorted_chunks[0] or rec[1][0] != sorted_chunks[1]:
                                     result.add_error(
                                         f"{prefix}: ccl[delta=0] k2 record not "
