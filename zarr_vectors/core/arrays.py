@@ -455,6 +455,7 @@ def create_cross_chunk_links_array(
     delta: int = 0,
     link_width: int = 2,
     sid_ndim: int | None = None,
+    directed: bool = False,
     exist_ok: bool = True,
 ) -> None:
     """Create a ``cross_chunk_links/<delta>/`` array (v0.8 vlen-bytes layout).
@@ -476,6 +477,14 @@ def create_cross_chunk_links_array(
             3 for triangle faces, 1 for parent→child metanode refs.
         sid_ndim: Spatial-index dimension arity, stamped on group meta.
             Defaulted by writers when omitted here.
+        directed: Stamped on group meta so readers/validators know
+            ``delta=0, link_width=2`` records are walk-order (predecessor
+            -> successor) and intentionally NOT lex-canonicalized — set
+            this when the group will be populated by a decentralized
+            directed writer (e.g. :func:`write_cross_chunk_link_cells`
+            with ``directed=True``), since that writer (unlike
+            :func:`write_cross_chunk_links`) writes into a pre-created
+            array and has no whole-group meta to stamp itself.
         exist_ok: When True (default), no-op if the group already exists.
             When False, raise :class:`ArrayError` on conflict.
     """
@@ -488,6 +497,7 @@ def create_cross_chunk_links_array(
         "level_delta": int(delta),
         "link_width": int(link_width),
         "layout": "sharded_v1",
+        "directed": bool(directed),
     }
     if sid_ndim is not None:
         meta["sid_ndim"] = int(sid_ndim)
@@ -1414,6 +1424,7 @@ def create_cross_chunk_link_kN_arrays(
     chunk_grid_shape: tuple[int, ...],
     chunk_origin: tuple[int, ...],
     max_K: int | None = None,
+    directed: bool = False,
 ) -> None:
     """Pre-create the ``kN`` sharded cross-chunk-link arrays (``k1..kK``).
 
@@ -1422,9 +1433,18 @@ def create_cross_chunk_link_kN_arrays(
     ``chunk_origin``.  A single coordinator calls this once with the **level-wide**
     ``chunk_grid_shape`` / ``chunk_origin`` (from the target level's chunk bounds);
     workers then only *write cells* into the pre-created arrays.
+
+    Args:
+        directed: Pass ``True`` when workers will call
+            :func:`write_cross_chunk_link_cells` with ``directed=True`` (e.g.
+            walk-order streamline data) — stamps the group meta so
+            validators don't flag the resulting non-canonical ``delta=0,
+            link_width=2`` endpoint order.  Must match what workers actually
+            do; see :func:`create_cross_chunk_links_array`'s ``directed`` arg.
     """
     create_cross_chunk_links_array(
         level_group, delta=0, link_width=link_width, sid_ndim=sid_ndim,
+        directed=directed,
     )
     for K in range(1, (max_K or link_width) + 1):
         _open_or_create_kN_array(
