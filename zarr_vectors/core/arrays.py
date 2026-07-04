@@ -1424,6 +1424,7 @@ def create_cross_chunk_link_kN_arrays(
     chunk_grid_shape: tuple[int, ...],
     chunk_origin: tuple[int, ...],
     max_K: int | None = None,
+    min_K: int = 1,
     directed: bool = False,
 ) -> None:
     """Pre-create the ``kN`` sharded cross-chunk-link arrays (``k1..kK``).
@@ -1435,6 +1436,23 @@ def create_cross_chunk_link_kN_arrays(
     workers then only *write cells* into the pre-created arrays.
 
     Args:
+        max_K: Highest K-bucket to pre-create (defaults to ``link_width``).
+        min_K: Lowest K-bucket to pre-create (default ``1``).  Raise this to
+            skip K-buckets a caller knows can never be populated — e.g.
+            walk-order streamline data can never produce a same-chunk
+            (K=1) cross-chunk-link record (a genuine cross-target
+            transition, by construction, always connects two DIFFERENT
+            chunks), so pre-creating ``k1`` would leave a permanently
+            empty array on disk (metadata present, zero shard files).
+            Neuroglancer's reader does not treat that the same as "this
+            K-bucket doesn't exist" — it 404s fetching a cell out of the
+            empty array and fails the whole chunk download, which cascades
+            into the LOD picker falling back to the finest level.  The old
+            whole-level ``write_cross_chunk_links`` writer never hit this
+            because it only ever created K-buckets that actually had data;
+            decentralized writers must know in advance which K-buckets to
+            skip since they can't discover "no K=1 data exists anywhere in
+            this level" without a level-wide scan.
         directed: Pass ``True`` when workers will call
             :func:`write_cross_chunk_link_cells` with ``directed=True`` (e.g.
             walk-order streamline data) — stamps the group meta so
@@ -1446,7 +1464,7 @@ def create_cross_chunk_link_kN_arrays(
         level_group, delta=0, link_width=link_width, sid_ndim=sid_ndim,
         directed=directed,
     )
-    for K in range(1, (max_K or link_width) + 1):
+    for K in range(min_K, (max_K or link_width) + 1):
         _open_or_create_kN_array(
             level_group, delta=0, K=K, sid_ndim=sid_ndim, link_width=link_width,
             chunk_grid_shape=chunk_grid_shape, chunk_origin=chunk_origin,
