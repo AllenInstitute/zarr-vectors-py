@@ -171,9 +171,23 @@ def _is_bytes_only_codecs(codecs: list[dict[str, Any]] | None) -> bool:
     return len(codecs) == 1 and codecs[0].get("name") == "bytes"
 
 
+def _normalize_triple(
+    item: tuple,
+) -> tuple[str, str, bytes, list[dict[str, Any]] | None]:
+    """Accept 3-tuples (legacy) or 4-tuples (with a per-write codec override).
+
+    The 4th element, when present, is a full Zarr V3 codecs list overriding
+    the batch-level ``codecs`` for that single write (used to write one
+    array uncompressed while siblings stay compressed).
+    """
+    array_name, chunk_key, data, *rest = item
+    override = rest[0] if rest else None
+    return array_name, chunk_key, data, override
+
+
 def _flush_batch_sync(
     zarr_group: zarr.Group,
-    triples: list[tuple[str, str, bytes]],
+    triples: list[tuple],
     array_metas: dict[str, dict[str, Any]],
     codecs: list[dict[str, Any]] | None = None,
 ) -> None:
@@ -181,7 +195,8 @@ def _flush_batch_sync(
     PUTs against array paths (icechunk) **and** for batches that need a
     real compressor in the codec pipeline (the fast async path can only
     PUT raw chunk bytes; with a compressor in the pipeline we have to go
-    through zarr's encoder).
+    through zarr's encoder) **and** for batches that mix per-write codec
+    overrides.
 
     Replays each queued operation through the zarr ``Array.create_array``
     + ``array[:] = data`` path that ``Group.write_bytes`` would have
@@ -191,9 +206,15 @@ def _flush_batch_sync(
     # the ``serializer=`` default and only accepts BytesBytes codecs in
     # ``compressors=``.
     from zarr_vectors.encoding.compression import codecs_for_create_array
-    extra_kwargs: dict[str, Any] = {}
-    if codecs is not None:
-        extra_kwargs["compressors"] = codecs_for_create_array(codecs)
+
+    def _extra_kwargs(effective: list[dict[str, Any]] | None) -> dict[str, Any]:
+        return (
+            {"compressors": codecs_for_create_array(effective)}
+            if effective is not None
+            else {}
+        )
+
+    batch_kwargs = _extra_kwargs(codecs)
 
     # Array metadata first so the parent group exists with the right
     # attributes before any per-chunk array creation.
@@ -201,7 +222,9 @@ def _flush_batch_sync(
         arr_group = zarr_group.require_group(array_name)
         arr_group.attrs.update(meta)
 
-    for array_name, chunk_key, data in triples:
+    for item in triples:
+        array_name, chunk_key, data, override = _normalize_triple(item)
+        extra_kwargs = _extra_kwargs(override) if override is not None else batch_kwargs
         arr_group = zarr_group.require_group(array_name)
         if chunk_key in arr_group:
             del arr_group[chunk_key]
@@ -253,11 +276,15 @@ def flush_batch(
     blocks until they complete (or the first error propagates).
     Idempotent on empty inputs.
     """
-    triples = list(triples)
+    triples = [_normalize_triple(t) for t in triples]
     array_metas = dict(array_metas or {})
 
     if not triples and not array_metas:
         return
+
+    # Any per-write codec override forces the sync encoder path (the fast
+    # async PUT below can only emit raw bytes under one uniform codec).
+    has_overrides = any(override is not None for _, _, _, override in triples)
 
     # Icechunk doesn't pick up arrays added via raw ``store.set`` of
     # their ``zarr.json`` — it tracks arrays as first-class entities and
@@ -265,7 +292,11 @@ def flush_batch(
     # required when the codec pipeline includes a compressor: the fast
     # async PUT below can only emit raw bytes, so a compressor in the
     # pipeline must go through zarr's encoder.
-    if _is_icechunk_store(zarr_group.store) or not _is_bytes_only_codecs(codecs):
+    if (
+        _is_icechunk_store(zarr_group.store)
+        or not _is_bytes_only_codecs(codecs)
+        or has_overrides
+    ):
         _flush_batch_sync(zarr_group, triples, array_metas, codecs=codecs)
         return
 
@@ -278,7 +309,7 @@ def flush_batch(
     # — typically 2-6 names per batch).  Array_names with queued meta
     # skip require_group entirely; the meta PUT below creates the group
     # directly.
-    chunk_array_names = {array_name for array_name, _, _ in triples}
+    chunk_array_names = {array_name for array_name, _, _, _ in triples}
     needs_require_group = chunk_array_names - array_metas.keys()
     for array_name in sorted(needs_require_group):
         zarr_group.require_group(array_name)
@@ -292,8 +323,9 @@ def flush_batch(
             (f"{base_prefix}{array_name}/zarr.json", _group_zarr_json_bytes(meta))
         )
 
-    # Per-chunk inner-array PUTs.
-    for array_name, chunk_key, data in triples:
+    # Per-chunk inner-array PUTs.  (This path only runs when no per-write
+    # override is present, so the uniform batch ``codecs_json`` applies.)
+    for array_name, chunk_key, data, _override in triples:
         inner_prefix = f"{base_prefix}{array_name}/{chunk_key}/"
         n = len(data)
         puts.append(

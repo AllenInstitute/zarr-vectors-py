@@ -134,6 +134,66 @@ class TestVertexArrays:
         except ArrayError:
             pass
 
+    def test_uncompressed_range_addressable_layout(self, tmp_path: Path) -> None:
+        """compress=False writes raw, byte-range-addressable vertex chunks
+        and stamps the ``vertices_layout="raw_v1"`` capability, while the
+        decoded round-trip stays identical to the compressed path."""
+        import json
+        import zarr as _zarr
+
+        ZSTD_MAGIC = b"\x28\xb5\x2f\xfd"
+        store_dir = tmp_path / "store.zarr"
+
+        lg = _make_level_group(tmp_path)
+        create_vertices_array(lg, compress=False)
+
+        g0 = np.array([[0, 0, 0], [1, 1, 1]], dtype=np.float32)
+        g1 = np.array([[10, 10, 10], [11, 11, 11], [12, 12, 12]], dtype=np.float32)
+        write_chunk_vertices(lg, (0, 0, 0), [g0, g1], compress=False)
+
+        # (1) Capability flag stamped on the vertices array metadata.
+        vmeta = json.loads((store_dir / "0" / VERTICES / "zarr.json").read_text())
+        assert vmeta["attributes"]["vertices_layout"] == "raw_v1"
+
+        # (2) Inner chunk array uses a bytes-only codec pipeline (no zstd).
+        cmeta = json.loads(
+            (store_dir / "0" / VERTICES / "0.0.0" / "zarr.json").read_text()
+        )
+        codec_names = [c.get("name") for c in cmeta["codecs"]]
+        assert "zstd" not in codec_names and "blosc" not in codec_names
+
+        # (3) The chunk blob on disk is exactly the raw float bytes (no
+        # compression header) and is byte-range-addressable per fragment.
+        raw = (store_dir / "0" / VERTICES / "0.0.0" / "c" / "0").read_bytes()
+        expected = np.concatenate([g0, g1]).astype("<f4").tobytes()
+        assert raw == expected
+        assert raw[:4] != ZSTD_MAGIC
+        stride = 3 * 4  # rank * float32
+        # fragment 1 == rows [2, 5) → bytes [2*stride, 5*stride)
+        frag1_bytes = raw[2 * stride:5 * stride]
+        np.testing.assert_array_equal(
+            np.frombuffer(frag1_bytes, dtype="<f4").reshape(-1, 3), g1
+        )
+
+        # (4) Decoded round-trip is identical to the compressed path.
+        groups = read_chunk_vertices(lg, (0, 0, 0), dtype=np.float32, ndim=3)
+        assert len(groups) == 2
+        np.testing.assert_array_equal(groups[0], g0)
+        np.testing.assert_array_equal(groups[1], g1)
+        _zarr  # (imported to assert availability of the zarr runtime)
+
+    def test_compressed_default_has_no_layout_flag(self, tmp_path: Path) -> None:
+        """Default (compressed) path stays byte-for-byte legacy: no
+        ``vertices_layout`` flag stamped."""
+        import json
+
+        store_dir = tmp_path / "store.zarr"
+        lg = _make_level_group(tmp_path)
+        create_vertices_array(lg)  # compress=True default
+        write_chunk_vertices(lg, (0, 0, 0), [np.ones((4, 3), dtype=np.float32)])
+        vmeta = json.loads((store_dir / "0" / VERTICES / "zarr.json").read_text())
+        assert "vertices_layout" not in vmeta["attributes"]
+
     def test_empty_group(self, tmp_path: Path) -> None:
         lg = _make_level_group(tmp_path)
         create_vertices_array(lg)

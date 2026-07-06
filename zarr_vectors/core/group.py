@@ -42,6 +42,14 @@ from zarr.storage import LocalStore
 from zarr_vectors.exceptions import StoreError
 
 
+# Sentinel for :meth:`Group.write_bytes`'s ``compressors=`` argument, meaning
+# "keep the existing codec selection" (session codecs from ``batched_writes``,
+# else zarr's default).  Distinct from ``None`` because ``None`` is a valid
+# explicit override resolving to bytes-only (uncompressed) via
+# ``resolve_compressor``.
+_KEEP_CODECS = object()
+
+
 class Group:
     """A ZV group wrapping an underlying :class:`zarr.Group`."""
 
@@ -137,22 +145,51 @@ class Group:
 
     # ---------------- chunk I/O (Option G: 1 tiny array per chunk) ----------------
 
-    def write_bytes(self, array_name: str, chunk_key: str, data: bytes) -> None:
+    def write_bytes(
+        self,
+        array_name: str,
+        chunk_key: str,
+        data: bytes,
+        *,
+        compressors: Any = _KEEP_CODECS,
+    ) -> None:
+        """Write one chunk blob as a tiny single-chunk uint8 array.
+
+        Args:
+            compressors: Per-write codec override.  Default
+                :data:`_KEEP_CODECS` keeps the existing behaviour (session
+                codecs from :meth:`batched_writes`, else zarr 3.x's
+                ``bytes`` + ``zstd`` default).  Pass a full Zarr V3 codecs
+                list (BytesCodec serializer + any BytesBytes compressors,
+                as produced by
+                :func:`zarr_vectors.encoding.compression.resolve_compressor`)
+                to force a specific pipeline for THIS array only —
+                e.g. ``resolve_compressor(None)`` (``[{"name": "bytes"}]``)
+                to write the chunk **uncompressed** so it is byte-range-
+                addressable, independent of what sibling arrays use.
+        """
+        override = None if compressors is _KEEP_CODECS else compressors
         # Batched-write mode (see :meth:`batched_writes`): defer until
-        # the context manager flushes all queued PUTs concurrently.
+        # the context manager flushes all queued PUTs concurrently.  The
+        # per-write ``override`` rides along so a single batch can mix
+        # compressed and uncompressed arrays.
         if self._pending_writes is not None:
-            self._pending_writes.append((array_name, chunk_key, bytes(data)))
+            self._pending_writes.append(
+                (array_name, chunk_key, bytes(data), override)
+            )
             return
         arr_group = self._zarr.require_group(array_name)
         if chunk_key in arr_group:
             del arr_group[chunk_key]
-        # When a session compressor is active we pass an explicit codec
-        # list to ``create_array``; otherwise zarr 3.x's default applies
-        # (which is ``bytes`` + ``zstd``).  See
+        # Codec precedence: an explicit per-write ``compressors`` override
+        # wins; else a session compressor from ``batched_writes``; else
+        # zarr 3.x's default (``bytes`` + ``zstd``).  See
         # :func:`zarr_vectors.encoding.compression.resolve_compressor`.
         from zarr_vectors.encoding.compression import codecs_for_create_array
         extra_kwargs: dict[str, Any] = {}
-        if self._active_codecs is not None:
+        if override is not None:
+            extra_kwargs["compressors"] = codecs_for_create_array(override)
+        elif self._active_codecs is not None:
             extra_kwargs["compressors"] = codecs_for_create_array(
                 self._active_codecs
             )

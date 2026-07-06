@@ -189,6 +189,7 @@ def create_vertices_array(
     dtype: str = "float32",
     encoding: str = "raw",
     *,
+    compress: bool = True,
     exist_ok: bool = True,
 ) -> None:
     """Create the ``vertices/`` array within a resolution level.
@@ -197,6 +198,15 @@ def create_vertices_array(
         level_group: The resolution level FsGroup.
         dtype: Numpy dtype string for vertex positions.
         encoding: ``"raw"`` or ``"draco"``.
+        compress: When False, the paired :func:`write_chunk_vertices` /
+            :func:`write_chunk_attributes` calls write their chunk blobs
+            **uncompressed** (bytes-only codec) so each fragment's rows are
+            byte-range-addressable (``rowIndex * rank * itemsize``); this
+            stamps ``vertices_layout = "raw_v1"`` on the array metadata to
+            advertise that to readers.  When True (default), chunks are
+            compressed as before and no layout flag is stamped (legacy:
+            absent flag ⇒ whole-chunk-compressed, not range-addressable).
+            Applies only to ``raw`` encoding.
         exist_ok: When True (default), no-op if the array already exists.
             When False, raise :class:`ArrayError` on conflict.
     """
@@ -204,11 +214,17 @@ def create_vertices_array(
         return
     _ensure_array_dir(level_group, VERTICES)
     _ensure_array_dir(level_group, VERTEX_FRAGMENTS)
-    level_group.write_array_meta(VERTICES, {
+    vertices_meta: dict[str, Any] = {
         "zv_array": "vertices",
         "dtype": dtype,
         "encoding": encoding,
-    })
+    }
+    if not compress and encoding == "raw":
+        # Advertise the range-addressable uncompressed layout.  Also covers
+        # sibling `vertex_attributes/<name>` arrays, which the same-level
+        # write path stores uncompressed too.
+        vertices_meta["vertices_layout"] = "raw_v1"
+    level_group.write_array_meta(VERTICES, vertices_meta)
     level_group.write_array_meta(VERTEX_FRAGMENTS, {
         "zv_array": VERTEX_FRAGMENTS,
         "encoding": "fragment_index_v1",
@@ -570,6 +586,8 @@ def write_chunk_vertices(
     chunk_coords: ChunkCoords,
     groups: list[npt.NDArray[np.floating]],
     dtype: np.dtype | str = np.float32,
+    *,
+    compress: bool = True,
 ) -> npt.NDArray[np.int64]:
     """Write fragments to a spatial chunk.
 
@@ -582,6 +600,14 @@ def write_chunk_vertices(
         chunk_coords: Spatial chunk coordinates.
         groups: List of arrays, each ``(N_k, D)``.
         dtype: Numpy dtype for serialisation.
+        compress: When False, write the ``vertices`` chunk blob
+            **uncompressed** (bytes-only codec) so each fragment's rows are
+            byte-range-addressable (``[start*rank*itemsize,
+            (start+count)*rank*itemsize)``).  Pair with
+            :func:`create_vertices_array` ``compress=False`` to stamp the
+            ``vertices_layout="raw_v1"`` capability.  The paired
+            ``vertex_fragments`` index stays compressed regardless (it is
+            always read whole).  Default True (legacy whole-chunk-compressed).
 
     Returns:
         ``(K,)`` int64 array of vertex byte offsets (kept for backwards-
@@ -592,7 +618,13 @@ def write_chunk_vertices(
     key = _chunk_key(chunk_coords)
 
     raw_bytes, vertex_byte_offsets = encode_ragged_floats(groups, dtype)
-    level_group.write_bytes(VERTICES, key, raw_bytes)
+    if compress:
+        level_group.write_bytes(VERTICES, key, raw_bytes)
+    else:
+        from zarr_vectors.encoding.compression import resolve_compressor
+        level_group.write_bytes(
+            VERTICES, key, raw_bytes, compressors=resolve_compressor(None),
+        )
 
     # Express each group as a contiguous (start_row, count) fragment.
     if len(groups) == 0:
@@ -789,6 +821,8 @@ def write_chunk_attributes(
     chunk_coords: ChunkCoords,
     attr_groups: list[npt.NDArray],
     dtype: np.dtype | str = np.float32,
+    *,
+    compress: bool = True,
 ) -> None:
     """Write vertex attribute data for groups in a spatial chunk.
 
@@ -804,12 +838,21 @@ def write_chunk_attributes(
             Each array is ``(N_k,)`` for scalar or ``(N_k, C)`` for
             multi-channel attributes.
         dtype: Numpy dtype.
+        compress: When False, write the attribute chunk blob uncompressed
+            (bytes-only) so a fragment's attribute rows are byte-range-
+            addressable — mirror :func:`write_chunk_vertices`.  Default True.
     """
     dtype = np.dtype(dtype)
     key = _chunk_key(chunk_coords)
     full_name = f"{VERTEX_ATTRIBUTES}/{attr_name}"
     raw_bytes, _ = encode_ragged_floats(attr_groups, dtype)
-    level_group.write_bytes(full_name, key, raw_bytes)
+    if compress:
+        level_group.write_bytes(full_name, key, raw_bytes)
+    else:
+        from zarr_vectors.encoding.compression import resolve_compressor
+        level_group.write_bytes(
+            full_name, key, raw_bytes, compressors=resolve_compressor(None),
+        )
 
 
 def write_chunk_fragment_attributes(
