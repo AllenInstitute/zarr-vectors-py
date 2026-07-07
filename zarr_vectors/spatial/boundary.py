@@ -431,21 +431,84 @@ def _lehmer_decode(code: int, L: int) -> list[int]:
     return perm
 
 
+def _cell_placements(
+    record: Sequence[tuple[ChunkCoords, int]],
+    *,
+    directed: bool,
+    store: str,
+) -> list[list[int]]:
+    """Return the storage permutations a record is filed under.
+
+    Each returned ``sigma`` is a permutation of ``range(L)``: the record
+    is stored in a cell keyed by ``[chunk(sigma[0]), ..., chunk(sigma[L-1])]``
+    with vertex indices ``[vi(sigma[0]), ...]`` and
+    ``perm_idx = _lehmer_encode(sigma)``, so :func:`apply_perm_inverse`
+    recovers the original input order from any copy.
+
+    - ``store="canonical"`` → one placement:
+        * ``directed=False``: ``sigma`` is the argsort of the endpoints by
+          ``(chunk_coords, vi)`` — the canonical order (identical to
+          :func:`canonical_sort`).
+        * ``directed=True``: ``sigma`` is the identity — input endpoint
+          order is preserved, so ``A→B`` and ``B→A`` file under distinct
+          cells (``A.B`` vs ``B.A``) and ``perm_idx`` is 0.
+    - ``store="duplicate"`` → one placement per *distinct* endpoint chunk:
+      that chunk leads the cell key, the remaining endpoints follow in
+      ascending input-position order.  ``K`` placements where ``K`` is the
+      number of distinct chunks the record touches, so a reader can find
+      every record incident to a chunk ``C`` by scanning only the cells
+      whose first slot is ``C``.  Records are independent physical copies;
+      ``perm_idx`` recovers input order (direction / winding) in each.
+    """
+    L = len(record)
+    if store == "canonical":
+        if directed:
+            return [list(range(L))]
+        keys = [(tuple(c), int(v)) for c, v in record]
+        return [sorted(range(L), key=lambda i: keys[i])]
+    if store == "duplicate":
+        chunks = [tuple(c) for c, _ in record]
+        vis = [int(v) for _, v in record]
+        placements: list[list[int]] = []
+        seen: set[ChunkCoords] = set()
+        # Lead each distinct chunk once; ascending (chunk, vi) order makes
+        # the emitted cell set deterministic and independent of input order.
+        for lead in sorted(range(L), key=lambda i: (chunks[i], vis[i])):
+            if chunks[lead] in seen:
+                continue
+            seen.add(chunks[lead])
+            rest = [i for i in range(L) if i != lead]
+            placements.append([lead] + rest)
+        return placements
+    raise ChunkingError(
+        f"partition_cross_records_by_tuple: unknown store {store!r}; "
+        f"expected 'canonical' or 'duplicate'"
+    )
+
+
 def partition_cross_records_by_tuple(
     records: Sequence[Sequence[tuple[ChunkCoords, int]]],
     link_width: int,
     sid_ndim: int,
-) -> dict[str, list[tuple[list[int], int]]]:
-    """Group cross-chunk records by canonical chunk-tuple key.
+    *,
+    directed: bool = False,
+    store: str = "canonical",
+) -> dict[str, list[tuple[list[int], int, int]]]:
+    """Group cross-chunk records into per-tuple cells.
 
-    For each record:
-    - canonical-sort its endpoints with :func:`canonical_sort`,
-    - build the cell key from the sorted chunk coords via
+    For each record and each storage permutation ``sigma`` chosen by
+    :func:`_cell_placements` (one for ``canonical``; one per distinct
+    endpoint chunk for ``duplicate``):
+
+    - build the cell key from the permuted chunk coords via
       :func:`zarr_vectors.core.paths.format_cell_key`,
-    - emit ``(vi_canonical_list, perm_idx)`` into that key's bucket.
+    - emit ``(vi_in_cell_order, perm_idx, input_index)`` into that key's
+      bucket, where ``perm_idx`` is the Lehmer code of ``sigma``.
 
-    Within a bucket, records preserve their input ordering — callers
-    relying on row-aligned attribute arrays can depend on this.
+    Within a bucket, entries preserve input record ordering — callers
+    relying on row-aligned attribute arrays can depend on this.  In
+    ``store="duplicate"`` the same ``input_index`` appears under several
+    keys, so a parallel attribute array replicates identically.
 
     Args:
         records: List of records; each record is a sequence of
@@ -455,14 +518,21 @@ def partition_cross_records_by_tuple(
             arity raise ``ChunkingError``.
         sid_ndim: Number of spatial index dimensions; every
             ``chunk_coords`` must have this arity.
+        directed: When ``True``, keep input endpoint order (no canonical
+            sort); ``A→B`` and ``B→A`` land in distinct cells.  See
+            :func:`_cell_placements`.
+        store: ``"canonical"`` (default, one cell per record) or
+            ``"duplicate"`` (one cell per distinct incident chunk).
 
     Returns:
-        Dict mapping ``cell_key`` → list of ``(vi_canonical, perm_idx)``
-        tuples.  ``vi_canonical`` is a length-L list of int vertex
-        indices in canonical (sorted) order.
+        Dict mapping ``cell_key`` → list of
+        ``(vi_in_cell_order, perm_idx, input_index)`` tuples.
+        ``vi_in_cell_order`` is a length-L list of int vertex indices in
+        the cell's chunk order.
     """
-    buckets: dict[str, list[tuple[list[int], int]]] = {}
-    for rec in records:
+    buckets: dict[str, list[tuple[list[int], int, int]]] = {}
+    for input_idx, rec in enumerate(records):
+        rec = list(rec)
         if len(rec) != link_width:
             raise ChunkingError(
                 f"partition_cross_records_by_tuple: record arity "
@@ -474,10 +544,14 @@ def partition_cross_records_by_tuple(
                     f"partition_cross_records_by_tuple: chunk_coords "
                     f"arity {len(chunk)} != sid_ndim {sid_ndim}"
                 )
-        sorted_rec, perm_idx = canonical_sort(rec)
-        key = format_cell_key([c for c, _ in sorted_rec])
-        vi_canonical = [int(v) for _, v in sorted_rec]
-        buckets.setdefault(key, []).append((vi_canonical, perm_idx))
+        for sigma in _cell_placements(rec, directed=directed, store=store):
+            cell_chunks = [tuple(rec[j][0]) for j in sigma]
+            vi_in_cell = [int(rec[j][1]) for j in sigma]
+            perm_idx = _lehmer_encode(sigma)
+            key = format_cell_key(cell_chunks)
+            buckets.setdefault(key, []).append(
+                (vi_in_cell, perm_idx, input_idx)
+            )
     return buckets
 
 
