@@ -292,6 +292,135 @@ class TestAttributesAlignment:
         assert back.shape == (2,)
 
 
+class TestDirectedStoreMeta:
+    """directed / store flags are stamped in the family .zattrs."""
+
+    def test_defaults(self, tmp_path: Path) -> None:
+        lg = _new_lg(tmp_path)
+        write_cross_chunk_links(
+            lg, [[((0, 0, 0), 1), ((1, 0, 0), 2)]], sid_ndim=3, delta=0,
+        )
+        meta = lg.read_array_meta(cross_chunk_links_path(0))
+        assert meta["directed"] is False
+        assert meta["store"] == "canonical"
+        assert meta["num_links"] == 1
+        assert meta["num_physical_records"] == 1
+
+    def test_directed_flag_and_counts(self, tmp_path: Path) -> None:
+        lg = _new_lg(tmp_path)
+        write_cross_chunk_links(
+            lg, [[((0, 0, 0), 1), ((1, 0, 0), 2)]], sid_ndim=3, delta=0,
+            directed=True, store="duplicate",
+        )
+        meta = lg.read_array_meta(cross_chunk_links_path(0))
+        assert meta["directed"] is True
+        assert meta["store"] == "duplicate"
+        assert meta["num_links"] == 1
+        assert meta["num_physical_records"] == 2  # both orderings on disk
+
+
+class TestDirectedReads:
+    """directed families keep A→B and B→A as distinct directional cells."""
+
+    def test_both_orientations_distinct(self, tmp_path: Path) -> None:
+        lg = _new_lg(tmp_path)
+        fwd = [((0, 0, 0), 1), ((1, 0, 0), 2)]
+        rev = [((1, 0, 0), 9), ((0, 0, 0), 8)]
+        p = write_cross_chunk_links(
+            lg, [fwd, rev], sid_ndim=3, delta=0, directed=True,
+        )
+        assert set(p.cell_indices) == {"0.0.0.1.0.0", "1.0.0.0.0.0"}
+        # for_tuple must respect input order (no canonical sort).
+        got_fwd = read_cross_chunk_links_for_tuple(
+            lg, [(0, 0, 0), (1, 0, 0)], delta=0,
+        )
+        got_rev = read_cross_chunk_links_for_tuple(
+            lg, [(1, 0, 0), (0, 0, 0)], delta=0,
+        )
+        assert got_fwd == [(((0, 0, 0), 1), ((1, 0, 0), 2))]
+        assert got_rev == [(((1, 0, 0), 9), ((0, 0, 0), 8))]
+
+    def test_directed_full_scan_input_order(self, tmp_path: Path) -> None:
+        lg = _new_lg(tmp_path)
+        # canonical would swap (2,) before (0,); directed must not.
+        write_cross_chunk_links(
+            lg, [[((2, 0, 0), 8), ((0, 0, 0), 3)]], sid_ndim=3, delta=0,
+            directed=True,
+        )
+        out = read_cross_chunk_links(lg, delta=0)
+        assert out == [(((2, 0, 0), 8), ((0, 0, 0), 3))]
+
+    def test_append_mismatched_directed_raises(self, tmp_path: Path) -> None:
+        lg = _new_lg(tmp_path)
+        write_cross_chunk_links(
+            lg, [[((0, 0, 0), 1), ((1, 0, 0), 2)]], sid_ndim=3, delta=0,
+            directed=True,
+        )
+        with pytest.raises(ArrayError, match="directed"):
+            write_cross_chunk_links(
+                lg, [[((0, 0, 0), 3), ((1, 0, 0), 4)]], sid_ndim=3, delta=0,
+                mode="append", directed=False,
+            )
+
+
+class TestDuplicateStore:
+    """store='duplicate' fans each record across incident-chunk cells."""
+
+    def test_edge_in_both_prefix_cells(self, tmp_path: Path) -> None:
+        lg = _new_lg(tmp_path)
+        p = write_cross_chunk_links(
+            lg, [[((0, 0, 0), 1), ((4, 4, 4), 9)]], sid_ndim=3, delta=0,
+            store="duplicate",
+        )
+        assert set(p.cell_indices) == {"0.0.0.4.4.4", "4.4.4.0.0.0"}
+        # Incidence read from either chunk finds the record by prefix.
+        from_a = read_cross_chunk_links_for_tuple(
+            lg, [(0, 0, 0), (4, 4, 4)], delta=0,
+        )
+        assert from_a == [(((0, 0, 0), 1), ((4, 4, 4), 9))]
+        # Full scan returns one copy per cell (documented duplicate behavior).
+        assert len(read_cross_chunk_links(lg, delta=0)) == 2
+
+    def test_attributes_replicate_across_copies(self, tmp_path: Path) -> None:
+        lg = _new_lg(tmp_path)
+        create_cross_chunk_link_attributes_array(lg, "weight", delta=0)
+        records = [
+            [((0, 0, 0), 1), ((4, 4, 4), 9)],
+            [((1, 0, 0), 2), ((2, 0, 0), 3)],
+        ]
+        weights = np.array([0.5, 0.7], dtype=np.float32)
+        partition = write_cross_chunk_links(
+            lg, records, sid_ndim=3, delta=0, store="duplicate",
+        )
+        write_cross_chunk_link_attributes(
+            lg, "weight", weights, num_links=2, delta=0, partition=partition,
+        )
+        # Links and attributes are both physically duplicated and stay
+        # row-aligned under the global read.
+        links = read_cross_chunk_links(lg, delta=0)
+        attrs = read_cross_chunk_link_attributes(lg, "weight", delta=0)
+        assert len(links) == len(attrs) == 4  # 2 records × 2 cells each
+        expected = {
+            tuple(tuple(t) for t in rec): weights[i]
+            for i, rec in enumerate(records)
+        }
+        for rec, w in zip(links, attrs):
+            assert np.isclose(w, expected[rec])
+
+    def test_duplicate_attributes_require_partition(self, tmp_path: Path) -> None:
+        lg = _new_lg(tmp_path)
+        create_cross_chunk_link_attributes_array(lg, "weight", delta=0)
+        write_cross_chunk_links(
+            lg, [[((0, 0, 0), 1), ((4, 4, 4), 9)]], sid_ndim=3, delta=0,
+            store="duplicate",
+        )
+        with pytest.raises(ArrayError, match="duplicate"):
+            write_cross_chunk_link_attributes(
+                lg, "weight", np.array([0.5], dtype=np.float32),
+                num_links=1, delta=0,   # no partition → must raise
+            )
+
+
 class TestCellKeyHelpers:
     """parse_cell_key ↔ format_cell_key round-trip."""
 

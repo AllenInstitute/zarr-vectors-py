@@ -140,8 +140,15 @@
     },
     "CrossChunkLinksMeta": {
       "additionalProperties": false,
-      "description": "``.zattrs`` for a ``cross_chunk_links/<delta>/`` parent group. In 0.8 the family stores per-cell arrays keyed on the canonical-sorted L-tuple of endpoint chunks (``cross_chunk_links/<delta>/<x.y.z...>`` \u2014 exactly ``sid_ndim * link_width`` dotted components).  Each cell holds records spanning that exact L-tuple of chunks; each record is ``[perm_idx, vi_0, ..., vi_{L-1}]`` int64s, where ``perm_idx`` is the Lehmer code of the canonical\u2192input-order permutation (so readers can recover original endpoint order \u2014 mesh-face winding, directed-edge direction).  Source-side endpoint (input endpoint 0) lives at the array's own resolution level; target-side endpoints live at ``this_level + level_delta``.  ``num_links`` is the family- wide total record count.",
+      "description": "``.zattrs`` for a ``cross_chunk_links/<delta>/`` parent group. In 0.8 the family stores per-cell arrays keyed on the canonical-sorted L-tuple of endpoint chunks (``cross_chunk_links/<delta>/<x.y.z...>`` \u2014 exactly ``sid_ndim * link_width`` dotted components).  Each cell holds records spanning that exact L-tuple of chunks; each record is ``[perm_idx, vi_0, ..., vi_{L-1}]`` int64s, where ``perm_idx`` is the Lehmer code of the canonical\u2192input-order permutation (so readers can recover original endpoint order \u2014 mesh-face winding, directed-edge direction).  Source-side endpoint (input endpoint 0) lives at the array's own resolution level; target-side endpoints live at ``this_level + level_delta``.  ``num_links`` is the family- wide *logical* record count (one per input record).\nTwo family-level policy flags govern cell placement: ``directed`` (endpoint order preserved, so ``A\u2192B`` and ``B\u2192A`` are distinct cells) and ``store`` (``canonical`` = one cell per record; ``duplicate`` = one cell per distinct incident chunk). ``num_physical_records`` is the on-disk row count, which exceeds ``num_links`` under ``duplicate``.",
       "properties": {
+        "directed": {
+          "description": "When true, endpoint order is meaningful and preserved (no canonical sort): ``A\u2192B`` and ``B\u2192A`` occupy distinct cells and every stored ``perm_idx`` is 0.  Defaults to false (undirected).\n",
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
         "level_delta": {
           "description": "Pyramid-level delta between the source side (the level that owns this array) and the target side of the edges.  ``0`` for intra-level arrays (the only kind written pre-0.4), ``+N`` for edges from this level to ``this_level + N`` (coarser), ``-N`` for edges to ``this_level - N`` (finer).\n",
           "type": "integer"
@@ -156,10 +163,22 @@
           "minimum": 0,
           "type": "integer"
         },
+        "num_physical_records": {
+          "description": "On-disk record row count across all cells of a ``cross_chunk_links/<delta>/`` family.  Equals ``num_links`` for ``store=canonical``; larger when ``store=duplicate`` replicates a record across its incident-chunk cells.\n",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
         "sid_ndim": {
           "description": "Number of spatial-index dimensions encoded in chunk keys.",
           "minimum": 1,
           "type": "integer"
+        },
+        "store": {
+          "$ref": "#/$defs/CrossChunkStore",
+          "description": "Cell-duplication policy; see CrossChunkStore."
         },
         "zv_array": {
           "$ref": "#/$defs/ZvArrayTag",
@@ -176,6 +195,15 @@
       ],
       "title": "CrossChunkLinksMeta",
       "type": "object"
+    },
+    "CrossChunkStore": {
+      "description": "Cell-duplication policy for a ``cross_chunk_links/<delta>/`` family.",
+      "enum": [
+        "canonical",
+        "duplicate"
+      ],
+      "title": "CrossChunkStore",
+      "type": "string"
     },
     "CrossChunkStrategy": {
       "description": "How connectivity that crosses chunk boundaries is represented.",

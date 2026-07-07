@@ -621,6 +621,9 @@ def create_cross_chunk_links_array(
     *,
     delta: int = 0,
     link_width: int = 2,
+    sid_ndim: int | None = None,
+    directed: bool = False,
+    store: str = "canonical",
     exist_ok: bool = True,
 ) -> None:
     """Create a ``cross_chunk_links/<delta>/`` array.
@@ -628,24 +631,44 @@ def create_cross_chunk_links_array(
     Source-side endpoints live at the owning resolution level;
     target-side endpoints live at ``this_level + delta``.
 
+    The whole-level :func:`write_cross_chunk_links` re-stamps every field
+    on write, so the ``directed`` / ``store`` / ``sid_ndim`` args here
+    matter mainly for the decentralized per-cell writer flow, where a
+    coordinator pre-creates the array and workers only write cells.
+
     Args:
         level_group: Resolution level group.
         delta: Level delta (0 for intra-level, ±N for cross-level).
         link_width: Number of vertex refs per record.  2 for edges
             (the default — chunk pairs straddling a boundary), 3 for
             triangle faces, 1 for parent→child metanode references.
+        sid_ndim: Spatial index dims; stamped into the meta when given
+            (per-cell writers and readers need it).
+        directed: Endpoint order is meaningful; see
+            :func:`write_cross_chunk_links`.
+        store: ``"canonical"`` or ``"duplicate"``; see
+            :func:`write_cross_chunk_links`.
         exist_ok: When True (default), no-op if the array already exists.
             When False, raise :class:`ArrayError` on conflict.
     """
+    if store not in ("canonical", "duplicate"):
+        raise ArrayError(
+            f"store must be 'canonical' or 'duplicate', got {store!r}"
+        )
     full_name = cross_chunk_links_path(delta)
     if _short_circuit_existing(level_group, full_name, exist_ok):
         return
     _ensure_array_dir(level_group, full_name)
-    level_group.write_array_meta(full_name, {
+    meta = {
         "zv_array": "cross_chunk_links",
         "level_delta": int(delta),
         "link_width": int(link_width),
-    })
+        "directed": bool(directed),
+        "store": str(store),
+    }
+    if sid_ndim is not None:
+        meta["sid_ndim"] = int(sid_ndim)
+    level_group.write_array_meta(full_name, meta)
 
 
 def create_link_attributes_array(
@@ -1390,6 +1413,8 @@ def write_cross_chunk_links(
     delta: int = 0,
     link_width: int | None = None,
     mode: Literal["replace", "append"] = "replace",
+    directed: bool = False,
+    store: Literal["canonical", "duplicate"] = "canonical",
 ) -> CrossChunkLinkPartition:
     """Write cross-chunk link records under ``cross_chunk_links/<delta>/<cell_key>``.
 
@@ -1440,6 +1465,22 @@ def write_cross_chunk_links(
         ``first_new`` int for callers that only cared about the
         append offset.
 
+    Other args:
+        directed: When ``True``, endpoint order is meaningful (streamline
+            predecessor→successor, skeleton child→parent): records are NOT
+            canonical-sorted, the cell key follows input order, and
+            ``perm_idx`` is 0.  ``A→B`` and ``B→A`` file under distinct
+            cells.  Stamped in the family ``.zattrs`` so readers/validators
+            don't guess.  A family is uniformly directed or undirected —
+            appending with a different ``directed`` than the existing
+            family raises.
+        store: ``"canonical"`` (default) files each record in one cell;
+            ``"duplicate"`` files it under one cell per distinct incident
+            chunk (independent physical copies) so incidence reads become a
+            prefix scan.  Duplicated links return multiple times from
+            :func:`read_cross_chunk_links`; the parallel attribute family
+            replicates identically via the returned partition.
+
     Concurrency:
         ``mode="append"`` is read-modify-write per cell — safe
         across disjoint cells, unsafe within a single cell.
@@ -1448,13 +1489,17 @@ def write_cross_chunk_links(
         raise ArrayError(
             f"mode must be 'replace' or 'append', got {mode!r}"
         )
+    if store not in ("canonical", "duplicate"):
+        raise ArrayError(
+            f"store must be 'canonical' or 'duplicate', got {store!r}"
+        )
 
     # Local import to avoid circular import at module load.
     from zarr_vectors.encoding.ragged import (
         decode_ragged_blob,
         encode_ragged_blob,
     )
-    from zarr_vectors.spatial.boundary import canonical_sort
+    from zarr_vectors.spatial.boundary import partition_cross_records_by_tuple
 
     if not links:
         # Honour the empty-input fast-exit; emit an empty partition
@@ -1521,19 +1566,40 @@ def write_cross_chunk_links(
                     f"append with sid_ndim={sid_ndim} onto existing "
                     f"sid_ndim={existing_sid}"
                 )
+            existing_directed = bool(existing_meta.get("directed", False))
+            if existing_directed != bool(directed):
+                raise ArrayError(
+                    f"cross_chunk_links/{format_delta(delta)}: cannot "
+                    f"append directed={directed} onto existing "
+                    f"directed={existing_directed} (a family is uniformly "
+                    f"directed or undirected)"
+                )
+            existing_store = str(existing_meta.get("store", "canonical"))
+            if existing_store != store:
+                raise ArrayError(
+                    f"cross_chunk_links/{format_delta(delta)}: cannot "
+                    f"append store={store!r} onto existing "
+                    f"store={existing_store!r}"
+                )
 
-    # Build the cell partition in input order: for each input record
-    # canonical-sort the endpoints, derive the cell key, and record
-    # both the canonical (vi list, perm_idx) pair and the input index.
-    # Both per-cell lists preserve input order within the bucket.
-    bucket_entries: dict[str, list[tuple[list[int], int]]] = {}
-    cell_indices: dict[str, list[int]] = {}
-    for i, rec in enumerate(normalised):
-        sorted_rec, perm_idx = canonical_sort(rec)
-        key = format_cell_key([c for c, _ in sorted_rec])
-        vi_canonical = [int(v) for _, v in sorted_rec]
-        bucket_entries.setdefault(key, []).append((vi_canonical, perm_idx))
-        cell_indices.setdefault(key, []).append(i)
+    # Build the per-cell partition (input order preserved within each
+    # cell).  ``partition_cross_records_by_tuple`` applies the directed /
+    # store policy: canonical sort for undirected, input-order keys for
+    # directed, and one cell per distinct incident chunk for duplicate.
+    partitioned = partition_cross_records_by_tuple(
+        normalised, link_width, sid_ndim, directed=directed, store=store,
+    )
+    bucket_entries: dict[str, list[tuple[list[int], int]]] = {
+        key: [(vi, perm) for vi, perm, _ in entries]
+        for key, entries in partitioned.items()
+    }
+    cell_indices: dict[str, list[int]] = {
+        key: [idx for _, _, idx in entries]
+        for key, entries in partitioned.items()
+    }
+    # Physical rows this write adds (== len(normalised) for canonical, more
+    # when ``store="duplicate"`` fans a record across incident-chunk cells).
+    new_physical = sum(len(rows) for rows in bucket_entries.values())
 
     record_len_int64 = 1 + link_width  # [perm_idx, vi_0, ..., vi_{L-1}]
 
@@ -1544,14 +1610,15 @@ def write_cross_chunk_links(
             level_group.delete_subtree(full_name)
         first_new = 0
         existing_total = 0
+        existing_physical = 0
 
         # Write each new cell.
         for cell_key, rows in bucket_entries.items():
             blob_groups: list[npt.NDArray] = []
-            for vi_canonical, perm_idx in rows:
+            for vi_cell, perm_idx in rows:
                 row = np.empty(record_len_int64, dtype=np.int64)
                 row[0] = perm_idx
-                row[1:] = vi_canonical
+                row[1:] = vi_cell
                 blob_groups.append(row)
             blob = encode_ragged_blob(blob_groups, np.dtype(np.int64))
             level_group.write_bytes(full_name, cell_key, blob)
@@ -1559,22 +1626,24 @@ def write_cross_chunk_links(
         # Append: per-cell RMW.  Cells not touched by ``links`` keep
         # their existing contents.
         existing_total = 0
+        existing_physical = 0
         if level_group.array_exists(full_name):
-            # The total existing record count is persisted in the family
-            # meta ``num_links`` — read it in O(1) rather than decoding
-            # every cell (append cost must scale with the batch, not the
-            # whole store).  Fall back to a full scan only for older
-            # stores written before ``num_links`` was recorded.
+            # Existing counts come from family meta in O(1); fall back to a
+            # full cell scan only for older stores predating the meta.
             existing_meta = level_group.read_array_meta(full_name) or {}
             if "num_links" in existing_meta:
                 existing_total = int(existing_meta["num_links"])
+                existing_physical = int(
+                    existing_meta.get("num_physical_records", existing_total)
+                )
             else:
                 for existing_key in level_group.list_chunks(full_name):
                     blob = level_group.read_bytes(full_name, existing_key)
                     existing_rows = decode_ragged_blob(
                         blob, np.dtype(np.int64), ncols=record_len_int64,
                     )
-                    existing_total += len(existing_rows)
+                    existing_physical += len(existing_rows)
+                existing_total = existing_physical
         first_new = existing_total
 
         for cell_key, rows in bucket_entries.items():
@@ -1586,19 +1655,22 @@ def write_cross_chunk_links(
                     blob, np.dtype(np.int64), ncols=record_len_int64,
                 )
             new_rows: list[npt.NDArray] = []
-            for vi_canonical, perm_idx in rows:
+            for vi_cell, perm_idx in rows:
                 row = np.empty(record_len_int64, dtype=np.int64)
                 row[0] = perm_idx
-                row[1:] = vi_canonical
+                row[1:] = vi_cell
                 new_rows.append(row)
             combined = existing_rows + new_rows
             blob = encode_ragged_blob(combined, np.dtype(np.int64))
             level_group.write_bytes(full_name, cell_key, blob)
 
-    # Family .zattrs on the parent group.  ``num_links`` is the total
-    # record count after this write — useful for length-invariant
-    # checks on the parallel attribute array.
+    # Family .zattrs on the parent group.  ``num_links`` is the *logical*
+    # record count (one per input record); ``num_physical_records`` is the
+    # on-disk row count (larger than ``num_links`` under ``duplicate``).
+    # ``directed`` / ``store`` let readers and the validator interpret the
+    # cell keys without inspecting the data.
     new_total = existing_total + len(normalised)
+    new_physical_total = existing_physical + new_physical
     _ensure_array_dir(level_group, full_name)
     level_group.write_array_meta(full_name, {
         "zv_array": "cross_chunk_links",
@@ -1606,6 +1678,9 @@ def write_cross_chunk_links(
         "level_delta": int(delta),
         "link_width": int(link_width),
         "num_links": int(new_total),
+        "num_physical_records": int(new_physical_total),
+        "directed": bool(directed),
+        "store": str(store),
     })
 
     return CrossChunkLinkPartition(
@@ -1689,6 +1764,17 @@ def write_cross_chunk_link_attributes(
                 f"requires partition=... from the matching "
                 f"write_cross_chunk_links(mode='append') call so the "
                 f"writer knows which cell each new row belongs to"
+            )
+        # A duplicate family fans one input record across several cells;
+        # only the link writer's partition records that fan-out, so the
+        # re-derived (physical, positional) partition would misalign
+        # attribute rows.  Require the partition explicitly.
+        links_meta = level_group.read_array_meta(links_family) or {}
+        if str(links_meta.get("store", "canonical")) == "duplicate":
+            raise ArrayError(
+                f"cross_chunk_link_attributes[{attr_name}]: store='duplicate' "
+                f"requires partition=... from the matching "
+                f"write_cross_chunk_links call so replicated rows align"
             )
         partition = _derive_partition_from_links(
             level_group, links_family, delta,
@@ -2606,7 +2692,13 @@ def read_cross_chunk_links(
     cell in write order).  Each record is a tuple of
     ``(chunk_coords, vi)`` endpoints in **original input order** —
     canonical sorting and ``perm_idx`` encoding are reversed here so
-    callers see the same record shape they wrote.
+    callers see the same record shape they wrote.  This works uniformly
+    for directed families (``perm_idx=0`` makes the reversal a no-op).
+
+    For a ``store="duplicate"`` family each logical record was written to
+    several cells, so it is returned **once per copy** — callers wanting
+    unique links should dedupe, or query with
+    :func:`read_cross_chunk_links_for_tuple`.
 
     Returns ``[]`` when the ``<delta>`` family is absent or empty.
     """
@@ -2666,9 +2758,11 @@ def read_cross_chunk_links_for_tuple(
 ) -> list[tuple[tuple[ChunkCoords, int], ...]]:
     """Read records that span exactly the L chunks in ``chunk_tuple``.
 
-    The input chunk-tuple is canonical-sorted internally, so callers
-    may pass the chunks in any order.  ``len(chunk_tuple)`` must
-    equal the family's ``link_width``.
+    For an **undirected** family the input chunk-tuple is canonical-sorted
+    internally, so callers may pass the chunks in any order.  For a
+    **directed** family the tuple selects a specific directional cell —
+    ``(A, B)`` and ``(B, A)`` are different cells — so the order matters.
+    ``len(chunk_tuple)`` must equal the family's ``link_width``.
 
     Returns ``[]`` if no records exist for that exact L-tuple.
     Records are returned in write order, each in original input
@@ -2682,6 +2776,7 @@ def read_cross_chunk_links_for_tuple(
         return []
     link_width = int(meta["link_width"])
     sid_ndim = int(meta["sid_ndim"])
+    directed = bool(meta.get("directed", False))
     if len(chunk_tuple) != link_width:
         raise ArrayError(
             f"chunk_tuple has {len(chunk_tuple)} chunks; expected "
@@ -2694,10 +2789,13 @@ def read_cross_chunk_links_for_tuple(
                 f"expected sid_ndim={sid_ndim}"
             )
 
-    canonical_chunks = tuple(
-        sorted(tuple(c) for c in chunk_tuple)
-    )
-    cell_key = format_cell_key(canonical_chunks)
+    # Directed cells key on input order; undirected canonical-sort so any
+    # caller ordering resolves to the one canonical cell.
+    if directed:
+        query_chunks = tuple(tuple(c) for c in chunk_tuple)
+    else:
+        query_chunks = tuple(sorted(tuple(c) for c in chunk_tuple))
+    cell_key = format_cell_key(query_chunks)
     if not level_group.chunk_exists(full_name, cell_key):
         return []
 
@@ -2713,10 +2811,10 @@ def read_cross_chunk_links_for_tuple(
     for row in rows:
         row_arr = np.asarray(row).reshape(-1)
         perm_idx = int(row_arr[0])
-        vi_canonical = [int(v) for v in row_arr[1:1 + link_width]]
-        canonical_endpoints = list(zip(canonical_chunks, vi_canonical))
+        vi_cell = [int(v) for v in row_arr[1:1 + link_width]]
+        cell_endpoints = list(zip(query_chunks, vi_cell))
         input_order = apply_perm_inverse(
-            canonical_endpoints, perm_idx, link_width,
+            cell_endpoints, perm_idx, link_width,
         )
         out.append(tuple(input_order))
     return out
@@ -2790,8 +2888,16 @@ def read_cross_chunk_link_attributes_for_tuple(
     row_size = int(np.prod(row_shape)) if row_shape else 1
     row_bytes = dtype.itemsize * row_size
 
-    canonical_chunks = tuple(sorted(tuple(c) for c in chunk_tuple))
-    cell_key = format_cell_key(canonical_chunks)
+    # Cell keys must match the parallel links family — read its `directed`
+    # flag (attribute meta doesn't carry it) to pick the same ordering.
+    links_meta = level_group.read_array_meta(
+        cross_chunk_links_path(delta)
+    ) or {}
+    if bool(links_meta.get("directed", False)):
+        query_chunks = tuple(tuple(c) for c in chunk_tuple)
+    else:
+        query_chunks = tuple(sorted(tuple(c) for c in chunk_tuple))
+    cell_key = format_cell_key(query_chunks)
     if not level_group.chunk_exists(full_name, cell_key):
         return np.empty((0, *row_shape), dtype=dtype) if row_shape else np.empty((0,), dtype=dtype)
     blob = level_group.read_bytes(full_name, cell_key)
