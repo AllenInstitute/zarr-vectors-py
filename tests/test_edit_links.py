@@ -158,3 +158,33 @@ class TestCrossChunkLink:
         )
         after = read_cross_chunk_links(root["0"], delta=0)
         assert len(after) == len(before) + 1
+
+    def test_edit_preserves_directed_family(self, tmp_path: Path) -> None:
+        # A directed cross-chunk family must stay directed across an edit
+        # (read-modify-rewrite would otherwise revert it to canonical).
+        from zarr_vectors.core.arrays import write_cross_chunk_links
+        from zarr_vectors.core.paths import cross_chunk_links_path
+
+        path = tmp_path / "store.zv"
+        positions = np.array(
+            [[10.0, 10.0, 10.0], [70.0, 70.0, 70.0]], dtype=np.float32,
+        )
+        edges = np.array([[0, 1]], dtype=np.int64)
+        write_graph(
+            str(path), positions, edges,
+            chunk_shape=(50.0, 50.0, 50.0),
+            bounds=([0.0, 0.0, 0.0], [100.0, 100.0, 100.0]),
+            kind="graph",
+        )
+        root = open_store(str(path), mode="r+")
+        # Replace the family with a directed one (input-order cell).
+        write_cross_chunk_links(
+            root["0"], [[((1, 1, 1), 0), ((0, 0, 0), 0)]],
+            sid_ndim=3, delta=0, directed=True,
+        )
+        add_cross_chunk_link(
+            root, level=0, endpoints=[((0, 0, 0), 0), ((1, 1, 1), 0)], delta=0,
+        )
+        meta = root["0"].read_array_meta(cross_chunk_links_path(0))
+        assert meta["directed"] is True
+        assert meta["num_links"] == 2
