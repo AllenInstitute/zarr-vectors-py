@@ -90,6 +90,7 @@ def coarsen_level(
     sparsity_strategy: str = "random",
     sparsity_seed: int | None = None,
     cross_level_storage: str = XLEVEL_NONE,
+    method: str = COARSEN_PER_OBJECT,
 ) -> dict[str, Any]:
     """Coarsen a single level and write it to the store.
 
@@ -116,18 +117,24 @@ def coarsen_level(
             target chunk_shape differs from the root chunk_shape it is
             stamped on the target level's ``LevelMetadata.chunk_shape``;
             otherwise the target inherits from root.
-        sparsity_strategy: Object selection strategy.
+        sparsity_strategy: Object selection strategy — ``"random"`` (core)
+            or a name registered by ``zarr-vectors-tools``.
         sparsity_seed: Random seed.
         cross_level_storage: When called via ``build_pyramid`` this is
             threaded through to enable inline ``±1`` cross-level link
             emission.  Standalone callers should leave it at the
             ``"none"`` default.
+        method: Coarsening method.  ``"per_object"`` (core default) uses the
+            metavertex-binning pyramid; any other name is dispatched to a
+            method registered by ``zarr-vectors-tools`` via
+            :mod:`zarr_vectors.multiresolution.registry` (raises if that
+            package is not installed).
 
     Returns:
         Summary dict.  Always includes ``method``,
         ``preserves_object_ids``, ``vertex_count``.
     """
-    return _per_object_coarsen(
+    kwargs = dict(
         store_path=store_path,
         source_level=source_level,
         target_level=target_level,
@@ -138,6 +145,11 @@ def coarsen_level(
         sparsity_seed=sparsity_seed,
         cross_level_storage=cross_level_storage,
     )
+    if method == COARSEN_PER_OBJECT:
+        return _per_object_coarsen(**kwargs)
+    # Advanced coarsening methods live in zarr-vectors-tools.
+    from zarr_vectors.multiresolution.registry import require_coarsen_strategy
+    return require_coarsen_strategy(method)(**kwargs)
 
 
 def _per_object_coarsen(
@@ -867,6 +879,7 @@ def build_pyramid(
     sparsity_seed: int | None = None,
     cross_level_depth: int = DEFAULT_CROSS_LEVEL_DEPTH,
     cross_level_storage: str = DEFAULT_CROSS_LEVEL_STORAGE,
+    method: str = COARSEN_PER_OBJECT,
 ) -> dict[str, Any]:
     """Build a multi-resolution pyramid for an existing store.
 
@@ -887,8 +900,12 @@ def build_pyramid(
             length).  Each entry is either a scalar int (uniform per
             axis) or a per-axis tuple.  ``None`` (default) means
             all-ones: every level inherits root ``chunk_shape``.
-        sparsity_strategy: Object selection strategy.
+        sparsity_strategy: Object selection strategy — ``"random"`` (core)
+            or a name registered by ``zarr-vectors-tools``.
         sparsity_seed: Random seed.
+        method: Coarsening method; ``"per_object"`` (core default) or a
+            ``zarr-vectors-tools``-registered method (see
+            :func:`coarsen_level`).
         cross_level_depth: Maximum absolute level delta for materialized
             cross-pyramid-level link arrays.  ``0`` = none, ``N`` = up
             to ``±N`` per pair (or ``+N`` only when
@@ -939,6 +956,7 @@ def build_pyramid(
             sparsity_strategy=sparsity_strategy,
             sparsity_seed=sparsity_seed,
             cross_level_storage=cross_level_storage,
+            method=method,
         ))
 
     # Compose deeper-delta cross-level links from the inline-emitted +1

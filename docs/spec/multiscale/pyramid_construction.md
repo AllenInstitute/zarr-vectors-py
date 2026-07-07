@@ -26,10 +26,11 @@
   see [`constants.VALID_AGGREGATIONS`](../../../zarr_vectors/constants.py).
 
 **Coarsening method**
-: How the writer reconciles object identity across levels —
-  `per_object` (default; OID-stable, metavertices may be shared) or
-  `cross_object_metanode` (legacy alias `grid_metanode`; fresh OID
-  space per level).
+: How the writer reconciles object identity across levels.  Core
+  provides `per_object` (default; OID-stable, metavertices may be
+  shared).  Other methods (e.g. `cross_object_metanode` / `grid_metanode`,
+  fresh OID space per level) are provided by `zarr-vectors-tools` and
+  selected by name via `method=`.
 
 **Cross-level link**
 : An edge from a fine-level vertex to its coarse-level parent
@@ -67,7 +68,31 @@ cross-level link options.
 
 ## Technical reference
 
+### Core vs `zarr-vectors-tools`
+
+Core ships only the simplest, **dependency-free** coarsening:
+
+- the `per_object` metavertex-binning coarsener (`build_pyramid` /
+  `coarsen_level` with the default `method="per_object"`), and
+- the `random` object-selection strategy (`sparsity_strategy="random"`).
+
+Everything more elaborate — the geometry-type-specific coarsening described
+below (quadric mesh decimation, Douglas–Peucker polyline simplification,
+graph/point metanodes), alternative coarsening methods (e.g.
+`cross_object_metanode`), and non-random object selection (spatial coverage,
+length/attribute-ranked, point-thinning) — lives in **`zarr-vectors-tools`**.
+That package registers its implementations through
+[`zarr_vectors/multiresolution/registry.py`](../../../zarr_vectors/multiresolution/registry.py)
+on import; `build_pyramid` / `coarsen_level` then dispatch to them by
+`method=` / `sparsity_strategy=` name. Requesting one without
+`zarr-vectors-tools` installed raises a clear error naming the package to
+install. Core takes no dependency on it.
+
 ### Coarsening by geometry type
+
+> These geometry-type-specific coarseners are provided by
+> `zarr-vectors-tools`, not core. They register as `method=` values (see
+> *Core vs `zarr-vectors-tools`* above).
 
 #### Point cloud
 
@@ -141,9 +166,8 @@ build_pyramid(
         (2.0, 1.0),                 # level 2: 2× coarsen
         (2.0, 3.0),                 # level 3: 2× coarsen + drop 2/3 objects
     ],
-    method="per_object",            # OID-stable (default); see "Methods"
-    agg_mode="mean",                # attribute aggregation
-    sparsity_strategy="random",
+    method="per_object",            # core default; see "Methods"
+    sparsity_strategy="random",     # core default; advanced ones via tools
     sparsity_seed=None,
     cross_level_depth=1,            # ±1 cross-level edges per pair
     cross_level_storage="explicit", # write both +1 (fine) and -1 (coarse)
@@ -151,35 +175,25 @@ build_pyramid(
 ```
 
 Each factor pair `(coarsen, sparsity)` opts out by passing `1.0` on
-that axis. Passing the same factors with `method="cross_object_metanode"`
-uses the legacy path.
+that axis. Passing a non-default `method=` / `sparsity_strategy=` dispatches
+to a `zarr-vectors-tools`-registered implementation.
 
-**Full signature** (see
+**Signature** (see
 [`zarr_vectors/multiresolution/coarsen.py:build_pyramid`](../../../zarr_vectors/multiresolution/coarsen.py)):
 
 ```python
 def build_pyramid(
     store_path: str | Path,
     *,
-    factors: list[tuple[float, float]] | None = None,
-    method: str = "per_object",
-    level_configs: list[dict] | None = None,        # legacy: explicit bin_ratio
-    target_volume_reduction: float = 8.0,           # legacy: auto-plan mode
-    sparsity_weight: float = 0.0,                   # legacy: auto-plan mode
-    reduction_factor: int = 8,                      # legacy: heuristic threshold
-    max_levels: int = 10,
-    min_vertices: int = 8,
-    agg_mode: str = "mean",
-    sparsity_strategy: str = "random",
+    factors: list[tuple[float, float]],
+    chunk_scale_factors: list[int | tuple[int, ...]] | None = None,
+    sparsity_strategy: str = "random",     # core built-in; else via tools
     sparsity_seed: int | None = None,
     cross_level_depth: int = 1,
     cross_level_storage: str = "explicit",
+    method: str = "per_object",            # core built-in; else via tools
 ) -> dict[str, Any]
 ```
-
-The `factors=` interface is the recommended path. The
-`level_configs=` / `sparsity_weight=` / auto-plan branches are kept
-for backwards compatibility.
 
 ### `coarsen_level` API
 
@@ -194,8 +208,7 @@ coarsen_level(
     target_level=1,
     coarsen_factor=2.0,
     sparsity_factor=1.0,
-    method="per_object",
-    agg_mode="mean",
+    method="per_object",            # core default; advanced ones via tools
 )
 ```
 
@@ -206,23 +219,21 @@ to materialise `±delta` arrays, call `build_pyramid(..., factors=...)`
 instead (which post-processes the whole pyramid in one pass via
 `_finalize_cross_level_for_store`).
 
-### Methods: `per_object` vs `cross_object_metanode`
+### Methods
 
-| Method | Behaviour | OID stability | Capabilities stamped |
-|--------|-----------|---------------|----------------------|
-| `per_object` (default) | Per-object pyramid; metavertices may be shared between objects | **Stable** — each surviving object keeps its OID across levels | `CAP_PRESERVED_OBJECT_IDS`, `CAP_SHARED_VERTEX_GROUPS` |
-| `cross_object_metanode` (alias: `grid_metanode`) | Legacy grid-binning; merges vertices across object boundaries | Fresh OID space per level | (none additional) |
+| Method | Provided by | Behaviour | OID stability |
+|--------|-------------|-----------|---------------|
+| `per_object` (default) | **core** | Per-object pyramid; metavertices may be shared between objects | **Stable** — each surviving object keeps its OID across levels |
+| `cross_object_metanode` (alias: `grid_metanode`), and others | `zarr-vectors-tools` | Registered via the strategy registry; e.g. grid-binning that merges vertices across object boundaries for the smallest coarse representation | Method-defined |
 
-Choose `per_object` when downstream consumers need to track the
-"same object" across resolution levels (e.g. drill-down navigation
-in Neuroglancer, ID-preserving analytics). Choose
-`cross_object_metanode` when you want the smallest possible coarse
-representation and don't need OID continuity.
+Choose `per_object` (core) when downstream consumers need to track the
+"same object" across resolution levels (e.g. drill-down navigation in
+Neuroglancer, ID-preserving analytics). Advanced methods are selected by
+passing their registered name as `method=`; they require
+`zarr-vectors-tools` to be installed (see *Core vs `zarr-vectors-tools`*).
 
-Implementations:
-[`_per_object_coarsen`](../../../zarr_vectors/multiresolution/coarsen.py)
-and
-[`_cross_object_metanode_coarsen`](../../../zarr_vectors/multiresolution/coarsen.py).
+Core implementation:
+[`_per_object_coarsen`](../../../zarr_vectors/multiresolution/coarsen.py).
 
 ### Aggregation modes
 
