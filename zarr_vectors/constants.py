@@ -24,6 +24,19 @@ already used.  Custom per-array attrs move from the parent group's
 ``attributes`` into the array's own ``attributes`` block.  Hard break:
 0.8.0 stores are not readable; rewrite from source.
 
+0.8.1 also adds three **optional, backward-compatible** fields to the
+``cross_chunk_links/<delta>/`` family ``.zattrs`` (absent ⇒ the prior
+behaviour, so existing 0.8.1 stores read unchanged): ``directed``
+(bool; when true endpoint order is preserved and ``A→B`` / ``B→A`` are
+distinct cells — used by streamline and skeleton parent→child edges),
+``store`` (``"canonical"`` = one cell per record, or ``"duplicate"`` =
+one cell per distinct incident chunk for prefix-scan incidence reads),
+and ``num_physical_records`` (on-disk row count, ``> num_links`` when
+duplicated).  ``num_links`` remains the *logical* record count.  A
+decentralized ``write_cross_chunk_link_cells`` + ``finalize_cross_chunk_links``
+pair lets independent workers append into disjoint cells race-free.
+See ``docs/spec/object_model/cross_chunk_links.md``.
+
 0.8.0: per-tuple ``cross_chunk_links`` layout.  The global flat
 ``cross_chunk_links/<delta>/data`` blob is replaced by per-cell
 arrays keyed on the canonical-sorted L-tuple of endpoint chunks

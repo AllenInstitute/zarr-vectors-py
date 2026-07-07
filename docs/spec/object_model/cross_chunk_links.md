@@ -186,17 +186,90 @@ group — see
 
 ```jsonc
 {
-  "zv_array":    "cross_chunk_links",
-  "num_links":   12,         // family-wide total record count
-  "sid_ndim":    3,
-  "level_delta": 1,
-  "link_width":  2
+  "zv_array":             "cross_chunk_links",
+  "num_links":            12,         // family-wide *logical* record count
+  "num_physical_records": 12,         // on-disk rows (> num_links if duplicated)
+  "sid_ndim":             3,
+  "level_delta":          1,
+  "link_width":           2,
+  "directed":             false,      // endpoint order preserved when true
+  "store":                "canonical" // "canonical" | "duplicate"
 }
 ```
 
 Per-cell arrays carry no extra metadata — `K` in this cell is
 recoverable from the ragged blob header, mirroring how
 `links/<delta>/<chunk_key>` works today.
+
+### Directed and duplicate storage
+
+Two family-level flags on the `.zattrs` govern how a record is placed
+into cells. They are recorded so readers and the consistency validator
+never have to inspect the data to interpret the cell keys.
+
+**`directed` (bool, default `false`).**
+
+- `false` (undirected): endpoint order is not meaningful. The writer
+  canonical-sorts each record's endpoints by `(chunk_coords, vi)` and
+  files it under the canonical cell key; the Lehmer `perm_idx` recovers
+  the original order on read. `A→B` and `B→A` collapse into the **same**
+  canonical cell (distinguished only by `perm_idx`). The validator
+  enforces the canonical-sort invariant (cell-key chunks non-decreasing).
+- `true` (directed): endpoint order **is** data — streamline
+  predecessor→successor, skeleton parent→child. No canonical sort; the
+  cell key follows **input** endpoint order and every `perm_idx` is `0`.
+  `A→B` files under cell `A.B`, `B→A` under `B.A` — **distinct cells with
+  distinct meaning**. The validator skips the canonical-sort invariant.
+  A family is uniformly directed or undirected; appending with the other
+  `directed` value raises.
+
+**`store` (`"canonical"` | `"duplicate"`, default `"canonical"`).**
+
+- `"canonical"`: each record is written to exactly **one** cell.
+  Fewest files. Finding every link incident to a chunk `C` requires
+  scanning each cell whose key contains `C` in any slot.
+- `"duplicate"`: each record is written under **one cell per distinct
+  incident chunk** — that chunk leads the key — as **independent physical
+  copies**, each carrying the `perm_idx` back to input order. A reader can
+  then find every link incident to `C` by scanning only cells whose
+  **first** slot is `C` (a prefix scan), trading up to `K`× storage (`K`
+  = distinct chunks touched) for faster incidence reads. Copies are **not**
+  deduplicated on read — [`read_cross_chunk_links`](../../../zarr_vectors/core/arrays.py)
+  returns each one; callers wanting unique links dedupe or query with
+  `read_cross_chunk_links_for_tuple`. The parallel attribute family
+  replicates identically (same cell keys, same per-cell order), which the
+  writer gets for free from the returned partition — so a `duplicate`
+  attribute write **requires** that partition.
+
+All four `directed × store` combinations are valid:
+
+| directed | store | on disk |
+|----------|-------|---------|
+| false | canonical | one canonical cell + `perm_idx` (the pre-0.9 default) |
+| false | duplicate | copies under all permutations of the **canonical** order |
+| true  | canonical | one **input-order** cell, `perm_idx = 0` |
+| true  | duplicate | copies under all permutations of the **input** order |
+
+**Counts.** `num_links` is the **logical** record count (one per input
+record), so the parallel attribute array stays one row per logical link
+and replicates through the partition. `num_physical_records` is the
+on-disk row count — equal to `num_links` for `canonical`, larger for
+`duplicate`.
+
+### Decentralized (per-cell) writes
+
+`write_cross_chunk_links` is a whole-family replace/append that maintains
+the counts above. For scale-out ingest, `write_cross_chunk_link_cells`
+lets many workers each append a batch into **only** the cells it touches,
+deferring the global bookkeeping to a single `finalize_cross_chunk_links`
+pass. Because cells are flat one-file-per-cell (sharding is a later
+`shard_store` pass), workers writing **disjoint** cells never touch the
+same file — so if each worker owns the records whose canonical-first
+chunk (or, when directed, source chunk) it is responsible for, every cell
+has exactly one writer and the ingest is race-free. Per-cell RMW is **not**
+safe for two workers hitting the same cell. A coordinator pre-creates the
+family (matching `directed` / `store` / `sid_ndim`) via
+`create_cross_chunk_links_array` so workers agree on the policy.
 
 **Sid-ndim assumption.** Source and target levels share `sid_ndim`
 (uniform per store). The writer asserts every endpoint's chunk-coord
