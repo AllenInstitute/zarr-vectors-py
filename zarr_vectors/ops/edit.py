@@ -1013,6 +1013,7 @@ class EditSession:
             write_cross_chunk_links,
         )
         from zarr_vectors.core.metadata import RootMetadata
+        from zarr_vectors.core.paths import cross_chunk_links_path
         from zarr_vectors.core.store import get_resolution_level
 
         meta = RootMetadata.from_dict(self.root.attrs.to_dict())
@@ -1027,7 +1028,23 @@ class EditSession:
 
         for (level, delta), ops in groups.items():
             level_group = get_resolution_level(self.root, level)
+            # Preserve the family's directed/store policy across the
+            # read-modify-rewrite, else editing a directed or duplicate
+            # family would silently revert it to canonical undirected.
+            fam_meta = level_group.read_array_meta(
+                cross_chunk_links_path(delta)
+            ) or {}
+            directed = bool(fam_meta.get("directed", False))
+            store = str(fam_meta.get("store", "canonical"))
             current = read_cross_chunk_links(level_group, delta=delta)
+            if store == "duplicate":
+                # read_cross_chunk_links returns physical copies; collapse
+                # to logical records (first-seen order) so the rewrite
+                # re-expands them once rather than squaring the fan-out.
+                seen: set = set()
+                current = [
+                    r for r in current if not (r in seen or seen.add(r))
+                ]
             # Apply ops in submission order.
             rows: list[list[tuple[ChunkCoords, int]]] = [list(r) for r in current]
             for op in ops:
@@ -1039,7 +1056,10 @@ class EditSession:
                 elif op.op == "overwrite":
                     if op.index is not None and 0 <= op.index < len(rows):
                         rows[op.index] = list(op.payload or [])
-            write_cross_chunk_links(level_group, rows, sid_ndim, delta=delta)
+            write_cross_chunk_links(
+                level_group, rows, sid_ndim, delta=delta,
+                directed=directed, store=store,
+            )
 
     def _flush_manifest_ops(self) -> None:
         if not self._manifest_ops:

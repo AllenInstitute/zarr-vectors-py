@@ -60,6 +60,20 @@ enums:
       both:
         description: Both boundary duplication and explicit links are present.
 
+  CrossChunkStore:
+    description: >
+      Cell-duplication policy for a ``cross_chunk_links/<delta>/`` family.
+    permissible_values:
+      canonical:
+        description: >
+          Each record is filed in exactly one cell (canonical-sorted
+          endpoints, or input order when ``directed``).  Fewest cells.
+      duplicate:
+        description: >
+          Each record is filed under one cell per distinct incident chunk
+          as independent physical copies, so incidence reads become a
+          prefix scan.  ``num_physical_records`` then exceeds ``num_links``.
+
   CrossLevelStorage:
     description: >
       How cross-pyramid-level edges are stored in the multiscale links
@@ -346,8 +360,15 @@ classes:
       endpoint (input endpoint 0) lives at the array's own
       resolution level; target-side endpoints live at
       ``this_level + level_delta``.  ``num_links`` is the family-
-      wide total record count.
-    slots: [zv_array, num_links, sid_ndim, level_delta, link_width]
+      wide *logical* record count (one per input record).
+
+      Two family-level policy flags govern cell placement:
+      ``directed`` (endpoint order preserved, so ``A→B`` and ``B→A``
+      are distinct cells) and ``store`` (``canonical`` = one cell per
+      record; ``duplicate`` = one cell per distinct incident chunk).
+      ``num_physical_records`` is the on-disk row count, which exceeds
+      ``num_links`` under ``duplicate``.
+    slots: [zv_array, num_links, num_physical_records, sid_ndim, level_delta, link_width, directed, store]
     slot_usage:
       zv_array:
         equals_string: cross_chunk_links
@@ -616,6 +637,26 @@ slots:
     range: integer
     minimum_value: 0
     required: true
+  num_physical_records:
+    description: >
+      On-disk record row count across all cells of a
+      ``cross_chunk_links/<delta>/`` family.  Equals ``num_links`` for
+      ``store=canonical``; larger when ``store=duplicate`` replicates a
+      record across its incident-chunk cells.
+    range: integer
+    minimum_value: 0
+    required: false
+  directed:
+    description: >
+      When true, endpoint order is meaningful and preserved (no canonical
+      sort): ``A→B`` and ``B→A`` occupy distinct cells and every stored
+      ``perm_idx`` is 0.  Defaults to false (undirected).
+    range: boolean
+    required: false
+  store:
+    description: Cell-duplication policy; see CrossChunkStore.
+    range: CrossChunkStore
+    required: false
   sid_ndim:
     description: Number of spatial-index dimensions encoded in chunk keys.
     range: integer

@@ -198,11 +198,19 @@ def validate_consistency(store_path: str | Path) -> ValidationResult:
                 family_meta = lg.read_array_meta(family) or {}
                 link_width = int(family_meta.get("link_width", 2))
                 ccl_sid_ndim = int(family_meta.get("sid_ndim", 0))
+                directed = bool(family_meta.get("directed", False))
+                store = str(family_meta.get("store", "canonical"))
             except Exception:
                 continue
             if ccl_sid_ndim == 0:
                 continue
 
+            # The canonical-sort invariant (chunks non-decreasing in the
+            # cell key) only holds for an undirected, single-cell family.
+            # Directed cells key on input endpoint order, and duplicate
+            # cells lead with each incident chunk, so both legitimately
+            # break lex ordering — skip the check for them.
+            enforce_canonical = not directed and store == "canonical"
             cell_keys = sorted(lg.list_chunks(family))
             for ckey in cell_keys:
                 try:
@@ -215,18 +223,30 @@ def validate_consistency(store_path: str | Path) -> ValidationResult:
                         f"malformed: {exc}"
                     )
                     continue
-                for i in range(1, link_width):
-                    if canonical_chunks[i] < canonical_chunks[i - 1]:
-                        result.add_error(
-                            f"{prefix}: ccl[delta={d}] cell {ckey!r} "
-                            f"violates canonical-sort invariant"
-                        )
-                        break
+                if enforce_canonical:
+                    for i in range(1, link_width):
+                        if canonical_chunks[i] < canonical_chunks[i - 1]:
+                            result.add_error(
+                                f"{prefix}: ccl[delta={d}] cell {ckey!r} "
+                                f"violates canonical-sort invariant"
+                            )
+                            break
 
             try:
                 ccl = read_cross_chunk_links(lg, delta=d)
             except Exception:
                 ccl = []
+
+            # read_cross_chunk_links returns one row per on-disk record
+            # (physical, so duplicated copies are counted); it must match
+            # the family's recorded num_physical_records.
+            if "num_physical_records" in family_meta:
+                expected_phys = int(family_meta["num_physical_records"])
+                if expected_phys != len(ccl):
+                    result.add_error(
+                        f"{prefix}: ccl[delta={d}] num_physical_records="
+                        f"{expected_phys} != {len(ccl)} rows on disk"
+                    )
             for record in ccl:
                 # record is a tuple of (chunk_coords, vi) endpoints
                 # in input order; endpoint 0 is the owning-level
