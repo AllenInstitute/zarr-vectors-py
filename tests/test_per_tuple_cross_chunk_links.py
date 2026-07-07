@@ -194,6 +194,73 @@ class TestCanonicalSortInvariant:
         assert bad_messages, f"expected canonical-sort error; got {result.errors}"
 
 
+class TestValidatorModeAware:
+    """Directed / duplicate families must not trip the canonical-sort check."""
+
+    def _graph_store(self, tmp_path: Path):
+        from zarr_vectors.types.graphs import write_graph
+        from zarr_vectors.core.store import open_store, get_resolution_level
+
+        store_path = tmp_path / "store.zv"
+        positions = np.array([
+            [50.0, 50.0, 50.0],
+            [150.0, 50.0, 50.0],
+        ], dtype=np.float32)
+        edges = np.array([[0, 1]], dtype=np.int64)
+        write_graph(
+            str(store_path), positions, edges,
+            chunk_shape=(100.0, 100.0, 100.0),
+        )
+        root = open_store(str(store_path), mode="r+")
+        return store_path, get_resolution_level(root, 0)
+
+    def test_directed_not_flagged(self, tmp_path: Path) -> None:
+        from zarr_vectors.validate.consistency import validate_consistency
+
+        store_path, lg = self._graph_store(tmp_path)
+        # Directed edge stored in non-canonical (input) order.
+        write_cross_chunk_links(
+            lg, [[((1, 0, 0), 1), ((0, 0, 0), 0)]], sid_ndim=3, delta=0,
+            directed=True,
+        )
+        result = validate_consistency(str(store_path))
+        assert not [e for e in result.errors if "canonical-sort" in e], (
+            result.errors
+        )
+
+    def test_duplicate_not_flagged_counts_ok(self, tmp_path: Path) -> None:
+        from zarr_vectors.validate.consistency import validate_consistency
+
+        store_path, lg = self._graph_store(tmp_path)
+        write_cross_chunk_links(
+            lg, [[((0, 0, 0), 0), ((1, 0, 0), 1)]], sid_ndim=3, delta=0,
+            store="duplicate",
+        )
+        result = validate_consistency(str(store_path))
+        assert not [e for e in result.errors if "canonical-sort" in e], (
+            result.errors
+        )
+        assert not [
+            e for e in result.errors if "num_physical_records" in e
+        ], result.errors
+
+    def test_physical_count_mismatch_flagged(self, tmp_path: Path) -> None:
+        from zarr_vectors.validate.consistency import validate_consistency
+
+        store_path, lg = self._graph_store(tmp_path)
+        write_cross_chunk_links(
+            lg, [[((0, 0, 0), 0), ((1, 0, 0), 1)]], sid_ndim=3, delta=0,
+        )
+        family = cross_chunk_links_path(0)
+        meta = lg.read_array_meta(family)
+        meta["num_physical_records"] = 99  # corrupt the recorded count
+        lg.write_array_meta(family, meta)
+        result = validate_consistency(str(store_path))
+        assert [
+            e for e in result.errors if "num_physical_records" in e
+        ], result.errors
+
+
 class TestAttributesAlignment:
     """Cell-aligned attribute writes preserve per-record correspondence."""
 
