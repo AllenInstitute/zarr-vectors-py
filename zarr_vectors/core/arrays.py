@@ -785,10 +785,10 @@ def write_chunk_links(
 ) -> npt.NDArray[np.int64]:
     """Write link groups to a spatial chunk under ``links/<delta>/``.
 
-    For ``delta=0`` link groups are 1:1 aligned with the chunk's
-    fragments; readers derive per-group link byte offsets from the
+    For ``delta=0`` readers derive per-group link byte offsets from the
     cumulative sizes of each group's link bytes (see
-    :func:`read_chunk_links`).
+    :func:`read_chunk_links`); link groups need not be 1:1 with the
+    chunk's vertex fragments.
 
     For ``delta != 0`` (cross-pyramid-level links) the source vertex
     groups and link groups live at different levels and there is
@@ -808,15 +808,12 @@ def write_chunk_links(
     key = _chunk_key(chunk_coords)
     full_name = links_path(delta)
 
-    if delta == 0 and level_group.chunk_exists(VERTEX_FRAGMENTS, key):
-        existing_fi = decode_fragments(
-            level_group.read_bytes(VERTEX_FRAGMENTS, key),
-        )
-        if existing_fi.num_fragments != len(link_groups):
-            raise ArrayError(
-                f"Link group count ({len(link_groups)}) != "
-                f"vertex fragment count ({existing_fi.num_fragments}) in chunk {key}"
-            )
+    # NOTE: link groups are no longer required to be 1:1 with the chunk's
+    # vertex fragments. BRIDGE stores streamlines as vertex-fragments and the
+    # node graph as link-fragments, so a chunk legitimately has many vertex
+    # fragments (Core-1 range + polyline twins) but few link groups (the node
+    # graph). Readers derive per-group link ranges from ``link_fragments/``
+    # (not from ``vertex_fragments``), so no write-time 1:1 guard is needed.
 
     if delta == 0:
         # v0.6 intra-level: flat concatenated link data + sibling
