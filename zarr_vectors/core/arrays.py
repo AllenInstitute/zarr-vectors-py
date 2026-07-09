@@ -58,7 +58,6 @@ from zarr_vectors.encoding.fragments import (
 )
 from zarr_vectors.encoding.ragged import (
     decode_ragged_blob,
-    decode_ragged_floats,
     encode_ragged_blob,
     encode_ragged_floats,
     encode_ragged_ints,
@@ -2425,10 +2424,15 @@ def read_chunk_attributes(
 ) -> list[npt.NDArray]:
     """Read vertex attribute data for a chunk.
 
-    Per-group byte offsets are derived from ``vertex_fragments``:
-    group ``k`` has ``n_k = (vert_offsets[k+1] - vert_offsets[k]) /
-    (vert_dtype.itemsize * vert_ndim)`` vertices, so its attribute
-    byte offset is ``cumsum(n_k) * dtype.itemsize * ncols``.
+    Per-vertex attributes are stored one row per vertex, aligned 1:1
+    with the ``vertices`` buffer (Core-1's fragment 0).  Each fragment
+    is gathered by vertex index from the shared attribute buffer via the
+    ``vertex_fragments/<chunk>`` index — range fragments as contiguous
+    slices, explicit fragments via ``fi.indices(f)`` — exactly as
+    :func:`read_chunk_vertices` does.  There is no contiguity
+    requirement, so explicit path-fragment vertex-fragments (e.g.
+    BRIDGE's polyline twins appended on top of Core-1's range) read
+    correctly.
 
     Args:
         level_group: Resolution level group.
@@ -2436,30 +2440,19 @@ def read_chunk_attributes(
         chunk_coords: Spatial chunk coordinates.
         dtype: Numpy dtype of the attribute.
         ncols: Number of columns (channels). Use 1 for scalars.
-        vert_dtype: Vertex dtype (needed to derive per-group sizes).
-            When ``None`` (default) it is read from the ``vertices/``
-            array metadata.
-        vert_ndim: Vertex coordinate dimensionality.  When ``None``
-            (default) it is read from root metadata via NGFF axes; on
-            failure falls back to 3.
+        vert_dtype: Retained for backward compatibility; ignored.
+            Per-fragment sizes now come from the fragment index directly.
+        vert_ndim: Retained for backward compatibility; ignored.
 
     Returns:
-        List of arrays aligned with fragments.
+        List of arrays aligned with fragments, each ``(N_k, ncols)`` (or
+        ``(N_k,)`` when ``ncols == 1``).  ``groups[0]`` is Core-1's
+        fragment 0 — the full per-vertex buffer for the chunk.
     """
+    del vert_dtype, vert_ndim  # retained for signature compat; unused
     key = _chunk_key(chunk_coords)
     dtype = np.dtype(dtype)
     full_name = f"{VERTEX_ATTRIBUTES}/{attr_name}"
-
-    if vert_dtype is None:
-        try:
-            vmeta = level_group.read_array_meta(VERTICES)
-            vert_dtype = np.dtype(vmeta.get("dtype", "float32"))
-        except Exception:
-            vert_dtype = np.dtype(np.float32)
-    else:
-        vert_dtype = np.dtype(vert_dtype)
-    if vert_ndim is None:
-        vert_ndim = _infer_vert_ndim(level_group)
 
     with _maybe_batched_reads(level_group, [
         (full_name, [key]),
@@ -2471,14 +2464,45 @@ def read_chunk_attributes(
             raise ArrayError(
                 f"Cannot read attribute '{attr_name}' chunk {key}: {e}"
             ) from e
+        fi = read_vertex_fragment_index(level_group, chunk_coords)
 
-        attr_offsets = _derive_attribute_offsets(
-            level_group, chunk_coords,
-            vert_dtype=vert_dtype, vert_ndim=vert_ndim,
-            attr_dtype=dtype, attr_ncols=ncols,
-            total_attr_bytes=len(raw),
+    if fi.num_fragments == 0:
+        return []
+    # Per-vertex attributes are one row per underlying vertex, aligned 1:1
+    # with the ``vertices`` buffer (Core-1's fragment 0).  Reshape the flat
+    # buffer to ``(N_vertices, width)`` where ``width`` is the attribute's
+    # true per-vertex column count (derived from the buffer size and the
+    # vertex extent — independent of the requested ``ncols``), then gather
+    # each fragment by vertex index exactly as read_chunk_vertices does:
+    # range fragments as contiguous slices, explicit fragments (e.g.
+    # BRIDGE's appended path-fragment twins) via ``fi.indices(f)``.  Each
+    # gathered group is finally flattened and re-shaped to honour the
+    # caller's ``ncols`` (ncols=1 yields a flat 1-D array), matching the
+    # historical decode_ragged_floats contract.
+    itemsize = dtype.itemsize
+    total_elements = len(raw) // itemsize if itemsize else 0
+    n_vertices = _fragment_vertex_extent(fi)
+    if n_vertices <= 0 or total_elements == 0:
+        empty = np.empty((0,) if ncols == 1 else (0, ncols), dtype=dtype)
+        return [empty for _ in range(fi.num_fragments)]
+    if total_elements % n_vertices != 0:
+        raise ArrayError(
+            f"Attribute '{attr_name}' chunk {key} has {total_elements} "
+            f"elements, not a multiple of its {n_vertices} vertices; "
+            "per-vertex attributes must align 1:1 with the vertices array."
         )
-    return decode_ragged_floats(raw, attr_offsets, dtype, ncols)
+    width = total_elements // n_vertices
+    full = np.frombuffer(raw, dtype=dtype).reshape(n_vertices, width)
+    groups: list[npt.NDArray] = []
+    for f in range(fi.num_fragments):
+        if fi.is_range(f):
+            start, count = fi.range(f)
+            rows = full[start : start + count]
+        else:
+            rows = full[fi.indices(f)]
+        flat = np.ascontiguousarray(rows).reshape(-1)
+        groups.append(flat if ncols == 1 else flat.reshape(-1, ncols))
+    return groups
 
 
 def read_chunk_fragment_attributes(
@@ -2638,51 +2662,6 @@ def _infer_vert_ndim(level_group: FsGroup) -> int:
     except Exception:
         pass
     return 3
-
-
-def _derive_attribute_offsets(
-    level_group: FsGroup,
-    chunk_coords: ChunkCoords,
-    *,
-    vert_dtype: np.dtype,
-    vert_ndim: int,
-    attr_dtype: np.dtype,
-    attr_ncols: int,
-    total_attr_bytes: int,
-) -> npt.NDArray[np.int64]:
-    """Compute per-group attribute byte offsets from vertex offsets.
-
-    Attribute groups align 1:1 with fragments.  The k-th vertex
-    group spans ``vert_offsets[k+1] - vert_offsets[k]`` bytes of
-    vertex data, which corresponds to ``n_k`` vertices (and therefore
-    ``n_k`` attribute rows).
-    """
-    vert_row_size = vert_dtype.itemsize * vert_ndim
-    if vert_row_size <= 0:
-        return np.empty(0, dtype=np.int64)
-    fi = read_vertex_fragment_index(level_group, chunk_coords)
-    if fi.num_fragments == 0:
-        return np.empty(0, dtype=np.int64)
-    # Per-fragment vertex row count.  Today's writers always emit
-    # range fragments; non-contiguous shapes will need a richer
-    # attribute-alignment story (out of scope for this change).
-    n_per_group = np.empty(fi.num_fragments, dtype=np.int64)
-    for f in range(fi.num_fragments):
-        if not fi.is_range(f):
-            raise ArrayError(
-                f"vertex_fragments fragment {f} is non-contiguous; "
-                "attribute alignment requires every fragment to be a "
-                "contiguous range of vertex rows.",
-            )
-        _start, count = fi.range(f)
-        n_per_group[f] = int(count)
-    attr_row_size = attr_dtype.itemsize * attr_ncols
-    attr_byte_lengths = n_per_group * int(attr_row_size)
-    attr_offsets = np.empty_like(attr_byte_lengths)
-    attr_offsets[0] = 0
-    np.cumsum(attr_byte_lengths[:-1], out=attr_offsets[1:])
-    del total_attr_bytes  # signature retained for caller compat
-    return attr_offsets
 
 
 def read_object_manifest(
@@ -3390,6 +3369,28 @@ def _reshape_vertex_buffer(
     """
     arr = np.frombuffer(raw, dtype=dtype)
     return arr.reshape(-1, ndim) if ndim > 1 else arr
+
+
+def _fragment_vertex_extent(fi: ChunkFragmentIndex) -> int:
+    """Return the number of underlying vertices a fragment index spans.
+
+    This is ``max(referenced vertex index) + 1`` across every fragment —
+    equal to the length of the ``vertices`` array the chunk's per-vertex
+    attributes align 1:1 with (Core-1's fragment 0 is a range covering
+    all vertices, so it sets this extent; explicit twins only reference a
+    subset).  Used by :func:`read_chunk_attributes` to recover the
+    attribute's true per-vertex column width.
+    """
+    extent = 0
+    for f in range(fi.num_fragments):
+        if fi.is_range(f):
+            start, count = fi.range(f)
+            extent = max(extent, int(start) + int(count))
+        else:
+            idx = fi.indices(f)
+            if idx.size:
+                extent = max(extent, int(idx.max()) + 1)
+    return extent
 
 
 def _slice_vertex_range(

@@ -785,6 +785,63 @@ class TestExplicitFragments:
         np.testing.assert_array_equal(groups[1], buf[[3, 5, 4]])
         np.testing.assert_array_equal(groups[2], buf[5:6])
 
+    # --- Vertex attributes: gather by index for explicit fragments ---
+
+    def test_read_chunk_attributes_mixed_scalar(self, tmp_path: Path) -> None:
+        # BRIDGE shape: Core-1 range fragment 0 over all vertices, plus an
+        # explicit path-fragment twin referencing a subset.  Previously
+        # raised "vertex_fragments fragment N is non-contiguous".
+        lg = _make_level_group(tmp_path)
+        create_vertices_array(lg)
+        create_attribute_array(lg, "fa")
+
+        verts = np.array([[i, i, i] for i in range(6)], dtype=np.float32)
+        write_chunk_vertices(lg, (0, 0, 0), [verts])
+        fa = np.array([0.0, 0.1, 0.2, 0.3, 0.4, 0.5], dtype=np.float32)
+        write_chunk_attributes(lg, "fa", (0, 0, 0), [fa])
+
+        self._write_vertex_explicit_index(
+            lg, (0, 0, 0),
+            [(0, 6), np.array([2, 0, 3], dtype=np.int64)],
+        )
+
+        groups = read_chunk_attributes(
+            lg, "fa", (0, 0, 0), dtype=np.float32, ncols=1,
+        )
+        assert len(groups) == 2
+        # Fragment 0 is the full per-vertex buffer (what BRIDGE reads as [0]).
+        np.testing.assert_array_equal(groups[0], fa)
+        assert groups[0].ndim == 1
+        # Explicit fragment gathered by vertex index.
+        np.testing.assert_array_equal(groups[1], fa[[2, 0, 3]])
+
+    def test_read_chunk_attributes_mixed_multichannel(
+        self, tmp_path: Path,
+    ) -> None:
+        lg = _make_level_group(tmp_path)
+        create_vertices_array(lg)
+        create_attribute_array(lg, "evec", channel_names=["x", "y", "z"])
+
+        verts = np.array([[i, i, i] for i in range(4)], dtype=np.float32)
+        write_chunk_vertices(lg, (0, 0, 0), [verts])
+        evec = np.array(
+            [[0, 1, 2], [3, 4, 5], [6, 7, 8], [9, 10, 11]], dtype=np.float32,
+        )
+        write_chunk_attributes(lg, "evec", (0, 0, 0), [evec], dtype=np.float32)
+
+        self._write_vertex_explicit_index(
+            lg, (0, 0, 0),
+            [(0, 4), np.array([3, 1], dtype=np.int64)],
+        )
+
+        groups = read_chunk_attributes(
+            lg, "evec", (0, 0, 0), dtype=np.float32, ncols=3,
+        )
+        assert len(groups) == 2
+        np.testing.assert_array_equal(groups[0], evec)
+        assert groups[0].shape == (4, 3)
+        np.testing.assert_array_equal(groups[1], evec[[3, 1]])
+
     # --- Links: single fragment via read_chunk_link_fragment ---------
 
     def test_read_chunk_link_fragment_explicit(self, tmp_path: Path) -> None:
@@ -792,8 +849,8 @@ class TestExplicitFragments:
         create_vertices_array(lg)
         create_links_array(lg, link_width=2)
 
-        # Need a single vertex fragment that covers all referenced rows so
-        # the writer's vertex/link fragment-count check passes.
+        # Lay down a single vertex fragment covering every row the links
+        # reference (the old writer vertex/link fragment-count check is gone).
         write_chunk_vertices(
             lg, (0, 0, 0), [np.zeros((10, 3), dtype=np.float32)],
         )
