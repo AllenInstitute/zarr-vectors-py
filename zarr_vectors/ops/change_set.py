@@ -185,8 +185,9 @@ class ChunkChangeBuilder:
         when the on-disk link layer has fewer fragments than the chunk
         has vertex fragments (e.g. a graph writer that consolidated all
         edges into a single link fragment), the result is padded with
-        empty per-fragment groups so subsequent mutations preserve the
-        1:1 alignment invariant ``write_chunk_links`` enforces.
+        empty per-fragment groups so this builder can keep indexing its
+        link groups per vertex fragment.  (``write_chunk_links`` no longer
+        requires 1:1 alignment; this padding is internal bookkeeping.)
         """
         if delta in self.link_groups:
             return self.link_groups[delta]
@@ -284,8 +285,9 @@ class ChunkChangeBuilder:
                 )
             attr_list.append(vals)
             self.attrs_dirty[name] = True
-        # Also extend every link delta with an empty per-fragment group
-        # so the 1:1 link/fragment alignment invariant holds.
+        # Also extend every link delta with an empty per-fragment group so
+        # this builder keeps one link group per vertex fragment (internal
+        # bookkeeping; write_chunk_links no longer requires 1:1 alignment).
         for delta, groups in self.link_groups.items():
             link_width = groups[0].shape[1] if groups and groups[0].ndim == 2 else 2
             groups.append(np.empty((0, link_width), dtype=np.int64))
