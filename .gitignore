@@ -36,3 +36,5 @@ htmlcov/
 
 docs/_build
 *.prof
+
+examples/
