@@ -109,3 +109,11 @@ warn_unused_configs = true
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+# zarr-vectors' per-chunk-array layout depends on Zarr v3's
+# ``variable_length_bytes`` dtype, which zarr-python flags as
+# spec-unstable on every array create/open (see zarr_vectors/__init__.py
+# for the matching runtime-side filter — pytest resets the warnings
+# filter list per test, so that filter alone doesn't reach test output).
+filterwarnings = [
+    "ignore::zarr.errors.UnstableSpecificationWarning",
+]
