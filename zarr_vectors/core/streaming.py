@@ -24,12 +24,10 @@ group in batches, holding only O(fragments) in memory:
 
 from __future__ import annotations
 
-import warnings
 from typing import Sequence
 
 import numpy as np
 from zarr.codecs import VLenBytesCodec
-from zarr.errors import UnstableSpecificationWarning
 
 from zarr_vectors.constants import OBJECT_INDEX
 from zarr_vectors.core.arrays import (
@@ -114,22 +112,18 @@ class ObjectIndexAppender:
             arr.resize((self._base_oid,))
             return arr
 
-        # vlen-bytes lacks a finalised V3 spec — silence as
-        # _write_object_index_manifests does.
-        with warnings.catch_warnings():
-            warnings.simplefilter("ignore", UnstableSpecificationWarning)
-            arr = oi_group.create_array(
-                "manifests",
-                shape=(self._base_oid,),
-                chunks=(OBJECT_INDEX_MANIFEST_BUCKET,),
-                dtype="bytes",
-                serializer=VLenBytesCodec(),
-            )
-            if self._base_oid > 0:
-                empty = encode_object_manifest_blocks([], sid_ndim=self._sid_ndim)
-                obj = np.empty(self._base_oid, dtype=object)
-                obj[:] = [empty] * self._base_oid
-                arr[:] = obj
+        arr = oi_group.create_array(
+            "manifests",
+            shape=(self._base_oid,),
+            chunks=(OBJECT_INDEX_MANIFEST_BUCKET,),
+            dtype="bytes",
+            serializer=VLenBytesCodec(),
+        )
+        if self._base_oid > 0:
+            empty = encode_object_manifest_blocks([], sid_ndim=self._sid_ndim)
+            obj = np.empty(self._base_oid, dtype=object)
+            obj[:] = [empty] * self._base_oid
+            arr[:] = obj
         return arr
 
     def append(
