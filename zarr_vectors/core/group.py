@@ -31,7 +31,6 @@ Public surface mirrors the legacy :class:`FsGroup` for back-compat:
 
 from __future__ import annotations
 
-import warnings
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Iterator, Sequence
@@ -39,7 +38,6 @@ from typing import Any, Iterator, Sequence
 import numpy as np
 import zarr
 from zarr.codecs import VLenBytesCodec
-from zarr.errors import UnstableSpecificationWarning
 from zarr.storage import LocalStore
 
 from zarr_vectors.exceptions import StoreError
@@ -615,21 +613,17 @@ class Group:
 
         chunk_size = chunks if chunks is not None else n
 
-        with warnings.catch_warnings():
-            # vlen-bytes lacks a finalised V3 spec — see the matching
-            # suppression in `_write_object_index_manifests`.
-            warnings.simplefilter("ignore", UnstableSpecificationWarning)
-            arr = parent.create_array(
-                leaf,
-                shape=(n,),
-                chunks=(chunk_size,),
-                dtype="bytes",
-                serializer=VLenBytesCodec(),
-            )
-            obj = np.empty(n, dtype=object)
-            for i, blob in enumerate(blob_list):
-                obj[i] = blob
-            arr[:] = obj
+        arr = parent.create_array(
+            leaf,
+            shape=(n,),
+            chunks=(chunk_size,),
+            dtype="bytes",
+            serializer=VLenBytesCodec(),
+        )
+        obj = np.empty(n, dtype=object)
+        for i, blob in enumerate(blob_list):
+            obj[i] = blob
+        arr[:] = obj
 
         if attributes:
             arr.attrs.update(_json_safe(attributes))
@@ -648,6 +642,7 @@ class Group:
         *,
         shard_shape: tuple[int, ...] | None = None,
         attributes: dict[str, Any] | None = None,
+        cell_compressor: Any = "auto",
     ) -> None:
         """Allocate a sharded vlen-bytes Zarr array for per-chunk blobs.
 
@@ -675,6 +670,15 @@ class Group:
             attributes: Per-array metadata merged into the array's
                 ``zarr.json`` ``attributes`` block (the standard Zarr
                 v3 location for user metadata).
+            cell_compressor: Compressor applied inside the
+                ``sharding_indexed`` codec's inner ``vlen-bytes``
+                serializer, i.e. to each chunk cell's payload.
+                ``"auto"`` (default) keeps Zarr's default (currently
+                ``zstd`` level 0).  Pass ``None`` to write raw,
+                uncompressed cells — required for a reader to
+                byte-range-read individual rows *within* a cell (e.g.
+                one fragment's vertices) instead of fetching and
+                decompressing the whole cell.
         """
         ndim = len(grid_shape)
         if shard_shape is not None and len(shard_shape) != ndim:
@@ -697,18 +701,17 @@ class Group:
             "chunks": (1,) * ndim,
             "dtype": "bytes",
             "serializer": VLenBytesCodec(),
+            "compressors": cell_compressor,
         }
         if shard_shape is not None:
             # Zarr 3.2 high-level ``shards=`` kwarg: wraps the inner
             # ``chunks=`` codec in ``sharding_indexed`` automatically.
             create_kwargs["shards"] = tuple(shard_shape)
 
-        with warnings.catch_warnings():
-            warnings.simplefilter("ignore", UnstableSpecificationWarning)
-            arr = parent.create_array(leaf, **create_kwargs)
-            arr.attrs[_NONEMPTY_CHUNKS_ATTR] = []
-            if attributes:
-                arr.attrs.update(_json_safe(attributes))
+        arr = parent.create_array(leaf, **create_kwargs)
+        arr.attrs[_NONEMPTY_CHUNKS_ATTR] = []
+        if attributes:
+            arr.attrs.update(_json_safe(attributes))
 
     def _sharded_chunk_array(self, array_name: str) -> zarr.Array | None:
         """Return the multidim Zarr array at ``array_name`` when the
@@ -992,9 +995,7 @@ def _vlen_set_cell(
     obj = np.empty((1,) * len(coords), dtype=object)
     obj.flat[0] = bytes(data)
     slices = tuple(slice(c, c + 1) for c in coords)
-    with warnings.catch_warnings():
-        warnings.simplefilter("ignore", UnstableSpecificationWarning)
-        arr[slices] = obj
+    arr[slices] = obj
 
 
 def _record_nonempty_chunk(
