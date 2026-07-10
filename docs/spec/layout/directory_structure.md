@@ -13,11 +13,18 @@
   is a non-negative integer. Level 0 is always the full-resolution level.
   Higher levels are progressively coarser.
 
-**Array group**
-: A Zarr group within a resolution level that holds a single logical array
-  (e.g. `vertices/`, `attributes/intensity/`). The group contains a
-  `zarr.json` with the array metadata and one file per chunk in the `c/`
-  sub-tree.
+**Per-chunk array**
+: Every per-spatial-chunk array (`vertices/`, `vertex_fragments/`,
+  `links/<delta>/`, `vertex_attributes/<name>/`, …) is a **single** Zarr v3
+  vlen-bytes array whose shape is the level's chunk grid. One cell holds
+  one spatial chunk's payload bytes; the chunk files live under the `c/`
+  sub-tree (`c/i/j/k`). A spatial chunk at absolute coord `c` maps to cell
+  `c - origin`, where `origin = floor(min_corner / chunk_shape)` is stored
+  in the array's `chunk_grid_origin` attribute (absent ⇒ zero origin). The
+  set of non-empty cells is listed in the array's `nonempty_chunks`
+  attribute. `cross_chunk_links/<delta>/` is the one exception — its cells
+  are keyed by endpoint-chunk tuples (not a spatial grid), so each cell is
+  its own small array under a group.
 
 **`metadata.json`**
 : A plain-text JSON file at the store root containing human-readable
@@ -61,19 +68,20 @@ dataset.zarrvectors/
 │   ├── zarr.json                # Zarr v3 group metadata
 │   ├── .zattrs                  # per-level metadata (bin_ratio, sparsity)
 │   │
-│   ├── vertices/                # spatial positions — shape (N_chunk, D)
-│   │   ├── zarr.json
+│   ├── vertices/                # single vlen-bytes array; shape = chunk grid
+│   │   ├── zarr.json            # codecs=[vlen-bytes(, compressor)]; attrs:
+│   │   │                        #   nonempty_chunks, chunk_grid_origin
 │   │   └── c/
 │   │       ├── 0/0/0            # chunk at grid coord (0,0,0)
 │   │       ├── 0/0/1            # chunk at grid coord (0,0,1)
 │   │       └── …
 │   │
-│   ├── vertex_fragments/        # fragment index — uint8 blob per chunk
+│   ├── vertex_fragments/        # fragment index — one vlen array, cell/chunk
 │   │   ├── zarr.json
 │   │   └── c/ …
 │   │
-│   ├── attributes/              # per-vertex attribute arrays
-│   │   ├── intensity/           # one sub-group per named attribute
+│   ├── vertex_attributes/       # per-vertex attribute arrays
+│   │   ├── intensity/           # one single vlen array per named attribute
 │   │   │   ├── zarr.json
 │   │   │   └── c/ …
 │   │   └── label/

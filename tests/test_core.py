@@ -716,7 +716,7 @@ class TestStoreInfo:
         write_parametric_types(root, [PARAMETRIC_PLANE])
 
         info = store_info(root)
-        assert info["zv_version"].startswith("0.8")
+        assert info["zv_version"].startswith("0.9")
         assert info["geometry_types"] == ["point_cloud", "skeleton"]
         assert info["chunk_shape"] == [100.0, 100.0, 100.0]
         assert len(info["levels"]) == 1

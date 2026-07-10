@@ -330,16 +330,16 @@ class RootMetadata:
             raise MetadataError(
                 f"zv_version {self.zv_version!r} is not a valid X.Y[.Z] string"
             ) from exc
-        if (major, minor, patch) < (0, 8, 1):
+        if (major, minor, patch) < (0, 9, 0):
             raise MetadataError(
                 f"store zv_version is {self.zv_version}; this build "
                 f"requires {FORMAT_VERSION} — no backwards-compat shim. "
-                f"Pre-0.8.1 stores wrote each non-spatial array as a Zarr "
-                f"group containing single-chunk ``data``/``offsets``/"
-                f"``present_mask`` child arrays; 0.8.1 collapses each to "
-                f"a single standard Zarr v3 array with ``fill_value`` "
-                f"sparsity — the old layout cannot be read.  Rewrite "
-                f"from source."
+                f"Pre-0.9.0 stores wrote each per-spatial-chunk array "
+                f"(vertices, fragments, links, attribute arrays) as a Zarr "
+                f"group of single-chunk ``uint8`` sub-arrays, one per chunk "
+                f"key; 0.9.0 collapses each to a single vlen-bytes Zarr "
+                f"array whose cells are spatial chunks — the old layout "
+                f"cannot be read.  Rewrite from source."
             )
 
         if self.cross_level_storage not in VALID_XLEVEL_STORAGE:

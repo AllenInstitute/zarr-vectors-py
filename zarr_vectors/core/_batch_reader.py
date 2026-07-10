@@ -60,6 +60,18 @@ def _parse_coords(chunk_key: str) -> tuple[int, ...] | None:
         return None
 
 
+def _apply_origin(
+    coords: tuple[int, ...], attributes: dict[str, Any],
+) -> tuple[int, ...]:
+    """Translate an absolute chunk coord to a 0-based cell index using
+    the array's stored ``chunk_grid_origin`` (absent → zero origin).
+    """
+    origin = attributes.get("chunk_grid_origin")
+    if not origin:
+        return coords
+    return tuple(c - int(o) for c, o in zip(coords, origin))
+
+
 async def _async_get_legacy_chunk(
     async_group: Any,
     array_name: str,
@@ -100,6 +112,7 @@ async def _async_get_sharded_cell(
         return None
     if len(coords) != len(async_array.shape):
         return None
+    coords = _apply_origin(coords, async_array.metadata.attributes)
     if any(c < 0 or c >= s for c, s in zip(coords, async_array.shape)):
         return None
     region = tuple(slice(c, c + 1) for c in coords)
@@ -211,12 +224,14 @@ def _sync_fallback(
         except KeyError:
             continue
         if isinstance(node, zarr.Array):
-            # Native-sharded: one cell per chunk.
+            # Single vlen array: one cell per chunk.
             shape = node.shape
+            attrs = dict(node.attrs)
             for chunk_key in chunk_keys:
                 coords = _parse_coords(chunk_key)
                 if coords is None or len(coords) != len(shape):
                     continue
+                coords = _apply_origin(coords, attrs)
                 if any(c < 0 or c >= s for c, s in zip(coords, shape)):
                     continue
                 region = tuple(slice(c, c + 1) for c in coords)

@@ -192,6 +192,19 @@ def rechunk(
         chunk_attribute_values=chunk_attribute_values,
     )
     out_level = create_resolution_level(out_root, 0, level_meta)
+    # Rechunk prefixes every chunk key with a leading bin index, so the
+    # single vlen arrays need that extra axis on their grid.  Activate
+    # the single-array layout with the right rank for the write span.
+    from zarr_vectors.core.arrays import level_grid_layout
+    _spatial_origin, _spatial_grid = level_grid_layout(
+        src_meta.bounds, chunk_shape,
+    )
+    _rechunk_session = out_level.native_sharded_arrays(
+        None,
+        (max(unique_bins) + 1, *_spatial_grid),
+        origin=(0, *_spatial_origin),
+    )
+    _rechunk_session.__enter__()
     create_vertices_array(out_level, dtype="float32")
     create_object_index_array(out_level)
 
@@ -274,6 +287,9 @@ def rechunk(
         # The manifests use (prefix, z, y, x) coords — ndim+1 dimensions
         extended_ndim = ndim + 1 if obj_to_bin else ndim
         write_object_index(out_level, object_manifests_out, sid_ndim=extended_ndim)
+
+    # Close the single-array write context; the per-chunk writes are done.
+    _rechunk_session.__exit__(None, None, None)
 
     # Write groupings if rechunked by group (preserve group structure)
     if spec.by == "group" and groupings is not None:

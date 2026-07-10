@@ -510,7 +510,10 @@ def read_skeleton_by_segment_id(
 def _list_vertex_attributes(level_group) -> list[str]:
     try:
         if VERTEX_ATTRIBUTES in level_group:
-            return [n for n in level_group[VERTEX_ATTRIBUTES]]
+            # Each attribute is a single vlen array, so enumerate via
+            # ``children()`` (array + group keys), not ``__iter__``
+            # which yields sub-groups only.
+            return level_group[VERTEX_ATTRIBUTES].children()
     except Exception:
         pass
     return []

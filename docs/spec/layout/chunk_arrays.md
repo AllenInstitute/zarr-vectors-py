@@ -3,40 +3,47 @@
 ## Terms
 
 **Chunk array**
-: A Zarr array within a resolution level group whose logical shape is
-  expressed in terms of the chunk grid. The first `D` dimensions of a chunk
-  array's shape correspond to the chunk grid dimensions; later dimensions
-  carry per-chunk payload data (vertex coordinates, edge indices, etc.).
+: A single Zarr v3 **vlen-bytes** array within a resolution level group
+  whose shape *is* the chunk grid: one array cell per spatial chunk. Each
+  cell holds that chunk's payload as one opaque, variable-length byte blob
+  (ZVF-encoded vertices, edges, fragment index, attribute values, …).
+  Chunk files land at `<array>/c/i/j/k`.
 
-**Ragged array**
-: An array where the size of the payload dimension varies per chunk. For
-  example, `vertices/` has shape `(Cx, Cy, Cz, N_max, D)` in the Zarr
-  metadata, but most chunks contain fewer than `N_max` vertices. Unused
-  positions are filled with the array's fill value.
+**Chunk grid origin**
+: `origin = floor(min_corner / chunk_shape)` per axis, stored in the array's
+  `chunk_grid_origin` attribute (absent ⇒ all-zero). A spatial chunk at
+  absolute coord `c` (= `floor(position / chunk_shape)`) is stored in cell
+  `c - origin`, so data whose positions dip below the origin (negative
+  coords) still maps onto the 0-indexed array.
 
-**`N_max`**
-: The maximum number of vertices (or edges, faces) per chunk as declared in
-  the Zarr array's `shape`. This is a soft upper bound; `zarr-vectors-py`
-  resizes the array as needed when writing.
+**`nonempty_chunks`**
+: An array attribute listing the dotted chunk keys (`"i.j.k"`) that hold a
+  non-empty payload, so chunk enumeration is O(1) without scanning cells.
 
 **Chunk grid shape**
-: The number of chunks along each spatial axis. For a store with spatial
-  extent `[E_0, E_1, …, E_{D-1}]` and `chunk_shape = [C_0, …, C_{D-1}]`,
-  the chunk grid shape is `[ceil(E_i / C_i) for i in range(D)]`.
+: The number of chunks along each spatial axis: for spatial extent up to
+  `max_corner` and `chunk_shape = [C_0, …]`, the grid spans
+  `floor(max_corner_i / C_i) - origin_i + 1` cells along axis `i`.
 
 ---
 
 ## Introduction
 
-Every vertex, edge, face, and attribute value in a ZVF store is stored in a
-Zarr array whose first dimensions index the chunk grid. Within a given chunk,
-data is stored as a dense payload slice. Because different chunks contain
-different numbers of vertices, the payload dimension is ragged: the Zarr
-array declares a fixed maximum, but only the used portion is written (the
-rest is fill-value padded or absent if the chunk is empty).
+Every per-spatial-chunk quantity in a ZVF store — vertices, edges, faces,
+the fragment index, and per-vertex / per-fragment / per-edge attributes — is
+stored as a **single** Zarr v3 vlen-bytes array whose shape is the level's
+chunk grid. One array cell holds one spatial chunk's payload as an opaque
+byte blob; empty chunks simply have no chunk file (the vlen fill value is
+`b""`). This replaces the earlier "Option G" layout, where each spatial
+chunk was its own single-chunk `uint8` sub-array under a per-array group.
 
-This page documents the dtype, shape, chunk grid, and fill value for every
-array defined by the ZVF spec, for each geometry type.
+`cross_chunk_links/<delta>/` is the sole exception: its cells are keyed by
+canonical-sorted endpoint-chunk tuples rather than a spatial grid, so each
+cell is its own small array under a group (see
+[cross-chunk links](../object_model/cross_chunk_links.md)).
+
+This page documents the dtype, shape, chunk grid, and codec for every array
+defined by the ZVF spec, for each geometry type.
 
 ---
 
@@ -44,20 +51,24 @@ array defined by the ZVF spec, for each geometry type.
 
 ### `vertices/`
 
-Stores the spatial positions of all vertices in the store, one Zarr chunk
-per spatial chunk.
+Stores the spatial positions of all vertices, one array cell per spatial
+chunk.
 
 | Property | Value |
 |----------|-------|
-| Dtype | `float32` |
-| Logical shape | `(*chunk_grid_shape, N_max, D)` |
-| Zarr chunk shape | `(1, 1, …, 1, N_chunk_max, D)` — one Zarr chunk per spatial chunk |
-| Fill value | `0.0` |
-| Codec | `bytes → blosc(zstd, bitshuffle)` (default) |
+| Dtype | `variable_length_bytes` (vlen-bytes serializer) |
+| Shape | `chunk_grid_shape` (one cell per spatial chunk) |
+| Zarr chunk shape | `(1, …, 1)` — one inner chunk per cell (file at `c/i/j/k`) |
+| Fill value | `b""` (empty chunk ⇒ no chunk file) |
+| Codec | `vlen-bytes` (+ optional `zstd` / `blosc` compressor; none by default) |
+| Sharding | optional `shard_shape=` wraps cells in `sharding_indexed` |
+| Attributes | `chunk_grid_origin`, `nonempty_chunks`, `zv_array="vertices"`, `dtype`, `encoding` |
 
-`N_max` is set conservatively at write time based on the expected vertex
-density and chunk volume; the array is resized if a chunk exceeds the
-declared maximum.
+Each cell's blob is the ZVF-encoded positions for that chunk. Within a
+chunk the vertices are stored in **fragment order** (all vertices of bin
+(0,0,0), then (0,0,1), … in C-order); the `vertex_fragments/` array encodes
+one fragment per non-empty bin describing its row range (see
+[Fragment-index arrays](fragment_index_arrays.md)).
 
 Within each spatial chunk the vertices are stored in **fragment order**: all
 vertices of bin (0,0,0) first, then bin (0,0,1), etc., in C-order bin
@@ -65,20 +76,30 @@ index. The `vertex_fragments/` array encodes one fragment per non-empty
 bin describing its row range within this ordering (see
 [Fragment-index arrays](fragment_index_arrays.md)).
 
-**Example:** a 3-D store with a chunk grid of shape `(5, 6, 4)` and up to
-65 536 vertices per chunk:
+**Example:** a 3-D store with a chunk grid of shape `(5, 6, 4)`, one cell
+per spatial chunk (chunk file at `vertices/c/i/j/k`):
 
 ```json
 {
-  "shape": [5, 6, 4, 65536, 3],
-  "data_type": "float32",
+  "shape": [5, 6, 4],
+  "data_type": "variable_length_bytes",
   "chunk_grid": {
     "name": "regular",
-    "configuration": {"chunk_shape": [1, 1, 1, 65536, 3]}
+    "configuration": {"chunk_shape": [1, 1, 1]}
   },
-  "fill_value": 0.0
+  "chunk_key_encoding": {"name": "default", "configuration": {"separator": "/"}},
+  "codecs": [{"name": "vlen-bytes", "configuration": {}}],
+  "fill_value": "",
+  "attributes": {
+    "zv_array": "vertices",
+    "chunk_grid_origin": [0, 0, 0],
+    "nonempty_chunks": ["0.0.0", "0.0.1"]
+  }
 }
 ```
+
+The `vertex_fragments/`, `links/<delta>/`, and attribute arrays use the same
+single-vlen-array shape; only the encoded blob differs.
 
 ### `vertex_fragments/`
 

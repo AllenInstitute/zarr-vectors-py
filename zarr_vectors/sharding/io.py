@@ -52,10 +52,6 @@ import json
 from pathlib import Path
 from typing import Any, Sequence
 
-from zarr_vectors.constants import (
-    CROSS_CHUNK_LINK_ATTRIBUTES,
-    LINK_ATTRIBUTES,
-)
 from zarr_vectors.core.group import _parse_chunk_coords
 from zarr_vectors.core.store import (
     get_resolution_level,
@@ -67,22 +63,6 @@ from zarr_vectors.core.store import (
 # ===================================================================
 # Walking per-array groups
 # ===================================================================
-
-
-_DOUBLE_DESCENT_PREFIXES = frozenset({
-    LINK_ATTRIBUTES,
-    CROSS_CHUNK_LINK_ATTRIBUTES,
-})
-
-
-def _looks_like_per_chunk_group(zarr_group) -> bool:
-    """Return True if ``zarr_group`` holds chunk-key-named child arrays
-    (the legacy Option-G layout for per-chunk byte blobs).
-    """
-    for name in zarr_group.array_keys():
-        if _parse_chunk_coords(name) is not None:
-            return True
-    return False
 
 
 def _is_native_sharded(zarr_node) -> bool:
@@ -115,53 +95,37 @@ def _codec_name(codec: Any) -> str | None:
 
 
 def _list_array_names(level_group, requested: list[str] | None) -> list[str]:
-    """Enumerate per-array logical names under a resolution level.
+    """Enumerate the per-spatial-chunk array paths under a level.
 
-    Walks the level's hierarchy and returns every path whose node looks
-    like a per-chunk container — either the legacy "Option G" group
-    (children are chunk-key-named Zarr arrays) or a native-sharded
-    Zarr array.
+    Every such array is a single vlen-bytes Zarr array (``vertices``,
+    ``vertex_fragments``, ``links/<delta>``, ``vertex_attributes/<name>``,
+    ``link_attributes/<name>/<delta>``, …).  Walks the level's group
+    hierarchy and returns each array path for which
+    :func:`zarr_vectors.core.arrays._is_per_chunk_array` holds —
+    excluding ``cross_chunk_links`` (endpoint-tuple cells, not a spatial
+    grid), ``object_index``, ``object_attributes`` and ``groups``.
 
-    ``requested`` short-circuits the walk: callers pass an explicit
-    list to limit the migration to specific arrays (e.g. just
-    ``vertex_fragments``).
+    ``requested`` short-circuits the walk: callers pass an explicit list
+    to limit the migration to specific arrays.
     """
     import zarr
+
+    from zarr_vectors.core.arrays import _is_per_chunk_array
 
     if requested is not None:
         return requested
 
     names: list[str] = []
-    zg = level_group.zarr_group
 
-    for top in zg:
-        sub = zg[top]
-        if isinstance(sub, zarr.Array):
-            # Top-level native-sharded array (vertices, links/<delta>
-            # rolled up — but the delta cases nest under a sub-group).
-            names.append(top)
-            continue
-        if _looks_like_per_chunk_group(sub):
-            names.append(top)
-            continue
-        # First descent: attributes/<name>, links/<delta>,
-        # cross_chunk_links/<delta>.
-        for child in sub.group_keys():
-            child_node = sub[child]
-            if _looks_like_per_chunk_group(child_node):
-                names.append(f"{top}/{child}")
-                continue
-            if top not in _DOUBLE_DESCENT_PREFIXES:
-                continue
-            for grand in child_node.group_keys():
-                grand_node = child_node[grand]
-                if _looks_like_per_chunk_group(grand_node):
-                    names.append(f"{top}/{child}/{grand}")
-        # Native-sharded arrays nested one level deep (links/<delta>).
-        for child in sub.array_keys():
-            child_node = sub[child]
-            if _is_native_sharded(child_node):
-                names.append(f"{top}/{child}")
+    def _walk(prefix: str, group: zarr.Group) -> None:
+        for name in group.array_keys():
+            path = f"{prefix}{name}"
+            if _is_per_chunk_array(path):
+                names.append(path)
+        for name in group.group_keys():
+            _walk(f"{prefix}{name}/", group[name])
+
+    _walk("", level_group.zarr_group)
     return names
 
 
@@ -190,27 +154,6 @@ def _normalise_shard_shape(
     if any(s < 1 for s in shape):
         raise ValueError(f"shard_shape components must be >= 1, got {shape}")
     return shape
-
-
-def _infer_grid_shape(chunk_keys: list[str]) -> tuple[int, ...]:
-    """Derive an enclosing grid_shape from observed chunk keys.
-
-    Returns ``max(coord[axis]) + 1`` per axis across all keys.  Empty
-    input raises — callers should skip arrays with no chunks.
-    """
-    parsed: list[tuple[int, ...]] = []
-    for k in chunk_keys:
-        coords = _parse_chunk_coords(k)
-        if coords is not None:
-            parsed.append(coords)
-    if not parsed:
-        raise ValueError("Cannot infer grid_shape: no parseable chunk keys")
-    ndim = len(parsed[0])
-    if any(len(c) != ndim for c in parsed):
-        raise ValueError(
-            f"Chunk keys have mixed rank: {sorted({len(c) for c in parsed})}"
-        )
-    return tuple(max(c[axis] for c in parsed) + 1 for axis in range(ndim))
 
 
 # ===================================================================
@@ -270,15 +213,27 @@ def shard_store(
             if not chunk_keys:
                 continue
 
-            grid_shape = _infer_grid_shape(chunk_keys)
+            import zarr
+            existing = level.zarr_group[array_name]
+            if not isinstance(existing, zarr.Array):
+                # Every per-chunk array is a single Zarr array; a group
+                # here means an explicit ``arrays=`` pointed at a non-array
+                # path (e.g. cross_chunk_links) — not shardable this way.
+                continue
+            # Reuse the source array's grid shape + origin verbatim —
+            # re-sharding only repacks cells into shards, it does not
+            # change the grid.
+            grid_shape = tuple(int(s) for s in existing.shape)
+            raw_origin = existing.attrs.get("chunk_grid_origin")
+            origin: tuple[int, ...] | None = (
+                tuple(int(x) for x in raw_origin) if raw_origin else None
+            )
             ndim = len(grid_shape)
             this_shard_shape = _normalise_shard_shape(shard_shape, ndim)
             if final_shard_shape is None:
                 final_shard_shape = this_shard_shape
 
             # Already native-sharded with the right shape → skip.
-            existing = level.zarr_group[array_name]
-            import zarr
             if (
                 isinstance(existing, zarr.Array)
                 and _is_native_sharded(existing)
@@ -287,11 +242,15 @@ def shard_store(
                 continue
 
             # Snapshot existing per-chunk payloads + array metadata so
-            # we can rebuild after replacing the node at this path.
+            # we can rebuild after replacing the node at this path.  The
+            # presence manifest and origin are managed by the create /
+            # write calls below, so drop them from the carried-over attrs.
             chunk_payloads: dict[str, bytes] = {}
             for k in chunk_keys:
                 chunk_payloads[k] = level.read_bytes(array_name, k)
             preserved_attrs = dict(level.read_array_meta(array_name))
+            preserved_attrs.pop("nonempty_chunks", None)
+            preserved_attrs.pop("chunk_grid_origin", None)
 
             # Delete the legacy group / prior array.
             del level.zarr_group[array_name]
@@ -301,6 +260,7 @@ def shard_store(
                 array_name,
                 grid_shape=grid_shape,
                 shard_shape=this_shard_shape,
+                origin=origin,
                 attributes=preserved_attrs,
             )
 
@@ -326,12 +286,13 @@ def unshard_store(
     arrays: list[str] | None = None,
 ) -> dict[str, Any]:
     """Reverse of :func:`shard_store`: rewrite every native-sharded
-    Zarr array as a Zarr group of single-chunk uint8 arrays (the
-    "Option G" flat layout).
+    per-chunk array as an **unsharded** single vlen-bytes array — one
+    storage object per spatial chunk (``<array>/c/i/j/k``).
 
-    Useful for stores that need to be opened by tooling that doesn't
-    understand the ``sharding_indexed`` codec, or for write-heavy
-    workflows where shard contention hurts throughput.
+    The logical single-array layout is unchanged; only the Zarr v3
+    ``sharding_indexed`` packing is removed.  Useful for write-heavy
+    workflows where shard read-modify-write contention hurts throughput,
+    or when a reader prefers one file per chunk.
     """
     import zarr
 
@@ -344,24 +305,40 @@ def unshard_store(
     for level_idx in list_resolution_levels(root):
         level = get_resolution_level(root, level_idx)
         for array_name in _list_array_names(level, arrays):
-            if not level.array_exists(array_name):
+            if not level.standalone_array_exists(array_name):
                 continue
             existing = level.zarr_group[array_name]
-            if not isinstance(existing, zarr.Array):
-                continue
+            if not isinstance(existing, zarr.Array) or not _is_native_sharded(
+                existing
+            ):
+                continue  # already unsharded
 
+            grid_shape = tuple(int(s) for s in existing.shape)
+            raw_origin = existing.attrs.get("chunk_grid_origin")
+            origin = (
+                tuple(int(x) for x in raw_origin) if raw_origin else None
+            )
             chunk_keys = level.list_chunks(array_name)
             chunk_payloads: dict[str, bytes] = {
                 k: level.read_bytes(array_name, k) for k in chunk_keys
             }
             preserved_attrs = dict(level.read_array_meta(array_name))
+            preserved_attrs.pop("nonempty_chunks", None)
+            preserved_attrs.pop("chunk_grid_origin", None)
 
             del level.zarr_group[array_name]
 
-            level.zarr_group.require_group(array_name)
-            level.write_array_meta(array_name, preserved_attrs)
+            level.create_sharded_chunk_array(
+                array_name,
+                grid_shape=grid_shape,
+                shard_shape=None,
+                origin=origin,
+                attributes=preserved_attrs,
+            )
 
             for k, data in chunk_payloads.items():
+                if not data:
+                    continue
                 level.write_bytes(array_name, k, data)
 
             arrays_unsharded += 1

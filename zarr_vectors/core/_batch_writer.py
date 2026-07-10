@@ -40,12 +40,15 @@ from __future__ import annotations
 
 import asyncio
 import json
+import warnings
+from collections import defaultdict
 from typing import Any, Iterable
 
 import numpy as np
 import zarr
 from zarr.core.buffer import default_buffer_prototype
 from zarr.core.sync import sync
+from zarr.errors import UnstableSpecificationWarning
 
 
 def _is_icechunk_store(store: Any) -> bool:
@@ -219,6 +222,65 @@ def _flush_batch_sync(
         a[:] = np.frombuffer(data, dtype="uint8")
 
 
+def _flush_native_cells(
+    zarr_group: zarr.Group,
+    triples: list[tuple[str, str, bytes]],
+) -> None:
+    """Flush queued cell writes into single vlen-bytes chunk arrays.
+
+    Each ``array_name`` in ``triples`` is a single multidim vlen-bytes
+    Zarr array (the default single-array layout) whose cells are spatial
+    chunks.  For every array we write all of its queued cells in one
+    :meth:`zarr.Array.set_coordinate_selection` — zarr fans the per-cell
+    chunk writes out across its async pipeline, so N cells cost roughly
+    one round-trip rather than N.  The ``nonempty_chunks`` presence
+    manifest is then stamped once (instead of once per cell).
+    """
+    from zarr_vectors.core.group import (
+        _CHUNK_GRID_ORIGIN_ATTR,
+        _NONEMPTY_CHUNKS_ATTR,
+    )
+
+    by_array: dict[str, dict[str, bytes]] = defaultdict(dict)
+    for array_name, chunk_key, data in triples:
+        # Last write wins for a repeated key within the batch.
+        by_array[array_name][chunk_key] = data
+
+    for array_name, cells in by_array.items():
+        arr = zarr_group[array_name]
+        ndim = arr.ndim
+        present = set(arr.attrs.get(_NONEMPTY_CHUNKS_ATTR) or [])
+        origin_raw = arr.attrs.get(_CHUNK_GRID_ORIGIN_ATTR)
+        origin = (
+            tuple(int(o) for o in origin_raw) if origin_raw else None
+        )
+        axis_coords: list[list[int]] = [[] for _ in range(ndim)]
+        values: list[bytes] = []
+        for chunk_key, data in cells.items():
+            coords = tuple(int(p) for p in chunk_key.split("."))
+            # Cell index = coord - origin (grid anchored at min coord).
+            index = (
+                coords if origin is None
+                else tuple(c - o for c, o in zip(coords, origin))
+            )
+            for ax in range(ndim):
+                axis_coords[ax].append(index[ax])
+            values.append(bytes(data))
+            if data:
+                present.add(chunk_key)
+            else:
+                present.discard(chunk_key)
+
+        obj = np.empty(len(values), dtype=object)
+        for i, v in enumerate(values):
+            obj[i] = v
+        selection = tuple(np.asarray(a, dtype=np.intp) for a in axis_coords)
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", UnstableSpecificationWarning)
+            arr.set_coordinate_selection(selection, obj)
+            arr.attrs[_NONEMPTY_CHUNKS_ATTR] = sorted(present)
+
+
 def flush_batch(
     zarr_group: zarr.Group,
     triples: Iterable[tuple[str, str, bytes]],
@@ -229,25 +291,26 @@ def flush_batch(
     """Flush a batch of chunk writes + array-metadata writes.
 
     ``triples`` is the chunk batch: ``(array_name, chunk_key, data)``.
-    Each item produces an inner-array ``zarr.json`` and (for non-empty
-    data) a ``c/0`` PUT.
+    Two physical destinations are handled and dispatched per array by
+    inspecting the node already at ``array_name``:
 
-    ``array_metas`` is the per-array metadata batch:
-    ``{array_name: attributes_dict}``.  Each entry produces one PUT for
-    ``{array_name}/zarr.json`` with the attributes inlined into a fresh
-    v3 group node.  This collapses the legacy ``require_group(name)`` +
-    ``attrs.update(meta)`` sync pair (2-3 round-trips) into a single
-    PUT that joins the chunk gather.
+    * **Single vlen array** (``zarr.Array`` node) — the default
+      single-array layout for every per-spatial-chunk array.  Cells
+      flush via :func:`_flush_native_cells` (one concurrent
+      ``set_coordinate_selection`` per array).
+    * **Per-cell group** (``zarr.Group`` node, or absent) — retained for
+      ``cross_chunk_links`` / ``…_attributes``, whose keys are endpoint
+      tuples.  Each cell becomes a single-chunk ``uint8`` inner array,
+      flushed by :func:`_flush_legacy`.
 
-    ``codecs`` is the per-batch codec list (full Zarr V3 ``codecs`` JSON
-    shape — BytesCodec serializer plus any compressors).  When the list
-    is BytesCodec-only the fast async path runs; any other pipeline
-    forces the sync fallback so zarr's encoder can compress the chunk
-    bytes before they are written.
+    ``array_metas`` is the per-array metadata batch for the per-cell
+    groups: ``{array_name: attributes_dict}``.  (Single vlen arrays get
+    their metadata written directly to the array's ``attrs`` at create
+    time, so they never appear here.)
 
-    For array_names that appear only in ``triples`` (chunk writes
-    without queued metadata), the parent group is created with a single
-    sync ``require_group`` call — fast and amortised over the batch.
+    ``codecs`` is the per-batch codec list applied to the per-cell inner
+    arrays.  When BytesCodec-only the fast async PUT path runs; any other
+    pipeline (or an icechunk store) forces the sync fallback.
 
     All PUTs go through one :func:`asyncio.gather`, then the function
     blocks until they complete (or the first error propagates).
@@ -256,6 +319,41 @@ def flush_batch(
     triples = list(triples)
     array_metas = dict(array_metas or {})
 
+    if not triples and not array_metas:
+        return
+
+    # Dispatch each triple by the node already at its ``array_name``:
+    # a ``zarr.Array`` is a single vlen array (default layout); a group
+    # (or absent) is the per-cell primitive used by cross_chunk_links.
+    native_triples: list[tuple[str, str, bytes]] = []
+    legacy_triples: list[tuple[str, str, bytes]] = []
+    is_native: dict[str, bool] = {}
+    for item in triples:
+        array_name = item[0]
+        native = is_native.get(array_name)
+        if native is None:
+            node = zarr_group[array_name] if array_name in zarr_group else None
+            native = isinstance(node, zarr.Array)
+            is_native[array_name] = native
+        (native_triples if native else legacy_triples).append(item)
+
+    if native_triples:
+        _flush_native_cells(zarr_group, native_triples)
+
+    if legacy_triples or array_metas:
+        _flush_legacy(zarr_group, legacy_triples, array_metas, codecs=codecs)
+
+
+def _flush_legacy(
+    zarr_group: zarr.Group,
+    triples: list[tuple[str, str, bytes]],
+    array_metas: dict[str, dict[str, Any]],
+    *,
+    codecs: list[dict[str, Any]] | None = None,
+) -> None:
+    """Flush the per-cell layout (cross_chunk_links): one single-chunk
+    ``uint8`` inner array per cell key, plus per-group ``zarr.json``.
+    """
     if not triples and not array_metas:
         return
 
