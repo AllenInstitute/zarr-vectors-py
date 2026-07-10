@@ -5,6 +5,10 @@ Cloud-native storage for points, lines, streamlines, graphs, and meshes
 built on Zarr v3.
 """
 
+import warnings
+
+from zarr.errors import UnstableSpecificationWarning
+
 from zarr_vectors.core.backends import StorageBackend, detect_scheme
 from zarr_vectors.core.group import Group
 from zarr_vectors.core.store import (
@@ -15,6 +19,14 @@ from zarr_vectors.core.store import (
 )
 from zarr_vectors.lazy.writer import ZVWriter
 from zarr_vectors.rechunk import RechunkSpec, rechunk, rechunk_by_attribute
+
+# zarr-vectors' per-chunk-array layout is built on Zarr v3's
+# ``variable_length_bytes`` dtype (see :doc:`/spec/chunking/sharding`), which
+# zarr-python flags as spec-unstable on every array create *and* open. This
+# is a permanent, deliberate design choice rather than something callers can
+# act on, so silence it once here instead of wrapping every array create/open
+# call site throughout the package.
+warnings.filterwarnings("ignore", category=UnstableSpecificationWarning)
 
 # Version resolution.  Three sources in priority order:
 #   1. ``zarr_vectors/_version.py`` — written by setuptools-scm at build
