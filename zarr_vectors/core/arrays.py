@@ -12,7 +12,6 @@ the store or encoding modules directly.
 
 from __future__ import annotations
 
-import warnings
 from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import Any, Literal, Sequence
@@ -21,7 +20,6 @@ import numpy as np
 import numpy.typing as npt
 import zarr
 from zarr.codecs import VLenBytesCodec
-from zarr.errors import UnstableSpecificationWarning
 
 from zarr_vectors.constants import (
     CROSS_CHUNK_LINK_ATTRIBUTES,
@@ -209,7 +207,9 @@ def _default_fill_value_for_dtype(dtype: np.dtype) -> Any:
     )
 
 
-def _ensure_array_dir(level_group: FsGroup, array_name: str) -> None:
+def _ensure_array_dir(
+    level_group: FsGroup, array_name: str, *, raw_cells: bool = False
+) -> None:
     """Ensure an array subdirectory exists within a level group.
 
     Three layouts are produced here depending on context:
@@ -225,6 +225,13 @@ def _ensure_array_dir(level_group: FsGroup, array_name: str) -> None:
     * Otherwise — create an empty Zarr group at the path so subsequent
       ``write_array_meta`` (which only ``attrs.update``s, not create)
       has a target.
+
+    Args:
+        raw_cells: When native-sharded, write this array's cells with
+            no inner compressor (``cell_compressor=None``) and stamp
+            ``cell_codec: "raw"`` on the array's attributes, so a
+            reader can byte-range-read rows within a cell.  Ignored
+            outside :meth:`Group.native_sharded_arrays`.
     """
     cfg = level_group._native_sharded_config
     if cfg is not None and _is_per_chunk_array(array_name):
@@ -235,6 +242,8 @@ def _ensure_array_dir(level_group: FsGroup, array_name: str) -> None:
                 array_name,
                 grid_shape=cfg["grid_shape"],
                 shard_shape=cfg["shard_shape"],
+                cell_compressor=None if raw_cells else "auto",
+                attributes={"cell_codec": "raw"} if raw_cells else None,
             )
         return
     if level_group._pending_array_metas is not None:
@@ -351,6 +360,7 @@ def create_vertices_array(
     dtype: str = "float32",
     encoding: str = "raw",
     *,
+    compress: bool = True,
     exist_ok: bool = True,
 ) -> None:
     """Create the ``vertices/`` array within a resolution level.
@@ -359,12 +369,19 @@ def create_vertices_array(
         level_group: The resolution level FsGroup.
         dtype: Numpy dtype string for vertex positions.
         encoding: ``"raw"`` or ``"draco"``.
+        compress: When ``False`` and this call happens inside
+            :meth:`Group.native_sharded_arrays`, the vertices array's
+            sharded cells are written uncompressed (no inner codec),
+            so a reader can byte-range-read one fragment's rows
+            within a cell instead of fetching and decompressing the
+            whole cell. Has no effect outside a native-sharded write
+            session. Default ``True`` keeps Zarr's default compressor.
         exist_ok: When True (default), no-op if the array already exists.
             When False, raise :class:`ArrayError` on conflict.
     """
     if _short_circuit_existing(level_group, VERTICES, exist_ok):
         return
-    _ensure_array_dir(level_group, VERTICES)
+    _ensure_array_dir(level_group, VERTICES, raw_cells=not compress)
     _ensure_array_dir(level_group, VERTEX_FRAGMENTS)
     level_group.write_array_meta(VERTICES, {
         "zv_array": "vertices",
@@ -420,6 +437,7 @@ def create_attribute_array(
     channel_names: list[str] | None = None,
     extra_meta: dict[str, Any] | None = None,
     *,
+    compress: bool = True,
     exist_ok: bool = True,
 ) -> None:
     """Create a vertex attribute array ``attributes/<name>/``.
@@ -435,11 +453,16 @@ def create_attribute_array(
             ``ordered``, ``_FillValue``) and other userspace
             extensions.  Keys collide-check against the core fields
             (``zv_array``, ``name``, ``dtype``, ``channel_names``).
+        compress: When ``False`` and this call happens inside
+            :meth:`Group.native_sharded_arrays`, this attribute's
+            sharded cells are written uncompressed — see
+            :func:`create_vertices_array`. Has no effect outside a
+            native-sharded write session.
     """
     full_name = f"{VERTEX_ATTRIBUTES}/{name}"
     if _short_circuit_existing(level_group, full_name, exist_ok):
         return
-    _ensure_array_dir(level_group, full_name)
+    _ensure_array_dir(level_group, full_name, raw_cells=not compress)
     meta: dict[str, Any] = {
         "zv_array": "attribute",
         "name": name,
@@ -1114,23 +1137,17 @@ def _write_object_index_manifests(
         return
 
     chunk_size = min(OBJECT_INDEX_MANIFEST_BUCKET, n)
-    # zarr 3.x's variable-length bytes dtype lacks a finalised V3 spec
-    # (zarr-extensions tracks it); the warning is informational and ZVF
-    # is alpha — accept it and silence at the call site so writes stay
-    # quiet.  Revisit if the spec lands incompatibly.
-    with warnings.catch_warnings():
-        warnings.simplefilter("ignore", UnstableSpecificationWarning)
-        arr = oi_group.create_array(
-            "manifests",
-            shape=(n,),
-            chunks=(chunk_size,),
-            dtype="bytes",
-            serializer=VLenBytesCodec(),
-        )
-        obj = np.empty(n, dtype=object)
-        for i, blob in enumerate(manifest_blobs):
-            obj[i] = blob
-        arr[:] = obj
+    arr = oi_group.create_array(
+        "manifests",
+        shape=(n,),
+        chunks=(chunk_size,),
+        dtype="bytes",
+        serializer=VLenBytesCodec(),
+    )
+    obj = np.empty(n, dtype=object)
+    for i, blob in enumerate(manifest_blobs):
+        obj[i] = blob
+    arr[:] = obj
 
 
 def write_object_attributes(
