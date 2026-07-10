@@ -12,8 +12,8 @@ Adds the write-back surface the algorithms package needs:
 * :meth:`commit` / :meth:`compact` — pending-sidecar lifecycle.
 
 Each public method has both an async and a sync mirror.  The async
-methods route I/O through :class:`AsyncStorageBackend`; the sync
-mirrors are thin ``asyncio.run`` wrappers for non-async callers.
+methods drive the zarr store's async I/O directly; the sync mirrors are
+thin ``asyncio.run`` wrappers for non-async callers.
 
 v1 is **single-writer-only**.  Concurrent writers against the same
 level can race on object_index sidecar batch numbering; documented

@@ -1,27 +1,13 @@
-"""Pluggable storage backends.
+"""Storage-backend selection for Zarr v3 stores.
 
-zarr-vectors has **two** distinct backend layers, both of which can be
-selected via the ``backend=`` kwarg on
-:func:`zarr_vectors.core.store.create_store` /
-:func:`zarr_vectors.core.store.open_store`:
+Every backend zarr-vectors supports returns a plain
+``zarr.abc.store.Store`` built by its own native constructor — there is
+no custom byte-level abstraction layer.  This package only decides
+*which* backend a URL should use; the store objects themselves are
+built in :mod:`zarr_vectors.core.store` (LocalStore / FsspecStore /
+obstore-backed ObjectStore) and :mod:`icechunk_backend` (icechunk).
 
-1. **Byte-level KV backends** (this package): implement the
-   :class:`StorageBackend` protocol.  Built-ins are ``local``,
-   ``obstore``, and ``fsspec``.  Resolution and instantiation live in
-   :func:`resolve_backend_name` and :func:`make_backend`.
-
-2. **Zarr-Store-level backends**: return a ``zarr.abc.store.Store``
-   directly.  Currently just ``icechunk`` (transactional, commit-based
-   versioning on top of any object store).  Wired in
-   :func:`zarr_vectors.core.store._make_zarr_store_with_session`.
-
-Both kinds share the same public ``backend=`` kwarg, so callers don't
-need to know which layer they're talking to.  Use ``backend="icechunk"``
-for transactional cloud or local storage; use ``backend="obstore"`` /
-``backend="fsspec"`` for direct byte-level cloud I/O without versioning.
-
-Resolution order for the byte-level layer (icechunk is always explicit,
-never auto-detected):
+Selection order (``icechunk`` is always explicit, never auto-detected):
 
 1. Explicit ``backend=`` kwarg on the public API.
 2. ``ZARR_VECTORS_BACKEND`` environment variable.
@@ -37,14 +23,9 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
-from typing import Any
 from urllib.parse import urlparse
 
 from zarr_vectors.exceptions import StoreError
-
-from zarr_vectors.core.backends.async_base import AsyncStorageBackend
-from zarr_vectors.core.backends.base import StorageBackend
-from zarr_vectors.core.backends.local import LocalBackend
 
 SCHEMES_LOCAL = frozenset({"", "file"})
 SCHEMES_OBJECT_STORE = frozenset(
@@ -54,15 +35,10 @@ SCHEMES_OBJECT_STORE = frozenset(
 _ENV_VAR = "ZARR_VECTORS_BACKEND"
 
 __all__ = [
-    "StorageBackend",
-    "AsyncStorageBackend",
-    "LocalBackend",
     "SCHEMES_LOCAL",
     "SCHEMES_OBJECT_STORE",
     "detect_scheme",
     "resolve_backend_name",
-    "make_backend",
-    "make_async_backend",
 ]
 
 
@@ -128,60 +104,6 @@ def resolve_backend_name(
     # Unknown scheme — let local handle it; if it's broken, the backend
     # constructor will raise something more specific.
     return "local"
-
-
-def make_backend(
-    url: str | Path,
-    backend: str | None = None,
-    *,
-    env_override: str | None = None,
-    **kwargs: Any,
-) -> StorageBackend:
-    """Resolve and construct the appropriate backend for ``url``.
-
-    Args:
-        url: Store URL or path.
-        backend: Explicit backend name (``"local"`` / ``"obstore"`` /
-            ``"fsspec"``).  ``None`` means auto-detect.
-        env_override: Test hook — see :func:`resolve_backend_name`.
-        **kwargs: Forwarded to the backend constructor.
-    """
-    name = resolve_backend_name(url, backend, env_override=env_override)
-
-    if name == "local":
-        return LocalBackend(url, **kwargs)
-    if name == "obstore":
-        from zarr_vectors.core.backends.obstore_backend import ObstoreBackend
-
-        return ObstoreBackend(url, **kwargs)
-    if name == "fsspec":
-        from zarr_vectors.core.backends.fsspec_backend import FsspecBackend
-
-        return FsspecBackend(url, **kwargs)
-    raise StoreError(f"Unknown backend: {name!r}")
-
-
-def make_async_backend(
-    url: str | Path,
-    backend: str | None = None,
-    *,
-    env_override: str | None = None,
-    **kwargs: Any,
-) -> AsyncStorageBackend:
-    """Resolve and construct an async-capable backend for ``url``.
-
-    Each concrete backend implements both :class:`StorageBackend` and
-    :class:`AsyncStorageBackend`, so the returned object can also be
-    used synchronously.  This entry point exists to give callers a
-    statically-typed handle when they intend to use the async surface.
-
-    Args:
-        url: Store URL or path.
-        backend: Explicit backend name.  ``None`` means auto-detect.
-        env_override: Test hook — see :func:`resolve_backend_name`.
-        **kwargs: Forwarded to the backend constructor.
-    """
-    return make_backend(url, backend, env_override=env_override, **kwargs)
 
 
 def _have(module: str) -> bool:

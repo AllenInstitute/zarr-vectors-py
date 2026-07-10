@@ -10,7 +10,6 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
-from zarr_vectors.core.backends import StorageBackend
 from zarr_vectors.core.group import Group
 from zarr_vectors.core.store import (
     FsGroup,
@@ -47,7 +46,7 @@ class ZVStore:
 
     @property
     def path(self) -> Path:
-        """Filesystem path of the store (LocalBackend only)."""
+        """Filesystem path of the store (local ``LocalStore`` only)."""
         return self._root.path
 
     @property
@@ -149,7 +148,9 @@ class ZVStore:
 
     def set_backend(
         self,
-        backend: str | StorageBackend,
+        backend: str,
+        *,
+        storage_options: dict[str, Any] | None = None,
         **backend_kwargs: Any,
     ) -> None:
         """Swap the underlying storage backend in place (no data movement).
@@ -160,12 +161,18 @@ class ZVStore:
         next access using the new backend.
 
         Args:
-            backend: Backend name string or a pre-built
-                :class:`StorageBackend` already pointed at the same URL.
-            **backend_kwargs: Forwarded to the backend constructor when
-                ``backend`` is a string.
+            backend: Backend name (``"local"`` / ``"obstore"`` /
+                ``"fsspec"`` / ``"icechunk"``).  The URL is unchanged; only
+                the driver/credentials are re-bound.
+            storage_options: Credentials / options forwarded to the store
+                constructor (e.g. ``key`` / ``secret`` / ``anon``).
+            **backend_kwargs: Additional options merged into
+                ``storage_options`` (back-compat with loose kwargs).
         """
-        rebind(self._root, backend, **backend_kwargs)
+        rebind(
+            self._root, backend,
+            storage_options=storage_options, **backend_kwargs,
+        )
         self._levels_cache.clear()
 
     def object_levels(self, oid: int) -> list[int]:
@@ -193,6 +200,7 @@ def open_zv(
     path: str | Path,
     *,
     backend: str | None = None,
+    storage_options: dict[str, Any] | None = None,
     **backend_kwargs: Any,
 ) -> ZVStore:
     """Open a zarr vectors store lazily.
@@ -202,8 +210,12 @@ def open_zv(
     Args:
         path: URL or filesystem path to the ZV store.
         backend: Force a backend (``"local"`` / ``"obstore"`` /
-            ``"fsspec"``).  Auto-detected from the URL scheme by default.
-        **backend_kwargs: Forwarded to the backend constructor.
+            ``"fsspec"`` / ``"icechunk"``).  Auto-detected from the URL
+            scheme by default.
+        storage_options: Credentials / options forwarded to the store
+            constructor (e.g. ``key`` / ``secret`` / ``anon``).
+        **backend_kwargs: Additional options merged into
+            ``storage_options``.
 
     Returns:
         A :class:`ZVStore` handle for lazy access.
@@ -211,7 +223,10 @@ def open_zv(
     # mode="r+" so the writer() handles returned by ZVLevel / ZVStore
     # can mutate without an extra reopen.  Pure readers pay no cost for
     # this — the actual reads still touch only the chunks they need.
-    root = open_store(str(path), mode="r+", backend=backend, **backend_kwargs)
+    root = open_store(
+        str(path), mode="r+", backend=backend,
+        storage_options=storage_options, **backend_kwargs,
+    )
     meta = read_root_metadata(root)
     return ZVStore(root, meta)
 

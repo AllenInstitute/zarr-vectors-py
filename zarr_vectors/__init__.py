@@ -5,7 +5,7 @@ Cloud-native storage for points, lines, streamlines, graphs, and meshes
 built on Zarr v3.
 """
 
-from zarr_vectors.core.backends import StorageBackend, detect_scheme
+from zarr_vectors.core.backends import detect_scheme
 from zarr_vectors.core.group import Group
 from zarr_vectors.core.store import (
     FsGroup,
@@ -37,7 +37,6 @@ except ImportError:
         __version__ = "0.0.0+unknown"
 
 __all__ = [
-    "StorageBackend",
     "Group",
     "FsGroup",
     "create_store",
