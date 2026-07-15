@@ -2982,10 +2982,29 @@ def finalize_links(
 # Reading data
 # ===================================================================
 
+def vertices_dtype(level_group: FsGroup) -> np.dtype:
+    """The element dtype ``vertices/`` declares.
+
+    A cell is a flat buffer with no inline header, so the Zarr
+    ``data_type`` (``variable_length_bytes``) describes the *container*
+    and says nothing about the payload.  The element type lives in the
+    array's ``dtype`` **attribute**, which :func:`create_vertices_array`
+    stamps — this is the only place it is recorded.
+
+    Falls back to ``float32`` when the attribute is unreadable, matching
+    the writer's own default.
+    """
+    try:
+        vmeta = level_group.read_array_meta(VERTICES) or {}
+        return np.dtype(vmeta.get("dtype", "float32"))
+    except Exception:
+        return np.dtype(np.float32)
+
+
 def read_chunk_vertices(
     level_group: FsGroup,
     chunk_coords: ChunkCoords,
-    dtype: np.dtype | str = np.float32,
+    dtype: np.dtype | str | None = None,
     ndim: int = 3,
 ) -> list[npt.NDArray[np.floating]]:
     """Read all fragments from a spatial chunk.
@@ -2998,7 +3017,11 @@ def read_chunk_vertices(
     Args:
         level_group: Resolution level group.
         chunk_coords: Spatial chunk coordinates.
-        dtype: Numpy dtype.
+        dtype: Numpy dtype.  ``None`` (the default) reads the dtype the
+            store declares — see :func:`vertices_dtype`.  Pass one only to
+            override, and only knowing that a wrong value does not raise:
+            a ``float64`` cell read as ``float32`` decodes to garbage at
+            twice the row count, silently.
         ndim: Number of coordinate dimensions (D).
 
     Returns:
@@ -3008,7 +3031,10 @@ def read_chunk_vertices(
         ArrayError: If the chunk does not exist or data is malformed.
     """
     key = _chunk_key(chunk_coords)
-    dtype = np.dtype(dtype)
+    # Default to the declared dtype rather than float32.  Nothing in the
+    # blob records the element type, so an assumed dtype is not checkable
+    # — it just produces wrong numbers.  The store already knows; ask it.
+    dtype = vertices_dtype(level_group) if dtype is None else np.dtype(dtype)
 
     with _maybe_batched_reads(level_group, [
         (VERTICES, [key]),

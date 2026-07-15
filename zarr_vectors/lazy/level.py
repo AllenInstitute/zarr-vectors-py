@@ -225,7 +225,7 @@ class ZVLevel:
                 continue
             try:
                 groups.extend(
-                    read_chunk_vertices(self._group, cc, dtype=np.float32, ndim=ndim)
+                    read_chunk_vertices(self._group, cc, ndim=ndim)
                 )
             except Exception:
                 continue

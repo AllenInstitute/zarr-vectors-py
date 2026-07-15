@@ -214,7 +214,7 @@ def _per_object_coarsen(
     src_fragment_positions: dict[tuple[ChunkCoords, int], npt.NDArray] = {}
     for cc in list_chunk_keys(src_group, VERTICES):
         try:
-            fragments = read_chunk_vertices(src_group, cc, dtype=np.float32, ndim=ndim)
+            fragments = read_chunk_vertices(src_group, cc, ndim=ndim)
         except ArrayError:
             continue
         for fragment_idx, fragment in enumerate(fragments):
@@ -620,7 +620,7 @@ def _reconstruct_chunk_assignments(
     cursor = 0
     for cc in chunk_keys:
         try:
-            fragments = read_chunk_vertices(level_group, cc, dtype=np.float32, ndim=ndim)
+            fragments = read_chunk_vertices(level_group, cc, ndim=ndim)
         except ArrayError:
             continue
         n = sum(int(fragment.shape[0]) for fragment in fragments)

@@ -116,7 +116,7 @@ def validate_consistency(store_path: str | Path) -> ValidationResult:
 
         for ck in chunk_keys:
             try:
-                groups = read_chunk_vertices(lg, ck, dtype=np.float32, ndim=ndim)
+                groups = read_chunk_vertices(lg, ck, ndim=ndim)
             except Exception as e:
                 result.add_error(f"{prefix}: chunk {ck} decode failed: {e}")
                 continue

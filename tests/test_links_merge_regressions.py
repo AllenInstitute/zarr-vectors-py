@@ -21,6 +21,7 @@ from zarr_vectors.core.arrays import (
     read_chunk_links,
     read_chunk_vertices,
     read_links,
+    vertices_dtype,
     write_link_cells,
 )
 from zarr_vectors.core.paths import is_intra, links_group_path, parse_offsets
@@ -236,6 +237,76 @@ class TestPublicIntrospection:
         # Negative offsets resolve backwards.
         chunks = cell_endpoint_chunks((2, 0, 0), ((-1, 0, 0),), one, one)
         assert chunks == ((2, 0, 0), (1, 0, 0))
+
+
+class TestVerticesDtypeIsHonoured:
+    """Readers must decode at the dtype the store declares.
+
+    A ``vertices/`` cell is a flat buffer with no inline header, so the
+    Zarr ``data_type`` (``variable_length_bytes``) describes the container
+    and says nothing about the payload; the element type lives only in the
+    array's ``dtype`` attribute.  ``read_chunk_vertices`` used to default
+    to ``float32`` and several callers hardcoded it, so a ``float64`` store
+    decoded to garbage at twice the row count — silently, because an
+    assumed dtype is not checkable against anything.
+
+    This is the code half of the question that prompted the vlen-metadata
+    doc fix: the spec says readers MUST honour the stored dtype, and this
+    is what makes that true.
+    """
+
+    def _float64_store(self) -> str:
+        path = os.path.join(tempfile.mkdtemp(), "f64.zv")
+        pos = np.array(
+            [[1.0, 2.0, 3.0], [4.0, 5.0, 6.0], [7.0, 8.0, 9.0]],
+            dtype=np.float64,
+        )
+        write_points(
+            path, pos, chunk_shape=(100.0, 100.0, 100.0),
+            bounds=([0.0, 0.0, 0.0], [100.0, 100.0, 100.0]),
+            dtype="float64",
+        )
+        return path
+
+    def test_declared_dtype_is_readable(self) -> None:
+        lg = get_resolution_level(open_store(self._float64_store()), 0)
+        assert vertices_dtype(lg) == np.dtype("float64")
+
+    def test_default_read_honours_declared_dtype(self) -> None:
+        lg = get_resolution_level(open_store(self._float64_store()), 0)
+        got = np.concatenate(
+            [np.asarray(g) for g in read_chunk_vertices(lg, (0, 0, 0))], axis=0,
+        )
+        assert got.shape == (3, 3), got.shape
+        np.testing.assert_allclose(
+            got, [[1.0, 2.0, 3.0], [4.0, 5.0, 6.0], [7.0, 8.0, 9.0]],
+        )
+
+    def test_wrong_dtype_corrupts_silently(self) -> None:
+        # Pins WHY the default matters: an explicit wrong dtype does not
+        # raise, it just returns different numbers.  Nothing in the blob
+        # can catch it.
+        lg = get_resolution_level(open_store(self._float64_store()), 0)
+        bad = np.concatenate(
+            [np.asarray(g)
+             for g in read_chunk_vertices(lg, (0, 0, 0), dtype=np.float32)],
+            axis=0,
+        )
+        assert not np.allclose(bad, [[1.0, 2.0, 3.0]] * 3)
+
+    def test_float32_store_still_reads_float32(self) -> None:
+        path = os.path.join(tempfile.mkdtemp(), "f32.zv")
+        pos = np.array([[1.0, 2.0, 3.0]], dtype=np.float32)
+        write_points(
+            path, pos, chunk_shape=(100.0, 100.0, 100.0),
+            bounds=([0.0, 0.0, 0.0], [100.0, 100.0, 100.0]),
+        )
+        lg = get_resolution_level(open_store(path), 0)
+        assert vertices_dtype(lg) == np.dtype("float32")
+        got = np.concatenate(
+            [np.asarray(g) for g in read_chunk_vertices(lg, (0, 0, 0))], axis=0,
+        )
+        np.testing.assert_allclose(got, [[1.0, 2.0, 3.0]])
 
 
 class TestLinesCrossChunkEndpointIndices:
