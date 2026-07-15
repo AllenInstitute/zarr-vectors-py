@@ -13,8 +13,9 @@ for skeletons (rooted trees of ``[child, parent]`` edges):
   records that a downstream reduce groups into a dense ``object_index``.
 
 - :func:`write_skeleton_cross_chunk_links` — store parent→child edges that
-  cross a chunk boundary.  These are **directed** (parent→child order is
-  data), so they use the ``cross_chunk_links`` ``directed=True`` mode.
+  cross a chunk boundary.  They land in the non-zero-offset arrays of the
+  same ``links/0/`` family the branch links above use, which is declared
+  ``directed=True`` because parent→child order is data.
 
 - :func:`read_skeleton_by_segment_id` — resolve a segment ID to its
   object, follow the manifest, and reconstruct the skeleton (positions +
@@ -43,7 +44,6 @@ from zarr_vectors.constants import (
 )
 from zarr_vectors.core.arrays import (
     create_attribute_array,
-    create_cross_chunk_links_array,
     create_fragment_attribute_array,
     create_links_array,
     create_object_index_array,
@@ -57,7 +57,7 @@ from zarr_vectors.core.arrays import (
     write_chunk_fragment_attributes,
     write_chunk_links,
     write_chunk_vertices,
-    write_cross_chunk_links,
+    write_links,
 )
 from zarr_vectors.core.metadata import LevelMetadata
 from zarr_vectors.core.multiscale import upsert_level_transform
@@ -276,6 +276,10 @@ def write_skeleton_chunk(
         chunk_offset += len(opos)
 
     write_chunk_vertices(level_group, chunk_coords, vert_groups, dtype=dtype)
+    # Per-cell writer, not ``write_links``: these branch links are already
+    # chunk-local and all-zero-offset, and they must stay one group per
+    # fragment for ``read_chunk_link_fragment`` to slice them back out.
+    # ``write_links`` files a cell's records as a single group.
     write_chunk_links(level_group, chunk_coords, link_groups, delta=0)
     for name in attr_names:
         write_chunk_attributes(
@@ -347,12 +351,15 @@ def init_skeleton_store(
     )
     level_group = create_resolution_level(root, 0, level_meta)
     create_vertices_array(level_group, dtype="float32")
-    create_links_array(level_group, link_width=2, delta=0)
-    create_object_index_array(level_group)
-    # Skeleton cross-chunk edges are directed parent->child links.
-    create_cross_chunk_links_array(
-        level_group, delta=0, link_width=2, sid_ndim=ndim, directed=True,
+    # One links family holds both the intra-chunk branch links and the
+    # boundary-crossing parent→child edges.  ``directed=True`` is family
+    # policy: it stops the cross-chunk arrays canonical-sorting endpoints
+    # (which would swap parent and child).  Intra-chunk records are stored
+    # in input order regardless, so branch links are unaffected.
+    create_links_array(
+        level_group, link_width=2, delta=0, sid_ndim=ndim, directed=True,
     )
+    create_object_index_array(level_group)
     create_fragment_attribute_array(level_group, "segment_id", dtype="uint64")
     for name, dt in attribute_dtypes.items():
         create_attribute_array(level_group, name, dtype=dt)
@@ -381,14 +388,14 @@ def write_skeleton_cross_chunk_links(
     Stored ``directed=True`` so the parent→child order survives — a
     canonical sort by chunk coord would otherwise silently swap
     endpoints whenever the child chunk sorts before the parent chunk.
+    Each link lands in the offsets array naming where the child chunk
+    sits relative to the parent's, within the same ``links/0/`` family
+    :func:`write_skeleton_chunk` writes branch links into.
     """
     if not links:
         return
-    create_cross_chunk_links_array(
-        level_group, delta=0, link_width=2, sid_ndim=ndim, directed=True,
-    )
-    write_cross_chunk_links(
-        level_group, links, sid_ndim=ndim, delta=0, directed=True,
+    write_links(
+        level_group, links, ndim, delta=0, link_width=2, directed=True,
     )
 
 
