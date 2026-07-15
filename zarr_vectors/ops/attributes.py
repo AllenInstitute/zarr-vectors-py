@@ -10,9 +10,11 @@
   reads the whole array, replaces row ``oid``, and writes back.
   ``add_attribute`` for a brand-new name allocates a zero-filled
   ``(num_objects, ...)`` buffer.
-- **Per-link**: ragged, parallel to ``links/0/<chunk>``, lives under
-  ``link_attributes/<name>/0/<chunk>``.  Read-modify-write the fragment
-  group via the change-set builder.
+- **Per-link**: ragged, parallel to ``links/<delta>/<offsets>/``, lives
+  under ``link_attributes/<name>/<delta>/<offsets>/``, mirroring the link
+  family cell for cell.  A :class:`~zarr_vectors.ops.refs.LinkRef` names
+  the row in both, so intra- and cross-chunk link attributes are edited
+  through one path.  Read-modify-write the cell.
 
 Tombstones for ``remove_attribute``: there is no on-disk "null" for a
 dense per-object attribute, so removal writes the dtype's zero
@@ -30,6 +32,7 @@ import numpy.typing as npt
 
 from zarr_vectors.constants import FRAGMENT_ATTRIBUTES, OBJECT_ATTRIBUTES
 from zarr_vectors.exceptions import EditError
+from zarr_vectors.typing import ChunkCoords
 from zarr_vectors.ops.refs import (
     AttributeRef,
     FragmentRef,
@@ -259,6 +262,73 @@ def _ensure_object_attribute_array(
 # Per-link
 # ---------------------------------------------------------------------
 
+def _read_link_attribute_cell(
+    level_group,
+    attr_name: str,
+    chunk: ChunkCoords,
+    *,
+    delta: int,
+    offsets,
+    dtype: np.dtype,
+    ncols: int,
+) -> list[npt.NDArray] | None:
+    """Decode one ``link_attributes/<name>/<delta>/<offsets>/`` cell.
+
+    Returns the rows split into groups matching the parallel link cell,
+    or ``None`` when the cell holds nothing.
+
+    An attribute cell is a bare concatenation — nothing in it marks where
+    one group ends.  The grouping comes from the link cell it mirrors,
+    which is the same rule :func:`read_link_attributes` relies on to align
+    row ``i`` with record ``i``.
+    """
+    from zarr_vectors.core.arrays import (
+        _chunk_key,
+        _decode_link_cell,
+        link_family_policy,
+        links_has_perm,
+    )
+    from zarr_vectors.core.paths import link_attributes_path
+
+    full_name = link_attributes_path(attr_name, delta, offsets)
+    if not level_group.array_exists(full_name):
+        return None
+    try:
+        blob = level_group.read_bytes(full_name, _chunk_key(chunk))
+    except Exception:
+        return None
+    if not blob:
+        return None
+
+    arr = np.frombuffer(blob, dtype=dtype)
+    if ncols > 1:
+        arr = arr.reshape(-1, ncols)
+    arr = arr.copy()
+
+    policy = link_family_policy(level_group, delta)
+    if policy is None:
+        return [arr]
+    link_width, _sid_ndim, directed, store = policy
+    width = link_width + (
+        1 if links_has_perm(
+            offsets, delta=delta, directed=directed, store=store,
+        ) else 0
+    )
+    link_groups = _decode_link_cell(
+        level_group, chunk, delta=delta, offsets=offsets,
+        dtype=np.int64, width=width, default=None,
+    )
+    if not link_groups:
+        return [arr]
+    out: list[npt.NDArray] = []
+    cursor = 0
+    for g in link_groups:
+        n = int(np.asarray(g).shape[0])
+        out.append(arr[cursor:cursor + n])
+        cursor += n
+    return out
+
+
 def _edit_link_attr(
     session: EditSession,
     ref: AttributeRef,
@@ -270,21 +340,21 @@ def _edit_link_attr(
             f"LinkRef; got {type(ref.target).__name__}"
         )
     lref = ref.target
-    if lref.delta != 0:
-        raise EditError(
-            f"per-link attribute edits only support intra-level "
-            f"links (delta=0); got delta={lref.delta}"
-        )
-    from zarr_vectors.core.arrays import (
-        read_chunk_link_attributes,
-        write_chunk_link_attributes,
-    )
+    from zarr_vectors.core.arrays import link_family_policy
+    from zarr_vectors.core.paths import intra_offsets, link_attributes_path
     from zarr_vectors.core.store import get_resolution_level
 
     level_group = get_resolution_level(session.root, lref.level)
-    # Determine dtype + ncols from on-disk meta when available.
-    from zarr_vectors.core.paths import link_attributes_path
-    full_name = link_attributes_path(ref.name, 0)
+
+    # The attribute cell mirrors the link cell exactly — same delta, same
+    # offsets segment — so a ref addresses both with one set of coords.
+    policy = link_family_policy(level_group, lref.delta)
+    link_width = policy[0] if policy is not None else 2
+    offsets = (
+        intra_offsets(len(lref.chunk), link_width)
+        if lref.offsets is None else lref.offsets
+    )
+    full_name = link_attributes_path(ref.name, lref.delta, offsets)
     try:
         meta = level_group.read_array_meta(full_name)
         dtype = np.dtype(meta.get("dtype", "float32"))
@@ -294,37 +364,35 @@ def _edit_link_attr(
         dtype = np.dtype(np.float32)
         ncols = 1
 
-    try:
-        groups = read_chunk_link_attributes(
-            level_group, ref.name, lref.chunk,
-            dtype=dtype, ncols=ncols, delta=0,
-        )
-    except Exception as e:
+    groups = _read_link_attribute_cell(
+        level_group, ref.name, lref.chunk,
+        delta=lref.delta, offsets=offsets, dtype=dtype, ncols=ncols,
+    )
+    if groups is None:
         raise EditError(
-            f"edit_attribute(scope='link'): {ref.name!r} not present "
-            f"in chunk {lref.chunk}: {e}"
-        ) from None
-
-    if lref.fragment < 0 or lref.fragment >= len(groups):
+            f"edit_attribute(scope='link'): {ref.name!r} not present in "
+            f"chunk {lref.chunk} (delta={lref.delta}, offsets={lref.offsets})"
+        )
+    if lref.fragment >= len(groups):
         raise EditError(
             f"link_attributes/{ref.name}: fragment {lref.fragment} out "
             f"of range in chunk {lref.chunk}"
         )
     group = groups[lref.fragment]
-    if lref.row < 0 or lref.row >= group.shape[0]:
+    if lref.row >= group.shape[0]:
         raise EditError(
             f"link_attributes/{ref.name}: row {lref.row} out of range "
             f"in fragment {lref.fragment}"
         )
 
     val = np.asarray(value, dtype=dtype)
-    if ncols == 1:
-        group[lref.row] = val.reshape(())
-    else:
-        group[lref.row] = val
+    group[lref.row] = val.reshape(()) if ncols == 1 else val
+
+    from zarr_vectors.core.arrays import write_chunk_link_attributes
     write_chunk_link_attributes(
         level_group, ref.name, lref.chunk, groups,
-        dtype=dtype, delta=0,
+        dtype=dtype, delta=lref.delta, offsets=offsets,
+        link_width=link_width,
     )
     session._mark_edit(lref.level)
 

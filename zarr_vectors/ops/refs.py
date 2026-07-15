@@ -24,6 +24,7 @@ from typing import TYPE_CHECKING, Literal
 import numpy as np
 import numpy.typing as npt
 
+from zarr_vectors.core.paths import is_intra
 from zarr_vectors.exceptions import EditError
 from zarr_vectors.typing import ChunkCoords
 
@@ -195,14 +196,28 @@ class VertexRef:
 
 @dataclass(frozen=True)
 class LinkRef:
-    """Physical address of one link row.
+    """Physical address of one link row in ``links/<delta>/<offsets>/``.
 
-    ``(level, chunk, fragment, row, delta)``:
+    ``(level, chunk, fragment, row, delta, offsets)``:
 
-    - ``delta == 0`` → intra-level link inside ``links/0/<chunk>``.
-    - ``delta != 0`` → cross-level link inside ``links/<delta>/<chunk>``.
+    - ``chunk``: the record's **source** chunk — the array cell holding
+      the row.  Endpoint ``k``'s vertex index is local to
+      ``chunk + offsets[k - 1]``.
+    - ``offsets``: the ``link_width - 1`` chunk offsets of the non-source
+      endpoints relative to ``chunk``, naming which array under
+      ``links/<delta>/`` holds the row.  ``None`` is the all-zero
+      (intra-chunk) array — every endpoint lives in ``chunk``.
+    - ``fragment``: row group within the cell.
+    - ``row``: row index within that group.
+    - ``delta``: ``0`` intra-level, non-zero cross-level.
 
-    ``row`` is the row index inside that link fragment group.
+    Every link is addressed identically: an intra-chunk link is just one
+    whose offsets are all zero, and a cross-chunk link one whose offsets
+    are not.  There is no separate address space for either.
+
+    ``offsets`` is normalised so an all-zero tuple and ``None`` are the
+    same value — the intra cell has exactly one address, and two refs to
+    it compare and hash equal regardless of spelling.
     """
 
     level: int
@@ -210,17 +225,31 @@ class LinkRef:
     fragment: int
     row: int
     delta: int = 0
+    offsets: tuple[ChunkCoords, ...] | None = None
 
+    def __post_init__(self) -> None:
+        if self.fragment < 0:
+            raise EditError(f"LinkRef.fragment must be >= 0, got {self.fragment}")
+        if self.row < 0:
+            raise EditError(f"LinkRef.row must be >= 0, got {self.row}")
+        object.__setattr__(self, "chunk", tuple(int(c) for c in self.chunk))
+        if self.offsets is None:
+            return
+        norm = tuple(
+            tuple(int(c) for c in offset) for offset in self.offsets
+        )
+        for offset in norm:
+            if len(offset) != len(self.chunk):
+                raise EditError(
+                    f"LinkRef.offsets entry {offset} has arity {len(offset)} "
+                    f"but chunk {self.chunk} has arity {len(self.chunk)}"
+                )
+        object.__setattr__(self, "offsets", None if is_intra(norm) else norm)
 
-@dataclass(frozen=True)
-class CrossChunkLinkRef:
-    """Address of one row in the global
-    ``cross_chunk_links/<delta>/data`` array.
-    """
-
-    level: int
-    row: int
-    delta: int = 0
+    @property
+    def is_intra(self) -> bool:
+        """Whether every endpoint lives in the source chunk."""
+        return self.offsets is None
 
 
 @dataclass(frozen=True)
@@ -266,7 +295,8 @@ class AttributeRef:
       :class:`ObjectRef`.  Indexed inside
       ``object_attributes/<name>/data`` at row ``object_id``.
     - ``"link"``: per-link attribute.  ``target`` is a :class:`LinkRef`.
-      Indexed inside ``link_attributes/<name>/<delta>/<chunk>``.
+      Indexed inside ``link_attributes/<name>/<delta>/<offsets>/<chunk>``,
+      the cell mirroring the ref's link cell exactly.
     """
 
     scope: AttrScope
