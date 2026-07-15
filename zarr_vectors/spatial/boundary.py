@@ -14,7 +14,7 @@ from typing import Sequence
 import numpy as np
 import numpy.typing as npt
 
-from zarr_vectors.core.paths import format_cell_key
+from zarr_vectors.core.paths import format_offsets
 from zarr_vectors.exceptions import ChunkingError
 from zarr_vectors.spatial.chunking import compute_chunk_coords
 from zarr_vectors.typing import ChunkCoords, ChunkShape, CrossChunkLink
@@ -335,22 +335,61 @@ def partition_faces(
 # Canonical chunk-tuple sort + Lehmer-coded permutation
 # ===================================================================
 #
-# A cross-chunk record is a list of L (chunk_coords, vertex_idx)
-# endpoints.  For the per-tuple cell layout we lex-sort those L
-# endpoints by ``(chunk_coords, vertex_idx)`` and store the records
-# under the dotted concatenation of the sorted chunk_coords (see
-# :func:`zarr_vectors.core.paths.format_cell_key`).
+# A link record is a list of L (chunk_coords, vertex_idx) endpoints.
+# Under the offset layout a record is stored in the array
+# ``links/<delta>/<offsets>/`` at the cell of its *source* chunk — the
+# first endpoint of the chosen placement — where ``<offsets>`` names
+# where the remaining endpoints sit relative to that source (see
+# :func:`zarr_vectors.core.paths.format_offsets`).  A record whose
+# endpoints all share one chunk has all-zero offsets: that is the
+# intra-chunk array, and it needs no sort and no ``perm_idx``.
 #
-# The sort is destructive of the input endpoint order — but mesh
-# face winding and directed-graph edge direction depend on that
-# order.  We preserve it by storing one ``perm_idx`` int per record:
-# the Lehmer code of the permutation ``sorted_idx`` that maps
-# canonical position i back to the original input position
-# (``input[sorted_idx[i]] == canonical[i]``).
+# For genuinely cross-chunk records we lex-sort the L endpoints by
+# ``(chunk_coords, vertex_idx)`` so that each undirected record is
+# stored exactly once, under the lexicographically-positive offset.
+#
+# That sort is destructive of the input endpoint order — but mesh face
+# winding and directed-graph edge direction depend on it.  We preserve
+# it by storing one ``perm_idx`` int per record: the Lehmer code of the
+# permutation ``sorted_idx`` that maps canonical position i back to the
+# original input position (``input[sorted_idx[i]] == canonical[i]``).
 #
 # Lehmer codes pack a permutation of length L into an integer in
 # ``[0, L!)``.  L=1 → 1 code, L=2 → 2, L=3 → 6, L=4 → 24 — all fit
 # comfortably in an int64 slot.
+
+
+def anchor_chunk(
+    chunk: ChunkCoords,
+    scale_src: Sequence[int],
+    scale_trg: Sequence[int],
+) -> ChunkCoords:
+    """Express a source chunk coord in the *target* level's chunk grid.
+
+    Chunk coords are indices into a level's grid, so when two levels
+    carry different ``chunk_shape`` (a per-level override — see
+    :func:`zarr_vectors.core.metadata.chunk_scale_factor`) their coords
+    are **not** commensurable and differencing them directly is
+    meaningless.  Re-anchoring the source into the target's grid makes
+    the subtraction well-defined:
+
+        anchor = floor(c_src * r_src / r_trg)
+        offset = c_trg - anchor          # decode: c_trg = anchor + offset
+
+    where ``r_L`` is level L's chunk_shape as an integer multiple of the
+    root chunk_shape.  When ``r_src == r_trg`` — same level, or any
+    pyramid built with the default ``chunk_scale_factor=1`` — this
+    reduces to ``anchor == chunk`` and the offset is the plain
+    difference.  So it is a strict generalisation, not a special case.
+
+    Uses integer floor division: exact for large coords (no float
+    rounding) and floors toward -inf, which is what negative chunk
+    coords require.
+    """
+    return tuple(
+        (int(c) * int(rs)) // int(rt)
+        for c, rs, rt in zip(chunk, scale_src, scale_trg)
+    )
 
 
 def canonical_sort(
@@ -436,34 +475,66 @@ def _cell_placements(
     *,
     directed: bool,
     store: str,
+    cross_level: bool = False,
 ) -> list[list[int]]:
     """Return the storage permutations a record is filed under.
 
     Each returned ``sigma`` is a permutation of ``range(L)``: the record
-    is stored in a cell keyed by ``[chunk(sigma[0]), ..., chunk(sigma[L-1])]``
-    with vertex indices ``[vi(sigma[0]), ...]`` and
+    is stored at the cell of ``chunk(sigma[0])`` — the *source* — in the
+    array whose offsets are ``chunk(sigma[k]) - anchor(source)`` for
+    ``k > 0``, with vertex indices ``[vi(sigma[0]), ...]`` and
     ``perm_idx = _lehmer_encode(sigma)``, so :func:`apply_perm_inverse`
     recovers the original input order from any copy.
+
+    Identity placement (``sigma = range(L)``, ``perm_idx = 0``) is forced
+    in two cases, regardless of ``directed`` / ``store``:
+
+    - **Intra-chunk records** (every endpoint in one chunk).  Their
+      offsets are all zero, so there is nothing to canonicalise: sorting
+      would reorder endpoints and cost a ``perm_idx`` column for no
+      benefit.  Preserving input order here is what keeps the all-zero
+      offsets array byte-identical to the pre-merge ``links/<delta>/``
+      (polyline traversal order, for instance, is data).
+    - **Cross-level records** (``cross_level=True``, i.e. ``delta != 0``).
+      Endpoint 0 lives at the owning level and endpoints 1..L-1 at
+      ``owning + delta``, so the endpoints are already distinguished by
+      *level*, not by coord order — a canonical sort dedupes nothing
+      (``A→B`` and ``B→A`` live in different delta arrays at different
+      levels).  It would only risk promoting a target-level endpoint to
+      source, which flips the anchor's scale factors.  Leading with
+      endpoint 0 keeps the source at the owning level.
+
+    Otherwise:
 
     - ``store="canonical"`` → one placement:
         * ``directed=False``: ``sigma`` is the argsort of the endpoints by
           ``(chunk_coords, vi)`` — the canonical order (identical to
-          :func:`canonical_sort`).
+          :func:`canonical_sort`) — which is what makes the stored offset
+          lexicographically positive, so each undirected record is stored
+          exactly once.
         * ``directed=True``: ``sigma`` is the identity — input endpoint
-          order is preserved, so ``A→B`` and ``B→A`` file under distinct
-          cells (``A.B`` vs ``B.A``) and ``perm_idx`` is 0.
+          order is preserved, so ``A→B`` and ``B→A`` file under opposite
+          offsets (``0.0.+1`` vs ``0.0.-1``) at different cells, and
+          ``perm_idx`` is 0.
     - ``store="duplicate"`` → one placement per *distinct* endpoint chunk:
-      that chunk leads the cell key, the remaining endpoints follow in
+      that chunk becomes the source, the remaining endpoints follow in
       ascending input-position order.  ``K`` placements where ``K`` is the
       number of distinct chunks the record touches, so a reader can find
-      every record incident to a chunk ``C`` by scanning only the cells
-      whose first slot is ``C``.  Records are independent physical copies;
+      every record incident to a chunk ``C`` by scanning only ``C``'s cell
+      across the offset arrays.  Records are independent physical copies;
       ``perm_idx`` recovers input order (direction / winding) in each.
     """
     L = len(record)
+    identity = list(range(L))
+    if cross_level:
+        return [identity]
+    chunks_all = [tuple(c) for c, _ in record]
+    if all(c == chunks_all[0] for c in chunks_all):
+        # Intra-chunk: all-zero offsets, nothing to canonicalise.
+        return [identity]
     if store == "canonical":
         if directed:
-            return [list(range(L))]
+            return [identity]
         keys = [(tuple(c), int(v)) for c, v in record]
         return [sorted(range(L), key=lambda i: keys[i])]
     if store == "duplicate":
@@ -481,34 +552,41 @@ def _cell_placements(
             placements.append([lead] + rest)
         return placements
     raise ChunkingError(
-        f"partition_cross_records_by_tuple: unknown store {store!r}; "
+        f"partition_records_by_offset: unknown store {store!r}; "
         f"expected 'canonical' or 'duplicate'"
     )
 
 
-def partition_cross_records_by_tuple(
+def partition_records_by_offset(
     records: Sequence[Sequence[tuple[ChunkCoords, int]]],
     link_width: int,
     sid_ndim: int,
     *,
+    scale_src: Sequence[int],
+    scale_trg: Sequence[int],
     directed: bool = False,
     store: str = "canonical",
-) -> dict[str, list[tuple[list[int], int, int]]]:
-    """Group cross-chunk records into per-tuple cells.
+    cross_level: bool = False,
+) -> dict[tuple[str, ChunkCoords], list[tuple[list[int], int, int]]]:
+    """Group link records into ``(offsets_segment, source_chunk)`` buckets.
 
-    For each record and each storage permutation ``sigma`` chosen by
-    :func:`_cell_placements` (one for ``canonical``; one per distinct
-    endpoint chunk for ``duplicate``):
+    This is the single choke point that decides *where* a record is
+    stored.  For each record and each storage permutation ``sigma``
+    chosen by :func:`_cell_placements`:
 
-    - build the cell key from the permuted chunk coords via
-      :func:`zarr_vectors.core.paths.format_cell_key`,
-    - emit ``(vi_in_cell_order, perm_idx, input_index)`` into that key's
-      bucket, where ``perm_idx`` is the Lehmer code of ``sigma``.
+    - the source chunk is ``chunk(sigma[0])`` — that is the array cell,
+    - the offsets are ``chunk(sigma[k]) - anchor(source)`` for ``k > 0``,
+      re-anchored across levels by :func:`anchor_chunk`,
+    - ``(vi_in_source_order, perm_idx, input_index)`` is emitted into the
+      bucket for that ``(offsets_segment, source_chunk)``.
+
+    Intra-chunk records fall out naturally as all-zero offsets — they are
+    not a separate family.
 
     Within a bucket, entries preserve input record ordering — callers
     relying on row-aligned attribute arrays can depend on this.  In
     ``store="duplicate"`` the same ``input_index`` appears under several
-    keys, so a parallel attribute array replicates identically.
+    buckets, so a parallel attribute array replicates identically.
 
     Args:
         records: List of records; each record is a sequence of
@@ -518,39 +596,60 @@ def partition_cross_records_by_tuple(
             arity raise ``ChunkingError``.
         sid_ndim: Number of spatial index dimensions; every
             ``chunk_coords`` must have this arity.
+        scale_src: Per-axis chunk-scale factor of the level the source
+            endpoint lives at (all-ones for a default pyramid).
+        scale_trg: Per-axis chunk-scale factor of the level the non-source
+            endpoints live at.  Equal to ``scale_src`` when
+            ``cross_level`` is False.  See :func:`anchor_chunk` — passing
+            these wrong silently mis-places cross-level records on a
+            store built with ``chunk_scale_factor > 1``.
         directed: When ``True``, keep input endpoint order (no canonical
-            sort); ``A→B`` and ``B→A`` land in distinct cells.  See
+            sort); ``A→B`` and ``B→A`` land under opposite offsets.  See
             :func:`_cell_placements`.
-        store: ``"canonical"`` (default, one cell per record) or
-            ``"duplicate"`` (one cell per distinct incident chunk).
+        store: ``"canonical"`` (default, one bucket per record) or
+            ``"duplicate"`` (one bucket per distinct incident chunk).
+        cross_level: True for ``delta != 0``; forces the source to be
+            input endpoint 0 so the anchor's ``scale_src`` is the owning
+            level's.  See :func:`_cell_placements`.
 
     Returns:
-        Dict mapping ``cell_key`` → list of
-        ``(vi_in_cell_order, perm_idx, input_index)`` tuples.
-        ``vi_in_cell_order`` is a length-L list of int vertex indices in
-        the cell's chunk order.
+        Dict mapping ``(offsets_segment, source_chunk)`` → list of
+        ``(vi_in_source_order, perm_idx, input_index)`` tuples.
+        ``vi_in_source_order`` is a length-L list of int vertex indices
+        in the placement's endpoint order.
     """
-    buckets: dict[str, list[tuple[list[int], int, int]]] = {}
+    if len(scale_src) != sid_ndim or len(scale_trg) != sid_ndim:
+        raise ChunkingError(
+            f"partition_records_by_offset: scale_src/scale_trg rank "
+            f"{len(scale_src)}/{len(scale_trg)} != sid_ndim {sid_ndim}"
+        )
+    buckets: dict[tuple[str, ChunkCoords], list[tuple[list[int], int, int]]] = {}
     for input_idx, rec in enumerate(records):
         rec = list(rec)
         if len(rec) != link_width:
             raise ChunkingError(
-                f"partition_cross_records_by_tuple: record arity "
+                f"partition_records_by_offset: record arity "
                 f"{len(rec)} != link_width {link_width}"
             )
         for chunk, _vi in rec:
             if len(chunk) != sid_ndim:
                 raise ChunkingError(
-                    f"partition_cross_records_by_tuple: chunk_coords "
+                    f"partition_records_by_offset: chunk_coords "
                     f"arity {len(chunk)} != sid_ndim {sid_ndim}"
                 )
-        for sigma in _cell_placements(rec, directed=directed, store=store):
-            cell_chunks = [tuple(rec[j][0]) for j in sigma]
-            vi_in_cell = [int(rec[j][1]) for j in sigma]
+        for sigma in _cell_placements(
+            rec, directed=directed, store=store, cross_level=cross_level,
+        ):
+            src_chunk = tuple(int(x) for x in rec[sigma[0]][0])
+            anchor = anchor_chunk(src_chunk, scale_src, scale_trg)
+            offsets = tuple(
+                tuple(int(c) - int(a) for c, a in zip(rec[j][0], anchor))
+                for j in sigma[1:]
+            )
+            vi_in_src = [int(rec[j][1]) for j in sigma]
             perm_idx = _lehmer_encode(sigma)
-            key = format_cell_key(cell_chunks)
-            buckets.setdefault(key, []).append(
-                (vi_in_cell, perm_idx, input_idx)
+            buckets.setdefault((format_offsets(offsets), src_chunk), []).append(
+                (vi_in_src, perm_idx, input_idx)
             )
     return buckets
 
