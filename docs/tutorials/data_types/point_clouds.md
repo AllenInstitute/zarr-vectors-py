@@ -64,16 +64,21 @@ write_points(
     positions,
     chunk_shape=(200.0, 200.0, 200.0),
     bin_shape=(50.0, 50.0, 50.0),
-    attributes={
+    vertex_attributes={
         "intensity":  intensity,
         "label":      label,
         "color":      rgb,        # vector attribute: shape (N, 3)
         "confidence": confidence,
     },
-    coordinate_system="RAS",
-    axis_units="micrometer",
 )
 ```
+
+`write_points` still accepts `attributes=` as a deprecated alias for
+`vertex_attributes=`; it emits a `DeprecationWarning`. Passing both
+raises `TypeError`.
+
+There are no `coordinate_system` or `axis_units` arguments — those
+concepts do not exist anywhere in this package.
 
 ### Choosing `chunk_shape` and `bin_shape`
 
@@ -126,18 +131,37 @@ print(coarse["vertex_count"])     # fewer vertices — spatially coarsened
 print(coarse["level"])            # 1
 ```
 
-### Read a subset of attributes
+### Reading attributes
 
-For large stores, reading only the needed attributes avoids loading
-attribute data for unused arrays:
+**Attributes are opt-in.** `read_points` loads *no* attribute data unless
+you name what you want: the returned `vertex_attributes` dict is empty by
+default. Name them with `attribute_names` (not `attributes`):
 
 ```python
+result = read_points("scan.zarrvectors")
+print(result["vertex_attributes"])      # {} — nothing loaded
+
 result = read_points(
     "scan.zarrvectors",
-    attributes=["intensity"],         # only load intensity; skip others
+    attribute_names=["intensity"],      # only load intensity
 )
-assert "label" not in result["attributes"]
+print(sorted(result["vertex_attributes"]))   # ['intensity']
+assert "label" not in result["vertex_attributes"]
 ```
+
+The result key is `vertex_attributes`, not `attributes`. `read_points`
+returns exactly three keys:
+
+```python
+result = read_points("scan.zarrvectors", attribute_names=["intensity", "color"])
+print(sorted(result))                              # ['positions', 'vertex_attributes', 'vertex_count']
+print(result["positions"].shape)                   # (N, 3)
+print(result["vertex_attributes"]["color"].shape)  # (N, 3) — shape preserved
+```
+
+Vector attributes keep their `(N, C)` shape through `read_points`. (The
+lazy API flattens them — see
+[Lazy loading](../multiscale/lazy_loading.md).)
 
 ---
 
@@ -193,9 +217,11 @@ from zarr_vectors.multiresolution.coarsen import build_pyramid
 build_pyramid(
     "scan.zarrvectors",
     factors=[(2.0, 1.00), (4.0, 1.00)],
-    agg_mode="mean",  # 0.4+: a single global mode (per-attribute via manual coarsen_level)
 )
 ```
+
+Bin aggregation is fixed: source vertices collapse to their centroid.
+There is no aggregation-mode parameter.
 
 After building, the resolution summary is:
 

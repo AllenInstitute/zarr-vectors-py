@@ -23,14 +23,15 @@ factor of `2.0` means each axis is binned 2× coarser, giving up to
 meshes) at coarser levels. A factor of `3.0` keeps every third object
 on average. `1.0` (the default) keeps all objects.
 
-**Aggregation mode** (`agg_mode`) controls how per-vertex / per-object
-attributes are combined within a bin: `mean`, `sum`, `mode`, `count`,
-`min`, `max`. Applies globally to all attributes in the store.
+**Aggregation** is not configurable. Coarsening aggregates a bin's
+source vertices into their **centroid** (a metavertex); there is no
+`agg_mode`-style choice of `mean` / `sum` / `mode` / `min` / `max`.
 
-**Coarsening method** (`method`) controls object identity across
-levels: `per_object` (default; OID-stable, metavertices shared between
-objects) or `cross_object_metanode` (legacy; fresh OID space at each
-level). See the spec page for the trade-off.
+**Coarsening method** (`method`) selects the coarsening implementation.
+Core ships exactly one: `per_object` (the default) — OID-stable, with
+metavertices shared between objects. Any other name must be registered by
+**`zarr-vectors-tools`**; core raises a clear `ValueError` if it is not
+installed. See the spec page for the trade-off.
 
 **Cross-level links** are edges from a fine-level vertex to its
 coarse-level parent metanode, materialised at each adjacent level pair.
@@ -72,7 +73,6 @@ build_pyramid(
         (2.0, 1.0),         # level 2: another 8× reduction
         (2.0, 1.0),         # level 3
     ],
-    agg_mode="mean",        # one mode applied to all attributes
 )
 ```
 
@@ -100,30 +100,35 @@ pyramid uses the same factor at every level:
 | 27×   | 3.0 | each axis thirded |
 | 64×   | 4.0 | each axis quartered |
 
-For datasets with anisotropic data, use the legacy `level_configs=`
-interface (or call `coarsen_level` manually) — `factors=` is isotropic
-only.
-
-### Aggregation modes
-
-`agg_mode` applies globally to all attributes in the store. Choose
-based on attribute semantics:
+`factors` is isotropic: each entry scales every axis by the same
+`coarsen_factor`. For finer control, call `coarsen_level` per level
+yourself — it takes an explicit `source_level` / `target_level` pair
+plus `coarsen_factor`, `sparsity_factor`, and a `chunk_scale_factor`
+that may be a per-axis tuple:
 
 ```python
-build_pyramid(
+from zarr_vectors.multiresolution.coarsen import coarsen_level
+
+coarsen_level(
     "scan.zarrvectors",
-    factors=[(2.0, 1.0), (2.0, 1.0)],
-    agg_mode="mean",        # continuous scalars (intensity, FA, ...)
+    source_level=0,
+    target_level=1,
+    coarsen_factor=2.0,
+    chunk_scale_factor=(2, 2, 1),   # per-axis
 )
-# Or:
-#   agg_mode="mode"    # categorical labels — most frequent class wins
-#   agg_mode="sum"     # counts, densities
-#   agg_mode="min"     # conservative aggregation
-#   agg_mode="max"     # peak preservation
 ```
 
-Per-attribute aggregation requires manual per-level calls via
-`coarsen_level` (one call per `agg_mode`).
+`build_pyramid` also accepts `chunk_scale_factors=` — one entry per
+level, each a scalar or a per-axis tuple — if you only need to vary the
+chunk shape rather than the coarsening itself.
+
+### A note on attributes
+
+There is no per-attribute aggregation setting, and no `agg_mode`
+parameter on either `build_pyramid` or `coarsen_level`. Every bin's
+vertices collapse to a centroid metavertex under the one built-in
+`per_object` method. If you need categorical labels or counts handled
+differently, that behaviour is not in core.
 
 ---
 
@@ -182,19 +187,36 @@ appropriate coarser metanode trajectory.
 
 ### Sparsity strategies
 
-`sparsity_strategy` picks which objects survive at each level:
+`sparsity_strategy` picks which objects survive at each level. **Core
+ships exactly one strategy: `"random"`** (the default).
 
 ```python
 build_pyramid(
     "tracts.zarrvectors",
     factors=[(2.0, 1.0), (2.0, 4.0)],
-    sparsity_strategy="spatial_coverage",   # samples proportionally per bin
+    sparsity_strategy="random",
     sparsity_seed=42,
 )
 ```
 
-For most tractography datasets, `spatial_coverage` produces the most
-visually representative thinned set; `random` is simplest and fastest.
+Non-random strategies — spatial-coverage, length-ranked,
+attribute-ranked, point-thinning — live in **`zarr-vectors-tools`**,
+which registers them on import. Requesting one without that package
+installed raises a `ValueError` naming the strategy and telling you to
+install the tools package; it does not silently fall back to `random`.
+
+```python
+# Requires `pip install zarr-vectors-tools`
+build_pyramid(
+    "tracts.zarrvectors",
+    factors=[(2.0, 1.0), (2.0, 4.0)],
+    sparsity_strategy="spatial_coverage",
+    sparsity_seed=42,
+)
+```
+
+The same applies to `method=`: `"per_object"` is core, anything else is
+tools-registered.
 
 ---
 
@@ -202,10 +224,9 @@ visually representative thinned set; `random` is simplest and fastest.
 
 `build_pyramid` materialises edges between fine vertices and their
 coarse-level parent metanodes. These are stored under
-`links/<delta>/` and `cross_chunk_links/<delta>/` at every adjacent
-level pair. See
-[Links and cross-chunk links](../../spec/object_model/cross_chunk_links.md)
-for the on-disk layout.
+`links/<delta>/<offsets>/` at every adjacent level pair — one family,
+whether or not an edge's endpoints share a chunk. See
+[Links](../../spec/object_model/links.md) for the on-disk layout.
 
 ### Default: ±1 explicit
 
@@ -220,11 +241,17 @@ build_pyramid(
 
 This emits, at every adjacent (fine, coarse) pair:
 
-- `links/+1/<chunk>` at the fine level — chunk-aligned drill-up edges
-- `cross_chunk_links/+1/data` at the fine level — drill-up edges
-  whose target metanode sits in a different chunk_key
-- `links/-1/<chunk>` and `cross_chunk_links/-1/data` at the coarse
-  level — the same edges with endpoints swapped (drill-down direction)
+- `links/+1/<offsets>/` at the fine level — the drill-up edges. Edges
+  whose target metanode shares the source chunk_key land in the all-zero
+  segment (`links/+1/0.0.0/`); those whose target sits in a different
+  chunk_key land in the segment naming that displacement (e.g.
+  `links/+1/0.0.+1/`).
+- `links/-1/<offsets>/` at the coarse level — the same edges with
+  endpoints swapped (drill-down direction).
+
+Both directions are one family per delta. There is no separate
+cross-chunk array: the `<offsets>` segment *is* how a cross-chunk edge is
+distinguished from an intra-chunk one.
 
 ### Storage modes
 
@@ -296,7 +323,6 @@ coarsen_level(
     coarsen_factor=2.0,
     sparsity_factor=1.0,
     method="per_object",
-    agg_mode="mean",
     sparsity_strategy="random",
     sparsity_seed=42,
 )
@@ -370,11 +396,11 @@ level 0, so per-level work decreases as the pyramid grows.
 don't navigate between levels, pass `cross_level_depth=0` to skip the
 post-build pass.
 
-**Use `method="per_object"` for OID-stable navigation.** When you need
-to track "the same object" across resolution levels (Neuroglancer
-drill-down, ID-preserving analytics), use the default. Switch to
-`"cross_object_metanode"` only when OID continuity isn't needed and
-you want the smallest possible coarse representation.
+**`method="per_object"` is the only core method, and it is OID-stable.**
+It is what you want when you need to track "the same object" across
+resolution levels (Neuroglancer drill-down, ID-preserving analytics),
+and it is the default. Alternative methods exist only if
+**`zarr-vectors-tools`** is installed to register them.
 
 **Build pyramids on the same machine as the store.** For cloud stores
 (S3 / GCS), run `build_pyramid` from a VM in the same region as the
