@@ -10,8 +10,6 @@ from zarr_vectors.constants import LINK_FRAGMENTS, VERTEX_FRAGMENTS, VERTICES
 from zarr_vectors.core.arrays import (
     count_fragments,
     create_attribute_array,
-    create_cross_chunk_link_attributes_array,
-    create_cross_chunk_links_array,
     create_fragment_attribute_array,
     create_groupings_array,
     create_groupings_attributes_array,
@@ -28,12 +26,12 @@ from zarr_vectors.core.arrays import (
     read_chunk_link_fragment,
     read_chunk_links,
     read_chunk_vertices,
-    read_cross_chunk_link_attributes,
-    read_cross_chunk_links,
     read_fragment,
     read_group_object_ids,
     read_groupings_attributes,
+    read_link_attributes,
     read_link_fragment_index,
+    read_links,
     read_object_attributes,
     read_object_manifest,
     read_object_vertices,
@@ -44,21 +42,40 @@ from zarr_vectors.core.arrays import (
     write_chunk_link_attributes,
     write_chunk_links,
     write_chunk_vertices,
-    write_cross_chunk_link_attributes,
-    write_cross_chunk_links,
     write_groupings,
     write_groupings_attributes,
+    write_link_attributes,
+    write_links,
     write_object_attributes,
     write_object_index,
 )
-from zarr_vectors.core.store import FsGroup
+from zarr_vectors.core.paths import (
+    intra_offsets,
+    link_attributes_path,
+    links_group_path,
+)
+from zarr_vectors.core.store import FsGroup, create_store, get_resolution_level
 from zarr_vectors.encoding.fragments import encode_fragments
 from zarr_vectors.exceptions import ArrayError
 
 
-def _make_level_group(tmp_path: Path, name: str = "0") -> FsGroup:
-    root = FsGroup(tmp_path / "store.zarr", create=True)
-    return root.create_group(name)
+def _make_level_group(tmp_path: Path, ndim: int = 3) -> FsGroup:
+    """A resolution level backed by a real store.
+
+    Every per-spatial-chunk array is ONE vlen array whose shape is the
+    level's chunk grid, so a level group has to come from a store with
+    ``bounds`` — there is no grid to allocate against otherwise.  The
+    grid here is 100 chunks per axis, which covers the chunk coords
+    these tests use (including the deliberately-far (99, 99, 99)).
+    """
+    root = create_store(
+        str(tmp_path / "store.zarr"),
+        bounds=([0.0] * ndim, [10000.0] * ndim),
+        chunk_shape=(100.0,) * ndim,
+        geometry_types=["graph"],
+        ndim=ndim,
+    )
+    return get_resolution_level(root, 0)
 
 
 # ===================================================================
@@ -157,7 +174,7 @@ class TestVertexArrays:
         assert count_fragments(lg, (0, 0, 0)) == 3
 
     def test_2d_points(self, tmp_path: Path) -> None:
-        lg = _make_level_group(tmp_path)
+        lg = _make_level_group(tmp_path, ndim=2)
         create_vertices_array(lg, dtype="float64")
 
         pts = np.array([[10.0, 20.0], [30.0, 40.0]], dtype=np.float64)
@@ -176,7 +193,7 @@ class TestLinkArrays:
     def test_triangle_faces(self, tmp_path: Path) -> None:
         lg = _make_level_group(tmp_path)
         create_vertices_array(lg)
-        create_links_array(lg, link_width=3)
+        create_links_array(lg, link_width=3, sid_ndim=3)
 
         verts = [np.zeros((4, 3), dtype=np.float32)]
         write_chunk_vertices(lg, (0, 0, 0), verts)
@@ -191,7 +208,7 @@ class TestLinkArrays:
     def test_edge_list(self, tmp_path: Path) -> None:
         lg = _make_level_group(tmp_path)
         create_vertices_array(lg)
-        create_links_array(lg, link_width=2)
+        create_links_array(lg, link_width=2, sid_ndim=3)
 
         verts = [np.zeros((3, 3), dtype=np.float32)]
         write_chunk_vertices(lg, (0, 0, 0), verts)
@@ -205,7 +222,7 @@ class TestLinkArrays:
     def test_multiple_link_groups(self, tmp_path: Path) -> None:
         lg = _make_level_group(tmp_path)
         create_vertices_array(lg)
-        create_links_array(lg, link_width=2)
+        create_links_array(lg, link_width=2, sid_ndim=3)
 
         v0 = np.zeros((3, 3), dtype=np.float32)
         v1 = np.zeros((2, 3), dtype=np.float32)
@@ -561,29 +578,50 @@ class TestCrossChunkLinks:
 
     def test_basic_3d(self, tmp_path: Path) -> None:
         lg = _make_level_group(tmp_path)
-        create_cross_chunk_links_array(lg)
+        create_links_array(lg, link_width=2, sid_ndim=3)
 
         links = [
             (((0, 0, 0), 4), ((0, 0, 1), 0)),
             (((0, 0, 0), 2), ((1, 0, 0), 1)),
         ]
-        write_cross_chunk_links(lg, links, sid_ndim=3)
+        write_links(lg, links, sid_ndim=3)
 
-        read_back = read_cross_chunk_links(lg)
+        read_back = read_links(lg)
         assert len(read_back) == 2
-        assert read_back[0] == links[0]
-        assert read_back[1] == links[1]
+        # Records come back in (offsets segment, cell) sorted order, NOT
+        # input order — the two records land in different offset arrays
+        # ("0.0.+1" and "+1.0.0"), so nothing ties the read order to the
+        # order they were passed in.
+        assert set(read_back) == set(links)
+
+    def test_read_order_is_offsets_segment_then_cell(
+        self, tmp_path: Path,
+    ) -> None:
+        """The documented enumeration order, which attributes align to."""
+        lg = _make_level_group(tmp_path)
+        links = [
+            (((0, 0, 0), 4), ((0, 0, 1), 0)),   # segment "0.0.+1"
+            (((0, 0, 0), 2), ((1, 0, 0), 1)),   # segment "+1.0.0"
+            (((1, 0, 0), 7), ((1, 0, 0), 8)),   # segment "0.0.0"  (intra)
+        ]
+        write_links(lg, links, sid_ndim=3)
+        # ASCII sorts '+' (0x2b) and '-' (0x2d) before '0' (0x30), so the
+        # segment order is "+1.0.0" < "0.0.+1" < "0.0.0" — intra sorts LAST.
+        assert lg[links_group_path(0)].children() == [
+            "+1.0.0", "0.0.+1", "0.0.0",
+        ]
+        assert read_links(lg) == [links[1], links[0], links[2]]
 
     def test_2d(self, tmp_path: Path) -> None:
-        lg = _make_level_group(tmp_path)
-        create_cross_chunk_links_array(lg)
+        lg = _make_level_group(tmp_path, ndim=2)
+        create_links_array(lg, link_width=2, sid_ndim=2)
 
         links = [
             (((0, 1), 3), ((1, 1), 0)),
         ]
-        write_cross_chunk_links(lg, links, sid_ndim=2)
+        write_links(lg, links, sid_ndim=2)
 
-        read_back = read_cross_chunk_links(lg)
+        read_back = read_links(lg)
         assert read_back[0] == links[0]
 
 
@@ -596,8 +634,8 @@ class TestLinkAttributes:
     def test_basic(self, tmp_path: Path) -> None:
         lg = _make_level_group(tmp_path)
         create_vertices_array(lg)
-        create_links_array(lg, link_width=2)
-        create_link_attributes_array(lg, "weight")
+        create_links_array(lg, link_width=2, sid_ndim=3)
+        create_link_attributes_array(lg, "weight", sid_ndim=3)
 
         verts = [np.zeros((3, 3), dtype=np.float32)]
         write_chunk_vertices(lg, (0, 0, 0), verts)
@@ -608,10 +646,14 @@ class TestLinkAttributes:
         weights = [np.array([0.5, 0.8], dtype=np.float32)]
         write_chunk_link_attributes(lg, "weight", (0, 0, 0), weights)
 
-        # Read back via raw bytes (link_attributes use same encoding as fragments)
-        # 0.4 multiscale layout: link_attributes/<name>/<delta>/<chunk_key>
+        # Read back via raw bytes (link_attributes use same encoding as
+        # fragments).  Offset layout: the attribute family mirrors the link
+        # family, so intra-chunk link attributes live in the all-zero
+        # offsets array — link_attributes/<name>/<delta>/<offsets>/<chunk_key>.
         key = "0.0.0"
-        raw = lg.read_bytes("link_attributes/weight/0", key)
+        raw = lg.read_bytes(
+            link_attributes_path("weight", 0, intra_offsets(3, 2)), key,
+        )
         arr = np.frombuffer(raw, dtype=np.float32)
         np.testing.assert_allclose(arr, [0.5, 0.8])
 
@@ -627,7 +669,7 @@ class TestObjectReconstruction:
         lg = _make_level_group(tmp_path)
         create_vertices_array(lg)
         create_object_index_array(lg)
-        create_cross_chunk_links_array(lg)
+        create_links_array(lg, link_width=2, sid_ndim=3)
 
         # Segment A in chunk (0,0,0): 3 points
         seg_a = np.array([[0, 0, 0], [1, 1, 1], [2, 2, 2]], dtype=np.float32)
@@ -643,7 +685,7 @@ class TestObjectReconstruction:
         }, sid_ndim=3)
 
         # Cross-chunk link: last vertex of seg_a → first vertex of seg_b
-        write_cross_chunk_links(lg, [
+        write_links(lg, [
             (((0, 0, 0), 2), ((0, 0, 1), 0)),
         ], sid_ndim=3)
 
@@ -660,7 +702,7 @@ class TestObjectReconstruction:
         np.testing.assert_array_equal(full[4], [4, 4, 4])
 
         # Verify cross-chunk link
-        ccl = read_cross_chunk_links(lg)
+        ccl = read_links(lg)
         assert len(ccl) == 1
         assert ccl[0] == (((0, 0, 0), 2), ((0, 0, 1), 0))
 
@@ -847,7 +889,7 @@ class TestExplicitFragments:
     def test_read_chunk_link_fragment_explicit(self, tmp_path: Path) -> None:
         lg = _make_level_group(tmp_path)
         create_vertices_array(lg)
-        create_links_array(lg, link_width=2)
+        create_links_array(lg, link_width=2, sid_ndim=3)
 
         # Lay down a single vertex fragment covering every row the links
         # reference (the old writer vertex/link fragment-count check is gone).
@@ -881,7 +923,7 @@ class TestExplicitFragments:
         # link_width=None should auto-detect from array metadata.
         lg = _make_level_group(tmp_path)
         create_vertices_array(lg)
-        create_links_array(lg, link_width=3)
+        create_links_array(lg, link_width=3, sid_ndim=3)
 
         write_chunk_vertices(
             lg, (0, 0, 0), [np.zeros((5, 3), dtype=np.float32)],
@@ -904,7 +946,7 @@ class TestExplicitFragments:
     def test_read_chunk_links_mixed(self, tmp_path: Path) -> None:
         lg = _make_level_group(tmp_path)
         create_vertices_array(lg)
-        create_links_array(lg, link_width=2)
+        create_links_array(lg, link_width=2, sid_ndim=3)
 
         write_chunk_vertices(
             lg, (0, 0, 0), [np.zeros((10, 3), dtype=np.float32)],
@@ -936,7 +978,7 @@ class TestExplicitFragments:
     ) -> None:
         lg = _make_level_group(tmp_path)
         create_vertices_array(lg)
-        create_links_array(lg, link_width=2)
+        create_links_array(lg, link_width=2, sid_ndim=3)
         write_chunk_vertices(
             lg, (0, 0, 0), [np.zeros((1, 3), dtype=np.float32)],
         )
@@ -1019,7 +1061,7 @@ class TestWriteChunkFragments:
     def test_append_link(self, tmp_path: Path) -> None:
         lg = _make_level_group(tmp_path)
         create_vertices_array(lg)
-        create_links_array(lg, link_width=2)
+        create_links_array(lg, link_width=2, sid_ndim=3)
         write_chunk_vertices(
             lg, (0, 0, 0), [np.zeros((5, 3), dtype=np.float32)],
         )
@@ -1202,14 +1244,16 @@ class TestWriteObjectAttributesAppend:
 
 
 # ===================================================================
-# R3: write_cross_chunk_links / write_cross_chunk_link_attributes append
+# R3: write_links / write_link_attributes append
 # ===================================================================
 
-class TestWriteCrossChunkLinksAppend:
-    """Covers ``mode="append"`` on cross-chunk-link writers (R3)."""
+class TestWriteLinksAppend:
+    """Covers ``mode="append"`` on the whole-family link writers (R3)."""
 
     def _records(self, n: int, base: int = 0) -> list:
         # Build n simple 2-endpoint records with distinct vertex indices.
+        # Every record spans the same chunk pair, so they all land in one
+        # cell of one offsets array and read back in write order.
         return [
             [((0, 0, 0), base + i), ((1, 0, 0), base + i + 100)]
             for i in range(n)
@@ -1217,86 +1261,86 @@ class TestWriteCrossChunkLinksAppend:
 
     def test_append_records(self, tmp_path: Path) -> None:
         lg = _make_level_group(tmp_path)
-        create_cross_chunk_links_array(lg, delta=0)
+        create_links_array(lg, link_width=2, delta=0, sid_ndim=3)
 
-        ret0 = write_cross_chunk_links(
+        ret0 = write_links(
             lg, self._records(2), sid_ndim=3, delta=0,
         )
         assert int(ret0) == 0   # replace returns first_new=0
 
-        ret1 = write_cross_chunk_links(
+        ret1 = write_links(
             lg, self._records(1, base=10), sid_ndim=3,
             delta=0, mode="append",
         )
         assert int(ret1) == 2   # row index of first appended record
 
-        records = read_cross_chunk_links(lg, delta=0)
+        records = read_links(lg, delta=0)
         assert len(records) == 3
         assert records[0][0] == ((0, 0, 0), 0)
         assert records[2][0] == ((0, 0, 0), 10)
 
     def test_append_to_empty(self, tmp_path: Path) -> None:
         lg = _make_level_group(tmp_path)
-        create_cross_chunk_links_array(lg, delta=0)
+        create_links_array(lg, link_width=2, delta=0, sid_ndim=3)
 
-        ret = write_cross_chunk_links(
+        ret = write_links(
             lg, self._records(2), sid_ndim=3, delta=0, mode="append",
         )
         assert int(ret) == 0
 
-        records = read_cross_chunk_links(lg, delta=0)
+        records = read_links(lg, delta=0)
         assert len(records) == 2
 
     def test_append_attributes(self, tmp_path: Path) -> None:
         lg = _make_level_group(tmp_path)
-        create_cross_chunk_links_array(lg, delta=0)
-        create_cross_chunk_link_attributes_array(
-            lg, "weight", delta=0, dtype="float32",
+        create_links_array(lg, link_width=2, delta=0, sid_ndim=3)
+        create_link_attributes_array(
+            lg, "weight", delta=0, dtype="float32", sid_ndim=3,
         )
 
-        p0 = write_cross_chunk_links(
+        p0 = write_links(
             lg, self._records(2), sid_ndim=3, delta=0,
         )
-        write_cross_chunk_link_attributes(
+        write_link_attributes(
             lg, "weight", np.array([0.1, 0.2], dtype=np.float32),
             num_links=2, delta=0, partition=p0,
         )
 
         # Append one more record + its attribute.
-        p1 = write_cross_chunk_links(
+        p1 = write_links(
             lg, self._records(1, base=10), sid_ndim=3,
             delta=0, mode="append",
         )
-        write_cross_chunk_link_attributes(
+        write_link_attributes(
             lg, "weight", np.array([0.3], dtype=np.float32),
             num_links=3, delta=0, mode="append", partition=p1,
         )
 
-        back = read_cross_chunk_link_attributes(lg, "weight", delta=0)
+        back = read_link_attributes(lg, "weight", delta=0)
         assert back.shape == (3,)
         np.testing.assert_allclose(back, [0.1, 0.2, 0.3])
 
     def test_append_attributes_misaligned(self, tmp_path: Path) -> None:
         lg = _make_level_group(tmp_path)
-        create_cross_chunk_links_array(lg, delta=0)
-        create_cross_chunk_link_attributes_array(
-            lg, "weight", delta=0, dtype="float32",
+        create_links_array(lg, link_width=2, delta=0, sid_ndim=3)
+        create_link_attributes_array(
+            lg, "weight", delta=0, dtype="float32", sid_ndim=3,
         )
-        p0 = write_cross_chunk_links(
+        p0 = write_links(
             lg, self._records(2), sid_ndim=3, delta=0,
         )
-        write_cross_chunk_link_attributes(
+        write_link_attributes(
             lg, "weight", np.array([0.1, 0.2], dtype=np.float32),
             num_links=2, delta=0, partition=p0,
         )
-        p1 = write_cross_chunk_links(
+        p1 = write_links(
             lg, self._records(1, base=10), sid_ndim=3,
             delta=0, mode="append",
         )
         try:
             # Append one row, but pass num_links=5 (does not match
             # post-append length of 3).
-            write_cross_chunk_link_attributes(
+            write_link_attributes(
                 lg, "weight", np.array([0.3], dtype=np.float32),
                 num_links=5, delta=0, mode="append", partition=p1,
             )
@@ -1306,9 +1350,9 @@ class TestWriteCrossChunkLinksAppend:
 
     def test_append_invalid_mode(self, tmp_path: Path) -> None:
         lg = _make_level_group(tmp_path)
-        create_cross_chunk_links_array(lg, delta=0)
+        create_links_array(lg, link_width=2, delta=0, sid_ndim=3)
         try:
-            write_cross_chunk_links(
+            write_links(
                 lg, self._records(1), sid_ndim=3, delta=0, mode="invalid",
             )
             assert False, "Should raise"
@@ -1341,14 +1385,14 @@ class TestCreateArraysIdempotent:
 
     def test_links_idempotent(self, tmp_path: Path) -> None:
         lg = _make_level_group(tmp_path)
-        create_links_array(lg, link_width=2)
-        create_links_array(lg, link_width=2)   # no-op
+        create_links_array(lg, link_width=2, sid_ndim=3)
+        create_links_array(lg, link_width=2, sid_ndim=3)   # no-op
 
     def test_links_strict(self, tmp_path: Path) -> None:
         lg = _make_level_group(tmp_path)
-        create_links_array(lg, link_width=2)
+        create_links_array(lg, link_width=2, sid_ndim=3)
         try:
-            create_links_array(lg, link_width=2, exist_ok=False)
+            create_links_array(lg, link_width=2, sid_ndim=3, exist_ok=False)
             assert False, "Should raise"
         except ArrayError:
             pass
@@ -1430,7 +1474,7 @@ class TestReadFragmentDefault:
     ) -> None:
         lg = _make_level_group(tmp_path)
         create_vertices_array(lg)
-        create_links_array(lg, link_width=2)
+        create_links_array(lg, link_width=2, sid_ndim=3)
         out = read_chunk_link_fragment(
             lg, (99, 99, 99), 0, link_width=2, default=None,
         )
@@ -1441,7 +1485,7 @@ class TestReadFragmentDefault:
     ) -> None:
         lg = _make_level_group(tmp_path)
         create_vertices_array(lg)
-        create_links_array(lg, link_width=2)
+        create_links_array(lg, link_width=2, sid_ndim=3)
         write_chunk_vertices(
             lg, (0, 0, 0), [np.zeros((1, 3), dtype=np.float32)],
         )
@@ -1459,7 +1503,7 @@ class TestReadFragmentDefault:
     ) -> None:
         lg = _make_level_group(tmp_path)
         create_vertices_array(lg)
-        create_links_array(lg, link_width=2)
+        create_links_array(lg, link_width=2, sid_ndim=3)
         write_chunk_vertices(
             lg, (0, 0, 0), [np.zeros((1, 3), dtype=np.float32)],
         )

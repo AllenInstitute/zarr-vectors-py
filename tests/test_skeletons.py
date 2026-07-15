@@ -13,11 +13,11 @@ import numpy as np
 import pytest
 
 from zarr_vectors.core.arrays import (
-    read_cross_chunk_links,
+    read_links,
     write_object_attributes,
     write_object_index,
 )
-from zarr_vectors.core.paths import cross_chunk_links_path
+from zarr_vectors.core.paths import links_group_path, links_path
 from zarr_vectors.types.skeletons import (
     decompose_tree_to_paths,
     init_skeleton_store,
@@ -25,6 +25,19 @@ from zarr_vectors.types.skeletons import (
     write_skeleton_chunk,
     write_skeleton_cross_chunk_links,
 )
+
+
+def read_cross_links(level_group, *, delta: int = 0) -> list:
+    """Records spanning more than one chunk.
+
+    ``read_links`` returns the whole family — intra-chunk links are the
+    all-zero-offsets array, not a separate family — so tests that care
+    about the pre-merge ``cross_chunk_links`` set filter for it.
+    """
+    return [
+        record for record in read_links(level_group, delta=delta)
+        if len({tuple(cc) for cc, _vi in record}) > 1
+    ]
 
 
 def _init(tmp_path: Path):
@@ -98,10 +111,21 @@ class TestDirectedCrossChunk:
         links = [(((1, 0, 0), 0), ((0, 0, 0), 0))]
         write_skeleton_cross_chunk_links(lg, links, ndim=3)
 
-        meta = lg.read_array_meta(cross_chunk_links_path(0))
+        # directed/store is family-wide, so it lives on the <delta> group.
+        meta = lg.read_array_meta(links_group_path(0))
         assert meta["directed"] is True
-        out = read_cross_chunk_links(lg, delta=0)
+        out = read_cross_links(lg, delta=0)
         assert out == [(((1, 0, 0), 0), ((0, 0, 0), 0))]
+
+        # The parent is the source cell and the child sits one chunk back
+        # along -x.  A canonical sort would instead have led with the
+        # child, filing the record at cell 0.0.0 under offsets "+1.0.0" —
+        # the negative offset is the direction surviving on disk.
+        # (``0.0.0``, the intra array, is pre-created empty by init.)
+        segments = lg[links_group_path(0)].children()
+        assert "-1.0.0" in segments
+        assert "+1.0.0" not in segments
+        assert lg.chunk_exists(links_path(0, ((-1, 0, 0),)), "1.0.0")
 
 
 class TestReadBySegmentId:
