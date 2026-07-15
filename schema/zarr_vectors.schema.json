@@ -101,103 +101,8 @@
         "string"
       ]
     },
-    "CrossChunkLinkAttributeMeta": {
-      "additionalProperties": false,
-      "description": "``.zattrs`` for each ``cross_chunk_link_attributes/<name>/<delta>/`` parent group.  In 0.8 the parallel link family was split into per-cell arrays keyed on the canonical-sorted L-tuple of endpoint chunks.  This attribute family mirrors that layout: per-cell byte blobs with one row per record, in the same write order as the matching cell.  ``num_links`` MUST equal the parallel CCL family's ``num_links``.",
-      "properties": {
-        "dtype": {
-          "description": "Numpy dtype string of the array's value type (e.g. \"float32\").",
-          "type": "string"
-        },
-        "level_delta": {
-          "description": "Pyramid-level delta between the source side (the level that owns this array) and the target side of the edges.  ``0`` for intra-level arrays (the only kind written pre-0.4), ``+N`` for edges from this level to ``this_level + N`` (coarser), ``-N`` for edges to ``this_level - N`` (finer).\n",
-          "type": "integer"
-        },
-        "name": {
-          "description": "NGFF axis or attribute name (e.g. \"x\", \"intensity\").",
-          "type": "string"
-        },
-        "num_links": {
-          "description": "Total cross-chunk link count.",
-          "minimum": 0,
-          "type": "integer"
-        },
-        "zv_array": {
-          "$ref": "#/$defs/ZvArrayTag",
-          "const": "cross_chunk_link_attribute",
-          "description": "Discriminator slot identifying the kind of per-array ``.zattrs`` block.  Each writer in ``core/arrays.py`` stamps the corresponding token from :class:`ZvArrayTag`.\n"
-        }
-      },
-      "required": [
-        "zv_array",
-        "name",
-        "dtype",
-        "level_delta",
-        "num_links"
-      ],
-      "title": "CrossChunkLinkAttributeMeta",
-      "type": "object"
-    },
-    "CrossChunkLinksMeta": {
-      "additionalProperties": false,
-      "description": "``.zattrs`` for a ``cross_chunk_links/<delta>/`` parent group. In 0.8 the family stores per-cell arrays keyed on the canonical-sorted L-tuple of endpoint chunks (``cross_chunk_links/<delta>/<x.y.z...>`` \u2014 exactly ``sid_ndim * link_width`` dotted components).  Each cell holds records spanning that exact L-tuple of chunks; each record is ``[perm_idx, vi_0, ..., vi_{L-1}]`` int64s, where ``perm_idx`` is the Lehmer code of the canonical\u2192input-order permutation (so readers can recover original endpoint order \u2014 mesh-face winding, directed-edge direction).  Source-side endpoint (input endpoint 0) lives at the array's own resolution level; target-side endpoints live at ``this_level + level_delta``.  ``num_links`` is the family- wide *logical* record count (one per input record).\nTwo family-level policy flags govern cell placement: ``directed`` (endpoint order preserved, so ``A\u2192B`` and ``B\u2192A`` are distinct cells) and ``store`` (``canonical`` = one cell per record; ``duplicate`` = one cell per distinct incident chunk). ``num_physical_records`` is the on-disk row count, which exceeds ``num_links`` under ``duplicate``.",
-      "properties": {
-        "directed": {
-          "description": "When true, endpoint order is meaningful and preserved (no canonical sort): ``A\u2192B`` and ``B\u2192A`` occupy distinct cells and every stored ``perm_idx`` is 0.  Defaults to false (undirected).\n",
-          "type": [
-            "boolean",
-            "null"
-          ]
-        },
-        "level_delta": {
-          "description": "Pyramid-level delta between the source side (the level that owns this array) and the target side of the edges.  ``0`` for intra-level arrays (the only kind written pre-0.4), ``+N`` for edges from this level to ``this_level + N`` (coarser), ``-N`` for edges to ``this_level - N`` (finer).\n",
-          "type": "integer"
-        },
-        "link_width": {
-          "description": "Width of a links row (1 for parent\u2192child metanode references, 2 for edges, 3 for triangle faces, 4 for quads).\n",
-          "minimum": 1,
-          "type": "integer"
-        },
-        "num_links": {
-          "description": "Total cross-chunk link count.",
-          "minimum": 0,
-          "type": "integer"
-        },
-        "num_physical_records": {
-          "description": "On-disk record row count across all cells of a ``cross_chunk_links/<delta>/`` family.  Equals ``num_links`` for ``store=canonical``; larger when ``store=duplicate`` replicates a record across its incident-chunk cells.\n",
-          "minimum": 0,
-          "type": [
-            "integer",
-            "null"
-          ]
-        },
-        "sid_ndim": {
-          "description": "Number of spatial-index dimensions encoded in chunk keys.",
-          "minimum": 1,
-          "type": "integer"
-        },
-        "store": {
-          "$ref": "#/$defs/CrossChunkStore",
-          "description": "Cell-duplication policy; see CrossChunkStore."
-        },
-        "zv_array": {
-          "$ref": "#/$defs/ZvArrayTag",
-          "const": "cross_chunk_links",
-          "description": "Discriminator slot identifying the kind of per-array ``.zattrs`` block.  Each writer in ``core/arrays.py`` stamps the corresponding token from :class:`ZvArrayTag`.\n"
-        }
-      },
-      "required": [
-        "zv_array",
-        "num_links",
-        "sid_ndim",
-        "level_delta",
-        "link_width"
-      ],
-      "title": "CrossChunkLinksMeta",
-      "type": "object"
-    },
     "CrossChunkStore": {
-      "description": "Cell-duplication policy for a ``cross_chunk_links/<delta>/`` family.",
+      "description": "Cell-duplication policy for a ``links/<delta>/`` family.  Governs only the boundary-crossing (non-zero offsets) arrays: an intra-chunk record has a single incident chunk, so both values place it identically.",
       "enum": [
         "canonical",
         "duplicate"
@@ -216,7 +121,7 @@
       "type": "string"
     },
     "CrossLevelStorage": {
-      "description": "How cross-pyramid-level edges are stored in the multiscale links layout (``links/<delta>/`` and ``cross_chunk_links/<delta>/``).",
+      "description": "How cross-pyramid-level edges are stored in the multiscale links layout (``links/<delta>/``).",
       "enum": [
         "none",
         "implicit",
@@ -484,9 +389,43 @@
       "title": "LevelMetadata",
       "type": "object"
     },
+    "LinkAttributeFamilyMeta": {
+      "additionalProperties": false,
+      "description": "``.zattrs`` for a ``link_attributes/<name>/<delta>/`` **group**. There is no separate cross-chunk attribute family: an intra-chunk link's attributes live under the all-zero offsets segment, exactly like the links themselves.\n``num_links`` is stamped by the whole-family writer and MUST then equal the parallel ``links/<delta>/`` family's ``num_links``.  It is absent when the family was created without data (the per-cell writers do not stamp it).",
+      "properties": {
+        "level_delta": {
+          "description": "Pyramid-level delta between the source side (the level that owns this array) and the target side of the edges.  ``0`` for intra-level arrays (the only kind written pre-0.4), ``+N`` for edges from this level to ``this_level + N`` (coarser), ``-N`` for edges to ``this_level - N`` (finer).\n",
+          "type": "integer"
+        },
+        "name": {
+          "description": "NGFF axis or attribute name (e.g. \"x\", \"intensity\").",
+          "type": "string"
+        },
+        "num_links": {
+          "description": "Family-wide *logical* link count \u2014 one per input record, however many physical copies ``store`` filed.  Absent on a ``links/<delta>/`` group until ``finalize_links`` has run, and on a ``link_attributes/<name>/<delta>/`` group created without data.\n",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "zv_array": {
+          "$ref": "#/$defs/ZvArrayTag",
+          "const": "link_attribute_family",
+          "description": "Discriminator slot identifying the kind of per-array ``.zattrs`` block.  Each writer in ``core/arrays.py`` stamps the corresponding token from :class:`ZvArrayTag`.\n"
+        }
+      },
+      "required": [
+        "zv_array",
+        "name",
+        "level_delta"
+      ],
+      "title": "LinkAttributeFamilyMeta",
+      "type": "object"
+    },
     "LinkAttributeMeta": {
       "additionalProperties": false,
-      "description": "``.zattrs`` for each ``link_attributes/<name>/<delta>/`` array. Parallel to the ``links/<delta>/`` array of the same ``<delta>``.",
+      "description": "``.zattrs`` for one ``link_attributes/<name>/<delta>/<offsets>/`` array.  Mirrors the ``links/<delta>/<offsets>/`` array of the same ``<delta>`` and ``<offsets>`` cell-for-cell \u2014 same cells, same per-cell row order \u2014 so attribute rows align 1:1 with link records without storing a row id.\nRows never carry the links array's ``perm_idx`` column: that column describes a record's placement, not its value, so ``has_perm`` has no analogue here and a row is exactly ``row_shape`` worth of ``dtype``.  A ``store=\"duplicate\"`` family replicates an attribute value alongside each physical copy of its record, so cells stay row-aligned with the links array they mirror.",
       "properties": {
         "dtype": {
           "description": "Numpy dtype string of the array's value type (e.g. \"float32\").",
@@ -500,6 +439,30 @@
           "description": "NGFF axis or attribute name (e.g. \"x\", \"intensity\").",
           "type": "string"
         },
+        "offsets": {
+          "items": {
+            "additionalProperties": true,
+            "type": [
+              "null",
+              "boolean",
+              "object",
+              "number",
+              "string",
+              "array"
+            ]
+          },
+          "type": "array"
+        },
+        "row_shape": {
+          "description": "Tail dimensions of one attribute row (``[]`` for a 1-D per-link attribute), letting a reader reconstruct shape from a bare byte blob.  Stamped by the writers that lay down attribute bytes; absent on an array created empty.\n",
+          "items": {
+            "type": "integer"
+          },
+          "type": [
+            "array",
+            "null"
+          ]
+        },
         "zv_array": {
           "$ref": "#/$defs/ZvArrayTag",
           "const": "link_attribute",
@@ -510,6 +473,7 @@
         "zv_array",
         "name",
         "dtype",
+        "offsets",
         "level_delta"
       ],
       "title": "LinkAttributeMeta",
@@ -525,13 +489,16 @@
       "title": "LinksConvention",
       "type": "string"
     },
-    "LinksMeta": {
+    "LinksFamilyMeta": {
       "additionalProperties": false,
-      "description": "``.zattrs`` for a ``links/<delta>/`` array.  Under the 0.4 multiscale layout, each delta segment carries its own meta block; ``level_delta=0`` is the intra-level array (the only one written pre-0.4).",
+      "description": "``.zattrs`` for a ``links/<delta>/`` **group** \u2014 the family-wide policy every offsets array beneath it decodes against, which is why it lives on the group rather than being repeated per array.\nSince 0.9.0 connectivity is one family: there is no separate ``cross_chunk_links/``.  An intra-chunk link is a link whose relative offsets are all zero; a cross-chunk link is one whose offsets are non-zero.\nTwo policy flags govern how a boundary-crossing record is placed: ``directed`` (endpoint order is data, so ``A\u2192B`` and ``B\u2192A`` stay distinct) and ``store`` (``canonical`` = one cell per record; ``duplicate`` = one cell per distinct incident chunk).  The source-side endpoint (input endpoint 0) lives at the level owning the array; target-side endpoints live at ``this_level + level_delta``.\n``num_links`` is the family-wide *logical* record count (one per input record) and ``num_physical_records`` the on-disk row count; both are absent until ``finalize_links`` has run, since the decentralized per-cell writers leave them for it to fill in. ``sid_ndim`` is likewise optional: a family may be stamped without it, and readers then recover offsets from each array's own ``offsets`` meta.",
       "properties": {
-        "dtype": {
-          "description": "Numpy dtype string of the array's value type (e.g. \"float32\").",
-          "type": "string"
+        "directed": {
+          "description": "When true, endpoint order is meaningful and preserved (no canonical sort): ``A\u2192B`` and ``B\u2192A`` occupy distinct cells and every stored ``perm_idx`` is 0.  Family-wide; defaults to false (undirected).\n",
+          "type": [
+            "boolean",
+            "null"
+          ]
         },
         "level_delta": {
           "description": "Pyramid-level delta between the source side (the level that owns this array) and the target side of the edges.  ``0`` for intra-level arrays (the only kind written pre-0.4), ``+N`` for edges from this level to ``this_level + N`` (coarser), ``-N`` for edges to ``this_level - N`` (finer).\n",
@@ -542,6 +509,83 @@
           "minimum": 1,
           "type": "integer"
         },
+        "num_links": {
+          "description": "Family-wide *logical* link count \u2014 one per input record, however many physical copies ``store`` filed.  Absent on a ``links/<delta>/`` group until ``finalize_links`` has run, and on a ``link_attributes/<name>/<delta>/`` group created without data.\n",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "num_physical_records": {
+          "description": "On-disk record row count across every offsets array and cell of a ``links/<delta>/`` family.  Equals ``num_links`` for ``store=canonical``; larger when ``store=duplicate`` replicates a record across its incident-chunk cells.  Stamped by ``finalize_links``.\n",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "sid_ndim": {
+          "description": "Number of spatial-index dimensions encoded in chunk keys and in each offset.  Optional on a links family: writers stamp it only when known, and ``finalize_links`` preserves its absence rather than inventing one.\n",
+          "minimum": 1,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "store": {
+          "$ref": "#/$defs/CrossChunkStore",
+          "description": "Cell-duplication policy for a links family; see CrossChunkStore. Family-wide; defaults to ``canonical``.\n"
+        },
+        "zv_array": {
+          "$ref": "#/$defs/ZvArrayTag",
+          "const": "links_family",
+          "description": "Discriminator slot identifying the kind of per-array ``.zattrs`` block.  Each writer in ``core/arrays.py`` stamps the corresponding token from :class:`ZvArrayTag`.\n"
+        }
+      },
+      "required": [
+        "zv_array",
+        "level_delta",
+        "link_width"
+      ],
+      "title": "LinksFamilyMeta",
+      "type": "object"
+    },
+    "LinksMeta": {
+      "additionalProperties": false,
+      "description": "``.zattrs`` for a single ``links/<delta>/<offsets>/`` array: a rank-D vlen array over the level's chunk grid, one cell per **source** chunk, holding the records whose source chunk is that cell.\nThe ``offsets`` segment names the array: ``link_width - 1`` relative offsets, each of ``sid_ndim`` signed components.  Record ``vi_k`` is local to chunk ``src + o_k``; the implicit ``o_0 = 0`` (the source itself) is never encoded.  All-zero offsets is the intra-chunk array; non-zero offsets hold records whose other endpoints sit that far away.  ``link_width == 1`` (parent\u2192child metanode refs) has no other endpoint and so carries an empty ``offsets`` list, written at the ``self`` segment.\n``has_perm`` is the record-width discriminator.  Rows are ``L`` ints normally; when ``has_perm`` is true they are ``1 + L`` (``[perm_idx, vi_0, ..., vi_{L-1}]``), where ``perm_idx`` is the Lehmer code of the canonical\u2192input-order permutation, letting readers recover the original endpoint order (mesh-face winding, directed-edge direction).  It is true exactly when a non-identity placement is possible \u2014 non-intra offsets AND ``level_delta == 0`` AND (``store=\"duplicate\"`` OR not ``directed``) \u2014 so an intra-chunk link never pays the extra 8 bytes for a value that is always 0.",
+      "properties": {
+        "dtype": {
+          "description": "Numpy dtype string of the array's value type (e.g. \"float32\").",
+          "type": "string"
+        },
+        "has_perm": {
+          "description": "Whether each row of this links array carries a leading ``perm_idx`` column \u2014 i.e. whether rows are ``1 + link_width`` ints rather than ``link_width``.  True exactly when a non-identity endpoint placement is possible: non-intra ``offsets`` AND ``level_delta == 0`` AND (``store=\"duplicate\"`` OR not ``directed``).  Readers must take the record width from this stamp rather than inferring it: decoding physical bytes at the logical width does not reliably raise, it silently fabricates rows.\n",
+          "type": "boolean"
+        },
+        "level_delta": {
+          "description": "Pyramid-level delta between the source side (the level that owns this array) and the target side of the edges.  ``0`` for intra-level arrays (the only kind written pre-0.4), ``+N`` for edges from this level to ``this_level + N`` (coarser), ``-N`` for edges to ``this_level - N`` (finer).\n",
+          "type": "integer"
+        },
+        "link_width": {
+          "description": "Width of a links row (1 for parent\u2192child metanode references, 2 for edges, 3 for triangle faces, 4 for quads).\n",
+          "minimum": 1,
+          "type": "integer"
+        },
+        "offsets": {
+          "items": {
+            "additionalProperties": true,
+            "type": [
+              "null",
+              "boolean",
+              "object",
+              "number",
+              "string",
+              "array"
+            ]
+          },
+          "type": "array"
+        },
         "zv_array": {
           "$ref": "#/$defs/ZvArrayTag",
           "const": "links",
@@ -551,6 +595,8 @@
       "required": [
         "zv_array",
         "dtype",
+        "offsets",
+        "has_perm",
         "link_width",
         "level_delta"
       ],
@@ -757,6 +803,7 @@
         "vertices",
         "vertex_fragments",
         "link_fragments",
+        "links_family",
         "links",
         "attribute",
         "fragment_attribute",
@@ -764,9 +811,8 @@
         "object_attribute",
         "groupings",
         "groupings_attribute",
-        "cross_chunk_links",
-        "link_attribute",
-        "cross_chunk_link_attribute"
+        "link_attribute_family",
+        "link_attribute"
       ],
       "title": "ZvArrayTag",
       "type": "string"
