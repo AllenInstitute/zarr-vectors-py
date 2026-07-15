@@ -58,13 +58,19 @@ the distinction is in the metadata and semantic interpretation.
 |-----------|----------|-------------|
 | `vertices/` | Yes | Streamline vertex positions |
 | `vertex_fragments/` | Yes | Fragment index over `vertices/` rows |
-| `links/<delta>/` | Yes | Intra-chunk consecutive vertex pairs |
-| `link_fragments/` | Yes (`<delta>=0`) | Fragment index over `links/0/` rows |
 | `object_index/` | Yes | Per-object manifest blobs naming fragments |
-| `cross_chunk_links/` | Yes* | Inter-chunk vertex connections |
+| `links/0/<offsets>/` | Only when a streamline spans chunks | Bridges joining consecutive segments; offsets always non-zero |
 | `attributes/<name>/` | No | Per-vertex attributes (e.g. FA, MD per point) |
 | `object_attributes/<name>/` | No | Per-streamline attributes (e.g. mean FA, length) |
 | `groupings/` | No | Bundle / tract group assignments |
+
+`streamline` shares `polyline`'s connectivity model exactly:
+`links_convention` is `implicit_sequential`, so vertex order within a
+fragment *is* the topology and **no intra-chunk links are written**.
+Every link record has non-zero offsets. There is no `cross_chunk_links/`
+array — that family was merged into `links/`. See
+[Polyline](polyline.md) for the bridge encoding and
+[Links](../object_model/links.md) for the layout.
 
 ### Streamline-specific root `.zattrs` keys
 

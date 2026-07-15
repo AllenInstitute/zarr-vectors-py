@@ -77,8 +77,9 @@ Each reference fixture must:
 2. Cover all arrays defined for its geometry type (no missing optional
    arrays for the primary fixture).
 3. Include at least two resolution levels for types that support pyramids.
-4. Include at least one cross-chunk object for types that support
-   `cross_chunk_links/`.
+4. Include at least one object that spans chunks, for types that
+   support it — so the fixture exercises a non-zero-offset link array
+   and not just the all-zero one.
 5. Include at least two named attributes.
 6. Pass L5 validation (asserted in `test_validation.py`).
 

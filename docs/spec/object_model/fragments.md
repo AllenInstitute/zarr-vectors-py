@@ -152,8 +152,9 @@ fragment:
   contiguous range of adjacent-bin fragments (mode 1), or an
   arbitrary list (mode 2 — most common after coarsening).
 - For **graphs and skeletons**, block order is implementation-defined;
-  connectivity is recovered from `links/<delta>/` and
-  `cross_chunk_links/`.
+  connectivity is recovered from the `links/<delta>/<offsets>/` family
+  (intra-chunk edges and boundary-crossing edges alike — they differ
+  only by which offsets array holds them).
 
 ### Fragments across multiple chunks
 
@@ -173,9 +174,9 @@ def read_object(level_group, object_id):
 Pre-0.6 stores required walking `cross_chunk_links/` forward from
 each chunk to discover the next chunk; the walk was a sequence of
 dependent reads. Post-0.6 the manifest enumerates every chunk
-directly. `cross_chunk_links/0/` still encodes geometric edges
-across chunks but is not used for chunk discovery during object
-reads.
+directly. The links family still encodes geometric edges across
+chunks — as records with non-zero offsets in `links/0/<offsets>/` —
+but is not used for chunk discovery during object reads.
 
 ### Fragment count at coarser levels
 

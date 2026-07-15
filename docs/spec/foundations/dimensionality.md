@@ -80,11 +80,13 @@ explicitly. The table below shows how shapes vary with `D`:
 | `vertices/` (per chunk) | `(N, D)` | N varies per chunk |
 | `vertex_fragments/` (per chunk) | opaque `uint8` blob, length depends on `F` | Fragment-index binary blob; size grows with the number of fragments in the chunk, independent of D |
 | `link_fragments/` (per chunk) | opaque `uint8` blob, length depends on `F` | Same structure as `vertex_fragments/` but indexes `links/0/<chunk>` rows |
-| `links/<delta>` (per chunk) | `(E, 2)` | E varies; independent of D |
-| `links/<delta>` (per chunk, mesh) | `(F, 3)` | F varies; independent of D |
+| `links/<delta>/<offsets>/` (per source chunk) | `(R, L)` | R varies; `L` = `link_width` (2 for edges, ≥ 3 for faces); independent of D |
 | `object_index/data` | ragged `uint8` (concatenated manifest blobs) | Each blob's `chunk_coords` words have `D` int64s; total size grows with manifest count and complexity |
 | `object_index/offsets` | `(n_objects,)` `int64` | Independent of D |
-| `cross_chunk_links/` | `(L, 2)` | independent of D |
+
+The `<offsets>` **path segment** does depend on D: it carries
+`link_width - 1` offsets, each of `sid_ndim` signed components (see
+[Links](../object_model/links.md)). The array *contents* do not.
 
 The `chunk_grid` of the `vertices/` Zarr array reflects `D`:
 

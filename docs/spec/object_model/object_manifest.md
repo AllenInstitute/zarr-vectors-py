@@ -12,9 +12,19 @@ as a ragged `uint8` blob: every chunk the object touches, and
 every fragment within each chunk, is enumerated directly.
 
 The cross-chunk-link walk is no longer required during object
-read. `cross_chunk_links/0/` still exists and still encodes
-geometric edges across chunks, but it is not used to discover
-which chunks an object touches.
+read. Links still encode geometric edges across chunks — as
+records with non-zero offsets in the `links/0/<offsets>/` family
+(see [Links](links.md)) — but they are not used to discover which
+chunks an object touches.
+```
+
+```{admonition} Format change in ZVF 0.9.0
+:class: note
+
+The `cross_chunk_links/` and `cross_chunk_link_attributes/` families
+were merged into `links/` and `link_attributes/`. **Manifests are
+unaffected**: they reference vertex fragments only, and have not
+referenced links since the walk was removed in 0.6.0.
 ```
 
 ## Terms

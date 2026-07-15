@@ -23,19 +23,34 @@ from zarr_vectors.constants import (
 
 | Property | `point_cloud` | `line` | `polyline` | `streamline` | `graph` | `skeleton` | `mesh` |
 |----------|:---:|:---:|:---:|:---:|:---:|:---:|:---:|
-| Discrete objects | — | — | ✓ | ✓ | ✓ | ✓ | ✓ |
-| `links/<delta>/` | — | ✓ | ✓ | ✓ | ✓ | ✓ | — |
-| `links/<delta>/` | — | — | — | — | — | — | ✓ |
-| `object_index/` | — | — | ✓ | ✓ | ✓ | ✓ | ✓ |
-| `cross_chunk_links/` | — | — | ✓ | ✓ | ✓ | ✓ | — |
-| `object_attributes/` | — | — | ✓ | ✓ | ✓ | ✓ | ✓ |
+| Discrete objects | — | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
+| `links/` family | — | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
+| `link_width` | — | 2 | 2 | 2 | 2 | 2 | ≥ 3 |
+| Intra-chunk links (`0.0.0`) | — | — | — | — | ✓ | ✓ | ✓* |
+| Cross-chunk links (non-zero offsets) | — | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
+| Family `directed` | — | false | false | false | false | **true** | false |
+| `object_index/` | — | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
+| `object_attributes/` | — | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
 | `groupings/` | — | — | ✓ | ✓ | ✓ | ✓ | ✓ |
 | Per-vertex attributes | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
 | Object sparsity | — | — | ✓ | ✓ | ✓ | ✓ | ✓ |
 | Multiscale pyramid | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
 | Draco compression | — | — | — | — | — | — | ✓ |
-| `is_directed` flag | — | — | — | — | ✓ | — | — |
-| `is_tree` flag | — | — | — | — | ✓ | ✓ | — |
+
+\* Mesh intra-chunk faces move into the Draco bitstream under
+`encoding="draco"`, leaving only boundary faces in `links/`.
+
+There is no `cross_chunk_links/` family: connectivity is one family,
+and an intra-chunk link is simply one whose offsets are all zero.
+`line`, `polyline`, and `streamline` use
+`links_convention: implicit_sequential` — vertex order within a
+fragment carries the topology — so they emit **only** non-zero-offset
+links, and a store whose objects never cross a chunk has no `links/`
+group at all.
+
+There are no `is_directed` or `is_tree` root keys; `directed` is
+per-family link policy, and tree-ness is carried by `geometry_type`
+plus `links_convention`. See [Links](../object_model/links.md).
 
 ## Type selection guide
 

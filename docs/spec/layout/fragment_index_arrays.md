@@ -19,7 +19,7 @@ coarsened pyramid levels.
 
 **Fragment**
 : A logical grouping of rows inside one chunk's `vertices/<i.j.k>`
-  (or `links/0/<i.j.k>`) array. A fragment is either a contiguous
+  (or `links/0/<all-zero offsets>/<i.j.k>`) array. A fragment is either a contiguous
   range of rows or an explicit list of row indices. At level 0 with
   the default writer, each non-empty bin emits exactly one fragment;
   at coarsened pyramid levels a fragment may represent a metavertex
@@ -123,7 +123,7 @@ result. This section explains why.
 ### When fragment sharing matters — and when it doesn't
 
 The "reuse" question is whether a single row of `vertices/<chunk>`
-(or `links/0/<chunk>`) can be named by more than one logical owner —
+(or `links/0/<all-zero offsets>/<chunk>`) can be named by more than one logical owner —
 two object manifests, or two adjacent bins, or a parent and a child
 in a pyramid. The answer depends on the level and on the writer:
 
@@ -450,8 +450,8 @@ fragment-index format is independent of any outer compression.
 
 ### `link_fragments/` array schema
 
-Identical structure, parallel role for the cross-chunk link arrays
-at `delta == 0`:
+Identical structure, parallel role for exactly one link array: the
+**intra-chunk array at delta 0**, `links/0/<all-zero offsets>/`.
 
 | Property | Value |
 |----------|-------|
@@ -462,11 +462,43 @@ at `delta == 0`:
 | group metadata | `{"zv_array": "link_fragments", "encoding": "fragment_index_v1"}` |
 
 `link_fragments/<chunk_coords>` describes the fragment partition of
-`links/0/<chunk_coords>` rows. Present iff the geometry type has
-connectivity (polyline / streamline / graph / skeleton / mesh) and
-at least one chunk has been written. Cross-level link arrays
-(`delta != 0`) keep their inline self-describing header and do not
-have a `link_fragments/` sibling.
+`links/0/<all-zero offsets>/<chunk_coords>` rows. Present iff the geometry
+type has connectivity (polyline / streamline / graph / skeleton / mesh) and
+at least one chunk has been written.
+
+Every other link array — any non-zero offsets segment, and every
+`delta != 0` — uses an inline self-describing ragged blob and has **no**
+`link_fragments/` sibling. The writer picks between the two on exactly one
+condition, `delta == 0 and is_intra(offsets)`; see
+[Links](../object_model/links.md#cell-encoding-two-branches-one-condition).
+
+```{important}
+**Why only that one array may write it.** `link_fragments/<chunk>` is keyed
+by **chunk alone** — the key carries no `<delta>` and no `<offsets>`
+segment — and the write is an unconditional replace. The path therefore
+admits exactly **one** writer per chunk.
+
+That is safe only because the enclosing branch condition allows exactly one
+array to reach it: the intra array at delta 0. A chunk is the source cell
+of at most one such array, since "delta 0, all offsets zero" names a single
+array per family. If a second offsets array — say `links/0/0.0.+1/` — ever
+wrote this sidecar for the same source chunk, it would **silently clobber**
+the intra array's fragment index: no error, no key collision to detect,
+just an index describing the wrong array's rows. The intra cell would then
+decode its flat blob against another array's group boundaries and return
+wrong-length link groups.
+
+The branch condition in `write_chunk_links` and this write must therefore
+stay together. Widening the condition without re-keying the sidecar (to
+include the delta and offsets) reintroduces the clobber.
+```
+
+Note also that link groups need **not** be 1:1 with the chunk's vertex
+fragments. A chunk may legitimately have many vertex fragments but few link
+groups — BRIDGE, for instance, stores streamlines as vertex fragments and
+its node graph as link fragments. Readers derive per-group link ranges from
+`link_fragments/`, never from `vertex_fragments/`, so no write-time 1:1
+guard applies.
 
 ### Write-time invariants
 

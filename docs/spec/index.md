@@ -84,7 +84,7 @@ multiscale/sparsity
 geometry_types/index
 object_model/fragments
 object_model/object_manifest
-object_model/cross_chunk_links
+object_model/links
 object_model/object_attributes
 validation/overview
 comparisons/neuroglancer_precomputed

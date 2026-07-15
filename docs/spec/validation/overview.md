@@ -9,14 +9,17 @@
   checks.
 
 **`ValidationResult`**
-: The object returned by `validate()`. Carries a list of passed checks,
-  warnings, and errors, plus a `summary()` method and an `is_valid`
-  property.
+: The object returned by `validate()`. Carries the run's `level` plus
+  three lists of message strings — `passed`, `warnings`, `errors` — an
+  `ok` property, and a `summary()` method.
 
 **Check**
 : A single assertion evaluated during validation. A check either passes,
-  emits a warning (non-fatal), or raises an error (fatal). Errors
-  accumulate; validation does not stop at the first failure.
+  emits a warning (non-fatal), or records an error (fatal). Errors
+  accumulate within a level; validation does not stop at the first
+  failure. A check is **not** a reified object — it appends a
+  human-readable string to one of the three lists. There are no stable
+  check IDs to match on.
 
 **Warning**
 : A non-fatal issue that indicates the store may behave unexpectedly in
@@ -59,11 +62,20 @@ The validator is designed to be useful in several contexts:
 
 | Level | Name | What it checks | Typical runtime |
 |-------|------|----------------|-----------------|
-| 1 | Structural | Required files/groups/arrays exist; correct Zarr node types | < 1 s |
-| 2 | Metadata | `.zattrs` schema validity; dtype/shape declarations; divisibility constraints; all keys present and correctly typed | 1–5 s |
-| 3 | Consistency | fragment offset arithmetic; manifest integrity; cross-chunk link validity; attribute–vertex alignment | 10 s – 10 min (reads all chunks) |
-| 4 | Geometry | Type-specific constraints: tree topology for `skeleton`/`graph(is_tree)`; watertightness for `mesh(closed_surface)`; polyline gap detection | varies |
-| 5 | Pyramid | Multi-resolution correctness: monotonically non-increasing vertex and object counts; `bin_ratio` / `bin_shape` / `object_sparsity` self-consistency across levels | adds per-level cost |
+| 1 | Structural | Required paths exist ([`structure.py`](../../../zarr_vectors/validate/structure.py)). Filesystem presence only — **no** Zarr node-type inspection | < 1 s |
+| 2 | Metadata | Group-attribute validity ([`metadata.py`](../../../zarr_vectors/validate/metadata.py)): `sid_ndim` agreement, vocabulary tokens, bin/chunk divisibility. **No** array `zarr.json`, **no** link families | 1–5 s |
+| 3 | Consistency | Chunk decode, manifest integrity, link offsets-segment and record validity ([`consistency.py`](../../../zarr_vectors/validate/consistency.py)) | 10 s – 10 min (reads all chunks) |
+| 4 | Geometry | `links_convention` valid for each declared geometry type; mesh `link_width >= 3`; point clouds carry no links ([`conformance.py`](../../../zarr_vectors/validate/conformance.py)) | < 1 s |
+| 5 | Pyramid | Levels contiguous from 0; `vertex_count` non-increasing across levels; `bin_ratio` volume non-decreasing; `object_sparsity` in `(0, 1]` | adds per-level cost |
+
+The level names are historical. **L4 does not verify topology or
+geometry**: it checks metadata conventions, not tree structure,
+watertightness, or polyline gaps. **L5 does not check object counts**,
+`bin_shape` consistency, or cross-level vertex correspondence.
+
+L5 falls back to decoding every chunk to count vertices when a level
+omits its `vertex_count` attribute, so its cost is only per-level-
+metadata-sized on stores that record that attribute.
 
 ### Python API
 
@@ -79,42 +91,51 @@ print(result.summary())
 #   54 passed, 2 warnings, 0 errors
 
 # Check programmatically
-if not result.is_valid:
-    for err in result.errors:
-        print(f"ERROR [{err.level}] {err.check}: {err.message}")
+if not result.ok:
+    for msg in result.errors:
+        print(f"ERROR: {msg}")
 
 # Run only fast checks (CI use)
 result = validate("scan.zarrvectors", level=2)
-
-# Validate a specific level group only
-result = validate("scan.zarrvectors", level=3, resolution_levels=[0])
 ```
+
+`validate()` takes the store path and `level=` (default `3`) — nothing
+else. A `level` outside `1–5` raises `ValueError`.
+
+**Short-circuiting.** Levels run cumulatively but abort early on a
+fatal result, so a failing store reports the *first* level that failed
+rather than every level's findings:
+
+- If L1 fails, `validate()` returns immediately — no L2+ checks run.
+- If L2 fails and `level >= 3`, it returns after L2 — no L3+ checks run.
+- L3, L4, and L5 do not short-circuit each other.
+
+Consequently `result.errors` on a failing store is not an exhaustive
+list of everything wrong with it. Re-run after each fix.
 
 ### `ValidationResult` API
 
 ```python
-result.is_valid           # bool: True if no errors at any level
-result.passed             # list[Check]: checks that passed
-result.warnings           # list[Check]: non-fatal warnings
-result.errors             # list[Check]: fatal errors
-result.summary()          # str: one-line human-readable summary
-result.report()           # str: full multi-line report with all checks
-result.as_dict()          # dict: machine-readable representation
-
-# Iterate over all checks
-for check in result.all_checks:
-    print(check.level, check.name, check.status, check.message)
+result.level              # int: the level this run was invoked at
+result.ok                 # bool: True if there are no errors
+result.passed             # list[str]: messages for checks that passed
+result.warnings           # list[str]: non-fatal warning messages
+result.errors             # list[str]: fatal error messages
+result.summary()          # str: multi-line report — status line, counts,
+                          #      then every error and warning
+result.merge(other)       # None: absorb another result's three lists
 ```
 
-### `Check` object
+The three lists hold **plain strings**, not objects. There is no
+`is_valid`, `report()`, `as_dict()`, or `all_checks`; there is no
+`Check` class, and messages carry no structured level, ID, status, or
+store path. Programmatic consumers that need to distinguish specific
+findings must match on message text, which is **not** a stable
+interface.
 
-```python
-check.level      # int: conformance level this check belongs to
-check.name       # str: human-readable check name (e.g. "bin_divisibility")
-check.status     # str: "pass", "warning", or "error"
-check.message    # str: description of what was checked / what failed
-check.path       # str: store path relevant to this check (e.g. "0/.zattrs")
-```
+`result.level` records the level `validate()` was *called* with, not
+the level that produced any given message — messages from all executed
+levels are merged into one flat set of lists.
 
 ### CLI usage
 
@@ -132,14 +153,11 @@ a new store.
 
 ### Validation and performance
 
-Levels 1 and 2 touch only metadata files. Level 3 and above require reading
-all array chunks. For a large store (> 100 GB), level 3 validation may take
-several minutes. To validate a sample of chunks rather than all:
+Levels 1 and 2 touch only metadata. Level 3 reads every chunk at every
+level; for a large store (> 100 GB) it may take several minutes.
 
-```python
-result = validate("scan.zarrvectors", level=3, sample_fraction=0.1, seed=42)
-```
-
-Sampled validation is non-deterministic (random chunk selection) and may
-miss errors confined to specific chunks. It is suitable for quick sanity
-checks, not for publication-quality conformance certification.
+There is **no sampling or chunk-subsetting option**: `validate()`
+accepts only `level=`. To bound cost, either run at `level=2` or point
+the validator at a smaller store. The one place L3 samples is internal
+and not configurable — its point-cloud bin-bounds check examines at
+most the first 3 chunks per level (see [L3](l3_consistency.md)).

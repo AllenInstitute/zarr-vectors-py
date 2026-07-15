@@ -19,20 +19,21 @@
   vertices of a given object. Encoded in the `object_index/` array. See
   [Object manifest](../object_model/object_manifest.md).
 
-**Cross-chunk link**
+**Bridge**
 : A stored connection between the last vertex of a polyline segment in
   chunk A and the first vertex of the continuation segment in chunk B.
-  Required when a polyline spans multiple chunks. See
-  [Cross-chunk links](../object_model/cross_chunk_links.md).
+  Written when a polyline spans multiple chunks. A bridge is an ordinary
+  record in the one link family, distinguished only by having non-zero
+  offsets — see [Links](../object_model/links.md).
 
 ---
 
 ## Introduction
 
-The `polyline` type extends `line` with an object model: each polyline is
-a named, addressable entity that can be retrieved by ID. Polylines may
-span multiple spatial chunks; the `cross_chunk_links/` array preserves
-inter-chunk connectivity.
+The `polyline` type extends `line` with an ordered path of arbitrary
+length: each polyline is a named, addressable entity that can be
+retrieved by ID. Polylines may span multiple spatial chunks; links with
+non-zero offsets preserve inter-chunk connectivity.
 
 Use `polyline` over `line` whenever you need to:
 - Retrieve individual paths by ID.
@@ -54,17 +55,16 @@ seeding strategy, propagation algorithm).
 |-----------|----------|-------------|
 | `vertices/` | Yes | Vertex positions |
 | `vertex_fragments/` | Yes | Fragment index over `vertices/` rows |
-| `links/<delta>/` | Yes | Intra-chunk consecutive vertex pairs |
-| `link_fragments/` | Yes (`<delta>=0`) | Fragment index over `links/0/` rows |
 | `object_index/` | Yes | Per-object manifest blobs naming fragments |
-| `cross_chunk_links/` | Yes* | Inter-chunk vertex connections |
+| `links/0/<offsets>/` | Only when a polyline spans chunks | Bridges joining consecutive segments; offsets always non-zero |
 | `attributes/<name>/` | No | Per-vertex attributes |
 | `object_attributes/<name>/` | No | Per-polyline attributes |
 | `groupings/` | No | Group ID → [object IDs] |
 
-*`cross_chunk_links/` must be present if any polyline spans more than one
-chunk. It may be absent for stores where all polylines are confined to
-a single chunk each.
+There is no `cross_chunk_links/` array — that family was merged into
+`links/`. A store whose polylines each sit within one chunk has **no
+`links/` group at all**; see *Why polylines have no intra-chunk links*
+below.
 
 ### Vertex ordering within a chunk
 
@@ -72,21 +72,39 @@ For a polyline that contributes vertices to multiple bins within a chunk,
 its vertices appear in multiple fragments. Within each fragment, vertices are stored in
 traversal order (from the start of the polyline toward the end).
 
-Across fragments within the same chunk, vertices may be interleaved with vertices
-from other polylines. The `links/<delta>/` array stores the consecutive pairs
-for all polylines in the chunk, regardless of fragment assignment.
+Across fragments within the same chunk, vertices from different
+polylines may be interleaved. A fragment holds one contiguous run of a
+single polyline's vertices, in traversal order.
 
-### `links/<delta>/` for polylines
+### Why polylines have no intra-chunk links
 
-Each row in `links/<delta>/` is a pair `[i, j]` where `i` and `j` are
-local-chunk vertex indices and vertex `i` immediately precedes vertex `j`
-in the traversal order of some polyline. For a polyline contributing
-vertices at local indices `[3, 7, 11, 4]` (in traversal order), the edges
-are `[[3,7], [7,11], [11,4]]`.
+`polyline` uses `links_convention: implicit_sequential`. Within a
+fragment, **vertex order is the topology**: consecutive vertices are
+connected by definition, so a consecutive pair needs no link record.
 
-Only *intra-chunk* edges are stored here. The connection between the last
-vertex of a segment in chunk A and the first vertex of the continuation in
-chunk B is stored in `cross_chunk_links/`.
+The all-zero-offsets (intra-chunk) array would therefore never hold a
+row, and `write_polylines` does not create a links array up front.
+`write_links` creates exactly the non-zero-offset arrays the bridges
+land in. **Every link record in a `polyline` store has non-zero
+offsets.**
+
+### Bridges in `links/0/<offsets>/`
+
+A bridge is written when a polyline's traversal leaves one chunk and
+enters another. Each record is two `(chunk, vertex_index)` endpoints:
+the last vertex of the segment in chunk A and the first vertex of the
+continuation in chunk B. `vi_k` is local to chunk `src + o_k`, so the
+second endpoint's index is local to the chunk the offsets name — not to
+the source.
+
+The family is written with the default policy — undirected,
+`store="canonical"` — so each bridge is stored once, under the
+lexicographically positive offset, with `perm_idx` recovering the
+original traversal direction.
+
+A polyline crossing chunks *n* times yields *n* bridges; its vertices
+are distributed across *n + 1* fragments, which `object_index/` lists in
+traversal order.
 
 ### Write API
 
@@ -172,12 +190,21 @@ as a separate string lookup table in `groupings_attributes/name/`).
 
 ### Validation
 
-L1: `vertices/`, `vertex_fragments/`, `links/<delta>/`, `link_fragments/`
-(at `<delta>=0`), and `object_index/` exist.
+L1: `vertices/` exists at every level. `object_index/` and `links/` are
+recorded when present but are **not** required at L1.
 
 L3:
-- Every object ID in `object_index/` is in `[0, n_objects)`.
-- For each object, all referenced fragments exist and contain at least one vertex.
-- `cross_chunk_links/` entries reference valid global vertex IDs.
-- No polyline has a gap (a vertex with no outgoing edge unless it is the
-  last vertex of the polyline).
+- Every manifest entry names a chunk present at the level and a
+  `fragment_index` below that chunk's fragment count.
+- Every `links/0/` offsets segment parses, and — the family being
+  undirected, canonical, and intra-level — each offset is
+  lexicographically non-negative and offsets are non-decreasing.
+- Every record's endpoints name chunks present at the level.
+
+L4: `links_convention` MUST be `implicit_sequential` for `polyline`.
+
+Gap detection (a vertex with no outgoing edge that is not a polyline's
+last vertex) is **not** implemented at any level. Neither is a check
+that bridges reference valid vertex indices *within* the endpoint
+chunk — only the chunk's existence is checked. See
+[Validation overview](../validation/overview.md).

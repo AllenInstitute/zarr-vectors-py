@@ -37,10 +37,13 @@ byte blob; empty chunks simply have no chunk file (the vlen fill value is
 `b""`). This replaces the earlier "Option G" layout, where each spatial
 chunk was its own single-chunk `uint8` sub-array under a per-array group.
 
-`cross_chunk_links/<delta>/` is the sole exception: its cells are keyed by
-canonical-sorted endpoint-chunk tuples rather than a spatial grid, so each
-cell is its own small array under a group (see
-[cross-chunk links](../object_model/cross_chunk_links.md)).
+Since 0.9.0 this pattern has **no exceptions**. `cross_chunk_links/<delta>/`
+used to be one — its cells were keyed by canonical-sorted endpoint-chunk
+tuples rather than a spatial grid, so each cell was its own small array
+under a group. That family is gone: connectivity is a single family whose
+arrays are ordinary chunk arrays, one cell per **source** chunk, with the
+relationship between endpoints factored into the path instead
+(see [Links](../object_model/links.md)).
 
 This page documents the dtype, shape, chunk grid, and codec for every array
 defined by the ZVF spec, for each geometry type.
@@ -64,16 +67,11 @@ chunk.
 | Sharding | optional `shard_shape=` wraps cells in `sharding_indexed` |
 | Attributes | `chunk_grid_origin`, `nonempty_chunks`, `zv_array="vertices"`, `dtype`, `encoding` |
 
-Each cell's blob is the ZVF-encoded positions for that chunk. Within a
-chunk the vertices are stored in **fragment order** (all vertices of bin
-(0,0,0), then (0,0,1), … in C-order); the `vertex_fragments/` array encodes
-one fragment per non-empty bin describing its row range (see
-[Fragment-index arrays](fragment_index_arrays.md)).
-
-Within each spatial chunk the vertices are stored in **fragment order**: all
-vertices of bin (0,0,0) first, then bin (0,0,1), etc., in C-order bin
-index. The `vertex_fragments/` array encodes one fragment per non-empty
-bin describing its row range within this ordering (see
+Each cell's blob is the ZVF-encoded positions for that chunk. Within each
+spatial chunk the vertices are stored in **fragment order**: all vertices
+of bin (0,0,0) first, then bin (0,0,1), etc., in C-order bin index. The
+`vertex_fragments/` array encodes one fragment per non-empty bin describing
+its row range within this ordering (see
 [Fragment-index arrays](fragment_index_arrays.md)).
 
 **Example:** a 3-D store with a chunk grid of shape `(5, 6, 4)`, one cell
@@ -92,14 +90,66 @@ per spatial chunk (chunk file at `vertices/c/i/j/k`):
   "fill_value": "",
   "attributes": {
     "zv_array": "vertices",
+    "dtype": "float32",
+    "encoding": "raw",
     "chunk_grid_origin": [0, 0, 0],
     "nonempty_chunks": ["0.0.0", "0.0.1"]
   }
 }
 ```
 
-The `vertex_fragments/`, `links/<delta>/`, and attribute arrays use the same
-single-vlen-array shape; only the encoded blob differs.
+Note that `data_type` above is `variable_length_bytes` — that describes the
+*container*, not the payload. The element type of the vertex positions is
+the `dtype` **attribute** (`"float32"` here). See
+[Decoding a cell blob](#decoding-a-cell-blob).
+
+### Decoding a cell blob
+
+A `vertices/` cell is a flat, C-order buffer of `N × D` elements with no
+inline header, so a reader needs three pieces of metadata to recover the
+`(N, D)` position array. Only one of them lives on the array itself:
+
+| Input | Source |
+|-------|--------|
+| Element dtype | `vertices/` array attribute `dtype` (e.g. `"float32"`) |
+| `D` (columns) | root metadata `zarr_vectors.spatial_dims` — **not** stored on the array; see [Dimensionality](../foundations/dimensionality.md) |
+| `N` (rows) | derived: `len(blob) // (dtype.itemsize * D)` |
+| Blob framing | `vertices/` array attribute `encoding`: `"raw"` (flat buffer, as above) or `"draco"` (compressed mesh payload; `dtype`/`D` describe the *decoded* result) |
+
+For `encoding == "raw"` the decode is therefore:
+
+```python
+positions = np.frombuffer(blob, dtype=attrs["dtype"]).reshape(-1, spatial_dims)
+```
+
+Readers **must** honour the stored `dtype` rather than assuming `float32`:
+a `float64` store decoded as `float32` yields garbage coordinates at twice
+the row count, silently and without error.
+
+Writers must keep the blob consistent with the declared `dtype`: the bytes
+written are the positions cast to `dtype`, so a well-formed cell's length is
+always an exact multiple of `dtype.itemsize * D`. Nothing in the format
+records `N` independently, so this invariant is what makes the row count
+recoverable — a blob that violates it decodes to the wrong shape rather
+than raising.
+
+The `vertex_fragments/`, `links/<delta>/<offsets>/`, and attribute arrays use
+the same single-vlen-array shape; only the encoded blob and its `dtype` /
+`encoding` attributes differ.
+
+A link array's **physical row width** is not simply `link_width`. It is
+`link_width + 1` when the array declares `has_perm` — the extra leading
+column is `perm_idx`. So a link cell decodes as:
+
+```python
+W = attrs["link_width"] + (1 if attrs["has_perm"] else 0)
+rows = np.frombuffer(blob, dtype=attrs["dtype"]).reshape(-1, W)
+```
+
+Readers **must** honour the stored `has_perm` rather than assuming `L`
+columns: decoding a `1 + L` array at width `L` mis-parses every row in the
+cell — silently, since the blob length is still a valid multiple. See
+[`links/<delta>/<offsets>/`](#linksdeltaoffsets) below.
 
 ### `vertex_fragments/`
 
@@ -109,10 +159,15 @@ the full byte layout, the decoder algorithm, and worked examples.
 
 | Property | Value |
 |----------|-------|
-| Dtype | `uint8` |
-| Layout | One opaque blob per chunk; addressed by chunk coordinate |
-| Codec | none (bytes written directly; see [Codec pipeline](../foundations/codec_pipeline.md)) |
-| `zv_array` metadata | `"vertex_fragments"`, `encoding == "fragment_index_v1"` |
+| Dtype | `variable_length_bytes` (vlen-bytes serializer) |
+| Shape | `chunk_grid_shape` — same grid as `vertices/`, one cell per spatial chunk |
+| Fill value | `b""` (empty chunk ⇒ no chunk file) |
+| Codec | `vlen-bytes` (blob written as-is; see [Codec pipeline](../foundations/codec_pipeline.md)) |
+| Attributes | `chunk_grid_origin`, `nonempty_chunks`, `zv_array="vertex_fragments"`, `encoding="fragment_index_v1"` |
+
+Unlike `vertices/`, this array declares no `dtype` attribute: the blob is
+not a typed buffer but a self-describing structure whose element widths are
+fixed by the `fragment_index_v1` encoding and its `'ZVFG'` header.
 
 Each blob is a v1 fragment-index header (magic `'ZVFG'`) followed by a
 range bitmap, range table, and explicit CSR. At level 0 with the default
@@ -122,53 +177,111 @@ shared between objects' manifests.
 
 ### `link_fragments/`
 
-Parallel structure for `links/0/<chunk>` rows. Same byte layout as
-`vertex_fragments/`; present only where the geometry type has connectivity
-and only at `<delta>=0`. Cross-level link arrays (`<delta> != 0`) keep
-their inline self-describing header.
+Parallel structure for the rows of `links/0/<all-zero offsets>/` — the
+intra-chunk array at delta 0, and **only** that array. Same byte layout as
+`vertex_fragments/`; present only where the geometry type has connectivity.
+
+Every other link array — any non-zero offset, and every `<delta> != 0` —
+uses an inline self-describing blob and has no sidecar. The sidecar is
+keyed by chunk **alone**, carrying neither a delta nor an offsets segment,
+which is exactly why only one array per chunk may write it; see
+[Fragment-index arrays](fragment_index_arrays.md).
 
 ### `links/<delta>/`
 
-Present for: polyline, streamline, graph, skeleton.
+A **group**, not an array. Present for: polyline, streamline, graph,
+skeleton (`link_width=2`); mesh (`link_width=3`); skeleton parent refs
+(`link_width=1`).
 
-Stores pairs of vertex indices representing graph edges or polyline segment
-connections, within a single chunk.
+Its children are one chunk array per distinct relative-offset segment. The
+group's own metadata carries the family-wide policy that every child
+decodes against:
+
+| Attribute | Value |
+|-----------|-------|
+| `zv_array` | `"links_family"` |
+| `level_delta` | signed int; `0` for intra-level |
+| `link_width` | `L` — 2 for edges, 3 for triangles, 1 for parent refs |
+| `sid_ndim` | spatial index dims — the arity of each offset |
+| `directed` | `false` (default) / `true` — endpoint order is data |
+| `store` | `"canonical"` (default) / `"duplicate"` |
+| `num_links` | family-wide **logical** record count (after `finalize_links`) |
+| `num_physical_records` | on-disk rows; `> num_links` under `"duplicate"` |
+
+### `links/<delta>/<offsets>/`
+
+The chunk array itself. One cell per **source** chunk — the chunk of the
+endpoint the record is filed under. The `<offsets>` segment names where the
+record's other `L - 1` endpoints sit relative to that source, so
+`links/0/0.0.0/` holds intra-chunk records and `links/0/0.0.+1/` holds
+records whose second endpoint is one chunk along `+z`.
 
 | Property | Value |
 |----------|-------|
-| Dtype | `int32` |
-| Logical shape | `(*chunk_grid_shape, E_max, 2)` |
-| Zarr chunk shape | `(1, 1, …, 1, E_max, 2)` |
-| Fill value | `-1` |
-| Codec | `bytes → blosc(zstd, byteshuffle)` |
+| Dtype | `variable_length_bytes` (vlen-bytes serializer) |
+| Shape | `chunk_grid_shape` (one cell per spatial chunk) |
+| Fill value | `b""` (empty chunk ⇒ no chunk file) |
+| Codec | `vlen-bytes` (+ optional `zstd` / `blosc` compressor; none by default) |
+| Attributes | `chunk_grid_origin`, `nonempty_chunks`, `zv_array="links"`, `dtype` (default `int64`), `offsets`, `has_perm`, `link_width`, `level_delta` |
 
-Vertex indices in `edges/` are **local to the chunk**: index `k` refers to
-the `k`-th vertex in the `vertices/` chunk slice. Inter-chunk connections are
-stored separately in `cross_chunk_links/`.
+**Record width.** Rows are `L` ints — or `1 + L`, `[perm_idx, vi_0 …
+vi_{L-1}]`, when `has_perm` is true. `perm_idx` is a Lehmer code that
+exists only to undo a canonical sort, so it is stored exactly where a
+non-identity placement is possible: **non-intra AND `delta == 0` AND
+(`store == "duplicate"` OR not `directed`)**. Decode at the physical width
+given by `has_perm` (see [Decoding a cell blob](#decoding-a-cell-blob));
+never infer it.
+
+**Cell encoding** turns on one condition — `delta == 0` and offsets all
+zero:
+
+| Condition | Encoding | Sidecar |
+|-----------|----------|---------|
+| `delta == 0` **and** offsets all-zero | flat concatenated rows | `link_fragments/<chunk>` |
+| otherwise | inline self-describing ragged blob | none |
+
+**Vertex indices are local to their own endpoint's chunk**: `vi_k` indexes
+the `vertices/` slice of chunk `src + o_k`, with `o_0 = 0` — so `vi_0` is
+local to the cell itself. This is what lets an inter-chunk record store
+plain local indices rather than global vertex IDs.
 
 For polylines and streamlines, edges are stored in traversal order: edge `i`
-connects vertex `i` to vertex `i+1` along the polyline. For graphs and
-skeletons, edge order is not semantically significant.
+connects vertex `i` to vertex `i+1` along the polyline — which is why the
+intra array never sorts its endpoints. For graphs and skeletons, edge order
+is not semantically significant.
 
-### `links/<delta>/`
+For meshes (`link_width=3`) each row is one triangle's three vertex
+indices. Vertex winding order is consistent within a store (default:
+counter-clockwise when viewed from outside the surface, i.e. outward-facing
+normals). The winding order convention is stored in root `.zattrs` under
+`"winding_order"`: `"ccw"` (default) or `"cw"`. Where a face is
+canonical-sorted, `perm_idx` is what recovers its winding.
 
-Present for: mesh only.
+See [Links](../object_model/links.md) for the offsets grammar, the
+placement rules, and the enumeration order.
 
-Stores triangular face definitions as triplets of vertex indices, local to
-the chunk.
+### `link_attributes/<name>/<delta>/<offsets>/`
+
+Per-record attribute data, mirroring `links/<delta>/<offsets>/`
+cell-for-cell: same delta, same offsets segments, same cells, one row per
+link record in the same order.
 
 | Property | Value |
 |----------|-------|
-| Dtype | `int32` |
-| Logical shape | `(*chunk_grid_shape, F_max, 3)` |
-| Zarr chunk shape | `(1, 1, …, 1, F_max, 3)` |
-| Fill value | `-1` |
-| Codec | `bytes → blosc(zstd, byteshuffle)` or `draco` |
+| Dtype | `variable_length_bytes` (vlen-bytes serializer) |
+| Shape | `chunk_grid_shape` (one cell per spatial chunk) |
+| Fill value | `b""` (empty chunk ⇒ no chunk file) |
+| Codec | `vlen-bytes` (+ optional `zstd` / `blosc` compressor; none by default) |
+| Attributes | `chunk_grid_origin`, `nonempty_chunks`, `zv_array="link_attribute"`, `name`, `dtype`, `offsets`, `level_delta` |
 
-Vertex winding order is consistent within a store (default: counter-clockwise
-when viewed from outside the surface, i.e. outward-facing normals). The
-winding order convention is stored in root `.zattrs` under `"winding_order"`:
-`"ccw"` (default) or `"cw"`.
+The parent `link_attributes/<name>/<delta>/` is a **group**
+(`zv_array="link_attribute_family"`, plus `name` and `level_delta`).
+
+Attribute rows carry no `perm_idx` — they are per-record values, not
+endpoints, so a placement permutation does not reorder them. Their
+alignment to link records rests entirely on the shared enumeration order
+that `read_links` and `read_link_attributes` both use; see
+[Enumeration order](../object_model/links.md#enumeration-order).
 
 ### `attributes/<name>/`
 
@@ -177,11 +290,21 @@ valid Python identifier (alphanumeric and underscores only).
 
 | Property | Value |
 |----------|-------|
-| Dtype | Any numeric dtype declared in `zarr.json` |
-| Logical shape | `(*chunk_grid_shape, N_max)` for scalar attributes; `(*chunk_grid_shape, N_max, K)` for vector attributes of width K |
-| Zarr chunk shape | `(1, 1, …, 1, N_max)` or `(1, 1, …, 1, N_max, K)` |
-| Fill value | `0` or `NaN` (declared per array) |
-| Codec | Varies; default is `bytes → blosc(zstd, bitshuffle)` |
+| Dtype | `variable_length_bytes` (vlen-bytes serializer) |
+| Shape | `chunk_grid_shape` (one cell per spatial chunk) |
+| Fill value | `b""` (empty chunk ⇒ no chunk file) |
+| Codec | `vlen-bytes` (+ optional `zstd` / `blosc` compressor; none by default) |
+| Attributes | `chunk_grid_origin`, `nonempty_chunks`, `zv_array="attribute"`, `name`, `dtype`, optional `channel_names` |
+
+As with `vertices/`, the Zarr `data_type` is the container type; the
+attribute's element type is the `dtype` **attribute**, and the column count
+`K` is `len(channel_names)` (scalar — one column — when `channel_names` is
+absent). A cell decodes as
+`np.frombuffer(blob, dtype=attrs["dtype"]).reshape(-1, K)`, with the row
+count derived from the blob length (see
+[Decoding a cell blob](#decoding-a-cell-blob)). Honouring the stored `dtype`
+matters more here than anywhere else in the format, since attributes are
+routinely non-`float32` (integer labels, `float64` measurements).
 
 The vertex ordering within an attribute chunk must match the vertex ordering
 in the corresponding `vertices/` chunk exactly. That is, attribute value `k`
@@ -253,23 +376,15 @@ Maps group IDs to lists of object IDs.
 | Zarr chunk shape | `(1, max_group_size)` |
 | Fill value | `-1` (padding for groups smaller than `max_group_size`) |
 
-### `cross_chunk_links/`
+### `cross_chunk_links/` — removed in 0.9.0
 
-Present for: polyline, streamline.
+This array no longer exists, and neither does
+`cross_chunk_link_attributes/`. A link that crosses a chunk boundary is not
+a separate kind of object: it is a record in
+[`links/<delta>/<offsets>/`](#linksdeltaoffsets) whose offsets are non-zero.
 
-Stores pairs of global vertex IDs representing connections that cross a
-chunk boundary.
-
-| Property | Value |
-|----------|-------|
-| Dtype | `int64` |
-| Logical shape | `(n_links, 2)` |
-| Zarr chunk shape | `(65536, 2)` |
-| Fill value | `-1` |
-
-Each row is a `(src_global_vertex_id, dst_global_vertex_id)` pair where
-`src` is the last vertex of a polyline segment in chunk A and `dst` is the
-first vertex of the continuation segment in chunk B.
-
-See [Cross-chunk links](../object_model/cross_chunk_links.md) for the
-encoding of global vertex IDs and the reconstruction algorithm.
+The replacement stores **no global vertex IDs at all**. Each endpoint's
+chunk is recovered from the cell coordinate plus the offsets segment, and
+its vertex index is local to that chunk — so there is nothing to reconstruct
+and no global-ID encoding to decode. See
+[Links](../object_model/links.md).
