@@ -48,6 +48,7 @@ from zarr_vectors.core.paths import (
     parse_delta,
     parse_offsets,
 )
+from zarr_vectors.core._vlen import region_to_bytes as _vlen_region_to_bytes
 from zarr_vectors.core.store import FsGroup
 from zarr_vectors.encoding.fragments import (
     ChunkFragmentIndex,
@@ -3615,11 +3616,9 @@ def read_object_manifest(
 
     _require_object_index_v1(meta)
     manifests_arr = level_group.zarr_group[OBJECT_INDEX]["manifests"]
-    # Slice (then index) instead of scalar indexing: zarr 3.x vlen-bytes
-    # returns a 0-d object ndarray under ``arr[i]``, whose ``bytes()``
-    # is the array header — not the payload.  ``arr[i:i+1][0]`` is the
-    # actual bytes object and still fetches only the chunk holding i.
-    blob = manifests_arr[object_id:object_id + 1][0]
+    # Slice-then-extract, never scalar-index: see zarr_vectors.core._vlen.
+    # This 1-D manifests array shares that rule with the N-D cell readers.
+    blob = _vlen_region_to_bytes(manifests_arr[object_id:object_id + 1])
     blocks = decode_object_manifest_blocks(blob, sid_ndim=sid_ndim)
     return _expand_blocks(blocks)
 

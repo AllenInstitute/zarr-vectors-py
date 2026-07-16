@@ -35,6 +35,13 @@ import numpy as np
 import zarr
 from zarr.core.sync import sync
 
+# Leaf module (no other zarr_vectors imports), so importing it here does
+# not reintroduce the import cycle this module otherwise avoids.
+from zarr_vectors.core._vlen import (
+    cell_region as _vlen_cell_region,
+    region_to_bytes as _vlen_region_to_bytes,
+)
+
 
 def _is_icechunk_store(store: Any) -> bool:
     """Return True when ``store`` is an icechunk-backed Store.
@@ -92,12 +99,8 @@ async def _async_get_sharded_cell(
     coords = _apply_origin(coords, async_array.metadata.attributes)
     if any(c < 0 or c >= s for c, s in zip(coords, async_array.shape)):
         return None
-    region = tuple(slice(c, c + 1) for c in coords)
-    arr = np.asarray(await async_array.getitem(region))
-    if arr.size == 0:
-        return b""
-    val = arr.flat[0]
-    return b"" if val is None else bytes(val)
+    region = _vlen_cell_region(coords)
+    return _vlen_region_to_bytes(await async_array.getitem(region))
 
 
 async def _gather_plan(
@@ -199,13 +202,8 @@ def _sync_fallback(
             coords = _apply_origin(coords, attrs)
             if any(c < 0 or c >= s for c, s in zip(coords, shape)):
                 continue
-            region = tuple(slice(c, c + 1) for c in coords)
-            cell = np.asarray(node[region])
-            if cell.size == 0:
-                cache[(array_name, chunk_key)] = b""
-                continue
-            val = cell.flat[0]
-            cache[(array_name, chunk_key)] = (
-                b"" if val is None else bytes(val)
+            region = _vlen_cell_region(coords)
+            cache[(array_name, chunk_key)] = _vlen_region_to_bytes(
+                node[region]
             )
     return cache

@@ -43,6 +43,10 @@ from zarr.codecs import VLenBytesCodec
 from zarr.errors import UnstableSpecificationWarning
 from zarr.storage import LocalStore
 
+from zarr_vectors.core._vlen import (
+    cell_region as _vlen_cell_region,
+    region_to_bytes as _vlen_region_to_bytes,
+)
 from zarr_vectors.exceptions import StoreError
 
 
@@ -1139,17 +1143,12 @@ def _vlen_get_cell(
 ) -> bytes:
     """Read one vlen-bytes cell as ``bytes``.
 
-    Zarr 3.x vlen-bytes scalar indexing returns a 0-d object array; we
-    slice-then-extract so the result is always a ``bytes`` instance.
+    Slice-then-extract via the shared :mod:`zarr_vectors.core._vlen`
+    helpers, so this, the batched async/sync readers, and the manifest
+    reader all decode a vlen cell the same way.
     """
-    slices = tuple(slice(c, c + 1) for c in coords)
-    region = np.asarray(arr[slices])
-    if region.size == 0:
-        return b""
-    val = region.flat[0]
-    if val is None:
-        return b""
-    return bytes(val)
+    slices = _vlen_cell_region(coords)
+    return _vlen_region_to_bytes(arr[slices])
 
 
 def _vlen_set_cell(
