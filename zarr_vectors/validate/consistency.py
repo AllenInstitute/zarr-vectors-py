@@ -195,12 +195,13 @@ def validate_consistency(store_path: str | Path) -> ValidationResult:
         except Exception:
             pass
 
-        # Walk every cross_chunk_links/<delta>/ family.  Two passes:
+        # Walk every links/<delta>/ family.  Two passes:
         #
-        # (a) Structural pass — for each cell key, parse the dotted
-        #     canonical chunk-tuple and check the cell-key arity
-        #     (sid_ndim * link_width) and the canonical-sort
-        #     invariant (chunks non-decreasing in lex order).
+        # (a) Structural pass — for each <offsets> segment, parse the
+        #     dotted relative-offset tuples and check the canonical-sort
+        #     invariant (offsets non-negative and non-decreasing in lex
+        #     order) on the intra-level, undirected, single-copy families
+        #     where it applies.
         # (b) Endpoint-presence pass — read records in input order
         #     via read_links so endpoint 0 is the owning-level
         #     source.  For delta=0 every endpoint must exist in this

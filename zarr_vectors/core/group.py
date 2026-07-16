@@ -695,7 +695,8 @@ class Group:
                 the ``bytes`` serializer, i.e. the ``create_array``
                 ``compressors=`` form).  ``None`` leaves the codec
                 pipeline at vlen-bytes only (no compression) — matching
-                the historical default of the batched Option-G writer.
+                the historical no-compression default of the earlier
+                per-chunk-array writer.
                 Pass ``[]`` for the same effect explicitly, or a
                 ``[{"name": "zstd", ...}]``-style list to compress.
             attributes: Per-array metadata merged into the array's

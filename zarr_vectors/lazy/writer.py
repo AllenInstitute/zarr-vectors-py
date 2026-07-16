@@ -144,10 +144,10 @@ class ZVWriter:
         chunk's ``F_local`` faces appear in the same order as the
         decoded ``links/<chunk_key>``.
 
-        Note: cross-chunk faces are stored in
-        ``cross_chunk_links/<delta>/`` with ``link_width=3`` (0.6.0+);
-        per-face attributes for those records use the parallel
-        ``cross_chunk_link_attributes/<name>/<delta>/`` array.
+        Note: faces whose vertices span chunks are just ``link_width=3``
+        records at non-zero offsets in the merged ``links/<delta>/<offsets>/``
+        family; per-face attributes for those records use the parallel
+        ``link_attributes/<name>/<delta>/<offsets>/`` array.
         """
         await self._write_per_face_attribute(
             name=name, values=values, dtype=dtype,
@@ -253,12 +253,12 @@ class ZVWriter:
         # Allocate the array once, before the per-chunk fan-out below.
         #
         # This used to be a ``require_group(f"{subpath}/{name}")``, which
-        # pre-created the per-cell *group* the old Option-G layout wrote
-        # into — the parallel writes then raced to create it, hence the
-        # pre-create.  Under the single-array layout the target is one
-        # grid-shaped vlen array, so there is no per-cell group to race
-        # on; pre-creating one instead left a Group where the array
-        # belongs and every cell write failed against it.
+        # pre-created the per-array *group* the removed per-chunk-sub-array
+        # layout wrote into — the parallel writes then raced to create it,
+        # hence the pre-create.  Under the single-array layout the target is
+        # one grid-shaped vlen array, so there is no group to race on;
+        # pre-creating one instead left a Group where the array belongs and
+        # every cell write failed against it.
         #
         # It still has to happen here rather than inside the per-chunk
         # write: ``_write_one`` is fanned out concurrently by the gather,

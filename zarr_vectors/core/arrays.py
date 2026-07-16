@@ -138,13 +138,13 @@ def _short_circuit_existing(
     already exists and ``exist_ok=True``.  Raises :class:`ArrayError` when
     the array exists and ``exist_ok=False``.
 
-    Detects both layouts: the legacy Option-G group-with-chunk-arrays
-    (``array_exists``) and the 0.8.1 single-standard-Zarr-v3-array layout
+    Detects both layouts: the legacy group-with-chunk-arrays form
+    (``array_exists``) and the single-standard-Zarr-v3-array layout
     (``standalone_array_exists``).
 
     When the caller is running inside
     :meth:`Group.native_sharded_arrays` and the existing node is a
-    legacy Option-G group at a per-chunk-array path, *do not*
+    legacy group at a per-chunk-array path, *do not*
     short-circuit — the create call needs to replace the legacy group
     with a native-sharded Zarr array.  This matters when the store
     was warmed via :func:`create_store` (which writes an empty
@@ -1246,7 +1246,7 @@ def write_chunk_links(
         # Ensure the sibling array container exists.  Routes through
         # ``_ensure_array_dir`` so that native-sharded writers allocate
         # a multidim vlen-bytes array at this path instead of the
-        # legacy Option-G group.
+        # legacy per-chunk-array group.
         #
         # ``link_fragments/<chunk>`` is keyed by chunk ALONE — it carries
         # no delta and no offsets segment — and this write is an

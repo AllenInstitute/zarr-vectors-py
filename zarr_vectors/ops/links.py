@@ -85,7 +85,8 @@ def _require_ref_cell(
 ) -> tuple[object, LinkCell, npt.NDArray[np.integer]]:
     """Load the cell ``ref`` addresses and bounds-check it.
 
-    Returns ``(builder, cell_key, row_group)``.  Raises :class:`EditError`
+    Returns ``(builder, cell, row_group)`` where ``cell`` is the
+    ``(delta, offsets)`` :data:`LinkCell`.  Raises :class:`EditError`
     when the cell, the fragment or the row is absent — a stale ref must
     not silently edit the wrong row.
     """

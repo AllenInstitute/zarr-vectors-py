@@ -261,7 +261,7 @@ def write_polylines(
         return out
 
     # Per-chunk running offset into the chunk's vertices array — used
-    # to compute chunk-local vertex indices for cross_chunk_links
+    # to compute chunk-local vertex indices for the cross-chunk link
     # endpoints below.  Each new fragment's first local vertex is the
     # current offset; its last local vertex is offset + len - 1.
     chunk_vertex_offsets: dict[ChunkCoords, int] = {}
@@ -273,7 +273,8 @@ def write_polylines(
         # zarr-vectors spec, each (object, chunk) contributes ONE
         # fragment with implicit_sequential edges; intra-chunk vertices
         # are connected by implicit edges, and cross-chunk transitions
-        # go in cross_chunk_links with real chunk-local vertex indices.
+        # become cross-chunk links (non-zero-offset records in the links
+        # family) with real chunk-local vertex indices.
         # Splitting at bin boundaries would create multiple same-chunk
         # fragments per object, leaving no place for the intra-chunk
         # bin-boundary edges (implicit_sequential has no explicit links
@@ -322,7 +323,7 @@ def write_polylines(
 
         # manifest_with_indices augments each manifest entry with the
         # chunk-local vertex range of its fragment, used by the
-        # cross_chunk_links writer below to record proper endpoints.
+        # cross-chunk link writer below to record proper endpoints.
         manifest: ObjectManifest = []
         manifest_with_indices: list[
             tuple[ChunkCoords, int, int, int]

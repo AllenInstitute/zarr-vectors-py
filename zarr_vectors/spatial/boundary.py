@@ -220,10 +220,13 @@ def partition_cross_level_edges(
     use the ``tgt_*`` tables.
 
     An edge is classified as **chunk-aligned** when its source chunk
-    coordinates equal its target chunk coordinates — in that case the
-    edge is bucketed by chunk and written to ``links/<delta>/<chunk_key>``
-    at the source level.  Otherwise the edge is **cross-chunk** and
-    written to ``cross_chunk_links/<delta>/data`` at the source level.
+    coordinates equal its target chunk coordinates; those rows are
+    bucketed by source chunk and returned in ``aligned``.  Otherwise the
+    edge is **cross-chunk** and returned in ``cross``.  Callers persist
+    both through the merged ``links/<delta>/<offsets>/`` family at the
+    source level (aligned rows at the all-zero offset, cross rows at the
+    relative offset between the endpoints' chunks); this helper only
+    partitions and never writes.
 
     Args:
         edges: ``(M, 2)`` integer pairs.  Column 0 is the source-level
