@@ -125,7 +125,7 @@ def read_level_transform(
     return None, None
 
 
-def write_multiscale_metadata(root: FsGroup) -> dict[str, Any]:
+def write_multiscale_metadata(root: FsGroup) -> list[dict[str, Any]]:
     """Generate and write OME-Zarr multiscale metadata to root .zattrs.
 
     Reads all existing resolution levels and their bin shapes to

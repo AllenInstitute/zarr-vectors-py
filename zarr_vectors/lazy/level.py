@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from typing import Any
 
+from zarr_vectors.constants import VERTEX_ATTRIBUTES
 from zarr_vectors.core.arrays import list_chunk_keys
 from zarr_vectors.core.metadata import LevelMetadata, RootMetadata
 from zarr_vectors.core.store import FsGroup
@@ -172,13 +174,21 @@ class ZVLevel:
         """Return True if ``oid`` is present at this level.
 
         Cheap: probes the object's manifest and treats an empty
-        manifest (or out-of-range OID) as absent.
+        manifest (or out-of-range OID) as absent.  A store with no object
+        index at all — a plain point cloud — has no objects, so this
+        returns False rather than raising.
         """
+        from zarr_vectors.constants import OBJECT_INDEX
         from zarr_vectors.core.arrays import read_object_manifest
-        from zarr_vectors.exceptions import ArrayError
+        from zarr_vectors.exceptions import ArrayError, StoreError
+        # No object index => no objects.  read_object_manifest requires one
+        # (it reads sid_ndim off its meta), so guard rather than let it
+        # KeyError on a point-cloud store.
+        if not self._group.array_exists(OBJECT_INDEX):
+            return False
         try:
             manifest = read_object_manifest(self._group, int(oid))
-        except ArrayError:
+        except (ArrayError, StoreError, KeyError, IndexError):
             return False
         return bool(manifest)
 
@@ -383,21 +393,46 @@ class ZVLevel:
         )
 
 
-class _AttributeAccessor:
-    """Dict-like proxy for lazy attribute access."""
+class _AttributeAccessor(Mapping):
+    """Mapping proxy for lazy per-vertex attribute access.
+
+    A full :class:`~collections.abc.Mapping`, so ``list()``, ``dict()``,
+    ``for name in attrs``, ``len()`` and membership all work.  Hand-rolling
+    only ``__getitem__`` used to hang: with no ``__iter__``/``__len__``,
+    Python fell back to the legacy sequence protocol (``self[0]``,
+    ``self[1]``, …), and ``__getitem__`` never raised, so the sequence
+    never ended.
+    """
 
     def __init__(self, level: ZVLevel) -> None:
         self._level = level
 
+    def _names(self) -> list[str]:
+        """The per-vertex attribute names actually present, sorted."""
+        group = self._level._group
+        if not group.array_exists(VERTEX_ATTRIBUTES):
+            return []
+        try:
+            return list(group[VERTEX_ATTRIBUTES].children())
+        except Exception:
+            return []
+
     def __getitem__(self, name: str) -> ZVAttributeCollection:
+        if name not in self._names():
+            raise KeyError(name)
         return self._level._get_attribute(name)
 
-    def __contains__(self, name: str) -> bool:
-        try:
-            self._level._group.read_array_meta(f"attributes/{name}")
-            return True
-        except Exception:
-            return False
+    def __iter__(self):
+        return iter(self._names())
+
+    def __len__(self) -> int:
+        return len(self._names())
+
+    def __contains__(self, name: object) -> bool:
+        return name in self._names()
 
     def __repr__(self) -> str:
-        return f"AttributeAccessor(level={self._level.level_index})"
+        return (
+            f"AttributeAccessor(level={self._level.level_index}, "
+            f"names={self._names()})"
+        )
