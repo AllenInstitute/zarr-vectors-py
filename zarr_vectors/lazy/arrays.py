@@ -302,6 +302,7 @@ def _read_attribute_chunk(
     chunk_coords: ChunkCoords,
 ) -> npt.NDArray:
     """Read all attribute groups from a chunk and concatenate."""
+    from zarr_vectors.constants import VERTEX_ATTRIBUTES
     try:
         # Pull dtype + ncols from the array's metadata; writers persist
         # dtype via `create_attribute_array(..., dtype=...)`, so reading
@@ -309,7 +310,12 @@ def _read_attribute_chunk(
         ncols = 1
         dtype: np.dtype = np.dtype(np.float32)
         try:
-            meta = group.read_array_meta(f"attributes/{attr_name}")
+            # Read from vertex_attributes/, where the writer actually
+            # stamps channel_names and dtype.  Reading "attributes/" (the
+            # pre-0.9 path) silently returned {}, so ncols stayed 1 and a
+            # width-K vector attribute came back flat (N*K,) instead of
+            # (N, K) — and a non-float32 attribute decoded as float32.
+            meta = group.read_array_meta(f"{VERTEX_ATTRIBUTES}/{attr_name}") or {}
             cn = meta.get("channel_names")
             if cn:
                 ncols = len(cn)
@@ -331,7 +337,6 @@ def _read_attribute_chunk(
             pass
 
         # Fallback: read raw bytes and decode as flat array
-        from zarr_vectors.constants import VERTEX_ATTRIBUTES
         key = f"{chunk_coords[0]}" + "".join(f".{c}" for c in chunk_coords[1:])
         raw = group.read_bytes(f"{VERTEX_ATTRIBUTES}/{attr_name}", key)
         if len(raw) == 0:

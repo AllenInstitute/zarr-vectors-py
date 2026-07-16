@@ -69,6 +69,46 @@ class TestAttributeAccessorIsAMapping:
         assert len(acc) == 0
 
 
+class TestLazyAttributeShapeMatchesReadPoints:
+    """The lazy attribute path must agree with ``read_points``.
+
+    ``_read_attribute_chunk`` read ``channel_names`` and ``dtype`` from
+    ``attributes/<name>`` — the pre-0.9 path — but the writer stamps them
+    on ``vertex_attributes/<name>``. The meta read silently returned {},
+    so a width-K vector attribute came back flat ``(N*K,)`` instead of
+    ``(N, K)``, and a non-float32 attribute decoded as float32.
+    """
+
+    def test_vector_attribute_keeps_shape(self) -> None:
+        from zarr_vectors.types.points import read_points
+
+        path = os.path.join(tempfile.mkdtemp(), "vec.zv")
+        vec = np.random.default_rng(1).uniform(0, 1, (50, 3)).astype("f4")
+        write_points(
+            path,
+            np.random.default_rng(0).uniform(0, 100, (50, 3)).astype("f4"),
+            vertex_attributes={"normal": vec},
+        )
+        eager = read_points(path, attribute_names=["normal"])[
+            "vertex_attributes"]["normal"]
+        lazy = open_zv(path)[0].attributes["normal"].compute()
+        assert eager.shape == (50, 3)
+        assert lazy.shape == eager.shape
+        np.testing.assert_allclose(
+            np.sort(lazy, axis=0), np.sort(eager, axis=0),
+        )
+
+    def test_non_float32_attribute_keeps_dtype(self) -> None:
+        path = os.path.join(tempfile.mkdtemp(), "int.zv")
+        write_points(
+            path,
+            np.random.default_rng(0).uniform(0, 100, (50, 3)).astype("f4"),
+            vertex_attributes={"label": np.arange(50, dtype=np.int32)},
+        )
+        lazy = open_zv(path)[0].attributes["label"].compute()
+        assert lazy.dtype == np.int32
+
+
 class TestHasObjectOnPointCloud:
     """``has_object`` must return False on a store with no object index.
 
