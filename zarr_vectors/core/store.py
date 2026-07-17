@@ -1248,9 +1248,11 @@ def create_resolution_level(
             root, level, scale=scale, translation=translation,
         )
     elif level_metadata.bin_ratio is not None or level_metadata.bin_shape is not None:
+        base_bin: tuple[float, ...] | None = None
         try:
             root_meta = read_root_metadata(root)
             ndim = root_meta.sid_ndim
+            base_bin = root_meta.effective_bin_shape
         except Exception:
             ndim = (
                 len(level_metadata.bin_ratio) if level_metadata.bin_ratio
@@ -1258,6 +1260,24 @@ def create_resolution_level(
             )
         if level_metadata.bin_ratio is not None:
             scale = [float(r) for r in level_metadata.bin_ratio]
+        elif level_metadata.bin_shape is not None and base_bin is not None:
+            # Derive the (float) NGFF scale directly from bin_shape (this
+            # level's bin_shape ÷ the root's) rather than defaulting to
+            # 1.0 — a caller that only ever sets bin_shape (letting the
+            # ratio be implied, e.g. so cumulative-across-levels bin_shape
+            # math is the single source of truth) would otherwise get a
+            # wrong, non-cumulative scale=1.0 baked into the NGFF
+            # transform at level-creation time. NGFF scale is a plain
+            # float multiplier with no integer requirement — unlike
+            # `compute_bin_ratio` (which backs the separately-typed
+            # `bin_ratio: tuple[int, ...]` field and rejects non-integer
+            # ratios), so a fractional cumulative coarsen_factor (e.g. a
+            # 1.5 step composing into a non-integer ratio-to-root at some
+            # level) must not go through it here.
+            scale = [
+                float(bs) / float(bb)
+                for bs, bb in zip(level_metadata.bin_shape, base_bin)
+            ]
         else:
             scale = [1.0] * ndim
         translation = (
