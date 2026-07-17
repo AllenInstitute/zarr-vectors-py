@@ -21,10 +21,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from zarr_vectors.core.metadata import (
-    LevelMetadata,
-    compute_bin_ratio,
-)
+from zarr_vectors.core.metadata import LevelMetadata
 from zarr_vectors.core.store import (
     FsGroup,
     list_resolution_levels,
@@ -171,8 +168,16 @@ def write_multiscale_metadata(root: FsGroup) -> dict[str, Any]:
                 if lm.bin_ratio is not None:
                     scale = [float(r) for r in lm.bin_ratio]
                 elif lm.bin_shape is not None:
-                    ratio = compute_bin_ratio(base_bin, lm.bin_shape)
-                    scale = [float(r) for r in ratio]
+                    # Plain float ratio, not compute_bin_ratio: NGFF scale
+                    # has no integer requirement, unlike the separately-
+                    # typed `bin_ratio: tuple[int, ...]` field — a
+                    # fractional cumulative coarsen_factor must not raise
+                    # here. See the identical fallback in
+                    # store.create_resolution_level.
+                    scale = [
+                        float(bs) / float(bb)
+                        for bs, bb in zip(lm.bin_shape, base_bin)
+                    ]
                 else:
                     scale = [1.0] * ndim
 
