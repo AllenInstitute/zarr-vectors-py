@@ -33,7 +33,7 @@ from __future__ import annotations
 
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Any, Iterator, Sequence
+from typing import Any, Iterable, Iterator, Sequence
 
 import numpy as np
 import zarr
@@ -225,6 +225,71 @@ class Group:
             **extra_kwargs,
         )
         a[:] = np.frombuffer(data, dtype="uint8")
+
+    def write_bytes_batch(self, array_name: str, items: dict[str, bytes]) -> None:
+        """Write many chunks of one array in as few shard-level passes as
+        possible.
+
+        ``write_bytes``'s native-sharded path does a full shard
+        read-modify-write for EVERY individual chunk — zarr's sharding
+        codec has no bulk-write API at that granularity. Writing many
+        chunks that land in the same shard via repeated ``write_bytes``
+        calls therefore re-reads and re-encodes that shard once per
+        chunk: an O(chunks_in_shard) redundant-work multiplier that
+        becomes a real memory/time cost once a shard holds dozens of
+        chunks (observed as dask worker OOM/restarts during a real
+        multi-worker ingest once the "missing blocks" fix — batching
+        writes by shard for correctness — concentrated many chunks'
+        writes into one task).
+
+        This performs the SAME writes as calling ``write_bytes`` once per
+        item, but as one vectorized ``set_coordinate_selection`` per
+        array — zarr's codec then performs exactly one read-modify-write
+        PER SHARD touched, not per chunk, regardless of how many chunks
+        in ``items`` land in it.
+
+        For a non-native-sharded (legacy Option-G) array, falls back to
+        one ``write_bytes`` call per item — that layout is one file per
+        chunk, so there is no shard-collision cost to batch away.
+
+        Args:
+            array_name: Logical path of the array.
+            items: Mapping of dotted chunk-key strings to their encoded
+                bytes. An empty ``bytes`` value clears that cell (mirrors
+                ``write_bytes``).
+        """
+        if not items:
+            return
+        sharded_arr = self._sharded_chunk_array(array_name)
+        if sharded_arr is None:
+            for chunk_key, data in items.items():
+                self.write_bytes(array_name, chunk_key, data)
+            return
+
+        coords_list: list[tuple[int, ...]] = []
+        data_list: list[bytes] = []
+        for chunk_key, data in items.items():
+            coords = _parse_chunk_coords(chunk_key)
+            if coords is None:
+                raise StoreError(
+                    f"Cannot write to native-sharded array {array_name!r}: "
+                    f"chunk_key {chunk_key!r} is not a coord tuple"
+                )
+            _check_coords_in_bounds(coords, sharded_arr.shape, array_name)
+            coords_list.append(coords)
+            data_list.append(bytes(data))
+        _vlen_set_cells_batch(sharded_arr, coords_list, data_list)
+
+        # Repair the nonempty_chunks manifest with ONE read-modify-write
+        # covering the whole batch, instead of one per chunk.
+        current = sharded_arr.attrs.get(_NONEMPTY_CHUNKS_ATTR)
+        keys = set(current) if current else set()
+        for chunk_key, data in items.items():
+            if data:
+                keys.add(chunk_key)
+            else:
+                keys.discard(chunk_key)
+        sharded_arr.attrs[_NONEMPTY_CHUNKS_ATTR] = sorted(keys)
 
     @contextmanager
     def batched_reads(
@@ -456,6 +521,33 @@ class Group:
         if not isinstance(node, zarr.Group):
             return []
         return sorted(node.array_keys())
+
+    def set_nonempty_chunks(
+        self, array_name: str, chunk_coords: Iterable[tuple[int, ...]],
+    ) -> None:
+        """Overwrite a native-sharded array's ``nonempty_chunks`` manifest
+        with an exact, caller-supplied set of occupied chunk coordinates.
+
+        ``write_bytes``'s per-chunk manifest update
+        (:func:`_record_nonempty_chunk`) is a read-modify-write of the
+        whole array's ``zarr.json`` attributes block — safe from a single
+        writer, but racy across concurrent processes: two workers updating
+        the manifest at the same time can each silently drop the other's
+        addition, even though the underlying chunk *data* they wrote is
+        unaffected (each chunk's cell write is independent). Call this
+        once, from a single process, after any concurrently-dispatched
+        write phase completes, with the caller's own already-known-correct
+        set of occupied chunks (e.g. what a coordinator already enumerated
+        before dispatching writers), to repair the manifest.
+        """
+        arr = self._sharded_chunk_array(array_name)
+        if arr is None:
+            raise StoreError(
+                f"{array_name!r} is not a native-sharded array"
+            )
+        arr.attrs[_NONEMPTY_CHUNKS_ATTR] = sorted(
+            _format_chunk_key(tuple(int(c) for c in cc)) for cc in chunk_coords
+        )
 
     # ---------------- array metadata ----------------
 
@@ -996,6 +1088,29 @@ def _vlen_set_cell(
     obj.flat[0] = bytes(data)
     slices = tuple(slice(c, c + 1) for c in coords)
     arr[slices] = obj
+
+
+def _vlen_set_cells_batch(
+    arr: zarr.Array,
+    coords_list: list[tuple[int, ...]],
+    data_list: list[bytes],
+) -> None:
+    """Write many cells of a native-sharded vlen-bytes array in ONE
+    vectorized ``set_coordinate_selection`` call.
+
+    Zarr's sharding codec performs exactly one read-modify-write pass PER
+    SHARD touched by the selection, regardless of how many points land in
+    it — critical when many chunks map to the same shard (see
+    :meth:`Group.write_bytes_batch`).
+    """
+    ndim = len(coords_list[0])
+    coord_arrays = tuple(
+        np.array([c[d] for c in coords_list], dtype=np.int64) for d in range(ndim)
+    )
+    vals = np.empty(len(data_list), dtype=object)
+    for i, data in enumerate(data_list):
+        vals[i] = bytes(data)
+    arr.set_coordinate_selection(coord_arrays, vals)
 
 
 def _record_nonempty_chunk(

@@ -87,6 +87,15 @@ OBJECT_INDEX_LAYOUT_V1 = "vlen_manifests_v1"
 OBJECT_INDEX_MANIFEST_BUCKET = 16_384
 
 
+# Shard width (in cells) for the opt-in ``layout="packed_sharded"``
+# cross-chunk-links physical layout.  A packed family stores all of its
+# populated cells in ONE native-sharded 1-D vlen-bytes array of shape
+# ``(N,)``; the ``sharding_indexed`` codec packs this many cells into a
+# single shard file, collapsing thousands of tiny per-cell objects into
+# ``ceil(N / _CROSS_CHUNK_LINK_SHARD_WIDTH)`` shard files.
+_CROSS_CHUNK_LINK_SHARD_WIDTH = 512
+
+
 # ===================================================================
 # Helpers
 # ===================================================================
@@ -647,6 +656,7 @@ def create_cross_chunk_links_array(
     sid_ndim: int | None = None,
     directed: bool = False,
     store: str = "canonical",
+    layout: str = "flat_cells",
     exist_ok: bool = True,
 ) -> None:
     """Create a ``cross_chunk_links/<delta>/`` array.
@@ -671,12 +681,22 @@ def create_cross_chunk_links_array(
             :func:`write_cross_chunk_links`.
         store: ``"canonical"`` or ``"duplicate"``; see
             :func:`write_cross_chunk_links`.
+        layout: Physical storage layout.  ``"flat_cells"`` (default,
+            the historical behavior) stores each populated cell as its
+            own object under a per-family group.  ``"packed_sharded"``
+            packs every cell into one native-sharded 1-D vlen-bytes
+            array; see :func:`write_cross_chunk_links`.  The whole-level
+            :func:`write_cross_chunk_links` re-stamps this on write.
         exist_ok: When True (default), no-op if the array already exists.
             When False, raise :class:`ArrayError` on conflict.
     """
     if store not in ("canonical", "duplicate"):
         raise ArrayError(
             f"store must be 'canonical' or 'duplicate', got {store!r}"
+        )
+    if layout not in ("flat_cells", "packed_sharded"):
+        raise ArrayError(
+            f"layout must be 'flat_cells' or 'packed_sharded', got {layout!r}"
         )
     full_name = cross_chunk_links_path(delta)
     if _short_circuit_existing(level_group, full_name, exist_ok):
@@ -688,6 +708,7 @@ def create_cross_chunk_links_array(
         "link_width": int(link_width),
         "directed": bool(directed),
         "store": str(store),
+        "layout": str(layout),
     }
     if sid_ndim is not None:
         meta["sid_ndim"] = int(sid_ndim)
@@ -796,6 +817,49 @@ def write_chunk_vertices(
         VERTEX_FRAGMENTS, key, encode_fragments(fragments),
     )
     return vertex_byte_offsets
+
+
+def write_chunk_vertices_batch(
+    level_group: FsGroup,
+    coords_to_groups: dict[ChunkCoords, list[npt.NDArray[np.floating]]],
+    dtype: np.dtype | str = np.float32,
+) -> None:
+    """Batched form of :func:`write_chunk_vertices` for many chunks at once.
+
+    Encodes every chunk's ``vertices``/``vertex_fragments`` payload the
+    same way :func:`write_chunk_vertices` does, then writes each array
+    with ONE :meth:`Group.write_bytes_batch` call instead of one
+    :meth:`Group.write_bytes` call per chunk — see that method's
+    docstring for why that matters when many chunks share a shard.
+
+    Args:
+        level_group: Resolution level group.
+        coords_to_groups: Mapping of chunk coordinates to that chunk's
+            list of fragment arrays (same shape convention as
+            ``groups`` in :func:`write_chunk_vertices`).
+        dtype: Numpy dtype for serialisation.
+    """
+    dtype = np.dtype(dtype)
+    vertices_items: dict[str, bytes] = {}
+    fragments_items: dict[str, bytes] = {}
+    for chunk_coords, groups in coords_to_groups.items():
+        key = _chunk_key(chunk_coords)
+        raw_bytes, _ = encode_ragged_floats(groups, dtype)
+        vertices_items[key] = raw_bytes
+
+        if len(groups) == 0:
+            fragments: list[tuple[int, int]] = []
+        else:
+            per_group_counts = [int(np.asarray(g).shape[0]) for g in groups]
+            cumulative = 0
+            fragments = []
+            for n in per_group_counts:
+                fragments.append((cumulative, n))
+                cumulative += n
+        fragments_items[key] = encode_fragments(fragments)
+
+    level_group.write_bytes_batch(VERTICES, vertices_items)
+    level_group.write_bytes_batch(VERTEX_FRAGMENTS, fragments_items)
 
 
 def write_chunk_links(
@@ -1028,6 +1092,25 @@ def write_chunk_fragment_attributes(
     full_name = f"{FRAGMENT_ATTRIBUTES}/{attr_name}"
     arr = np.ascontiguousarray(np.asarray(data).astype(dtype, copy=False))
     level_group.write_bytes(full_name, key, arr.tobytes())
+
+
+def write_chunk_fragment_attributes_batch(
+    level_group: FsGroup,
+    attr_name: str,
+    coords_to_data: dict[ChunkCoords, npt.NDArray],
+    dtype: np.dtype | str = np.float32,
+) -> None:
+    """Batched form of :func:`write_chunk_fragment_attributes` for many
+    chunks at once — see :meth:`Group.write_bytes_batch`.
+    """
+    dtype = np.dtype(dtype)
+    full_name = f"{FRAGMENT_ATTRIBUTES}/{attr_name}"
+    items: dict[str, bytes] = {}
+    for chunk_coords, data in coords_to_data.items():
+        key = _chunk_key(chunk_coords)
+        arr = np.ascontiguousarray(np.asarray(data).astype(dtype, copy=False))
+        items[key] = arr.tobytes()
+    level_group.write_bytes_batch(full_name, items)
 
 
 def write_chunk_link_attributes(
@@ -1476,6 +1559,7 @@ def write_cross_chunk_links(
     mode: Literal["replace", "append"] = "replace",
     directed: bool = False,
     store: Literal["canonical", "duplicate"] = "canonical",
+    layout: Literal["flat_cells", "packed_sharded"] = "flat_cells",
 ) -> CrossChunkLinkPartition:
     """Write cross-chunk link records under ``cross_chunk_links/<delta>/<cell_key>``.
 
@@ -1542,6 +1626,22 @@ def write_cross_chunk_links(
             :func:`read_cross_chunk_links`; the parallel attribute family
             replicates identically via the returned partition.
 
+    Other args (cont.):
+        layout: Physical storage layout, opt-in.  ``"flat_cells"``
+            (default) is the historical behavior — one storage object
+            per populated cell under a per-family group.
+            ``"packed_sharded"`` packs ALL of the family's cells into a
+            single native-sharded 1-D ``variable_length_bytes`` array of
+            shape ``(N,)`` (N = number of populated cells), with the
+            sorted list of cell-key strings stored in the array meta as
+            ``cell_keys`` (flat index ``i`` ↔ ``cell_keys[i]``).  Each
+            element's bytes are the SAME ragged-int64 blob the flat
+            layout writes for that cell.  This collapses thousands of
+            tiny per-cell files into ``ceil(N / 512)`` shard files,
+            fixing the write/read amplification at scale.  Readers
+            dispatch on the family's stored ``layout`` meta, so a packed
+            family reads back identically to a flat one.
+
     Concurrency:
         ``mode="append"`` is read-modify-write per cell — safe
         across disjoint cells, unsafe within a single cell.
@@ -1553,6 +1653,10 @@ def write_cross_chunk_links(
     if store not in ("canonical", "duplicate"):
         raise ArrayError(
             f"store must be 'canonical' or 'duplicate', got {store!r}"
+        )
+    if layout not in ("flat_cells", "packed_sharded"):
+        raise ArrayError(
+            f"layout must be 'flat_cells' or 'packed_sharded', got {layout!r}"
         )
 
     # Local import to avoid circular import at module load.
@@ -1633,6 +1737,22 @@ def write_cross_chunk_links(
     new_physical = sum(len(rows) for rows in bucket_entries.values())
 
     record_len_int64 = 1 + link_width  # [perm_idx, vi_0, ..., vi_{L-1}]
+
+    if layout == "packed_sharded":
+        return _write_cross_chunk_links_packed(
+            level_group, full_name,
+            bucket_entries=bucket_entries,
+            cell_indices=cell_indices,
+            num_new_logical=len(normalised),
+            new_physical=new_physical,
+            record_len_int64=record_len_int64,
+            sid_ndim=sid_ndim,
+            delta=delta,
+            link_width=link_width,
+            mode=mode,
+            directed=directed,
+            store=store,
+        )
 
     if mode == "replace":
         # Drop the whole family — clears stale cells, .zattrs,
@@ -1719,6 +1839,326 @@ def write_cross_chunk_links(
         num_links=new_total,
         first_new=first_new,
     )
+
+
+def _write_cross_chunk_links_packed(
+    level_group: FsGroup,
+    full_name: str,
+    *,
+    bucket_entries: dict[str, list[tuple[list[int], int]]],
+    cell_indices: dict[str, list[int]],
+    num_new_logical: int,
+    new_physical: int,
+    record_len_int64: int,
+    sid_ndim: int,
+    delta: int,
+    link_width: int,
+    mode: str,
+    directed: bool,
+    store: str,
+) -> CrossChunkLinkPartition:
+    """Write a ``cross_chunk_links/<delta>/`` family in the
+    ``packed_sharded`` layout: ALL populated cells in one native-sharded
+    1-D vlen-bytes array of shape ``(N,)``.
+
+    Element ``i`` holds the SAME ragged-int64 blob the flat layout writes
+    for ``cell_keys[i]`` (records ``[perm_idx, vi_0..vi_{L-1}]``).  The
+    sorted cell-key list lives in the array meta as ``cell_keys``.
+
+    ``append`` reads the existing packed family's per-cell raw rows,
+    merges the new rows in (existing rows first, matching the flat
+    per-cell append order), and rewrites the whole packed array — the
+    counts / ``first_new`` semantics match the flat append path.
+    """
+    from zarr_vectors.encoding.ragged import (
+        decode_ragged_blob,
+        encode_ragged_blob,
+    )
+
+    int64 = np.dtype(np.int64)
+
+    def _rows_for(entries: list[tuple[list[int], int]]) -> list[npt.NDArray]:
+        rows: list[npt.NDArray] = []
+        for vi_cell, perm_idx in entries:
+            row = np.empty(record_len_int64, dtype=np.int64)
+            row[0] = perm_idx
+            row[1:] = vi_cell
+            rows.append(row)
+        return rows
+
+    # Merge existing (append only) + new rows, keyed by cell key.
+    merged: dict[str, list[npt.NDArray]] = {}
+    existing_total = 0
+    existing_physical = 0
+    if mode == "append" and level_group.array_exists(full_name):
+        existing_meta = level_group.read_array_meta(full_name) or {}
+        existing_keys = list(existing_meta.get("cell_keys", []))
+        scanned_physical = 0
+        for i, ck in enumerate(existing_keys):
+            blob = level_group.read_bytes(full_name, str(i))
+            rows = decode_ragged_blob(blob, int64, ncols=record_len_int64)
+            merged[ck] = list(rows)
+            scanned_physical += len(rows)
+        if "num_links" in existing_meta:
+            existing_total = int(existing_meta["num_links"])
+            existing_physical = int(
+                existing_meta.get("num_physical_records", existing_total)
+            )
+        else:
+            existing_total = scanned_physical
+            existing_physical = scanned_physical
+
+    for ck, entries in bucket_entries.items():
+        merged.setdefault(ck, []).extend(_rows_for(entries))
+
+    first_new = existing_total
+    new_total = existing_total + num_new_logical
+    new_physical_total = existing_physical + new_physical
+
+    # Rewrite the whole family (replace semantics on the merged set).
+    if level_group.array_exists(full_name):
+        level_group.delete_subtree(full_name)
+
+    sorted_keys = sorted(merged)
+    n_cells = len(sorted_keys)
+    base_meta: dict[str, Any] = {
+        "zv_array": "cross_chunk_links",
+        "sid_ndim": int(sid_ndim),
+        "level_delta": int(delta),
+        "link_width": int(link_width),
+        "num_links": int(new_total),
+        "num_physical_records": int(new_physical_total),
+        "directed": bool(directed),
+        "store": str(store),
+        "layout": "packed_sharded",
+        "cell_keys": list(sorted_keys),
+    }
+
+    if n_cells == 0:
+        # Match the flat empty-family behavior: a family group carrying
+        # only meta.  (Unreachable when ``links`` is non-empty, since a
+        # non-empty input always yields at least one populated cell.)
+        _ensure_array_dir(level_group, full_name)
+        level_group.write_array_meta(full_name, base_meta)
+    else:
+        shard_width = _CROSS_CHUNK_LINK_SHARD_WIDTH
+        level_group.create_sharded_chunk_array(
+            full_name,
+            grid_shape=(n_cells,),
+            shard_shape=(shard_width,),
+            attributes=base_meta,
+            cell_compressor="auto",
+        )
+        items = {
+            str(i): encode_ragged_blob(merged[ck], int64)
+            for i, ck in enumerate(sorted_keys)
+        }
+        level_group.write_bytes_batch(full_name, items)
+
+    return CrossChunkLinkPartition(
+        cell_indices=cell_indices,
+        num_links=new_total,
+        first_new=first_new,
+    )
+
+
+def write_cross_chunk_links_bulk(
+    level_group: FsGroup,
+    records: npt.NDArray,
+    sid_ndim: int,
+    *,
+    delta: int = 0,
+) -> CrossChunkLinkPartition:
+    """Bulk numpy-native writer for ``cross_chunk_links/<delta>/``, restricted
+    to the policy a fully-distributed 50M+ ingest needs: ``link_width=2``,
+    ``directed=True``, ``store="canonical"``, ``layout="packed_sharded"``,
+    ``mode="replace"`` only.
+
+    Equivalent output to::
+
+        links = [
+            [(tuple(r[:D]), int(r[D])), (tuple(r[D+1:2*D+1]), int(r[2*D+1]))]
+            for r in records
+        ]
+        write_cross_chunk_links(level_group, links, sid_ndim=D, delta=delta,
+                                 mode="replace", directed=True, store="canonical",
+                                 layout="packed_sharded")
+
+    but does the cell-grouping and blob-encoding as a couple of dense-array
+    passes instead of one Python object per record. This is not just a
+    constant-factor speedup: building N Python tuples/dicts also grows
+    CPython's generational-GC scan cost as the live-object count grows, and
+    the ~200-400 bytes/record Python-object footprint (vs
+    ``8*(2*sid_ndim+2)`` bytes/record here, contiguous) is what pushes large
+    runs past the machine's RAM into swap — at which point cost-per-record
+    jumps by orders of magnitude. Keeping the whole operation inside dense
+    numpy arrays, with Python-level work bounded by the number of DISTINCT
+    CELLS (thousands) rather than the number of records (hundreds of
+    millions), avoids both effects.
+
+    Args:
+        level_group: Resolution level group.
+        records: ``(N, 2*sid_ndim + 2)`` int64 array, columns
+            ``[chunk_a (sid_ndim), vi_a, chunk_b (sid_ndim), vi_b]`` — the
+            exact layout callers already spill per-shard cross-link rows
+            in (endpoint A's chunk + vertex index, then endpoint B's).
+        sid_ndim: Number of spatial index dimensions.
+        delta: Level delta; see :mod:`zarr_vectors.core.paths`.
+
+    Returns:
+        :class:`CrossChunkLinkPartition` — same contract as
+        :func:`write_cross_chunk_links`.
+
+    Note:
+        Cell ordering in the stored ``cell_keys`` meta list need not match
+        the string-lexicographic order :func:`write_cross_chunk_links`
+        produces — no reader relies on that order; every reader looks a
+        cell up by dict/enumerate, not by assuming sortedness. This
+        function's cell order comes from a numeric sort on the raw chunk
+        coordinates, which is cheaper to compute and equally valid.
+    """
+    D = int(sid_ndim)
+    n_cols = 2 * D + 2
+    N = 0 if records is None else len(records)
+
+    if N == 0:
+        return CrossChunkLinkPartition(cell_indices={}, num_links=0, first_new=0)
+
+    records = np.asarray(records, dtype=np.int64)
+    if records.ndim != 2 or records.shape[1] != n_cols:
+        raise ArrayError(
+            f"write_cross_chunk_links_bulk: records shape {records.shape} "
+            f"!= (N, {n_cols}) for sid_ndim={D}"
+        )
+
+    full_name = cross_chunk_links_path(delta)
+    chunks_a = records[:, :D]
+    vi_a = records[:, D]
+    chunks_b = records[:, D + 1:2 * D + 1]
+    vi_b = records[:, 2 * D + 1]
+
+    # Group into cells by a single vectorized sort + boundary-diff on the
+    # raw (chunk_a || chunk_b) key columns — the same "lexsort then diff"
+    # trick used elsewhere in this codebase for O(N) grouping without a
+    # Python dict. np.lexsort is stable, so ties (records landing in the
+    # same cell) keep their original input order, preserving the
+    # "cell_indices preserve input ordering" contract.
+    key_cols = np.concatenate([chunks_a, chunks_b], axis=1)  # (N, 2D)
+    order = np.lexsort(key_cols.T[::-1])
+    key_sorted = key_cols[order]
+    vi_a_sorted = vi_a[order]
+    vi_b_sorted = vi_b[order]
+
+    if N > 1:
+        diffs = np.any(key_sorted[1:] != key_sorted[:-1], axis=1)
+        boundaries = np.flatnonzero(diffs) + 1
+    else:
+        boundaries = np.empty(0, dtype=np.intp)
+    starts = np.concatenate(([0], boundaries))
+    ends = np.concatenate((boundaries, [N]))
+    n_cells = len(starts)
+
+    # record_len_int64 = 1 (perm_idx, always 0 -- directed+canonical is the
+    # identity placement, see _cell_placements) + link_width (2: vi_a, vi_b).
+    record_len_int64 = 3
+    itemsize = 8
+    row_bytes = record_len_int64 * itemsize
+    all_rows = np.zeros((N, record_len_int64), dtype=np.int64)
+    all_rows[:, 1] = vi_a_sorted
+    all_rows[:, 2] = vi_b_sorted
+
+    cell_keys: list[str] = [""] * n_cells
+    cell_indices: dict[str, list[int]] = {}
+    items: dict[str, bytes] = {}
+    order_list = order.tolist()
+    for i in range(n_cells):
+        s, e = int(starts[i]), int(ends[i])
+        k_row = key_sorted[s]
+        cell_key = format_cell_key(
+            [tuple(int(x) for x in k_row[:D]), tuple(int(x) for x in k_row[D:])]
+        )
+        cell_keys[i] = cell_key
+        cell_indices[cell_key] = order_list[s:e]
+        block = all_rows[s:e]
+        k = e - s
+        header = np.empty(1 + k, dtype=np.int64)
+        header[0] = k
+        header[1:] = np.arange(k, dtype=np.int64) * row_bytes
+        items[str(i)] = header.tobytes() + block.tobytes()
+
+    base_meta: dict[str, Any] = {
+        "zv_array": "cross_chunk_links",
+        "sid_ndim": D,
+        "level_delta": int(delta),
+        "link_width": 2,
+        "num_links": N,
+        "num_physical_records": N,
+        "directed": True,
+        "store": "canonical",
+        "layout": "packed_sharded",
+        "cell_keys": cell_keys,
+    }
+
+    if level_group.array_exists(full_name):
+        level_group.delete_subtree(full_name)
+
+    level_group.create_sharded_chunk_array(
+        full_name,
+        grid_shape=(n_cells,),
+        shard_shape=(_CROSS_CHUNK_LINK_SHARD_WIDTH,),
+        attributes=base_meta,
+        cell_compressor="auto",
+    )
+    level_group.write_bytes_batch(full_name, items)
+
+    return CrossChunkLinkPartition(
+        cell_indices=cell_indices,
+        num_links=N,
+        first_new=0,
+    )
+
+
+def _decode_cross_cell_rows(
+    blob: bytes,
+    canonical_chunks: tuple[ChunkCoords, ...],
+    link_width: int,
+) -> list[tuple[tuple[ChunkCoords, int], ...]]:
+    """Decode one cross-chunk-link cell blob into input-order records.
+
+    Shared by the flat and packed read paths so both reverse the
+    canonical sort + Lehmer ``perm_idx`` encoding identically.  Records
+    come back in the cell's on-disk row order, each a tuple of
+    ``(chunk_coords, vi)`` endpoints in original input order.
+    """
+    from zarr_vectors.encoding.ragged import decode_ragged_blob
+    from zarr_vectors.spatial.boundary import apply_perm_inverse
+
+    record_len = 1 + link_width
+    rows = decode_ragged_blob(blob, np.dtype(np.int64), ncols=record_len)
+    out: list[tuple[tuple[ChunkCoords, int], ...]] = []
+    if not rows:
+        return out
+    # Decode the whole cell once into an (R, record_len) array and pull
+    # the perm column + vi columns out in two C-level conversions,
+    # instead of per-element int casts per record.
+    rows_arr = np.asarray(rows, dtype=np.int64).reshape(len(rows), record_len)
+    perm_list = rows_arr[:, 0].tolist()
+    vi_list = rows_arr[:, 1:1 + link_width].tolist()
+    if link_width == 2:
+        # The only 2-endpoint perms are identity (0) and swap (1);
+        # avoid the per-row Lehmer decode in apply_perm_inverse.
+        cc0, cc1 = canonical_chunks[0], canonical_chunks[1]
+        for perm_idx, (v0, v1) in zip(perm_list, vi_list):
+            ep0 = (cc0, v0)
+            ep1 = (cc1, v1)
+            out.append((ep0, ep1) if perm_idx == 0 else (ep1, ep0))
+    else:
+        for perm_idx, vi_canonical in zip(perm_list, vi_list):
+            canonical_endpoints = list(zip(canonical_chunks, vi_canonical))
+            out.append(tuple(apply_perm_inverse(
+                canonical_endpoints, perm_idx, link_width,
+            )))
+    return out
 
 
 def write_cross_chunk_link_attributes(
@@ -2973,43 +3413,33 @@ def read_cross_chunk_links(
         return []
     link_width = int(meta["link_width"])
     sid_ndim = int(meta["sid_ndim"])
+    layout = str(meta.get("layout", "flat_cells"))
 
-    from zarr_vectors.encoding.ragged import decode_ragged_blob
-    from zarr_vectors.spatial.boundary import apply_perm_inverse
-
-    record_len = 1 + link_width  # [perm_idx, vi_0, ..., vi_{L-1}]
     out: list[tuple[tuple[ChunkCoords, int], ...]] = []
+    if layout == "packed_sharded":
+        # All cells live in one native-sharded array indexed by the flat
+        # position of each cell key in the sorted ``cell_keys`` meta list.
+        # Iterating ``cell_keys`` in order == cell-key-sorted order, so
+        # records come back in the SAME order as the flat path.
+        cell_keys = list(meta.get("cell_keys", []))
+        for i, cell_key in enumerate(cell_keys):
+            canonical_chunks = parse_cell_key(
+                cell_key, sid_ndim=sid_ndim, link_width=link_width,
+            )
+            blob = level_group.read_bytes(full_name, str(i))
+            out.extend(_decode_cross_cell_rows(
+                blob, canonical_chunks, link_width,
+            ))
+        return out
+
     for cell_key in sorted(level_group.list_chunks(full_name)):
         canonical_chunks = parse_cell_key(
             cell_key, sid_ndim=sid_ndim, link_width=link_width,
         )
         blob = level_group.read_bytes(full_name, cell_key)
-        rows = decode_ragged_blob(
-            blob, np.dtype(np.int64), ncols=record_len,
-        )
-        if not rows:
-            continue
-        # Decode the whole cell once into an (R, record_len) array and pull
-        # the perm column + vi columns out in two C-level conversions,
-        # instead of ``np.asarray(row).reshape(-1)`` + per-element int casts
-        # per record.
-        rows_arr = np.asarray(rows, dtype=np.int64).reshape(len(rows), record_len)
-        perm_list = rows_arr[:, 0].tolist()
-        vi_list = rows_arr[:, 1:1 + link_width].tolist()
-        if link_width == 2:
-            # The only 2-endpoint perms are identity (0) and swap (1);
-            # avoid the per-row Lehmer decode in apply_perm_inverse.
-            cc0, cc1 = canonical_chunks[0], canonical_chunks[1]
-            for perm_idx, (v0, v1) in zip(perm_list, vi_list):
-                ep0 = (cc0, v0)
-                ep1 = (cc1, v1)
-                out.append((ep0, ep1) if perm_idx == 0 else (ep1, ep0))
-        else:
-            for perm_idx, vi_canonical in zip(perm_list, vi_list):
-                canonical_endpoints = list(zip(canonical_chunks, vi_canonical))
-                out.append(tuple(apply_perm_inverse(
-                    canonical_endpoints, perm_idx, link_width,
-                )))
+        out.extend(_decode_cross_cell_rows(
+            blob, canonical_chunks, link_width,
+        ))
     return out
 
 
@@ -3040,6 +3470,7 @@ def read_cross_chunk_links_for_tuple(
     link_width = int(meta["link_width"])
     sid_ndim = int(meta["sid_ndim"])
     directed = bool(meta.get("directed", False))
+    layout = str(meta.get("layout", "flat_cells"))
     if len(chunk_tuple) != link_width:
         raise ArrayError(
             f"chunk_tuple has {len(chunk_tuple)} chunks; expected "
@@ -3059,6 +3490,18 @@ def read_cross_chunk_links_for_tuple(
     else:
         query_chunks = tuple(sorted(tuple(c) for c in chunk_tuple))
     cell_key = format_cell_key(query_chunks)
+
+    if layout == "packed_sharded":
+        # Look the query cell up in the sorted ``cell_keys`` meta list;
+        # its position is the flat index into the packed array.
+        cell_keys = list(meta.get("cell_keys", []))
+        index_of = {k: i for i, k in enumerate(cell_keys)}
+        idx = index_of.get(cell_key)
+        if idx is None:
+            return []
+        blob = level_group.read_bytes(full_name, str(idx))
+        return _decode_cross_cell_rows(blob, query_chunks, link_width)
+
     if not level_group.chunk_exists(full_name, cell_key):
         return []
 
@@ -3080,6 +3523,88 @@ def read_cross_chunk_links_for_tuple(
             cell_endpoints, perm_idx, link_width,
         )
         out.append(tuple(input_order))
+    return out
+
+
+def read_cross_chunk_link_manifest(
+    level_group: FsGroup,
+    *,
+    delta: int = 0,
+) -> dict[str, Any] | None:
+    """Read ONLY the ``cross_chunk_links/<delta>/`` manifest — cell keys and
+    policy — WITHOUT decoding any link records.
+
+    This is the cheap, O(cells) half of the "hybrid" coarsening read: a
+    coordinator reads the manifest once to learn which cells exist and
+    where each lives, computes which cells are incident on a given set of
+    chunks, and hands workers just those cells' ``(flat_index, cell_key)``
+    specs (see :func:`read_cross_chunk_link_cells_by_index`) so the
+    O(links) record decode is done distributed by the workers — never
+    materialising the whole level's records in one process.
+
+    Returns ``None`` if the family is absent/uninitialised, else a dict
+    with ``cell_keys`` (list; for ``packed_sharded`` the flat array index
+    ``i`` ↔ ``cell_keys[i]``, for ``flat_cells`` just the populated cell
+    names), ``link_width``, ``sid_ndim``, ``directed``, ``store``,
+    ``layout``.
+    """
+    full_name = cross_chunk_links_path(delta)
+    if not level_group.array_exists(full_name):
+        return None
+    meta = level_group.read_array_meta(full_name) or {}
+    if "link_width" not in meta or "sid_ndim" not in meta:
+        return None
+    layout = str(meta.get("layout", "flat_cells"))
+    if layout == "packed_sharded":
+        cell_keys = list(meta.get("cell_keys", []))
+    else:
+        cell_keys = sorted(level_group.list_chunks(full_name))
+    return {
+        "cell_keys": cell_keys,
+        "link_width": int(meta["link_width"]),
+        "sid_ndim": int(meta["sid_ndim"]),
+        "directed": bool(meta.get("directed", False)),
+        "store": str(meta.get("store", "canonical")),
+        "layout": layout,
+    }
+
+
+def read_cross_chunk_link_cells_by_index(
+    level_group: FsGroup,
+    specs: list[tuple[int, str]],
+    *,
+    delta: int = 0,
+    link_width: int,
+    sid_ndim: int,
+    layout: str = "packed_sharded",
+) -> list[tuple[tuple[ChunkCoords, int], ...]]:
+    """Read + decode ONLY the specified cells, by ``(flat_index, cell_key)``.
+
+    The distributed half of the "hybrid" read: a worker is handed the
+    ``(flat_index, cell_key)`` specs for the cells incident on its target
+    chunks (computed centrally from :func:`read_cross_chunk_link_manifest`)
+    and reads just those cells' records straight from the packed store —
+    WITHOUT reading the whole manifest itself (which, done per task, would
+    be O(tasks × cells) and defeat the point). ``flat_index`` is the
+    sharded-array element index for ``packed_sharded``; ignored for
+    ``flat_cells`` (the cell_key addresses the tiny array directly).
+
+    Records come back in input-order endpoints, same shape as
+    :func:`read_cross_chunk_links`.
+    """
+    full_name = cross_chunk_links_path(delta)
+    out: list[tuple[tuple[ChunkCoords, int], ...]] = []
+    if not specs:
+        return out
+    if not level_group.array_exists(full_name):
+        return out
+    for flat_index, cell_key in specs:
+        canonical_chunks = parse_cell_key(
+            cell_key, sid_ndim=sid_ndim, link_width=link_width,
+        )
+        addr = str(flat_index) if layout == "packed_sharded" else cell_key
+        blob = level_group.read_bytes(full_name, addr)
+        out.extend(_decode_cross_cell_rows(blob, canonical_chunks, link_width))
     return out
 
 
