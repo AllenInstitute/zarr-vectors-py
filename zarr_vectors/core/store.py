@@ -294,6 +294,7 @@ def create_store(
     ndim: int | None = None,
     vertex_dtype: str = "float32",
     vertex_encoding: str = "raw",
+    compressor: Any = None,
     links_convention: str | None = None,
     object_index_convention: str | None = None,
     cross_chunk_strategy: str | None = None,
@@ -340,6 +341,15 @@ def create_store(
             ``chunk_shape``).  Defaults to 3.
         vertex_dtype: dtype for the level-0 vertices array.
         vertex_encoding: ``"raw"`` or ``"draco"``.
+        compressor: Codec pipeline for the warm-created
+            ``vertices``/``vertex_fragments`` arrays — and therefore for
+            the life of the store, since a chunk array's codecs are fixed
+            at creation and every later ``create_vertices_array`` reuses
+            the existing array.  ``None`` (default) stores raw.  See
+            :func:`zarr_vectors.encoding.compression.resolve_compressor`
+            for accepted values (``"zstd"``, ``"blosc"``, or a codec list).
+            Writers that create their own arrays (links, attributes) still
+            need the same compressor passed to their own write session.
         links_convention: How edges are encoded
             (``"explicit"`` / ``"implicit_sequential"`` /
             ``"implicit_sequential_with_branches"``).  When omitted the
@@ -450,7 +460,25 @@ def create_store(
     )
     # Defer import: arrays.py imports from store.py (FsGroup).
     from zarr_vectors.core.arrays import create_vertices_array
-    create_vertices_array(level0, dtype=vertex_dtype, encoding=vertex_encoding)
+    # The warm create fixes the vertices/vertex_fragments codec pipeline for
+    # the life of the store: every later create_vertices_array short-circuits
+    # on the existing array, so a compressor passed only to a downstream
+    # writer would silently never reach the largest arrays in the store.  Open
+    # the codec session here, or not at all.
+    # The warm create fixes the vertices/vertex_fragments codec pipeline for
+    # the life of the store: every later create_vertices_array short-circuits
+    # on the existing array, so a compressor passed only to a downstream
+    # writer would silently never reach the largest arrays in the store.  Open
+    # the codec session here, or not at all.
+    if compressor:
+        with level0.batched_writes(compressor=compressor):
+            create_vertices_array(
+                level0, dtype=vertex_dtype, encoding=vertex_encoding,
+            )
+    else:
+        create_vertices_array(
+            level0, dtype=vertex_dtype, encoding=vertex_encoding,
+        )
     return root
 
 
