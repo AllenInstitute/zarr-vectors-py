@@ -48,6 +48,7 @@ from zarr_vectors.core.arrays import (
     create_links_array,
     create_object_index_array,
     create_vertices_array,
+    open_write_session,
     read_chunk_link_fragment,
     read_fragment,
     read_object_manifest,
@@ -313,6 +314,7 @@ def init_skeleton_store(
     attribute_dtypes: dict[str, str],
     backend: str | None = None,
     coordinate_offset: Sequence[float] | None = None,
+    shard_shape: int | tuple[int, ...] | None = None,
 ):
     """Create a new skeleton store + an empty level 0 with its arrays.
 
@@ -322,11 +324,25 @@ def init_skeleton_store(
     aligns to the source grid.  It is recorded in metadata and mirrored
     to the NGFF ``translation`` transform.
 
+    ``shard_shape`` (optional) enables the native-sharded 0.8.1 per-chunk
+    array layout — the ONLY layout neuroglancer's zarr-vectors reader
+    understands (it requires a top-level ``shape`` + ``sharding_indexed``
+    codec on ``vertices/zarr.json``).  When ``None`` (default) the legacy
+    unsharded per-chunk-file layout is written (kept for existing callers
+    and tests).  Callers that pass ``shard_shape`` MUST also stream their
+    :func:`write_skeleton_chunk` calls inside their own
+    :func:`open_write_session` with the SAME ``shard_shape``/``bounds``/
+    ``chunk_shape`` so per-chunk writes land in the sharded cells.  It is
+    ignored (falls back to unsharded) when any ``bounds`` lower corner is
+    negative, since the origin-anchored chunk grid can't index negative
+    coordinates.
+
     Returns ``(root, level0_group)``.  Callers then stream
     :func:`write_skeleton_chunk` over chunks, reduce the records into an
     object index (``zarr_vectors_tools.multiresolution.object_index``), and
     finish with :func:`finalize_skeleton_store`.
     """
+    from contextlib import nullcontext
     # Tag axes as nanometers so neuroglancer treats positions as physical
     # (not unitless) coordinates.
     _axis_names = ["x", "y", "z", "t"][:ndim] if ndim <= 4 else [f"d{i}" for i in range(ndim)]
@@ -341,21 +357,63 @@ def init_skeleton_store(
         links_convention=LINKS_IMPLICIT_BRANCHES,
         object_index_convention=OBJIDX_STANDARD,
     )
+    # NOTE: `arrays_present` must list "fragment_attributes" — neuroglancer's
+    # spatially-indexed skeleton reader gates reading the per-fragment
+    # `fragment_attributes/segment_id` on it (see getSkeletonDataSource /
+    # hasFragmentSegmentIds). If omitted, the reader skips the segment id and
+    # falls back to each fragment's chunk-local index, so making one object
+    # visible lights up "fragment #N" in every chunk (scattered fragments).
+    _arrays_present = [
+        VERTICES, "vertex_fragments", "links", "object_index",
+        "fragment_attributes", "object_attributes",
+    ]
+    # Declare `vertex_attributes` when the store carries per-vertex attributes
+    # (e.g. Mouselight's `radius` / `vertex_types` axon-dendrite code).
+    # neuroglancer's reader parses the per-level `arrays_present` to decide
+    # which optional arrays to look for, so omitting it hides the attributes
+    # (no `prop_<name>()` in the skeleton shader) even though the arrays exist.
+    if attribute_dtypes:
+        _arrays_present.append(VERTEX_ATTRIBUTES)
     level_meta = LevelMetadata(
         level=0, vertex_count=0,
-        arrays_present=[VERTICES, "links", "object_index"],
+        arrays_present=_arrays_present,
     )
     level_group = create_resolution_level(root, 0, level_meta)
-    create_vertices_array(level_group, dtype="float32")
-    create_links_array(level_group, link_width=2, delta=0)
-    create_object_index_array(level_group)
-    # Skeleton cross-chunk edges are directed parent->child links.
-    create_cross_chunk_links_array(
-        level_group, delta=0, link_width=2, sid_ndim=ndim, directed=True,
+    # Enable native sharding for the per-chunk arrays when requested and the
+    # grid is origin-anchored (non-negative bounds); this is what makes the
+    # store readable by neuroglancer.  `native_sharded_arrays` only rewrites
+    # per-chunk spatial arrays (vertices/vertex_fragments/links/fragment_
+    # attributes/vertex_attributes) — object_index and cross_chunk_links are
+    # left in their non-sharded layouts regardless, so creating them inside
+    # the session is harmless.
+    _shard = shard_shape
+    if _shard is not None and any(float(b) < 0 for b in bounds[0]):
+        _shard = None
+    _session = (
+        open_write_session(
+            level_group,
+            shard_shape=_shard,
+            bounds=(list(bounds[0]), list(bounds[1])),
+            chunk_shape=tuple(chunk_shape),
+        )
+        if _shard is not None
+        else nullcontext()
     )
-    create_fragment_attribute_array(level_group, "segment_id", dtype="uint64")
-    for name, dt in attribute_dtypes.items():
-        create_attribute_array(level_group, name, dtype=dt)
+    with _session:
+        # Sharded cells are written uncompressed so a reader can byte-range-
+        # read one fragment's rows within a cell (matches the polyline path).
+        create_vertices_array(
+            level_group, dtype="float32", compress=(_shard is None),
+        )
+        create_links_array(level_group, link_width=2, delta=0)
+        create_object_index_array(level_group)
+        # Skeleton cross-chunk edges are directed parent->child links.
+        create_cross_chunk_links_array(
+            level_group, delta=0, link_width=2, sid_ndim=ndim, directed=True,
+        )
+        create_fragment_attribute_array(level_group, "segment_id", dtype="uint64")
+        for name, dt in attribute_dtypes.items():
+            create_attribute_array(level_group, name, dtype=dt)
     if coordinate_offset is not None and any(float(x) != 0 for x in coordinate_offset):
         set_coordinate_offset(root, coordinate_offset)
         upsert_level_transform(
@@ -508,9 +566,12 @@ def read_skeleton_by_segment_id(
 
 
 def _list_vertex_attributes(level_group) -> list[str]:
+    # Iterate the underlying zarr group: ``FsGroup.__iter__`` does not
+    # enumerate sub-array members, so ``for n in level_group[VERTEX_ATTRIBUTES]``
+    # returns nothing even when attribute arrays exist.
     try:
         if VERTEX_ATTRIBUTES in level_group:
-            return [n for n in level_group[VERTEX_ATTRIBUTES]]
+            return list(level_group.zarr_group[VERTEX_ATTRIBUTES])
     except Exception:
         pass
     return []
