@@ -189,10 +189,18 @@ def write_skeleton_chunk(
     *,
     attr_dtypes: dict[str, np.dtype] | None = None,
     dtype: np.dtype | str = np.float32,
+    record_presence: bool = True,
 ) -> tuple[list[tuple[int, ChunkCoords, int]], dict[Any, tuple[ChunkCoords, int]]]:
     """Write one spatial chunk's skeleton fragments.
 
     Args:
+        record_presence: Threaded into every per-chunk write this makes
+            (vertices, links, attributes, fragment attributes).  Pass
+            ``False`` from concurrent per-chunk writers — ``nonempty_chunks``
+            is array-wide state, so stamping it is a read-modify-write that
+            two workers writing *disjoint* chunks still race on — and
+            re-derive the manifests once afterwards from the coordinator
+            (``derive_nonempty_chunks`` / ``finalize_links``).
         level_group: Target resolution-level group (arrays must already
             be created — see :func:`init_skeleton_level`).
         chunk_coords: Spatial chunk coordinates.
@@ -275,16 +283,23 @@ def write_skeleton_chunk(
                 anchor_locs[tag] = (cc_tuple, piece_base + int(new_of_old[int(input_idx)]))
         chunk_offset += len(opos)
 
-    write_chunk_vertices(level_group, chunk_coords, vert_groups, dtype=dtype)
+    write_chunk_vertices(
+        level_group, chunk_coords, vert_groups, dtype=dtype,
+        record_presence=record_presence,
+    )
     # Per-cell writer, not ``write_links``: these branch links are already
     # chunk-local and all-zero-offset, and they must stay one group per
     # fragment for ``read_chunk_link_fragment`` to slice them back out.
     # ``write_links`` files a cell's records as a single group.
-    write_chunk_links(level_group, chunk_coords, link_groups, delta=0)
+    write_chunk_links(
+        level_group, chunk_coords, link_groups, delta=0,
+        record_presence=record_presence,
+    )
     for name in attr_names:
         write_chunk_attributes(
             level_group, name, chunk_coords, attr_groups[name],
             dtype=attr_dtypes.get(name, attr_groups[name][0].dtype),
+            record_presence=record_presence,
         )
     # Per-fragment ``segment_id`` (uint64): one original (flywire) id per
     # fragment, in fragment order (``frag_seg_ids`` is appended in lockstep
@@ -295,6 +310,7 @@ def write_skeleton_chunk(
         seg_ids = np.asarray(frag_seg_ids, dtype=np.uint64)
         write_chunk_fragment_attributes(
             level_group, "segment_id", chunk_coords, seg_ids, dtype=np.uint64,
+            record_presence=record_presence,
         )
     if any(frag_has_obj_id):
         if not all(frag_has_obj_id):
@@ -304,6 +320,7 @@ def write_skeleton_chunk(
         obj_ids = np.asarray(frag_obj_ids, dtype=np.uint64)
         write_chunk_fragment_attributes(
             level_group, "object_id", chunk_coords, obj_ids, dtype=np.uint64,
+            record_presence=record_presence,
         )
     return records, anchor_locs
 

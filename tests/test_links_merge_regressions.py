@@ -150,6 +150,58 @@ class TestDecentralizedManifestProtocol:
         finalize_links(lg, delta=0)
         assert len(read_links(lg, delta=0)) == 1
 
+    def test_record_presence_false_is_honoured_by_every_per_chunk_writer(
+        self,
+    ) -> None:
+        # record_presence=False must suppress the nonempty_chunks stamp on
+        # EVERY array a per-chunk write touches, or a concurrent writer still
+        # races on the un-suppressed one (the leak was: write_chunk_links
+        # honoured it on the links cell but not on the link_fragments sidecar,
+        # and write_chunk_fragment_attributes had no opt-out at all).
+        from zarr_vectors.core.arrays import (
+            create_fragment_attribute_array,
+            create_links_array,
+            create_vertices_array,
+            write_chunk_fragment_attributes,
+            write_chunk_links,
+            write_chunk_vertices,
+        )
+        from zarr_vectors.core.paths import intra_offsets, links_path
+        from zarr_vectors.core.store import create_store
+
+        # Empty store: no prior write may pre-stamp any manifest, or the
+        # opt-out under test would be masked by an earlier presence entry.
+        path = os.path.join(tempfile.mkdtemp(), "rp.zv")
+        root = create_store(
+            path, bounds=([0.0, 0.0, 0.0], [40.0, 40.0, 40.0]),
+            chunk_shape=(10.0, 10.0, 10.0), geometry_types=["graph"], ndim=3,
+        )
+        lg = get_resolution_level(root, 0)
+        create_vertices_array(lg, dtype="float32")
+        create_links_array(lg, link_width=2, sid_ndim=3)
+        create_fragment_attribute_array(lg, "segment_id", dtype="uint64")
+
+        write_chunk_vertices(
+            lg, (0, 0, 0), [np.zeros((3, 3), np.float32)], record_presence=False,
+        )
+        write_chunk_links(
+            lg, (0, 0, 0), [np.array([[0, 1], [1, 2]], np.int64)],
+            record_presence=False,
+        )
+        write_chunk_fragment_attributes(
+            lg, "segment_id", (0, 0, 0), np.array([7], np.uint64),
+            dtype=np.uint64, record_presence=False,
+        )
+
+        intra = links_path(0, intra_offsets(3, 2))
+        for name in (
+            "vertices", "vertex_fragments", intra, "link_fragments",
+            "fragment_attributes/segment_id",
+        ):
+            assert lg.list_chunks(name) == [], (
+                f"{name} stamped its manifest despite record_presence=False"
+            )
+
 
 class TestCreateLinksFamily:
     """Policy must be stampable without materialising an offsets array."""

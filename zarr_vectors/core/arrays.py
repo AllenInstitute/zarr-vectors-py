@@ -806,6 +806,23 @@ def create_links_array(
     full_name = links_path(delta, offsets)
     if _short_circuit_existing(level_group, full_name, exist_ok):
         return
+    # Capture whether the family group's policy meta already exists BEFORE
+    # allocating the offsets array (which creates the group as a side effect).
+    # Re-stamping the family group's zarr.json on every offsets-array creation
+    # makes concurrent decentralized writers (each creating a DIFFERENT offsets
+    # array) collide on the group's atomic-rename — a Windows hard-fail.  A
+    # coordinator (:func:`create_links_family`) or the first creator establishes
+    # the policy; later creators only add their offsets array under it.
+    existing_family = (
+        level_group.read_array_meta(family) or {}
+        if level_group.array_exists(family) else {}
+    )
+    if existing_family:
+        _check_link_family_policy(
+            existing_family, delta=delta, link_width=link_width,
+            sid_ndim=sid_ndim, directed=directed, store=store,
+            action="append to",
+        )
     # Hand the array's metadata to the allocation itself: one offsets
     # array per distinct offset means this runs once per segment, and
     # writing the meta separately would double the store writes for it.
@@ -819,16 +836,34 @@ def create_links_array(
         "link_width": link_width,
         "level_delta": int(delta),
     })
-    family_meta: dict[str, Any] = {
-        "zv_array": "links_family",
-        "level_delta": int(delta),
-        "link_width": int(link_width),
-        "directed": bool(directed),
-        "store": str(store),
-    }
-    if sid_ndim is not None:
-        family_meta["sid_ndim"] = int(sid_ndim)
-    level_group.write_array_meta(family, family_meta)
+    if not existing_family:
+        family_meta: dict[str, Any] = {
+            "zv_array": "links_family",
+            "level_delta": int(delta),
+            "link_width": int(link_width),
+            "directed": bool(directed),
+            "store": str(store),
+        }
+        if sid_ndim is not None:
+            family_meta["sid_ndim"] = int(sid_ndim)
+        level_group.write_array_meta(family, family_meta)
+
+    # Allocate the fragment sidecar next to the intra array, mirroring how
+    # create_vertices_array allocates vertex_fragments next to vertices.  The
+    # intra array at delta 0 is the only one that uses it (see
+    # write_chunk_links), which would otherwise create it lazily on first
+    # write — from inside a worker, where concurrent creators race on its
+    # zarr.json.  Allocating here keeps creation a coordinator concern.
+    if (
+        delta == 0
+        and is_intra(offsets)
+        and not level_group.array_exists(LINK_FRAGMENTS)
+    ):
+        _ensure_array_dir(level_group, LINK_FRAGMENTS)
+        level_group.write_array_meta(LINK_FRAGMENTS, {
+            "zv_array": LINK_FRAGMENTS,
+            "encoding": "fragment_index_v1",
+        })
 
 
 def create_attribute_array(
@@ -1262,8 +1297,14 @@ def write_chunk_links(
                 "zv_array": LINK_FRAGMENTS,
                 "encoding": "fragment_index_v1",
             })
+        # Thread record_presence through to the sidecar too: without this the
+        # links cell honours the opt-out but link_fragments still stamps its
+        # array-wide manifest on every cell, so concurrent per-chunk writers
+        # collide on link_fragments/zarr.json (a Windows hard-fail) even
+        # though the caller asked to defer manifest maintenance.
         level_group.write_bytes(
             LINK_FRAGMENTS, key, encode_fragments(link_fragments),
+            record_presence=record_presence,
         )
         del link_row_size  # silence unused-variable warning
         return link_byte_offsets
@@ -1418,6 +1459,8 @@ def write_chunk_fragment_attributes(
     chunk_coords: ChunkCoords,
     data: npt.NDArray,
     dtype: np.dtype | str = np.float32,
+    *,
+    record_presence: bool = True,
 ) -> None:
     """Write per-fragment attribute data for a spatial chunk.
 
@@ -1434,12 +1477,21 @@ def write_chunk_fragment_attributes(
         data: ``(F,)`` for scalar or ``(F, C)`` for multi-channel,
             where ``F`` is the number of fragments in this chunk.
         dtype: Numpy dtype to cast ``data`` to before writing.
+        record_presence: Whether to stamp this cell into the array's
+            ``nonempty_chunks`` manifest.  Pass ``False`` from concurrent
+            per-chunk writers (the manifest is one array-wide attribute, so
+            stamping it is a read-modify-write that races across processes)
+            and re-derive it once afterwards via
+            :meth:`FsGroup.derive_nonempty_chunks`.  See
+            :func:`write_chunk_vertices` for the same pattern.
     """
     dtype = np.dtype(dtype)
     key = _chunk_key(chunk_coords)
     full_name = f"{FRAGMENT_ATTRIBUTES}/{attr_name}"
     arr = np.ascontiguousarray(np.asarray(data).astype(dtype, copy=False))
-    level_group.write_bytes(full_name, key, arr.tobytes())
+    level_group.write_bytes(
+        full_name, key, arr.tobytes(), record_presence=record_presence,
+    )
 
 
 def write_chunk_link_attributes(
