@@ -334,6 +334,8 @@ def init_skeleton_store(
     attribute_dtypes: dict[str, str],
     backend: str | None = None,
     coordinate_offset: Sequence[float] | None = None,
+    compressor: Any = None,
+    shard_shape: int | tuple[int, ...] | None = None,
 ):
     """Create a new skeleton store + an empty level 0 with its arrays.
 
@@ -342,6 +344,20 @@ def init_skeleton_store(
     ``world - coordinate_offset`` so the spec's origin-0 chunk grid
     aligns to the source grid.  It is recorded in metadata and mirrored
     to the NGFF ``translation`` transform.
+
+    ``shard_shape`` (optional, in units of spatial chunks) wraps each
+    per-chunk array's cells in Zarr v3's ``sharding_indexed`` codec, so
+    many chunks share one storage object — the same knob the whole-store
+    writers (``write_points``, ``write_graph``, …) take.  ``compressor``
+    sets the codec pipeline for those arrays.
+
+    Skeletons are written by streaming rather than in one call, so the
+    arrays are allocated here and the caller's subsequent
+    :func:`write_skeleton_chunk` calls reuse them as-is — an existing
+    array is never re-created out from under a streaming writer.  A
+    caller that wants its streamed writes batched should open its own
+    :func:`~zarr_vectors.core.arrays.open_write_session` with the SAME
+    ``shard_shape`` / ``bounds`` / ``chunk_shape`` passed here.
 
     Returns ``(root, level0_group)``.  Callers then stream
     :func:`write_skeleton_chunk` over chunks, reduce the records into an
@@ -367,19 +383,32 @@ def init_skeleton_store(
         arrays_present=[VERTICES, "links", "object_index"],
     )
     level_group = create_resolution_level(root, 0, level_meta)
-    create_vertices_array(level_group, dtype="float32")
-    # One links family holds both the intra-chunk branch links and the
-    # boundary-crossing parent→child edges.  ``directed=True`` is family
-    # policy: it stops the cross-chunk arrays canonical-sorting endpoints
-    # (which would swap parent and child).  Intra-chunk records are stored
-    # in input order regardless, so branch links are unaffected.
-    create_links_array(
-        level_group, link_width=2, delta=0, sid_ndim=ndim, directed=True,
-    )
-    create_object_index_array(level_group)
-    create_fragment_attribute_array(level_group, "segment_id", dtype="uint64")
-    for name, dt in attribute_dtypes.items():
-        create_attribute_array(level_group, name, dtype=dt)
+    from zarr_vectors.core.arrays import open_write_session
+
+    # Allocate every per-chunk array inside a session so ``shard_shape``
+    # and ``compressor`` reach the array creation.  Without one the
+    # arrays fall back to the derived (unsharded, uncompressed) layout,
+    # which is why sharding never applied to skeleton stores.
+    with open_write_session(
+        level_group,
+        compressor=compressor,
+        shard_shape=shard_shape,
+        bounds=(list(bounds[0]), list(bounds[1])),
+        chunk_shape=tuple(chunk_shape),
+    ):
+        create_vertices_array(level_group, dtype="float32")
+        # One links family holds both the intra-chunk branch links and the
+        # boundary-crossing parent→child edges.  ``directed=True`` is family
+        # policy: it stops the cross-chunk arrays canonical-sorting endpoints
+        # (which would swap parent and child).  Intra-chunk records are stored
+        # in input order regardless, so branch links are unaffected.
+        create_links_array(
+            level_group, link_width=2, delta=0, sid_ndim=ndim, directed=True,
+        )
+        create_object_index_array(level_group)
+        create_fragment_attribute_array(level_group, "segment_id", dtype="uint64")
+        for name, dt in attribute_dtypes.items():
+            create_attribute_array(level_group, name, dtype=dt)
     if coordinate_offset is not None and any(float(x) != 0 for x in coordinate_offset):
         set_coordinate_offset(root, coordinate_offset)
         upsert_level_transform(
