@@ -523,6 +523,13 @@ def read_polylines(
         Dict with:
         - ``polylines``: list of lists of arrays. ``polylines[i]`` is
           a list of segment arrays for polyline i (concatenate for full path).
+        - ``object_ids``: the source object ID of each returned polyline,
+          same length and order as ``polylines``.  In the whole-object
+          modes these are unique.  Under ``chunks`` (segment-level crop) a
+          single object can yield several output polylines, so **IDs
+          repeat** — one entry per emitted polyline, not per object.  This
+          is what lets a caller re-associate the cropped runs of one
+          object.
         - ``polyline_count``: number of polylines returned.
         - ``vertex_count``: total vertices across all returned polylines.
     """
@@ -624,6 +631,7 @@ def read_polylines(
         )
 
     result_polylines: list[list[npt.NDArray]] = []
+    result_object_ids: list[int] = []
     total_verts = 0
 
     # Choose between a selective read (an explicit object/group subset —
@@ -739,6 +747,7 @@ def read_polylines(
                             ]
                             if fragment_list:
                                 result_polylines.append(fragment_list)
+                                result_object_ids.append(oid)
                                 total_verts += sum(len(fragment) for fragment in fragment_list)
                             run = []
                 if run:
@@ -748,6 +757,7 @@ def read_polylines(
                     ]
                     if fragment_list:
                         result_polylines.append(fragment_list)
+                        result_object_ids.append(oid)
                         total_verts += sum(len(fragment) for fragment in fragment_list)
                 continue
 
@@ -782,12 +792,14 @@ def read_polylines(
                     continue
 
             result_polylines.append(fragment_list)
+            result_object_ids.append(oid)
             total_verts += sum(len(fragment) for fragment in fragment_list)
     finally:
         _batched_reads_cm.__exit__(None, None, None)
 
     return {
         "polylines": result_polylines,
+        "object_ids": result_object_ids,
         "polyline_count": len(result_polylines),
         "vertex_count": total_verts,
     }
@@ -818,6 +830,7 @@ def _read_manifest_run(
 def _empty_polyline_result() -> dict[str, Any]:
     return {
         "polylines": [],
+        "object_ids": [],
         "polyline_count": 0,
         "vertex_count": 0,
     }
