@@ -49,6 +49,65 @@ from zarr_vectors.core._vlen import (
 )
 from zarr_vectors.exceptions import StoreError
 
+# Node-cache sentinel for "this path was probed and is genuinely absent",
+# as distinct from "this path was never prefetched".  Only the async
+# primer in :mod:`zarr_vectors.core.aio` stores it; without it an offline
+# lookup could not tell a legitimately missing array (``array_exists`` →
+# False) from a hole in the prefetch plan, and would have to answer one
+# of them wrongly.
+_ABSENT = object()
+
+
+class _OfflineSession:
+    """The snapshot an offline read is served from, shared by a Group and
+    every Group derived from it.
+
+    Sub-groups are built fresh by :meth:`Group._from_zarr` (a level group
+    is not the root Group), so per-instance caches would not reach the
+    handle that actually does the reading.  One session object, threaded
+    down through :meth:`Group.__getitem__` and friends, keeps the whole
+    tree served from the same snapshot.
+
+    Keys are **root-relative** paths, so they mean the same thing from
+    any Group in the tree.
+
+    ``misses`` is the reason this is a mutable object rather than two
+    plain dicts: a lookup that cannot be served records itself here
+    *before* raising.  Several ``read_*`` paths wrap optional metadata
+    reads in ``except Exception: pass``, which would swallow the raise
+    and silently degrade the result; the recorded miss survives that, and
+    is what lets :func:`zarr_vectors.core.aio.read_async` discover what
+    to fetch next instead of trusting the exception to propagate.
+
+    Four kinds of read are covered, because the readers make four kinds:
+    ``nodes`` resolves a path, ``chunks`` holds one vlen *cell* of a
+    chunk-grid array, ``arrays`` holds a whole standalone array read
+    end-to-end (the ``object_index`` manifests, object attributes), and
+    ``listings`` holds a group's child names.
+
+    ``listings`` is the one a browser cannot always fill: a plain
+    fetch-backed Store has no listing operation.  Readers that enumerate
+    a family — the ``links/<delta>`` offsets segments — need it, so on
+    such a store those reads stay out of reach and say so, rather than
+    hanging.  Stores with a real listing API (S3, GCS, local) fill it
+    like any other dimension.
+    """
+
+    __slots__ = ("nodes", "chunks", "arrays", "listings", "misses")
+
+    def __init__(
+        self,
+        nodes: dict[str, Any] | None = None,
+        chunks: dict[tuple[str, str], bytes] | None = None,
+        arrays: dict[str, Any] | None = None,
+        listings: dict[str, list[str]] | None = None,
+    ) -> None:
+        self.nodes = nodes if nodes is not None else {}
+        self.chunks = chunks if chunks is not None else {}
+        self.arrays = arrays if arrays is not None else {}
+        self.listings = listings if listings is not None else {}
+        self.misses: set[Any] = set()
+
 
 class Group:
     """A ZV group wrapping an underlying :class:`zarr.Group`."""
@@ -74,10 +133,20 @@ class Group:
     # — the default layout).  Used by ``arrays._ensure_array_dir`` and the
     # ``write_bytes`` / ``write_array_meta`` dispatch on this class.
     _native_sharded_config: dict[str, tuple[int, ...] | None] | None = None
-    # Node-lookup cache, active only for the duration of a
-    # :meth:`batched_writes` block.  Maps ``array_name`` → the
-    # ``zarr.Array`` node at that path.  See :meth:`_lookup_node`.
-    _node_cache: dict[str, zarr.Array] | None = None
+    # Node-lookup cache.  Maps a path → the resolved node.  Active for
+    # the duration of a :meth:`batched_writes` block (Array nodes only,
+    # populated lazily) or of an :meth:`offline_reads` block (Arrays,
+    # Groups and ``_ABSENT`` markers, populated up-front by the async
+    # primer).  See :meth:`_lookup_node`.
+    _node_cache: dict[str, Any] | None = None
+    # Active offline-read snapshot, or None for normal store-backed
+    # reads.  When set, reads must not touch the store: a miss records
+    # itself and raises rather than falling through to a synchronous GET.
+    # Propagates to derived Groups — see :class:`_OfflineSession` and
+    # :meth:`offline_reads`.  This is what makes a prefetch gap a loud
+    # failure rather than a silent sync round-trip, which under Pyodide
+    # is not merely slow but deadlocks the event loop.
+    _offline: _OfflineSession | None = None
 
     def __init__(self, zarr_group: zarr.Group) -> None:
         self._zarr = zarr_group
@@ -96,7 +165,9 @@ class Group:
         self._node_cache = None
 
     @classmethod
-    def _from_zarr(cls, zarr_group: zarr.Group) -> Group:
+    def _from_zarr(
+        cls, zarr_group: zarr.Group, _parent: Group | None = None,
+    ) -> Group:
         instance = cls.__new__(cls)
         instance._zarr = zarr_group
         instance._pending_writes = None
@@ -104,6 +175,11 @@ class Group:
         instance._prefetch_cache = None
         instance._active_codecs = None
         instance._node_cache = None
+        # An offline snapshot covers the whole tree, so a Group derived
+        # from one stays offline; without this a level group would fall
+        # back to the store and issue the very sync read the snapshot
+        # exists to avoid.  Everything else stays per-instance.
+        instance._offline = _parent._offline if _parent is not None else None
         return instance
 
     @classmethod
@@ -133,28 +209,38 @@ class Group:
 
     def create_group(self, name: str, **_kwargs: Any) -> Group:
         zg = self._zarr.require_group(name)
-        return type(self)._from_zarr(zg)
+        return type(self)._from_zarr(zg, self)
 
     def require_group(self, name: str) -> Group:
         zg = self._zarr.require_group(name)
-        return type(self)._from_zarr(zg)
+        return type(self)._from_zarr(zg, self)
+
+    def _full_path(self, path: str) -> str:
+        """``path`` made root-relative, the key form an offline snapshot
+        uses so a lookup means the same thing from any Group in the tree.
+        """
+        base = self._zarr.path.strip("/")
+        return f"{base}/{path}" if base else path
 
     def __getitem__(self, key: str) -> Group:
-        try:
-            node = self._zarr[key]
-        except KeyError:
+        # Via ``_lookup_node`` rather than ``self._zarr[key]`` so this
+        # shares the node cache — which both collapses the repeated
+        # ``zarr.json`` GETs a level lookup would otherwise pay and lets
+        # the call be served offline.
+        node = self._lookup_node(key)
+        if node is None:
             raise StoreError(
                 f"Group {key!r} not found under {self._zarr.path or '<root>'}"
-            ) from None
+            )
         if not isinstance(node, zarr.Group):
             raise StoreError(
                 f"{key!r} under {self._zarr.path or '<root>'} is a "
                 f"{type(node).__name__}, not a Group"
             )
-        return type(self)._from_zarr(node)
+        return type(self)._from_zarr(node, self)
 
     def __contains__(self, key: str) -> bool:
-        return key in self._zarr
+        return self._lookup_node(key) is not None
 
     def __iter__(self) -> Iterator[str]:
         yield from sorted(self._zarr.group_keys())
@@ -168,6 +254,18 @@ class Group:
         attributes are flat arrays.  ``__iter__`` yields sub-*groups*
         only, so it sees none of those.
         """
+        offline = self._offline
+        if offline is not None:
+            own = self._zarr.path.strip("/")
+            hit = offline.listings.get(own)
+            if hit is not None:
+                return list(hit)
+            # Speculative empty, same contract as an unresolved node in
+            # :meth:`_lookup_node`: the miss is recorded and only a
+            # zero-miss pass is accepted, so an enumeration that came up
+            # short is re-run once the listing is in the snapshot.
+            offline.misses.add(("list", own))
+            return []
         return sorted(
             set(self._zarr.group_keys()) | set(self._zarr.array_keys())
         )
@@ -295,6 +393,46 @@ class Group:
             yield
         finally:
             self._prefetch_cache = None
+
+    @contextmanager
+    def offline_reads(self, session: _OfflineSession) -> Iterator[None]:
+        """Serve every read inside the block from ``session``, touching
+        the store not at all.
+
+        This is the replay half of the async read path.  The snapshot is
+        built by :mod:`zarr_vectors.core.aio`, which resolves the nodes
+        and fetches the chunk cells with ``await``; inside this block the
+        ordinary synchronous ``read_*`` functions then run to completion
+        against it.  The decode, filtering and assembly work they do is
+        pure computation, so it needs no async treatment — it only ever
+        needed its I/O supplied up front.
+
+        That is why there is no async mirror of each ``read_*``: given a
+        primed handle, the sync ones *are* the async ones.
+
+        Any lookup or chunk read the snapshot does not cover records
+        itself in ``session.misses`` and raises :class:`StoreError`
+        rather than falling back to the store: a gap must surface, since
+        the silent alternative is the synchronous round-trip this path
+        exists to avoid.  The caller inspects ``misses`` to decide what
+        to fetch next — see :func:`~zarr_vectors.core.aio.read_async`.
+
+        Nesting is not supported and raises :class:`StoreError`.  The
+        block is read-only by construction; writes inside it are not
+        supported.
+        """
+        if self._offline is not None:
+            raise StoreError("offline_reads() does not support nesting")
+        if self._node_cache is not None or self._prefetch_cache is not None:
+            raise StoreError(
+                "offline_reads() cannot be combined with batched_reads() "
+                "or batched_writes()"
+            )
+        self._offline = session
+        try:
+            yield
+        finally:
+            self._offline = None
 
     @contextmanager
     def batched_writes(self, compressor: Any = None) -> Iterator[None]:
@@ -437,6 +575,21 @@ class Group:
         # prefetch cache when possible.  Cache misses fall through to
         # the sync path below — useful when a caller under-specifies
         # the plan or hits an array the prefetch skipped.
+        offline = self._offline
+        if offline is not None:
+            key = (self._full_path(array_name), chunk_key)
+            cached = offline.chunks.get(key)
+            if cached is not None:
+                return cached
+            # The node itself may well be in the snapshot, so the lookup
+            # below would succeed and then read the cell straight off the
+            # store.  Stop here instead: offline means offline.
+            offline.misses.add(key)
+            raise StoreError(
+                f"Offline read of chunk {key[0]!r}/{chunk_key!r}: not in "
+                f"the prefetched chunk snapshot."
+            )
+
         if self._prefetch_cache is not None:
             cached = self._prefetch_cache.get((array_name, chunk_key))
             if cached is not None:
@@ -469,7 +622,14 @@ class Group:
             return chunk_key in present
         # Fall back to inspecting the cell — slow path used when the
         # presence manifest is missing (e.g. mid-migration, or before a
-        # coordinator's ``derive_nonempty_chunks``).
+        # coordinator's ``derive_nonempty_chunks``).  That inspection is
+        # a store read, so offline it can only be served from the
+        # snapshot — via ``read_bytes``, which records the miss.
+        if self._offline is not None:
+            try:
+                return self.read_bytes(array_name, chunk_key) != b""
+            except StoreError:
+                return False
         coords = _parse_chunk_coords(chunk_key)
         index = (
             None if coords is None
@@ -600,8 +760,32 @@ class Group:
 
     def read_array(self, path: str) -> np.ndarray:
         """Read a chunked Zarr array at ``path`` as a numpy array."""
+        cached = self._offline_array(path)
+        if cached is not None:
+            return np.asarray(cached)
         node = self._require_array_node(path)
         return np.asarray(node[:])
+
+    def _offline_array(self, path: str) -> Any | None:
+        """Whole-array value for ``path`` from the offline snapshot.
+
+        Returns ``None`` when not offline, so callers fall through to
+        their normal store read.  Offline, a value absent from the
+        snapshot records a miss and raises — the same contract as
+        :meth:`_lookup_node` and :meth:`read_bytes`.
+        """
+        offline = self._offline
+        if offline is None:
+            return None
+        full = self._full_path(path)
+        hit = offline.arrays.get(full)
+        if hit is not None:
+            return hit
+        offline.misses.add(("array", full))
+        raise StoreError(
+            f"Offline read of array {full!r}: not in the prefetched "
+            f"array snapshot."
+        )
 
     def write_vlen_array(
         self,
@@ -658,8 +842,28 @@ class Group:
 
     def read_vlen_array(self, path: str) -> list[bytes]:
         """Read a vlen-bytes Zarr array at ``path`` as a list of bytes."""
+        cached = self._offline_array(path)
+        if cached is not None:
+            return [bytes(b) for b in cached]
         node = self._require_array_node(path)
         return [bytes(b) for b in node[:]]
+
+    def read_vlen_element(self, path: str, index: int) -> bytes:
+        """Read ONE element of the vlen-bytes array at ``path``.
+
+        Kept distinct from :meth:`read_vlen_array` so the online path
+        still fetches a single element rather than the whole array —
+        ``object_index/manifests`` has one row per object, so reading it
+        whole to answer a by-id lookup would not scale.  Offline the
+        distinction is moot: the snapshot holds the array entire, and
+        this just indexes into it.
+        """
+        cached = self._offline_array(path)
+        if cached is not None:
+            return _vlen_region_to_bytes(cached[index:index + 1])
+        node = self._require_array_node(path)
+        # Slice-then-extract, never scalar-index: see core._vlen.
+        return _vlen_region_to_bytes(node[index:index + 1])
 
     # ---------------- native-sharded chunk array (sharding_indexed) -------
 
@@ -787,12 +991,41 @@ class Group:
           re-resolve.  The cache lives exactly as long as the block (see
           :meth:`batched_writes`), so no handle outlives the session that
           made it.  Mutators invalidate it — see :meth:`_invalidate_node`.
+        - **Authoritative inside an offline-reads block.**  When
+          ``_offline_reads`` is set the cache is the whole world: it was
+          filled up-front by the async primer, so a hit for an absent
+          path is the ``_ABSENT`` marker rather than nothing at all, and
+          a genuine miss is a bug in the prefetch plan.  Falling through
+          to the store there would issue exactly the synchronous GET the
+          async path exists to avoid, so it raises instead.
         """
+        offline = self._offline
+        if offline is not None:
+            full = self._full_path(path)
+            hit = offline.nodes.get(full)
+            if hit is not None:
+                return None if hit is _ABSENT else hit
+            # Record the miss, then answer "absent" rather than raising.
+            #
+            # Unlike a chunk read, an unresolved node can be answered
+            # speculatively without risking a wrong result: only a pass
+            # that records *no* misses is ever accepted (see
+            # :func:`zarr_vectors.core.aio.read_async`), so a branch
+            # taken on a wrong "absent" is discarded and re-run once the
+            # node is in the snapshot.
+            #
+            # It also matters for speed.  Readers probe families of
+            # candidate paths — the 26 neighbour offsets under
+            # ``links/<delta>/`` among them — and raising at the first
+            # would reveal one path per round. Continuing surfaces the
+            # whole family in a single pass instead.
+            offline.misses.add(full)
+            return None
         cache = self._node_cache
         if cache is not None:
             hit = cache.get(path)
             if hit is not None:
-                return hit
+                return None if hit is _ABSENT else hit
         try:
             node = self._zarr[path]
         except KeyError:

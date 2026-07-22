@@ -14,7 +14,7 @@ the segment-to-segment bridges are ever stored.
 
 from __future__ import annotations
 
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import numpy as np
 import numpy.typing as npt
@@ -98,6 +98,9 @@ from zarr_vectors.typing import (
     ObjectManifest,
     FragmentRef,
 )
+
+if TYPE_CHECKING:
+    from zarr_vectors.core.store import ReadSource
 
 
 def write_polylines(
@@ -487,7 +490,7 @@ def write_polylines(
 
 
 def read_polylines(
-    store_path: str,
+    store_path: ReadSource,
     *,
     level: int = 0,
     object_ids: list[int] | None = None,
@@ -500,7 +503,8 @@ def read_polylines(
     """Read polylines/streamlines from a zarr vectors store.
 
     Args:
-        store_path: Path to the store.
+        store_path: URL or path to the store, a pre-built zarr Store,
+            or an already-open Group.
         level: Resolution level.
         object_ids: Optional list of polyline (object) IDs.
         group_ids: Optional group IDs — expands to their object IDs.

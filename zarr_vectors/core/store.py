@@ -21,6 +21,13 @@ from zarr.storage import LocalStore
 if TYPE_CHECKING:
     from zarr.storage import StoreLike
 
+    # What every ``read_*`` entry point accepts: a URL/path string, a
+    # pre-built ``zarr.abc.store.Store``, or an already-open Group.  The
+    # Group arm is what lets a caller hand in a handle whose caches are
+    # already primed — see :func:`open_store` and
+    # :mod:`zarr_vectors.core.aio`.
+    ReadSource = StoreLike | Group
+
 from zarr_vectors.constants import (
     DEFAULT_AXES_NAMES,
     DEFAULT_BOUNDS_SIDE,
@@ -931,7 +938,7 @@ def _finalize_write(root: Group, message: str) -> str | None:
     return commit(root, message)
 
 def open_store(
-    path: StoreLike,
+    path: StoreLike | Group,
     mode: str = "r",
     *,
     backend: str | None = None,
@@ -941,7 +948,16 @@ def open_store(
     """Open an existing ZV store.
 
     Args:
-        path: URL or filesystem path to the store.
+        path: URL or filesystem path to the store, a pre-built
+            ``zarr.abc.store.Store``, or an already-opened :class:`Group`.
+            A Group is returned unchanged — mirroring
+            :func:`_create_or_open_store` on the write side, so a caller
+            holding a handle can read through it without reopening.  This
+            is what lets a caller prime the handle's caches (see
+            :meth:`Group.offline_reads`) and then drive an otherwise
+            synchronous ``read_*`` with no store I/O at all.  When a Group
+            is passed, ``mode`` and the backend kwargs are ignored — the
+            handle's existing mode stands.
         mode: ``"r"`` (read-only — writes will raise), ``"r+"``
             (read-write), ``"a"`` (append).  For ``mode="r"`` the
             underlying Zarr store is wrapped via
@@ -960,6 +976,12 @@ def open_store(
         StoreError: If the store does not exist or is structurally invalid.
         MetadataError: If root metadata cannot be parsed.
     """
+    # Pass-through for an already-opened Group handle, matching
+    # ``_create_or_open_store``.  Checked first so none of the path
+    # sniffing below ever sees a Group.
+    if isinstance(path, Group):
+        return path
+
     # Local-FS existence check; transactional backends (icechunk) verify
     # repository existence inside their own session factory.  Pre-built
     # Store objects and cloud schemes skip the local check and rely on

@@ -15,7 +15,7 @@ Supports two encoding modes:
 
 from __future__ import annotations
 
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import numpy as np
 import numpy.typing as npt
@@ -90,6 +90,9 @@ from zarr_vectors.typing import (
     ChunkShape,
     ObjectManifest,
 )
+
+if TYPE_CHECKING:
+    from zarr_vectors.core.store import ReadSource
 
 
 def write_mesh(
@@ -385,7 +388,7 @@ def write_mesh(
 
 
 def read_mesh(
-    store_path: str,
+    store_path: ReadSource,
     *,
     level: int = 0,
     bbox: BoundingBox | None = None,
@@ -397,7 +400,8 @@ def read_mesh(
     """Read a mesh from a zarr vectors store.
 
     Args:
-        store_path: Path to the store.
+        store_path: URL or path to the store, a pre-built zarr Store,
+            or an already-open Group.
         level: Resolution level.
         bbox: Optional bounding box filter.
         object_ids: Optional object ID filter.

@@ -31,7 +31,7 @@ from __future__ import annotations
 
 from collections import defaultdict
 from pathlib import Path
-from typing import Any, Sequence
+from typing import TYPE_CHECKING, Any, Sequence
 
 import numpy as np
 import numpy.typing as npt
@@ -73,6 +73,9 @@ from zarr_vectors.core.store import (
 from zarr_vectors.exceptions import ArrayError
 from zarr_vectors.types.graphs import _extract_branch_links, _reorder_tree
 from zarr_vectors.typing import ChunkCoords
+
+if TYPE_CHECKING:
+    from zarr_vectors.core.store import ReadSource
 
 
 SEGMENT_ID_ATTR = "segment_id"
@@ -462,7 +465,7 @@ def _path_sequential_edges(n: int) -> npt.NDArray[np.int64]:
 
 
 def read_skeleton_by_segment_id(
-    store_path: str | Path,
+    store_path: ReadSource,
     segment_id: int,
     *,
     level: int = 0,
@@ -480,7 +483,7 @@ def read_skeleton_by_segment_id(
     parent]``, ``attributes`` ``{name: (N, ...)}``, and
     ``fragment_count``.
     """
-    root = open_store(str(store_path), backend=backend)
+    root = open_store(store_path, backend=backend)
     root_meta = read_root_metadata(root)
     ndim = root_meta.sid_ndim
     level_group = get_resolution_level(root, level)

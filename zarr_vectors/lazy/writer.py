@@ -13,7 +13,11 @@ Adds the write-back surface the algorithms package needs:
 
 Each public method has both an async and a sync mirror.  The async
 methods drive the zarr store's async I/O directly; the sync mirrors are
-thin ``asyncio.run`` wrappers for non-async callers.
+thin wrappers over zarr's :func:`~zarr.core.sync.sync`, which dispatches
+onto zarr's own background event loop.  ``asyncio.run`` is deliberately
+*not* used: it raises when called from inside a running event loop, which
+rules out every embedded/browser host.  Same reasoning as
+:mod:`zarr_vectors.ops.relocate`.
 
 v1 is **single-writer-only**.  Concurrent writers against the same
 level can race on object_index sidecar batch numbering; documented
@@ -27,6 +31,7 @@ from typing import Any, TYPE_CHECKING
 
 import numpy as np
 import numpy.typing as npt
+from zarr.core.sync import sync
 
 from zarr_vectors.core.arrays import (
     list_chunk_keys,
@@ -605,7 +610,7 @@ class ZVWriter:
         *,
         dtype: str | np.dtype | None = None,
     ) -> None:
-        asyncio.run(self.add_attribute(name, values, dtype=dtype))
+        sync(self.add_attribute(name, values, dtype=dtype))
 
     def add_node_attribute_sync(
         self,
@@ -614,7 +619,7 @@ class ZVWriter:
         *,
         dtype: str | np.dtype | None = None,
     ) -> None:
-        asyncio.run(self.add_node_attribute(name, values, dtype=dtype))
+        sync(self.add_node_attribute(name, values, dtype=dtype))
 
     def add_face_attribute_sync(
         self,
@@ -623,7 +628,7 @@ class ZVWriter:
         *,
         dtype: str | np.dtype | None = None,
     ) -> None:
-        asyncio.run(self.add_face_attribute(name, values, dtype=dtype))
+        sync(self.add_face_attribute(name, values, dtype=dtype))
 
     def add_object_attribute_sync(
         self,
@@ -632,7 +637,7 @@ class ZVWriter:
         *,
         dtype: str | np.dtype | None = None,
     ) -> None:
-        asyncio.run(self.add_object_attribute(name, values, dtype=dtype))
+        sync(self.add_object_attribute(name, values, dtype=dtype))
 
     def append_vertices_sync(
         self,
@@ -641,15 +646,15 @@ class ZVWriter:
         object_ids: npt.NDArray | None = None,
         dtype: str | np.dtype | None = None,
     ) -> dict:
-        return asyncio.run(self.append_vertices(
+        return sync(self.append_vertices(
             positions, object_ids=object_ids, dtype=dtype,
         ))
 
     def commit_sync(self) -> dict:
-        return asyncio.run(self.commit())
+        return sync(self.commit())
 
     def compact_sync(self) -> dict:
-        return asyncio.run(self.compact())
+        return sync(self.compact())
 
 
 def _safe_read_chunk_vertices(

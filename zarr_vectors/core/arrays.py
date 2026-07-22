@@ -3667,10 +3667,11 @@ def read_object_manifest(
         )
 
     _require_object_index_v1(meta)
-    manifests_arr = level_group.zarr_group[OBJECT_INDEX]["manifests"]
+    # Via the Group rather than the raw zarr node, so the read passes a
+    # chokepoint the offline snapshot can serve (see Group.offline_reads).
     # Slice-then-extract, never scalar-index: see zarr_vectors.core._vlen.
     # This 1-D manifests array shares that rule with the N-D cell readers.
-    blob = _vlen_region_to_bytes(manifests_arr[object_id:object_id + 1])
+    blob = level_group.read_vlen_element(f"{OBJECT_INDEX}/manifests", object_id)
     blocks = decode_object_manifest_blocks(blob, sid_ndim=sid_ndim)
     return _expand_blocks(blocks)
 
@@ -3690,10 +3691,9 @@ def read_all_object_manifests(
     _require_object_index_v1(meta)
     if num_objects == 0:
         return []
-    manifests_arr = level_group.zarr_group[OBJECT_INDEX]["manifests"]
-    # Slicing yields a 1-D object ndarray whose elements are bytes
-    # directly (unlike scalar indexing — see read_object_manifest).
-    blobs = manifests_arr[:]
+    # Via the Group rather than the raw zarr node, so the read passes a
+    # chokepoint the offline snapshot can serve (see Group.offline_reads).
+    blobs = level_group.read_vlen_array(f"{OBJECT_INDEX}/manifests")
     return [
         _expand_blocks(decode_object_manifest_blocks(b, sid_ndim=sid_ndim))
         for b in blobs

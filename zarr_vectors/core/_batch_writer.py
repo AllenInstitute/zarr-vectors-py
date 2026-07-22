@@ -32,6 +32,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import sys
 import warnings
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor
@@ -47,6 +48,13 @@ from zarr.errors import UnstableSpecificationWarning
 # (each worker blocks on zarr's shared event loop), so this is about how
 # many array writes may be in flight, not about CPU parallelism.
 _FLUSH_MAX_WORKERS = 32
+
+# Pyodide/WASM has no thread support: ``threading.Thread.start()`` raises
+# ``RuntimeError: can't start new thread``, so constructing a pool at all
+# is fatal there — clamping ``_FLUSH_MAX_WORKERS`` to 1 would not help,
+# since ThreadPoolExecutor still starts a worker thread.  Flush serially
+# instead.  The arrays are independent, so the only cost is wall-clock.
+_NO_THREADS = sys.platform == "emscripten" or sys.platform == "wasi"
 
 
 def _is_icechunk_store(store: Any) -> bool:
@@ -191,9 +199,9 @@ def _flush_native_cells(
     # is not safe to enter from the workers.
     with warnings.catch_warnings():
         warnings.simplefilter("ignore", UnstableSpecificationWarning)
-        if len(by_array) == 1:
-            (array_name, cells), = by_array.items()
-            _flush_one_array(zarr_group, array_name, cells)
+        if len(by_array) == 1 or _NO_THREADS:
+            for array_name, cells in by_array.items():
+                _flush_one_array(zarr_group, array_name, cells)
             return
         with ThreadPoolExecutor(
             max_workers=min(_FLUSH_MAX_WORKERS, len(by_array)),

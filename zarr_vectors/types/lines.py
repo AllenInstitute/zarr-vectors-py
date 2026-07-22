@@ -13,7 +13,7 @@ chunk needs none, since its two endpoints are already sequential.
 
 from __future__ import annotations
 
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import numpy as np
 import numpy.typing as npt
@@ -78,6 +78,9 @@ from zarr_vectors.typing import (
     ObjectManifest,
     FragmentRef,
 )
+
+if TYPE_CHECKING:
+    from zarr_vectors.core.store import ReadSource
 
 
 def write_lines(
@@ -359,7 +362,7 @@ def write_lines(
 
 
 def read_lines(
-    store_path: str,
+    store_path: ReadSource,
     *,
     level: int = 0,
     object_ids: list[int] | None = None,
@@ -370,7 +373,8 @@ def read_lines(
     """Read finite lines from a zarr vectors store.
 
     Args:
-        store_path: Path to the store.
+        store_path: URL or path to the store, a pre-built zarr Store,
+            or an already-open Group.
         level: Resolution level.
         object_ids: Optional list of line (object) IDs to read.
         bbox: Optional bounding box filter (lines with any endpoint
