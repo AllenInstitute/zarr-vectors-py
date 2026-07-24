@@ -9,8 +9,28 @@ everywhere in the package.
 # Format version
 # ---------------------------------------------------------------------------
 
-FORMAT_VERSION: str = "0.8.1"
+FORMAT_VERSION: str = "0.9.0"
 """Current ZV specification version.
+
+0.9.0: single-array layout for every per-spatial-chunk array.  Each
+logical array — ``vertices``, ``vertex_fragments``, ``link_fragments``,
+``links/<delta>``, ``vertex_attributes/<name>``,
+``fragment_attributes/<name>``, ``link_attributes/<name>/<delta>`` — is
+now ONE Zarr v3 vlen-bytes array whose shape is the level's chunk grid
+(``<array>/zarr.json`` + one chunk file per cell at ``<array>/c/i/j/k``),
+replacing the previous "Option G" layout where every spatial chunk was
+its own single-chunk ``uint8`` sub-array under a per-array group.  A
+spatial chunk at absolute coord ``c`` lands in cell ``c - origin`` where
+``origin = floor(min_corner / chunk_shape)`` is stored as the array's
+``chunk_grid_origin`` attribute (absent ⇒ zero origin); this lets data
+with negative coordinates map onto a 0-indexed array.  Non-empty cells
+are tracked in the array's ``nonempty_chunks`` attribute for O(1)
+enumeration.  ``cross_chunk_links`` / ``cross_chunk_link_attributes``
+keep the per-cell layout (their keys are canonical-sorted endpoint
+tuples, not spatial grid coords).  Optional ``shard_shape=`` wraps the
+cells in the Zarr v3 ``sharding_indexed`` codec.  Hard break: 0.8.x
+stores wrote per-chunk sub-arrays and cannot be read; rewrite from
+source.
 
 0.8.1: flat single-array layout for dense / ragged blobs.  Removes the
 ``group-with-data-child`` pattern used by every non-spatial array
@@ -320,17 +340,6 @@ VALID_ENCODINGS: frozenset[str] = frozenset({
     ENCODING_RAW,
     ENCODING_DRACO,
 })
-
-# ---------------------------------------------------------------------------
-# Default compression
-# ---------------------------------------------------------------------------
-
-DEFAULT_COMPRESSOR: str = "blosc"
-DEFAULT_COMPRESSOR_OPTS: dict[str, object] = {
-    "cname": "zstd",
-    "clevel": 5,
-    "shuffle": 1,  # SHUFFLE_BYTE
-}
 
 # ---------------------------------------------------------------------------
 # Multi-resolution defaults

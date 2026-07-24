@@ -2,12 +2,11 @@
 
 Icechunk (https://icechunk.io/) is a transactional Zarr v3 store that
 wraps an underlying object store (local FS, S3, GCS, Azure) and
-provides commit-style versioning on top.  Unlike the byte-level
-:class:`~zarr_vectors.core.backends.base.StorageBackend` protocol
-implementations (``local`` / ``obstore`` / ``fsspec``), icechunk is a
-**Zarr-Store-level** backend: it returns a ``zarr.abc.store.Store``
-that gets handed directly to :func:`zarr.open_group` without any ZV
-shim in between.
+provides commit-style versioning on top.  Like the other backends it
+returns a plain ``zarr.abc.store.Store`` (here a
+:class:`icechunk.Session` store) that gets handed directly to
+:func:`zarr.open_group`; the difference is the transactional
+session/commit model layered on top.
 
 This module's only public surface is :func:`make_icechunk_session`,
 which:
@@ -35,13 +34,25 @@ Install with::
 
 from __future__ import annotations
 
+import os
 from typing import Any, Literal
-from urllib.parse import urlparse
+from urllib.parse import unquote, urlparse
 
 from zarr_vectors.exceptions import StoreError
 
 
 _OpenMode = Literal["w", "r", "r+", "a"]
+
+
+def _file_url_to_path(url: str) -> str:
+    """Parse a ``file://`` URL to a local filesystem path string."""
+    parsed = urlparse(url)
+    p = unquote(parsed.path)
+    # On Windows, ``file:///C:/foo`` parses to path='/C:/foo' — strip the
+    # leading slash before the drive letter.
+    if os.name == "nt" and len(p) > 2 and p[0] == "/" and p[2] == ":":
+        p = p[1:]
+    return p
 
 
 def _import_icechunk():
@@ -72,8 +83,6 @@ def _make_storage(url: str, ic, **kwargs: Any):
     if scheme in ("", "file"):
         # Local filesystem icechunk.  Strip ``file://`` if present.
         if scheme == "file":
-            from zarr_vectors.core.backends.local import _file_url_to_path
-
             path = str(_file_url_to_path(url))
         else:
             path = url

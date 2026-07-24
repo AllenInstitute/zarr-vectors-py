@@ -39,14 +39,20 @@ def _new_store(prefix: str) -> Path:
     return Path(tempfile.mkdtemp(prefix=f"codec_{prefix}_")) / "store.zarrvectors"
 
 
-def _read_first_chunk_codecs(store: Path) -> list[dict]:
-    """Return the ``codecs`` list from the first vertex-chunk ``zarr.json``."""
-    vertices_dir = store / "0" / "vertices"
-    for chunk in sorted(vertices_dir.iterdir()):
-        inner = chunk / "zarr.json"
-        if inner.exists():
-            return json.loads(inner.read_text())["codecs"]
-    raise RuntimeError(f"no vertex chunks under {vertices_dir}")
+def _read_vertices_codecs(store: Path) -> list[dict]:
+    """Return the ``codecs`` list of the single ``vertices`` vlen array.
+
+    Under the single-array layout ``vertices`` is one Zarr v3 vlen-bytes
+    array; its ``codecs`` are the ``vlen-bytes`` serializer followed by
+    any BytesBytes compressor the writer applied.
+    """
+    meta = json.loads((store / "0" / "vertices" / "zarr.json").read_text())
+    return meta["codecs"]
+
+
+def _compressor_codecs(codecs: list[dict]) -> list[dict]:
+    """Drop the ``vlen-bytes`` serializer, leaving only compressors."""
+    return [c for c in codecs if c.get("name") != "vlen-bytes"]
 
 
 def _sorted_positions(p: np.ndarray) -> np.ndarray:
@@ -108,8 +114,9 @@ def test_write_points_default_is_uncompressed(positions: np.ndarray) -> None:
     """
     store = _new_store("default")
     write_points(store, positions, chunk_shape=CHUNK, bin_shape=BIN)
-    codecs = _read_first_chunk_codecs(store)
-    assert codecs == [{"name": "bytes"}]
+    codecs = _read_vertices_codecs(store)
+    # vlen-bytes serializer, no compressor.
+    assert [c["name"] for c in codecs] == ["vlen-bytes"]
     out = read_points(store)
     assert np.allclose(
         _sorted_positions(positions),
@@ -123,9 +130,9 @@ def test_write_points_zstd_round_trips(positions: np.ndarray) -> None:
     write_points(
         store, positions, chunk_shape=CHUNK, bin_shape=BIN, compressor="zstd",
     )
-    codecs = _read_first_chunk_codecs(store)
-    assert codecs[0]["name"] == "bytes"
-    assert codecs[1]["name"] == "zstd"
+    codecs = _read_vertices_codecs(store)
+    compressors = _compressor_codecs(codecs)
+    assert compressors[0]["name"] == "zstd"
     out = read_points(store)
     assert np.allclose(
         _sorted_positions(positions),
@@ -138,10 +145,10 @@ def test_write_points_blosc_shorthand_round_trips(positions: np.ndarray) -> None
     write_points(
         store, positions, chunk_shape=CHUNK, bin_shape=BIN, compressor="blosc",
     )
-    codecs = _read_first_chunk_codecs(store)
-    assert codecs[0]["name"] == "bytes"
-    assert codecs[1]["name"] == "blosc"
-    assert codecs[1]["configuration"]["shuffle"] == "bitshuffle"
+    codecs = _read_vertices_codecs(store)
+    compressors = _compressor_codecs(codecs)
+    assert compressors[0]["name"] == "blosc"
+    assert compressors[0]["configuration"]["shuffle"] == "bitshuffle"
     out = read_points(store)
     assert np.allclose(
         _sorted_positions(positions),
@@ -159,10 +166,10 @@ def test_write_points_custom_list_passes_through(positions: np.ndarray) -> None:
     write_points(
         store, positions, chunk_shape=CHUNK, bin_shape=BIN, compressor=custom,
     )
-    codecs = _read_first_chunk_codecs(store)
-    assert codecs[0] == {"name": "bytes"}
-    assert codecs[1]["name"] == "blosc"
-    assert codecs[1]["configuration"]["cname"] == "lz4"
+    codecs = _read_vertices_codecs(store)
+    compressors = _compressor_codecs(codecs)
+    assert compressors[0]["name"] == "blosc"
+    assert compressors[0]["configuration"]["cname"] == "lz4"
     out = read_points(store)
     assert np.allclose(
         _sorted_positions(positions),

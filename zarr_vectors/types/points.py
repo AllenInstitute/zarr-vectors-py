@@ -352,9 +352,15 @@ def write_points(
     # the array's grid cells (bypassing the batched queue).  See
     # :meth:`zarr_vectors.core.group.Group.native_sharded_arrays`.
     from zarr_vectors.core.arrays import open_write_session
+    # When chunking by an attribute, every chunk key gains a leading
+    # attr-bin axis, so the vlen array's grid needs that extra rank.
+    session_bin_count = (
+        len(attr_bin_values) if attr_bins is not None else None
+    )
     with open_write_session(
         level_group, compressor=compressor, shard_shape=shard_shape,
         bounds=bounds_list, chunk_shape=chunk_shape,
+        bin_count=session_bin_count,
     ):
         create_vertices_array(level_group, dtype=dtype)
 

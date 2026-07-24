@@ -25,22 +25,18 @@ from zarr_vectors.exceptions import StoreError
 obstore = pytest.importorskip("obstore")
 
 
-def test_obstore_helper_returns_objectstore(tmp_path):
-    store, session = _make_obstore_zarr_store(str(tmp_path), mode="r+")
+def test_obstore_helper_returns_objectstore():
+    # obstore.store.from_url handles the scheme dispatch; memory:// is a
+    # dependency-free target that yields a usable ObjectStore.
+    store, session = _make_obstore_zarr_store("memory:///x", mode="r+")
     assert session is None
     assert isinstance(store, _ZStore)
     assert store.read_only is False
 
 
-def test_obstore_helper_read_only(tmp_path):
-    tmp_path.mkdir(parents=True, exist_ok=True)
-    store, _ = _make_obstore_zarr_store(str(tmp_path), mode="r")
+def test_obstore_helper_read_only():
+    store, _ = _make_obstore_zarr_store("memory:///x", mode="r")
     assert store.read_only is True
-
-
-def test_obstore_helper_rejects_unknown_scheme():
-    with pytest.raises(StoreError, match="unsupported URL scheme"):
-        _make_obstore_zarr_store("weird://host/path", mode="r")
 
 
 def test_fsspec_helper_returns_fsspecstore(tmp_path):

@@ -157,10 +157,9 @@ def _attr_names_for_level(session: EditSession, level: int) -> list[str]:
     """Return the per-vertex attribute names at ``level``, cached on
     the session for the lifetime of the with-block.
 
-    Resolves via the level group's underlying zarr handle: the
-    ``vertex_attributes/`` directory is not a proper zarr group (no
-    zarr.json metadata) — ``Group.__contains__`` returns ``False`` —
-    so we walk the store keys directly to enumerate attribute names.
+    Resolves via the level group's underlying zarr handle by walking
+    the store keys under ``<level>/vertex_attributes/`` directly (its
+    own ``zarr.json`` and other reserved entries are filtered out).
     Synchronous; safe to call from any sync code path including
     running event loops (no asyncio.run).
     """
@@ -185,9 +184,16 @@ def _list_attr_names_from_store_sync(
     rather than O(N_attrs × N_chunks) as the previous prefix-walk
     implementation paid.  Falls back to ``list_prefix`` when
     ``list_dir`` is unavailable.
+
+    ``vertex_attributes/`` is a proper Zarr group (it holds one vlen
+    array per attribute), so its own ``zarr.json`` node metadata appears
+    among the children and must be filtered out — it is not an attribute.
     """
     from zarr_vectors.constants import VERTEX_ATTRIBUTES
     from zarr_vectors.core.store import get_resolution_level
+
+    # Zarr-reserved child entries that are never attribute names.
+    reserved = {"zarr.json", ".zgroup", ".zarray", ".zattrs", "c"}
 
     try:
         level_group = get_resolution_level(session.root, level)
@@ -211,7 +217,7 @@ def _list_attr_names_from_store_sync(
     if sync is not None and hasattr(store, "list_dir"):
         try:
             for entry in sync(store.list_dir(base)):
-                if entry and not entry.startswith("."):
+                if entry and not entry.startswith(".") and entry not in reserved:
                     names.add(str(entry))
             return sorted(names)
         except Exception:
@@ -232,7 +238,7 @@ def _list_attr_names_from_store_sync(
             if not tail:
                 continue
             name = tail.split("/", 1)[0]
-            if name and not name.startswith("."):
+            if name and not name.startswith(".") and name not in reserved:
                 out.add(name)
         return out
 

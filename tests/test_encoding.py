@@ -12,10 +12,6 @@ from zarr_vectors.encoding.ragged import (
     encode_ragged_ints,
     encode_ragged_floats,
 )
-from zarr_vectors.encoding.compression import (
-    get_codec_pipeline,
-    get_default_compressor,
-)
 from zarr_vectors.exceptions import ArrayError
 
 
@@ -167,40 +163,3 @@ class TestRaggedBlob:
         decoded = decode_ragged_blob(blob, np.dtype(np.int64), ncols=2)
         assert decoded == []
 
-
-# ---------------------------------------------------------------------------
-# Compression config
-# ---------------------------------------------------------------------------
-
-class TestCompressionConfig:
-
-    def test_default_compressor_vertices(self) -> None:
-        cfg = get_default_compressor("vertices")
-        assert cfg["id"] == "blosc"
-        assert cfg["cname"] == "zstd"
-
-    def test_default_compressor_links(self) -> None:
-        cfg = get_default_compressor("links")
-        assert cfg["id"] == "blosc"
-        assert cfg["shuffle"] == 2  # bitshuffle for correlated ints
-
-    def test_codec_pipeline_raw(self) -> None:
-        pipeline = get_codec_pipeline("vertices", encoding="raw")
-        assert len(pipeline) >= 1
-        assert pipeline[0]["id"] == "blosc"
-
-    def test_codec_pipeline_draco_no_compression(self) -> None:
-        pipeline = get_codec_pipeline("vertices", encoding="draco")
-        assert len(pipeline) == 0  # draco is already compressed
-
-    def test_codec_pipeline_draco_with_override(self) -> None:
-        pipeline = get_codec_pipeline(
-            "vertices", encoding="draco",
-            compression="gzip", compression_opts={"clevel": 1}
-        )
-        assert len(pipeline) == 1
-        assert pipeline[0]["id"] == "gzip"
-
-    def test_codec_pipeline_no_compression(self) -> None:
-        pipeline = get_codec_pipeline("vertices", encoding="raw", compression="none")
-        assert len(pipeline) == 0

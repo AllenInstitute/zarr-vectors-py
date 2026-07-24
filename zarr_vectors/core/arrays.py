@@ -167,6 +167,20 @@ def _short_circuit_existing(
     ):
         return False
 
+    # A single vlen array already exists but an explicit session wants a
+    # different layout (e.g. the warm-created unsharded ``vertices`` is
+    # now being written with ``shard_shape=``).  Fall through so
+    # ``_ensure_array_dir`` recreates it to match the requested layout.
+    if (
+        exists_as_array
+        and level_group._native_sharded_config is not None
+        and _is_per_chunk_array(full_name)
+        and not _array_matches_layout(
+            level_group, full_name, level_group._native_sharded_config
+        )
+    ):
+        return False
+
     if exist_ok:
         return True
     raise ArrayError(
@@ -208,37 +222,172 @@ def _default_fill_value_for_dtype(dtype: np.dtype) -> Any:
     )
 
 
-def _ensure_array_dir(level_group: FsGroup, array_name: str) -> None:
-    """Ensure an array subdirectory exists within a level group.
+_UNSET = object()
 
-    Three layouts are produced here depending on context:
 
-    * Inside :meth:`Group.native_sharded_arrays` (per-chunk arrays only)
-      — allocate a single multidim vlen-bytes Zarr array at the path
-      using the ``sharding_indexed`` codec.  Subsequent ``write_bytes``
-      calls land in this array's grid-coord cells.
-    * Inside :meth:`Group.batched_writes` — skip the sync
-      ``require_group`` round-trip; the metadata flush will PUT the
-      parent ``zarr.json`` directly, including the right attributes,
-      in the same gather as the chunk PUTs.
-    * Otherwise — create an empty Zarr group at the path so subsequent
-      ``write_array_meta`` (which only ``attrs.update``s, not create)
-      has a target.
+def _derive_native_config(level_group: FsGroup) -> dict[str, Any] | None:
+    """Best-effort single-array grid config from the store's metadata.
+
+    Lets writers that don't open an explicit
+    :func:`open_write_session` (multiresolution coarsen, rechunk, lazy
+    append, in-place edits that add a new array) still produce the
+    single vlen-array layout.  Derives ``(origin, grid_shape)`` from the
+    root ``bounds`` and the level's effective ``chunk_shape``; returns
+    ``None`` (→ fall back to the per-cell group primitive) when the
+    metadata can't be read (e.g. a bare ``Group`` in a low-level test).
+
+    Cached on the ``level_group`` instance for the object's lifetime.
     """
-    cfg = level_group._native_sharded_config
+    cached = level_group.__dict__.get("_derived_native_config", _UNSET)
+    if cached is not _UNSET:
+        return cached
+
+    cfg: dict[str, Any] | None
+    try:
+        import zarr
+
+        from zarr_vectors.core.metadata import (
+            LevelMetadata,
+            get_level_chunk_shape,
+        )
+        from zarr_vectors.core.store import read_root_metadata
+
+        store = level_group._zarr.store
+        root_zarr = zarr.open_group(store, path="/", mode="r")
+        root_group = type(level_group)._from_zarr(root_zarr)
+        root_meta = read_root_metadata(root_group)
+        try:
+            level_meta = LevelMetadata.from_dict(level_group.attrs.to_dict())
+        except Exception:
+            level_meta = None
+        chunk_shape = get_level_chunk_shape(root_meta, level_meta)
+        origin, grid_shape = level_grid_layout(root_meta.bounds, chunk_shape)
+        cfg = {
+            "origin": origin,
+            "grid_shape": grid_shape,
+            "shard_shape": None,
+        }
+    except Exception:
+        cfg = None
+
+    level_group.__dict__["_derived_native_config"] = cfg
+    return cfg
+
+
+def _ensure_array_dir(level_group: FsGroup, array_name: str) -> None:
+    """Ensure an array node exists within a level group.
+
+    For per-spatial-chunk arrays (vertices, fragments, links/<delta>,
+    attribute arrays) this allocates a single multidim vlen-bytes Zarr
+    array (one cell per spatial chunk) — the default single-array
+    layout.  The grid comes from the active :func:`open_write_session`
+    when one is open, else it is derived from the store's metadata (so
+    coarsen / rechunk / edit paths get single-array too).
+
+    Non-per-chunk names (``cross_chunk_links``, ``object_index``,
+    attribute *namespace* groups) become plain Zarr groups.  Under an
+    active :meth:`Group.batched_writes`, the sync ``require_group``
+    round-trip is skipped — the metadata flush PUTs the parent
+    ``zarr.json`` directly.
+    """
+    explicit_cfg = level_group._native_sharded_config
+    cfg = explicit_cfg
+    if cfg is None and _is_per_chunk_array(array_name):
+        # No explicit session — derive the grid from metadata so this
+        # write path still produces a single vlen array.
+        cfg = _derive_native_config(level_group)
     if cfg is not None and _is_per_chunk_array(array_name):
-        # Idempotent: if the sharded array already exists at this path
-        # (e.g. a second writer pass on the same level), leave it alone.
-        if not level_group.standalone_array_exists(array_name):
-            level_group.create_sharded_chunk_array(
-                array_name,
-                grid_shape=cfg["grid_shape"],
-                shard_shape=cfg["shard_shape"],
+        if level_group.standalone_array_exists(array_name):
+            # An array is already here.  Under the derived path (no
+            # explicit session) always reuse it — recreating would drop
+            # existing cells (e.g. an edit adding a chunk).  Under an
+            # explicit session, reuse only when the on-disk layout
+            # already matches the requested grid/sharding; otherwise
+            # recreate to honor the writer's intent (e.g. a store whose
+            # ``vertices`` was warm-created unsharded but is now being
+            # written with ``shard_shape=``).
+            if explicit_cfg is None or _array_matches_layout(
+                level_group, array_name, explicit_cfg
+            ):
+                return
+        # Honor the session compressor so the array's codec pipeline
+        # matches the batched default (no compression) unless the
+        # caller asked for zstd/blosc.
+        compressors = None
+        if level_group._active_codecs is not None:
+            from zarr_vectors.encoding.compression import (
+                codecs_for_create_array,
             )
+            compressors = codecs_for_create_array(
+                level_group._active_codecs
+            )
+        level_group.create_sharded_chunk_array(
+            array_name,
+            grid_shape=cfg["grid_shape"],
+            shard_shape=cfg["shard_shape"],
+            origin=cfg.get("origin"),
+            compressors=compressors,
+        )
         return
     if level_group._pending_array_metas is not None:
         return
     level_group.require_group(array_name)
+
+
+def _array_matches_layout(
+    level_group: FsGroup, array_name: str, cfg: dict[str, Any],
+) -> bool:
+    """Whether an existing single vlen array can be reused as-is under an
+    explicit session, rather than recreated to match ``cfg``.
+
+    An **empty** array (no cells written) is never a match: it is
+    recreated so it picks up the session's full config — grid shape,
+    sharding, *and* codec pipeline.  This is what lets a store whose
+    ``vertices`` was warm-created (unsharded, uncompressed) by
+    :func:`create_store` be rewritten with ``shard_shape=`` or
+    ``compressor=``.  A non-empty array is reused only when its grid and
+    sharded-ness already match (a legit second writer pass), so its data
+    is preserved.
+    """
+    existing = level_group._sharded_chunk_array(array_name)
+    if existing is None:
+        return False
+    if not existing.attrs.get("nonempty_chunks"):
+        return False
+    desired_sharded = cfg.get("shard_shape") is not None
+    existing_sharded = getattr(existing, "shards", None) is not None
+    return (
+        tuple(existing.shape) == tuple(cfg["grid_shape"])
+        and existing_sharded == desired_sharded
+    )
+
+
+def level_grid_layout(
+    bounds: tuple[list[float], list[float]],
+    chunk_shape: tuple[float, ...],
+) -> tuple[tuple[int, ...], tuple[int, ...]]:
+    """Return ``(origin, grid_shape)`` for a level's single vlen arrays.
+
+    :func:`zarr_vectors.spatial.chunking.assign_chunks` maps a position
+    to the *absolute* coord ``floor(pos / chunk_shape)``.  When the data
+    extends below the origin (negative positions), those coords are
+    negative — which a 0-indexed Zarr array cannot hold directly.  We
+    therefore anchor the array at ``origin = floor(min_corner /
+    chunk_shape)`` (per axis) and store that offset on the array, so
+    cell ``index = coord - origin`` and the array only needs to span
+    ``floor(max_corner / chunk_shape) - origin + 1`` cells.  Using
+    ``ceil(max_corner / chunk_shape)`` would also be one short whenever a
+    point lands exactly on a chunk boundary — ``floor(..) + 1`` is exact.
+    """
+    min_corner = np.asarray(bounds[0], dtype=np.float64)
+    max_corner = np.asarray(bounds[1], dtype=np.float64)
+    cs = np.asarray(chunk_shape, dtype=np.float64)
+    origin = tuple(int(np.floor(mn / c)) for mn, c in zip(min_corner, cs))
+    grid_shape = tuple(
+        max(1, int(np.floor(mx / c)) - o + 1)
+        for mx, c, o in zip(max_corner, cs, origin)
+    )
+    return origin, grid_shape
 
 
 @contextmanager
@@ -249,74 +398,83 @@ def open_write_session(
     shard_shape: int | tuple[int, ...] | None = None,
     bounds: tuple[list[float], list[float]] | None = None,
     chunk_shape: tuple[float, ...] | None = None,
+    bin_count: int | None = None,
 ):
-    """Open the batched-write context (and native-sharded context when
-    ``shard_shape`` is set) used by every type writer.
+    """Open the write session used by every type writer.
 
-    ``shard_shape`` accepts an int (broadcast to every axis) or an
-    explicit per-axis tuple.  When provided, ``bounds`` and
-    ``chunk_shape`` are required so the grid shape can be computed
-    upfront — that's the size of the multidim vlen-bytes array each
-    per-chunk path is allocated as.
+    Always activates the single-array layout: each per-spatial-chunk
+    array (vertices, vertex_fragments, links/<delta>, link_fragments,
+    vertex_attributes/<name>, …) is one multidim vlen-bytes Zarr array
+    whose cells are spatial chunks (files at ``<array>/c/i/j/k``), and a
+    batched-write context flushes every cell of an array in one
+    concurrent :meth:`~zarr.Array.set_coordinate_selection`.
+
+    ``bounds`` and ``chunk_shape`` are required so the chunk-grid extent
+    (and origin offset, for data with negative coords) can be sized
+    upfront — that's the shape of each vlen array.
 
     Args:
         level_group: The resolution-level group.
-        compressor: Forwarded to :meth:`Group.batched_writes`.
-        shard_shape: When set, activates
-            :meth:`Group.native_sharded_arrays` so per-chunk-array
-            creations route through the ``sharding_indexed`` codec
-            and per-chunk writes land directly in array cells.
+        compressor: Forwarded to :meth:`Group.batched_writes`; also
+            determines each array's on-disk codec pipeline (``None`` →
+            no compression, the default).
+        shard_shape: ``None`` (default) → unsharded, one storage object
+            per spatial chunk.  An int (broadcast to every axis) or a
+            per-axis tuple wraps the cells in the ``sharding_indexed``
+            codec so many chunks pack into one storage object.
         bounds: ``(min_corner, max_corner)`` for the level — used to
-            compute the chunk grid extent.
+            compute the chunk grid extent and origin.
         chunk_shape: Physical chunk size per axis — paired with
             ``bounds`` for the grid extent.
+        bin_count: When the writer chunks by an attribute, every chunk
+            key gains a leading attr-bin axis; pass the number of bins
+            so the vlen array grid gets that extra leading axis
+            (origin 0, extent ``bin_count``).
     """
     from contextlib import ExitStack
+
+    if bounds is None or chunk_shape is None:
+        raise ArrayError(
+            "open_write_session requires `bounds` and `chunk_shape` so "
+            "the per-axis chunk-grid extent can be computed"
+        )
+
+    origin, grid_shape = level_grid_layout(bounds, chunk_shape)
+    if bin_count is not None:
+        # chunk_by_attribute prepends a 0-based bin axis to every key.
+        origin = (0, *origin)
+        grid_shape = (int(bin_count), *grid_shape)
+
+    ss: tuple[int, ...] | None
+    if shard_shape is None:
+        ss = None
+    elif isinstance(shard_shape, int):
+        ss = (int(shard_shape),) * len(grid_shape)
+    else:
+        ss = tuple(int(x) for x in shard_shape)
 
     stack = ExitStack()
     with stack:
         stack.enter_context(level_group.batched_writes(compressor=compressor))
-        if shard_shape is not None:
-            if bounds is None or chunk_shape is None:
-                raise ArrayError(
-                    "shard_shape requires `bounds` and `chunk_shape` so "
-                    "the per-axis chunk-grid extent can be computed"
-                )
-            # Chunk coords are origin-anchored: ``floor(position /
-            # chunk_shape)``.  The grid must therefore size to
-            # ``ceil(max_corner / chunk_shape)``, *not* the extent
-            # ``ceil((max - min) / chunk_shape)`` — bounds that don't
-            # start at zero would otherwise yield coords past the end.
-            max_corner = np.asarray(bounds[1], dtype=np.float64)
-            cs = np.asarray(chunk_shape, dtype=np.float64)
-            grid_shape = tuple(
-                max(1, int(np.ceil(m / c))) for m, c in zip(max_corner, cs)
-            )
-            ss = (
-                (int(shard_shape),) * len(grid_shape)
-                if isinstance(shard_shape, int)
-                else tuple(int(x) for x in shard_shape)
-            )
-            stack.enter_context(
-                level_group.native_sharded_arrays(ss, grid_shape)
-            )
+        stack.enter_context(
+            level_group.native_sharded_arrays(ss, grid_shape, origin=origin)
+        )
         yield
 
 
 def _is_per_chunk_array(name: str) -> bool:
-    """Whether ``name`` points to a per-spatial-chunk array container.
+    """Whether ``name`` is a per-spatial-chunk array.
 
-    These are the Option-G groups whose children are chunk-key-named
-    byte blobs — the arrays that benefit from native sharding because
-    each spatial chunk is one tiny storage object without it.  Object-
-    level arrays (``object_index``, ``object_attributes/...``, groups,
-    ``group_attributes/...``) use the single-array layout already and
-    do **not** get rewritten.
+    These become a single vlen-bytes Zarr array whose shape is the
+    level's chunk grid — one cell per spatial chunk (file at
+    ``<name>/c/i/j/k``).  Object-level arrays (``object_index``,
+    ``object_attributes/...``, ``groups``, ``group_attributes/...``) are
+    plain single arrays that do **not** use this grid layout.
 
-    ``cross_chunk_links/<delta>`` is excluded for now — its "cell keys"
-    are canonical-sorted endpoint chunk-pair tuples, not single-chunk
-    spatial coords, so the grid shape doesn't match the spatial
-    chunk grid.  Callers who need those sharded can apply
+    ``cross_chunk_links/<delta>`` (and its attributes) is excluded — its
+    cell keys are canonical-sorted endpoint chunk-pair tuples, not
+    single-chunk spatial coords, so it keeps the per-cell layout.
+    Callers who need those sharded can apply
     :func:`zarr_vectors.sharding.shard_store` post-hoc.
     """
     if name in {VERTICES, VERTEX_FRAGMENTS, LINK_FRAGMENTS}:

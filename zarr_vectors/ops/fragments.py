@@ -319,7 +319,8 @@ def partition_fragment_rows(
     try:
         level_group = get_resolution_level(root, builder.level)
         if VERTEX_ATTRIBUTES in level_group:
-            for name in level_group[VERTEX_ATTRIBUTES]:
+            # Attributes are single vlen arrays → enumerate via children().
+            for name in level_group[VERTEX_ATTRIBUTES].children():
                 builder.require_attribute(root, name)
     except Exception:
         pass

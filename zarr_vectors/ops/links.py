@@ -1265,7 +1265,8 @@ def _list_fragment_attribute_names(level_group) -> list:
     if g is None:
         return []
     try:
-        return sorted(list(g.group_keys()))
+        # fragment_attributes/<name> are single vlen arrays.
+        return sorted(set(g.array_keys()) | set(g.group_keys()))
     except Exception:
         try:
             return sorted([k for k in g.keys()])
@@ -1287,9 +1288,11 @@ def _list_link_attribute_names(level_group, *, delta: int = 0) -> list:
             sub = g.get(name)
             if sub is None:
                 continue
-            # delta="0" is a subgroup under each name in v0.6 layout.
+            # link_attributes/<name>/<delta> is a single vlen array, so
+            # the delta child lives under array_keys (not group_keys).
             try:
-                if str(delta) in list(sub.group_keys()):
+                delta_children = set(sub.array_keys()) | set(sub.group_keys())
+                if str(delta) in delta_children:
                     names.append(name)
             except Exception:
                 continue

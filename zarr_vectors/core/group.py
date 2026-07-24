@@ -60,12 +60,14 @@ class Group:
     # Consumed by :meth:`write_bytes` and the batched flush in
     # :mod:`zarr_vectors.core._batch_writer`.
     _active_codecs: list[dict[str, Any]] | None = None
-    # When set, per-chunk-array creations route through the native
-    # ``sharding_indexed`` codec instead of the legacy Option-G layout.
-    # Set by :meth:`native_sharded_arrays`; the dict holds ``shard_shape``
-    # and ``grid_shape``.  Used by ``arrays._ensure_array_dir`` and the
+    # When set, per-chunk-array creations produce a single multidim
+    # vlen-bytes Zarr array (one cell per spatial chunk) instead of the
+    # legacy Option-G group-of-tiny-arrays.  Set by
+    # :meth:`native_sharded_arrays`; the dict holds ``grid_shape`` and
+    # ``shard_shape`` (``None`` = unsharded, one storage object per chunk
+    # — the default layout).  Used by ``arrays._ensure_array_dir`` and the
     # ``write_bytes`` / ``write_array_meta`` dispatch on this class.
-    _native_sharded_config: dict[str, tuple[int, ...]] | None = None
+    _native_sharded_config: dict[str, tuple[int, ...] | None] | None = None
 
     def __init__(self, zarr_group: zarr.Group) -> None:
         self._zarr = zarr_group
@@ -175,29 +177,38 @@ class Group:
     # layout they're talking to.
 
     def write_bytes(self, array_name: str, chunk_key: str, data: bytes) -> None:
-        # Native-sharded fast path: a single Zarr Array at ``array_name``
-        # means we're talking to the standard ``sharding_indexed`` layout.
-        # The chunk's bytes live in one cell of that multidim vlen-bytes
-        # array; the sharding codec packs many such cells per shard file.
-        # Checked BEFORE the batched-write queue so that writers running
-        # under :meth:`native_sharded_arrays` always reach the array
-        # cells, even if an outer :meth:`batched_writes` is open.
+        # Single-array layout: a Zarr Array at ``array_name`` is the
+        # multidim vlen-bytes array whose cells are spatial chunks.  This
+        # is the layout produced under :meth:`native_sharded_arrays` for
+        # every per-spatial-chunk array (vertices, fragments, links, …).
         sharded_arr = self._sharded_chunk_array(array_name)
         if sharded_arr is not None:
             coords = _parse_chunk_coords(chunk_key)
             if coords is None:
                 raise StoreError(
-                    f"Cannot write to native-sharded array {array_name!r}: "
+                    f"Cannot write to array {array_name!r}: "
                     f"chunk_key {chunk_key!r} is not a coord tuple"
                 )
-            _check_coords_in_bounds(coords, sharded_arr.shape, array_name)
-            _vlen_set_cell(sharded_arr, coords, bytes(data))
+            index = _coord_to_index(coords, _grid_origin(sharded_arr))
+            _check_coords_in_bounds(index, sharded_arr.shape, array_name)
+            # Batched mode: queue the cell write; the batch flush writes
+            # every cell of an array in one concurrent
+            # ``set_coordinate_selection`` and stamps ``nonempty_chunks``
+            # once (see :mod:`zarr_vectors.core._batch_writer`).
+            if self._pending_writes is not None:
+                self._pending_writes.append((array_name, chunk_key, bytes(data)))
+                return
+            _vlen_set_cell(sharded_arr, index, bytes(data))
             _record_nonempty_chunk(sharded_arr, chunk_key, present=bool(data))
             return
 
-        # Batched-write mode (see :meth:`batched_writes`): defer until
-        # the context manager flushes all queued PUTs concurrently.
-        # Batched writes target the legacy Option-G layout only.
+        # Per-cell primitive: ``array_name`` is a Zarr Group whose
+        # children are single-chunk ``uint8`` arrays, one per key.  This
+        # is retained ONLY for ``cross_chunk_links`` / ``…_attributes``,
+        # whose cell keys are canonical-sorted endpoint tuples (not
+        # spatial grid coords) and so cannot map onto a grid-shaped
+        # array.  Spatial per-chunk arrays never reach here — they are
+        # pre-created as single vlen arrays by ``_ensure_array_dir``.
         if self._pending_writes is not None:
             self._pending_writes.append((array_name, chunk_key, bytes(data)))
             return
@@ -346,45 +357,58 @@ class Group:
     @contextmanager
     def native_sharded_arrays(
         self,
-        shard_shape: tuple[int, ...],
+        shard_shape: tuple[int, ...] | None,
         grid_shape: tuple[int, ...],
+        *,
+        origin: tuple[int, ...] | None = None,
     ) -> Iterator[None]:
-        """Make subsequent per-chunk-array creations native-sharded.
+        """Make subsequent per-chunk-array creations single-array.
 
         Inside this block, every :func:`zarr_vectors.core.arrays._ensure_array_dir`
         call for a per-spatial-chunk array (vertices, vertex_fragments,
         links/<delta>, link_fragments, vertex_attributes/<name>,
         fragment_attributes/<name>) allocates a single multidim
-        vlen-bytes Zarr array at that path using Zarr v3's
-        ``sharding_indexed`` codec — instead of the legacy Option-G
-        group-of-tiny-arrays.  Subsequent
-        :meth:`write_bytes` calls go through the grid-coord write
-        dispatch on this class, so callers don't need to change.
+        vlen-bytes Zarr array at that path — one cell per spatial chunk,
+        chunk files at ``<array>/c/i/j/k`` — instead of the legacy
+        Option-G group-of-tiny-arrays.  Subsequent :meth:`write_bytes`
+        calls go through the grid-coord write dispatch on this class, so
+        callers don't need to change.  This is the default layout opened
+        by :func:`zarr_vectors.core.arrays.open_write_session`.
 
         Args:
             shard_shape: Outer-chunk shape in *inner-chunk* units, e.g.
-                ``(8, 8, 8)``.  Length must match ``grid_shape``.
+                ``(8, 8, 8)``.  ``None`` (the default) means unsharded —
+                one storage object per spatial chunk.  When set, its
+                length must match ``grid_shape`` and the Zarr v3
+                ``sharding_indexed`` codec packs many cells per shard.
             grid_shape: Number of spatial chunks along each axis at
                 this level.  Compute via
                 :func:`zarr_vectors.spatial.chunking.compute_grid_shape`.
 
         Nesting is not supported; an inner call raises :class:`StoreError`.
-        The legacy ``batched_writes`` context can be active concurrently
-        — writes still route through the sharded path (the batched
-        queue's flush is a no-op when nothing is queued).
+        The ``batched_writes`` context can be active concurrently — cell
+        writes are queued and flushed together (see
+        :mod:`zarr_vectors.core._batch_writer`).
         """
         if self._native_sharded_config is not None:
             raise StoreError(
                 "native_sharded_arrays() does not support nesting"
             )
-        if len(shard_shape) != len(grid_shape):
+        if shard_shape is not None and len(shard_shape) != len(grid_shape):
             raise StoreError(
                 f"shard_shape rank {len(shard_shape)} != grid_shape "
                 f"rank {len(grid_shape)}"
             )
         self._native_sharded_config = {
-            "shard_shape": tuple(int(s) for s in shard_shape),
+            "shard_shape": (
+                None if shard_shape is None
+                else tuple(int(s) for s in shard_shape)
+            ),
             "grid_shape": tuple(int(g) for g in grid_shape),
+            "origin": (
+                None if origin is None
+                else tuple(int(o) for o in origin)
+            ),
         }
         try:
             yield
@@ -404,12 +428,16 @@ class Group:
         sharded_arr = self._sharded_chunk_array(array_name)
         if sharded_arr is not None:
             coords = _parse_chunk_coords(chunk_key)
-            if coords is None or not _coords_in_bounds(coords, sharded_arr.shape):
+            index = (
+                None if coords is None
+                else _coord_to_index(coords, _grid_origin(sharded_arr))
+            )
+            if index is None or not _coords_in_bounds(index, sharded_arr.shape):
                 raise StoreError(
                     f"Chunk {array_name!r}/{chunk_key!r} not found in "
                     f"{self._zarr.path or '<root>'}"
                 )
-            return _vlen_get_cell(sharded_arr, coords)
+            return _vlen_get_cell(sharded_arr, index)
 
         path = f"{array_name}/{chunk_key}"
         try:
@@ -436,9 +464,13 @@ class Group:
             # Fall back to inspecting the cell — slow path used when the
             # presence manifest is missing (e.g. mid-migration).
             coords = _parse_chunk_coords(chunk_key)
-            if coords is None or not _coords_in_bounds(coords, sharded_arr.shape):
+            index = (
+                None if coords is None
+                else _coord_to_index(coords, _grid_origin(sharded_arr))
+            )
+            if index is None or not _coords_in_bounds(index, sharded_arr.shape):
                 return False
-            return _vlen_get_cell(sharded_arr, coords) != b""
+            return _vlen_get_cell(sharded_arr, index) != b""
 
         return f"{array_name}/{chunk_key}" in self._zarr
 
@@ -647,6 +679,8 @@ class Group:
         grid_shape: tuple[int, ...],
         *,
         shard_shape: tuple[int, ...] | None = None,
+        origin: tuple[int, ...] | None = None,
+        compressors: list[dict[str, Any]] | None = None,
         attributes: dict[str, Any] | None = None,
     ) -> None:
         """Allocate a sharded vlen-bytes Zarr array for per-chunk blobs.
@@ -672,6 +706,13 @@ class Group:
                 legacy layout but already in the new structural form.
                 A typical cloud workload uses ``(8, 8, 8)``: 512 ZVF
                 chunks per storage object.
+            compressors: BytesBytes compressor list (already stripped of
+                the ``bytes`` serializer, i.e. the ``create_array``
+                ``compressors=`` form).  ``None`` leaves the codec
+                pipeline at vlen-bytes only (no compression) — matching
+                the historical default of the batched Option-G writer.
+                Pass ``[]`` for the same effect explicitly, or a
+                ``[{"name": "zstd", ...}]``-style list to compress.
             attributes: Per-array metadata merged into the array's
                 ``zarr.json`` ``attributes`` block (the standard Zarr
                 v3 location for user metadata).
@@ -697,6 +738,12 @@ class Group:
             "chunks": (1,) * ndim,
             "dtype": "bytes",
             "serializer": VLenBytesCodec(),
+            # Default to no compression (vlen-bytes only).  Omitting the
+            # kwarg would let zarr add its default zstd; we instead honor
+            # the session's resolved codecs so the layout matches the
+            # historical uncompressed default and only compresses when
+            # the caller asked for it.
+            "compressors": list(compressors) if compressors else [],
         }
         if shard_shape is not None:
             # Zarr 3.2 high-level ``shards=`` kwarg: wraps the inner
@@ -707,16 +754,21 @@ class Group:
             warnings.simplefilter("ignore", UnstableSpecificationWarning)
             arr = parent.create_array(leaf, **create_kwargs)
             arr.attrs[_NONEMPTY_CHUNKS_ATTR] = []
+            # Store the grid origin so cell ``index = coord - origin``.
+            # Only when non-trivial — a zero origin is the common case
+            # and its absence means "coords are array indices".
+            if origin is not None and any(int(o) != 0 for o in origin):
+                arr.attrs[_CHUNK_GRID_ORIGIN_ATTR] = [int(o) for o in origin]
             if attributes:
                 arr.attrs.update(_json_safe(attributes))
 
     def _sharded_chunk_array(self, array_name: str) -> zarr.Array | None:
-        """Return the multidim Zarr array at ``array_name`` when the
-        native-sharded layout is in use, else ``None``.
+        """Return the single multidim vlen-bytes Zarr array at
+        ``array_name`` (the per-spatial-chunk layout), else ``None``.
 
-        The legacy "Option G" layout has a Zarr Group at the same path
-        with single-chunk uint8 children — this returns ``None`` for
-        that case so callers fall back to the per-chunk logic.
+        Returns ``None`` when a Zarr Group sits at the path instead — the
+        per-cell primitive used by ``cross_chunk_links`` — so callers
+        fall back to the per-cell logic.
         """
         if array_name not in self._zarr:
             return None
@@ -933,6 +985,29 @@ def _local_root(store: LocalStore) -> Path:
 # tiny sidecar so ``list_chunks`` / ``chunk_exists`` stay O(1) without
 # scanning every shard tail.
 _NONEMPTY_CHUNKS_ATTR = "nonempty_chunks"
+
+# Per-array attribute holding the chunk-grid origin (``floor(min_corner
+# / chunk_shape)`` per axis).  A single vlen array is 0-indexed, so a
+# spatial chunk at coord ``c`` lands in cell ``c - origin``.  Absent (the
+# common case) means a zero origin — chunk coords are cell indices.
+_CHUNK_GRID_ORIGIN_ATTR = "chunk_grid_origin"
+
+
+def _grid_origin(arr: zarr.Array) -> tuple[int, ...] | None:
+    """Return the stored chunk-grid origin for a vlen array, or ``None``."""
+    raw = arr.attrs.get(_CHUNK_GRID_ORIGIN_ATTR)
+    if not raw:
+        return None
+    return tuple(int(x) for x in raw)
+
+
+def _coord_to_index(
+    coords: tuple[int, ...], origin: tuple[int, ...] | None,
+) -> tuple[int, ...]:
+    """Translate an absolute chunk coord to a 0-based array index."""
+    if origin is None:
+        return coords
+    return tuple(c - o for c, o in zip(coords, origin))
 
 
 def _parse_chunk_coords(key: str) -> tuple[int, ...] | None:

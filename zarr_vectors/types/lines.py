@@ -303,9 +303,15 @@ def write_lines(
     # FS, large win against object stores.  ``shard_shape`` also
     # activates native ``sharding_indexed`` for per-chunk arrays.
     from zarr_vectors.core.arrays import open_write_session
+    # chunk_by_attribute prepends a leading attr-bin axis to every chunk
+    # key; size the vlen array grid to match that rank.
+    session_bin_count = (
+        len(attr_bin_values) if line_attr_bins is not None else None
+    )
     with open_write_session(
         level_group, compressor=compressor, shard_shape=shard_shape,
         bounds=bounds_list, chunk_shape=chunk_shape,
+        bin_count=session_bin_count,
     ):
         create_vertices_array(level_group, dtype=dtype)
         create_object_index_array(level_group)

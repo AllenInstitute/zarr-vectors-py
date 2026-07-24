@@ -3,17 +3,21 @@
 ## Terms
 
 **Storage backend**
-: A pluggable adapter that exposes a byte-level key/value interface to a
-  concrete storage system (local file system, S3, GCS, Azure, HTTP).
-  Defined by the `StorageBackend` protocol in
-  [`zarr_vectors/core/backends/base.py`](../../../zarr_vectors/core/backends/base.py);
-  every concrete backend implements both the sync and async variants.
+: A concrete Zarr v3 `zarr.abc.store.Store` for a storage system (local
+  file system, S3, GCS, Azure, HTTP, in-memory) plus the transactional
+  `icechunk` store. zarr-vectors builds these using zarr's / obstore's /
+  icechunk's own native constructors — there is no custom byte-level
+  abstraction layer. Backend *selection* (URL scheme → driver name)
+  lives in
+  [`zarr_vectors/core/backends/__init__.py`](../../../zarr_vectors/core/backends/__init__.py);
+  the store objects are built in
+  [`zarr_vectors/core/store.py`](../../../zarr_vectors/core/store.py).
 
 **Backend name**
-: A short string that selects a backend: `"local"`, `"obstore"`, or
-  `"fsspec"`. Passed as the `backend=` kwarg to public store entry
-  points or set globally via the `ZARR_VECTORS_BACKEND` environment
-  variable.
+: A short string that selects a backend: `"local"`, `"obstore"`,
+  `"fsspec"`, or `"icechunk"`. Passed as the `backend=` kwarg to public
+  store entry points or set globally via the `ZARR_VECTORS_BACKEND`
+  environment variable (icechunk is explicit-only, never auto-detected).
 
 **URL scheme**
 : The leading `scheme://` of the store URL (e.g. `s3://bucket/foo`).
@@ -45,19 +49,22 @@ archive, an in-memory dict, or a cloud object store. The backing store
 type affects performance characteristics (latency, throughput, cost per
 request) but not the data model or the semantics of any operation.
 
-The library ships with three built-in backends:
+Each backend is a plain Zarr v3 store built by its own native
+constructor — no custom adapter classes:
 
-| Backend name | Class | Implementation | Optional dep |
-|--------------|-------|----------------|--------------|
-| `local`      | `LocalBackend`   | [`backends/local.py`](../../../zarr_vectors/core/backends/local.py) | none (always available) |
-| `obstore`    | `ObstoreBackend` | [`backends/obstore_backend.py`](../../../zarr_vectors/core/backends/obstore_backend.py) | `obstore` (Rust object-store bindings; preferred for cloud) |
-| `fsspec`    | `FsspecBackend`  | [`backends/fsspec_backend.py`](../../../zarr_vectors/core/backends/fsspec_backend.py) | `fsspec` + scheme-specific driver (`s3fs`, `gcsfs`, `adlfs`) |
+| Backend name | Zarr store | Built via | Optional dep |
+|--------------|------------|-----------|--------------|
+| `local`      | `zarr.storage.LocalStore` | `LocalStore(path)` | none (always available) |
+| `obstore`    | `zarr.storage.ObjectStore` | `ObjectStore(obstore.store.from_url(url, **opts))` | `obstore` (Rust object-store bindings; preferred for cloud) |
+| `fsspec`     | `zarr.storage.FsspecStore` | `FsspecStore.from_url(url, storage_options=…)` | `fsspec` + scheme driver (`s3fs`, `gcsfs`, `adlfs`) |
+| `icechunk`   | `icechunk` session store | `Repository.open(...).session().store` | `icechunk` (transactional/versioned) |
 
 For most users the relevant choice is between **local** (development,
 HPC analysis) and **cloud** (sharing, Neuroglancer serving). The two
-cloud backends are interchangeable from the caller's perspective — the
-library picks `obstore` automatically when it's installed and falls
-back to `fsspec` otherwise.
+cloud byte backends are interchangeable from the caller's perspective —
+the library picks `obstore` automatically when it's installed and falls
+back to `fsspec` otherwise. Use `backend="icechunk"` for transactional,
+commit-versioned storage on top of any of these.
 
 ---
 
@@ -65,21 +72,25 @@ back to `fsspec` otherwise.
 
 ### Public entry points
 
-All three entry points accept `backend=` and `**backend_kwargs`:
+All three entry points accept `backend=`, `storage_options=`, and
+loose `**backend_kwargs`:
 
 ```python
 from zarr_vectors.core.store import create_store, open_store
 from zarr_vectors.lazy import open_zv
 
-create_store(path, *, bounds=None, chunk_shape=None, axes=None,
-              geometry_types=None, ..., backend=None, **backend_kwargs) -> Group
-open_store(path, mode="r", *, backend=None, **backend_kwargs)         -> Group
-open_zv(path, *, backend=None, **backend_kwargs)                     -> ZVStore
+create_store(path, *, ..., backend=None, storage_options=None, **backend_kwargs) -> Group
+open_store(path, mode="r", *, backend=None, storage_options=None, **backend_kwargs) -> Group
+open_zv(path, *, backend=None, storage_options=None, **backend_kwargs) -> ZVStore
 ```
 
-`backend` is one of `"local"` / `"obstore"` / `"fsspec"` or `None` for
-auto-detect. Extra `**backend_kwargs` are forwarded to the backend
-constructor (credentials, region, etc.).
+`backend` is one of `"local"` / `"obstore"` / `"fsspec"` / `"icechunk"`
+or `None` for auto-detect. `storage_options` is a dict of credentials /
+options forwarded verbatim to the store constructor (fsspec
+`storage_options`, obstore `from_url` kwargs, or icechunk `*_storage`
+kwargs). Loose `**backend_kwargs` are merged into `storage_options` for
+back-compat, so `key=...`, `region=...`, `anon=True` also work as bare
+kwargs.
 
 ### URL scheme dispatch
 
@@ -183,10 +194,11 @@ read_points("gs://my-bucket/scan.zarrvectors")        # obstore or fsspec
 read_points("az://account/container/scan.zarrvectors")
 ```
 
-**Authenticated writes:** pass credentials via `**backend_kwargs` (they
-are forwarded to the backend constructor) or rely on the standard
-ambient credentials (`~/.aws/credentials`, `gcloud auth
-application-default`, environment variables).
+**Authenticated writes:** pass credentials via `storage_options=`
+(or loose `**backend_kwargs`, which merge into it) — they are forwarded
+to the store constructor — or rely on standard ambient credentials
+(`~/.aws/credentials`, `gcloud auth application-default`, environment
+variables).
 
 ```python
 from zarr_vectors.types.points import write_points
