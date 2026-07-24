@@ -58,7 +58,12 @@ T = TypeVar("T")
 # snapshot (see the invariant check in :func:`read_async`), so termination
 # does not rest on this — it is here to turn a hypothetical
 # non-converging reader into a diagnosable error instead of a hang.
-_MAX_ROUNDS = 12
+#
+# Raised from 12: read_polylines reassembles tracts across chunks by following
+# cross-chunk links, and on a whole-brain store a long tract's chain of chunks
+# is discovered a few per round, so a level-0-ish read legitimately needs many
+# more passes than a simple read_points. The grow-invariant still bounds it.
+_MAX_ROUNDS = 100
 
 
 async def open_store_async(

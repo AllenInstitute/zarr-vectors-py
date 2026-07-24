@@ -386,6 +386,16 @@ class Group:
         """
         if self._prefetch_cache is not None:
             raise StoreError("batched_reads() does not support nesting")
+        if self._offline is not None:
+            # Under offline_reads (the async prime-and-replay path used by
+            # aio.read_async), the chunks this plan would prefetch are already in
+            # the session, and read_bytes serves them from there -- so the sync
+            # prefetch is redundant. It is also unavailable: flush_prefetch calls
+            # sync(), which under Pyodide needs WebAssembly stack switching
+            # (JSPI). Skip it; any genuine miss is recorded by the offline
+            # session and fetched by the next aio round.
+            yield
+            return
         from zarr_vectors.core._batch_reader import flush_prefetch
 
         self._prefetch_cache = flush_prefetch(self._zarr, plan)

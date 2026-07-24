@@ -669,13 +669,32 @@ def read_polylines(
         # gather.  ``vlen_manifests_v1`` stores read the ragged ``manifests``
         # array directly (one chunk per request); the OBJECT_INDEX entry is
         # a harmless no-op for them.
-        chunk_key_strs = [
-            ".".join(str(c) for c in cc)
-            for cc in list_chunk_keys(level_group, VERTICES)
-        ]
-        chunk_iter = [
-            tuple(int(c) for c in cc.split(".")) for cc in chunk_key_strs
-        ]
+        #
+        # The chunk set is the UNION of the object manifests' referenced
+        # chunks, not ``list_chunk_keys(VERTICES)``.  The manifests are the
+        # authority on which chunks a polyline's fragments live in; the
+        # VERTICES ``nonempty_chunks`` presence attribute is a derived index
+        # that can under-report (decentralized writers set
+        # ``record_presence=False`` and rebuild it out of band — see
+        # ``Group.write_bytes`` / ``derive_nonempty_chunks``).  Driving the
+        # read off ``nonempty_chunks`` would silently skip any referenced
+        # chunk missing from it: ``_read_fragment`` returns None, the
+        # fragment is filtered out below, and the polyline's surrounding
+        # fragments get concatenated across the gap — a spurious connection
+        # between non-adjacent points.  Reading off the manifests makes this
+        # full read assemble exactly what the ``object_ids=`` subset read
+        # does.
+        try:
+            manifests = read_all_object_manifests(level_group)
+        except Exception:
+            manifests = []
+
+        needed_chunks: set[ChunkCoords] = set()
+        for m in manifests:
+            for cc, _fi in m:
+                needed_chunks.add(cc)
+        chunk_iter = sorted(needed_chunks)
+        chunk_key_strs = [".".join(str(c) for c in cc) for cc in chunk_iter]
         prefetch_plan = [
             (VERTICES, chunk_key_strs),
             (VERTEX_FRAGMENTS, chunk_key_strs),
@@ -689,13 +708,8 @@ def read_polylines(
             def _get_manifest(oid: int) -> ObjectManifest | None:
                 return manifest_by_oid.get(oid)
         else:
-            # Read all manifests once.  The per-object loop indexes into
-            # this list — no per-iteration manifest read.
-            try:
-                manifests = read_all_object_manifests(level_group)
-            except Exception:
-                manifests = []
-
+            # ``manifests`` was read above to derive the chunk set; the
+            # per-object loop indexes into it — no per-iteration read.
             def _get_manifest(oid: int) -> ObjectManifest | None:
                 if 0 <= oid < len(manifests):
                     return manifests[oid]

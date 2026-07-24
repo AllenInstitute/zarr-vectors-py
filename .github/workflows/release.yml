@@ -86,15 +86,20 @@ jobs:
             echo "last_tag=${LAST_TAG}"
           } >>"$GITHUB_OUTPUT"
 
-      - name: Create and push tag
-        if: inputs.dry-run != 'true'
+      - name: Create tag locally
+        # Always create the annotated tag on the checked-out commit, even on
+        # a dry-run.  setuptools-scm derives the build version from the
+        # nearest tag, so the tag must exist in the working tree *before*
+        # ``python -m build`` runs for the sdist/wheel to carry the release
+        # version (e.g. ``0.3.0``) instead of a ``.devN`` guess off the
+        # previous tag.  The push to origin is deferred to a later step so a
+        # dry-run — or a failed build/verify — leaves no tag on the remote.
         run: |
           set -euo pipefail
           git config user.name  "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git tag -a "${{ steps.bump.outputs.new_tag }}" \
             -m "Release ${{ steps.bump.outputs.new_tag }}"
-          git push origin "${{ steps.bump.outputs.new_tag }}"
 
       - name: Install build tooling
         run: python -m pip install --upgrade build
@@ -109,10 +114,10 @@ jobs:
         run: |
           set -euo pipefail
           # The sdist filename contains the version setuptools-scm resolved.
-          # On dry-run runs the tag isn't pushed, but it's been created
-          # locally and setuptools-scm still picks it up from the working
-          # tree; the only way the assertion fails is if the build saw a
-          # stale tag, which would indicate setuptools_scm misconfiguration.
+          # The tag was created locally in an earlier step (pushed only on a
+          # real release), so setuptools-scm picks it up from the working
+          # tree on dry-runs too; the only way this assertion fails is if the
+          # build saw a stale tag, which would indicate misconfiguration.
           BUILT="$(ls dist/zarr_vectors-*.tar.gz | head -n1 | sed -E 's/.*zarr_vectors-(.+)\.tar\.gz/\1/')"
           EXPECTED="${{ steps.bump.outputs.new_version }}"
           echo "Built version: ${BUILT}"
@@ -121,6 +126,12 @@ jobs:
             echo "::error::Built version ${BUILT} does not match expected ${EXPECTED}" >&2
             exit 1
           fi
+
+      - name: Push tag
+        if: inputs.dry-run != 'true'
+        # Deferred until the build + version check have passed so a failed
+        # release never leaves a dangling tag on the remote.
+        run: git push origin "${{ steps.bump.outputs.new_tag }}"
 
       - name: Publish to PyPI (Trusted Publishing)
         if: inputs.dry-run != 'true'
