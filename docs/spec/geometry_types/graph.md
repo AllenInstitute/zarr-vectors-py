@@ -10,22 +10,23 @@
 **`GEOM_GRAPH`**
 : The geometry type constant `"graph"`.
 
-**`is_directed`**
-: A boolean flag in root `.zattrs` indicating whether edges have direction.
-  When `true`, edge `[i, j]` represents a directed connection from vertex
-  `i` to vertex `j`; the reverse is not implied. When `false` (default),
-  edges are undirected.
+**`kind`**
+: The `write_graph` argument selecting the store's geometry type:
+  `"graph"` (default) or `"skeleton"`. It is not itself persisted —
+  it determines `geometry_type` and `links_convention`.
 
-**`is_tree`**
-: A boolean flag in root `.zattrs` indicating that the graph is a tree
-  (connected, acyclic, exactly `n_vertices - 1` edges). When `true`, the
-  store may omit edges that can be inferred from the parent-child
-  relationship stored in `links/<delta>/`. Enabling `is_tree` also enables
-  tree-specific validation (cycle detection, connectivity check).
+**Link family policy**
+: The `directed` / `store` / `link_width` / `sid_ndim` values recorded
+  on the `links/<delta>/` **group**. For `graph` these are always
+  `directed=false`, `store="canonical"`, `link_width=2`. See
+  [Links](../object_model/links.md).
 
-**Root vertex**
-: For tree graphs (`is_tree = true`), the root is the vertex with no parent.
-  Its entry in `links/<delta>/` has the parent index set to `-1`.
+**Tree store**
+: A store written with `kind="skeleton"`. It carries
+  `geometry_type: "skeleton"` and
+  `links_convention: "implicit_sequential_with_branches"`, letting it
+  omit edges inferable from the parent-child sequence. See
+  [Skeleton](skeleton.md).
 
 ---
 
@@ -52,43 +53,78 @@ distinction is semantic and enforced by metadata flags and validation:
 |-----------|----------|-------------|
 | `vertices/` | Yes | Node positions |
 | `vertex_fragments/` | Yes | Fragment index over `vertices/` rows |
-| `links/<delta>/` | Yes | Vertex pairs; shape `(E, 2)` int32 per chunk |
-| `link_fragments/` | Yes (`<delta>=0`) | Fragment index over `links/0/` rows |
+| `links/0/0.0.0/` | Yes* | Edges whose endpoints share a chunk |
+| `links/0/<offsets>/` | Yes* | Edges whose endpoints straddle chunks; offsets name the far chunk |
+| `link_fragments/` | Yes (with `links/0/0.0.0/`) | Fragment index over the intra array's rows |
 | `object_index/` | Yes | Per-object manifest blobs naming fragments |
-| `cross_chunk_links/` | Yes* | Inter-chunk edges |
 | `attributes/<name>/` | No | Per-vertex attributes |
+| `link_attributes/<name>/0/<offsets>/` | No | Per-edge attributes, mirroring each offsets array cell-for-cell |
 | `object_attributes/<name>/` | No | Per-component attributes |
 | `groupings/` | No | Group assignment |
 
-*Required when any edge connects vertices in different chunks.
+*Which offsets arrays exist depends on the data: an edge lands in the
+array named by the offsets between its endpoints, and the all-zero
+array is simply where intra-chunk edges land. There is no separate
+`cross_chunk_links/` family. Unlike `polyline`, `graph` uses
+`links_convention: explicit`, so intra-chunk edges **are** materialised
+— the all-zero array is normally populated.
+
+`write_graph` always creates `links/0/` even when every edge is
+implied, so the family is advertised in `arrays_present`.
 
 ### Root `.zattrs` type-specific keys
 
 ```json
 {
-  "geometry_type": "graph",
-  "is_directed":   false,
-  "is_tree":       false
+  "geometry_type":    "graph",
+  "links_convention": "explicit"
 }
 ```
 
-| Key | Type | Default | Description |
-|-----|------|---------|-------------|
-| `is_directed` | `bool` | `false` | Whether edges are directed. |
-| `is_tree` | `bool` | `false` | Whether graph topology is a tree. Enables tree validation. |
+`graph` declares no type-specific root keys of its own. Tree-ness is
+carried by `geometry_type` and `links_convention`, not by a flag:
+
+| `write_graph(kind=…)` | `geometry_type` | `links_convention` |
+|-----------------------|-----------------|--------------------|
+| `"graph"` (default) | `graph` | `explicit` |
+| `"skeleton"` | `skeleton` | `implicit_sequential_with_branches` |
+
+> **`is_directed` and `is_tree` are not root metadata keys.** Neither
+> appears anywhere in the shipped code. `is_tree` survives only as a
+> **deprecated** `write_graph` argument that maps to `kind=` and emits a
+> `DeprecationWarning` (`is_tree=True` → `kind="skeleton"`); passing
+> both raises `TypeError`. It is not persisted under that name. There is
+> no `is_directed` argument, key, or validation check at any level.
 
 ### Edge encoding
 
-Edges in `links/<delta>/` are local-chunk vertex index pairs `[i, j]`. For
-undirected graphs, each edge is stored once in canonical form `[min(i,j),
-max(i,j)]`; readers must treat `[i,j]` and `[j,i]` as the same edge.
+`graph` writes one link family: `link_width = 2`, **undirected**,
+`store="canonical"`. Every edge — intra-chunk or not — goes through a
+single `write_links` call, which routes it to the offsets array naming
+where its far endpoint sits relative to its source chunk.
 
-For directed graphs, edges are stored in `[source, destination]` order.
-The direction is significant; readers must not reverse edges.
+Because the family is undirected and canonical, each edge is stored
+**exactly once**. `write_links` canonical-sorts the endpoints by
+`(chunk_coords, vertex_index)`, so:
 
-Cross-chunk edges (edges whose two endpoints are in different chunks) are
-stored in `cross_chunk_links/`. Each entry is a pair of global vertex IDs.
-See [Cross-chunk links](../object_model/cross_chunk_links.md).
+- the source is the lex-smallest endpoint, and the stored offset is
+  therefore lexicographically non-negative — `[i,j]` and `[j,i]` cannot
+  both appear;
+- `perm_idx` records the permutation applied, so a reader recovers the
+  original input order.
+
+An edge whose endpoints share a chunk lands in the all-zero-offsets
+array (`links/0/0.0.0/`) with both indices local to that chunk. An edge
+straddling chunks lands in the array named by the offsets between them,
+with `vi_k` local to chunk `src + o_k`. See
+[Links](../object_model/links.md).
+
+> **Directed graphs are not supported by `write_graph`.** The writer
+> takes no `is_directed` argument and always writes the family
+> undirected. The underlying `write_links` does accept `directed=True`
+> (which suppresses the canonical sort so `A→B` and `B→A` file under
+> opposite offsets), and `skeleton` uses it — but `write_graph` does
+> not expose it.
 
 ### Object model for graphs
 
@@ -121,8 +157,7 @@ write_graph(
     edges=edges,
     chunk_shape=(200.0, 200.0, 200.0),
     bin_shape=(50.0, 50.0, 50.0),
-    is_directed=False,
-    is_tree=False,
+    kind="graph",          # default; "skeleton" for trees
 )
 ```
 
@@ -134,14 +169,27 @@ write_graph(
     positions=positions,
     edges=edges,         # (n-1, 2) parent→child pairs
     chunk_shape=(200., 200., 200.),
-    is_tree=True,        # validates tree topology at write time
+    kind="skeleton",     # reorders depth-first; stores as geometry_type "skeleton"
 )
 ```
 
-With `is_tree=True`, `write_graph` validates that:
-- The graph is connected.
-- The graph is acyclic.
-- Exactly one vertex has no parent (the root).
+`kind="skeleton"` changes three things:
+
+- nodes are **reordered depth-first from the root** (`_reorder_tree`),
+  and `object_ids` / attributes are permuted to match;
+- `geometry_type` is written as `skeleton`, not `graph`;
+- `links_convention` is written as `implicit_sequential_with_branches`,
+  so edges inferable from the depth-first sequence may be omitted.
+
+> **`kind="skeleton"` does not validate tree topology.** `write_graph`
+> does not check connectivity, acyclicity, or that exactly one vertex
+> is a root, and raises nothing if the input is not a tree. The only
+> shape check is that `edges` is `(M, 2)`. Passing a non-tree produces a
+> store whose declared convention its data does not honour, and no
+> validation level catches it.
+
+`kind` must be `"graph"` or `"skeleton"`; anything else raises
+`ValueError`.
 
 ### Read API
 
@@ -178,22 +226,25 @@ result = read_graph("connectome.zarrvectors", object_ids=[42, 107, 318])
 
 ### Validation
 
-L1: `vertices/`, `vertex_fragments/`, `links/<delta>/`, `link_fragments/`
-(at `<delta>=0`), and `object_index/` exist.
-
-L2:
-- `is_directed` is a boolean.
-- `is_tree` is a boolean.
+L1: `vertices/` exists at every level. `links/` and `object_index/` are
+recorded when present but are **not** required at L1.
 
 L3:
-- All edge vertex indices are in `[0, N_chunk)`.
-- No self-loops: `edges[i,0] != edges[i,1]` for all `i`.
-- For undirected graphs: no duplicate edges (both `[i,j]` and `[j,i]`).
-- `cross_chunk_links/` entries reference valid global vertex IDs.
+- Every `links/0/` offsets segment parses under the family's `sid_ndim`
+  and `link_width`.
+- The family being undirected, canonical, and intra-level, each offset
+  is lexicographically non-negative and offsets are non-decreasing —
+  this is what enforces "each edge stored once". The all-zero (intra)
+  segment is legal and exempt.
+- `num_physical_records`, if recorded, matches the rows on disk.
+- Every record's endpoint chunks exist at the level.
 
-L4 (if `is_tree = true`):
-- Graph is connected (single component or each declared component is
-  individually connected).
-- Graph is acyclic.
-- Exactly one vertex per component has parent index `-1` (the root).
-- Number of edges equals `n_vertices - n_components`.
+L4: `links_convention` MUST be `explicit` for `graph`
+([`GEOMETRY_LINK_REQ`](../../../zarr_vectors/validate/conformance.py)).
+
+**Not checked at any level:** edge vertex indices within a chunk,
+self-loops, duplicate edges *within* one offsets array, connectivity,
+acyclicity, root count, or the edge-count identity. The offset-sign
+rule above catches an `[i,j]`/`[j,i]` pair only when the two land in
+*different* offsets arrays. See
+[Validation overview](../validation/overview.md).

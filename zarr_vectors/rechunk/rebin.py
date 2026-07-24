@@ -120,7 +120,7 @@ def rebin_level(
         # re-derived from positions, so we don't care about the old
         # grouping.
         try:
-            groups = read_chunk_vertices(level_group, cc, dtype=np.float32, ndim=ndim)
+            groups = read_chunk_vertices(level_group, cc, ndim=ndim)
         except Exception:
             continue
         if not groups:

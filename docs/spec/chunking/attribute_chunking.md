@@ -25,9 +25,9 @@
 : When the chunk-by attribute differs across vertices of the *same
   object*, the object is split across the corresponding attribute
   chunks. A polyline whose first half is `bundle="A"` and second half
-  is `bundle="B"` appears in two attribute chunks; the existing
-  `cross_chunk_links` array stitches the segments back together at read
-  time.
+  is `bundle="B"` appears in two attribute chunks; the `links/` family
+  stitches the segments back together at read time, via a record whose
+  offsets are non-zero on the prepended bin axis.
 
 **Per-object uniformity**
 : A restricted form of attribute chunking where all vertices of an

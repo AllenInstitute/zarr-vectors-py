@@ -8,7 +8,9 @@ Public surface:
   for one-shot edits.
 - Reference dataclasses :class:`VertexRef`, :class:`LinkRef`,
   :class:`FragmentRef`, :class:`ObjectRef`, :class:`AttributeRef` —
-  physical addresses passed to the edit functions.
+  physical addresses passed to the edit functions.  :class:`LinkRef`
+  addresses every link, intra- and cross-chunk alike, by the cell that
+  holds it.
 - :class:`EditReport` — diff summary returned by every edit.
 - :func:`rebuild_pyramid_from_level` — refresh coarser levels after
   edits when ``refresh_pyramid=False`` was used.
@@ -49,7 +51,6 @@ from zarr_vectors.ops.refresh import rebuild_pyramid_from_level
 from zarr_vectors.ops.vacuum import vacuum
 from zarr_vectors.ops.refs import (
     AttributeRef,
-    CrossChunkLinkRef,
     FragmentRef,
     LinkRef,
     ObjectRef,
@@ -58,7 +59,6 @@ from zarr_vectors.ops.refs import (
 
 __all__ = [
     "AttributeRef",
-    "CrossChunkLinkRef",
     "EditReport",
     "EditSession",
     "FragmentRef",

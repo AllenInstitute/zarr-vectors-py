@@ -156,7 +156,7 @@ def validate_multiresolution(store_path: str | Path) -> ValidationResult:
                 vc = 0
                 for ck in list_chunk_keys(lg):
                     try:
-                        gs = read_chunk_vertices(lg, ck, dtype=np.float32, ndim=ndim)
+                        gs = read_chunk_vertices(lg, ck, ndim=ndim)
                         vc += sum(len(g) for g in gs)
                     except Exception:
                         pass

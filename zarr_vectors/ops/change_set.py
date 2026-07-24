@@ -1,12 +1,19 @@
 """In-memory representation of pending edits.
 
 A :class:`ChunkChangeBuilder` lazily decodes one chunk's ragged
-state (vertices, fragment sidecar, per-vertex attributes, intra-chunk
-links) the first time the edit engine touches it, lets callers mutate
-the decoded state in Python, and re-encodes everything in one shot at
-flush time.  This is what gives the :class:`~zarr_vectors.ops.edit.
-EditSession` its "coalesce many edits to the same chunk into one
-read-modify-write" property.
+state (vertices, fragment sidecar, per-vertex attributes, links) the
+first time the edit engine touches it, lets callers mutate the decoded
+state in Python, and re-encodes everything in one shot at flush time.
+This is what gives the :class:`~zarr_vectors.ops.edit.EditSession` its
+"coalesce many edits to the same chunk into one read-modify-write"
+property.
+
+The builder is the source chunk's view of ``links/<delta>/<offsets>/``:
+it holds one entry per **cell** it has touched, keyed by
+``(delta, offsets)`` — the pair naming the array — with the builder's
+own chunk as the cell.  Intra- and cross-chunk links are the same
+family and flush through the same per-chunk path; ``offsets is None``
+is the all-zero (intra) array.
 
 :class:`EditReport` is the user-facing summary of what changed in a
 session: touched chunks, OID remap (atomic edits), dirty pyramid
@@ -16,16 +23,39 @@ serialisable diff returned by ``EditSession.change_set()``.
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
 import numpy as np
 import numpy.typing as npt
 
+from zarr_vectors.core.paths import is_intra
 from zarr_vectors.typing import ChunkCoords, ObjectManifest
 
 if TYPE_CHECKING:
     from zarr_vectors.core.group import Group
+
+
+# One touched ``links/<delta>/<offsets>/`` array, as seen from the
+# builder's chunk (which is the cell).  ``offsets is None`` is the
+# all-zero intra array — the single canonical spelling, so a cell has
+# exactly one key.
+LinkCell = tuple[int, tuple[ChunkCoords, ...] | None]
+
+
+def link_cell(
+    delta: int, offsets: Sequence[ChunkCoords] | None = None,
+) -> LinkCell:
+    """Normalise ``(delta, offsets)`` into a :data:`LinkCell` key.
+
+    All-zero offsets collapse to ``None``: they name the intra array, so
+    both spellings must key the same builder entry.
+    """
+    if offsets is None:
+        return (int(delta), None)
+    norm = tuple(tuple(int(c) for c in offset) for offset in offsets)
+    return (int(delta), None if is_intra(norm) else norm)
 
 
 @dataclass
@@ -36,9 +66,12 @@ class ChunkChangeBuilder:
 
     - ``vertex_groups``: list of fragments, each a ``(N_k, D)`` float
       array.  The list's length is the chunk's fragment count.
-    - ``link_groups``: per-fragment ``(M_k, L)`` integer arrays for the
-      intra-level ``links/0/`` array.  ``None`` when the chunk has no
-      links yet.
+    - ``link_groups``: ``{LinkCell: list_of_row_groups}`` — the decoded
+      rows of every ``links/<delta>/<offsets>/`` cell this chunk sources.
+      Row groups of the intra cell are kept 1:1 with ``vertex_groups``;
+      other cells carry no such alignment and their rows may lead with a
+      ``perm_idx`` column, so only the intra cell is safe to interpret as
+      chunk-local ``(src, dst)`` pairs.
     - ``attr_groups``: ``{attr_name: list_of_fragment_arrays}`` aligned
       with ``vertex_groups``.  Empty when no per-vertex attributes are
       touched.
@@ -59,7 +92,14 @@ class ChunkChangeBuilder:
     vertex_ndim: int
 
     vertex_groups: list[npt.NDArray[np.floating]] = field(default_factory=list)
-    link_groups: dict[int, list[npt.NDArray[np.integer]]] = field(
+    link_groups: dict[LinkCell, list[npt.NDArray[np.integer]]] = field(
+        default_factory=dict,
+    )
+    # Per-cell ``(link_width, directed, store)`` captured on first touch.
+    # The flush needs them to re-create the array with the family's own
+    # policy rather than the writer defaults, and to know the physical row
+    # width (``links_has_perm``).
+    link_policy: dict[LinkCell, tuple[int, bool, str]] = field(
         default_factory=dict,
     )
     attr_groups: dict[str, list[npt.NDArray]] = field(default_factory=dict)
@@ -73,8 +113,8 @@ class ChunkChangeBuilder:
     # When True, the flush phase rewrites ``vertices/<cc>`` +
     # ``vertex_fragments/<cc>`` for this chunk.
     vertices_dirty: bool = False
-    # ``{delta: True}`` for link arrays that need rewrite.
-    links_dirty: dict[int, bool] = field(default_factory=dict)
+    # ``{LinkCell: True}`` for link cells that need rewrite.
+    links_dirty: dict[LinkCell, bool] = field(default_factory=dict)
     # Per-attribute dirty flags.
     attrs_dirty: dict[str, bool] = field(default_factory=dict)
 
@@ -178,41 +218,74 @@ class ChunkChangeBuilder:
         root: Group,
         delta: int = 0,
         link_width: int = 2,
+        offsets: Sequence[ChunkCoords] | None = None,
     ) -> list[npt.NDArray[np.integer]]:
-        """Lazily decode ``links/<delta>/<chunk>`` for this chunk.
+        """Lazily decode one ``links/<delta>/<offsets>/`` cell for this chunk.
 
-        Always returns a list whose length matches ``self.vertex_groups``:
-        when the on-disk link layer has fewer fragments than the chunk
-        has vertex fragments (e.g. a graph writer that consolidated all
-        edges into a single link fragment), the result is padded with
-        empty per-fragment groups so this builder can keep indexing its
-        link groups per vertex fragment.  (``write_chunk_links`` no longer
-        requires 1:1 alignment; this padding is internal bookkeeping.)
+        ``offsets`` names the array; ``None`` (default) is the all-zero
+        intra one.  This chunk is always the cell — i.e. the **source**
+        chunk of every record decoded here.
+
+        For the intra cell the result is padded to one group per vertex
+        fragment: link rows there are chunk-local, so the edit engine
+        indexes them per vertex fragment, and the on-disk table may hold
+        fewer groups (e.g. a graph writer that consolidated every edge
+        into one link fragment).  ``write_chunk_links`` does not require
+        1:1 alignment — the padding is internal bookkeeping.
+
+        Other cells get no padding: their rows have no per-vertex-fragment
+        meaning.  An absent one starts as a single empty group so callers
+        have a group 0 to append into.
         """
-        if delta in self.link_groups:
-            return self.link_groups[delta]
+        cell = link_cell(delta, offsets)
+        if cell in self.link_groups:
+            return self.link_groups[cell]
 
-        from zarr_vectors.core.arrays import read_chunk_links
+        from zarr_vectors.core.arrays import (
+            _decode_link_cell,
+            link_family_policy,
+            links_has_perm,
+        )
+        from zarr_vectors.core.paths import intra_offsets
         from zarr_vectors.core.store import get_resolution_level
 
         level_group = get_resolution_level(root, self.level)
-        try:
-            groups = read_chunk_links(
-                level_group, self.chunk, link_width=link_width, delta=delta,
-            )
-        except Exception:
-            groups = []
-        # Normalise to one group per vertex fragment.  When the on-disk
-        # link table has fewer fragments than the chunk has vertex
-        # fragments (e.g. a graph writer that consolidated all edges
-        # into the first link slot), pad the tail with empty groups so
-        # the write-back invariant holds.
-        target_len = len(self.vertex_groups)
-        padded: list[npt.NDArray[np.integer]] = [g.copy() for g in groups]
-        while len(padded) < target_len:
-            padded.append(np.empty((0, link_width), dtype=np.int64))
-        self.link_groups[delta] = padded
-        return self.link_groups[delta]
+
+        # The family group carries the policy every cell under it shares.
+        # Absent means the family is this session's to create.
+        policy = link_family_policy(level_group, delta)
+        if policy is not None:
+            link_width, _sid_ndim, directed, store = policy
+        else:
+            directed, store = False, "canonical"
+        self.link_policy[cell] = (int(link_width), bool(directed), str(store))
+
+        resolved = (
+            intra_offsets(len(self.chunk), link_width)
+            if cell[1] is None else cell[1]
+        )
+        # Physical width: links_has_perm is the single definition writer
+        # and reader consult, so the decode never guesses.
+        width = link_width + (
+            1 if links_has_perm(
+                resolved, delta=delta, directed=directed, store=store,
+            ) else 0
+        )
+        groups = _decode_link_cell(
+            level_group, self.chunk, delta=delta, offsets=resolved,
+            dtype=np.int64, width=width, default=[],
+        )
+        decoded: list[npt.NDArray[np.integer]] = [
+            np.asarray(g).copy() for g in groups
+        ]
+        if cell[1] is None:
+            target_len = len(self.vertex_groups)
+            while len(decoded) < target_len:
+                decoded.append(np.empty((0, width), dtype=np.int64))
+        elif not decoded:
+            decoded.append(np.empty((0, width), dtype=np.int64))
+        self.link_groups[cell] = decoded
+        return self.link_groups[cell]
 
     # ----- vertex mutations --------------------------------------------
 
@@ -285,13 +358,18 @@ class ChunkChangeBuilder:
                 )
             attr_list.append(vals)
             self.attrs_dirty[name] = True
-        # Also extend every link delta with an empty per-fragment group so
-        # this builder keeps one link group per vertex fragment (internal
+        # Extend the intra cell with an empty per-fragment group so this
+        # builder keeps one link group per vertex fragment (internal
         # bookkeeping; write_chunk_links no longer requires 1:1 alignment).
-        for delta, groups in self.link_groups.items():
-            link_width = groups[0].shape[1] if groups and groups[0].ndim == 2 else 2
-            groups.append(np.empty((0, link_width), dtype=np.int64))
-            self.links_dirty[delta] = True
+        # Only the intra cell tracks vertex fragments — other cells hold
+        # records sourced here but indexed against other chunks, so a new
+        # vertex fragment says nothing about their grouping.
+        for cell, groups in self.link_groups.items():
+            if cell[1] is not None:
+                continue
+            width = groups[0].shape[1] if groups and groups[0].ndim == 2 else 2
+            groups.append(np.empty((0, width), dtype=np.int64))
+            self.links_dirty[cell] = True
         return new_idx
 
     def drop_fragment_row(self, fragment: int, local: int) -> None:
@@ -320,64 +398,61 @@ class ChunkChangeBuilder:
 
     # ----- link mutations ----------------------------------------------
 
+    def _cell_groups(
+        self, cell: LinkCell, fragment: int,
+    ) -> list[npt.NDArray[np.integer]]:
+        """Loaded row groups of ``cell``, with ``fragment`` bounds-checked."""
+        from zarr_vectors.exceptions import EditError
+        if cell not in self.link_groups:
+            raise EditError(
+                f"link cell delta={cell[0]} offsets={cell[1]} not loaded — "
+                f"call require_links first"
+            )
+        groups = self.link_groups[cell]
+        if fragment < 0 or fragment >= len(groups):
+            raise EditError(
+                f"fragment {fragment} out of range for link cell "
+                f"delta={cell[0]} offsets={cell[1]} ({len(groups)} groups)"
+            )
+        return groups
+
     def append_link_row(
         self,
-        delta: int,
+        cell: LinkCell,
         fragment: int,
         row: npt.NDArray[np.integer],
     ) -> int:
-        """Append a row to the per-fragment intra-chunk link group.
+        """Append a row to one row group of one link cell.
 
-        Returns the new row index inside the fragment group.
+        Returns the new row index inside that group.
         """
-        from zarr_vectors.exceptions import EditError
-        if delta not in self.link_groups:
-            raise EditError(
-                f"link delta={delta} not loaded — call require_links first"
-            )
-        groups = self.link_groups[delta]
-        if fragment < 0 or fragment >= len(groups):
-            raise EditError(
-                f"fragment {fragment} out of range for link delta={delta}"
-            )
+        groups = self._cell_groups(cell, fragment)
         arr = np.atleast_2d(np.asarray(row, dtype=np.int64))
         groups[fragment] = np.concatenate([groups[fragment], arr], axis=0)
-        self.links_dirty[delta] = True
+        self.links_dirty[cell] = True
         return groups[fragment].shape[0] - 1
 
-    def drop_link_row(self, delta: int, fragment: int, row: int) -> None:
+    def drop_link_row(self, cell: LinkCell, fragment: int, row: int) -> None:
         from zarr_vectors.exceptions import EditError
-        if delta not in self.link_groups:
-            raise EditError(
-                f"link delta={delta} not loaded — call require_links first"
-            )
-        groups = self.link_groups[delta]
-        if fragment < 0 or fragment >= len(groups):
-            raise EditError(f"fragment {fragment} out of range")
+        groups = self._cell_groups(cell, fragment)
         if row < 0 or row >= groups[fragment].shape[0]:
             raise EditError(f"row {row} out of range in fragment {fragment}")
         groups[fragment] = np.delete(groups[fragment], row, axis=0)
-        self.links_dirty[delta] = True
+        self.links_dirty[cell] = True
 
     def overwrite_link_row(
         self,
-        delta: int,
+        cell: LinkCell,
         fragment: int,
         row: int,
         new_row: npt.NDArray[np.integer],
     ) -> None:
         from zarr_vectors.exceptions import EditError
-        if delta not in self.link_groups:
-            raise EditError(
-                f"link delta={delta} not loaded — call require_links first"
-            )
-        groups = self.link_groups[delta]
-        if fragment < 0 or fragment >= len(groups):
-            raise EditError(f"fragment {fragment} out of range")
+        groups = self._cell_groups(cell, fragment)
         if row < 0 or row >= groups[fragment].shape[0]:
             raise EditError(f"row {row} out of range in fragment {fragment}")
         groups[fragment][row] = np.asarray(new_row, dtype=groups[fragment].dtype)
-        self.links_dirty[delta] = True
+        self.links_dirty[cell] = True
 
     # ----- introspection -----------------------------------------------
 
@@ -388,21 +463,6 @@ class ChunkChangeBuilder:
             or any(self.links_dirty.values())
             or any(self.attrs_dirty.values())
         )
-
-
-@dataclass
-class CrossChunkLinkOp:
-    """One pending edit to the global ``cross_chunk_links/<delta>/data``
-    array.
-
-    ``op`` is ``"append"`` (add a new row), ``"delete"`` (drop the row
-    at ``index``), or ``"overwrite"`` (replace the row at ``index``).
-    """
-
-    op: str
-    delta: int
-    payload: list[tuple[ChunkCoords, int]] | None = None
-    index: int | None = None
 
 
 @dataclass

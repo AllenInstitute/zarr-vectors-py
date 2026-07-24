@@ -303,3 +303,68 @@ def test_chunk_scale_factor_rank_must_match_ndim(tmp_path: Path) -> None:
             factors=[(2.0, 1.0)],
             chunk_scale_factors=[(2, 2)],  # rank 2 vs sid_ndim=3
         )
+
+
+def test_validate_metadata_passes_valid_scaled_pyramid(tmp_path: Path) -> None:
+    """A valid chunk_scale_factor>1 pyramid passes L2.
+
+    Guards the fix that made L2's per-level bin_shape check compare
+    against the effective per-level chunk_shape rather than the root's —
+    on a scaled pyramid the level's chunk_shape is a multiple of root, so
+    the old root-comparison tested the wrong quantity.
+    """
+    from zarr_vectors.validate.metadata import validate_metadata
+
+    rng = np.random.default_rng(0)
+    pos = rng.uniform(0.0, 400.0, size=(2000, 3)).astype(np.float32)
+    store = str(tmp_path / "sp.zarr")
+    write_points(
+        store, pos,
+        chunk_shape=(100.0, 100.0, 100.0),
+        bin_shape=(50.0, 50.0, 50.0),
+        bounds=([0.0, 0.0, 0.0], [400.0, 400.0, 400.0]),
+    )
+    build_pyramid(store, factors=[(2.0, 1.0)], chunk_scale_factors=[2])
+    result = validate_metadata(store)
+    assert result.ok, result.errors
+
+
+def test_validate_metadata_calls_the_per_level_validator(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    """L2 must actually invoke validate_level_chunk_shape_against_root.
+
+    The validator existed but no pass called it, so per-level chunk_shape
+    overrides went unvalidated.  Feed a corrupt override through the read
+    it uses and assert L2 reports it.
+    """
+    import zarr_vectors.validate.metadata as vm
+    from zarr_vectors.core.metadata import LevelMetadata
+
+    rng = np.random.default_rng(0)
+    pos = rng.uniform(0.0, 400.0, size=(500, 3)).astype(np.float32)
+    store = str(tmp_path / "corrupt.zarr")
+    write_points(
+        store, pos,
+        chunk_shape=(100.0, 100.0, 100.0),
+        bin_shape=(50.0, 50.0, 50.0),
+        bounds=([0.0, 0.0, 0.0], [400.0, 400.0, 400.0]),
+    )
+
+    real = vm.read_level_metadata if hasattr(vm, "read_level_metadata") else None
+
+    def fake_read_level_metadata(root, li):
+        # 150 is not an integer multiple of the root chunk_shape 100.
+        return LevelMetadata(
+            level=li, vertex_count=1, arrays_present=[],
+            chunk_shape=(150.0, 150.0, 150.0),
+        )
+
+    monkeypatch.setattr(
+        "zarr_vectors.core.store.read_level_metadata",
+        fake_read_level_metadata,
+    )
+    result = vm.validate_metadata(store)
+    assert not result.ok
+    assert any("chunk_shape" in e or "multiple" in e for e in result.errors), \
+        result.errors

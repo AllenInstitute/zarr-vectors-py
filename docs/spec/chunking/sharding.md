@@ -197,12 +197,25 @@ to ensure consumers are aware of the requirement.
 
 ### Implementation notes (zarr-vectors-py)
 
-* Each ZVF logical array (`vertices`, `vertex_fragments`, `links/<delta>`,
-  `link_fragments`, `cross_chunk_links/<delta>/<cell>`, attribute arrays,
-  ...) maps to a single Zarr v3 vlen-bytes array whose shape is the
-  level's chunk grid. One cell of that array holds one ZVF spatial
-  chunk's payload bytes; absent chunks are vlen-bytes `b""` (the codec's
-  fill value).
+* Each ZVF logical array (`vertices`, `vertex_fragments`,
+  `links/<delta>/<offsets>`, `link_fragments`,
+  `link_attributes/<name>/<delta>/<offsets>`, attribute arrays, ...) maps
+  to a single Zarr v3 vlen-bytes array whose shape is the level's chunk
+  grid. One cell of that array holds one ZVF spatial chunk's payload
+  bytes; absent chunks are vlen-bytes `b""` (the codec's fill value).
+
+  ```{note}
+  Before 0.9.0 this page claimed the same of `cross_chunk_links/<delta>/`,
+  which was **false**: that family's cells were keyed by endpoint-chunk
+  tuples, not a spatial grid, so it had no chunk-grid shape to shard and
+  was silently excluded from `shard_store`. The 0.9.0 merge makes the
+  claim true. `links/<delta>/<offsets>/` is an ordinary rank-D grid — cell
+  = the record's source chunk — so the whole connectivity family, its
+  intra-chunk array included, now shards like any other array. The
+  predicate deciding this is `_is_per_chunk_array`, which
+  `zarr_vectors.sharding.io` imports so there is one definition of what
+  may be migrated.
+  ```
 * The sharding codec is configured with `chunk_shape = (1,)*ndim`
   (one ZVF chunk per inner Zarr chunk) and an outer chunk shape equal
   to `shard_shape`. zarr-python ≥ 3.2 exposes this directly via the
@@ -230,3 +243,47 @@ reshard("scan.zv", None)                       # equivalent to unshard_store
 
 Both conversion functions are idempotent: shards already in the
 requested layout are skipped, and unsharding a flat store is a no-op.
+
+### Ordering: shard the links family last
+
+```{important}
+`shard_store` MUST run **after** `finalize_links`, never before.
+```
+
+`finalize_links` rebuilds each link array's `nonempty_chunks` manifest
+from the store listing, via `Group.derive_nonempty_chunks`. That rebuild
+is **unsharded-only**: it works by listing chunk objects at
+`<array>/c/i/j/k` and reading the cell coordinate back out of the key
+name. A shard packs many cells into a single object whose inner index is
+**not derivable from key names**, so once an array is sharded the listing
+no longer enumerates its cells and the rebuild finds nothing.
+
+The constraint is a consequence of how the decentralized write protocol
+splits work. `nonempty_chunks` is array-wide state, so stamping it is a
+read-modify-write that two workers race on even when their *cells* are
+disjoint — the loser's key vanishes while its payload sits on disk.
+Workers therefore write with `record_presence=False` and skip the
+manifest entirely, leaving one coordinator to reconstruct it. Sharding
+before that reconstruction strands the payloads: the cells are on disk,
+but nothing enumerates them.
+
+The safe order for a scale-out ingest is:
+
+```python
+# 1. Workers, in parallel, each owning a disjoint set of source chunks:
+write_link_cells(lg, batch, sid_ndim, delta=0)      # record_presence=False
+
+# 2. Coordinator, once every worker has finished:
+finalize_links(lg, delta=0)     # rebuilds nonempty_chunks + counts
+
+# 3. Coordinator, last:
+shard_store("scan.zv", shard_shape=8)
+```
+
+Reversing steps 2 and 3 fails **silently, not loudly**. `shard_store`
+selects each array's cells via `list_chunks`, which reads the very
+manifest the workers skipped; finding it empty, it takes its
+"nothing to migrate" branch and moves on. The links family is simply left
+unsharded — no error, no warning, and a later `finalize_links` will still
+recover the counts, so the only symptom is that the sharding you asked for
+never happened.

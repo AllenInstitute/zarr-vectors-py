@@ -43,9 +43,10 @@ metanodes.
 | `vertex_fragments/` | Yes | Fragment index — `uint8` blob per chunk; see [Fragment-index arrays](../layout/fragment_index_arrays.md) |
 | `attributes/<name>/` | No | Per-vertex scalar or vector attributes |
 
-No `links/`, `object_index/`, `cross_chunk_links/`, or `object_attributes/`
-arrays are present. The `groupings/` array is also absent; point clouds do
-not have a discrete object model.
+No `links/`, `object_index/`, or `object_attributes/` arrays are
+present. The `groupings/` array is also absent; point clouds do not have
+a discrete object model. (`cross_chunk_links/` does not exist for any
+type — that family was merged into `links/`.)
 
 ### Root `.zattrs` required keys
 
@@ -131,12 +132,22 @@ Common choices:
 
 ### Validation rules
 
-L1: `vertices/` and `vertex_fragments/` exist at each declared level.
+L1: `vertices/` exists at each level (an error if absent);
+`vertex_fragments/` is a warning if absent.
 
-L2:
-- No `links/`, `object_index/`, or `cross_chunk_links/` arrays are present.
-- Each `attributes/<name>/` array has shape consistent with the vertex
-  count at its level.
+L3 (point-cloud-specific): because the store is an undifferentiated
+point cloud, L3 additionally enforces the bin layout — a chunk's
+fragment count must not exceed the product of `bins_per_chunk`, and a
+spot check of the first 3 chunks per level warns when a fragment's
+points fall outside their bin's bounds. These checks apply **only** to
+stores that are point-cloud-only and have no `object_index`.
+
+L4: a point cloud requires no `links_convention`, and the presence of a
+`links/0` array emits a **warning**.
+
+Absence of `links/` / `object_index/` is not otherwise checked, and
+attribute-to-vertex length alignment is not checked at any level. See
+[Validation overview](../validation/overview.md).
 
 L3:
 - For every non-empty chunk, the sum of range-fragment `count` values

@@ -506,6 +506,10 @@ class TestFsGroup:
 
     def test_chunk_io(self, tmp_store_path: Path) -> None:
         g = FsGroup(tmp_store_path, create=True)
+        # Per-chunk arrays are allocated up front; the grid is passed
+        # explicitly because a bare FsGroup has no root metadata to
+        # derive it from.
+        g.create_sharded_chunk_array("vertices", grid_shape=(2, 1, 1))
         data = b"hello chunk"
         g.write_bytes("vertices", "0.0.0", data)
         assert g.chunk_exists("vertices", "0.0.0")
@@ -521,6 +525,7 @@ class TestFsGroup:
 
     def test_list_chunks(self, tmp_store_path: Path) -> None:
         g = FsGroup(tmp_store_path, create=True)
+        g.create_sharded_chunk_array("vertices", grid_shape=(2, 1, 2))
         g.write_bytes("vertices", "0.0.1", b"a")
         g.write_bytes("vertices", "0.0.0", b"b")
         g.write_bytes("vertices", "1.0.0", b"c")

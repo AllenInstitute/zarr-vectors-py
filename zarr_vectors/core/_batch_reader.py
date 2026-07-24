@@ -13,15 +13,13 @@ pairs; this module loads every requested chunk in one async gather and
 returns a ``{(array_name, chunk_key): bytes}`` cache that the Group
 serves :meth:`read_bytes` calls from while the context is active.
 
-Two storage layouts are dispatched per ``array_name`` resolution:
-
-* **Legacy Option-G** — ``<array_name>`` is a Zarr Group; each chunk
-  is a single-chunk uint8 child array at ``<array_name>/<chunk_key>``.
-  The per-chunk read fetches the whole 1-D array.
-* **Native-sharded** — ``<array_name>`` is itself a multidim vlen-bytes
-  Zarr Array.  One cell ``arr[coords]`` holds the chunk's payload; the
-  ``sharding_indexed`` codec transparently performs the byte-range
-  reads needed to fetch a single inner-chunk from its outer shard.
+Every ``<array_name>`` is a multidim vlen-bytes Zarr Array whose cell
+``arr[coords]`` holds one chunk's payload; the ``sharding_indexed``
+codec transparently performs the byte-range reads needed to fetch a
+single inner-chunk from its outer shard.  A plan entry naming anything
+else is skipped, which degrades to the sync :meth:`read_bytes` path —
+and that path must agree, so this module must not learn to serve a
+layout ``read_bytes`` would reject.
 
 Icechunk-backed stores fall back to the synchronous :meth:`read_bytes`
 path because icechunk tracks arrays as session-managed entities and the
@@ -36,6 +34,13 @@ from typing import Any
 import numpy as np
 import zarr
 from zarr.core.sync import sync
+
+# Leaf module (no other zarr_vectors imports), so importing it here does
+# not reintroduce the import cycle this module otherwise avoids.
+from zarr_vectors.core._vlen import (
+    cell_region as _vlen_cell_region,
+    region_to_bytes as _vlen_region_to_bytes,
+)
 
 
 def _is_icechunk_store(store: Any) -> bool:
@@ -72,32 +77,11 @@ def _apply_origin(
     return tuple(c - int(o) for c, o in zip(coords, origin))
 
 
-async def _async_get_legacy_chunk(
-    async_group: Any,
-    array_name: str,
-    chunk_key: str,
-) -> bytes | None:
-    """Read a legacy Option-G chunk: ``<array_name>/<chunk_key>`` is a
-    1-D uint8 ``AsyncArray``; we fetch the whole thing.
-    """
-    path = f"{array_name}/{chunk_key}"
-    try:
-        node = await async_group.getitem(path)
-    except KeyError:
-        return None
-    if not isinstance(node, zarr.AsyncArray):
-        return None
-    if node.shape[0] == 0:
-        return b""
-    data = await node.getitem(slice(None))
-    return bytes(np.asarray(data).tobytes())
-
-
 async def _async_get_sharded_cell(
     async_array: Any,
     chunk_key: str,
 ) -> bytes | None:
-    """Read one cell from a native-sharded vlen-bytes ``AsyncArray``.
+    """Read one cell from a vlen-bytes chunk ``AsyncArray``.
 
     Builds the ``(slice(c, c+1),) * ndim`` region so zarr's
     ``sharding_indexed`` codec fetches exactly the inner chunk's byte
@@ -115,12 +99,8 @@ async def _async_get_sharded_cell(
     coords = _apply_origin(coords, async_array.metadata.attributes)
     if any(c < 0 or c >= s for c, s in zip(coords, async_array.shape)):
         return None
-    region = tuple(slice(c, c + 1) for c in coords)
-    arr = np.asarray(await async_array.getitem(region))
-    if arr.size == 0:
-        return b""
-    val = arr.flat[0]
-    return b"" if val is None else bytes(val)
+    region = _vlen_cell_region(coords)
+    return _vlen_region_to_bytes(await async_array.getitem(region))
 
 
 async def _gather_plan(
@@ -131,12 +111,12 @@ async def _gather_plan(
     via :func:`asyncio.gather`.
 
     Returns a flat ``{(array_name, chunk_key): bytes}`` cache; entries
-    whose underlying node is missing or whose read returned ``None`` are
-    omitted (the caller's sync :meth:`Group.read_bytes` raises
-    :class:`StoreError` on a cache miss).
+    whose underlying node is missing or is not a chunk array, or whose
+    read returned ``None``, are omitted — the caller's sync
+    :meth:`Group.read_bytes` then raises :class:`StoreError` on the
+    cache miss, exactly as it would have without the prefetch.
     """
-    # Resolve each array_name once — the per-array AsyncArray /
-    # AsyncGroup node tells us which dispatch path to use.
+    # Resolve each array_name once.
     nodes: dict[str, Any] = {}
     for array_name, _ in plan:
         if array_name in nodes:
@@ -147,25 +127,16 @@ async def _gather_plan(
             nodes[array_name] = None
 
     # Build the per-chunk task list.  Each task returns ``bytes | None``
-    # so the post-gather assembly is uniform across both layouts.
+    # so the post-gather assembly is uniform.
     flat: list[tuple[str, str]] = []
     tasks: list[Any] = []
     for array_name, chunk_keys in plan:
         node = nodes.get(array_name)
-        if node is None:
+        if not isinstance(node, zarr.AsyncArray):
             continue
         for chunk_key in chunk_keys:
             flat.append((array_name, chunk_key))
-            if isinstance(node, zarr.AsyncArray):
-                tasks.append(_async_get_sharded_cell(node, chunk_key))
-            else:
-                # AsyncGroup (legacy Option-G).  Note: we call
-                # ``_async_get_legacy_chunk(async_group, array_name, ...)``
-                # rather than ``async_group.getitem(node, ...)`` so that
-                # the per-chunk path resolution stays a single getitem.
-                tasks.append(
-                    _async_get_legacy_chunk(async_group, array_name, chunk_key)
-                )
+            tasks.append(_async_get_sharded_cell(node, chunk_key))
 
     if not tasks:
         return {}
@@ -212,10 +183,7 @@ def _sync_fallback(
     play well with the async-gather pattern.
 
     Walks the plan one entry at a time using sync zarr access, returning
-    the same dict shape :func:`flush_prefetch` does.  Dispatches per
-    ``array_name`` between the legacy Option-G layout (chunk lookup by
-    child-array name) and the native-sharded layout (chunk lookup by
-    grid-coord cell).
+    the same dict shape :func:`flush_prefetch` does.
     """
     cache: dict[tuple[str, str], bytes] = {}
     for array_name, chunk_keys in plan:
@@ -223,38 +191,19 @@ def _sync_fallback(
             node = zarr_group[array_name]
         except KeyError:
             continue
-        if isinstance(node, zarr.Array):
-            # Single vlen array: one cell per chunk.
-            shape = node.shape
-            attrs = dict(node.attrs)
-            for chunk_key in chunk_keys:
-                coords = _parse_coords(chunk_key)
-                if coords is None or len(coords) != len(shape):
-                    continue
-                coords = _apply_origin(coords, attrs)
-                if any(c < 0 or c >= s for c, s in zip(coords, shape)):
-                    continue
-                region = tuple(slice(c, c + 1) for c in coords)
-                cell = np.asarray(node[region])
-                if cell.size == 0:
-                    cache[(array_name, chunk_key)] = b""
-                    continue
-                val = cell.flat[0]
-                cache[(array_name, chunk_key)] = (
-                    b"" if val is None else bytes(val)
-                )
+        if not isinstance(node, zarr.Array):
             continue
-        if not isinstance(node, zarr.Group):
-            continue
+        shape = node.shape
+        attrs = dict(node.attrs)
         for chunk_key in chunk_keys:
-            try:
-                arr = node[chunk_key]
-            except KeyError:
+            coords = _parse_coords(chunk_key)
+            if coords is None or len(coords) != len(shape):
                 continue
-            if not isinstance(arr, zarr.Array):
+            coords = _apply_origin(coords, attrs)
+            if any(c < 0 or c >= s for c, s in zip(coords, shape)):
                 continue
-            if arr.shape[0] == 0:
-                cache[(array_name, chunk_key)] = b""
-                continue
-            cache[(array_name, chunk_key)] = bytes(np.asarray(arr[:]).tobytes())
+            region = _vlen_cell_region(coords)
+            cache[(array_name, chunk_key)] = _vlen_region_to_bytes(
+                node[region]
+            )
     return cache

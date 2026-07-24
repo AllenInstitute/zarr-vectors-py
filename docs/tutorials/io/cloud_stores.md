@@ -66,44 +66,71 @@ print(result["vertex_count"])
 ```
 
 Authentication is opt-in: if the bucket allows anonymous reads, the
-default backend config will use it. If you need to force anonymous
-access in a credentialed environment, pass it through:
+default backend config will use it.
 
-```python
-read_points(
-    "s3://open-neuro-data/scan.zarrvectors",
-    backend="obstore",
-    skip_signature=True,                    # obstore-specific kwarg
-)
-```
+### Where credentials go
 
-### Authenticated access
+**The typed `read_*` / `write_*` functions take only `backend=` — a
+backend *name*.** They have no `storage_options` parameter and no
+`**backend_kwargs`, so passing `skip_signature=`, `aws_access_key_id=`,
+`region=`, or `token=` to `read_points`/`write_points`/`read_polylines`
+raises `TypeError`.
+
+Backend options belong to the store-opening functions, which do accept
+them:
+
+| Function | Accepts |
+|----------|---------|
+| `open_store(path, mode=...)` | `backend=`, `storage_options=`, `**backend_kwargs` |
+| `open_zv(path)` | `backend=`, `storage_options=`, `**backend_kwargs` |
+| `ZVStore.set_backend(name)` | `storage_options=`, `**backend_kwargs` |
+| `read_points` / `write_points` / `read_polylines` / `read_graph` / `read_mesh` | `backend=` only |
 
 Ambient credentials work without configuration — `obstore` and `fsspec`
-both read `~/.aws/credentials`, environment variables, and IAM roles:
+both read `~/.aws/credentials`, environment variables, and IAM roles — so
+for the typed readers this is the supported path:
 
 ```python
 result = read_points("s3://my-bucket/scan.zarrvectors")
 ```
 
-To pass credentials explicitly, forward them through `**backend_kwargs`:
+To pass credentials explicitly, open the store yourself and supply
+`storage_options` (loose `**backend_kwargs` are merged into it):
 
 ```python
 import os
-from zarr_vectors.types.points import read_points
+from zarr_vectors.core.store import open_store
 
-result = read_points(
+root = open_store(
     "s3://my-bucket/scan.zarrvectors",
+    mode="r",
     backend="obstore",
-    aws_access_key_id=os.environ["AWS_ACCESS_KEY_ID"],
-    aws_secret_access_key=os.environ["AWS_SECRET_ACCESS_KEY"],
-    region="us-east-1",
+    storage_options={
+        "aws_access_key_id":     os.environ["AWS_ACCESS_KEY_ID"],
+        "aws_secret_access_key": os.environ["AWS_SECRET_ACCESS_KEY"],
+        "region":                "us-east-1",
+    },
 )
 ```
 
-Keyword names match the active backend (`obstore` uses `aws_*`;
-`fsspec`/`s3fs` uses `key` / `secret`). Prefer ambient credentials when
-possible.
+The same works for the lazy handle, which can also swap credentials on an
+already-open store:
+
+```python
+from zarr_vectors.lazy import open_zv
+
+store = open_zv(
+    "s3://my-bucket/scan.zarrvectors",
+    backend="obstore",
+    storage_options={"skip_signature": True},   # force anonymous
+)
+
+store.set_backend("fsspec", storage_options={"anon": True})
+```
+
+Option names match the active backend (`obstore` uses `aws_*` /
+`skip_signature`; `fsspec`/`s3fs` uses `key` / `secret` / `anon`). Prefer
+ambient credentials when possible.
 
 ### Writing to S3
 
@@ -119,10 +146,13 @@ write_points(
     positions,
     chunk_shape=(500., 500., 500.),       # larger chunks = fewer S3 objects
     bin_shape=(100., 100., 100.),
-    backend="obstore",
-    region="us-east-1",
+    backend="obstore",                    # a backend *name* — no options here
 )
 ```
+
+`write_points` takes `backend=` only. Region and credentials come from
+the ambient environment (`AWS_REGION`, `~/.aws/config`, IAM role); there
+is no `region=` argument on the typed writers.
 
 **Chunk size guidance for S3.** Each ZV spatial chunk becomes one S3
 object. S3 charges per PUT (write) and GET (read) request. To minimise
@@ -177,13 +207,16 @@ write_polylines(
 )
 ```
 
-To pass GCS credentials explicitly:
+To pass GCS credentials explicitly, open the store rather than calling
+the typed reader — `read_polylines` accepts `backend=` but no `token=`:
 
 ```python
-read_polylines(
+from zarr_vectors.lazy import open_zv
+
+store = open_zv(
     "gs://my-bucket/tracts.zarrvectors",
     backend="fsspec",                       # gcsfs route
-    token="/path/to/service-account.json",
+    storage_options={"token": "/path/to/service-account.json"},
 )
 ```
 
@@ -330,6 +363,110 @@ print(f"Cost per 1M GETs:      ~${total_chunks / 1e6 * 0.40:.4f}")
 ```
 
 This counts every chunk across all resolution levels and every array
-family — including the new `links/<delta>/`, `cross_chunk_links/<delta>/`,
-and `cross_chunk_link_attributes/<name>/<delta>/` arrays produced by
-the multiscale-links layout.
+family — including the `links/<delta>/<offsets>/` and
+`link_attributes/<name>/<delta>/<offsets>/` arrays. Connectivity is a
+single family: intra-chunk links are the all-zero offsets segment
+(`links/0/0.0.0/`), cross-chunk links are the non-zero ones
+(`links/0/0.0.+1/`), and each `<offsets>` segment is its own array, so a
+store with many distinct offset directions has proportionally more
+objects.
+
+---
+
+## Reducing object count with sharding
+
+Each ZV spatial chunk is one cloud object, and per-request cost and
+latency scale with object count. `shard_store` repacks every per-chunk
+array with Zarr v3's standard `sharding_indexed` codec, so many inner
+chunks travel as one object:
+
+```python
+from zarr_vectors.sharding import shard_store
+
+stats = shard_store(
+    "s3://my-bucket/scan.zarrvectors",
+    shard_shape=8,        # outer chunk = 8 inner chunks per axis (~512 in 3-D)
+)
+print(stats["arrays_sharded"], stats["chunks_packed"], stats["shard_shape"])
+```
+
+`shard_shape` is expressed in *inner-chunk* units — one inner chunk is
+one ZVF spatial chunk. An `int` broadcasts to every axis; a tuple sets
+each axis explicitly. Pass `arrays=[...]` to convert only selected
+logical arrays. The result is plain Zarr v3, readable by any conformant
+implementation; no ZV-specific metadata is involved. See the
+[sharding spec](../../spec/chunking/sharding.md).
+
+---
+
+## Decentralized link writes
+
+When many workers write links in parallel — the common shape of a
+distributed cloud ingest — they must not race on the family-wide
+bookkeeping. The pattern is worker-writes, coordinator-finalizes,
+coordinator-shards, **in that order**:
+
+```python
+# --- on each worker: write only the cells this worker owns ---
+from zarr_vectors.core.arrays import write_link_cells, write_link_attribute_cells
+
+partition = write_link_cells(level_group, batch, sid_ndim, delta=0)
+
+# Per-link attributes follow the same partition, so they land beside
+# the records they describe.
+write_link_attribute_cells(
+    level_group, "weight", weights, partition=partition, delta=0,
+)
+```
+
+The returned `LinkPartition` describes **this batch** — its `num_links`
+is the batch's logical record count, not the family's — and it is what
+you pass to `write_link_attribute_cells`.
+
+`write_link_cells` touches only the cells its batch lands in, leaves
+every other cell alone, and deliberately does **not** maintain the
+family's `num_links` / `num_physical_records` counts. It routes placement
+through the same choke point `write_links` uses, so disjoint per-cell
+writes plus one finalize are equivalent to a single whole-family
+`write_links` over the union of the batches.
+
+It is safe only while workers own **disjoint source chunks** — the
+per-cell update is read-modify-write, so two workers appending to one
+cell lose rows. A coordinator may pre-create the family with
+`create_links_array` so workers agree on `directed` / `store` /
+`sid_ndim` and don't race to create it.
+
+```python
+# --- on the coordinator, once every worker has finished ---
+from zarr_vectors.core.arrays import finalize_links
+from zarr_vectors.sharding import shard_store
+
+part = finalize_links(level_group, delta=0)      # 1. reconcile counts
+shard_store("s3://my-bucket/scan.zarrvectors")   # 2. then shard
+```
+
+Order matters: `finalize_links` rescans every offsets array and every
+cell to recompute the counts, so it must run after all cells are on disk
+and **before** sharding. If the counts are left unreconciled, L3
+validation reports
+`links[delta=0] num_physical_records=<N> != <M> rows on disk`.
+
+### How link rows and attribute rows stay aligned
+
+`read_links` and `read_link_attributes` both enumerate in **(offsets
+segment, cell) sorted order** — segments sorted, then cells within each
+segment. That shared enumeration is the *only* thing tying attribute row
+`i` to link record `i`; nothing on disk records the association. So
+`read_link_attributes(...)[i]` describes `read_links(...)[i]`, and the
+two must never drift.
+
+One consequence worth knowing when reading raw families: segment names
+sort lexicographically, and `+` / `-` precede `0` in ASCII — so the
+intra-chunk segment `0.0.0` sorts **last**, after every cross-chunk
+direction. The order is deterministic, just not the one you might guess.
+
+Under `store="duplicate"` a logical record is filed in several cells and
+so comes back once per copy; dedupe, or query one location with
+`read_links_for_tuple`.
+
+

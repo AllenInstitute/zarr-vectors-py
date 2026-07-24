@@ -21,6 +21,13 @@ from zarr.storage import LocalStore
 if TYPE_CHECKING:
     from zarr.storage import StoreLike
 
+    # What every ``read_*`` entry point accepts: a URL/path string, a
+    # pre-built ``zarr.abc.store.Store``, or an already-open Group.  The
+    # Group arm is what lets a caller hand in a handle whose caches are
+    # already primed — see :func:`open_store` and
+    # :mod:`zarr_vectors.core.aio`.
+    ReadSource = StoreLike | Group
+
 from zarr_vectors.constants import (
     DEFAULT_AXES_NAMES,
     DEFAULT_BOUNDS_SIDE,
@@ -294,6 +301,7 @@ def create_store(
     ndim: int | None = None,
     vertex_dtype: str = "float32",
     vertex_encoding: str = "raw",
+    compressor: Any = None,
     links_convention: str | None = None,
     object_index_convention: str | None = None,
     cross_chunk_strategy: str | None = None,
@@ -340,6 +348,15 @@ def create_store(
             ``chunk_shape``).  Defaults to 3.
         vertex_dtype: dtype for the level-0 vertices array.
         vertex_encoding: ``"raw"`` or ``"draco"``.
+        compressor: Codec pipeline for the warm-created
+            ``vertices``/``vertex_fragments`` arrays — and therefore for
+            the life of the store, since a chunk array's codecs are fixed
+            at creation and every later ``create_vertices_array`` reuses
+            the existing array.  ``None`` (default) stores raw.  See
+            :func:`zarr_vectors.encoding.compression.resolve_compressor`
+            for accepted values (``"zstd"``, ``"blosc"``, or a codec list).
+            Writers that create their own arrays (links, attributes) still
+            need the same compressor passed to their own write session.
         links_convention: How edges are encoded
             (``"explicit"`` / ``"implicit_sequential"`` /
             ``"implicit_sequential_with_branches"``).  When omitted the
@@ -450,7 +467,25 @@ def create_store(
     )
     # Defer import: arrays.py imports from store.py (FsGroup).
     from zarr_vectors.core.arrays import create_vertices_array
-    create_vertices_array(level0, dtype=vertex_dtype, encoding=vertex_encoding)
+    # The warm create fixes the vertices/vertex_fragments codec pipeline for
+    # the life of the store: every later create_vertices_array short-circuits
+    # on the existing array, so a compressor passed only to a downstream
+    # writer would silently never reach the largest arrays in the store.  Open
+    # the codec session here, or not at all.
+    # The warm create fixes the vertices/vertex_fragments codec pipeline for
+    # the life of the store: every later create_vertices_array short-circuits
+    # on the existing array, so a compressor passed only to a downstream
+    # writer would silently never reach the largest arrays in the store.  Open
+    # the codec session here, or not at all.
+    if compressor:
+        with level0.batched_writes(compressor=compressor):
+            create_vertices_array(
+                level0, dtype=vertex_dtype, encoding=vertex_encoding,
+            )
+    else:
+        create_vertices_array(
+            level0, dtype=vertex_dtype, encoding=vertex_encoding,
+        )
     return root
 
 
@@ -903,7 +938,7 @@ def _finalize_write(root: Group, message: str) -> str | None:
     return commit(root, message)
 
 def open_store(
-    path: StoreLike,
+    path: StoreLike | Group,
     mode: str = "r",
     *,
     backend: str | None = None,
@@ -913,7 +948,16 @@ def open_store(
     """Open an existing ZV store.
 
     Args:
-        path: URL or filesystem path to the store.
+        path: URL or filesystem path to the store, a pre-built
+            ``zarr.abc.store.Store``, or an already-opened :class:`Group`.
+            A Group is returned unchanged — mirroring
+            :func:`_create_or_open_store` on the write side, so a caller
+            holding a handle can read through it without reopening.  This
+            is what lets a caller prime the handle's caches (see
+            :meth:`Group.offline_reads`) and then drive an otherwise
+            synchronous ``read_*`` with no store I/O at all.  When a Group
+            is passed, ``mode`` and the backend kwargs are ignored — the
+            handle's existing mode stands.
         mode: ``"r"`` (read-only — writes will raise), ``"r+"``
             (read-write), ``"a"`` (append).  For ``mode="r"`` the
             underlying Zarr store is wrapped via
@@ -932,6 +976,12 @@ def open_store(
         StoreError: If the store does not exist or is structurally invalid.
         MetadataError: If root metadata cannot be parsed.
     """
+    # Pass-through for an already-opened Group handle, matching
+    # ``_create_or_open_store``.  Checked first so none of the path
+    # sniffing below ever sees a Group.
+    if isinstance(path, Group):
+        return path
+
     # Local-FS existence check; transactional backends (icechunk) verify
     # repository existence inside their own session factory.  Pre-built
     # Store objects and cloud schemes skip the local check and rely on
@@ -1218,9 +1268,11 @@ def create_resolution_level(
             root, level, scale=scale, translation=translation,
         )
     elif level_metadata.bin_ratio is not None or level_metadata.bin_shape is not None:
+        base_bin: tuple[float, ...] | None = None
         try:
             root_meta = read_root_metadata(root)
             ndim = root_meta.sid_ndim
+            base_bin = root_meta.effective_bin_shape
         except Exception:
             ndim = (
                 len(level_metadata.bin_ratio) if level_metadata.bin_ratio
@@ -1228,6 +1280,23 @@ def create_resolution_level(
             )
         if level_metadata.bin_ratio is not None:
             scale = [float(r) for r in level_metadata.bin_ratio]
+        elif level_metadata.bin_shape is not None and base_bin is not None:
+            # Derive the NGFF scale from bin_shape (this level's ÷ the
+            # root's) rather than defaulting to 1.0.  This branch is
+            # reached whenever bin_shape is set, so a caller that only
+            # sets bin_shape — letting the ratio be implied, e.g. so
+            # cumulative-across-levels bin_shape math is the single
+            # source of truth — was silently getting a wrong,
+            # non-cumulative scale=1.0 baked into the transform.
+            #
+            # Plain float division, not compute_bin_ratio: the NGFF
+            # scale is a float multiplier with no integer requirement,
+            # unlike the separately-typed ``bin_ratio: tuple[int, ...]``
+            # field, so a fractional coarsen factor must not raise.
+            scale = [
+                (float(bs) / float(bb)) if bb else 1.0
+                for bb, bs in zip(base_bin, level_metadata.bin_shape)
+            ]
         else:
             scale = [1.0] * ndim
         translation = (

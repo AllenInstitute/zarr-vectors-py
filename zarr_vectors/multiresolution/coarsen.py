@@ -28,7 +28,6 @@ from zarr_vectors.constants import (
     COARSEN_PER_OBJECT,
     DEFAULT_CROSS_LEVEL_DEPTH,
     DEFAULT_CROSS_LEVEL_STORAGE,
-    LINKS,
     OBJECT_ATTRIBUTES,
     VERTICES,
     XLEVEL_EXPLICIT,
@@ -36,20 +35,16 @@ from zarr_vectors.constants import (
     VALID_XLEVEL_STORAGE,
 )
 from zarr_vectors.core.arrays import (
-    create_cross_chunk_links_array,
-    create_links_array,
     create_object_attributes_array,
     create_object_index_array,
     create_vertices_array,
     list_chunk_keys,
     read_all_object_manifests,
-    read_chunk_links,
     read_chunk_vertices,
-    read_cross_chunk_links,
+    read_links,
     read_object_attributes,
-    write_chunk_links,
     write_chunk_vertices,
-    write_cross_chunk_links,
+    write_links,
     write_object_attributes,
     write_object_index,
 )
@@ -67,10 +62,7 @@ from zarr_vectors.core.store import (
 )
 from zarr_vectors.exceptions import ArrayError, CoarseningError
 from zarr_vectors.multiresolution.object_selection import apply_sparsity
-from zarr_vectors.spatial.boundary import (
-    build_vertex_chunk_mapping,
-    partition_cross_level_edges,
-)
+from zarr_vectors.spatial.boundary import build_vertex_chunk_mapping
 from zarr_vectors.spatial.chunking import assign_chunks
 from zarr_vectors.typing import ChunkCoords
 
@@ -222,7 +214,7 @@ def _per_object_coarsen(
     src_fragment_positions: dict[tuple[ChunkCoords, int], npt.NDArray] = {}
     for cc in list_chunk_keys(src_group, VERTICES):
         try:
-            fragments = read_chunk_vertices(src_group, cc, dtype=np.float32, ndim=ndim)
+            fragments = read_chunk_vertices(src_group, cc, ndim=ndim)
         except ArrayError:
             continue
         for fragment_idx, fragment in enumerate(fragments):
@@ -403,8 +395,8 @@ def _per_object_coarsen(
     src_obj_attr_group_name = f"{OBJECT_ATTRIBUTES}"
     if src_obj_attr_group_name in src_group:
         src_obj_attr_group = src_group[src_obj_attr_group_name]
-        # children() covers both layouts: Option-G groups under
-        # group_keys() and 0.8.1 standalone arrays under array_keys().
+        # children() covers both layouts: legacy per-chunk-array groups
+        # under group_keys() and standalone arrays under array_keys().
         attr_names = src_obj_attr_group.children()
     else:
         attr_names = []
@@ -432,6 +424,8 @@ def _per_object_coarsen(
     _stamp_root_capability(root, CAP_SHARED_FRAGMENTS)
 
     # --- Step 13: emit inline ±1 cross-level link arrays ----------------
+    # Must stay after step 6's create_resolution_level: the anchor's
+    # scale factors are read off the target level's metadata.
     if cross_level_storage != XLEVEL_NONE and n_metavertices > 0:
         _emit_inline_cross_level_links(
             root,
@@ -468,7 +462,7 @@ def _emit_inline_cross_level_links(
     coarse_chunk_assignments_mv: dict[ChunkCoords, npt.NDArray[np.int64]],
     storage: str,
 ) -> None:
-    """Emit ``±1`` link/cross_chunk_link arrays for one coarsen step.
+    """Emit the ``±1`` link families for one coarsen step.
 
     Re-walks the source level in chunk-major order, re-bins each
     vertex against ``bin_shape_arr``, and looks up the matching
@@ -477,6 +471,16 @@ def _emit_inline_cross_level_links(
     metavertex IDs to chunk-major-flat coarse indices via the
     just-written coarse-level chunks, then dispatches to
     :func:`_write_cross_level_edges`.
+
+    ORDERING CONSTRAINT: the target level must already exist on disk
+    with its ``LevelMetadata`` — including any ``chunk_shape`` override
+    — before this runs.  ``write_links`` derives ``(r_src, r_trg)`` via
+    ``arrays._derive_level_scales``, which falls back to ALL-ONES when it
+    cannot read the target level.  All-ones is right only for a pyramid
+    built at the default ``chunk_scale_factor=1``; on a scaled pyramid it
+    silently mis-anchors every cross-level record.  Callers must keep
+    this after the ``create_resolution_level`` for ``source_level + 1``
+    (step 6 of :func:`_per_object_coarsen`).
     """
     # bin_key_bytes → mv_idx (bin-key-ordered, matches np.unique output).
     unique_keys = np.unique(bin_keys)
@@ -616,7 +620,7 @@ def _reconstruct_chunk_assignments(
     cursor = 0
     for cc in chunk_keys:
         try:
-            fragments = read_chunk_vertices(level_group, cc, dtype=np.float32, ndim=ndim)
+            fragments = read_chunk_vertices(level_group, cc, ndim=ndim)
         except ArrayError:
             continue
         n = sum(int(fragment.shape[0]) for fragment in fragments)
@@ -634,40 +638,22 @@ def _decode_parent_from_plus_one(
     coarse_assn: dict[ChunkCoords, npt.NDArray[np.int64]],
     n_fine: int,
 ) -> npt.NDArray[np.int64] | None:
-    """Decode a fine→coarse ``parent`` array from already-written ``+1`` arrays.
+    """Decode a fine→coarse ``parent`` array from the already-written ``+1`` family.
 
-    Reads ``links/<+1>/<chunk_key>`` (intra-chunk edges) and
-    ``cross_chunk_links/<+1>/`` (cross-chunk edges) at the fine level
-    and converts each ``(chunk, local_idx)`` pair to global flat indices
-    via the supplied chunk-assignment dicts.  Returns ``None`` when
-    neither array exists.
+    Reads every ``links/<+1>/<offsets>/`` record at the fine level and
+    converts each ``(chunk, local_idx)`` endpoint to a global flat index
+    via the supplied chunk-assignment dicts.  Endpoint 0 is the fine side
+    and endpoint 1 the coarse side — :func:`write_links` keeps that order
+    for ``delta != 0``.  Intra- and cross-chunk records arrive together:
+    they differ only by which offsets array holds them, and ``read_links``
+    already re-anchored each one back to absolute chunk coords.  Returns
+    ``None`` when the family is absent or empty.
     """
     parent = np.full(n_fine, -1, dtype=np.int64)
     found_any = False
 
-    # Aligned (intra-chunk) edges: read each chunk in links/+1/.
     try:
-        chunk_keys = list_chunk_keys(fine_lg, f"{LINKS}/+1")
-    except (ArrayError, KeyError):
-        chunk_keys = []
-    for cc in chunk_keys:
-        try:
-            link_groups = read_chunk_links(fine_lg, cc, delta=1)
-        except ArrayError:
-            continue
-        for rows in link_groups:
-            if rows is None or len(rows) == 0:
-                continue
-            local_src = rows[:, 0].astype(np.int64)
-            local_tgt = rows[:, 1].astype(np.int64)
-            fine_global = fine_assn[cc][local_src]
-            coarse_global = coarse_assn[cc][local_tgt]
-            parent[fine_global] = coarse_global
-            found_any = True
-
-    # Cross-chunk edges.
-    try:
-        records = read_cross_chunk_links(fine_lg, delta=1)
+        records = read_links(fine_lg, delta=1)
     except (ArrayError, KeyError):
         records = []
     for (cc_s, vi_s), (cc_t, vi_t) in records:
@@ -801,13 +787,23 @@ def _write_cross_level_edges(
     vertex ``i`` belongs to.  The cross-level edges are trivially
     ``(i, parent[i])`` for each fine vertex.
 
-    Writes the ``+delta`` arrays under the fine level.  When
-    ``storage='explicit'`` also writes the matching ``-delta`` arrays
+    Writes the ``+delta`` family under the fine level.  When
+    ``storage='explicit'`` also writes the matching ``-delta`` family
     under the coarse level by swapping endpoint roles.
+
+    Records go to :func:`write_links` in global ``(chunk_coords,
+    vertex_idx)`` form; it routes each one to the offsets array for the
+    gap between its endpoints, so intra- and cross-chunk edges are one
+    call.  Crucially it anchors that gap through
+    :func:`~zarr_vectors.spatial.boundary.anchor_chunk` using the two
+    levels' real ``chunk_shape`` scales, which is the only correct way
+    to difference chunk coords when ``chunk_scale_factor > 1`` gives the
+    levels different chunk grids.  Both calls therefore require the
+    level they reference across to already carry its metadata — see the
+    ordering note on :func:`_emit_inline_cross_level_links`.
     """
     if storage == XLEVEL_NONE or delta == 0:
         return
-    coarse_level = fine_level + delta
 
     # Drop orphaned fine vertices (parent < 0) before building edges.
     valid_mask = parent >= 0
@@ -817,53 +813,49 @@ def _write_cross_level_edges(
     parent_valid = parent[valid_mask].astype(np.int64)
 
     # Build chunk-mapping tables for both levels.
-    fine_chunk_list = sorted(fine_chunk_assignments.keys())
     fine_vchunks, fine_vlocal, fine_chunk_list = build_vertex_chunk_mapping(
-        fine_chunk_assignments, n_fine, fine_chunk_list,
+        fine_chunk_assignments, n_fine, sorted(fine_chunk_assignments.keys()),
     )
-    coarse_chunk_list = sorted(coarse_chunk_assignments.keys())
     coarse_vchunks, coarse_vlocal, coarse_chunk_list = build_vertex_chunk_mapping(
-        coarse_chunk_assignments, n_coarse, coarse_chunk_list,
+        coarse_chunk_assignments, n_coarse, sorted(coarse_chunk_assignments.keys()),
     )
 
-    # Trivial fine→parent edge list.
-    edges = np.stack([fine_global, parent_valid], axis=1)
-    aligned, cross = partition_cross_level_edges(
-        edges,
-        fine_vchunks, fine_vlocal, fine_chunk_list,
-        coarse_vchunks, coarse_vlocal, coarse_chunk_list,
-    )
+    fine_eps = [
+        (fine_chunk_list[int(fine_vchunks[i])], int(fine_vlocal[i]))
+        for i in fine_global.tolist()
+    ]
+    coarse_eps = [
+        (coarse_chunk_list[int(coarse_vchunks[i])], int(coarse_vlocal[i]))
+        for i in parent_valid.tolist()
+    ]
 
+    # Endpoint 0 leads and stays at the owning level, so each call's
+    # anchor uses that level's scale as ``r_src``.  ``directed=True``:
+    # fine→coarse parenthood is data, not an undirected pair.
     fine_lg = get_resolution_level(root_group, fine_level)
-    if aligned:
-        create_links_array(fine_lg, link_width=2, delta=delta)
-        for cc, rows in aligned.items():
-            write_chunk_links(fine_lg, cc, [rows], delta=delta)
-    if cross:
-        create_cross_chunk_links_array(fine_lg, delta=delta)
-        write_cross_chunk_links(fine_lg, cross, sid_ndim=sid_ndim, delta=delta)
+    write_links(
+        fine_lg,
+        [[f, c] for f, c in zip(fine_eps, coarse_eps)],
+        sid_ndim,
+        delta=delta,
+        link_width=2,
+        directed=True,
+    )
 
     if storage == XLEVEL_EXPLICIT:
-        # Mirror at the coarse level under -delta: swap endpoint roles.
-        coarse_lg = get_resolution_level(root_group, coarse_level)
-        # Re-partition from the coarse side so chunk-alignment is
-        # evaluated against the coarse chunk grid (intra/cross split
-        # may differ from the fine-side view when grids don't align).
-        rev_edges = np.stack([parent_valid, fine_global], axis=1)
-        rev_aligned, rev_cross = partition_cross_level_edges(
-            rev_edges,
-            coarse_vchunks, coarse_vlocal, coarse_chunk_list,
-            fine_vchunks, fine_vlocal, fine_chunk_list,
+        # Mirror at the coarse level under -delta: the coarse endpoint
+        # leads, so the anchor's scales swap with it.  No re-partitioning
+        # by hand — write_links re-derives the offsets from the coarse
+        # grid, which is what the fine-side split cannot speak to.
+        coarse_lg = get_resolution_level(root_group, fine_level + delta)
+        write_links(
+            coarse_lg,
+            [[c, f] for f, c in zip(fine_eps, coarse_eps)],
+            sid_ndim,
+            delta=-delta,
+            link_width=2,
+            directed=True,
         )
-        if rev_aligned:
-            create_links_array(coarse_lg, link_width=2, delta=-delta)
-            for cc, rows in rev_aligned.items():
-                write_chunk_links(coarse_lg, cc, [rows], delta=-delta)
-        if rev_cross:
-            create_cross_chunk_links_array(coarse_lg, delta=-delta)
-            write_cross_chunk_links(
-                coarse_lg, rev_cross, sid_ndim=sid_ndim, delta=-delta,
-            )
 
 
 # ===================================================================

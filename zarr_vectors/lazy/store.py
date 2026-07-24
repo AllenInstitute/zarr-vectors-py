@@ -7,8 +7,12 @@ first access and cached.
 
 from __future__ import annotations
 
-from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    from pathlib import Path
+
+    from zarr.storage import StoreLike
 
 from zarr_vectors.core.group import Group
 from zarr_vectors.core.store import (
@@ -197,7 +201,7 @@ class ZVStore:
 
 
 def open_zv(
-    path: str | Path,
+    path: StoreLike,
     *,
     backend: str | None = None,
     storage_options: dict[str, Any] | None = None,
@@ -208,7 +212,12 @@ def open_zv(
     Reads only root metadata (a few KB).  No vertex data is loaded.
 
     Args:
-        path: URL or filesystem path to the ZV store.
+        path: URL, filesystem path, or a pre-built ``zarr.abc.store.Store``
+            (or any other ``StoreLike``).  A Store instance is passed
+            through to :func:`open_store` untouched, which is the only way
+            to drive the lazy API from an environment that cannot
+            construct a store from a URL — a browser fetch-backed Store
+            under Pyodide, say.
         backend: Force a backend (``"local"`` / ``"obstore"`` /
             ``"fsspec"`` / ``"icechunk"``).  Auto-detected from the URL
             scheme by default.
@@ -224,7 +233,7 @@ def open_zv(
     # can mutate without an extra reopen.  Pure readers pay no cost for
     # this — the actual reads still touch only the chunks they need.
     root = open_store(
-        str(path), mode="r+", backend=backend,
+        path, mode="r+", backend=backend,
         storage_options=storage_options, **backend_kwargs,
     )
     meta = read_root_metadata(root)

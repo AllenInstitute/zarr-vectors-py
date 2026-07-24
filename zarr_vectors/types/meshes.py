@@ -2,29 +2,30 @@
 
 Supports two encoding modes:
 
-- **Raw**: vertex positions in ``vertices/``, face indices in ``links/``
-  (L=3 for triangles, L=4 for quads).  Faces spanning chunk boundaries
-  go into ``cross_chunk_links/``.
+- **Raw**: vertex positions in ``vertices/``, face indices in
+  ``links/0/<offsets>/`` (L=3 for triangles, L=4 for quads).  Faces
+  within one chunk land in the all-zero offsets array; faces spanning
+  chunk boundaries land in the array naming the offsets between them.
 
 - **Draco**: each fragment is encoded as a Draco bitstream containing
-  both positions and faces.  ``links/`` may be omitted.
+  both positions and its own intra-chunk faces.  Only the boundary-
+  crossing faces remain in ``links/`` — the bitstream is per-chunk and
+  cannot carry them.
 """
 
 from __future__ import annotations
 
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import numpy as np
 import numpy.typing as npt
 
 from zarr_vectors.constants import (
     CROSS_CHUNK_EXPLICIT,
-    CROSS_CHUNK_LINKS,
     ENCODING_DRACO,
     ENCODING_RAW,
     GEOM_MESH,
     LINK_FRAGMENTS,
-    LINKS,
     LINKS_EXPLICIT,
     OBJIDX_STANDARD,
     VERTEX_FRAGMENTS,
@@ -32,21 +33,19 @@ from zarr_vectors.constants import (
 )
 from zarr_vectors.core.arrays import (
     create_attribute_array,
-    create_cross_chunk_links_array,
     create_links_array,
     create_object_attributes_array,
     create_object_index_array,
     create_vertices_array,
     list_chunk_keys,
+    list_link_offsets,
     resolve_chunk_keys,
-    read_chunk_links,
     read_chunk_vertices,
-    read_cross_chunk_links,
+    read_links,
     read_object_vertices,
     write_chunk_attributes,
-    write_chunk_links,
     write_chunk_vertices,
-    write_cross_chunk_links,
+    write_links,
     write_object_attributes,
     write_object_index,
 )
@@ -60,6 +59,7 @@ from zarr_vectors.core.metadata import (
     RootMetadata,
     get_level_chunk_shape,
 )
+from zarr_vectors.core.paths import links_group_path
 from zarr_vectors.core.store import (
     _apply_out_of_bounds_policy,
     _create_or_open_store,
@@ -90,6 +90,9 @@ from zarr_vectors.typing import (
     ChunkShape,
     ObjectManifest,
 )
+
+if TYPE_CHECKING:
+    from zarr_vectors.core.store import ReadSource
 
 
 def write_mesh(
@@ -249,10 +252,34 @@ def write_mesh(
         chunk_assignments, n_verts, chunk_list
     )
 
-    # Partition faces
-    intra_faces, cross_faces = partition_faces(
-        faces, vertex_chunks, vertex_local, chunk_list
-    )
+    # A face is intra-chunk exactly when all L of its vertices share a
+    # chunk — the all-zero-offsets case (``paths.is_intra``) once the
+    # record reaches ``write_links``.
+    f_chunk = vertex_chunks[faces]                      # (F, L)
+    f_local = vertex_local[faces]                       # (F, L)
+    is_intra_face = np.all(f_chunk == f_chunk[:, :1], axis=1)
+    is_draco = encoding == ENCODING_DRACO and ndim == 3
+
+    # Draco embeds a chunk's intra-chunk faces in that chunk's own
+    # bitstream, in chunk-local indices, so only the boundary-crossing
+    # faces stay in the links family.  Raw stores every face there.
+    intra_faces: dict[ChunkCoords, npt.NDArray[np.int64]] = {}
+    if is_draco:
+        intra_faces, _ = partition_faces(
+            faces, vertex_chunks, vertex_local, chunk_list
+        )
+        store_rows = np.flatnonzero(~is_intra_face)
+    else:
+        store_rows = np.arange(n_faces, dtype=np.int64)
+
+    # Records stay in face order, which ``partition_records_by_offset``
+    # preserves within each cell.
+    link_records: list[list[tuple[ChunkCoords, int]]] = [
+        [(chunk_list[ci], li) for ci, li in zip(row_chunks, row_locals)]
+        for row_chunks, row_locals in zip(
+            f_chunk[store_rows].tolist(), f_local[store_rows].tolist(),
+        )
+    ]
 
     # Write vertices per chunk (one fragment per chunk for simplicity)
     object_manifests: dict[int, ObjectManifest] = {}
@@ -273,9 +300,12 @@ def write_mesh(
         bin_count=session_bin_count,
     ):
         create_vertices_array(level_group, dtype=dtype, encoding=encoding)
-        create_links_array(level_group, link_width=link_width, delta=0)
         create_object_index_array(level_group)
-        create_cross_chunk_links_array(level_group, delta=0)
+        # The links family is created by ``write_links`` below, stamped
+        # with the real face arity.  The pre-merge cross-chunk family was
+        # created here with the default link_width=2 and mis-declared L=3
+        # geometry whenever no face happened to cross a boundary.
+
         if vertex_attributes:
             for name, data in vertex_attributes.items():
                 create_attribute_array(level_group, name, dtype=str(data.dtype))
@@ -287,7 +317,7 @@ def write_mesh(
             global_indices = chunk_assignments[chunk_coords]
             chunk_verts = vertices[global_indices]
 
-            if encoding == ENCODING_DRACO and ndim == 3:
+            if is_draco:
                 # Draco mode: encode positions + local faces together
                 local_faces_arr = intra_faces.get(chunk_coords)
                 _write_draco_chunk(
@@ -316,33 +346,24 @@ def write_mesh(
                         dtype=data.dtype,
                     )
 
-        # Write intra-chunk faces (raw mode)
-        if encoding != ENCODING_DRACO:
-            for chunk_coords in chunk_list:
-                if chunk_coords in intra_faces:
-                    write_chunk_links(
-                        level_group, chunk_coords, [intra_faces[chunk_coords]], delta=0,
-                    )
-
-        # Write cross-chunk faces as variable-width records under
-        # ``cross_chunk_links/<delta=0>/``.  Each record is a list of L
-        # ``(chunk_coords, local_vertex_idx)`` endpoints where L is the
-        # face arity (3 for triangles).  Faces of different arity are
-        # rejected; meshes are uniform-arity by construction.
-        if cross_faces:
-            face_arities = {len(f) for f in cross_faces}
-            if len(face_arities) != 1:
-                raise ArrayError(
-                    f"cross-chunk faces have inconsistent arities {face_arities}; "
-                    "meshes must be uniform-arity"
-                )
-            write_cross_chunk_links(
-                level_group,
-                [list(face) for face in cross_faces],
-                sid_ndim=idx_ndim,
-                delta=0,
-                link_width=face_arities.pop(),
+        # One write for every face record: each is L ``(chunk_coords,
+        # local_vertex_idx)`` endpoints, and ``write_links`` routes it to
+        # the offsets array naming where those endpoints sit.  Winding is
+        # recovered on read from ``perm_idx``, so the family is undirected.
+        if link_records:
+            write_links(
+                level_group, link_records, idx_ndim, delta=0,
+                link_width=link_width,
             )
+        # Backstop: `arrays_present` advertises the family, and the
+        # per-cell editors in ops/ write into an array that must already
+        # exist — Draco leaves write_links nothing to create when no face
+        # crosses.  Must run *after* it: an array present but untargeted
+        # makes write_links recount the family off disk, which inside this
+        # deferred write session reads back empty.
+        create_links_array(
+            level_group, link_width=link_width, delta=0, sid_ndim=idx_ndim,
+        )
 
         # Write object index
         write_object_index(level_group, object_manifests, sid_ndim=idx_ndim)
@@ -357,14 +378,17 @@ def write_mesh(
         "vertex_count": n_verts,
         "face_count": n_faces,
         "chunk_count": len(chunk_list),
-        "intra_face_count": sum(len(f) for f in intra_faces.values()),
-        "cross_face_count": len(cross_faces),
+        # Geometry, not storage: Draco keeps its intra-chunk faces in the
+        # bitstream rather than the links family, and these counts stay
+        # the same either way.
+        "intra_face_count": int(np.count_nonzero(is_intra_face)),
+        "cross_face_count": int(np.count_nonzero(~is_intra_face)),
         "encoding": encoding,
     }
 
 
 def read_mesh(
-    store_path: str,
+    store_path: ReadSource,
     *,
     level: int = 0,
     bbox: BoundingBox | None = None,
@@ -376,7 +400,8 @@ def read_mesh(
     """Read a mesh from a zarr vectors store.
 
     Args:
-        store_path: Path to the store.
+        store_path: URL or path to the store, a pre-built zarr Store,
+            or an already-open Group.
         level: Resolution level.
         bbox: Optional bounding box filter.
         object_ids: Optional object ID filter.
@@ -391,6 +416,18 @@ def read_mesh(
         - ``faces``: ``(F, L)`` face indices (remapped to output vertex order)
         - ``vertex_count``, ``face_count``
     """
+    if object_ids is not None:
+        # Declared and documented, but never applied — the filter was
+        # never implemented here (``read_polylines`` does implement it).
+        # Silently returning the unfiltered store is the worst outcome:
+        # the caller believes they scoped the read.  Fail loudly until
+        # someone implements it.
+        raise NotImplementedError(
+            "read_mesh(object_ids=...) is not implemented: the filter would be "
+            "silently ignored and you would get the whole level back. "
+            "Filter the returned arrays yourself, or use read_polylines, "
+            "which does implement object_ids."
+        )
     root = open_store(store_path, backend=backend)
     root_meta = read_root_metadata(root)
     level_group = get_resolution_level(root, level)
@@ -410,9 +447,11 @@ def read_mesh(
     except Exception:
         pass
 
+    # Face arity is family-wide policy, stamped on the ``links/<delta>/``
+    # group rather than on the per-offsets arrays under it.
     link_width = 3
     try:
-        lmeta = level_group.read_array_meta("links/0")
+        lmeta = level_group.read_array_meta(links_group_path(0))
         link_width = lmeta.get("link_width", 3)
     except Exception:
         pass
@@ -452,22 +491,21 @@ def read_mesh(
             return _empty_mesh_result(ndim, link_width)
         chunk_keys = [k for k in chunk_keys if k and k[0] == filter_bin]
 
-    # Prefetch every chunk (vertices, offsets, faces) and the cross-chunk
-    # face records in one async gather.  Subsequent ``read_bytes`` calls
-    # below hit the cache instead of paying one round-trip per chunk.
+    # Prefetch every chunk (vertices, offsets) and the whole links family
+    # in one async gather.  Subsequent ``read_bytes`` calls below hit the
+    # cache instead of paying one round-trip per chunk.  ``links/0`` is a
+    # group of one array per offsets segment, so the plan enumerates them
+    # — and each array's cells are keyed by *source* chunk, which for the
+    # non-zero offsets is not the ``chunk_keys`` set.
     chunk_key_strs = [".".join(str(c) for c in cc) for cc in chunk_keys]
-    _ccl_family = f"{CROSS_CHUNK_LINKS}/0"
-    _ccl_cell_keys = (
-        level_group.list_chunks(_ccl_family)
-        if level_group.array_exists(_ccl_family) else []
-    )
     _prefetch_plan: list[tuple[str, list[str]]] = [
         (VERTICES, chunk_key_strs),
         (VERTEX_FRAGMENTS, chunk_key_strs),
-        (f"{LINKS}/0", chunk_key_strs),
         (LINK_FRAGMENTS, chunk_key_strs),
-        (_ccl_family, _ccl_cell_keys),
     ]
+    for _seg in list_link_offsets(level_group, 0):
+        _seg_path = f"{links_group_path(0)}/{_seg}"
+        _prefetch_plan.append((_seg_path, level_group.list_chunks(_seg_path)))
     _batched_reads_cm = level_group.batched_reads(_prefetch_plan)
     _batched_reads_cm.__enter__()
     try:
@@ -493,37 +531,27 @@ def read_mesh(
 
         positions_out = np.concatenate(all_positions, axis=0)
 
-        # Read intra-chunk faces
+        # Faces: one family, so intra and cross records come back from one
+        # call already in global ``(chunk, local_idx)`` form — a single
+        # remap covers both, with winding restored from ``perm_idx``.  A
+        # face touching a chunk outside ``chunk_keys`` has no offset and is
+        # dropped, which is what applies the bbox/chunks filter to faces.
         all_faces: list[npt.NDArray] = []
-        for chunk_coords in chunk_keys:
-            try:
-                link_groups = read_chunk_links(
-                    level_group, chunk_coords, link_width=link_width, delta=0,
-                )
-                offset = chunk_offsets.get(chunk_coords, 0)
-                for lg in link_groups:
-                    if len(lg) > 0:
-                        remapped = lg.copy() + offset
-                        all_faces.append(remapped)
-            except ArrayError:
-                pass
-
-        # Cross-chunk faces are stored as variable-width records under
-        # ``cross_chunk_links/<delta=0>/`` (link_width = face arity).  Map
-        # each (chunk, local_idx) endpoint into the global vertex index
-        # via ``chunk_offsets`` built above.
-        cross_face_records = read_cross_chunk_links(level_group, delta=0)
-        for face in cross_face_records:
+        face_rows: list[list[int]] = []
+        for face in read_links(level_group, delta=0):
             if len(face) != link_width:
                 continue  # not a face record (e.g. edge-arity, ignore)
             vertex_ids: list[int] = []
             for cc, local_idx in face:
-                if cc not in chunk_offsets:
+                offset = chunk_offsets.get(cc)
+                if offset is None:
                     vertex_ids = []
                     break
-                vertex_ids.append(int(chunk_offsets[cc]) + int(local_idx))
+                vertex_ids.append(offset + int(local_idx))
             if len(vertex_ids) == link_width:
-                all_faces.append(np.asarray(vertex_ids, dtype=np.int64)[None, :])
+                face_rows.append(vertex_ids)
+        if face_rows:
+            all_faces.append(np.asarray(face_rows, dtype=np.int64))
 
         if all_faces:
             faces_out = np.concatenate(all_faces, axis=0)

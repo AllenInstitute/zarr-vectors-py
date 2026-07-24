@@ -1,8 +1,16 @@
 # Validation and repair
 
 The `zarr-vectors` validator checks ZVF stores for conformance at five
-levels of increasing thoroughness. This tutorial covers running validation,
-interpreting results, and repairing the most common failure modes.
+levels of increasing thoroughness. This tutorial covers running validation
+and interpreting results.
+
+A note on scope: **there is no repair module.** `zarr-vectors` ships no
+general-purpose repair API — no function that rebuilds an object index, a
+fragment index, or a links family from damaged data. The validator tells
+you what is wrong; fixing it almost always means rewriting the affected
+level from source through the normal write API. The few genuine
+in-place remedies that do exist are shown below, and each one is a
+general-purpose writer being used deliberately, not a repair tool.
 
 For the complete check catalogue by level, see
 [Validation overview](../../spec/validation/overview.md),
@@ -25,21 +33,46 @@ from zarr_vectors.validate import validate
 
 result = validate("scan.zarrvectors", level=5)
 
-# One-line status
+# One-line status plus every error and warning
 print(result.summary())
-# Level 5 validation: PASS — 54 passed, 0 warnings, 0 errors
-
-# Full report (all checks listed)
-print(result.report())
+# Level 5 validation: PASS
+#   54 passed, 0 warnings, 0 errors
 
 # Programmatic access
-print(result.is_valid)          # bool
+print(result.ok)                # bool — True when there are no errors
+print(result.level)             # int — the level that was requested
 print(len(result.errors))       # int
 print(len(result.warnings))     # int
+print(len(result.passed))       # int
 
-for err in result.errors:
-    print(f"[L{err.level}] {err.check}: {err.message}")
-    print(f"  at: {err.path}")
+# passed / warnings / errors are plain lists of strings.
+for msg in result.errors:
+    print(msg)
+```
+
+`ValidationResult` is a dataclass with exactly four fields — `level`,
+`passed`, `warnings`, `errors` — plus the `ok` property and the
+`summary()`, `add_pass()`, `add_warning()`, `add_error()` and `merge()`
+methods. Each message is a **string**, not a structured record: there is
+no per-error `check`, `path`, or `level` attribute to read, so filter by
+substring if you need to triage programmatically.
+
+Levels run cumulatively, and the run short-circuits: if L1 fails,
+nothing further runs; if L2 fails and `level >= 3`, the deeper passes are
+skipped. A failing `summary()` therefore shows the *first* thing that
+broke, not everything that is wrong.
+
+The individual passes are also importable directly, each returning its
+own `ValidationResult`:
+
+```python
+from zarr_vectors.validate import (
+    validate_structure,        # L1
+    validate_metadata,         # L2
+    validate_consistency,      # L3
+    validate_conformance,      # L4
+    validate_multiresolution,  # L5
+)
 ```
 
 ---
@@ -54,112 +87,229 @@ for err in result.errors:
 | After rechunking | 3 |
 | Before publishing / sharing a dataset | 5 |
 | Nightly CI on reference fixtures | 5 |
-| Large store (> 100 GB), quick sanity check | 2 with `sample_fraction=0.05` |
 
 Level 3 reads all array data and is the minimum recommended for any store
 that will be shared or used in analysis. Level 5 additionally checks
 multi-resolution pyramid correctness.
 
+`validate()` takes `store_path` and `level` only. There is no sampling
+option — every level is all-or-nothing over the store, so budget L3+ runs
+on very large stores accordingly.
+
 ---
 
 ## Interpreting common errors
 
-### L1 errors
+Message text below is quoted from the validator source. `resolution_{N}`
+is the level prefix the deeper passes stamp on every message.
 
-**`cross_chunk_links missing`**
+### L1 — structure
+
+L1 checks that the store exists, has root metadata, has at least one
+resolution level, and that each level has the directories it needs.
 
 ```
-ERROR [L1] cross_chunk_links  0/cross_chunk_links/ missing;
-                               required for streamline type
+Store path does not exist: scan.zarrvectors
+No root metadata found (expected .zattrs, zarr.json, or metadata.json)
+No resolution level directories found
+resolution_0/vertices/ missing
 ```
 
-The store's geometry type requires `cross_chunk_links/` but the array
-is absent. This typically means the store was written with an older version
-of `zarr-vectors-py` that did not generate cross-chunk links, or was
-written by a third-party tool that omitted the array.
+Those are errors. L1 also emits warnings, which do **not** fail
+validation:
 
-*Repair:* regenerate cross-chunk links from the existing vertex data:
-
-```python
-from zarr_vectors.repair import rebuild_cross_chunk_links
-
-rebuild_cross_chunk_links("tracts.zarrvectors", level=0)
 ```
+resolution_0/vertex_fragments/ missing
+resolution_0/ has no metadata file
+resolution_0/links/ exists but has no <delta> subdirs
+```
+
+The last one is why a links family with no `<delta>` segments is a
+warning rather than an error: a connectivity type with no stored links —
+a fully implicit-sequential polyline, say — is legal.
+
+*Remedy:* none of these are repairable in place. A store missing its
+vertices or its root metadata was written that way, or was truncated in
+transit; rewrite the level from source.
 
 ---
 
-**`object_index missing`**
+### L2 — metadata
+
+L2 validates the root metadata and each level's attributes.
 
 ```
-ERROR [L1] object_index  0/object_index/ missing
+SID dimensionality is 0, must be >= 1
+chunk_shape has 2 dims, expected 3
+chunk_shape[2] = 0, must be > 0
+Unknown links_convention: 'implicit_seq'
+Unknown object_index_convention: 'sparse'
+Unknown cross_chunk_strategy: 'lazy'
+resolution_0: bin_shape[2]=60.0 does not divide chunk_shape[2]=200.0
+resolution_0: bin_ratio[0]=0 < 1
+resolution_0: object_sparsity=1.5 not in (0, 1]
 ```
 
-*Repair:* rebuild the object index from vertices and edges:
+The `bin_shape` divisibility error means the declared `bin_shape` does not
+evenly divide `chunk_shape` on that axis. It is a metadata-level check —
+the validator compares the two declared tuples and does not look at the
+data.
 
-```python
-from zarr_vectors.repair import rebuild_object_index
+*Remedy:* these are all `.zattrs` / root-metadata faults, and the honest
+fix depends on which is true:
 
-rebuild_object_index("tracts.zarrvectors", level=0)
-```
-
----
-
-### L2 errors
-
-**`divisibility`**
-
-```
-ERROR [L2] divisibility [d=2]  chunk_shape[2]=200.0, bin_shape[2]=60.0
-                                200.0 % 60.0 = 20.0 ≠ 0
-```
-
-The `bin_shape` does not evenly divide `chunk_shape`. This cannot be
-repaired in-place — the store must be rechunked with a valid `bin_shape`:
-
-```python
-from zarr_vectors.core.rechunk import rebin_store
-
-# Change bin_shape to something that divides chunk_shape
-rebin_store("scan.zarrvectors", new_bin_shape=(50., 50., 50.))
-```
-
----
-
-**`bin_shape_inconsistent`**
-
-```
-ERROR [L2] bin_shape_inconsistent [level=1]
-           bin_shape [100,100,80] ≠ base [50,50,50] × ratio [2,2,2] = [100,100,100]
-```
-
-The `bin_shape` declared in the per-level `.zattrs` does not match
-`base_bin_shape × bin_ratio`. Usually caused by a manual edit to `.zattrs`.
-
-*Repair:* recompute and overwrite the per-level `bin_shape`:
+- If the **metadata** is wrong and the data is fine (usually a hand-edit),
+  correct the attribute. Any Zarr attribute writer will do; `open_store`
+  in `r+` mode gives you the group.
+- If the **data** was actually written under the bad geometry, the
+  metadata is telling the truth and the store must be rewritten from
+  source. There is no rebinning API in this package.
 
 ```python
 from zarr_vectors.core.store import open_store
-import numpy as np
 
 root = open_store("scan.zarrvectors", mode="r+")
-base = np.array(root.attrs["base_bin_shape"])
-for level_group in root.values():
-    if hasattr(level_group, "attrs") and "bin_ratio" in level_group.attrs:
-        ratio = np.array(level_group.attrs["bin_ratio"])
-        level_group.attrs["bin_shape"] = (base * ratio).tolist()
+# Inspect before changing anything — only edit attrs you are certain
+# disagree with the data on disk.
+print(root.attrs.to_dict())
+```
+
+`.attrs` is a dict-*like* wrapper, not a dict: it supports `attrs[k]`,
+`attrs.get(k, default)`, `k in attrs`, `attrs.update(d)`, and
+`attrs.to_dict()`. It is not iterable, so `dict(root.attrs)` and
+`for k in root.attrs` do not work — use `to_dict()`.
+
+---
+
+### L3 — consistency
+
+L3 decodes every chunk and cross-checks the data against the metadata.
+
+**Vertex / fragment errors**
+
+```
+resolution_0: chunk (2,3,1) decode failed: <exception>
+resolution_0: chunk (2,3,1) fragment[7] shape (4200,)
+resolution_0: chunk (2,3,1) has 9 fragments, exceeds bins_per_chunk product 8
+resolution_0: metadata vertex_count=4092, actual=4200
+```
+
+These indicate a writer bug or a corrupted chunk. *Remedy:* none in
+place — re-ingest the level.
+
+**Object index errors**
+
+```
+resolution_0: obj 1042 refs non-existent chunk (8,8,4)
+resolution_0: obj 1042 refs fragment_idx=12 >= 8
+```
+
+The object index points at a chunk or fragment that is not there, usually
+after something moved vertices without rewriting the index. *Remedy:* the
+index can be rewritten with `write_object_index` if — and only if — you
+can reconstruct the correct manifests yourself; the package will not
+derive them for you.
+
+**Links errors**
+
+```
+resolution_0: links[delta=0] offsets segment '0.0.+' malformed: <reason>
+resolution_0: links[delta=0] num_physical_records=1500 != 1499 rows on disk
+resolution_0: links[delta=0] refs non-existent source chunk (8,8,4)
+resolution_0: links[delta=0] refs non-existent chunk (8,8,5)
+```
+
+A `num_physical_records` mismatch is the one links error with a real
+remedy: it is exactly what `finalize_links` reconciles after
+decentralized per-cell writes. If workers wrote cells with
+`write_link_cells` and no coordinator ever finalized, run it now:
+
+```python
+from zarr_vectors.core.arrays import finalize_links
+from zarr_vectors.core.store import open_store, get_resolution_level
+
+root = open_store("tracts.zarrvectors", mode="r+")
+level_group = get_resolution_level(root, 0)
+partition = finalize_links(level_group, delta=0)
+print(partition.num_links, partition.num_physical_records)
+```
+
+See [Cloud stores](cloud_stores.md) for the full decentralized
+write-then-finalize sequence.
+
+**Canonical-form errors**
+
+The L3 validator also enforces invariants on the *directory names* of a
+links family — the offsets segments themselves, before any data is read:
+
+```
+resolution_0: links[delta=0] segment '0.0.-1' offset 1 is lexicographically
+negative; a canonical family stores each record once, under the positive offset
+resolution_0: links[delta=0] segment '0.+1.0_0.0.+1' offsets are not
+non-decreasing; violates the canonical-sort invariant
+```
+
+These two checks are **gated**: they run only when the family is
+`directed=False`, `store="canonical"`, and `delta == 0`. Directed families
+key on input endpoint order, `duplicate` families deliberately lead with
+each incident chunk, and cross-level (`delta != 0`) records are never
+sorted — all three legitimately carry lex-negative offsets, so enforcing
+canonical form on them would be wrong.
+
+An all-zero segment (`0.0.0`) is always legal — it is the intra-chunk
+array, not a violation.
+
+*Remedy:* none in place. A family in non-canonical form was written by
+something that bypassed `write_links`; rewrite it through the real writer.
+
+---
+
+### L4 — conformance
+
+L4 checks that each declared geometry type has the metadata it requires.
+
+```
+'mesh' requires links in ('explicit',), got 'implicit_sequential'
+Mesh link_width=2, must be >= 3
+```
+
+and warnings:
+
+```
+Unknown geometry type: 'polygon'
+Point cloud but links array exists
 ```
 
 ---
 
-**`levels_match_groups` / `level_0_present`**
+### L5 — multiresolution
+
+L5 checks pyramid shape and monotonicity.
 
 ```
-ERROR [L2] levels_match_groups  multiscales entry for 2
-                                  references non-existent group
+Levels [0, 1, 3], expected [0, 1, 2]
+resolution_2: 5000 > resolution_1 (4000)
 ```
 
-The `multiscales` metadata references a level group that does not exist.
-Regenerate multiscale metadata:
+The second says a coarser level has *more* vertices than the level below
+it, which means the coarsening did not actually coarsen.
+
+*Remedy:* this one has a genuine rebuild path — the levels above a known-good
+source level can be re-coarsened from scratch, reusing each target level's
+own recorded `bin_ratio` / `object_sparsity` / `chunk_shape`:
+
+```python
+from zarr_vectors.ops.refresh import rebuild_pyramid_from_level
+from zarr_vectors.core.store import open_store
+
+root = open_store("scan.zarrvectors", mode="r+")
+summaries = rebuild_pyramid_from_level(root, source_level=0)
+```
+
+This replaces the old level data in place. It trusts `source_level`
+completely — validate that level at L3 first.
+
+If instead the `multiscales` metadata itself is stale, regenerate it:
 
 ```python
 from zarr_vectors.core.multiscale import write_multiscale_metadata
@@ -171,130 +321,18 @@ write_multiscale_metadata(root)
 
 ---
 
-### L3 errors
+## Validation after any fix
 
-**`frag_range_in_bounds`**
-
-```
-ERROR [L3] frag_range_in_bounds [chunk (2,3,1)]
-           range fragment 7: start+count = 4200 > vertex_count = 4092
-```
-
-A range fragment's `[start, start + count)` extends past the chunk's
-vertex count. This indicates a bug in the writer — the most common cause
-is reordering vertices without re-encoding the fragment index.
-
-*Repair:* rebuild the fragment index by re-sorting vertices and recomputing
-fragments:
+Always re-run the validator at the same or higher level after changing
+anything:
 
 ```python
-from zarr_vectors.repair import rebuild_fragment_index
+from zarr_vectors.validate import validate
 
-rebuild_fragment_index("scan.zarrvectors", level=0)
-# Reads vertices, re-sorts into bin order, rewrites vertex_fragments
-```
-
----
-
-**`ccl_different_chunks`**
-
-```
-ERROR [L3] ccl_different_chunks  2 cross-chunk links found where
-           src chunk == dst chunk (rows 14502, 87331)
-```
-
-Cross-chunk links where both endpoints are in the same chunk — these
-should be intra-chunk edges in `links/<delta>/`. Caused by incorrect link
-generation logic that triggers on bin boundaries instead of chunk
-boundaries.
-
-*Repair:* regenerate all cross-chunk links from scratch:
-
-```python
-from zarr_vectors.repair import rebuild_cross_chunk_links
-
-rebuild_cross_chunk_links("tracts.zarrvectors", level=0)
-```
-
----
-
-**`attr_length_matches`**
-
-```
-ERROR [L3] attr_length_matches [chunk (1,0,2), attr "intensity"]
-           attr_length=3800 ≠ vertex_count=4200
-```
-
-A per-vertex attribute array has the wrong length in a specific chunk.
-This means the attribute was not reordered when vertices were sorted into
-fragment order — a writer bug.
-
-*Repair:* re-ingest the data from the original source, or use the repair
-function if vertex order can be recovered:
-
-```python
-from zarr_vectors.repair import realign_attribute
-
-# Re-sort the attribute array to match the current vertex fragment order
-realign_attribute("scan.zarrvectors", attribute_name="intensity", level=0)
-# WARNING: This assumes vertices are already in correct fragment order.
-# If vertex order is also wrong, rebuild_fragment_index must run first.
-```
-
----
-
-**`obj_index_nonempty_vg`**
-
-```
-ERROR [L3] obj_index_nonempty_vg  object 1042 primary fragment at
-           (chunk=8843, bin=12) has count=0 (empty fragment)
-```
-
-The object index points to an empty fragment. This usually means the object's
-vertices were moved by a rechunking operation that did not update the
-object index.
-
-*Repair:* rebuild the object index:
-
-```python
-from zarr_vectors.repair import rebuild_object_index
-
-rebuild_object_index("tracts.zarrvectors", level=0)
-```
-
----
-
-## Validation after repair
-
-Always re-run the validator at the same or higher level after any repair:
-
-```python
 result = validate("tracts.zarrvectors", level=3)
-assert result.is_valid, result.report()
-print("Store is valid after repair.")
+assert result.ok, result.summary()
+print("Store is valid.")
 ```
-
----
-
-## Sampled validation for large stores
-
-Full L3 validation on stores > 100 GB can take tens of minutes. For routine
-health checks, sample a fraction of chunks:
-
-```python
-result = validate(
-    "large_scan.zarrvectors",
-    level=3,
-    sample_fraction=0.05,   # validate 5% of chunks, chosen randomly
-    seed=42,
-)
-print(result.summary())
-# Level 3 validation (sampled 5%): PASS — 38 passed, 0 warnings, 0 errors
-# NOTE: sampled validation may miss errors in unsampled chunks
-```
-
-Sampled validation is never a substitute for full validation before
-publishing a dataset. Use it for fast incremental checks during development.
 
 ---
 
@@ -317,5 +355,5 @@ FIXTURES = list((Path("tests") / "fixtures").glob("*/store.zarrvectors"))
 @pytest.mark.slow
 def test_fixture_passes_l5(store_path):
     result = validate(str(store_path), level=5)
-    assert result.is_valid, result.report()
+    assert result.ok, result.summary()
 ```

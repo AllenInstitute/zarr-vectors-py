@@ -5,6 +5,27 @@ Cloud-native storage for points, lines, streamlines, graphs, and meshes
 built on Zarr v3.
 """
 
+# Silence zarr's UnstableSpecificationWarning once, at import.
+#
+# The ZV format stores every per-chunk payload in a Zarr v3 vlen-bytes
+# array (and some string metadata in fixed-length UTF-32), and zarr warns
+# that those dtypes have no finalised v3 spec.  That is an informed,
+# load-bearing choice of this library, not something a caller can act on —
+# you cannot use zarr-vectors without triggering it — and zarr re-emits it
+# on essentially every array access, so it floods (10k+ lines) on any real
+# read.  Filter the category so it fires zero times instead of once per
+# cell.  Scoped to this one category; every other warning is untouched.
+# To see it anyway, re-enable after importing zarr_vectors:
+#     warnings.simplefilter("always", UnstableSpecificationWarning)
+import warnings as _warnings
+
+try:
+    from zarr.errors import UnstableSpecificationWarning as _UnstableDtypeWarning
+
+    _warnings.filterwarnings("ignore", category=_UnstableDtypeWarning)
+except Exception:  # pragma: no cover - older/newer zarr without the class
+    pass
+
 from zarr_vectors.core.backends import detect_scheme
 from zarr_vectors.core.group import Group
 from zarr_vectors.core.store import (

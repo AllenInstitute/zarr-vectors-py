@@ -13,8 +13,9 @@ for skeletons (rooted trees of ``[child, parent]`` edges):
   records that a downstream reduce groups into a dense ``object_index``.
 
 - :func:`write_skeleton_cross_chunk_links` — store parent→child edges that
-  cross a chunk boundary.  These are **directed** (parent→child order is
-  data), so they use the ``cross_chunk_links`` ``directed=True`` mode.
+  cross a chunk boundary.  They land in the non-zero-offset arrays of the
+  same ``links/0/`` family the branch links above use, which is declared
+  ``directed=True`` because parent→child order is data.
 
 - :func:`read_skeleton_by_segment_id` — resolve a segment ID to its
   object, follow the manifest, and reconstruct the skeleton (positions +
@@ -30,7 +31,7 @@ from __future__ import annotations
 
 from collections import defaultdict
 from pathlib import Path
-from typing import Any, Sequence
+from typing import TYPE_CHECKING, Any, Sequence
 
 import numpy as np
 import numpy.typing as npt
@@ -43,7 +44,6 @@ from zarr_vectors.constants import (
 )
 from zarr_vectors.core.arrays import (
     create_attribute_array,
-    create_cross_chunk_links_array,
     create_fragment_attribute_array,
     create_links_array,
     create_object_index_array,
@@ -57,7 +57,7 @@ from zarr_vectors.core.arrays import (
     write_chunk_fragment_attributes,
     write_chunk_links,
     write_chunk_vertices,
-    write_cross_chunk_links,
+    write_links,
 )
 from zarr_vectors.core.metadata import LevelMetadata
 from zarr_vectors.core.multiscale import upsert_level_transform
@@ -73,6 +73,9 @@ from zarr_vectors.core.store import (
 from zarr_vectors.exceptions import ArrayError
 from zarr_vectors.types.graphs import _extract_branch_links, _reorder_tree
 from zarr_vectors.typing import ChunkCoords
+
+if TYPE_CHECKING:
+    from zarr_vectors.core.store import ReadSource
 
 
 SEGMENT_ID_ATTR = "segment_id"
@@ -189,10 +192,18 @@ def write_skeleton_chunk(
     *,
     attr_dtypes: dict[str, np.dtype] | None = None,
     dtype: np.dtype | str = np.float32,
+    record_presence: bool = True,
 ) -> tuple[list[tuple[int, ChunkCoords, int]], dict[Any, tuple[ChunkCoords, int]]]:
     """Write one spatial chunk's skeleton fragments.
 
     Args:
+        record_presence: Threaded into every per-chunk write this makes
+            (vertices, links, attributes, fragment attributes).  Pass
+            ``False`` from concurrent per-chunk writers — ``nonempty_chunks``
+            is array-wide state, so stamping it is a read-modify-write that
+            two workers writing *disjoint* chunks still race on — and
+            re-derive the manifests once afterwards from the coordinator
+            (``derive_nonempty_chunks`` / ``finalize_links``).
         level_group: Target resolution-level group (arrays must already
             be created — see :func:`init_skeleton_level`).
         chunk_coords: Spatial chunk coordinates.
@@ -275,12 +286,23 @@ def write_skeleton_chunk(
                 anchor_locs[tag] = (cc_tuple, piece_base + int(new_of_old[int(input_idx)]))
         chunk_offset += len(opos)
 
-    write_chunk_vertices(level_group, chunk_coords, vert_groups, dtype=dtype)
-    write_chunk_links(level_group, chunk_coords, link_groups, delta=0)
+    write_chunk_vertices(
+        level_group, chunk_coords, vert_groups, dtype=dtype,
+        record_presence=record_presence,
+    )
+    # Per-cell writer, not ``write_links``: these branch links are already
+    # chunk-local and all-zero-offset, and they must stay one group per
+    # fragment for ``read_chunk_link_fragment`` to slice them back out.
+    # ``write_links`` files a cell's records as a single group.
+    write_chunk_links(
+        level_group, chunk_coords, link_groups, delta=0,
+        record_presence=record_presence,
+    )
     for name in attr_names:
         write_chunk_attributes(
             level_group, name, chunk_coords, attr_groups[name],
             dtype=attr_dtypes.get(name, attr_groups[name][0].dtype),
+            record_presence=record_presence,
         )
     # Per-fragment ``segment_id`` (uint64): one original (flywire) id per
     # fragment, in fragment order (``frag_seg_ids`` is appended in lockstep
@@ -291,6 +313,7 @@ def write_skeleton_chunk(
         seg_ids = np.asarray(frag_seg_ids, dtype=np.uint64)
         write_chunk_fragment_attributes(
             level_group, "segment_id", chunk_coords, seg_ids, dtype=np.uint64,
+            record_presence=record_presence,
         )
     if any(frag_has_obj_id):
         if not all(frag_has_obj_id):
@@ -300,6 +323,7 @@ def write_skeleton_chunk(
         obj_ids = np.asarray(frag_obj_ids, dtype=np.uint64)
         write_chunk_fragment_attributes(
             level_group, "object_id", chunk_coords, obj_ids, dtype=np.uint64,
+            record_presence=record_presence,
         )
     return records, anchor_locs
 
@@ -313,6 +337,8 @@ def init_skeleton_store(
     attribute_dtypes: dict[str, str],
     backend: str | None = None,
     coordinate_offset: Sequence[float] | None = None,
+    compressor: Any = None,
+    shard_shape: int | tuple[int, ...] | None = None,
 ):
     """Create a new skeleton store + an empty level 0 with its arrays.
 
@@ -321,6 +347,20 @@ def init_skeleton_store(
     ``world - coordinate_offset`` so the spec's origin-0 chunk grid
     aligns to the source grid.  It is recorded in metadata and mirrored
     to the NGFF ``translation`` transform.
+
+    ``shard_shape`` (optional, in units of spatial chunks) wraps each
+    per-chunk array's cells in Zarr v3's ``sharding_indexed`` codec, so
+    many chunks share one storage object — the same knob the whole-store
+    writers (``write_points``, ``write_graph``, …) take.  ``compressor``
+    sets the codec pipeline for those arrays.
+
+    Skeletons are written by streaming rather than in one call, so the
+    arrays are allocated here and the caller's subsequent
+    :func:`write_skeleton_chunk` calls reuse them as-is — an existing
+    array is never re-created out from under a streaming writer.  A
+    caller that wants its streamed writes batched should open its own
+    :func:`~zarr_vectors.core.arrays.open_write_session` with the SAME
+    ``shard_shape`` / ``bounds`` / ``chunk_shape`` passed here.
 
     Returns ``(root, level0_group)``.  Callers then stream
     :func:`write_skeleton_chunk` over chunks, reduce the records into an
@@ -346,16 +386,32 @@ def init_skeleton_store(
         arrays_present=[VERTICES, "links", "object_index"],
     )
     level_group = create_resolution_level(root, 0, level_meta)
-    create_vertices_array(level_group, dtype="float32")
-    create_links_array(level_group, link_width=2, delta=0)
-    create_object_index_array(level_group)
-    # Skeleton cross-chunk edges are directed parent->child links.
-    create_cross_chunk_links_array(
-        level_group, delta=0, link_width=2, sid_ndim=ndim, directed=True,
-    )
-    create_fragment_attribute_array(level_group, "segment_id", dtype="uint64")
-    for name, dt in attribute_dtypes.items():
-        create_attribute_array(level_group, name, dtype=dt)
+    from zarr_vectors.core.arrays import open_write_session
+
+    # Allocate every per-chunk array inside a session so ``shard_shape``
+    # and ``compressor`` reach the array creation.  Without one the
+    # arrays fall back to the derived (unsharded, uncompressed) layout,
+    # which is why sharding never applied to skeleton stores.
+    with open_write_session(
+        level_group,
+        compressor=compressor,
+        shard_shape=shard_shape,
+        bounds=(list(bounds[0]), list(bounds[1])),
+        chunk_shape=tuple(chunk_shape),
+    ):
+        create_vertices_array(level_group, dtype="float32")
+        # One links family holds both the intra-chunk branch links and the
+        # boundary-crossing parent→child edges.  ``directed=True`` is family
+        # policy: it stops the cross-chunk arrays canonical-sorting endpoints
+        # (which would swap parent and child).  Intra-chunk records are stored
+        # in input order regardless, so branch links are unaffected.
+        create_links_array(
+            level_group, link_width=2, delta=0, sid_ndim=ndim, directed=True,
+        )
+        create_object_index_array(level_group)
+        create_fragment_attribute_array(level_group, "segment_id", dtype="uint64")
+        for name, dt in attribute_dtypes.items():
+            create_attribute_array(level_group, name, dtype=dt)
     if coordinate_offset is not None and any(float(x) != 0 for x in coordinate_offset):
         set_coordinate_offset(root, coordinate_offset)
         upsert_level_transform(
@@ -381,14 +437,14 @@ def write_skeleton_cross_chunk_links(
     Stored ``directed=True`` so the parent→child order survives — a
     canonical sort by chunk coord would otherwise silently swap
     endpoints whenever the child chunk sorts before the parent chunk.
+    Each link lands in the offsets array naming where the child chunk
+    sits relative to the parent's, within the same ``links/0/`` family
+    :func:`write_skeleton_chunk` writes branch links into.
     """
     if not links:
         return
-    create_cross_chunk_links_array(
-        level_group, delta=0, link_width=2, sid_ndim=ndim, directed=True,
-    )
-    write_cross_chunk_links(
-        level_group, links, sid_ndim=ndim, delta=0, directed=True,
+    write_links(
+        level_group, links, ndim, delta=0, link_width=2, directed=True,
     )
 
 
@@ -409,7 +465,7 @@ def _path_sequential_edges(n: int) -> npt.NDArray[np.int64]:
 
 
 def read_skeleton_by_segment_id(
-    store_path: str | Path,
+    store_path: ReadSource,
     segment_id: int,
     *,
     level: int = 0,
@@ -427,7 +483,7 @@ def read_skeleton_by_segment_id(
     parent]``, ``attributes`` ``{name: (N, ...)}``, and
     ``fragment_count``.
     """
-    root = open_store(str(store_path), backend=backend)
+    root = open_store(store_path, backend=backend)
     root_meta = read_root_metadata(root)
     ndim = root_meta.sid_ndim
     level_group = get_resolution_level(root, level)

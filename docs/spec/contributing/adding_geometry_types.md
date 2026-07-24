@@ -9,8 +9,8 @@
 
 **Type-specific arrays**
 : Arrays that are required or optional for a given geometry type but not
-  for all types (e.g. `links/<delta>/` for `mesh`, `cross_chunk_links/` for
-  `polyline`).
+  for all types (e.g. `object_index/` for types with discrete objects, or
+  a `links/<delta>/` family with `link_width >= 3` for `mesh`).
 
 **Write function**
 : The `write_<type>()` function in `zarr_vectors/types/<type>.py` that
@@ -46,8 +46,13 @@ Decide:
    `link_fragments/`).
 3. What new arrays, if any, it introduces.
 4. Whether it has discrete objects (requires `object_index/`).
-5. Whether objects can span chunks (requires `cross_chunk_links/`).
-6. What type-specific metadata keys it adds to root `.zattrs`.
+5. Its link-family policy: `link_width`, and whether the family is
+   `directed` (endpoint order is data) or undirected (canonical-sorted
+   and deduplicated, with `perm_idx` recovering input order).
+6. Whether its connectivity is explicit or implicit — an
+   `implicit_sequential` type emits no intra-chunk links at all, since
+   vertex order within a fragment carries the topology.
+7. What type-specific metadata keys it adds to root `.zattrs`.
 
 ### Step 1 — Add the type constant
 

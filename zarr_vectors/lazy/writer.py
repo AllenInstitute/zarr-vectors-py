@@ -13,7 +13,11 @@ Adds the write-back surface the algorithms package needs:
 
 Each public method has both an async and a sync mirror.  The async
 methods drive the zarr store's async I/O directly; the sync mirrors are
-thin ``asyncio.run`` wrappers for non-async callers.
+thin wrappers over zarr's :func:`~zarr.core.sync.sync`, which dispatches
+onto zarr's own background event loop.  ``asyncio.run`` is deliberately
+*not* used: it raises when called from inside a running event loop, which
+rules out every embedded/browser host.  Same reasoning as
+:mod:`zarr_vectors.ops.relocate`.
 
 v1 is **single-writer-only**.  Concurrent writers against the same
 level can race on object_index sidecar batch numbering; documented
@@ -27,6 +31,7 @@ from typing import Any, TYPE_CHECKING
 
 import numpy as np
 import numpy.typing as npt
+from zarr.core.sync import sync
 
 from zarr_vectors.core.arrays import (
     list_chunk_keys,
@@ -144,10 +149,10 @@ class ZVWriter:
         chunk's ``F_local`` faces appear in the same order as the
         decoded ``links/<chunk_key>``.
 
-        Note: cross-chunk faces are stored in
-        ``cross_chunk_links/<delta>/`` with ``link_width=3`` (0.6.0+);
-        per-face attributes for those records use the parallel
-        ``cross_chunk_link_attributes/<name>/<delta>/`` array.
+        Note: faces whose vertices span chunks are just ``link_width=3``
+        records at non-zero offsets in the merged ``links/<delta>/<offsets>/``
+        family; per-face attributes for those records use the parallel
+        ``link_attributes/<name>/<delta>/<offsets>/`` array.
         """
         await self._write_per_face_attribute(
             name=name, values=values, dtype=dtype,
@@ -211,14 +216,6 @@ class ZVWriter:
 
         ndim = self._level._root_meta.sid_ndim
 
-        # Pre-create the parent attribute group so that the parallel
-        # per-chunk writes below don't race on creating it
-        # concurrently (Windows file-rename collision on
-        # ``attributes/<name>/zarr.json``).
-        await asyncio.to_thread(
-            self._group.require_group, f"{subpath}/{name}"
-        )
-
         # Schedule one per-chunk write in parallel.  Each task reads the
         # chunk's fragments to discover per-group sizes, slices the
         # values array, and emits the attribute bytes.
@@ -241,10 +238,16 @@ class ZVWriter:
             # If the writer is targeting non-default subpath (e.g.
             # face attributes), patch the array name; otherwise the
             # standard helper writes under "vertex_attributes/".
+            # record_presence=False: these tasks run concurrently over
+            # disjoint cells, but nonempty_chunks is array-wide, so
+            # stamping it rewrites the shared zarr.json once per cell and
+            # the tasks collide on it.  The manifest is rebuilt once after
+            # the gather.
             if subpath == "vertex_attributes":
                 await asyncio.to_thread(
                     write_chunk_attributes,
                     self._group, name, cc, attr_groups, arr.dtype,
+                    record_presence=False,
                 )
             else:
                 await asyncio.to_thread(
@@ -252,7 +255,30 @@ class ZVWriter:
                     self._group, subpath, name, cc, attr_groups, arr.dtype,
                 )
 
+        # Allocate the array once, before the per-chunk fan-out below.
+        #
+        # This used to be a ``require_group(f"{subpath}/{name}")``, which
+        # pre-created the per-array *group* the removed per-chunk-sub-array
+        # layout wrote into — the parallel writes then raced to create it,
+        # hence the pre-create.  Under the single-array layout the target is
+        # one grid-shaped vlen array, so there is no group to race on;
+        # pre-creating one instead left a Group where the array belongs and
+        # every cell write failed against it.
+        #
+        # It still has to happen here rather than inside the per-chunk
+        # write: ``_write_one`` is fanned out concurrently by the gather,
+        # so allocating there would race for real.
+        await asyncio.to_thread(
+            _ensure_chunk_array, self._group, f"{subpath}/{name}",
+        )
+
         await asyncio.gather(*(_write_one(cc) for cc in chunk_keys))
+
+        # Rebuild the presence manifest the fanned-out writes deliberately
+        # skipped.  One listing, after every task has landed.
+        await asyncio.to_thread(
+            self._group.derive_nonempty_chunks, f"{subpath}/{name}",
+        )
 
         # Make sure the level metadata advertises the new array.
         await asyncio.to_thread(self._touch_arrays_present, f"{subpath}/{name}")
@@ -447,14 +473,24 @@ class ZVWriter:
                 )
 
             all_groups = existing_groups + new_groups
+            # record_presence=False: these run concurrently over disjoint
+            # cells, but nonempty_chunks is array-wide — stamping it
+            # rewrites the shared zarr.json per cell and the tasks collide
+            # on it.  Rebuilt once after the gather.
             await asyncio.to_thread(
                 write_chunk_vertices, self._group, cc, all_groups, dtype,
+                record_presence=False,
             )
             results[cc] = chunk_assignments_per_oid
 
         await asyncio.gather(*(
             _rmw_chunk(cc, idxs) for cc, idxs in chunk_assignments.items()
         ))
+
+        from zarr_vectors.constants import VERTEX_FRAGMENTS, VERTICES
+
+        for _arr in (VERTICES, VERTEX_FRAGMENTS):
+            await asyncio.to_thread(self._group.derive_nonempty_chunks, _arr)
 
         # Build manifest entries per new object id.
         new_oids = set()
@@ -574,7 +610,7 @@ class ZVWriter:
         *,
         dtype: str | np.dtype | None = None,
     ) -> None:
-        asyncio.run(self.add_attribute(name, values, dtype=dtype))
+        sync(self.add_attribute(name, values, dtype=dtype))
 
     def add_node_attribute_sync(
         self,
@@ -583,7 +619,7 @@ class ZVWriter:
         *,
         dtype: str | np.dtype | None = None,
     ) -> None:
-        asyncio.run(self.add_node_attribute(name, values, dtype=dtype))
+        sync(self.add_node_attribute(name, values, dtype=dtype))
 
     def add_face_attribute_sync(
         self,
@@ -592,7 +628,7 @@ class ZVWriter:
         *,
         dtype: str | np.dtype | None = None,
     ) -> None:
-        asyncio.run(self.add_face_attribute(name, values, dtype=dtype))
+        sync(self.add_face_attribute(name, values, dtype=dtype))
 
     def add_object_attribute_sync(
         self,
@@ -601,7 +637,7 @@ class ZVWriter:
         *,
         dtype: str | np.dtype | None = None,
     ) -> None:
-        asyncio.run(self.add_object_attribute(name, values, dtype=dtype))
+        sync(self.add_object_attribute(name, values, dtype=dtype))
 
     def append_vertices_sync(
         self,
@@ -610,15 +646,15 @@ class ZVWriter:
         object_ids: npt.NDArray | None = None,
         dtype: str | np.dtype | None = None,
     ) -> dict:
-        return asyncio.run(self.append_vertices(
+        return sync(self.append_vertices(
             positions, object_ids=object_ids, dtype=dtype,
         ))
 
     def commit_sync(self) -> dict:
-        return asyncio.run(self.commit())
+        return sync(self.commit())
 
     def compact_sync(self) -> dict:
-        return asyncio.run(self.compact())
+        return sync(self.compact())
 
 
 def _safe_read_chunk_vertices(
@@ -635,6 +671,19 @@ def _safe_read_chunk_vertices(
         return read_chunk_vertices(level_group, cc, dtype=dtype, ndim=ndim)
     except Exception:
         return []
+
+
+def _ensure_chunk_array(level_group, full_name: str) -> None:
+    """Allocate a per-chunk array node if it is not there yet.
+
+    Call once before fanning per-chunk writes out concurrently: the write
+    path no longer creates the container implicitly, and allocating from
+    inside the fan-out would race.
+    """
+    from zarr_vectors.core.arrays import _ensure_array_dir
+
+    if not level_group.array_exists(full_name):
+        _ensure_array_dir(level_group, full_name)
 
 
 def _write_custom_subpath(
@@ -659,5 +708,7 @@ def _write_custom_subpath(
     dtype = np.dtype(dtype)
     key = _chunk_key(chunk_coords)
     full_name = f"{subpath}/{name}"
+    # The array must already exist — see _ensure_chunk_array, which the
+    # caller runs once before fanning these writes out.
     raw_bytes, _ = encode_ragged_floats(attr_groups, dtype)
     level_group.write_bytes(full_name, key, raw_bytes)

@@ -5,8 +5,8 @@ return results identical to the unoptimized/sibling paths.
 
 * B — ``read_polylines`` selective (object/group subset) path vs the full-read
   path: same fragments, composing correctly with ``bbox`` / ``chunks``.
-* A — ``write_cross_chunk_links(mode="append")`` in batches vs a single
-  ``replace`` of the union: same records, ``num_links``, ``first_new``.
+* A — ``write_links(mode="append")`` in batches vs a single ``replace`` of the
+  union: same records, ``num_links``, ``first_new``.
 * C — ``read_mesh(bbox=...)`` vectorized vertex/face remap: faces reference only
   kept vertices, remapped consistently.
 """
@@ -18,9 +18,10 @@ from pathlib import Path
 import numpy as np
 
 from zarr_vectors.core.arrays import (
-    read_cross_chunk_links,
-    write_cross_chunk_links,
+    read_links,
+    write_links,
 )
+from zarr_vectors.core.paths import links_group_path
 from zarr_vectors.core.store import create_store, get_resolution_level
 from zarr_vectors.types.meshes import read_mesh, write_mesh
 from zarr_vectors.types.polylines import read_polylines, write_polylines
@@ -112,10 +113,10 @@ def test_selective_empty_subset(tmp_path: Path):
 
 
 # ---------------------------------------------------------------------------
-# A. write_cross_chunk_links append batches == replace of the union
+# A. write_links append batches == replace of the union
 # ---------------------------------------------------------------------------
 
-def _make_ccl(n: int, rng: np.random.Generator):
+def _make_links(n: int, rng: np.random.Generator):
     """n edge records ((chunkA, viA), (chunkB, viB)) spanning chunk pairs."""
     recs = []
     for i in range(n):
@@ -125,28 +126,45 @@ def _make_ccl(n: int, rng: np.random.Generator):
     return recs
 
 
-def test_ccl_append_batches_equal_replace_union(tmp_path: Path):
+def _links_level(tmp_path: Path, name: str):
+    """A level group whose chunk grid actually holds chunks (0..3, 0, 0).
+
+    The links family is a rank-D array over the level's chunk grid, so a
+    source chunk outside it is rejected — bounds must cover the coords
+    ``_make_links`` uses.
+    """
+    root = create_store(
+        str(tmp_path / name),
+        bounds=([0.0, 0.0, 0.0], [1000.0, 1000.0, 1000.0]),
+        chunk_shape=CHUNK,
+        geometry_types=["graph"],
+        ndim=3,
+    )
+    return get_resolution_level(root, 0)
+
+
+def test_links_append_batches_equal_replace_union(tmp_path: Path):
     rng = np.random.default_rng(4)
-    all_recs = _make_ccl(30, rng)
+    all_recs = _make_links(30, rng)
 
     # Reference: single replace of the union.
-    ref = create_store(str(tmp_path / "ccl_ref.zarrvectors"))
-    write_cross_chunk_links(ref, all_recs, sid_ndim=3, delta=0, mode="replace")
-    ref_out = read_cross_chunk_links(ref, delta=0)
-    ref_meta = ref.read_array_meta("cross_chunk_links/0")
+    ref = _links_level(tmp_path, "links_ref.zarrvectors")
+    write_links(ref, all_recs, sid_ndim=3, delta=0, mode="replace")
+    ref_out = read_links(ref, delta=0)
+    ref_meta = ref.read_array_meta(links_group_path(0))
 
     # Streaming: replace first batch, then append the rest in chunks.
-    strm = create_store(str(tmp_path / "ccl_strm.zarrvectors"))
-    write_cross_chunk_links(strm, all_recs[:10], sid_ndim=3, delta=0, mode="replace")
+    strm = _links_level(tmp_path, "links_strm.zarrvectors")
+    write_links(strm, all_recs[:10], sid_ndim=3, delta=0, mode="replace")
     total_first_new = []
     for start in range(10, 30, 7):
-        part = write_cross_chunk_links(
+        part = write_links(
             strm, all_recs[start:start + 7], sid_ndim=3, delta=0, mode="append",
         )
         total_first_new.append(part.first_new)
 
-    strm_out = read_cross_chunk_links(strm, delta=0)
-    strm_meta = strm.read_array_meta("cross_chunk_links/0")
+    strm_out = read_links(strm, delta=0)
+    strm_meta = strm.read_array_meta(links_group_path(0))
 
     # Same total record count and the meta num_links matches.
     assert strm_meta["num_links"] == ref_meta["num_links"] == 30
@@ -155,6 +173,9 @@ def test_ccl_append_batches_equal_replace_union(tmp_path: Path):
     # Same multiset of records (cell ordering is deterministic but compare
     # as sets to be robust).
     assert sorted(map(repr, strm_out)) == sorted(map(repr, ref_out))
+    # Every record here straddles a chunk boundary, so nothing landed in
+    # the intra (all-zero offsets) array and the family IS the 30 records.
+    assert len(ref_out) == 30
 
 
 # ---------------------------------------------------------------------------

@@ -6,12 +6,14 @@ Connectivity is implicit sequential (vertex 0 → vertex 1), so no
 
 Lines that cross a chunk boundary are split into two single-vertex
 fragments in their respective chunks, with the ``object_index``
-tracking both and a ``cross_chunk_links`` entry bridging them.
+tracking both and a ``links/0/<offsets>/`` record bridging them.  Only
+boundary-crossing lines produce a record: a line wholly inside one
+chunk needs none, since its two endpoints are already sequential.
 """
 
 from __future__ import annotations
 
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import numpy as np
 import numpy.typing as npt
@@ -27,19 +29,17 @@ from zarr_vectors.constants import (
 from zarr_vectors.constants import OBJECT_INDEX
 from zarr_vectors.core.arrays import (
     create_attribute_array,
-    create_cross_chunk_links_array,
     create_object_attributes_array,
     create_object_index_array,
     create_vertices_array,
     list_chunk_keys,
     read_all_object_manifests,
     read_chunk_vertices,
-    read_cross_chunk_links,
     read_object_attributes,
     read_fragment,
     write_chunk_attributes,
     write_chunk_vertices,
-    write_cross_chunk_links,
+    write_links,
     write_object_attributes,
     write_object_index,
 )
@@ -78,6 +78,9 @@ from zarr_vectors.typing import (
     ObjectManifest,
     FragmentRef,
 )
+
+if TYPE_CHECKING:
+    from zarr_vectors.core.store import ReadSource
 
 
 def write_lines(
@@ -295,7 +298,14 @@ def write_lines(
             bucket_b.append((i, endpoints[i, 1:2]))  # (1, D)
 
             object_manifests[i] = [(ca, fragment_idx_a), (cb, fragment_idx_b)]
-            cross_links.append(((ca, 0), (cb, 0)))
+            # Link endpoints are chunk-local vertex indices, not
+            # fragment-local ones.  Each endpoint above is appended as its
+            # own single-vertex fragment, and a chunk's vertices are the
+            # concatenation of its fragments in order — so the k-th
+            # fragment's only vertex sits at chunk-local index k.
+            # Hardcoding 0 here made every line in a chunk link to that
+            # chunk's *first* vertex.
+            cross_links.append(((ca, fragment_idx_a), (cb, fragment_idx_b)))
 
     idx_ndim = ndim + 1 if line_attr_bins is not None else ndim
     # Collapse all per-array zarr.json PUTs + per-chunk byte writes into
@@ -315,7 +325,10 @@ def write_lines(
     ):
         create_vertices_array(level_group, dtype=dtype)
         create_object_index_array(level_group)
-        create_cross_chunk_links_array(level_group, delta=0)
+        # No links array is created up front: connectivity here is
+        # implicit_sequential, so the all-zero (intra-chunk) offsets array
+        # would never hold a row.  ``write_links`` below creates exactly
+        # the non-zero-offset arrays the split lines land in.
         if line_attributes:
             for name in line_attributes:
                 create_object_attributes_array(level_group, name)
@@ -329,8 +342,8 @@ def write_lines(
         write_object_index(level_group, object_manifests, sid_ndim=idx_ndim)
 
         if cross_links:
-            write_cross_chunk_links(
-                level_group, cross_links, sid_ndim=idx_ndim, delta=0,
+            write_links(
+                level_group, cross_links, idx_ndim, delta=0, link_width=2,
             )
 
         if line_attributes:
@@ -341,12 +354,15 @@ def write_lines(
     return {
         "line_count": n_lines,
         "chunk_count": len(chunk_groups),
+        # Every record is boundary-crossing by construction — one is
+        # appended only where the two endpoints landed in different
+        # chunks, which is exactly the non-``is_intra`` offsets case.
         "cross_chunk_count": len(cross_links),
     }
 
 
 def read_lines(
-    store_path: str,
+    store_path: ReadSource,
     *,
     level: int = 0,
     object_ids: list[int] | None = None,
@@ -357,7 +373,8 @@ def read_lines(
     """Read finite lines from a zarr vectors store.
 
     Args:
-        store_path: Path to the store.
+        store_path: URL or path to the store, a pre-built zarr Store,
+            or an already-open Group.
         level: Resolution level.
         object_ids: Optional list of line (object) IDs to read.
         bbox: Optional bounding box filter (lines with any endpoint

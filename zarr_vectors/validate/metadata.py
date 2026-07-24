@@ -121,7 +121,35 @@ def validate_metadata(store_path: str | Path) -> ValidationResult:
                 else:
                     result.add_pass(f"resolution_{li}: vertex_count={vc}")
 
-            # Validate per-level bin_shape divides chunk_shape
+            # Cross-level chunk_shape invariants: a per-level chunk_shape
+            # override must be a positive integer multiple of the root's,
+            # and the per-level bin_shape must still tile it.  This
+            # validator existed but was never called by any pass, so
+            # per-level overrides went unvalidated.
+            from zarr_vectors.core.metadata import (
+                get_level_chunk_shape,
+                validate_level_chunk_shape_against_root,
+            )
+            from zarr_vectors.core.store import read_level_metadata
+            from zarr_vectors.exceptions import MetadataError
+
+            level_meta = None
+            try:
+                level_meta = read_level_metadata(root, li)
+                validate_level_chunk_shape_against_root(meta, level_meta)
+            except MetadataError as e:
+                result.add_error(f"resolution_{li}: {e}")
+            except Exception:
+                level_meta = None
+
+            # Validate per-level bin_shape divides the EFFECTIVE per-level
+            # chunk_shape.  Comparing against the root chunk_shape (as this
+            # did before) tests the wrong quantity on a chunk_scale_factor>1
+            # store, where the level's chunk_shape is a multiple of root's.
+            eff_chunk_shape = (
+                get_level_chunk_shape(meta, level_meta)
+                if level_meta is not None else meta.chunk_shape
+            )
             bin_shape = la.get("bin_shape")
             if bin_shape is None:
                 bin_shape = la.get("bin_size")  # legacy fallback
@@ -131,7 +159,7 @@ def validate_metadata(store_path: str | Path) -> ValidationResult:
                         f"resolution_{li}: bin_shape has {len(bin_shape)} dims"
                     )
                 else:
-                    for i, (cs, bs) in enumerate(zip(meta.chunk_shape, bin_shape)):
+                    for i, (cs, bs) in enumerate(zip(eff_chunk_shape, bin_shape)):
                         if bs <= 0:
                             result.add_error(
                                 f"resolution_{li}: bin_shape[{i}]={bs} not > 0"

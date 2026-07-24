@@ -2,34 +2,34 @@
 
 Sharding packs many per-chunk byte blobs into a single storage object
 to reduce object count on cloud stores (S3/GCS) and inode pressure on
-local filesystems.  This module owns the conversion between the two
-storage layouts that share the same logical ZV data:
+local filesystems.  Every per-chunk array is a multidim vlen-bytes Zarr
+array whose shape is the level's chunk grid; this module owns the one
+thing that distinguishes its two packings:
 
-* **Flat** — each per-array group holds one Zarr array per chunk key
-  (e.g. ``vertices/0.0.0``, ``vertices/0.0.1``, ...).  One storage
-  object per ZVF chunk.
-* **Sharded** — each per-array group is replaced with a single
-  multidim vlen-bytes Zarr array at the same logical path.  Zarr v3's
-  built-in ``sharding_indexed`` codec packs the chunk-grid cells into
-  outer-chunk shards.  One storage object per shard (default 512
-  ZVF chunks per shard).
+* **Unsharded** — one storage object per ZVF chunk, at
+  ``<array>/c/i/j/k``.
+* **Sharded** — Zarr v3's built-in ``sharding_indexed`` codec packs the
+  chunk-grid cells into outer-chunk shards.  One storage object per
+  shard (default 512 ZVF chunks per shard).
 
-Both layouts are read transparently by :class:`zarr_vectors.core.group.Group`
-— ``read_bytes`` / ``write_bytes`` / ``list_chunks`` dispatch on the
-node type at the array's path (Array → sharded, Group → flat).
+The logical layout is identical either way — only the codec pipeline in
+each array's ``zarr.json`` changes — so both are read transparently by
+:class:`zarr_vectors.core.group.Group` with no dispatch at all.  Both
+link families are ordinary rank-D grids (cell = the record's source
+chunk), so they shard exactly like ``vertices``.
 
 Public API
 ----------
 
 ``shard_store(path, *, shard_shape=8)``
-    Convert every per-array group in the store to a native-sharded
-    vlen-bytes array.  ``shard_shape`` is either an int (broadcast to
+    Repack every per-chunk array in the store with the
+    ``sharding_indexed`` codec.  ``shard_shape`` is either an int (broadcast to
     every axis) or an explicit per-axis tuple.  Idempotent: arrays
     already sharded with the requested shape are skipped.
 
 ``unshard_store(path)``
-    Reverse direction: every native-sharded array is unpacked back to
-    a Zarr group with one child array per chunk key.
+    Reverse direction: every sharded array is unpacked back to one
+    storage object per chunk.  The array itself stays put.
 
 ``reshard(path, shard_shape)``
     Convenience wrapper: ``shard_shape=None`` → unshard, otherwise
@@ -61,7 +61,7 @@ from zarr_vectors.core.store import (
 
 
 # ===================================================================
-# Walking per-array groups
+# Walking per-chunk arrays
 # ===================================================================
 
 
@@ -98,12 +98,15 @@ def _list_array_names(level_group, requested: list[str] | None) -> list[str]:
     """Enumerate the per-spatial-chunk array paths under a level.
 
     Every such array is a single vlen-bytes Zarr array (``vertices``,
-    ``vertex_fragments``, ``links/<delta>``, ``vertex_attributes/<name>``,
-    ``link_attributes/<name>/<delta>``, …).  Walks the level's group
-    hierarchy and returns each array path for which
-    :func:`zarr_vectors.core.arrays._is_per_chunk_array` holds —
-    excluding ``cross_chunk_links`` (endpoint-tuple cells, not a spatial
-    grid), ``object_index``, ``object_attributes`` and ``groups``.
+    ``vertex_fragments``, ``links/<delta>/<offsets>``,
+    ``vertex_attributes/<name>``,
+    ``link_attributes/<name>/<delta>/<offsets>``, …).  Recursively walks
+    the level's group hierarchy — the link families nest two levels
+    deeper than the rest — and returns each array path for which
+    :func:`zarr_vectors.core.arrays._is_per_chunk_array` holds.  That
+    predicate is what excludes ``object_index``, ``object_attributes``
+    and ``groups``, whose arrays have no spatial chunk grid; both link
+    families ARE rank-D grids and shard like any other array.
 
     ``requested`` short-circuits the walk: callers pass an explicit list
     to limit the migration to specific arrays.
@@ -167,8 +170,8 @@ def shard_store(
     shard_shape: int | Sequence[int] = 8,
     arrays: list[str] | None = None,
 ) -> dict[str, Any]:
-    """Convert every per-array group in the store to a native-sharded
-    vlen-bytes Zarr array.
+    """Repack every per-chunk array in the store with the
+    ``sharding_indexed`` codec.
 
     The new layout uses Zarr v3's built-in ``sharding_indexed`` codec
     — readable by any standards-compliant Zarr v3 implementation
@@ -216,9 +219,11 @@ def shard_store(
             import zarr
             existing = level.zarr_group[array_name]
             if not isinstance(existing, zarr.Array):
-                # Every per-chunk array is a single Zarr array; a group
-                # here means an explicit ``arrays=`` pointed at a non-array
-                # path (e.g. cross_chunk_links) — not shardable this way.
+                # The walk only yields arrays, so a group here means an
+                # explicit ``arrays=`` named a container rather than an
+                # array — e.g. the ``links/<delta>`` family group instead
+                # of one of its ``<offsets>`` children.  Its children
+                # shard fine; name them.
                 continue
             # Reuse the source array's grid shape + origin verbatim —
             # re-sharding only repacks cells into shards, it does not
@@ -252,7 +257,7 @@ def shard_store(
             preserved_attrs.pop("nonempty_chunks", None)
             preserved_attrs.pop("chunk_grid_origin", None)
 
-            # Delete the legacy group / prior array.
+            # Drop the prior array before re-creating at this path.
             del level.zarr_group[array_name]
 
             # Allocate the native-sharded vlen-bytes array.
@@ -356,11 +361,12 @@ def reshard(
     *,
     arrays: list[str] | None = None,
 ) -> dict[str, Any]:
-    """Re-layout a ZV store between flat and native-sharded forms.
+    """Re-layout a ZV store between unsharded and sharded packings.
 
     Args:
         store_path: Path or URL to the store.
-        shard_shape: ``None`` → unshard (flat layout); ``int`` or
+        shard_shape: ``None`` → unshard (one object per chunk);
+            ``int`` or
             tuple → shard with that outer-chunk shape.
         arrays: Optional list of logical array names to limit the
             operation to.
@@ -372,7 +378,7 @@ def reshard(
     """
     if shard_shape is None:
         if not is_sharded(str(store_path)):
-            return {"action": "noop", "message": "already flat"}
+            return {"action": "noop", "message": "already unsharded"}
         result = unshard_store(store_path, arrays=arrays)
         return {"action": "unshard", **result}
 

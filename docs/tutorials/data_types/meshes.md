@@ -36,11 +36,17 @@ write_mesh(
     faces=faces.astype(np.int32),
     chunk_shape=(100.0, 100.0, 100.0),
     bin_shape=(25.0, 25.0, 25.0),
-    winding_order="ccw",        # counter-clockwise = outward normals
-    coordinate_system="RAS",
-    axis_units="micrometer",
 )
 ```
+
+Face **winding is preserved automatically** — there is no
+`winding_order` argument. A face is stored as an undirected link record
+of `L` endpoints, and the permutation needed to restore your original
+vertex order is kept alongside it as `perm_idx`; `read_mesh` applies it,
+so the faces you read back have the winding you wrote.
+
+`write_mesh` also has no `coordinate_system` or `axis_units` arguments —
+those concepts do not exist anywhere in this package.
 
 ### Write with per-vertex attributes
 
@@ -62,14 +68,17 @@ write_mesh(
     faces=faces,
     chunk_shape=(10.0, 10.0, 10.0),     # smaller chunks for dense mesh
     bin_shape=(5.0, 5.0, 5.0),
-    winding_order="ccw",
-    attributes={
+    vertex_attributes={
         "normal":    normals,           # vector attribute: (N, 3)
         "curvature": curvature,         # scalar attribute: (N,)
         "thickness": thickness,
     },
 )
 ```
+
+The keyword is `vertex_attributes` — `write_mesh` has no `attributes`
+alias. (`write_points` does accept `attributes=`, but it is deprecated
+there in favour of `vertex_attributes`.)
 
 ---
 
@@ -86,14 +95,29 @@ Draco is a geometry compression library that exploits vertex-face
 correlations for significantly better compression than general-purpose
 codecs on mesh data. Requires `zarr-vectors[draco]`.
 
-Draco compression is enabled when writing a mesh by passing
-`use_draco=True` to `write_mesh()`, or by configuring the mesh codec
-pipeline directly. Format converters in `zarr-vectors-tools` accept the
-same `use_draco`/`draco_quantization` keyword arguments.
+Draco compression is enabled with `encoding="draco"` (the default is
+`encoding="raw"`). There is no `use_draco` argument. Quantisation is set
+with `draco_quantization_bits`, which defaults to `11`:
+
+```python
+from zarr_vectors.types.meshes import write_mesh
+
+summary = write_mesh(
+    "brain_draco.zarrvectors",
+    vertices=vertices,
+    faces=faces,
+    chunk_shape=(100.0, 100.0, 100.0),
+    encoding="draco",              # "raw" (default) or "draco"
+    draco_quantization_bits=11,    # default 11
+)
+print(summary["encoding"])         # 'draco'
+```
+
+The Draco encode path is taken only for 3-D meshes.
 
 ### Compression ratio guidance
 
-| `draco_quantization` | Precision per axis | Typical compression vs float32 |
+| `draco_quantization_bits` | Precision per axis | Typical compression vs float32 |
 |--------------------|--------------------|-------------------------------|
 | 8 | 1 / 256 of bbox | 12–18× |
 | 11 | 1 / 2048 of bbox | 7–12× |
@@ -104,10 +128,14 @@ For nanometre-resolution EM segmentation meshes with a bbox of ~100 µm,
 most visualisation and analysis workflows.
 
 ```python
-# Check if a store uses Draco
-from zarr_vectors.core.store import open_store
-root = open_store("brain_draco.zarrvectors", mode="r")
-print(root.attrs.get("draco_compressed", False))   # True
+# Check whether a store's vertices are Draco-encoded.
+# The encoding is recorded on the vertices array, not in root attrs —
+# there is no "draco_compressed" root attribute.
+from zarr_vectors.core.store import open_store, get_resolution_level
+
+level_group = get_resolution_level(open_store("brain_draco.zarrvectors", mode="r"), 0)
+meta = level_group.read_array_meta("vertices")
+print(meta["encoding"])            # 'raw' or 'draco'
 ```
 
 **Important:** Draco-compressed stores are not readable without
@@ -137,13 +165,32 @@ the `vertices` array). Face indices are consistent: face `k` is defined by
 
 ### Read per-vertex attributes
 
+`read_mesh` takes no `attributes=` argument and never returns an
+`"attributes"` key — it returns only `vertices`, `faces`, `vertex_count`,
+and `face_count`. Read per-vertex attributes through the lazy API:
+
 ```python
-result = read_mesh("brain_surface.zarrvectors",
-                   attributes=["curvature", "thickness"])
-curvature = result["attributes"]["curvature"]   # (N,)
-thickness = result["attributes"]["thickness"]   # (N,)
-normals   = result["attributes"]["normal"]      # (N, 3) if stored
+from zarr_vectors.lazy import open_zv
+
+level = open_zv("brain_surface.zarrvectors")[0]
+
+curvature = level.attributes["curvature"].compute()   # (V,)
+thickness = level.attributes["thickness"].compute()   # (V,)
 ```
+
+**Vector attributes come back flat.** A `(V, C)` attribute such as
+`normal` reads back as a 1-D `(V * C,)` array — the component shape is
+not restored. Reshape it yourself:
+
+```python
+if "normal" in level.attributes:
+    normals = level.attributes["normal"].compute()    # (V*3,) — flat!
+    normals = normals.reshape(-1, 3)                  # (V, 3)
+```
+
+These arrays are in stored order for the whole level, so they align with
+an unfiltered `read_mesh(...)["vertices"]` but not with a bbox-filtered
+one.
 
 ### Spatial bbox query
 
@@ -168,39 +215,67 @@ store is far more efficient than per-cell OBJ files:
 
 ### Writing a multi-mesh store
 
+`write_mesh` takes **one** `(V, D)` vertex array and **one** `(F, L)`
+face array — not lists of per-object arrays. Multiple objects are
+expressed with `object_ids`, a `(V,)` array assigning each vertex to a
+mesh object. Concatenate your per-cell meshes and offset each cell's face
+indices into the combined vertex space:
+
 ```python
+import numpy as np
 from zarr_vectors.types.meshes import write_mesh
 
-all_vertices = []    # list of (N_i, 3) arrays
-all_faces    = []    # list of (F_i, 3) arrays (local vertex indices)
-cell_volumes = []    # per-cell scalar attribute
+vert_blocks, face_blocks, oid_blocks = [], [], []
+cell_volumes, cell_types = [], []
+offset = 0
 
 for cell_id, (verts, faces) in enumerate(cell_meshes):
-    all_vertices.append(verts)
-    all_faces.append(faces)
+    vert_blocks.append(verts)
+    face_blocks.append(faces + offset)      # local -> global vertex indices
+    oid_blocks.append(np.full(len(verts), cell_id, dtype=np.int64))
+    offset += len(verts)
     cell_volumes.append(compute_volume(verts, faces))
+    cell_types.append(cell_type_of(cell_id))
 
 write_mesh(
     "cells.zarrvectors",
-    vertices=all_vertices,      # list of per-object vertex arrays
-    faces=all_faces,            # list of per-object face arrays
+    vertices=np.concatenate(vert_blocks),     # (V, 3)
+    faces=np.concatenate(face_blocks),        # (F, 3) global indices
     chunk_shape=(50., 50., 50.),
+    object_ids=np.concatenate(oid_blocks),    # (V,) vertex -> object
     object_attributes={
-        "volume":       np.array(cell_volumes, dtype=np.float32),
-        "cell_type":    np.array(cell_types,   dtype=np.int32),
+        "volume":    np.array(cell_volumes, dtype=np.float32),
+        "cell_type": np.array(cell_types,   dtype=np.int32),
     },
 )
 ```
 
-### Reading individual cells
+If `object_ids` is omitted, every vertex belongs to object 0 — except
+when `chunk_by_attribute` is set, in which case each vertex becomes its
+own object so the per-object uniformity check is trivially satisfied.
+
+### Reading cells
+
+> **Known limitation.** `read_mesh` accepts an `object_ids=` argument,
+> but in the current version it has **no effect** — the parameter is
+> never applied, so you get the whole level back regardless of what you
+> pass. There is currently no way to read a single mesh object out of a
+> multi-mesh store via `read_mesh`. Use `bbox=` or `chunks=` to restrict
+> a read spatially, which does work.
 
 ```python
 from zarr_vectors.types.meshes import read_mesh
 
-result = read_mesh("cells.zarrvectors", object_ids=[42, 107])
-print(result["object_ids"])       # [42, 107]
-print(result["vertex_count"])     # combined vertex count
+result = read_mesh("cells.zarrvectors")
+print(sorted(result))             # ['face_count', 'faces', 'vertex_count', 'vertices']
+print(result["vertex_count"])
+print(result["vertices"].shape)   # (V, 3)
+print(result["faces"].shape)      # (F, L)
 ```
+
+`read_mesh` returns exactly those four keys. It does **not** return an
+`object_ids` key, and objects come back merged into one vertex/face
+array with no per-object boundary.
 
 ### Spatial query in a multi-mesh store
 
@@ -209,10 +284,21 @@ result = read_mesh(
     "cells.zarrvectors",
     bbox=(np.array([500., 500., 200.]),
           np.array([600., 600., 300.])),
-    return_object_ids=True,
 )
-print(result["object_ids"])       # IDs of cells with faces in the region
 print(result["face_count"])
+```
+
+There is no `return_object_ids` option — passing it raises `TypeError`.
+To discover which cells have geometry in a region, use the lazy API's
+object helpers:
+
+```python
+from zarr_vectors.lazy import open_zv
+
+store = open_zv("cells.zarrvectors")
+level = store[0]
+print(level.present_oids)        # object IDs present at this level
+print(level.has_object(42))      # True / False
 ```
 
 ---

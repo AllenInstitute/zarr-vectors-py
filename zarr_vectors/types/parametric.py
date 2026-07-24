@@ -19,7 +19,7 @@ Supported built-in types:
 
 from __future__ import annotations
 
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import numpy as np
 import numpy.typing as npt
@@ -44,6 +44,9 @@ from zarr_vectors.core.store import (
     read_parametric_types,
 )
 from zarr_vectors.exceptions import ArrayError, MetadataError
+
+if TYPE_CHECKING:
+    from zarr_vectors.core.store import ReadSource
 
 
 # ===================================================================
@@ -245,11 +248,15 @@ def write_parametric_objects(
 # ===================================================================
 
 def read_parametric_objects(
-    store_path: str,
+    store_path: ReadSource,
     *,
     backend: str | None = None,
 ) -> list[dict[str, Any]]:
     """Read all parametric objects from a zarr vectors store.
+
+    Args:
+        store_path: URL or path to the store, a pre-built zarr Store,
+            or an already-open Group.
 
     Returns:
         List of dicts, each with:

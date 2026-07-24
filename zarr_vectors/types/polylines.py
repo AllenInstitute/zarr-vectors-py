@@ -6,14 +6,15 @@ attributes like termination regions.
 
 Polylines that cross chunk boundaries are split into segments.  The
 ``object_index`` stores the ordered segment sequence for each polyline,
-and ``cross_chunk_links`` connects the last vertex of one segment to
-the first vertex of the next.  Within each segment, connectivity is
-implicit sequential (vertex i → vertex i+1).
+and a ``links/0/<offsets>/`` record connects the last vertex of one
+segment to the first vertex of the next.  Within each segment,
+connectivity is implicit sequential (vertex i → vertex i+1), so only
+the segment-to-segment bridges are ever stored.
 """
 
 from __future__ import annotations
 
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import numpy as np
 import numpy.typing as npt
@@ -31,7 +32,6 @@ from zarr_vectors.constants import (
 )
 from zarr_vectors.core.arrays import (
     create_attribute_array,
-    create_cross_chunk_links_array,
     create_fragment_attribute_array,
     create_groupings_array,
     create_groupings_attributes_array,
@@ -44,7 +44,6 @@ from zarr_vectors.core.arrays import (
     read_all_object_manifests,
     read_object_manifest,
     read_chunk_vertices,
-    read_cross_chunk_links,
     read_group_object_ids,
     read_object_attributes,
     read_object_vertices,
@@ -52,9 +51,9 @@ from zarr_vectors.core.arrays import (
     write_chunk_attributes,
     write_chunk_fragment_attributes,
     write_chunk_vertices,
-    write_cross_chunk_links,
     write_groupings,
     write_groupings_attributes,
+    write_links,
     write_object_attributes,
     write_object_index,
 )
@@ -99,6 +98,9 @@ from zarr_vectors.typing import (
     ObjectManifest,
     FragmentRef,
 )
+
+if TYPE_CHECKING:
+    from zarr_vectors.core.store import ReadSource
 
 
 def write_polylines(
@@ -262,7 +264,7 @@ def write_polylines(
         return out
 
     # Per-chunk running offset into the chunk's vertices array — used
-    # to compute chunk-local vertex indices for cross_chunk_links
+    # to compute chunk-local vertex indices for the cross-chunk link
     # endpoints below.  Each new fragment's first local vertex is the
     # current offset; its last local vertex is offset + len - 1.
     chunk_vertex_offsets: dict[ChunkCoords, int] = {}
@@ -274,7 +276,8 @@ def write_polylines(
         # zarr-vectors spec, each (object, chunk) contributes ONE
         # fragment with implicit_sequential edges; intra-chunk vertices
         # are connected by implicit edges, and cross-chunk transitions
-        # go in cross_chunk_links with real chunk-local vertex indices.
+        # become cross-chunk links (non-zero-offset records in the links
+        # family) with real chunk-local vertex indices.
         # Splitting at bin boundaries would create multiple same-chunk
         # fragments per object, leaving no place for the intra-chunk
         # bin-boundary edges (implicit_sequential has no explicit links
@@ -323,7 +326,7 @@ def write_polylines(
 
         # manifest_with_indices augments each manifest entry with the
         # chunk-local vertex range of its fragment, used by the
-        # cross_chunk_links writer below to record proper endpoints.
+        # cross-chunk link writer below to record proper endpoints.
         manifest: ObjectManifest = []
         manifest_with_indices: list[
             tuple[ChunkCoords, int, int, int]
@@ -375,7 +378,10 @@ def write_polylines(
     ):
         create_vertices_array(level_group, dtype=dtype)
         create_object_index_array(level_group)
-        create_cross_chunk_links_array(level_group, delta=0)
+        # No links array is created up front: within a segment connectivity
+        # is implicit_sequential, so the all-zero (intra-chunk) offsets
+        # array would never hold a row.  ``write_links`` below creates
+        # exactly the non-zero-offset arrays the bridges land in.
         if vertex_attributes:
             for attr_name, attr_list in vertex_attributes.items():
                 sample = attr_list[0]
@@ -445,10 +451,12 @@ def write_polylines(
         # attribute-chunked, so widen sid_ndim accordingly.
         write_object_index(level_group, object_manifests, sid_ndim=idx_ndim)
 
-        # Write cross-chunk links
+        # Write the segment-to-segment bridges.  ``write_links`` routes
+        # each one to the offsets array naming where its far endpoint sits
+        # relative to the near one.
         if all_cross_links:
-            write_cross_chunk_links(
-                level_group, all_cross_links, sid_ndim=idx_ndim, delta=0,
+            write_links(
+                level_group, all_cross_links, idx_ndim, delta=0, link_width=2,
             )
 
         # Write object attributes
@@ -473,13 +481,16 @@ def write_polylines(
         "polyline_count": n_polylines,
         "vertex_count": total_vertices,
         "chunk_count": len(chunk_data),
+        # Every record is boundary-crossing by construction — one is
+        # appended only where consecutive fragments landed in different
+        # chunks, which is exactly the non-``is_intra`` offsets case.
         "cross_chunk_link_count": len(all_cross_links),
         "group_count": n_groups,
     }
 
 
 def read_polylines(
-    store_path: str,
+    store_path: ReadSource,
     *,
     level: int = 0,
     object_ids: list[int] | None = None,
@@ -492,7 +503,8 @@ def read_polylines(
     """Read polylines/streamlines from a zarr vectors store.
 
     Args:
-        store_path: Path to the store.
+        store_path: URL or path to the store, a pre-built zarr Store,
+            or an already-open Group.
         level: Resolution level.
         object_ids: Optional list of polyline (object) IDs.
         group_ids: Optional group IDs — expands to their object IDs.
@@ -515,6 +527,13 @@ def read_polylines(
         Dict with:
         - ``polylines``: list of lists of arrays. ``polylines[i]`` is
           a list of segment arrays for polyline i (concatenate for full path).
+        - ``object_ids``: the source object ID of each returned polyline,
+          same length and order as ``polylines``.  In the whole-object
+          modes these are unique.  Under ``chunks`` (segment-level crop) a
+          single object can yield several output polylines, so **IDs
+          repeat** — one entry per emitted polyline, not per object.  This
+          is what lets a caller re-associate the cropped runs of one
+          object.
         - ``polyline_count``: number of polylines returned.
         - ``vertex_count``: total vertices across all returned polylines.
     """
@@ -616,6 +635,7 @@ def read_polylines(
         )
 
     result_polylines: list[list[npt.NDArray]] = []
+    result_object_ids: list[int] = []
     total_verts = 0
 
     # Choose between a selective read (an explicit object/group subset —
@@ -731,6 +751,7 @@ def read_polylines(
                             ]
                             if fragment_list:
                                 result_polylines.append(fragment_list)
+                                result_object_ids.append(oid)
                                 total_verts += sum(len(fragment) for fragment in fragment_list)
                             run = []
                 if run:
@@ -740,6 +761,7 @@ def read_polylines(
                     ]
                     if fragment_list:
                         result_polylines.append(fragment_list)
+                        result_object_ids.append(oid)
                         total_verts += sum(len(fragment) for fragment in fragment_list)
                 continue
 
@@ -774,12 +796,14 @@ def read_polylines(
                     continue
 
             result_polylines.append(fragment_list)
+            result_object_ids.append(oid)
             total_verts += sum(len(fragment) for fragment in fragment_list)
     finally:
         _batched_reads_cm.__exit__(None, None, None)
 
     return {
         "polylines": result_polylines,
+        "object_ids": result_object_ids,
         "polyline_count": len(result_polylines),
         "vertex_count": total_verts,
     }
@@ -810,6 +834,7 @@ def _read_manifest_run(
 def _empty_polyline_result() -> dict[str, Any]:
     return {
         "polylines": [],
+        "object_ids": [],
         "polyline_count": 0,
         "vertex_count": 0,
     }

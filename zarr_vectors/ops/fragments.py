@@ -31,6 +31,7 @@ import numpy as np
 import numpy.typing as npt
 
 from zarr_vectors.exceptions import EditError
+from zarr_vectors.ops.change_set import LinkCell
 from zarr_vectors.ops.refs import FragmentRef
 from zarr_vectors.typing import ChunkCoords
 
@@ -247,12 +248,17 @@ def remove_fragment_in_session(
                 dtype=builder.attr_dtype.get(name, np.float32),
             )
             builder.attrs_dirty[name] = True
-    for delta, link_list in builder.link_groups.items():
+    # Intra cell only: its groups are 1:1 with vertex fragments, so
+    # dropping fragment k empties link group k.  Other cells index rows
+    # against other chunks and carry no such alignment.
+    for cell, link_list in builder.link_groups.items():
+        if cell[1] is not None:
+            continue
         if ref.fragment < len(link_list):
             shape = link_list[ref.fragment].shape
             new_shape = (0,) + shape[1:]
             link_list[ref.fragment] = np.empty(new_shape, dtype=np.int64)
-            builder.links_dirty[delta] = True
+            builder.links_dirty[cell] = True
 
     # Drop the fragment from every referring manifest (under fresh OIDs).
     affected = session._oids_referencing(ref.level, ref.chunk, ref.fragment)
@@ -299,6 +305,20 @@ def partition_fragment_rows(
     holds.  Per-fragment intra-chunk link rows whose endpoints fall in
     a single slice are routed to that slice's new fragment; links
     straddling slices are dropped (caller already decided they go away).
+
+    Only the intra link cell is re-partitioned: its rows are pairs of
+    this chunk's own indices, so the slice rebasing applies to both
+    columns.
+
+    Rows in other ``links/<delta>/<offsets>/`` cells sourced by this
+    chunk are left untouched, which is exact under ``atomic=True``
+    (fragments are appended, so existing chunk-local indices keep their
+    values) but NOT under ``atomic=False``, which empties the original
+    fragment and shifts every later fragment's indices down.  Those cells'
+    source-side indices would then be stale.  Carried over from the
+    pre-merge layout, where the same rows lived in a global cross-chunk
+    array this function also ignored; folding them into the family has
+    made the gap addressable but has not closed it.
     """
     if fragment < 0 or fragment >= len(builder.vertex_groups):
         raise EditError(
@@ -331,13 +351,17 @@ def partition_fragment_rows(
         for r in rows:
             row_to_slice[int(r)] = si
 
-    # Capture link rows of the original fragment (per delta) before
-    # mutating anything — append_fragment extends link_groups with
-    # empty arrays.
-    original_link_rows: dict[int, npt.NDArray] = {}
-    for delta, link_list in builder.link_groups.items():
+    # Capture link rows of the original fragment before mutating anything
+    # — append_fragment extends link_groups with empty arrays.  Intra
+    # cells only: the rebasing below reads rows as chunk-local
+    # ``(src, dst)`` pairs, which is exactly what a non-intra cell's rows
+    # are not (other-chunk indices, possibly behind a perm_idx column).
+    original_link_rows: dict[LinkCell, npt.NDArray] = {}
+    for cell, link_list in builder.link_groups.items():
+        if cell[1] is not None:
+            continue
         if fragment < len(link_list):
-            original_link_rows[delta] = link_list[fragment].copy()
+            original_link_rows[cell] = link_list[fragment].copy()
 
     new_fragments: list[int] = []
     for rows in slices:
@@ -353,7 +377,7 @@ def partition_fragment_rows(
     frag_chunk_start = sum(
         int(g.shape[0]) for g in builder.vertex_groups[:fragment]
     )
-    for delta, original_rows in original_link_rows.items():
+    for cell, original_rows in original_link_rows.items():
         per_slice: dict[int, list[npt.NDArray]] = {
             i: [] for i in range(len(slices))
         }
@@ -386,8 +410,8 @@ def partition_fragment_rows(
             for i, (a, b) in enumerate(stacked):
                 rebased[i, 0] = row_remap.get(int(a), int(a))
                 rebased[i, 1] = row_remap.get(int(b), int(b))
-            builder.link_groups[delta][new_frag_idx] = rebased
-            builder.links_dirty[delta] = True
+            builder.link_groups[cell][new_frag_idx] = rebased
+            builder.links_dirty[cell] = True
 
     if not atomic:
         empty_rows = np.empty((0, builder.vertex_ndim), dtype=builder.vertex_dtype)
@@ -400,11 +424,13 @@ def partition_fragment_rows(
                     dtype=builder.attr_dtype.get(name, np.float32),
                 )
                 builder.attrs_dirty[name] = True
-        for delta, link_list in builder.link_groups.items():
+        for cell, link_list in builder.link_groups.items():
+            if cell[1] is not None:
+                continue
             if fragment < len(link_list):
                 shape = link_list[fragment].shape
                 link_list[fragment] = np.empty((0,) + shape[1:], dtype=np.int64)
-                builder.links_dirty[delta] = True
+                builder.links_dirty[cell] = True
 
     builder.vertices_dirty = True
     return new_fragments

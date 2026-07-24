@@ -3,131 +3,144 @@
 ## Terms
 
 **Schema check**
-: A validation check that reads a `.zattrs` or `zarr.json` file and
-  verifies that its values conform to the ZVF specification — correct
-  types, valid ranges, required keys present, cross-key consistency.
+: A validation check that reads a group's attributes and verifies that
+  its values conform to the ZVF specification — valid ranges, valid
+  vocabulary tokens, and dimensional agreement with `sid_ndim`.
 
 **Divisibility constraint**
-: The requirement that `chunk_shape[d] % bin_shape[d] == 0` for all `d`.
-  Checked at L2 using floating-point tolerance.
+: The requirement that each axis's `chunk_shape[d]` be an integer
+  multiple of `bin_shape[d]`, so bins tile chunks cleanly. Checked at
+  L2 with a floating-point tolerance.
 
 **Floating-point tolerance**
-: The permissible difference between two floating-point values when
-  checking equality. For divisibility checks, ZVF uses a tolerance of
-  `1e-6 × chunk_shape[d]` per axis.
-
-**Array metadata consistency**
-: The agreement between the shape and dtype declared in each array's
-  `zarr.json` and the values declared in the store's `.zattrs`.
+: The permissible difference when checking a float for integrality. L2
+  computes `ratio = chunk_shape[d] / bin_shape[d]` and requires
+  `abs(ratio - round(ratio)) <= 1e-9`. Note the tolerance applies to
+  the **ratio**, not to the shape values.
 
 ---
 
 ## Introduction
 
-L2 validation reads all `.zattrs` and `zarr.json` metadata files and
+L2 validation reads the store's root and per-level group attributes and
 checks that their contents are internally consistent and conform to the
 ZVF specification. No array data is read.
 
-L2 catches the most common class of write-time bugs: mis-typed keys,
-invalid ranges, dimensionality mismatches between chunk_shape and bin_shape,
-array shapes that are inconsistent with the declared chunk grid, and
-multiscale metadata that does not match the level groups actually present
-in the store.
+L2 catches the most common class of write-time bugs: invalid ranges,
+unrecognised vocabulary tokens, and dimensionality mismatches between
+`sid_ndim`, `chunk_shape`, and `bin_shape`.
+
+L2's scope is narrower than the name suggests: it inspects **group
+attributes only**, never an array's `zarr.json`, and never the link
+families. See *What L2 does not check* below before relying on it.
 
 ---
 
 ## Technical reference
 
-### Root `.zattrs` checks
+L2 is implemented by
+[`validate_metadata`](../../../zarr_vectors/validate/metadata.py).
+Checks are reported as free-text messages on a `ValidationResult`; they
+do not carry stable machine-readable check IDs (see
+[Validation overview](overview.md#validationresult-api)).
 
-| Check | Rule | Failure type |
-|-------|------|--------------|
-| `version_present` | `zarr_vectors_version` key present | Error |
-| `version_known` | `zarr_vectors_version == "1.0"` | Warning (unknown version) |
-| `geometry_type_valid` | `geometry_type` is one of the seven constants | Error |
-| `spatial_dims_type` | `spatial_dims` is a positive integer | Error |
-| `chunk_shape_length` | `len(chunk_shape) == spatial_dims` | Error |
-| `base_bin_shape_length` | `len(base_bin_shape) == spatial_dims` | Error |
-| `chunk_shape_positive` | All elements of `chunk_shape` are > 0 | Error |
-| `base_bin_shape_positive` | All elements of `base_bin_shape` are > 0 | Error |
-| `divisibility` | `chunk_shape[d] % base_bin_shape[d] ≈ 0` for all `d` (tol = 1e-6 × chunk_shape[d]) | Error |
-| `multiscales_present` | `multiscales` key is present and non-empty | Error |
-| `level_0_present` | `multiscales` contains an entry with `level == 0` | Error |
-| `level_0_bin_ratio` | Level 0 entry has `bin_ratio == [1, …, 1]` | Error |
-| `level_0_sparsity` | Level 0 `object_sparsity == 1.0` (if present) | Error |
-| `levels_ordered` | `multiscales` entries are in ascending `level` order | Error |
-| `levels_match_groups` | Each `path` in `multiscales` references an existing level group | Error |
-| `coordinate_system_type` | `coordinate_system`, if present, is a string | Warning |
-| `bounding_box_shape` | `bounding_box.min` and `.max` are D-length arrays if present | Warning |
+L2 reads the root metadata **through `RootMetadata`**, not as raw JSON.
+Structural well-formedness of the document (required keys, parseable
+types) is therefore enforced by the parser: a document that cannot be
+parsed produces a single `Cannot read root metadata` error and L2
+returns immediately. The checks below are those applied *on top of* a
+successful parse.
 
-### Per-level `.zattrs` checks
+### Root metadata checks
 
-| Check | Rule | Failure type |
-|-------|------|--------------|
-| `level_key_matches_name` | `level` in `.zattrs` equals N in `N/` | Error |
-| `bin_ratio_length` | `len(bin_ratio) == spatial_dims` | Error |
-| `bin_ratio_positive` | All elements of `bin_ratio` are positive integers | Error |
-| `bin_shape_consistent` | `bin_shape[d] ≈ base_bin_shape[d] × bin_ratio[d]` for all `d` | Error |
-| `bin_shape_divides_chunk` | `chunk_shape[d] % bin_shape[d] ≈ 0` for all `d` | Error |
-| `bin_shape_le_chunk` | `bin_shape[d] ≤ chunk_shape[d]` for all `d` | Error |
-| `sparsity_range` | `0.0 < object_sparsity ≤ 1.0` | Error |
-| `sparsity_for_point_cloud` | Point cloud stores have `object_sparsity == 1.0` | Error |
-| `sparsity_strategy_valid` | `sparsity_strategy` is one of the four constants if present | Warning |
-| `ratio_monotone` | `bin_ratio[N][d] ≥ bin_ratio[N-1][d]` for all `d` and `N > 0` | Error |
+| Rule | Failure type |
+|------|--------------|
+| `sid_ndim >= 1` | Error |
+| `len(chunk_shape) == sid_ndim` | Error |
+| Every `chunk_shape[i] > 0` | Error |
+| `bounds`, if present, has `len(min) == len(max) == sid_ndim` | Error |
+| `links_convention` ∈ `{explicit, implicit_sequential, implicit_sequential_with_branches}` | Error |
+| `object_index_convention` ∈ `{standard, identity}` | Error |
+| `cross_chunk_strategy` ∈ `{explicit_links, boundary_deduplication, both}` | Error |
+| `geometry_types` is non-empty | Warning |
 
-### Array `zarr.json` checks
+A convention field that is empty / falsy **passes** — the check is
+`if value and value not in VALID: error`. Only a non-empty unrecognised
+token is an error.
 
-| Check | Rule | Failure type |
-|-------|------|--------------|
-| `vertices_dtype` | `vertices/` dtype is `float32` | Warning (other float types accepted with warning) |
-| `vertices_shape_dims` | `vertices/` last dimension equals `spatial_dims` | Error |
-| `vertex_fragments_dtype` | `vertex_fragments/` `.zattrs` declares `zv_array == "vertex_fragments"` and `encoding == "fragment_index_v1"` | Error |
-| `vertex_fragments_blob_magic` | Every non-empty chunk's blob starts with magic `0x5A56_4647` (`'ZVFG'`) and `version == 1` | Error |
-| `link_fragments_dtype` | `link_fragments/` (when present) `.zattrs` declares `zv_array == "link_fragments"` and `encoding == "fragment_index_v1"` | Error |
-| `links_dtype` | `links/<delta>/` `.zattrs` declares `dtype` as an integer type (`int32`/`int64`) | Warning if `int64` |
-| `links_link_width` | `links/<delta>/` `.zattrs` declares `link_width` ≥ 2 (2 for graph/poly/skeleton edges; 3 for triangle faces; 4 for quad faces) | Error |
-| `links_level_delta` | `links/<delta>/` `.zattrs` declares `level_delta` matching the path segment | Error |
-| `obj_index_meta` | `object_index/` `.zattrs` declares `zv_array == "object_index"`, `num_objects` (int ≥ 0), and `sid_ndim` (positive int) | Error |
-| `obj_index_offsets_len` | `object_index/offsets` has length equal to `num_objects` and dtype `int64` | Error |
-| `ccl_meta` | `cross_chunk_links/<delta>/` `.zattrs` declares `num_links`, `sid_ndim`, `level_delta` | Error |
-| `ccl_attr_num_links` | `cross_chunk_link_attributes/<name>/<delta>/` `num_links` matches parallel CCL meta (0.4+) | Error |
+> `cross_chunk_strategy` survives the merge of `cross_chunk_links/` into
+> `links/`. It is **semantic, not physical**: it says how a writer
+> handled geometry at chunk boundaries (duplicate the boundary record,
+> or link across), a question the layout merge does not answer. It does
+> not name a directory.
 
-### Multiscale metadata checks
+### Bin-shape checks (root)
 
-| Check | Rule | Failure type |
-|-------|------|--------------|
-| `coord_transforms_present` | Each level entry has `coordinateTransformations` | Error |
-| `scale_translation_pair` | Each level has exactly one `scale` and one `translation` transform | Error |
-| `scale_values` | `scale[d] ≈ bin_ratio[d]` for all `d` | Error |
-| `translation_values` | `translation[d] ≈ bin_shape[d] / 2` for all `d` | Error |
-| `axes_length` | `len(axes) == spatial_dims` | Error |
-| `axes_type` | Each axis has `type` in `{"space", "time"}` | Warning |
+Applied only when `base_bin_shape` is not `None`:
 
-### Streamline-specific checks
+| Rule | Failure type |
+|------|--------------|
+| `len(base_bin_shape) == sid_ndim` | Error |
+| Every `base_bin_shape[i] > 0` | Error |
+| `chunk_shape[i] / base_bin_shape[i]` is an integer (tolerance `1e-9` on the ratio) | Error |
 
-| Check | Rule | Failure type |
-|-------|------|--------------|
-| `step_size_positive` | `step_size` > 0 if present | Error |
-| `step_size_unit_valid` | `step_size_unit` in known unit vocabulary if present | Warning |
+### Per-level checks
+
+For every resolution level:
+
+| Rule | Failure type |
+|------|--------------|
+| The level's attributes can be read | Error |
+| `vertex_count`, if present, is an `int >= 0` | Error |
+| `bin_shape` (or legacy `bin_size`), if present, has length `sid_ndim` | Error |
+| Every `bin_shape[i] > 0` | Error |
+| `chunk_shape[i] / bin_shape[i]` is an integer (tolerance `1e-9`) | Error |
+| `bin_ratio`, if present, has length `sid_ndim` | Error |
+| Every `bin_ratio[i] >= 1` | Error |
+| `object_sparsity` (default `1.0`) is in `(0, 1]` | Error |
+
+### What L2 does *not* check
+
+These are called out because earlier revisions of this page specified
+them and no shipped code enforces them. They are not ZVF requirements
+at L2:
+
+- **Nothing about link families.** L2 does not open
+  `links/<delta>/`, does not check `link_width`, `sid_ndim`,
+  `directed`, `store`, or `num_physical_records`, and does not verify
+  that a `link_attributes/<name>/<delta>/<offsets>/` array is
+  row-aligned with the offsets array it mirrors. Link families are
+  reached first at [L3](l3_consistency.md).
+- **No array `zarr.json` inspection at all.** L2 reads group attributes
+  only. `vertices/` dtype and trailing dimension, `vertex_fragments/`
+  encoding tokens, and blob magic are not checked at L2.
+- **No `multiscales` / `coordinateTransformations` checks.** Scale and
+  translation values, axis counts, and level-to-group correspondence
+  are not validated.
+- **No per-level `chunk_shape` override validation.** A level may carry
+  a `chunk_shape` override (see
+  [Pyramid construction](../multiscale/pyramid_construction.md#per-level-chunk-grids-chunk_scale_factor)).
+  `zarr_vectors.core.metadata` provides
+  `validate_level_chunk_shape_against_root` to check that it nests
+  inside root, but **the L2 validator never calls it**. Note also that
+  L2's per-level `bin_shape` divisibility check above divides the
+  **root** `chunk_shape`, not the level's effective one — so on a store
+  built with `chunk_scale_factor > 1` that check is testing the wrong
+  quantity.
+- **No cross-level `level` / ordering checks**, no `level_key_matches_name`,
+  no monotone `bin_ratio` across levels, and no geometry-type-specific
+  metadata rules (those are L4).
 
 ### Example L2 report
 
 ```
-Level 2 validation of tracts.zarrvectors
-==========================================
-PASS  version_present           zarr_vectors_version present
-PASS  geometry_type_valid       geometry_type = "streamline"
-PASS  spatial_dims_type         spatial_dims = 3
-PASS  divisibility [d=0]        200.0 % 50.0 = 0.0 ✓
-PASS  divisibility [d=1]        200.0 % 50.0 = 0.0 ✓
-PASS  divisibility [d=2]        200.0 % 50.0 = 0.0 ✓
-PASS  level_0_present           multiscales contains level 0
-PASS  bin_ratio_consistent [1]  bin_shape [100,100,100] = base [50,50,50] × ratio [2,2,2] ✓
-PASS  scale_values [level=1]    scale [2.0,2.0,2.0] = bin_ratio [2,2,2] ✓
-PASS  translation_values [1]    translation [50,50,50] = bin_shape/2 [50,50,50] ✓
-PASS  vertex_fragments_dtype [0] zv_array = "vertex_fragments", encoding = "fragment_index_v1" ✓
-WARN  step_size_unit_valid       step_size_unit "voxels" not in recommended vocabulary
-PASS  sparsity_range [level=1]  0.5 in (0, 1] ✓
-
-Level 2 validation: PASS — 14 passed, 1 warning, 0 errors
+Level 2 validation: FAIL
+  8 passed, 1 warnings, 1 errors
+  ERROR: resolution_1: bin_shape[0]=30.0 does not divide chunk_shape[0]=200.0
+  WARN:  No geometry_types specified
 ```
+
+Passing messages take the form `Root metadata parsed`,
+`SID dimensionality: 3`, `chunk_shape dimensionality matches SID`,
+`links_convention: 'implicit_sequential'`, `bins_per_chunk: (4, 4, 4)`,
+and `resolution_0: vertex_count=100000`.

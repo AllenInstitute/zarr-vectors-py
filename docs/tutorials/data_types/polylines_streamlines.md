@@ -75,25 +75,33 @@ write_polylines(
     bin_shape=(50.0, 50.0, 50.0),
     geometry_type="streamline",
     groups={
-        "CST":  list(range(300)),           # corticospinal tract
-        "AF":   list(range(300, 600)),      # arcuate fasciculus
-        "UF":   list(range(600, 1000)),     # uncinate fasciculus
+        0: list(range(300)),                # corticospinal tract
+        1: list(range(300, 600)),           # arcuate fasciculus
+        2: list(range(600, 1000)),          # uncinate fasciculus
     },
     object_attributes={
         "length":  lengths,
         "mean_fa": mean_fa,
     },
-    attributes={
+    vertex_attributes={
         "fa": per_vertex_fa,               # list of per-vertex arrays
-    },
-    streamline_metadata={
-        "step_size":             0.5,
-        "step_size_unit":        "mm",
-        "propagation_algorithm": "probabilistic",
-        "seeding_strategy":      "wm_mask",
     },
 )
 ```
+
+Three things to note:
+
+- **Group keys are integers**, not names: `groups` is
+  `{group_id: [polyline_indices]}`. Passing string keys such as
+  `{"CST": [...]}` raises `TypeError`. A group whose members are
+  contiguous may be passed as a `range` object, which is stored compactly.
+  To attach human-readable names, use `group_attributes={"name": ...}`.
+- The per-vertex keyword is `vertex_attributes`. `write_polylines` has no
+  `attributes=` alias (unlike `write_points`, where it exists but is
+  deprecated).
+- There is no `streamline_metadata=` argument, and no place in the core
+  API for free-form acquisition metadata such as step size or seeding
+  strategy. That concept does not exist in this package.
 
 ---
 
@@ -170,33 +178,47 @@ result = read_polylines(
 print(result["polyline_count"])   # streamlines passing through the bbox
 ```
 
-To clip streamlines to the bbox boundary (splitting paths that enter and
-exit multiple times), pass `clip=True`. This changes the number of
-polylines returned and is not lossless:
+There is no `clip=` option — streamlines are returned whole, never split
+at the bbox boundary.
+
+### What `read_polylines` returns
+
+`read_polylines` returns exactly three keys:
 
 ```python
-result = read_polylines("tracts.zarrvectors", bbox=(lo, hi), clip=True)
+result = read_polylines("tracts.zarrvectors")
+print(sorted(result))            # ['polyline_count', 'polylines', 'vertex_count']
 ```
+
+It has no `include_object_attributes=` option and returns neither an
+`object_attributes` nor an `object_ids` key.
 
 ### Combining bbox and object attributes
 
-A common analysis pattern: spatial query to find candidates, then filter
-by attributes:
+A common analysis pattern is a spatial query followed by an attribute
+filter. Object attributes are read separately, with
+`read_object_attributes`, which returns a dense array indexed by object
+ID:
 
 ```python
-# Step 1: find streamlines in a region of interest
-result = read_polylines(
-    "tracts.zarrvectors",
-    bbox=(np.array([0., 0., 0.]), np.array([100., 100., 100.])),
-    include_object_attributes=True,
-)
+import numpy as np
+from zarr_vectors.core.store import open_store, get_resolution_level
+from zarr_vectors.core.arrays import read_object_attributes
 
-# Step 2: filter by FA
-high_fa_mask = result["object_attributes"]["mean_fa"] > 0.5
-high_fa_ids  = np.array(result["object_ids"])[high_fa_mask]
+level_group = get_resolution_level(open_store("tracts.zarrvectors", mode="r"), 0)
 
-print(f"{len(high_fa_ids)} high-FA streamlines in region")
+mean_fa = read_object_attributes(level_group, "mean_fa")   # (O,) by object id
+high_fa_ids = np.nonzero(mean_fa > 0.5)[0]
+
+# Then read just those streamlines — object_ids filtering works for polylines.
+result = read_polylines("tracts.zarrvectors", object_ids=high_fa_ids.tolist())
+print(f"{result['polyline_count']} high-FA streamlines")
 ```
+
+Do **not** reach for object attributes through the lazy
+`level.attributes[...]` accessor: that path is for *per-vertex* arrays
+and silently returns an empty array for an object attribute rather than
+raising.
 
 ---
 
@@ -208,9 +230,11 @@ from zarr_vectors.multiresolution.coarsen import build_pyramid
 build_pyramid(
     "tracts.zarrvectors",
     factors=[(2.0, 1.00), (4.0, 4.00)],
-    agg_mode="mean",  # 0.4+: a single global mode (per-attribute via manual coarsen_level)
 )
 ```
+
+Bin aggregation is fixed: source vertices collapse to their centroid.
+There is no aggregation-mode parameter.
 
 After building, the resolution summary looks like:
 
@@ -231,13 +255,18 @@ live in the companion package **`zarr-vectors-tools`**.
 
 ## Common pitfalls
 
-**Cross-chunk links not generated for same-chunk vertices.**
-`cross_chunk_links/` only stores connections between different chunks.
-If two consecutive vertices of a streamline happen to fall in the same
-chunk, the connection is stored in `links/<delta>/` (intra-chunk), not in
-`cross_chunk_links/`. Manually inspecting `cross_chunk_links/` will not
-show all edges — use `read_polylines(object_ids=[k])` to retrieve the
-complete vertex sequence.
+**Links do not contain every edge of a streamline.**
+Streamlines are `implicit_sequential`: within a chunk, consecutive
+vertices are connected by *vertex order alone*, and no link record is
+written for them. Only a transition that crosses a chunk boundary
+becomes a stored link, under a non-zero offsets segment such as
+`links/0/0.0.+1/`. The all-zero (intra-chunk) segment `links/0/0.0.0/`
+is never even created for this type — there is no row that could live in
+it.
+
+Inspecting the links family therefore shows you the chunk-boundary
+bridges, not the streamline. Use `read_polylines(object_ids=[k])` to
+retrieve the complete vertex sequence.
 
 **Streamlines entirely outside the bbox are not returned.**
 A bbox query returns streamlines with at least one vertex inside the bbox.
@@ -246,10 +275,22 @@ inside (because vertices are spaced far apart) will not be returned. Reduce
 `step_size` or `bin_shape` relative to the streamline vertex spacing to
 ensure all passing streamlines are captured.
 
-**Group IDs vs group names.**
-Groups can be specified by integer ID or by string name. String names are
-stored in `groupings_attributes/name/`. Pass string names to `group_ids`
-for readability; the reader resolves them to integer IDs internally.
+**Group IDs are integers everywhere — names are not resolved.**
+`groups={...}` takes integer keys at write time, and `group_ids=[...]`
+takes integers at read time. Passing a string name to either fails:
+`write_polylines(groups={"CST": ...})` raises `TypeError`, and
+`read_polylines(group_ids=["CST"])` raises
+`TypeError: '<' not supported between instances of 'str' and 'int'`.
+
+Names can be *stored* alongside groups with
+`group_attributes={"name": ...}` (they land in `groupings_attributes/`),
+but nothing in the reader maps a name back to an ID. Keep your own
+name→ID mapping and pass integers:
+
+```python
+GROUPS = {"CST": 0, "AF": 1, "UF": 2}
+result = read_polylines("tracts.zarrvectors", group_ids=[GROUPS["CST"]])
+```
 
 **Lost attributes after rechunking.**
 Rechunking reorders vertices within each chunk. Per-vertex attribute arrays

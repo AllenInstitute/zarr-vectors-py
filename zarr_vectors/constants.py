@@ -25,12 +25,20 @@ spatial chunk at absolute coord ``c`` lands in cell ``c - origin`` where
 ``chunk_grid_origin`` attribute (absent ⇒ zero origin); this lets data
 with negative coordinates map onto a 0-indexed array.  Non-empty cells
 are tracked in the array's ``nonempty_chunks`` attribute for O(1)
-enumeration.  ``cross_chunk_links`` / ``cross_chunk_link_attributes``
-keep the per-cell layout (their keys are canonical-sorted endpoint
-tuples, not spatial grid coords).  Optional ``shard_shape=`` wraps the
-cells in the Zarr v3 ``sharding_indexed`` codec.  Hard break: 0.8.x
-stores wrote per-chunk sub-arrays and cannot be read; rewrite from
-source.
+enumeration.  Optional ``shard_shape=`` wraps the cells in the Zarr v3
+``sharding_indexed`` codec.  Hard break: 0.8.x stores wrote per-chunk
+sub-arrays and cannot be read; rewrite from source.
+
+0.9.0 also merges ``cross_chunk_links`` / ``cross_chunk_link_attributes``
+into ``links`` / ``link_attributes``.  Connectivity is ONE family: an
+intra-chunk link is just a link whose relative chunk offset is zero.
+``links/<delta>`` becomes a **group** whose children are one rank-D vlen
+array per relative-offset segment — ``links/<delta>/<offsets>``, cell =
+the record's SOURCE chunk, ``vi_k`` local to ``src + o_k`` — and
+``link_attributes/<name>/<delta>/<offsets>`` mirrors it exactly (same
+offsets, same cells, same row order).  Endpoint tuples are no longer
+part of any path, so both families are ordinary chunk-grid arrays and
+shard like everything else.  See :mod:`zarr_vectors.core.paths`.
 
 0.8.1: flat single-array layout for dense / ragged blobs.  Removes the
 ``group-with-data-child`` pattern used by every non-spatial array
@@ -55,7 +63,8 @@ and ``num_physical_records`` (on-disk row count, ``> num_links`` when
 duplicated).  ``num_links`` remains the *logical* record count.  A
 decentralized ``write_cross_chunk_link_cells`` + ``finalize_cross_chunk_links``
 pair lets independent workers append into disjoint cells race-free.
-See ``docs/spec/object_model/cross_chunk_links.md``.
+(That family and those helpers were merged into ``links/`` after 0.8.1 —
+see ``docs/spec/object_model/links.md`` for the layout that replaced it.)
 
 0.8.0: per-tuple ``cross_chunk_links`` layout.  The global flat
 ``cross_chunk_links/<delta>/data`` blob is replaced by per-cell
@@ -147,10 +156,12 @@ and ``link_fragments`` (single uint8 blob per chunk; see
 :mod:`zarr_vectors.encoding.fragments`)."""
 
 CAP_MULTISCALE_LINKS: str = "multiscale_links"
-"""Store uses the 0.4 multiscale links layout (``links/<delta>/``,
-``cross_chunk_links/<delta>/``, ``link_attributes/<name>/<delta>/`` and
-``cross_chunk_link_attributes/<name>/<delta>/``) and may contain
-cross-pyramid-level edges (``delta != 0``)."""
+"""Store uses the multiscale links layout (``links/<delta>/<offsets>/``
+and ``link_attributes/<name>/<delta>/<offsets>/``) and may contain
+cross-pyramid-level edges (``delta != 0``).  Since 0.9.0 there is no
+separate cross-chunk family — a cross-chunk link is a link with a
+non-zero offsets segment — so this token now marks only the presence of
+``delta != 0`` arrays."""
 
 DEFAULT_AXES_NAMES: tuple[str, ...] = ("x", "y", "z", "w")
 """Default axis names used when ``create_store`` is called without an
@@ -196,12 +207,19 @@ VERTEX_FRAGMENTS: str = "vertex_fragments"
 group into fragments.  See :mod:`zarr_vectors.encoding.fragments`."""
 
 LINK_FRAGMENTS: str = "link_fragments"
-"""Per-chunk fragment-index group describing how rows of
-``links/0/<chunk>`` group into fragments.  Exists at ``delta == 0``
-only; cross-level link arrays keep their inline self-describing
-header."""
+"""Per-chunk fragment-index describing how rows of the **intra-chunk**
+link array group into fragments.  Keyed by chunk ALONE — it carries no
+delta and no offsets segment — so exactly one array may write it: the
+all-zero-offsets array at ``delta == 0``
+(``links/0/<intra offsets>/<chunk>``).  Every other offset array, and
+every ``delta != 0`` array, uses an inline self-describing blob and has
+no sidecar; see :func:`zarr_vectors.core.arrays.write_chunk_links`."""
 
 LINKS: str = "links"
+"""Connectivity family.  ``links/<delta>`` is a *group*; its children are
+one rank-D vlen array per relative-offset segment
+(``links/<delta>/<offsets>``).  There is no array at ``links/<delta>``
+itself — compose paths via :mod:`zarr_vectors.core.paths`."""
 VERTEX_ATTRIBUTES: str = "vertex_attributes"
 FRAGMENT_ATTRIBUTES: str = "fragment_attributes"
 """Per-fragment attribute arrays.  Dense per-chunk blob with one row per
@@ -213,9 +231,11 @@ OBJECT_INDEX: str = "object_index"
 OBJECT_ATTRIBUTES: str = "object_attributes"
 GROUPS: str = "groups"
 GROUP_ATTRIBUTES: str = "group_attributes"
-CROSS_CHUNK_LINKS: str = "cross_chunk_links"
 LINK_ATTRIBUTES: str = "link_attributes"
-CROSS_CHUNK_LINK_ATTRIBUTES: str = "cross_chunk_link_attributes"
+"""Per-link attribute family.  ``link_attributes/<name>/<delta>`` is a
+*group* mirroring ``links/<delta>``: one array per offsets segment, same
+cells, same per-cell row order, so attribute rows align 1:1 with link
+records without storing a row id."""
 
 # Parametric sub-arrays
 PARAMETRIC_OBJECTS: str = "objects"
@@ -234,19 +254,17 @@ ALL_ARRAY_NAMES: frozenset[str] = frozenset({
     OBJECT_ATTRIBUTES,
     GROUPS,
     GROUP_ATTRIBUTES,
-    CROSS_CHUNK_LINKS,
     LINK_ATTRIBUTES,
-    CROSS_CHUNK_LINK_ATTRIBUTES,
 })
 
 # Array names whose on-disk layout includes a ``<level_delta>`` segment
-# between the array prefix and the chunk-key / data subpath (multiscale
-# links, 0.4+).  Use ``zarr_vectors.core.paths`` to compose paths.
+# between the array prefix and the rest of the subpath.  Both are link
+# families, and under the 0.9.0 merge both nest a further ``<offsets>``
+# segment below the delta.  Use ``zarr_vectors.core.paths`` to compose
+# paths — never assemble these f-strings inline.
 MULTISCALE_LINK_ARRAY_NAMES: frozenset[str] = frozenset({
     LINKS,
-    CROSS_CHUNK_LINKS,
     LINK_ATTRIBUTES,
-    CROSS_CHUNK_LINK_ATTRIBUTES,
 })
 
 # ---------------------------------------------------------------------------
@@ -273,7 +291,10 @@ VALID_OBJIDX_CONVENTIONS: frozenset[str] = frozenset({
     OBJIDX_IDENTITY,
 })
 
-# cross_chunk_strategy
+# cross_chunk_strategy.  Semantic, not physical: it says how a writer
+# reconciles geometry that straddles a chunk boundary, which is a
+# question the 0.9.0 links/cross_chunk_links merge does not answer and
+# does not remove.  These tokens outlive the ``cross_chunk_links`` path.
 CROSS_CHUNK_DEDUP: str = "boundary_deduplication"
 CROSS_CHUNK_EXPLICIT: str = "explicit_links"
 CROSS_CHUNK_BOTH: str = "both"
