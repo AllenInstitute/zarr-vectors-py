@@ -3,31 +3,51 @@
 ## Terms
 
 **Structural check**
-: A validation check that examines only the presence and node type of
-  paths in the Zarr store, without reading array data or interpreting
-  metadata values.
+: A validation check that examines only the presence of paths in the
+  store, without reading array data or interpreting metadata values.
 
 **Required path**
-: A store path that must exist for a valid ZVF store of a given geometry
-  type. Missing required paths are L1 errors.
+: A store path that must exist for a valid ZVF store. Missing required
+  paths are L1 errors. L1's required set is **geometry-type
+  independent** — see *Scope* below.
 
-**Node type**
-: Whether a path is a Zarr group or a Zarr array, as declared by its
-  `zarr.json`. A path that exists with the wrong node type (e.g. an array
-  where a group is expected) is an L1 error.
+**Level directory**
+: A directory under the store root whose name parses as an integer
+  (`0/`, `1/`, …). Directories whose names do not parse as integers
+  (e.g. `parametric/`) are not level directories and are skipped by the
+  level walk.
 
 ---
 
 ## Introduction
 
 L1 validation answers the question: "does this store have the right shape?"
-It checks that every required file and array is present, that paths that
-should be groups are groups, and that paths that should be arrays are arrays.
-It does not read any array data and does not interpret metadata values.
+It checks that the store root, its metadata file, and each resolution
+level's required paths are present. It does not read any array data and
+does not interpret metadata values.
 
 L1 is the fastest validation level and is appropriate as a first triage
 step when opening an unfamiliar store. An L1 failure means the store is
 structurally incomplete and cannot be read by any ZVF reader.
+
+### Scope
+
+L1 is deliberately **narrow**, and narrower than a reader's needs:
+
+- It checks **path presence only**, via ordinary filesystem directory
+  tests. It does **not** open `zarr.json` and does **not** verify Zarr
+  node types. A path that exists as the wrong node type passes L1 and
+  fails later.
+- It is **not** parameterised by geometry type. L1 applies one required
+  set to every store, so it cannot express "streamlines must have
+  links". Type-specific connectivity requirements are checked at **L4**
+  by [`validate_conformance`](../../../zarr_vectors/validate/conformance.py),
+  which is the level that reads `geometry_types` and
+  `links_convention`.
+
+Anything stated as a per-type requirement in this page's history was
+never enforced at L1; it has been removed rather than left as an
+aspiration.
 
 ---
 
@@ -35,86 +55,102 @@ structurally incomplete and cannot be read by any ZVF reader.
 
 ### Checks performed
 
+L1 is implemented by
+[`validate_structure`](../../../zarr_vectors/validate/structure.py).
+Checks are reported as free-text messages on a `ValidationResult`; they
+do not carry stable machine-readable check IDs (see
+[Validation overview](overview.md#validationresult-api)).
+
 #### Root level
 
-| Check | Description | Failure type |
-|-------|-------------|--------------|
-| `root_zarr_json` | `zarr.json` exists at store root and declares `node_type: group` | Error |
-| `root_zattrs` | `.zattrs` exists at store root and is valid JSON | Error |
-| `root_metadata_json` | `metadata.json` exists at store root | Warning (recommended) |
-| `level_0_exists` | `0/` group exists | Error |
+| Rule | Failure type |
+|------|--------------|
+| The store path exists | Error (returns immediately) |
+| The store path is a directory | Error (returns immediately) |
+| At least one of `.zattrs`, `zarr.json`, or `metadata.json` exists at the root | Error |
+| At least one level directory exists | Error (returns immediately) |
 
-#### Per resolution level (repeated for each declared level)
+Any of `.zattrs`, `zarr.json`, or `metadata.json` satisfies the root
+metadata check — L1 does not require a specific one, and does not parse
+whichever it finds. `metadata.json` is **not** separately recommended
+or warned about.
 
-| Check | Description | Failure type |
-|-------|-------------|--------------|
-| `level_zarr_json` | `N/zarr.json` exists and declares `node_type: group` | Error |
-| `level_zattrs` | `N/.zattrs` exists and is valid JSON | Error |
-| `vertices_array` | `N/vertices/zarr.json` declares `node_type: array` | Error |
-| `vertex_fragments_array` | `N/vertex_fragments/zarr.json` declares `node_type: array` | Error |
+The first three failures are **fatal to the walk**: `validate_structure`
+returns as soon as one trips, so no per-level results follow.
 
-#### Type-specific array presence (based on `geometry_type` in root `.zattrs`)
+#### Per level directory
 
-| Geometry type | Required arrays | Warning if absent |
-|---------------|----------------|-------------------|
-| `point_cloud` | `vertices/`, `vertex_fragments/` | `attributes/` if attributes were written at other levels |
-| `line` | + `links/<delta>/`, `link_fragments/` (at `<delta>=0`) | — |
-| `polyline` | + `links/<delta>/`, `link_fragments/` (at `<delta>=0`), `object_index/` | `cross_chunk_links/<delta>/` if objects may span chunks |
-| `streamline` | + `links/<delta>/`, `link_fragments/` (at `<delta>=0`), `object_index/` | `cross_chunk_links/<delta>/` |
-| `graph` | + `links/<delta>/`, `link_fragments/` (at `<delta>=0`), `object_index/` | `cross_chunk_links/<delta>/` |
-| `skeleton` | + `links/<delta>/`, `link_fragments/` (at `<delta>=0`), `object_index/` | `cross_chunk_links/<delta>/` |
-| `mesh` | + `links/<delta>/`, `link_fragments/` (at `<delta>=0`), `object_index/` | — |
+Repeated for every integer-named directory under the root, in ascending
+numeric order:
 
-#### Attribute sub-groups
+| Rule | Failure type |
+|------|--------------|
+| `N/vertices/` exists and is a directory | **Error** |
+| `N/vertex_fragments/` exists and is a directory | Warning |
+| `N/.zattrs` or `N/zarr.json` exists | Warning |
 
-| Check | Description | Failure type |
-|-------|-------------|--------------|
-| `attributes_is_group` | `N/attributes/` is a Zarr group if present | Error |
-| `attributes_sub_arrays` | Each `N/attributes/<name>/` declares `node_type: array` | Error |
-| `object_attrs_is_group` | `N/object_attributes/` is a Zarr group if present | Error |
-| `groupings_array` | `N/groupings/zarr.json` declares array if present | Error |
+`vertices/` is the **only** per-level path whose absence is an L1 error.
 
-#### Attribute consistency across levels
+#### Optional paths (presence recorded, never required)
 
-| Check | Description | Failure type |
-|-------|-------------|--------------|
-| `attribute_names_consistent` | The set of per-vertex attribute names is the same at every resolution level | Warning |
-| `object_attr_names_consistent` | The set of per-object attribute names is the same at every resolution level | Warning |
+Each of these emits a *pass* when present and nothing at all when
+absent:
+
+`vertex_attributes/`, `fragment_attributes/`, `object_index/`,
+`object_attributes/`, `groups/`
+
+At the root, `parametric/` is recorded the same way.
+
+#### Link families
+
+L1 scans the `links/` directory and lists its `<delta>` subdirectories:
+
+| Rule | Failure type |
+|------|--------------|
+| `N/links/` absent | *(nothing — not required at L1)* |
+| `N/links/` present with at least one `<delta>` subdirectory | Pass, listing the deltas found |
+| `N/links/` present but containing no `<delta>` subdirectory | Warning |
+
+L1 stops there. It does **not** descend into `<delta>/<offsets>/`, does
+not parse offsets segments, and does not require `links/` to exist for
+any geometry type. Offsets-segment grammar is checked at
+[L3](l3_consistency.md); type-specific connectivity requirements at L4.
+
+> **Legacy tolerance.** `structure.py` applies the same scan to a
+> `cross_chunk_links/` directory if one is present. That family was
+> merged into `links/` and is never written by a current writer; the
+> branch only keeps L1 from being silent about a pre-merge store. It
+> imposes no requirement, and a store MUST NOT rely on it.
 
 ### Example L1 report
 
 ```
-Level 1 validation of scan.zarrvectors
-=======================================
-PASS  root_zarr_json               zarr.json exists at store root
-PASS  root_zattrs                  .zattrs exists and is valid JSON
-WARN  root_metadata_json           metadata.json not found (recommended)
-PASS  level_0_exists          0/ group exists
-PASS  level_zarr_json [level=0]    0/zarr.json exists
-PASS  level_zattrs [level=0]       0/.zattrs exists
-PASS  vertices_array [level=0]     0/vertices/ is an array
-PASS  vertex_fragments_array [level=0]   0/vertex_fragments/ is an array
-PASS  object_index_array [level=0] 0/object_index/ is an array
-PASS  edges_array [level=0]        0/links/<delta>/ is an array
-ERROR cross_chunk_links [level=0]  0/cross_chunk_links/ missing;
-                                   required for streamline type
-
-Level 1 validation: FAIL — 9 passed, 1 warning, 1 error
+Level 1 validation: FAIL
+  6 passed, 2 warnings, 1 errors
+  ERROR: 1/vertices/ missing
+  WARN:  1/vertex_fragments/ missing
+  WARN:  0/links/ exists but has no <delta> subdirs
 ```
+
+Passing messages take the form `Store root exists and is a directory`,
+`Root metadata file found`, `Found 2 resolution level(s)`,
+`0/vertices/ exists`, and `0/links/ exists (deltas: 0,+1)`.
 
 ### Implementation notes for contributors
 
-L1 checks work by listing the keys in the store and checking for the
-presence of required paths. In `zarr-vectors-py`, L1 is implemented in
-`zarr_vectors.validate.structure`:
+L1 works by walking the store directory with ordinary filesystem tests
+and checking for the presence of required paths:
 
 ```python
-from zarr_vectors.validate.structure import check_l1
+from zarr_vectors.validate.structure import validate_structure
 
-result = check_l1(store_root, geometry_type)
+result = validate_structure(store_root)
+print(result.summary())
 ```
 
-To add a new required path for a new geometry type (see
-[Adding geometry types](../contributing/adding_geometry_types.md)), add an
-entry to the `REQUIRED_ARRAYS` dict in `zarr_vectors/validate/structure.py`
-and add a corresponding test fixture.
+`validate_structure` takes the store path alone — there is no
+`geometry_type` parameter and no `REQUIRED_ARRAYS` table to extend. A
+new geometry type that needs its own required paths (see
+[Adding geometry types](../contributing/adding_geometry_types.md))
+belongs in `zarr_vectors/validate/conformance.py` at L4, which is where
+geometry types are dispatched on.

@@ -15,7 +15,7 @@ from __future__ import annotations
 import warnings
 from contextlib import contextmanager
 from dataclasses import dataclass
-from typing import Any, Literal, Sequence
+from typing import Any, Iterator, Literal, Sequence
 
 import numpy as np
 import numpy.typing as npt
@@ -24,8 +24,6 @@ from zarr.codecs import VLenBytesCodec
 from zarr.errors import UnstableSpecificationWarning
 
 from zarr_vectors.constants import (
-    CROSS_CHUNK_LINK_ATTRIBUTES,
-    CROSS_CHUNK_LINKS,
     FRAGMENT_ATTRIBUTES,
     GROUP_ATTRIBUTES,
     GROUPS,
@@ -39,15 +37,18 @@ from zarr_vectors.constants import (
     VERTICES,
 )
 from zarr_vectors.core.paths import (
-    cross_chunk_link_attributes_path,
-    cross_chunk_links_path,
-    format_cell_key,
     format_delta,
+    format_offsets,
+    intra_offsets,
+    is_intra,
+    link_attributes_group_path,
     link_attributes_path,
+    links_group_path,
     links_path,
-    parse_cell_key,
     parse_delta,
+    parse_offsets,
 )
+from zarr_vectors.core._vlen import region_to_bytes as _vlen_region_to_bytes
 from zarr_vectors.core.store import FsGroup
 from zarr_vectors.encoding.fragments import (
     ChunkFragmentIndex,
@@ -138,13 +139,13 @@ def _short_circuit_existing(
     already exists and ``exist_ok=True``.  Raises :class:`ArrayError` when
     the array exists and ``exist_ok=False``.
 
-    Detects both layouts: the legacy Option-G group-with-chunk-arrays
-    (``array_exists``) and the 0.8.1 single-standard-Zarr-v3-array layout
+    Detects both layouts: the legacy group-with-chunk-arrays form
+    (``array_exists``) and the single-standard-Zarr-v3-array layout
     (``standalone_array_exists``).
 
     When the caller is running inside
     :meth:`Group.native_sharded_arrays` and the existing node is a
-    legacy Option-G group at a per-chunk-array path, *do not*
+    legacy group at a per-chunk-array path, *do not*
     short-circuit — the create call needs to replace the legacy group
     with a native-sharded Zarr array.  This matters when the store
     was warmed via :func:`create_store` (which writes an empty
@@ -232,9 +233,15 @@ def _derive_native_config(level_group: FsGroup) -> dict[str, Any] | None:
     :func:`open_write_session` (multiresolution coarsen, rechunk, lazy
     append, in-place edits that add a new array) still produce the
     single vlen-array layout.  Derives ``(origin, grid_shape)`` from the
-    root ``bounds`` and the level's effective ``chunk_shape``; returns
-    ``None`` (→ fall back to the per-cell group primitive) when the
-    metadata can't be read (e.g. a bare ``Group`` in a low-level test).
+    root ``bounds`` and the level's effective ``chunk_shape``.
+
+    Returns ``None`` when that metadata can't be read — e.g. a bare
+    ``Group`` with no root ``.zattrs``.  There is no longer a per-cell
+    group primitive to fall back to: :meth:`Group.write_bytes` requires an
+    allocated chunk array and raises otherwise.  A ``None`` here therefore
+    means a grid-shaped array cannot be allocated at all, which is
+    intrinsic rather than incidental — the grid is precisely what the
+    missing metadata would have supplied.
 
     Cached on the ``level_group`` instance for the object's lifetime.
     """
@@ -274,21 +281,105 @@ def _derive_native_config(level_group: FsGroup) -> dict[str, Any] | None:
     return cfg
 
 
-def _ensure_array_dir(level_group: FsGroup, array_name: str) -> None:
+def _derive_level_scales(
+    level_group: FsGroup, delta: int,
+) -> tuple[tuple[int, ...], tuple[int, ...]]:
+    """Return ``(scale_src, scale_trg)`` for records spanning ``delta`` levels.
+
+    Each is the per-axis integer multiple of the root ``chunk_shape`` that
+    the relevant level's ``chunk_shape`` represents — ``r_src`` for the
+    owning level, ``r_trg`` for ``owning + delta``.
+    :func:`zarr_vectors.spatial.boundary.anchor_chunk` needs both to make
+    a cross-level chunk offset well-defined: when the two levels carry
+    different ``chunk_shape`` (a per-level override written by
+    ``coarsen`` under ``chunk_scale_factor > 1``) their chunk coords index
+    grids of different cell sizes and cannot be differenced directly.
+
+    Returns all-ones for both when the metadata cannot be read, or when
+    the target level does not exist yet.  All-ones is exactly right for a
+    default pyramid (``chunk_scale_factor=1``), where every level inherits
+    the root ``chunk_shape`` — and it makes the anchor a no-op, which is
+    the pre-merge behaviour.  It is *wrong* for a scaled pyramid, so this
+    mirrors :func:`_derive_native_config`'s best-effort contract: callers
+    on a scaled store must be reachable from real metadata.
+    """
+    ndim_fallback: tuple[int, ...]
+    try:
+        import zarr
+
+        from zarr_vectors.core.metadata import (
+            LevelMetadata,
+            chunk_scale_factor,
+        )
+        from zarr_vectors.core.store import read_root_metadata
+
+        store = level_group._zarr.store
+        root_zarr = zarr.open_group(store, path="/", mode="r")
+        root_group = type(level_group)._from_zarr(root_zarr)
+        root_meta = read_root_metadata(root_group)
+        ndim_fallback = tuple(1 for _ in root_meta.chunk_shape)
+
+        src_meta = LevelMetadata.from_dict(level_group.attrs.to_dict())
+        scale_src = chunk_scale_factor(root_meta, src_meta)
+        if delta == 0:
+            return scale_src, scale_src
+
+        from zarr_vectors.core.store import (
+            get_resolution_level,
+            read_level_metadata,
+        )
+
+        target_idx = int(src_meta.level) + int(delta)
+        try:
+            get_resolution_level(root_group, target_idx)
+            trg_meta = read_level_metadata(root_group, target_idx)
+        except Exception:
+            # Target level not written yet (pyramid still being built):
+            # fall back to the source's own scale, which is correct
+            # whenever the pyramid is uniform.
+            return scale_src, scale_src
+        return scale_src, chunk_scale_factor(root_meta, trg_meta)
+    except Exception:
+        try:
+            ndim_fallback
+        except NameError:
+            ndim_fallback = (1, 1, 1)
+        return ndim_fallback, ndim_fallback
+
+
+def _ensure_array_dir(
+    level_group: FsGroup,
+    array_name: str,
+    *,
+    attributes: dict[str, Any] | None = None,
+) -> None:
     """Ensure an array node exists within a level group.
 
-    For per-spatial-chunk arrays (vertices, fragments, links/<delta>,
-    attribute arrays) this allocates a single multidim vlen-bytes Zarr
-    array (one cell per spatial chunk) — the default single-array
-    layout.  The grid comes from the active :func:`open_write_session`
-    when one is open, else it is derived from the store's metadata (so
-    coarsen / rechunk / edit paths get single-array too).
+    For per-spatial-chunk arrays (vertices, fragments,
+    ``links/<delta>/<offsets>``, attribute arrays) this allocates a single
+    multidim vlen-bytes Zarr array (one cell per spatial chunk) — the
+    default single-array layout.  The grid comes from the active
+    :func:`open_write_session` when one is open, else it is derived from
+    the store's metadata (so coarsen / rechunk / edit paths get
+    single-array too).
 
-    Non-per-chunk names (``cross_chunk_links``, ``object_index``,
-    attribute *namespace* groups) become plain Zarr groups.  Under an
+    Non-per-chunk names (``object_index``, the ``links/<delta>`` family
+    group, attribute *namespace* groups) become plain Zarr groups.  Which
+    is which is decided by :func:`_is_per_chunk_array`, and it is
+    depth-aware: ``links/0`` is a group, ``links/0/0.0.+1`` an array.
+    Under an
     active :meth:`Group.batched_writes`, the sync ``require_group``
     round-trip is skipped — the metadata flush PUTs the parent
     ``zarr.json`` directly.
+
+    ``attributes`` is the array's own metadata block.  Passing it here
+    rather than calling :meth:`Group.write_array_meta` afterwards is what
+    keeps allocation to a single store write: the attrs ride along with
+    the ``create_array`` that writes ``zarr.json`` anyway, instead of
+    rewriting the whole object a second time.  A writer that allocates one
+    array per offsets segment pays that saving per segment.  When the
+    array already exists it is *not* recreated, so the metadata is applied
+    with a normal write — same end state either way.
     """
     explicit_cfg = level_group._native_sharded_config
     cfg = explicit_cfg
@@ -309,6 +400,10 @@ def _ensure_array_dir(level_group: FsGroup, array_name: str) -> None:
             if explicit_cfg is None or _array_matches_layout(
                 level_group, array_name, explicit_cfg
             ):
+                # Reused as-is: the attrs can't ride a create_array that
+                # isn't happening, so apply them directly.
+                if attributes:
+                    level_group.write_array_meta(array_name, attributes)
                 return
         # Honor the session compressor so the array's codec pipeline
         # matches the batched default (no compression) unless the
@@ -327,7 +422,13 @@ def _ensure_array_dir(level_group: FsGroup, array_name: str) -> None:
             shard_shape=cfg["shard_shape"],
             origin=cfg.get("origin"),
             compressors=compressors,
+            attributes=attributes,
         )
+        return
+    # A group node, not a chunk array: nothing to ride along with, so any
+    # metadata is written normally rather than dropped.
+    if attributes:
+        level_group.write_array_meta(array_name, attributes)
         return
     if level_group._pending_array_metas is not None:
         return
@@ -471,21 +572,34 @@ def _is_per_chunk_array(name: str) -> bool:
     ``object_attributes/...``, ``groups``, ``group_attributes/...``) are
     plain single arrays that do **not** use this grid layout.
 
-    ``cross_chunk_links/<delta>`` (and its attributes) is excluded — its
-    cell keys are canonical-sorted endpoint chunk-pair tuples, not
-    single-chunk spatial coords, so it keeps the per-cell layout.
-    Callers who need those sharded can apply
-    :func:`zarr_vectors.sharding.shard_store` post-hoc.
+    The test is **depth-aware**, not a prefix match, because the link
+    families nest a group above their arrays: ``links/<delta>`` is a
+    *group* whose children are one array per relative-offset segment
+    (``links/<delta>/<offsets>``).  A prefix test would match both and
+    :func:`_ensure_array_dir` would clobber the group with an array.
+
+        vertices                                    array
+        links/0                                     GROUP
+        links/0/0.0.+1                              array
+        link_attributes/weight/0                    GROUP
+        link_attributes/weight/0/0.0.+1             array
+
+    Note this predicate does double duty: :mod:`zarr_vectors.sharding.io`
+    imports it to decide what ``shard_store`` may migrate.  Both link
+    families are rank-D grids now, so they shard like any other.
     """
     if name in {VERTICES, VERTEX_FRAGMENTS, LINK_FRAGMENTS}:
         return True
-    prefixes = (
-        VERTEX_ATTRIBUTES + "/",
-        FRAGMENT_ATTRIBUTES + "/",
-        LINKS + "/",
-        LINK_ATTRIBUTES + "/",
-    )
-    return any(name.startswith(p) for p in prefixes)
+    parts = name.split("/")
+    if len(parts) == 2 and parts[0] in (VERTEX_ATTRIBUTES, FRAGMENT_ATTRIBUTES):
+        return True
+    # links/<delta>/<offsets>
+    if len(parts) == 3 and parts[0] == LINKS:
+        return True
+    # link_attributes/<name>/<delta>/<offsets>
+    if len(parts) == 4 and parts[0] == LINK_ATTRIBUTES:
+        return True
+    return False
 
 
 def read_zv_array_tag(meta: dict) -> str | None:
@@ -534,20 +648,129 @@ def create_vertices_array(
     })
 
 
+def links_has_perm(
+    offsets: Sequence[ChunkCoords],
+    *,
+    delta: int,
+    directed: bool,
+    store: str,
+) -> bool:
+    """Whether ``links/<delta>/<offsets>/`` rows carry a ``perm_idx`` column.
+
+    ``perm_idx`` exists only to undo a canonical sort, so it is needed
+    exactly when :func:`zarr_vectors.spatial.boundary._cell_placements`
+    may return a non-identity permutation.  Storing it unconditionally
+    would add 8 bytes to every intra-chunk link — the overwhelming
+    majority of rows — for a value that is always 0.
+
+    Keep this in lockstep with ``_cell_placements``: it is the single
+    definition the writer and reader both consult to agree on the record
+    width (``L`` columns, or ``1 + L`` when this returns True).
+    """
+    if is_intra(offsets):
+        # Every endpoint in the source chunk: identity placement, input
+        # order preserved.  This is what keeps the all-zero-offsets array
+        # byte-identical to the pre-merge ``links/<delta>/``.
+        return False
+    if delta != 0:
+        # Cross-level: endpoints are distinguished by level, so the source
+        # is always input endpoint 0 and the placement is the identity.
+        return False
+    if store == "duplicate":
+        # Each copy leads with a different endpoint, so sigma varies.
+        return True
+    return not directed
+
+
+def create_links_family(
+    level_group: FsGroup,
+    *,
+    delta: int = 0,
+    link_width: int = 2,
+    sid_ndim: int | None = None,
+    directed: bool = False,
+    store: str = "canonical",
+) -> None:
+    """Stamp the ``links/<delta>/`` family group's policy, nothing else.
+
+    ``directed`` / ``store`` / ``link_width`` / ``sid_ndim`` are
+    family-wide: every offsets array under the delta decodes against them,
+    which is why they live on the group and why
+    :func:`write_links` refuses to flip them under surviving siblings.
+
+    Use this when the policy must exist before any offsets array does —
+    principally the decentralized flow, where a coordinator fixes the
+    policy up front and workers then create only the offsets arrays their
+    own records land in.  :func:`create_links_array` would otherwise force
+    a family to materialise an arbitrary (usually intra) array purely to
+    carry the group stamp, which a cross-only family does not want.
+
+    Idempotent, and merges rather than overwrites: an existing group keeps
+    any counts :func:`finalize_links` left on it.
+
+    Raises:
+        ArrayError: If ``store`` is not ``"canonical"`` or ``"duplicate"``,
+            or if the family already exists with a conflicting policy —
+            silently re-stamping would strand every array already written
+            under the old one.
+    """
+    if store not in ("canonical", "duplicate"):
+        raise ArrayError(
+            f"store must be 'canonical' or 'duplicate', got {store!r}"
+        )
+    family = links_group_path(delta)
+    existing = (
+        level_group.read_array_meta(family) or {}
+        if level_group.array_exists(family) else {}
+    )
+    if existing:
+        _check_link_family_policy(
+            existing, delta=delta, link_width=link_width, sid_ndim=sid_ndim,
+            directed=directed, store=store, action="re-stamp",
+        )
+    meta = dict(existing)
+    meta.update({
+        "zv_array": "links_family",
+        "level_delta": int(delta),
+        "link_width": int(link_width),
+        "directed": bool(directed),
+        "store": str(store),
+    })
+    if sid_ndim is not None:
+        meta["sid_ndim"] = int(sid_ndim)
+    _ensure_array_dir(level_group, family)
+    level_group.write_array_meta(family, meta)
+
+
 def create_links_array(
     level_group: FsGroup,
     link_width: int,
     dtype: str = "int64",
     *,
     delta: int = 0,
+    sid_ndim: int | None = None,
+    offsets: Sequence[ChunkCoords] | None = None,
+    directed: bool = False,
+    store: str = "canonical",
     exist_ok: bool = True,
 ) -> None:
-    """Create a ``links/<delta>/`` array.
+    """Create a ``links/<delta>/<offsets>/`` array and its family group.
 
-    Under the 0.4 multiscale links layout each ``<delta>`` segment is a
-    distinct array; ``delta=0`` is the intra-level array (the only one
-    written pre-0.4) and non-zero deltas hold edges that point ``delta``
-    pyramid levels away (positive = coarser, negative = finer).
+    To stamp the family policy *without* materialising any offsets array
+    — a cross-only family, or a coordinator fixing policy before workers
+    run — use :func:`create_links_family` instead.
+
+    Each ``<delta>`` segment is a group; its children are one rank-D vlen
+    array per distinct relative-offset segment, each cell holding the
+    records whose **source** chunk is that cell.  ``offsets`` all-zero is
+    the intra-chunk array (what was a standalone ``links/<delta>/`` array
+    before the offset layout); non-zero offsets hold records whose other
+    endpoints sit that far away — what used to be ``cross_chunk_links/``.
+
+    Family-wide policy (``directed``, ``store``, ``sid_ndim``,
+    ``link_width``) is stamped on the ``<delta>`` **group**, since several
+    arrays now live under it and must agree.  Per-array meta carries only
+    what is needed to decode that array's own cells.
 
     Args:
         level_group: The resolution level FsGroup.
@@ -555,19 +778,92 @@ def create_links_array(
             1 for skeleton parents, 2 for edges, 3 for triangle faces.
         dtype: Integer dtype.
         delta: Level delta; see :mod:`zarr_vectors.core.paths`.
+        sid_ndim: Spatial index dims.  Required when ``offsets`` is None
+            so the intra segment can be derived.
+        offsets: The ``link_width - 1`` relative offsets naming this
+            array.  Defaults to the all-zero (intra-chunk) offsets.
+        directed: Endpoint order is data; see
+            :func:`zarr_vectors.spatial.boundary._cell_placements`.
+        store: ``"canonical"`` or ``"duplicate"``.
         exist_ok: When True (default), no-op if the array already exists.
             When False, raise :class:`ArrayError` on conflict.
     """
-    full_name = links_path(delta)
+    if store not in ("canonical", "duplicate"):
+        raise ArrayError(
+            f"store must be 'canonical' or 'duplicate', got {store!r}"
+        )
+    if offsets is None:
+        if sid_ndim is None:
+            raise ArrayError(
+                "create_links_array requires sid_ndim when offsets is None "
+                "(needed to derive the intra-chunk offsets segment)"
+            )
+        offsets = intra_offsets(sid_ndim, link_width)
+    if sid_ndim is None and offsets:
+        sid_ndim = len(offsets[0])
+
+    family = links_group_path(delta)
+    full_name = links_path(delta, offsets)
     if _short_circuit_existing(level_group, full_name, exist_ok):
         return
-    _ensure_array_dir(level_group, full_name)
-    level_group.write_array_meta(full_name, {
+    # Capture whether the family group's policy meta already exists BEFORE
+    # allocating the offsets array (which creates the group as a side effect).
+    # Re-stamping the family group's zarr.json on every offsets-array creation
+    # makes concurrent decentralized writers (each creating a DIFFERENT offsets
+    # array) collide on the group's atomic-rename — a Windows hard-fail.  A
+    # coordinator (:func:`create_links_family`) or the first creator establishes
+    # the policy; later creators only add their offsets array under it.
+    existing_family = (
+        level_group.read_array_meta(family) or {}
+        if level_group.array_exists(family) else {}
+    )
+    if existing_family:
+        _check_link_family_policy(
+            existing_family, delta=delta, link_width=link_width,
+            sid_ndim=sid_ndim, directed=directed, store=store,
+            action="append to",
+        )
+    # Hand the array's metadata to the allocation itself: one offsets
+    # array per distinct offset means this runs once per segment, and
+    # writing the meta separately would double the store writes for it.
+    _ensure_array_dir(level_group, full_name, attributes={
         "zv_array": "links",
         "dtype": dtype,
+        "offsets": [list(int(c) for c in o) for o in offsets],
+        "has_perm": links_has_perm(
+            offsets, delta=delta, directed=directed, store=store,
+        ),
         "link_width": link_width,
         "level_delta": int(delta),
     })
+    if not existing_family:
+        family_meta: dict[str, Any] = {
+            "zv_array": "links_family",
+            "level_delta": int(delta),
+            "link_width": int(link_width),
+            "directed": bool(directed),
+            "store": str(store),
+        }
+        if sid_ndim is not None:
+            family_meta["sid_ndim"] = int(sid_ndim)
+        level_group.write_array_meta(family, family_meta)
+
+    # Allocate the fragment sidecar next to the intra array, mirroring how
+    # create_vertices_array allocates vertex_fragments next to vertices.  The
+    # intra array at delta 0 is the only one that uses it (see
+    # write_chunk_links), which would otherwise create it lazily on first
+    # write — from inside a worker, where concurrent creators race on its
+    # zarr.json.  Allocating here keeps creation a coordinator concern.
+    if (
+        delta == 0
+        and is_intra(offsets)
+        and not level_group.array_exists(LINK_FRAGMENTS)
+    ):
+        _ensure_array_dir(level_group, LINK_FRAGMENTS)
+        level_group.write_array_meta(LINK_FRAGMENTS, {
+            "zv_array": LINK_FRAGMENTS,
+            "encoding": "fragment_index_v1",
+        })
 
 
 def create_attribute_array(
@@ -773,112 +1069,50 @@ def create_groupings_attributes_array(
     _ensure_array_dir(level_group, full_name)
 
 
-def create_cross_chunk_links_array(
-    level_group: FsGroup,
-    *,
-    delta: int = 0,
-    link_width: int = 2,
-    sid_ndim: int | None = None,
-    directed: bool = False,
-    store: str = "canonical",
-    exist_ok: bool = True,
-) -> None:
-    """Create a ``cross_chunk_links/<delta>/`` array.
-
-    Source-side endpoints live at the owning resolution level;
-    target-side endpoints live at ``this_level + delta``.
-
-    The whole-level :func:`write_cross_chunk_links` re-stamps every field
-    on write, so the ``directed`` / ``store`` / ``sid_ndim`` args here
-    matter mainly for the decentralized per-cell writer flow, where a
-    coordinator pre-creates the array and workers only write cells.
-
-    Args:
-        level_group: Resolution level group.
-        delta: Level delta (0 for intra-level, ±N for cross-level).
-        link_width: Number of vertex refs per record.  2 for edges
-            (the default — chunk pairs straddling a boundary), 3 for
-            triangle faces, 1 for parent→child metanode references.
-        sid_ndim: Spatial index dims; stamped into the meta when given
-            (per-cell writers and readers need it).
-        directed: Endpoint order is meaningful; see
-            :func:`write_cross_chunk_links`.
-        store: ``"canonical"`` or ``"duplicate"``; see
-            :func:`write_cross_chunk_links`.
-        exist_ok: When True (default), no-op if the array already exists.
-            When False, raise :class:`ArrayError` on conflict.
-    """
-    if store not in ("canonical", "duplicate"):
-        raise ArrayError(
-            f"store must be 'canonical' or 'duplicate', got {store!r}"
-        )
-    full_name = cross_chunk_links_path(delta)
-    if _short_circuit_existing(level_group, full_name, exist_ok):
-        return
-    _ensure_array_dir(level_group, full_name)
-    meta = {
-        "zv_array": "cross_chunk_links",
-        "level_delta": int(delta),
-        "link_width": int(link_width),
-        "directed": bool(directed),
-        "store": str(store),
-    }
-    if sid_ndim is not None:
-        meta["sid_ndim"] = int(sid_ndim)
-    level_group.write_array_meta(full_name, meta)
-
-
 def create_link_attributes_array(
     level_group: FsGroup,
     name: str,
     dtype: str = "float32",
     *,
     delta: int = 0,
+    sid_ndim: int | None = None,
+    link_width: int = 2,
+    offsets: Sequence[ChunkCoords] | None = None,
     exist_ok: bool = True,
 ) -> None:
-    """Create a ``link_attributes/<name>/<delta>/`` array (parallel to
-    the matching ``links/<delta>/`` array).
+    """Create a ``link_attributes/<name>/<delta>/<offsets>/`` array.
+
+    Mirrors the matching ``links/<delta>/<offsets>/`` array exactly —
+    same delta, same offsets segment, same cells, same per-cell row
+    order — so attribute rows align 1:1 with link records without
+    storing a row id.  There is no separate cross-chunk attribute
+    family: an intra-chunk link's attributes live under the all-zero
+    offsets segment, just like the links themselves.
 
     ``exist_ok=True`` (default) makes the call idempotent; pass
     ``exist_ok=False`` to raise :class:`ArrayError` on conflict.
     """
-    full_name = link_attributes_path(name, delta)
+    if offsets is None:
+        if sid_ndim is None:
+            raise ArrayError(
+                "create_link_attributes_array requires sid_ndim when "
+                "offsets is None (needed to derive the intra segment)"
+            )
+        offsets = intra_offsets(sid_ndim, link_width)
+    full_name = link_attributes_path(name, delta, offsets)
     if _short_circuit_existing(level_group, full_name, exist_ok):
         return
     _ensure_array_dir(level_group, full_name)
+    level_group.write_array_meta(link_attributes_group_path(name, delta), {
+        "zv_array": "link_attribute_family",
+        "name": name,
+        "level_delta": int(delta),
+    })
     level_group.write_array_meta(full_name, {
         "zv_array": "link_attribute",
         "name": name,
         "dtype": dtype,
-        "level_delta": int(delta),
-    })
-
-
-def create_cross_chunk_link_attributes_array(
-    level_group: FsGroup,
-    name: str,
-    dtype: str = "float32",
-    *,
-    delta: int = 0,
-    exist_ok: bool = True,
-) -> None:
-    """Create a ``cross_chunk_link_attributes/<name>/<delta>/`` array.
-
-    Parallel attribute storage for the matching
-    ``cross_chunk_links/<delta>/`` array; one value (or one ``C``-vector
-    row) per cross-chunk link in path order.
-
-    ``exist_ok=True`` (default) makes the call idempotent; pass
-    ``exist_ok=False`` to raise :class:`ArrayError` on conflict.
-    """
-    full_name = cross_chunk_link_attributes_path(name, delta)
-    if _short_circuit_existing(level_group, full_name, exist_ok):
-        return
-    _ensure_array_dir(level_group, full_name)
-    level_group.write_array_meta(full_name, {
-        "zv_array": "cross_chunk_link_attribute",
-        "name": name,
-        "dtype": dtype,
+        "offsets": [list(int(c) for c in o) for o in offsets],
         "level_delta": int(delta),
     })
 
@@ -892,6 +1126,8 @@ def write_chunk_vertices(
     chunk_coords: ChunkCoords,
     groups: list[npt.NDArray[np.floating]],
     dtype: np.dtype | str = np.float32,
+    *,
+    record_presence: bool = True,
 ) -> npt.NDArray[np.int64]:
     """Write fragments to a spatial chunk.
 
@@ -914,7 +1150,12 @@ def write_chunk_vertices(
     key = _chunk_key(chunk_coords)
 
     raw_bytes, vertex_byte_offsets = encode_ragged_floats(groups, dtype)
-    level_group.write_bytes(VERTICES, key, raw_bytes)
+    # record_presence: see write_chunk_attributes.  nonempty_chunks is
+    # array-wide, so stamping it rewrites the shared zarr.json once per
+    # cell; concurrent writers over disjoint cells still collide there.
+    level_group.write_bytes(
+        VERTICES, key, raw_bytes, record_presence=record_presence,
+    )
 
     # Express each group as a contiguous (start_row, count) fragment.
     if len(groups) == 0:
@@ -928,8 +1169,18 @@ def write_chunk_vertices(
             cumulative += n
     level_group.write_bytes(
         VERTEX_FRAGMENTS, key, encode_fragments(fragments),
+        record_presence=record_presence,
     )
     return vertex_byte_offsets
+
+
+def _infer_link_width(link_groups: Sequence[npt.NDArray[np.integer]]) -> int:
+    """Best-effort ``L`` from a list of ``(M_k, L)`` link groups."""
+    for g in link_groups:
+        arr = np.asarray(g)
+        if arr.ndim == 2:
+            return int(arr.shape[1])
+    return 2
 
 
 def write_chunk_links(
@@ -939,31 +1190,64 @@ def write_chunk_links(
     dtype: np.dtype | str = np.int64,
     *,
     delta: int = 0,
+    offsets: Sequence[ChunkCoords] | None = None,
+    link_width: int | None = None,
+    record_presence: bool = True,
 ) -> npt.NDArray[np.int64]:
-    """Write link groups to a spatial chunk under ``links/<delta>/``.
+    """Write link rows to one cell of ``links/<delta>/<offsets>/``.
 
-    For ``delta=0`` readers derive per-group link byte offsets from the
-    cumulative sizes of each group's link bytes (see
-    :func:`read_chunk_links`); link groups need not be 1:1 with the
-    chunk's vertex fragments.
+    ``chunk_coords`` is the **source** chunk — the cell — and ``offsets``
+    names which array under ``links/<delta>/`` receives them.  Defaults to
+    the all-zero (intra-chunk) offsets, which is the array that holds
+    records whose endpoints all share the source chunk.
 
-    For ``delta != 0`` (cross-pyramid-level links) the source vertex
-    groups and link groups live at different levels and there is
-    typically one link group spanning the chunk.
+    This is the low-level per-cell writer: ``link_groups`` rows are
+    written as given.  Choosing the source chunk, computing the offsets
+    and prepending any ``perm_idx`` column is the caller's job — see
+    :func:`zarr_vectors.spatial.boundary.partition_records_by_offset`.
+
+    Two encodings, selected by ``delta == 0 and is_intra(offsets)``:
+
+    - **flat + ``link_fragments/`` sidecar** for intra-chunk links at
+      delta 0.  Readers derive per-group byte offsets from the cumulative
+      group sizes (see :func:`read_chunk_links`); link groups need not be
+      1:1 with the chunk's vertex fragments.
+    - **inline self-describing ragged blob** otherwise — cross-offset
+      records at any delta, and every cross-level record.  These carry no
+      fragment sidecar.
+
+    That condition reproduces both pre-merge layouts exactly: the intra
+    array is byte-identical to the old ``links/<delta>/``, and every other
+    offset array matches the old ``cross_chunk_links/<delta>/`` cells.
 
     Args:
         level_group: Resolution level group.
-        chunk_coords: Spatial chunk coordinates.
+        chunk_coords: **Source** chunk coordinates (the array cell).
         link_groups: List of arrays, each ``(M_k, L)``.
         dtype: Integer dtype.
         delta: Level delta; see :mod:`zarr_vectors.core.paths`.
+        offsets: Relative offsets naming the target array.  ``None``
+            (default) means the all-zero intra-chunk offsets.
+        link_width: Only used to derive the intra offsets segment when
+            ``offsets`` is None and ``link_groups`` is empty.
+        record_presence: Whether to stamp this cell into the array's
+            ``nonempty_chunks`` manifest.  Decentralized workers pass
+            False: the manifest is array-wide state, so stamping it is a
+            read-modify-write that two workers racing on *disjoint* cells
+            still lose keys to.  They leave it to a coordinator's
+            :func:`finalize_links`, which rebuilds it from the store
+            listing once every worker has finished.
 
     Returns:
         ``(K,)`` int64 array of link byte offsets.
     """
     dtype = np.dtype(dtype)
     key = _chunk_key(chunk_coords)
-    full_name = links_path(delta)
+    if offsets is None:
+        if link_width is None:
+            link_width = _infer_link_width(link_groups)
+        offsets = intra_offsets(len(chunk_coords), link_width)
+    full_name = links_path(delta, offsets)
 
     # NOTE: link groups are no longer required to be 1:1 with the chunk's
     # vertex fragments. BRIDGE stores streamlines as vertex-fragments and the
@@ -972,11 +1256,13 @@ def write_chunk_links(
     # graph). Readers derive per-group link ranges from ``link_fragments/``
     # (not from ``vertex_fragments``), so no write-time 1:1 guard is needed.
 
-    if delta == 0:
+    if delta == 0 and is_intra(offsets):
         # v0.6 intra-level: flat concatenated link data + sibling
         # link_fragments/ describing per-group row ranges.
         data_bytes, link_byte_offsets = encode_ragged_ints(link_groups, dtype)
-        level_group.write_bytes(full_name, key, data_bytes)
+        level_group.write_bytes(
+            full_name, key, data_bytes, record_presence=record_presence,
+        )
 
         link_row_size = dtype.itemsize * (
             int(np.asarray(link_groups[0]).shape[1]) if (
@@ -996,23 +1282,38 @@ def write_chunk_links(
         # Ensure the sibling array container exists.  Routes through
         # ``_ensure_array_dir`` so that native-sharded writers allocate
         # a multidim vlen-bytes array at this path instead of the
-        # legacy Option-G group.
+        # legacy per-chunk-array group.
+        #
+        # ``link_fragments/<chunk>`` is keyed by chunk ALONE — it carries
+        # no delta and no offsets segment — and this write is an
+        # unconditional replace.  It is therefore only correct because the
+        # enclosing branch admits exactly one array per chunk: the intra
+        # one at delta 0.  If a non-intra offset ever reached here it would
+        # silently clobber the intra array's fragment index.  Keep the
+        # branch condition and this write together.
         if not level_group.array_exists(LINK_FRAGMENTS):
             _ensure_array_dir(level_group, LINK_FRAGMENTS)
             level_group.write_array_meta(LINK_FRAGMENTS, {
                 "zv_array": LINK_FRAGMENTS,
                 "encoding": "fragment_index_v1",
             })
+        # Thread record_presence through to the sidecar too: without this the
+        # links cell honours the opt-out but link_fragments still stamps its
+        # array-wide manifest on every cell, so concurrent per-chunk writers
+        # collide on link_fragments/zarr.json (a Windows hard-fail) even
+        # though the caller asked to defer manifest maintenance.
         level_group.write_bytes(
             LINK_FRAGMENTS, key, encode_fragments(link_fragments),
+            record_presence=record_presence,
         )
         del link_row_size  # silence unused-variable warning
         return link_byte_offsets
 
-    # delta != 0: cross-level links keep the v0.5 inline self-describing
-    # layout (out of scope for the v0.6 fragment-index refactor).
+    # Cross-offset and/or cross-level: inline self-describing ragged blob,
+    # no fragment sidecar.  Matches the pre-merge ``cross_chunk_links/``
+    # cell encoding and the old ``links/<delta!=0>/`` layout.
     blob = encode_ragged_blob(link_groups, dtype)
-    level_group.write_bytes(full_name, key, blob)
+    level_group.write_bytes(full_name, key, blob, record_presence=record_presence)
     _, link_byte_offsets = encode_ragged_ints(link_groups, dtype)
     return link_byte_offsets
 
@@ -1108,6 +1409,8 @@ def write_chunk_attributes(
     chunk_coords: ChunkCoords,
     attr_groups: list[npt.NDArray],
     dtype: np.dtype | str = np.float32,
+    *,
+    record_presence: bool = True,
 ) -> None:
     """Write vertex attribute data for groups in a spatial chunk.
 
@@ -1123,12 +1426,31 @@ def write_chunk_attributes(
             Each array is ``(N_k,)`` for scalar or ``(N_k, C)`` for
             multi-channel attributes.
         dtype: Numpy dtype.
+        record_presence: Whether to stamp this cell into the array's
+            ``nonempty_chunks`` manifest.  Pass False when fanning
+            per-chunk writes out concurrently, then rebuild the manifest
+            once with :meth:`Group.derive_nonempty_chunks`.
     """
     dtype = np.dtype(dtype)
     key = _chunk_key(chunk_coords)
     full_name = f"{VERTEX_ATTRIBUTES}/{attr_name}"
+    # The array must already exist: this is a per-cell write, and callers
+    # fan it out across chunks (sometimes concurrently), so allocating
+    # here would both race and re-create the array on every chunk —
+    # ``_ensure_array_dir`` drops and rebuilds an array whose
+    # ``nonempty_chunks`` is still empty.  Allocate once up front instead.
+    #
+    # ``record_presence=False`` is for exactly that concurrent fan-out:
+    # ``nonempty_chunks`` lives on the array, so stamping it rewrites the
+    # shared ``zarr.json`` once per cell.  Two tasks writing *disjoint*
+    # cells still collide there — on Windows as a rename race over
+    # ``zarr.json``, elsewhere as a silently dropped key.  Callers that
+    # fan out pass False and rebuild once via
+    # :meth:`Group.derive_nonempty_chunks`.
     raw_bytes, _ = encode_ragged_floats(attr_groups, dtype)
-    level_group.write_bytes(full_name, key, raw_bytes)
+    level_group.write_bytes(
+        full_name, key, raw_bytes, record_presence=record_presence,
+    )
 
 
 def write_chunk_fragment_attributes(
@@ -1137,6 +1459,8 @@ def write_chunk_fragment_attributes(
     chunk_coords: ChunkCoords,
     data: npt.NDArray,
     dtype: np.dtype | str = np.float32,
+    *,
+    record_presence: bool = True,
 ) -> None:
     """Write per-fragment attribute data for a spatial chunk.
 
@@ -1153,12 +1477,21 @@ def write_chunk_fragment_attributes(
         data: ``(F,)`` for scalar or ``(F, C)`` for multi-channel,
             where ``F`` is the number of fragments in this chunk.
         dtype: Numpy dtype to cast ``data`` to before writing.
+        record_presence: Whether to stamp this cell into the array's
+            ``nonempty_chunks`` manifest.  Pass ``False`` from concurrent
+            per-chunk writers (the manifest is one array-wide attribute, so
+            stamping it is a read-modify-write that races across processes)
+            and re-derive it once afterwards via
+            :meth:`FsGroup.derive_nonempty_chunks`.  See
+            :func:`write_chunk_vertices` for the same pattern.
     """
     dtype = np.dtype(dtype)
     key = _chunk_key(chunk_coords)
     full_name = f"{FRAGMENT_ATTRIBUTES}/{attr_name}"
     arr = np.ascontiguousarray(np.asarray(data).astype(dtype, copy=False))
-    level_group.write_bytes(full_name, key, arr.tobytes())
+    level_group.write_bytes(
+        full_name, key, arr.tobytes(), record_presence=record_presence,
+    )
 
 
 def write_chunk_link_attributes(
@@ -1169,21 +1502,43 @@ def write_chunk_link_attributes(
     dtype: np.dtype | str = np.float32,
     *,
     delta: int = 0,
+    offsets: Sequence[ChunkCoords] | None = None,
+    link_width: int = 2,
 ) -> None:
-    """Write per-edge attribute data parallel to ``links/<delta>/``.
+    """Write one cell of ``link_attributes/<name>/<delta>/<offsets>/``.
+
+    Mirrors :func:`write_chunk_links` cell-for-cell: ``chunk_coords`` is
+    the **source** chunk and ``offsets`` names the same array under
+    ``link_attributes/<name>/<delta>/`` that ``links/<delta>/`` receives
+    the parallel records in.  Rows are written as given, in the same
+    order — that positional alignment is the whole contract, so there is
+    no row id.
+
+    Unlike the link cell there is no encoding branch: the payload is
+    always a flat dense blob of ``sum(M_k)`` rows.  Per-group boundaries
+    are recovered at read time from the parallel link cell — the
+    ``link_fragments/<chunk>`` sidecar for the intra array at delta 0,
+    the links blob's own inline header otherwise (see
+    :func:`read_chunk_link_attributes`).
 
     Args:
         level_group: Resolution level group.
         attr_name: Attribute name (e.g. ``"weight"``).
-        chunk_coords: Spatial chunk coordinates.
+        chunk_coords: **Source** chunk coordinates (the array cell).
         attr_groups: List of arrays, each ``(M_k,)`` or ``(M_k, C)``,
-            aligned with link groups in the ``links/<delta>/`` array.
+            aligned with the link groups in the parallel links cell.
         dtype: Numpy dtype.
         delta: Level delta; see :mod:`zarr_vectors.core.paths`.
+        offsets: Relative offsets naming the target array.  ``None``
+            (default) means the all-zero intra-chunk offsets.
+        link_width: Only used to derive the intra offsets segment when
+            ``offsets`` is None.
     """
     dtype = np.dtype(dtype)
     key = _chunk_key(chunk_coords)
-    full_name = link_attributes_path(attr_name, delta)
+    if offsets is None:
+        offsets = intra_offsets(len(chunk_coords), link_width)
+    full_name = link_attributes_path(attr_name, delta, offsets)
     raw_bytes, _ = encode_ragged_floats(attr_groups, dtype)
     level_group.write_bytes(full_name, key, raw_bytes)
 
@@ -1528,44 +1883,52 @@ def write_groupings_attributes(
 
 
 @dataclass
-class CrossChunkLinkPartition:
-    """Per-input-record cell mapping returned by
-    :func:`write_cross_chunk_links`.
+class LinkPartition:
+    """Per-input-record placement map returned by :func:`write_links`.
 
-    Pass to :func:`write_cross_chunk_link_attributes` to align
-    per-record attribute data with the per-cell layout used by the
-    link writer.
+    Pass to :func:`write_link_attributes` to align per-record attribute
+    data with the ``(offsets, cell)`` layout the link writer chose.
 
     Attributes:
-        cell_indices: Maps ``cell_key`` → list of indices into the
-            input ``links`` list (in input order).  Within each
-            bucket, indices preserve input ordering, so attribute
-            data passed in input order partitions deterministically.
-        num_links: Total record count after the write (==
-            ``sum(len(v) for v in cell_indices.values())``).  For
-            ``append`` mode this includes pre-existing records.
-        first_new: Backward-compat — the input-order row index of the
-            first newly-appended record.  ``0`` for ``replace`` mode,
-            ``len(existing)`` for ``append`` mode.
+        cell_indices: Maps ``(offsets_segment, source_chunk)`` → list of
+            indices into the input ``links`` list.  Within each bucket
+            indices preserve input ordering, so attribute data passed in
+            input order partitions deterministically.  Under
+            ``store="duplicate"`` one input index appears under several
+            buckets — that is what makes the parallel attribute family
+            replicate identically.
+        num_links: **Logical** record count after the write — one per
+            input record, regardless of how many physical copies
+            ``store="duplicate"`` filed.  For ``append`` mode this
+            includes pre-existing records.  This is the count
+            :func:`write_link_attributes` validates ``attr_data``
+            against, since ``attr_data`` is in input order.
+        num_physical_records: On-disk row count after the write.  Equal
+            to ``num_links`` for a ``canonical`` family; larger for a
+            ``duplicate`` one.
+        first_new: The input-order row index of the first newly-appended
+            record.  ``0`` for ``replace`` mode, the pre-existing logical
+            count for ``append`` mode.
     """
 
-    cell_indices: dict[str, list[int]]
+    cell_indices: dict[tuple[str, ChunkCoords], list[int]]
     num_links: int
+    num_physical_records: int = 0
     first_new: int = 0
 
     def __int__(self) -> int:
-        # Lets legacy callers that did
-        # ``first_new = int(write_cross_chunk_links(...))`` still work.
+        # Lets callers that did ``first_new = int(write_links(...))``
+        # keep working.
         return self.first_new
 
 
-def _normalise_cross_records(
+def _normalise_link_records(
     links: list[list[tuple[ChunkCoords, int]]] | list[CrossChunkLink],
     link_width: int | None,
     sid_ndim: int,
     delta: int,
 ) -> tuple[list[list[tuple[ChunkCoords, int]]], int]:
-    """Normalise cross-chunk input to list-of-lists and resolve link_width.
+    """Normalise record input to list-of-lists and resolve link_width.
 
     Accepts the legacy ``((chunk_a, vi_a), (chunk_b, vi_b))`` 2-tuple form
     or a list of ``(chunk_coords, vi)`` endpoint lists.  Validates record
@@ -1590,98 +1953,210 @@ def _normalise_cross_records(
     for rec in normalised:
         if len(rec) != link_width:
             raise ArrayError(
-                f"cross_chunk_links/{format_delta(delta)}: record arity "
+                f"links/{format_delta(delta)}: record arity "
                 f"{len(rec)} != link_width {link_width}"
             )
         for chunk, _vi in rec:
             if len(chunk) != sid_ndim:
                 raise ArrayError(
-                    f"chunk coords arity mismatch in cross_chunk_links/"
+                    f"chunk coords arity mismatch in links/"
                     f"{format_delta(delta)}: sid_ndim={sid_ndim}, "
                     f"got len(chunk)={len(chunk)}"
                 )
     return normalised, link_width
 
 
-def write_cross_chunk_links(
+def _pad_scale(scale: Sequence[int], sid_ndim: int) -> tuple[int, ...]:
+    """Fit a per-axis chunk-scale factor to ``sid_ndim`` axes.
+
+    :func:`_derive_level_scales` derives its rank from the root
+    ``chunk_shape``, i.e. the *spatial* rank.  Writers that chunk by an
+    attribute prepend a bin axis to every chunk key (see
+    :func:`open_write_session`'s ``bin_count``), so their ``sid_ndim`` is
+    one larger.  That axis indexes bins, not space, and therefore never
+    rescales across pyramid levels — pad with 1s at the front, which
+    makes :func:`~zarr_vectors.spatial.boundary.anchor_chunk` a no-op on
+    it.  Without this the rank check in ``partition_records_by_offset``
+    rejects every attribute-binned store.
+    """
+    scale = tuple(int(s) for s in scale)
+    if len(scale) == sid_ndim:
+        return scale
+    if len(scale) < sid_ndim:
+        return (1,) * (sid_ndim - len(scale)) + scale
+    return scale[len(scale) - sid_ndim:]
+
+
+def _link_scales(
+    level_group: FsGroup, delta: int, sid_ndim: int,
+) -> tuple[tuple[int, ...], tuple[int, ...]]:
+    """``(scale_src, scale_trg)`` fitted to ``sid_ndim`` — see
+    :func:`_derive_level_scales` and :func:`_pad_scale`."""
+    scale_src, scale_trg = _derive_level_scales(level_group, delta)
+    return _pad_scale(scale_src, sid_ndim), _pad_scale(scale_trg, sid_ndim)
+
+
+def _partition_links(
+    level_group: FsGroup,
+    records: Sequence[Sequence[tuple[ChunkCoords, int]]],
+    link_width: int,
+    sid_ndim: int,
+    *,
+    delta: int,
+    directed: bool,
+    store: str,
+) -> dict[tuple[str, ChunkCoords], list[tuple[list[int], int, int]]]:
+    """Bucket records into ``(offsets_segment, source_chunk)`` cells.
+
+    The single choke point deciding where a record lands.  ``delta != 0``
+    forces ``cross_level``, which keeps the source at the owning level so
+    the anchor's ``scale_src`` is that level's — see
+    :func:`~zarr_vectors.spatial.boundary.partition_records_by_offset`.
+    """
+    from zarr_vectors.spatial.boundary import partition_records_by_offset
+
+    scale_src, scale_trg = _link_scales(level_group, delta, sid_ndim)
+    return partition_records_by_offset(
+        records, link_width, sid_ndim,
+        scale_src=scale_src, scale_trg=scale_trg,
+        directed=directed, store=store, cross_level=(delta != 0),
+    )
+
+
+def _check_link_family_policy(
+    fam_meta: dict[str, Any],
+    *,
+    delta: int,
+    link_width: int,
+    sid_ndim: int,
+    directed: bool,
+    store: str,
+    action: str,
+) -> None:
+    """Reject a write whose policy contradicts the existing family.
+
+    ``directed`` / ``store`` / ``link_width`` / ``sid_ndim`` live on the
+    ``links/<delta>/`` **group** precisely because several offset arrays
+    sit under it and must agree — a per-array override would let two
+    arrays in one family decode differently.  Absent keys mean "no
+    opinion yet" and pass.
+    """
+    fam = f"links/{format_delta(delta)}"
+    checks = (
+        ("link_width", int(fam_meta.get("link_width", link_width)), link_width),
+        ("sid_ndim", int(fam_meta.get("sid_ndim", sid_ndim)), sid_ndim),
+        ("directed", bool(fam_meta.get("directed", directed)), bool(directed)),
+        ("store", str(fam_meta.get("store", store)), str(store)),
+    )
+    for field, existing, requested in checks:
+        if existing != requested:
+            raise ArrayError(
+                f"{fam}: cannot {action} it with {field}={requested!r} onto an "
+                f"existing family with {field}={existing!r} — this policy is "
+                f"family-wide (every offsets array under the delta shares it). "
+                f"Drop the family first to change it."
+            )
+
+
+def _pack_link_rows(
+    entries: Sequence[tuple[list[int], int, int]],
+    *,
+    has_perm: bool,
+    link_width: int,
+    dtype: np.dtype,
+) -> npt.NDArray[np.integer]:
+    """Build the ``(M, W)`` row block for one cell.
+
+    ``W`` is ``link_width`` normally and ``1 + link_width`` when
+    ``has_perm`` — see :func:`links_has_perm`, the single definition
+    writer and reader both consult.
+    """
+    width = link_width + (1 if has_perm else 0)
+    out = np.empty((len(entries), width), dtype=dtype)
+    for r, (vi, perm_idx, _input_idx) in enumerate(entries):
+        if has_perm:
+            out[r, 0] = perm_idx
+            out[r, 1:] = vi
+        else:
+            out[r, :] = vi
+    return out
+
+
+def write_links(
     level_group: FsGroup,
     links: list[list[tuple[ChunkCoords, int]]] | list[CrossChunkLink],
     sid_ndim: int,
     *,
     delta: int = 0,
     link_width: int | None = None,
+    dtype: np.dtype | str = np.int64,
     mode: Literal["replace", "append"] = "replace",
     directed: bool = False,
     store: Literal["canonical", "duplicate"] = "canonical",
-) -> CrossChunkLinkPartition:
-    """Write cross-chunk link records under ``cross_chunk_links/<delta>/<cell_key>``.
+) -> LinkPartition:
+    """Write whole link records into ``links/<delta>/<offsets>/``.
 
-    Each record is ``link_width`` ``(chunk_coords, vertex_idx)``
-    endpoints.  ``link_width=2`` (the default) encodes the classic
-    cross-chunk edge ``((chunk_A, vi_A), (chunk_B, vi_B))``;
-    ``link_width=3`` encodes a triangle face spanning chunks;
-    ``link_width=1`` encodes a single parent→child reference used by
-    pyramid metanode drill-down.
+    The whole-family counterpart to :func:`write_chunk_links`: it takes
+    records in *global* ``(chunk_coords, vertex_idx)`` form, decides where
+    each one belongs, and fans them out across the offset arrays.  There
+    is no separate cross-chunk family — a record whose endpoints all
+    share one chunk lands in the all-zero-offsets array, one whose
+    endpoints straddle chunks lands in the array named by the offsets
+    between them.
 
-    Each record's endpoints are canonical-sorted by ``chunk_coords``
-    (tie-break ``vi``) and the record is stored under the cell
-    keyed by the dotted concatenation of those L sorted chunks (see
-    :func:`zarr_vectors.core.paths.format_cell_key`).  Original
-    endpoint order is preserved via a Lehmer-coded ``perm_idx``
-    stored alongside the canonical vertex indices, so readers can
-    recover the input ordering (mesh-face winding, directed-edge
-    direction).
+    Each record is ``link_width`` endpoints.  ``link_width=2`` (the
+    default) encodes an edge, ``3`` a triangle face, ``1`` a parent→child
+    reference used by pyramid metanode drill-down.  Records may be passed
+    as legacy 2-tuples or as endpoint lists.
 
-    Records may be passed either as legacy 2-tuples (compatibility
-    with the pre-0.6.0 edge-only API) or as a list of endpoint lists
-    when ``link_width`` is supplied explicitly.
-
-    Endpoint 0 is at the owning resolution level; endpoint k (k>0)
-    is at ``this_level + delta``.
+    For ``delta != 0``, endpoint 0 is at the owning resolution level and
+    endpoints k>0 are at ``this_level + delta``; the source is always
+    endpoint 0 so offsets anchor against the owning level's chunk grid
+    (see :func:`~zarr_vectors.spatial.boundary.anchor_chunk`).
 
     Args:
         level_group: Resolution level group.
-        links: List of records; each record is a list of
-            ``(chunk_coords, vertex_idx)`` tuples of length
-            ``link_width``.  Legacy 2-tuple form is accepted when
-            ``link_width`` is 2 (or omitted).
+        links: List of records; each a list of ``(chunk_coords,
+            vertex_idx)`` tuples of length ``link_width``.
         sid_ndim: Number of spatial index dimensions.
         delta: Level delta; see :mod:`zarr_vectors.core.paths`.
-        link_width: Endpoints per record.  Defaults to 2 (or to the
-            arity of the first record if it's a list).
-        mode: ``"replace"`` (default) clears the existing
-            ``cross_chunk_links/<delta>/`` family and writes
-            ``links`` afresh.  ``"append"`` reads existing records
-            cell-by-cell, appends ``links`` (canonical-sorted to
-            their cells), and writes the merged cells back.
-            ``link_width`` of the appended records must match the
-            existing ``link_width``.
+        link_width: Endpoints per record.  Defaults to the arity of the
+            first record.
+        dtype: Integer dtype for the stored rows.
+        mode: ``"replace"`` (default) rewrites, from scratch, exactly the
+            offset arrays this call's records land in — see the warning
+            below.  ``"append"`` adds the records as a new group in each
+            target cell, leaving existing rows in place.
+        directed: When ``True`` endpoint order is data (streamline
+            predecessor→successor, skeleton child→parent): records are
+            NOT canonical-sorted, so ``A→B`` and ``B→A`` file under
+            opposite offsets (``0.0.+1`` vs ``0.0.-1``) and carry no
+            ``perm_idx``.
+        store: ``"canonical"`` (default) files each record once, under
+            the lexicographically-positive offset.  ``"duplicate"`` files
+            it once per distinct incident chunk, so every record incident
+            to a chunk can be found by scanning that chunk's cell alone.
+            Duplicated records are returned once per copy by
+            :func:`read_links`; the parallel attribute family replicates
+            identically via the returned partition.
 
     Returns:
-        :class:`CrossChunkLinkPartition` describing where each input
-        record landed.  ``int(partition)`` recovers the legacy
-        ``first_new`` int for callers that only cared about the
-        append offset.
+        :class:`LinkPartition` describing where each input record landed.
 
-    Other args:
-        directed: When ``True``, endpoint order is meaningful (streamline
-            predecessor→successor, skeleton child→parent): records are NOT
-            canonical-sorted, the cell key follows input order, and
-            ``perm_idx`` is 0.  ``A→B`` and ``B→A`` file under distinct
-            cells.  Stamped in the family ``.zattrs`` so readers/validators
-            don't guess.  A family is uniformly directed or undirected —
-            appending with a different ``directed`` than the existing
-            family raises.
-        store: ``"canonical"`` (default) files each record in one cell;
-            ``"duplicate"`` files it under one cell per distinct incident
-            chunk (independent physical copies) so incidence reads become a
-            prefix scan.  Duplicated links return multiple times from
-            :func:`read_cross_chunk_links`; the parallel attribute family
-            replicates identically via the returned partition.
+    Warning:
+        ``mode="replace"`` scopes its delete to the offset arrays this
+        call's records actually target.  It deliberately does **not**
+        clear the whole ``links/<delta>/`` family: intra-chunk links live
+        under it now, so a family-wide wipe would silently destroy
+        everything :func:`write_chunk_links` wrote.  The corollary is
+        that an offset array populated by an *earlier* call that this
+        call's records do not reach survives untouched — enumerate with
+        :func:`list_link_offsets` and delete explicitly if you need a
+        broader wipe.
 
     Concurrency:
-        ``mode="append"`` is read-modify-write per cell — safe
-        across disjoint cells, unsafe within a single cell.
+        ``mode="append"`` is read-modify-write per cell — safe across
+        disjoint cells, unsafe within a single cell.
     """
     if mode not in ("replace", "append"):
         raise ArrayError(
@@ -1691,174 +2166,171 @@ def write_cross_chunk_links(
         raise ArrayError(
             f"store must be 'canonical' or 'duplicate', got {store!r}"
         )
-
-    # Local import to avoid circular import at module load.
-    from zarr_vectors.encoding.ragged import (
-        decode_ragged_blob,
-        encode_ragged_blob,
-    )
-    from zarr_vectors.spatial.boundary import partition_cross_records_by_tuple
-
     if not links:
-        # Honour the empty-input fast-exit; emit an empty partition
-        # so callers don't crash on attribute reflection.
-        return CrossChunkLinkPartition(
-            cell_indices={}, num_links=0, first_new=0,
+        # Honour the empty-input fast-exit; emit an empty partition so
+        # callers don't crash on attribute reflection.  NOTE this means
+        # an empty `links` does NOT clear anything — callers wanting that
+        # must delete the offset arrays themselves (list_link_offsets).
+        return LinkPartition(
+            cell_indices={}, num_links=0, num_physical_records=0, first_new=0,
         )
 
-    normalised, link_width = _normalise_cross_records(
+    dtype = np.dtype(dtype)
+    normalised, link_width = _normalise_link_records(
         links, link_width, sid_ndim, delta,
     )
+    family = links_group_path(delta)
+    fam_meta = level_group.read_array_meta(family) or {}
 
-    full_name = cross_chunk_links_path(delta)
-
-    # Cross-link_width check on existing array before destructive write.
-    if mode == "append" and level_group.array_exists(full_name):
-        existing_meta = level_group.read_array_meta(full_name)
-        if existing_meta:
-            existing_link_width = int(
-                existing_meta.get("link_width", link_width)
-            )
-            if existing_link_width != link_width:
-                raise ArrayError(
-                    f"cross_chunk_links/{format_delta(delta)}: cannot "
-                    f"append records of link_width {link_width} onto "
-                    f"existing array of link_width {existing_link_width}"
-                )
-            existing_sid = int(
-                existing_meta.get("sid_ndim", sid_ndim)
-            )
-            if existing_sid != sid_ndim:
-                raise ArrayError(
-                    f"cross_chunk_links/{format_delta(delta)}: cannot "
-                    f"append with sid_ndim={sid_ndim} onto existing "
-                    f"sid_ndim={existing_sid}"
-                )
-            existing_directed = bool(existing_meta.get("directed", False))
-            if existing_directed != bool(directed):
-                raise ArrayError(
-                    f"cross_chunk_links/{format_delta(delta)}: cannot "
-                    f"append directed={directed} onto existing "
-                    f"directed={existing_directed} (a family is uniformly "
-                    f"directed or undirected)"
-                )
-            existing_store = str(existing_meta.get("store", "canonical"))
-            if existing_store != store:
-                raise ArrayError(
-                    f"cross_chunk_links/{format_delta(delta)}: cannot "
-                    f"append store={store!r} onto existing "
-                    f"store={existing_store!r}"
-                )
-
-    # Build the per-cell partition (input order preserved within each
-    # cell).  ``partition_cross_records_by_tuple`` applies the directed /
-    # store policy: canonical sort for undirected, input-order keys for
-    # directed, and one cell per distinct incident chunk for duplicate.
-    partitioned = partition_cross_records_by_tuple(
-        normalised, link_width, sid_ndim, directed=directed, store=store,
+    buckets = _partition_links(
+        level_group, normalised, link_width, sid_ndim,
+        delta=delta, directed=directed, store=store,
     )
-    bucket_entries: dict[str, list[tuple[list[int], int]]] = {
-        key: [(vi, perm) for vi, perm, _ in entries]
-        for key, entries in partitioned.items()
-    }
-    cell_indices: dict[str, list[int]] = {
-        key: [idx for _, _, idx in entries]
-        for key, entries in partitioned.items()
-    }
-    # Physical rows this write adds (== len(normalised) for canonical, more
-    # when ``store="duplicate"`` fans a record across incident-chunk cells).
-    new_physical = sum(len(rows) for rows in bucket_entries.values())
+    targeted: list[str] = sorted({seg for seg, _chunk in buckets})
+    surviving = [
+        seg for seg in list_link_offsets(level_group, delta)
+        if seg not in targeted
+    ]
 
-    record_len_int64 = 1 + link_width  # [perm_idx, vi_0, ..., vi_{L-1}]
+    # An append never wipes, so it must agree with the family it joins.
+    # A replace only has to agree when it leaves siblings behind: those
+    # arrays keep decoding against the family group's policy, so letting
+    # this call flip it would silently corrupt them.
+    if fam_meta and (mode == "append" or surviving):
+        _check_link_family_policy(
+            fam_meta, delta=delta, link_width=link_width, sid_ndim=sid_ndim,
+            directed=directed, store=store,
+            action="append to" if mode == "append" else "replace part of",
+        )
 
     if mode == "replace":
-        # Drop the whole family — clears stale cells, .zattrs,
-        # everything — and re-create with the new contents.
-        if level_group.array_exists(full_name):
-            level_group.delete_subtree(full_name)
         first_new = 0
         existing_total = 0
         existing_physical = 0
-
-        # Write each new cell.
-        for cell_key, rows in bucket_entries.items():
-            blob_groups: list[npt.NDArray] = []
-            for vi_cell, perm_idx in rows:
-                row = np.empty(record_len_int64, dtype=np.int64)
-                row[0] = perm_idx
-                row[1:] = vi_cell
-                blob_groups.append(row)
-            blob = encode_ragged_blob(blob_groups, np.dtype(np.int64))
-            level_group.write_bytes(full_name, cell_key, blob)
+        for seg in targeted:
+            path = f"{family}/{seg}"
+            if level_group.array_exists(path):
+                level_group.delete_subtree(path)
     else:
-        # Append: per-cell RMW.  Cells not touched by ``links`` keep
-        # their existing contents.
-        existing_total = 0
-        existing_physical = 0
-        if level_group.array_exists(full_name):
-            # Existing counts come from family meta in O(1); fall back to a
-            # full cell scan only for older stores predating the meta.
-            existing_meta = level_group.read_array_meta(full_name) or {}
-            if "num_links" in existing_meta:
-                existing_total = int(existing_meta["num_links"])
-                existing_physical = int(
-                    existing_meta.get("num_physical_records", existing_total)
-                )
-            else:
-                for existing_key in level_group.list_chunks(full_name):
-                    blob = level_group.read_bytes(full_name, existing_key)
-                    existing_rows = decode_ragged_blob(
-                        blob, np.dtype(np.int64), ncols=record_len_int64,
-                    )
-                    existing_physical += len(existing_rows)
-                existing_total = existing_physical
+        # Existing counts come from family meta in O(1); a family written
+        # only by the decentralized per-cell writers has none until
+        # ``finalize_links`` runs, so fall back to a scan.
+        if "num_links" in fam_meta:
+            existing_total = int(fam_meta["num_links"])
+            existing_physical = int(
+                fam_meta.get("num_physical_records", existing_total)
+            )
+        elif level_group._native_sharded_config is not None:
+            # An open write session is mid-build: the scan below reads the
+            # store, which does not see cells this session has queued but
+            # not flushed, so it would count 0 and stamp that as the
+            # family's total — and a later ``write_link_attributes``
+            # validating ``len(attr_data) == num_links`` would then reject
+            # correct data against a fabricated 0.  A family with no counts
+            # and a session open has nothing durable to count; leave the
+            # reconciliation to ``finalize_links`` after the session
+            # closes, which is when the cells are actually readable.
+            existing_total = 0
+            existing_physical = 0
+        else:
+            counted = finalize_links(level_group, delta=delta)
+            existing_total = counted.num_links
+            existing_physical = counted.num_physical_records
         first_new = existing_total
 
-        for cell_key, rows in bucket_entries.items():
-            # Read existing cell rows (if any).
-            existing_rows: list[npt.NDArray] = []
-            if level_group.chunk_exists(full_name, cell_key):
-                blob = level_group.read_bytes(full_name, cell_key)
-                existing_rows = decode_ragged_blob(
-                    blob, np.dtype(np.int64), ncols=record_len_int64,
-                )
-            new_rows: list[npt.NDArray] = []
-            for vi_cell, perm_idx in rows:
-                row = np.empty(record_len_int64, dtype=np.int64)
-                row[0] = perm_idx
-                row[1:] = vi_cell
-                new_rows.append(row)
-            combined = existing_rows + new_rows
-            blob = encode_ragged_blob(combined, np.dtype(np.int64))
-            level_group.write_bytes(full_name, cell_key, blob)
+    new_physical = 0
+    for seg in targeted:
+        offsets = parse_offsets(seg, sid_ndim=sid_ndim, link_width=link_width)
+        create_links_array(
+            level_group, link_width, dtype=str(dtype), delta=delta,
+            sid_ndim=sid_ndim, offsets=offsets, directed=directed,
+            store=store, exist_ok=True,
+        )
+        has_perm = links_has_perm(
+            offsets, delta=delta, directed=directed, store=store,
+        )
+        for (bucket_seg, src_chunk), entries in buckets.items():
+            if bucket_seg != seg:
+                continue
+            rows = _pack_link_rows(
+                entries, has_perm=has_perm, link_width=link_width, dtype=dtype,
+            )
+            new_physical += rows.shape[0]
+            groups: list[npt.NDArray] = []
+            if mode == "append":
+                groups = list(_decode_link_cell(
+                    level_group, src_chunk, delta=delta, offsets=offsets,
+                    dtype=dtype, width=rows.shape[1], default=[],
+                ))
+            groups.append(rows)
+            # Route through the per-cell writer so the flat+sidecar vs
+            # inline-blob choice has exactly one definition.
+            write_chunk_links(
+                level_group, src_chunk, groups, dtype,
+                delta=delta, offsets=offsets, link_width=link_width,
+            )
 
-    # Family .zattrs on the parent group.  ``num_links`` is the *logical*
-    # record count (one per input record); ``num_physical_records`` is the
-    # on-disk row count (larger than ``num_links`` under ``duplicate``).
-    # ``directed`` / ``store`` let readers and the validator interpret the
-    # cell keys without inspecting the data.
-    new_total = existing_total + len(normalised)
-    new_physical_total = existing_physical + new_physical
-    _ensure_array_dir(level_group, full_name)
-    level_group.write_array_meta(full_name, {
-        "zv_array": "cross_chunk_links",
-        "sid_ndim": int(sid_ndim),
-        "level_delta": int(delta),
-        "link_width": int(link_width),
-        "num_links": int(new_total),
-        "num_physical_records": int(new_physical_total),
-        "directed": bool(directed),
-        "store": str(store),
-    })
+    if surviving:
+        # This call did not own the whole family, so the totals it can
+        # see are partial.  Recount from disk — the same scan finalize
+        # does — rather than stamp a number that is wrong.
+        counted = finalize_links(level_group, delta=delta)
+        new_total = counted.num_links
+        new_physical_total = counted.num_physical_records
+    else:
+        new_total = existing_total + len(normalised)
+        new_physical_total = existing_physical + new_physical
 
-    return CrossChunkLinkPartition(
-        cell_indices=cell_indices,
+    _stamp_link_family_meta(
+        level_group, delta=delta, link_width=link_width, sid_ndim=sid_ndim,
+        directed=directed, store=store, num_links=new_total,
+        num_physical_records=new_physical_total,
+    )
+
+    return LinkPartition(
+        cell_indices={k: [idx for _, _, idx in v] for k, v in buckets.items()},
         num_links=new_total,
+        num_physical_records=new_physical_total,
         first_new=first_new,
     )
 
 
-def write_cross_chunk_link_attributes(
+def _stamp_link_family_meta(
+    level_group: FsGroup,
+    *,
+    delta: int,
+    link_width: int,
+    sid_ndim: int,
+    directed: bool,
+    store: str,
+    num_links: int | None = None,
+    num_physical_records: int | None = None,
+) -> None:
+    """Write the ``links/<delta>/`` group's family-wide ``.zattrs``.
+
+    Policy (``link_width`` / ``sid_ndim`` / ``directed`` / ``store``)
+    lives here rather than on the arrays because every offsets array
+    under the delta must agree on it.  The counts are family-wide totals
+    across all of them; the decentralized per-cell writers leave them
+    absent for :func:`finalize_links` to fill in.
+    """
+    meta: dict[str, Any] = {
+        "zv_array": "links_family",
+        "level_delta": int(delta),
+        "link_width": int(link_width),
+        "sid_ndim": int(sid_ndim),
+        "directed": bool(directed),
+        "store": str(store),
+    }
+    if num_links is not None:
+        meta["num_links"] = int(num_links)
+    if num_physical_records is not None:
+        meta["num_physical_records"] = int(num_physical_records)
+    _ensure_array_dir(level_group, links_group_path(delta))
+    level_group.write_array_meta(links_group_path(delta), meta)
+
+
+def write_link_attributes(
     level_group: FsGroup,
     attr_name: str,
     attr_data: npt.NDArray,
@@ -1866,444 +2338,695 @@ def write_cross_chunk_link_attributes(
     num_links: int,
     delta: int = 0,
     mode: Literal["replace", "append"] = "replace",
-    partition: CrossChunkLinkPartition | None = None,
+    partition: LinkPartition | None = None,
 ) -> None:
-    """Write per-edge attribute data parallel to
-    ``cross_chunk_links/<delta>/<cell_key>``.
+    """Write per-link attribute data parallel to ``links/<delta>/``.
 
-    Attribute rows are stored per-cell, one row per record, matching
-    the row order of the parallel links cell.
+    The whole-family counterpart to :func:`write_chunk_link_attributes`.
+    Attribute rows are stored per ``(offsets, cell)``, one row per link
+    record, in the same order the link writer used — that positional
+    alignment is the whole contract.
 
-    ``attr_data`` is expected in **input order** — the same ordering
-    used for the corresponding ``write_cross_chunk_links`` call.  The
-    ``partition`` returned by that call provides the cell mapping; if
-    omitted, the caller is responsible for ensuring ``attr_data`` is
-    in input order and the writer falls back to re-deriving the
-    partition by reading back the link records.
+    ``attr_data`` is in **input order** — the same ordering passed to the
+    matching :func:`write_links` call, whose returned ``partition``
+    supplies the mapping.  Without a ``partition`` the writer re-derives
+    one by reading the link records back, which only recovers *on-disk*
+    order, so ``attr_data`` must then already be in the enumeration order
+    :func:`read_links` returns (each offsets segment sorted, then each
+    cell sorted).
 
     Args:
         level_group: Resolution level group.
         attr_name: Attribute name.
         attr_data: ``(num_links,)`` or ``(num_links, C)`` array in
-            **input order**.  In ``mode="append"`` this represents
-            the NEW rows; the post-append total must equal
-            ``num_links``.
-        num_links: Expected post-write total record count (matches
-            ``CrossChunkLinkPartition.num_links``).
+            **input order**.  In ``mode="append"`` this is the NEW rows;
+            the post-append total must equal ``num_links``.
+        num_links: Expected post-write logical record count (matches
+            :attr:`LinkPartition.num_links`).
         delta: Level delta.
-        mode: ``"replace"`` (default) — wipes existing cells and
-            writes the full attribute family afresh.  ``"append"`` —
-            per-cell RMW: existing attribute rows are kept, new rows
-            are appended to their respective cells in the same per-
-            cell order as the link writer used.
-        partition: Optional :class:`CrossChunkLinkPartition` returned
-            by the matching :func:`write_cross_chunk_links` call.
-            Supplying it avoids reading the link records back.
+        mode: ``"replace"`` (default) rewrites exactly the offset arrays
+            the partition targets — same scoping rule, and same caveat,
+            as :func:`write_links`.  ``"append"`` per-cell RMW.
+        partition: :class:`LinkPartition` from the matching
+            :func:`write_links` call.  Required for ``append`` and for
+            any ``store="duplicate"`` family.
 
     Raises:
         ArrayError: If ``mode`` is invalid, if the row count of
-            ``attr_data`` does not match the expected ``num_links``
-            (replace) or the new-row count derived from
-            ``partition`` (append), or if the appended row shape
-            does not match an existing array.
+            ``attr_data`` does not match ``num_links`` (replace) or the
+            new-row count derived from ``partition`` (append), or if the
+            appended row shape does not match an existing array.
 
     Concurrency:
-        ``mode="append"`` is read-modify-write per cell — safe
-        across disjoint cells, unsafe within a single cell.
+        ``mode="append"`` is read-modify-write per cell — safe across
+        disjoint cells, unsafe within a single cell.
     """
     if mode not in ("replace", "append"):
         raise ArrayError(
             f"mode must be 'replace' or 'append', got {mode!r}"
         )
 
-    full_name = cross_chunk_link_attributes_path(attr_name, delta)
-    links_family = cross_chunk_links_path(delta)
     arr = np.ascontiguousarray(np.asarray(attr_data))
+    fam_meta = level_group.read_array_meta(links_group_path(delta)) or {}
 
-    # Resolve the partition.  Append mode requires it explicitly —
-    # only the matching write_cross_chunk_links call knows which
-    # cell each new attribute row belongs to.  Replace mode can
-    # fall back to re-deriving from disk (assumes ``attr_data`` is
-    # in cell-key-sorted on-disk order).
+    # Resolve the partition.  Append mode requires it explicitly — only
+    # the matching write_links call knows which cell each new attribute
+    # row belongs to.  Replace mode can fall back to re-deriving from
+    # disk (assumes ``attr_data`` is in on-disk enumeration order).
     if partition is None:
         if mode == "append":
             raise ArrayError(
-                f"cross_chunk_link_attributes[{attr_name}] append mode "
-                f"requires partition=... from the matching "
-                f"write_cross_chunk_links(mode='append') call so the "
-                f"writer knows which cell each new row belongs to"
+                f"link_attributes[{attr_name}] append mode requires "
+                f"partition=... from the matching write_links(mode='append') "
+                f"call so the writer knows which cell each new row belongs to"
             )
         # A duplicate family fans one input record across several cells;
         # only the link writer's partition records that fan-out, so the
         # re-derived (physical, positional) partition would misalign
         # attribute rows.  Require the partition explicitly.
-        links_meta = level_group.read_array_meta(links_family) or {}
-        if str(links_meta.get("store", "canonical")) == "duplicate":
+        if str(fam_meta.get("store", "canonical")) == "duplicate":
             raise ArrayError(
-                f"cross_chunk_link_attributes[{attr_name}]: store='duplicate' "
-                f"requires partition=... from the matching "
-                f"write_cross_chunk_links call so replicated rows align"
+                f"link_attributes[{attr_name}]: store='duplicate' requires "
+                f"partition=... from the matching write_links call so "
+                f"replicated rows align"
             )
-        partition = _derive_partition_from_links(
-            level_group, links_family, delta,
-        )
+        partition = _derive_partition_from_links(level_group, delta)
 
-    # Validate counts.
+    link_width = int(fam_meta.get("link_width", 2))
+    targeted = sorted({seg for seg, _chunk in partition.cell_indices})
+
     if mode == "replace":
         if arr.shape[0] != num_links:
             raise ArrayError(
-                f"cross_chunk_link_attributes[{attr_name}] row count "
-                f"{arr.shape[0]} != num_links {num_links} "
-                f"(delta={format_delta(delta)})"
+                f"link_attributes[{attr_name}] row count {arr.shape[0]} != "
+                f"num_links {num_links} (delta={format_delta(delta)})"
             )
         if arr.shape[0] != partition.num_links:
             raise ArrayError(
-                f"cross_chunk_link_attributes[{attr_name}] attr rows "
-                f"{arr.shape[0]} != link records {partition.num_links} "
-                f"derived from cross_chunk_links/{format_delta(delta)}"
+                f"link_attributes[{attr_name}] attr rows {arr.shape[0]} != "
+                f"link records {partition.num_links} derived from "
+                f"links/{format_delta(delta)}"
             )
-        # Wipe + rewrite the whole family.
-        if level_group.array_exists(full_name):
-            level_group.delete_subtree(full_name)
-
-        for cell_key, input_idxs in partition.cell_indices.items():
-            cell_attrs = arr[np.asarray(input_idxs, dtype=np.int64)]
-            level_group.write_bytes(
-                full_name, cell_key,
-                np.ascontiguousarray(cell_attrs).tobytes(),
-            )
+        # Scoped exactly like write_links: only the offset arrays this
+        # partition targets, never the whole family.
+        for seg in targeted:
+            path = f"{link_attributes_group_path(attr_name, delta)}/{seg}"
+            if level_group.array_exists(path):
+                level_group.delete_subtree(path)
     else:
         # Append mode.  The post-append total record count must equal
         # num_links; arr.shape[0] is the new-row count.
         new_count = sum(len(v) for v in partition.cell_indices.values())
         if arr.shape[0] != new_count:
             raise ArrayError(
-                f"cross_chunk_link_attributes[{attr_name}] append: "
-                f"attr_data row count {arr.shape[0]} != new link "
-                f"record count {new_count} "
+                f"link_attributes[{attr_name}] append: attr_data row count "
+                f"{arr.shape[0]} != new link record count {new_count} "
                 f"(delta={format_delta(delta)})"
             )
         if partition.num_links != num_links:
             raise ArrayError(
-                f"cross_chunk_link_attributes[{attr_name}] row count "
+                f"link_attributes[{attr_name}] row count "
                 f"{partition.num_links} != num_links {num_links} "
                 f"(delta={format_delta(delta)})"
             )
 
-        for cell_key, input_idxs in partition.cell_indices.items():
-            cell_attrs_new = arr[np.asarray(input_idxs, dtype=np.int64)]
-            if level_group.chunk_exists(full_name, cell_key):
-                existing_meta = level_group.read_array_meta(full_name)
-                existing_blob = level_group.read_bytes(full_name, cell_key)
-                if existing_meta and "dtype" in existing_meta:
-                    existing_dtype = np.dtype(existing_meta["dtype"])
-                else:
-                    existing_dtype = arr.dtype
-                tail_shape = tuple(existing_meta.get(
-                    "row_shape", arr.shape[1:],
-                ))
-                if tail_shape != arr.shape[1:]:
-                    raise ArrayError(
-                        f"cross_chunk_link_attributes[{attr_name}] "
-                        f"append shape mismatch: existing row shape "
-                        f"{tail_shape} vs new {arr.shape[1:]}"
-                    )
-                row_size = int(np.prod(tail_shape)) if tail_shape else 1
-                row_bytes = existing_dtype.itemsize * row_size
-                existing_count = len(existing_blob) // row_bytes
-                existing_arr = np.frombuffer(
-                    existing_blob, dtype=existing_dtype,
-                ).reshape((existing_count, *tail_shape)).copy()
-                new_cast = cell_attrs_new.astype(existing_dtype, copy=False)
-                combined = np.concatenate([existing_arr, new_cast], axis=0)
+    sid_ndim = int(fam_meta.get("sid_ndim", 0)) or None
+    for seg in targeted:
+        offsets = _parse_offsets_for_family(
+            seg, sid_ndim=sid_ndim, link_width=link_width, partition=partition,
+        )
+        create_link_attributes_array(
+            level_group, attr_name, dtype=str(arr.dtype), delta=delta,
+            sid_ndim=sid_ndim, link_width=link_width, offsets=offsets,
+            exist_ok=True,
+        )
+        full_name = link_attributes_path(attr_name, delta, offsets)
+        for (bucket_seg, src_chunk), input_idxs in partition.cell_indices.items():
+            if bucket_seg != seg:
+                continue
+            key = _chunk_key(src_chunk)
+            new_rows = arr[np.asarray(input_idxs, dtype=np.int64)]
+            if mode == "append" and level_group.chunk_exists(full_name, key):
+                combined = np.concatenate(
+                    [_read_attr_cell(level_group, full_name, key, arr), new_rows],
+                    axis=0,
+                )
             else:
-                combined = cell_attrs_new
+                combined = new_rows
             level_group.write_bytes(
-                full_name, cell_key,
-                np.ascontiguousarray(combined).tobytes(),
+                full_name, key, np.ascontiguousarray(combined).tobytes(),
             )
+        # ``row_shape`` (the tail dims per row, ``()`` for 1-D) lets the
+        # reader reconstruct shape from a bare byte blob.
+        level_group.write_array_meta(full_name, {
+            "zv_array": "link_attribute",
+            "name": attr_name,
+            "dtype": str(arr.dtype),
+            "row_shape": list(arr.shape[1:]),
+            "offsets": [list(int(c) for c in o) for o in offsets],
+            "level_delta": int(delta),
+        })
 
-    # Family .zattrs.  Stores ``row_shape`` (the tail dimensions per
-    # row, ``()`` for 1-D arrays) so readers can reconstruct shape
-    # from a per-cell byte blob without ambiguity.
-    _ensure_array_dir(level_group, full_name)
-    level_group.write_array_meta(full_name, {
-        "zv_array": "cross_chunk_link_attribute",
+    _ensure_array_dir(level_group, link_attributes_group_path(attr_name, delta))
+    level_group.write_array_meta(link_attributes_group_path(attr_name, delta), {
+        "zv_array": "link_attribute_family",
         "name": attr_name,
-        "dtype": str(arr.dtype),
         "level_delta": int(delta),
         "num_links": int(num_links),
-        "row_shape": list(arr.shape[1:]),
     })
+
+
+def _read_attr_cell(
+    level_group: FsGroup, full_name: str, key: str, like: npt.NDArray,
+) -> npt.NDArray:
+    """Decode one attribute cell as ``(M, *row_shape)``, matching ``like``.
+
+    Row shape comes from the array's own meta and must agree with the
+    incoming rows — an append that changes the tail dims would make the
+    blob undecodable, so it raises instead.
+    """
+    meta = level_group.read_array_meta(full_name) or {}
+    dtype = np.dtype(meta["dtype"]) if "dtype" in meta else like.dtype
+    tail = tuple(meta.get("row_shape", like.shape[1:]))
+    if tail != like.shape[1:]:
+        raise ArrayError(
+            f"{full_name}: append shape mismatch — existing row shape "
+            f"{tail} vs new {like.shape[1:]}"
+        )
+    blob = level_group.read_bytes(full_name, key)
+    return np.frombuffer(blob, dtype=dtype).reshape((-1, *tail)).astype(
+        like.dtype, copy=False,
+    )
+
+
+def _parse_offsets_for_family(
+    seg: str,
+    *,
+    sid_ndim: int | None,
+    link_width: int,
+    partition: LinkPartition,
+) -> tuple[ChunkCoords, ...]:
+    """Parse an offsets segment, recovering ``sid_ndim`` if the family
+    group meta didn't carry it.
+
+    The source chunks in the partition have the family's true arity, so
+    they are an exact fallback for a family whose group ``.zattrs``
+    predates ``sid_ndim`` (or was written by the per-cell writers alone).
+    """
+    if sid_ndim is None:
+        for _seg, src_chunk in partition.cell_indices:
+            sid_ndim = len(src_chunk)
+            break
+    if sid_ndim is None:
+        raise ArrayError(
+            f"cannot parse offsets segment {seg!r}: no sid_ndim on the "
+            f"links family meta and no cells in the partition"
+        )
+    return parse_offsets(seg, sid_ndim=sid_ndim, link_width=link_width)
+
+
+def list_link_offsets(level_group: FsGroup, delta: int = 0) -> list[str]:
+    """Sorted offsets segments present under ``links/<delta>/``.
+
+    ``links/<delta>`` is a group whose children are one array per
+    distinct relative-offset segment, so this enumerates the whole
+    family — the all-zero (intra-chunk) array included, since it is not
+    a separate family any more.
+
+    Uses :meth:`FsGroup.children`, not iteration: ``__iter__`` yields
+    sub-*groups* only and these children are arrays.
+    """
+    group_path = links_group_path(delta)
+    if not level_group.array_exists(group_path):
+        return []
+    try:
+        return sorted(level_group[group_path].children())
+    except Exception:
+        return []
+
+
+def list_link_attribute_offsets(
+    level_group: FsGroup, name: str, delta: int = 0,
+) -> list[str]:
+    """Sorted offsets segments under ``link_attributes/<name>/<delta>/``.
+
+    Mirrors :func:`list_link_offsets`; the attribute family is required
+    to carry the same segments as the link family it parallels.
+    """
+    group_path = link_attributes_group_path(name, delta)
+    if not level_group.array_exists(group_path):
+        return []
+    try:
+        return sorted(level_group[group_path].children())
+    except Exception:
+        return []
+
+
+def _decode_link_cell(
+    level_group: FsGroup,
+    chunk_coords: ChunkCoords,
+    *,
+    delta: int,
+    offsets: Sequence[ChunkCoords],
+    dtype: np.dtype | str,
+    width: int,
+    default: Any = _UNSET,
+) -> list[npt.NDArray[np.integer]] | Any:
+    """Decode one ``links/<delta>/<offsets>/`` cell into its row groups.
+
+    ``width`` is the **physical** row width — ``link_width``, or
+    ``1 + link_width`` when the array carries a ``perm_idx`` column.
+    :func:`links_has_perm` is the single definition of which; this
+    decoder is told, it never guesses.
+
+    The encoding branch mirrors :func:`write_chunk_links` exactly and
+    must stay in lockstep with it: a cell written under one branch is
+    undecodable under the other.
+    """
+    dtype = np.dtype(dtype)
+    full_name = links_path(delta, offsets)
+    key = _chunk_key(chunk_coords)
+    try:
+        if not level_group.chunk_exists(full_name, key):
+            raise ArrayError(f"{full_name}: no cell {key}")
+        raw = level_group.read_bytes(full_name, key)
+    except (ArrayError, StoreError):
+        if default is _UNSET:
+            raise
+        return default
+
+    if delta == 0 and is_intra(offsets):
+        # Flat blob + link_fragments/<chunk> sidecar.  An empty cell is
+        # the vlen fill value under the single-array layout, which is not
+        # the same as "no sidecar" — short-circuit before reading it.
+        if not raw:
+            return []
+        fi = read_link_fragment_index(level_group, chunk_coords)
+        if fi.num_fragments == 0:
+            return []
+        full = _reshape_link_buffer(raw, dtype, width)
+        groups: list[npt.NDArray[np.integer]] = []
+        for f in range(fi.num_fragments):
+            if fi.is_range(f):
+                start, count = fi.range(f)
+                groups.append(full[start : start + count])
+            else:
+                groups.append(full[fi.indices(f)])
+        return groups
+
+    # Inline self-describing blob; no sidecar.
+    return decode_ragged_blob(raw, dtype, ncols=width)
+
+
+def link_family_policy(
+    level_group: FsGroup, delta: int,
+) -> tuple[int, int | None, bool, str] | None:
+    """``(link_width, sid_ndim, directed, store)`` from the family group.
+
+    Returns ``None`` when the family carries no policy — an absent
+    family, or one whose group ``.zattrs`` was never stamped — which
+    callers treat as "nothing to read".
+    """
+    family = links_group_path(delta)
+    if not level_group.array_exists(family):
+        return None
+    fam_meta = level_group.read_array_meta(family) or {}
+    if "link_width" not in fam_meta:
+        return None
+    return (
+        int(fam_meta["link_width"]),
+        int(fam_meta["sid_ndim"]) if "sid_ndim" in fam_meta else None,
+        bool(fam_meta.get("directed", False)),
+        str(fam_meta.get("store", "canonical")),
+    )
+
+
+def iter_link_cells(
+    level_group: FsGroup, delta: int,
+) -> "Iterator[tuple[str, tuple[ChunkCoords, ...], ChunkCoords, list[npt.NDArray[np.integer]]]]":
+    """Yield ``(segment, offsets, source_chunk, groups)`` for every cell.
+
+    Enumeration order is the canonical one every reader shares: offsets
+    segments sorted, then cells sorted within each.  ``groups`` are the
+    decoded **physical** row blocks — still carrying any ``perm_idx``
+    column, since callers differ on whether they want it.
+
+    Offsets come from each array's own ``offsets`` meta when present,
+    falling back to parsing the path segment; the two agree, but the
+    meta needs no ``sid_ndim`` to decode.
+    """
+    policy = link_family_policy(level_group, delta)
+    if policy is None:
+        return
+    link_width, sid_ndim, directed, store = policy
+    family = links_group_path(delta)
+    for seg in list_link_offsets(level_group, delta):
+        full_name = f"{family}/{seg}"
+        meta = level_group.read_array_meta(full_name) or {}
+        raw_offsets = meta.get("offsets")
+        if raw_offsets is not None:
+            offsets = tuple(tuple(int(c) for c in o) for o in raw_offsets)
+        elif sid_ndim is not None:
+            offsets = parse_offsets(
+                seg, sid_ndim=sid_ndim, link_width=link_width,
+            )
+        else:
+            continue
+        dtype = np.dtype(meta.get("dtype", "int64"))
+        has_perm = links_has_perm(
+            offsets, delta=delta, directed=directed, store=store,
+        )
+        width = link_width + (1 if has_perm else 0)
+        for key in sorted(level_group.list_chunks(full_name)):
+            try:
+                chunk = _parse_chunk_key(key)
+            except ValueError:
+                continue  # skip non-chunk entries
+            groups = _decode_link_cell(
+                level_group, chunk, delta=delta, offsets=offsets,
+                dtype=dtype, width=width, default=[],
+            )
+            if not groups:
+                continue
+            yield seg, offsets, chunk, groups
 
 
 def _derive_partition_from_links(
     level_group: FsGroup,
-    links_family: str,
     delta: int,
-) -> CrossChunkLinkPartition:
-    """Re-derive a :class:`CrossChunkLinkPartition` by reading the
-    on-disk records under ``links_family``.
+) -> LinkPartition:
+    """Re-derive a :class:`LinkPartition` from the on-disk link records.
 
-    Returns a partition whose ``cell_indices`` is keyed in the same
-    iteration order as the on-disk cell layout (cell-key-sorted),
-    with input indices ``0..num_links-1`` assigned in that read
-    order.  Callers passing ``attr_data`` to
-    :func:`write_cross_chunk_link_attributes` without an explicit
-    partition must supply rows in this same cell-key-sorted order.
+    ``cell_indices`` is keyed in :func:`read_links` enumeration order —
+    each offsets segment sorted, then each cell sorted — with indices
+    ``0..num_links-1`` assigned in that read order.  Callers passing
+    ``attr_data`` to :func:`write_link_attributes` without an explicit
+    partition must supply rows in that same order.
+
+    Only meaningful for a ``canonical`` family: under ``duplicate`` the
+    on-disk rows are physical copies, so positional indices cannot
+    express the fan-out that maps them back to input records.
     """
-    cell_indices: dict[str, list[int]] = {}
+    cell_indices: dict[tuple[str, ChunkCoords], list[int]] = {}
     next_idx = 0
-    if level_group.array_exists(links_family):
-        meta = level_group.read_array_meta(links_family) or {}
-        link_width = int(meta.get("link_width", 2))
-        record_len = 1 + link_width
-        # Local import to avoid pulling decode_ragged_blob at module load.
-        from zarr_vectors.encoding.ragged import decode_ragged_blob
-
-        for cell_key in sorted(level_group.list_chunks(links_family)):
-            blob = level_group.read_bytes(links_family, cell_key)
-            rows = decode_ragged_blob(
-                blob, np.dtype(np.int64), ncols=record_len,
-            )
-            n = len(rows)
-            cell_indices[cell_key] = list(range(next_idx, next_idx + n))
-            next_idx += n
-    return CrossChunkLinkPartition(
+    for seg, offsets, chunk, rows in iter_link_cells(level_group, delta):
+        del offsets
+        n = sum(int(np.asarray(g).shape[0]) for g in rows)
+        cell_indices[(seg, chunk)] = list(range(next_idx, next_idx + n))
+        next_idx += n
+    return LinkPartition(
         cell_indices=cell_indices,
         num_links=next_idx,
+        num_physical_records=next_idx,
         first_new=0,
     )
 
 
 # ===================================================================
-# Decentralized (per-cell) cross-chunk-link writers
+# Decentralized (per-cell) link writers
 # ===================================================================
 #
-# ``write_cross_chunk_links`` is a whole-family replace/append that also
-# maintains the family-wide ``num_links`` / ``num_physical_records`` meta.
-# The functions below instead let many independent workers each append a
-# batch of records into ONLY the cells those records touch, deferring the
-# global bookkeeping to a single ``finalize_cross_chunk_links`` pass.
+# ``write_links`` is a whole-family replace/append that also maintains the
+# family-wide ``num_links`` / ``num_physical_records`` meta.  The functions
+# below instead let many independent workers each write a batch of records
+# into ONLY the cells those records touch, deferring the global bookkeeping
+# to a single ``finalize_links`` pass.
 #
 # Race-freedom rests on the flat layout: each cell is its own object
 # (sharding is a later, coordinator-run pass), so workers writing DISJOINT
-# cells never touch the same file.  Give each worker ownership of the
-# records whose canonical-first chunk (or, when ``directed``, source chunk)
-# it is responsible for, so every cell is written by exactly one worker.
-# Per-cell RMW is NOT safe for two workers hitting the SAME cell.
+# cells never touch the same file.  A cell IS a source chunk, so giving
+# each worker ownership of a disjoint set of source chunks makes every
+# cell the property of exactly one worker.  Per-cell RMW is NOT safe for
+# two workers hitting the SAME cell.
 
 
-def write_cross_chunk_link_cells(
+def write_link_cells(
     level_group: FsGroup,
     links: list[list[tuple[ChunkCoords, int]]] | list[CrossChunkLink],
     sid_ndim: int,
     *,
     delta: int = 0,
     link_width: int | None = None,
+    dtype: np.dtype | str = np.int64,
     directed: bool = False,
     store: Literal["canonical", "duplicate"] = "canonical",
-) -> CrossChunkLinkPartition:
-    """Append a batch of cross-chunk records into only the cells they touch.
+) -> LinkPartition:
+    """Write a batch of records into only the cells they touch.
 
-    Unlike :func:`write_cross_chunk_links`, this decentralized writer leaves
-    every other cell untouched and does **not** update the family-wide
+    The decentralized counterpart to :func:`write_links`: it leaves every
+    other cell untouched and does **not** maintain the family-wide
     ``num_links`` / ``num_physical_records`` counts — call
-    :func:`finalize_cross_chunk_links` once, after all workers finish, to
-    reconcile them (and shard separately if desired).
+    :func:`finalize_links` once, after all workers finish, to reconcile
+    them (and shard separately if desired).
 
-    A coordinator should pre-create the family with matching ``directed`` /
-    ``store`` / ``sid_ndim`` via :func:`create_cross_chunk_links_array` so
-    workers agree on the policy and don't race to create it; this function
-    also creates it idempotently if absent and rejects a policy mismatch.
+    Placement routes through :func:`_partition_links`, the same choke
+    point :func:`write_links` uses, so a batch lands in exactly the cells
+    the whole-family writer would have chosen.  That is what makes
+    disjoint per-cell writes plus one ``finalize_links`` equivalent to a
+    single ``write_links`` over the union of the batches.
 
-    Returns the :class:`CrossChunkLinkPartition` for THIS batch, for use
-    with :func:`write_cross_chunk_link_attribute_cells`.
+    A coordinator may pre-create the family with matching ``directed`` /
+    ``store`` / ``sid_ndim`` via :func:`create_links_array` so workers
+    agree on the policy and don't race to create it; this function also
+    creates it idempotently and rejects a policy mismatch.
+
+    Returns the :class:`LinkPartition` for THIS batch — its ``num_links``
+    is the batch's logical record count, not the family's — for use with
+    :func:`write_link_attribute_cells`.
+
+    Concurrency:
+        Per-cell read-modify-write.  Safe only while workers own disjoint
+        source chunks; two workers appending to one cell lose rows.
     """
     if store not in ("canonical", "duplicate"):
         raise ArrayError(
             f"store must be 'canonical' or 'duplicate', got {store!r}"
         )
     if not links:
-        return CrossChunkLinkPartition(
-            cell_indices={}, num_links=0, first_new=0,
+        return LinkPartition(
+            cell_indices={}, num_links=0, num_physical_records=0, first_new=0,
         )
 
-    from zarr_vectors.encoding.ragged import (
-        decode_ragged_blob,
-        encode_ragged_blob,
-    )
-    from zarr_vectors.spatial.boundary import partition_cross_records_by_tuple
-
-    normalised, link_width = _normalise_cross_records(
+    dtype = np.dtype(dtype)
+    normalised, link_width = _normalise_link_records(
         links, link_width, sid_ndim, delta,
     )
-    full_name = cross_chunk_links_path(delta)
 
-    # Ensure the family exists with the requested policy (idempotent), then
-    # guard against a coordinator that created it with different flags.
-    create_cross_chunk_links_array(
-        level_group, delta=delta, link_width=link_width, sid_ndim=sid_ndim,
-        directed=directed, store=store, exist_ok=True,
+    # Guard before any write: a worker joining a family stamped with other
+    # flags would file rows the family-wide reader decodes at the wrong
+    # width.  Absent meta means the family is this call's to create.
+    fam_meta = level_group.read_array_meta(links_group_path(delta)) or {}
+    if fam_meta:
+        _check_link_family_policy(
+            fam_meta, delta=delta, link_width=link_width, sid_ndim=sid_ndim,
+            directed=directed, store=store, action="append to",
+        )
+
+    buckets = _partition_links(
+        level_group, normalised, link_width, sid_ndim,
+        delta=delta, directed=directed, store=store,
     )
-    fam_meta = level_group.read_array_meta(full_name) or {}
-    if bool(fam_meta.get("directed", directed)) != directed:
-        raise ArrayError(
-            f"cross_chunk_links/{format_delta(delta)}: family directed="
-            f"{fam_meta.get('directed')} != requested {directed}"
+
+    physical = 0
+    for (seg, src_chunk), entries in buckets.items():
+        offsets = parse_offsets(seg, sid_ndim=sid_ndim, link_width=link_width)
+        create_links_array(
+            level_group, link_width, dtype=str(dtype), delta=delta,
+            sid_ndim=sid_ndim, offsets=offsets, directed=directed,
+            store=store, exist_ok=True,
         )
-    if str(fam_meta.get("store", store)) != store:
-        raise ArrayError(
-            f"cross_chunk_links/{format_delta(delta)}: family store="
-            f"{fam_meta.get('store')!r} != requested {store!r}"
+        has_perm = links_has_perm(
+            offsets, delta=delta, directed=directed, store=store,
         )
-    if int(fam_meta.get("link_width", link_width)) != link_width:
-        raise ArrayError(
-            f"cross_chunk_links/{format_delta(delta)}: family link_width="
-            f"{fam_meta.get('link_width')} != requested {link_width}"
+        rows = _pack_link_rows(
+            entries, has_perm=has_perm, link_width=link_width, dtype=dtype,
+        )
+        physical += rows.shape[0]
+        # RMW: this batch is a new group appended after whatever the cell
+        # already holds, so a worker may call this repeatedly.
+        groups = list(_decode_link_cell(
+            level_group, src_chunk, delta=delta, offsets=offsets,
+            dtype=dtype, width=rows.shape[1], default=[],
+        ))
+        groups.append(rows)
+        # Route through the per-cell writer so the flat+sidecar vs
+        # inline-blob choice has exactly one definition.
+        #
+        # record_presence=False: this is the worker half of the
+        # decentralized protocol.  Workers own disjoint source chunks, so
+        # their *cells* never collide — but ``nonempty_chunks`` is
+        # array-wide, and stamping it is a read-modify-write that two
+        # workers writing disjoint cells still race on, silently dropping
+        # the loser's key while its payload sits on disk.  The manifest is
+        # rebuilt from the store listing by :func:`finalize_links`, which
+        # the coordinator must run before any ``shard_store``.
+        write_chunk_links(
+            level_group, src_chunk, groups, dtype,
+            delta=delta, offsets=offsets, link_width=link_width,
+            record_presence=False,
         )
 
-    partitioned = partition_cross_records_by_tuple(
-        normalised, link_width, sid_ndim, directed=directed, store=store,
-    )
-    record_len_int64 = 1 + link_width
-    for cell_key, entries in partitioned.items():
-        existing_rows: list[npt.NDArray] = []
-        if level_group.chunk_exists(full_name, cell_key):
-            blob = level_group.read_bytes(full_name, cell_key)
-            existing_rows = decode_ragged_blob(
-                blob, np.dtype(np.int64), ncols=record_len_int64,
-            )
-        new_rows: list[npt.NDArray] = []
-        for vi_cell, perm_idx, _ in entries:
-            row = np.empty(record_len_int64, dtype=np.int64)
-            row[0] = perm_idx
-            row[1:] = vi_cell
-            new_rows.append(row)
-        combined = list(existing_rows) + new_rows
-        blob = encode_ragged_blob(combined, np.dtype(np.int64))
-        level_group.write_bytes(full_name, cell_key, blob)
-
-    cell_indices = {
-        key: [idx for _, _, idx in entries]
-        for key, entries in partitioned.items()
-    }
-    return CrossChunkLinkPartition(
-        cell_indices=cell_indices,
+    return LinkPartition(
+        cell_indices={k: [idx for _, _, idx in v] for k, v in buckets.items()},
         num_links=len(normalised),
+        num_physical_records=physical,
         first_new=0,
     )
 
 
-def write_cross_chunk_link_attribute_cells(
+def write_link_attribute_cells(
     level_group: FsGroup,
     attr_name: str,
     attr_data: npt.NDArray,
     *,
-    partition: CrossChunkLinkPartition,
+    partition: LinkPartition,
     delta: int = 0,
 ) -> None:
     """Append attribute rows for the cells one batch wrote.
 
-    ``attr_data`` holds one row per logical record in the SAME batch, in the
-    input order used for the matching :func:`write_cross_chunk_link_cells`
-    call; ``partition`` is that call's return value.  Rows are appended per
-    cell (replicating automatically in ``duplicate`` mode, where an input
-    index appears under several cells).  Global counts are reconciled by
-    :func:`finalize_cross_chunk_links`; only ``dtype`` / ``row_shape`` are
-    stamped here (idempotent across workers).
+    ``attr_data`` holds one row per logical record in the SAME batch, in
+    the input order used for the matching :func:`write_link_cells` call;
+    ``partition`` is that call's return value.  Rows are appended per
+    ``(offsets, cell)``, replicating automatically in ``duplicate`` mode
+    where one input index appears under several cells.
+
+    Only ``dtype`` / ``row_shape`` are stamped here (idempotent across
+    workers).  The attribute family's ``num_links`` is deliberately left
+    unstamped: a worker sees only its own batch, and :func:`read_link_attributes`
+    derives the row count from the cells themselves.
     """
-    full_name = cross_chunk_link_attributes_path(attr_name, delta)
     arr = np.ascontiguousarray(np.asarray(attr_data))
-    tail_shape = arr.shape[1:]
-    for cell_key, input_idxs in partition.cell_indices.items():
-        new_rows = arr[np.asarray(input_idxs, dtype=np.int64)]
-        if level_group.chunk_exists(full_name, cell_key):
-            existing_blob = level_group.read_bytes(full_name, cell_key)
-            existing_arr = np.frombuffer(
-                existing_blob, dtype=arr.dtype,
-            ).reshape((-1, *tail_shape))
-            combined = np.concatenate([existing_arr, new_rows], axis=0)
-        else:
-            combined = new_rows
-        level_group.write_bytes(
-            full_name, cell_key,
-            np.ascontiguousarray(combined).tobytes(),
+    fam_meta = level_group.read_array_meta(links_group_path(delta)) or {}
+    link_width = int(fam_meta.get("link_width", 2))
+    sid_ndim = int(fam_meta.get("sid_ndim", 0)) or None
+
+    for seg in sorted({seg for seg, _chunk in partition.cell_indices}):
+        offsets = _parse_offsets_for_family(
+            seg, sid_ndim=sid_ndim, link_width=link_width, partition=partition,
         )
+        create_link_attributes_array(
+            level_group, attr_name, dtype=str(arr.dtype), delta=delta,
+            sid_ndim=sid_ndim, link_width=link_width, offsets=offsets,
+            exist_ok=True,
+        )
+        full_name = link_attributes_path(attr_name, delta, offsets)
+        for (bucket_seg, src_chunk), input_idxs in partition.cell_indices.items():
+            if bucket_seg != seg:
+                continue
+            key = _chunk_key(src_chunk)
+            new_rows = arr[np.asarray(input_idxs, dtype=np.int64)]
+            if level_group.chunk_exists(full_name, key):
+                combined = np.concatenate(
+                    [_read_attr_cell(level_group, full_name, key, arr), new_rows],
+                    axis=0,
+                )
+            else:
+                combined = new_rows
+            level_group.write_bytes(
+                full_name, key, np.ascontiguousarray(combined).tobytes(),
+            )
+        # ``row_shape`` (the tail dims per row, ``()`` for 1-D) lets the
+        # reader reconstruct shape from a bare byte blob.
+        level_group.write_array_meta(full_name, {
+            "zv_array": "link_attribute",
+            "name": attr_name,
+            "dtype": str(arr.dtype),
+            "row_shape": list(arr.shape[1:]),
+            "offsets": [list(int(c) for c in o) for o in offsets],
+            "level_delta": int(delta),
+        })
 
-    _ensure_array_dir(level_group, full_name)
-    meta = level_group.read_array_meta(full_name) or {}
-    meta.update({
-        "zv_array": "cross_chunk_link_attribute",
-        "name": attr_name,
-        "dtype": str(arr.dtype),
-        "row_shape": list(tail_shape),
-        "level_delta": int(delta),
-    })
-    level_group.write_array_meta(full_name, meta)
 
-
-def finalize_cross_chunk_links(
+def finalize_links(
     level_group: FsGroup,
     *,
     delta: int = 0,
-) -> CrossChunkLinkPartition:
-    """Reconcile a ``cross_chunk_links/<delta>/`` family's counts after
-    decentralized per-cell writes.
+) -> LinkPartition:
+    """Reconcile a ``links/<delta>/`` family's counts after decentralized
+    per-cell writes.
 
-    Scans every cell to recompute ``num_physical_records`` (total on-disk
-    rows) and ``num_links`` (logical record count).  For ``canonical``
-    families the two are equal; for ``duplicate`` families the logical
-    count is recovered by deduplicating decoded records (every copy of a
-    record decodes to the same input-order endpoints).
+    Scans every offsets array and every cell under the family to recompute
+    ``num_physical_records`` (total on-disk rows) and ``num_links`` (the
+    logical record count).  For a ``canonical`` family the two are equal;
+    for a ``duplicate`` one the logical count is recovered by deduplicating
+    decoded records, since every physical copy of a record decodes to the
+    same input-order endpoints.
 
     Sharding is a separate coordinator step — run
     :func:`zarr_vectors.sharding.shard_store` after finalizing, once all
     cells are on disk.
 
-    Returns the re-derived :class:`CrossChunkLinkPartition` (cell-key order).
+    Returns the re-derived :class:`LinkPartition` in :func:`read_links`
+    enumeration order (each offsets segment sorted, then each cell
+    sorted).  ``num_links`` is the **logical** count and
+    ``num_physical_records`` the **physical** one — the same two numbers
+    stamped on the family group, which the returned partition must agree
+    with.  ``cell_indices`` is positional over the physical rows, so under
+    ``store="duplicate"`` its indices are row positions, not input
+    indices, and must not be fed to :func:`write_link_attributes`.
     """
-    from zarr_vectors.encoding.ragged import decode_ragged_blob
-
-    full_name = cross_chunk_links_path(delta)
-    if not level_group.array_exists(full_name):
-        return CrossChunkLinkPartition(
-            cell_indices={}, num_links=0, first_new=0,
+    policy = link_family_policy(level_group, delta)
+    if policy is None:
+        return LinkPartition(
+            cell_indices={}, num_links=0, num_physical_records=0, first_new=0,
         )
-    meta = level_group.read_array_meta(full_name) or {}
-    link_width = int(meta.get("link_width", 2))
-    store = str(meta.get("store", "canonical"))
-    record_len = 1 + link_width
+    store = policy[3]  # (link_width, sid_ndim, directed, store)
+
+    # Rebuild each offset array's ``nonempty_chunks`` manifest from the
+    # store listing BEFORE enumerating.  This is the coordinator half of
+    # the decentralized-write protocol: workers pass
+    # ``record_presence=False`` to skip the manifest, because stamping it
+    # is a read-modify-write of state shared by every cell in the array —
+    # two workers writing *disjoint* cells still race on it, and the
+    # loser's key vanishes even though its payload landed.  Without this
+    # rebuild, ``iter_link_cells`` (→ ``list_chunks`` → the manifest)
+    # would enumerate nothing and this pass would count 0.
+    #
+    # ``list_link_offsets`` discovers segments via ``children()`` — a
+    # store listing — so segment discovery is already race-free.
+    #
+    # Only valid unsharded: a shard packs many cells into one object whose
+    # inner index is not derivable from key names.  Hence the ordering
+    # requirement that ``shard_store`` runs *after* finalize.
+    family_group = links_group_path(delta)
+    for seg in list_link_offsets(level_group, delta):
+        try:
+            level_group.derive_nonempty_chunks(f"{family_group}/{seg}")
+        except Exception:
+            # An already-stamped array (the whole-family writer path)
+            # needs no rebuild; never let that mask the counts below.
+            pass
 
     physical = 0
-    cell_indices: dict[str, list[int]] = {}
-    next_idx = 0
-    for cell_key in sorted(level_group.list_chunks(full_name)):
-        blob = level_group.read_bytes(full_name, cell_key)
-        rows = decode_ragged_blob(
-            blob, np.dtype(np.int64), ncols=record_len,
-        )
-        n = len(rows)
-        cell_indices[cell_key] = list(range(next_idx, next_idx + n))
-        next_idx += n
+    cell_indices: dict[tuple[str, ChunkCoords], list[int]] = {}
+    for seg, offsets, chunk, groups in iter_link_cells(level_group, delta):
+        del offsets
+        n = sum(int(np.asarray(g).shape[0]) for g in groups)
+        cell_indices[(seg, chunk)] = list(range(physical, physical + n))
         physical += n
 
     if store == "duplicate":
         # Every physical copy of a logical record decodes to the same
         # input-order endpoints, so distinct decoded records == logical.
-        records = read_cross_chunk_links(level_group, delta=delta)
+        records = read_links(level_group, delta=delta)
         logical = len({tuple(r) for r in records})
     else:
         logical = physical
 
+    # Merge into the existing family meta rather than restamping policy:
+    # this pass counts rows, it has no opinion on directed/store, and a
+    # family group written without ``sid_ndim`` must not gain a made-up one.
+    family = links_group_path(delta)
+    meta = level_group.read_array_meta(family) or {}
     meta["num_links"] = int(logical)
     meta["num_physical_records"] = int(physical)
-    _ensure_array_dir(level_group, full_name)
-    level_group.write_array_meta(full_name, meta)
+    _ensure_array_dir(level_group, family)
+    level_group.write_array_meta(family, meta)
 
-    return CrossChunkLinkPartition(
+    return LinkPartition(
         cell_indices=cell_indices,
-        num_links=physical,
+        num_links=logical,
+        num_physical_records=physical,
         first_new=0,
     )
 
@@ -2312,10 +3035,29 @@ def finalize_cross_chunk_links(
 # Reading data
 # ===================================================================
 
+def vertices_dtype(level_group: FsGroup) -> np.dtype:
+    """The element dtype ``vertices/`` declares.
+
+    A cell is a flat buffer with no inline header, so the Zarr
+    ``data_type`` (``variable_length_bytes``) describes the *container*
+    and says nothing about the payload.  The element type lives in the
+    array's ``dtype`` **attribute**, which :func:`create_vertices_array`
+    stamps — this is the only place it is recorded.
+
+    Falls back to ``float32`` when the attribute is unreadable, matching
+    the writer's own default.
+    """
+    try:
+        vmeta = level_group.read_array_meta(VERTICES) or {}
+        return np.dtype(vmeta.get("dtype", "float32"))
+    except Exception:
+        return np.dtype(np.float32)
+
+
 def read_chunk_vertices(
     level_group: FsGroup,
     chunk_coords: ChunkCoords,
-    dtype: np.dtype | str = np.float32,
+    dtype: np.dtype | str | None = None,
     ndim: int = 3,
 ) -> list[npt.NDArray[np.floating]]:
     """Read all fragments from a spatial chunk.
@@ -2328,7 +3070,11 @@ def read_chunk_vertices(
     Args:
         level_group: Resolution level group.
         chunk_coords: Spatial chunk coordinates.
-        dtype: Numpy dtype.
+        dtype: Numpy dtype.  ``None`` (the default) reads the dtype the
+            store declares — see :func:`vertices_dtype`.  Pass one only to
+            override, and only knowing that a wrong value does not raise:
+            a ``float64`` cell read as ``float32`` decodes to garbage at
+            twice the row count, silently.
         ndim: Number of coordinate dimensions (D).
 
     Returns:
@@ -2338,7 +3084,10 @@ def read_chunk_vertices(
         ArrayError: If the chunk does not exist or data is malformed.
     """
     key = _chunk_key(chunk_coords)
-    dtype = np.dtype(dtype)
+    # Default to the declared dtype rather than float32.  Nothing in the
+    # blob records the element type, so an assumed dtype is not checkable
+    # — it just produces wrong numbers.  The store already knows; ask it.
+    dtype = vertices_dtype(level_group) if dtype is None else np.dtype(dtype)
 
     with _maybe_batched_reads(level_group, [
         (VERTICES, [key]),
@@ -2431,32 +3180,78 @@ def read_chunk_links(
     link_width: int | None = None,
     *,
     delta: int = 0,
+    offsets: Sequence[ChunkCoords] | None = None,
 ) -> list[npt.NDArray[np.integer]]:
-    """Read all link groups from a spatial chunk's ``links/<delta>/`` array.
+    """Read link groups from one cell of ``links/<delta>/<offsets>/``.
+
+    The per-cell counterpart to :func:`write_chunk_links`, and it mirrors
+    its encoding rule exactly: ``chunk_coords`` is the **source** chunk
+    (the cell) and ``offsets`` names the array.  Defaults to the all-zero
+    (intra-chunk) offsets — the array holding records whose endpoints all
+    share the source chunk.
+
+    Rows come back **as stored**, in placement order: this reader does not
+    reverse a canonical sort.  Where the array carries a ``perm_idx``
+    column (see :func:`links_has_perm`) the returned rows are ``1 + L``
+    wide, with ``perm_idx`` in column 0 and the ``L`` vertex indices after
+    it — and those indices are in the placement's endpoint order, not the
+    order they were written in.  Use :func:`read_links` or
+    :func:`read_links_for_tuple` for whole records in input order.
 
     Args:
         level_group: Resolution level group.
-        chunk_coords: Spatial chunk coordinates.
+        chunk_coords: **Source** chunk coordinates (the array cell).
         dtype: Integer dtype.
-        link_width: Number of columns per link (L). If None, read from
-            array metadata.
-        delta: Level delta; ``0`` is the intra-level array.
+        link_width: The **logical** width L. If None, read from the family
+            group's metadata.  Note the *stored* width may be ``1 + L``;
+            this argument never changes how the bytes are decoded, which
+            is governed by the array's own ``has_perm`` stamp.
+        delta: Level delta; ``0`` is the intra-level family.
+        offsets: Relative offsets naming the array.  ``None`` (default)
+            means the all-zero intra-chunk offsets.
 
     Returns:
-        List of arrays, each ``(M_k, L)``.
+        List of arrays, each ``(M_k, L)`` — or ``(M_k, 1 + L)`` when the
+        array carries ``perm_idx``.
     """
     key = _chunk_key(chunk_coords)
     dtype = np.dtype(dtype)
-    full_name = links_path(delta)
 
+    # Read L from the <delta> family group, not from the array: the
+    # offsets segment naming the array is itself a function of L, so
+    # reading it from the array would be circular.
+    fam_meta = level_group.read_array_meta(links_group_path(delta)) or {}
     if link_width is None:
-        meta = level_group.read_array_meta(full_name)
-        link_width = meta.get("link_width", 2)
+        link_width = int(fam_meta.get("link_width", 2))
+    if offsets is None:
+        offsets = intra_offsets(len(chunk_coords), link_width)
+    full_name = links_path(delta, offsets)
 
-    # delta == 0 needs both the link bytes and the fragment-index sibling;
-    # delta != 0 keeps the v0.5 inline self-describing layout (one blob).
+    # Decode at the PHYSICAL row width.  ``link_width`` is the logical
+    # width; a links_has_perm array stores 1 + L per row.  Decoding
+    # physical bytes at the logical width does not reliably raise: with N
+    # records the cell holds (1 + L)*N elements, and (1 + L)*N ≡ N (mod L),
+    # so it silently yields (1 + L)*N/L fabricated rows whenever
+    # N % L == 0 — every even N at L=2.  Take the width from the array's
+    # own stamp; never infer it from L.
+    arr_meta = level_group.read_array_meta(full_name) or {}
+    has_perm = bool(arr_meta.get(
+        "has_perm",
+        links_has_perm(
+            offsets,
+            delta=delta,
+            directed=bool(fam_meta.get("directed", False)),
+            store=str(fam_meta.get("store", "canonical")),
+        ),
+    ))
+    ncols = (1 + link_width) if has_perm else link_width
+
+    # Only the intra array at delta 0 is flat-with-sidecar; every other
+    # offset array is an inline self-describing blob.  Same condition as
+    # write_chunk_links — keep them in lockstep.
+    flat = delta == 0 and is_intra(offsets)
     plan: list[tuple[str, list[str]]] = [(full_name, [key])]
-    if delta == 0:
+    if flat:
         plan.append((LINK_FRAGMENTS, [key]))
 
     with _maybe_batched_reads(level_group, plan):
@@ -2464,10 +3259,11 @@ def read_chunk_links(
             raw = level_group.read_bytes(full_name, key)
         except Exception as e:
             raise ArrayError(
-                f"Cannot read links chunk {key} (delta={format_delta(delta)}): {e}"
+                f"Cannot read links chunk {key} (delta={format_delta(delta)}, "
+                f"offsets={format_offsets(offsets)}): {e}"
             ) from e
 
-        if delta == 0:
+        if flat:
             # v0.6 intra-level layout: raw is the flat concatenated link
             # data; per-group row counts live in link_fragments/<chunk>.
             # In the native-sharded layout, ``links/0`` is a single
@@ -2480,7 +3276,7 @@ def read_chunk_links(
             fi = read_link_fragment_index(level_group, chunk_coords)
             if fi.num_fragments == 0:
                 return []
-            full = _reshape_link_buffer(raw, dtype, link_width)
+            full = _reshape_link_buffer(raw, dtype, ncols)
             groups: list[npt.NDArray[np.integer]] = []
             for f in range(fi.num_fragments):
                 if fi.is_range(f):
@@ -2490,8 +3286,8 @@ def read_chunk_links(
                     groups.append(full[fi.indices(f)])
             return groups
 
-        # Cross-level delta != 0: v0.5 inline self-describing layout.
-        return decode_ragged_blob(raw, dtype, ncols=link_width)
+        # Cross-offset and/or cross-level: inline self-describing blob.
+        return decode_ragged_blob(raw, dtype, ncols=ncols)
 
 
 def read_chunk_link_fragment(
@@ -2533,12 +3329,17 @@ def read_chunk_link_fragment(
     """
     key = _chunk_key(chunk_coords)
     dtype = np.dtype(dtype)
-    full_name = links_path(0)
 
     try:
         if link_width is None:
-            meta = level_group.read_array_meta(full_name)
-            link_width = meta.get("link_width", 2)
+            # From the family group — the offsets segment naming the
+            # array depends on L, so reading L from the array is circular.
+            fam_meta = level_group.read_array_meta(links_group_path(0)) or {}
+            link_width = int(fam_meta.get("link_width", 2))
+        # link_fragments/ only ever partitions the intra array at delta 0
+        # (it is keyed by chunk alone, with no delta or offsets segment),
+        # so this reader is intra-only by construction.
+        full_name = links_path(0, intra_offsets(len(chunk_coords), link_width))
 
         with _maybe_batched_reads(level_group, [
             (full_name, [key]),
@@ -2701,6 +3502,16 @@ def read_chunk_fragment_attributes(
     row_bytes = dtype.itemsize * ncols
 
     try:
+        # An unwritten cell of a vlen array reads back b"" rather than
+        # raising, and b"" passes the stride check below — so without this
+        # guard a missing chunk would quietly decode to an empty array and
+        # ``default`` would never be honoured.  ``chunk_exists`` consults
+        # the presence manifest, which is what distinguishes "absent" from
+        # "empty" now that the two are byte-identical.
+        if not level_group.chunk_exists(full_name, key):
+            raise ArrayError(
+                f"fragment_attribute '{attr_name}' chunk {key} not present"
+            )
         try:
             raw = level_group.read_bytes(full_name, key)
         except Exception as e:
@@ -2734,12 +3545,18 @@ def read_chunk_link_attributes(
     *,
     delta: int = 0,
 ) -> list[npt.NDArray]:
-    """Read per-link attribute data for a chunk.
+    """Read per-link attribute data for a chunk's intra-chunk links.
 
     Mirrors :func:`read_chunk_attributes` for the per-link case: the
-    ragged bytes live under ``link_attributes/<name>/<delta>/<chunk>``
-    and align 1:1 with the link fragments under ``link_fragments/<chunk>``
-    (intra-level only, ``delta == 0``).  Per-link group ``k`` has the
+    ragged bytes live under
+    ``link_attributes/<name>/<delta>/<all-zero offsets>/<chunk>`` and
+    align 1:1 with the link fragments under ``link_fragments/<chunk>``.
+
+    Intra-chunk at ``delta == 0`` only, and not by omission: the fragment
+    sidecar is keyed by chunk alone, so the all-zero-offsets array is the
+    only one it partitions.  Attributes on any other offsets array have no
+    fragment structure to align to — read those with
+    :func:`read_link_attributes`.  Per-link group ``k`` has the
     same row count as link group ``k`` in ``links/<delta>/<chunk>``.
 
     Args:
@@ -2749,9 +3566,9 @@ def read_chunk_link_attributes(
         dtype: Numpy dtype of the attribute.
         ncols: Number of columns (channels).  Use 1 for scalars.
         delta: Level delta; cross-level link attributes are stored
-            differently and must be read via the global
-            ``cross_chunk_link_attributes`` path — this helper handles
-            only the per-chunk ``delta == 0`` case.
+            differently and must be read via the whole-family
+            :func:`read_link_attributes` — this helper handles only the
+            per-chunk ``delta == 0`` case.
 
     Returns:
         List of arrays aligned with the link fragments in the chunk.
@@ -2760,12 +3577,17 @@ def read_chunk_link_attributes(
         raise ArrayError(
             f"read_chunk_link_attributes only supports delta=0 "
             f"(per-chunk intra-level); got delta={delta}.  Use "
-            f"read_cross_chunk_link_attributes for cross-level "
-            f"link attributes.",
+            f"read_link_attributes for cross-level link attributes.",
         )
     key = _chunk_key(chunk_coords)
     dtype = np.dtype(dtype)
-    full_name = link_attributes_path(attr_name, delta)
+    # Fragment-aligned attributes exist only for the intra array: it is
+    # the one link_fragments/<chunk> partitions.
+    fam_meta = level_group.read_array_meta(links_group_path(delta)) or {}
+    link_width = int(fam_meta.get("link_width", 2))
+    full_name = link_attributes_path(
+        attr_name, delta, intra_offsets(len(chunk_coords), link_width),
+    )
 
     try:
         raw = level_group.read_bytes(full_name, key)
@@ -2845,12 +3667,11 @@ def read_object_manifest(
         )
 
     _require_object_index_v1(meta)
-    manifests_arr = level_group.zarr_group[OBJECT_INDEX]["manifests"]
-    # Slice (then index) instead of scalar indexing: zarr 3.x vlen-bytes
-    # returns a 0-d object ndarray under ``arr[i]``, whose ``bytes()``
-    # is the array header — not the payload.  ``arr[i:i+1][0]`` is the
-    # actual bytes object and still fetches only the chunk holding i.
-    blob = manifests_arr[object_id:object_id + 1][0]
+    # Via the Group rather than the raw zarr node, so the read passes a
+    # chokepoint the offline snapshot can serve (see Group.offline_reads).
+    # Slice-then-extract, never scalar-index: see zarr_vectors.core._vlen.
+    # This 1-D manifests array shares that rule with the N-D cell readers.
+    blob = level_group.read_vlen_element(f"{OBJECT_INDEX}/manifests", object_id)
     blocks = decode_object_manifest_blocks(blob, sid_ndim=sid_ndim)
     return _expand_blocks(blocks)
 
@@ -2870,10 +3691,9 @@ def read_all_object_manifests(
     _require_object_index_v1(meta)
     if num_objects == 0:
         return []
-    manifests_arr = level_group.zarr_group[OBJECT_INDEX]["manifests"]
-    # Slicing yields a 1-D object ndarray whose elements are bytes
-    # directly (unlike scalar indexing — see read_object_manifest).
-    blobs = manifests_arr[:]
+    # Via the Group rather than the raw zarr node, so the read passes a
+    # chokepoint the offline snapshot can serve (see Group.offline_reads).
+    blobs = level_group.read_vlen_array(f"{OBJECT_INDEX}/manifests")
     return [
         _expand_blocks(decode_object_manifest_blocks(b, sid_ndim=sid_ndim))
         for b in blobs
@@ -3061,76 +3881,253 @@ def read_groupings_attributes(
     return out
 
 
-def read_cross_chunk_links(
+def cell_endpoint_chunks(
+    src: ChunkCoords,
+    offsets: Sequence[ChunkCoords],
+    scale_src: Sequence[int],
+    scale_trg: Sequence[int],
+) -> tuple[ChunkCoords, ...]:
+    """Reconstruct a cell's L endpoint chunks from its source and offsets.
+
+    The inverse of the placement arithmetic in
+    :func:`~zarr_vectors.spatial.boundary.partition_records_by_offset`:
+    endpoint 0 *is* the source (its offset is the implicit zero and is
+    never encoded), and endpoint k>0 is ``anchor(src) + o_k``.  The
+    anchor makes this exact across levels whose chunk grids differ; it
+    is the identity when they do not.
+    """
+    from zarr_vectors.spatial.boundary import anchor_chunk
+
+    anchor = anchor_chunk(src, scale_src, scale_trg)
+    return (tuple(src),) + tuple(
+        tuple(int(a) + int(o) for a, o in zip(anchor, off)) for off in offsets
+    )
+
+
+def _link_cell_rows(
+    blob: bytes, *, ncols: int, flat: bool,
+) -> npt.NDArray[np.int64]:
+    """Decode one link cell's bytes into its ``(M, ncols)`` physical rows.
+
+    The single decode :func:`read_links` and :func:`read_links_for_tuple`
+    share, so a whole-family read and a single-cell read of the same bytes
+    cannot disagree.  ``flat`` selects the branch
+    :func:`write_chunk_links` wrote under (``delta == 0 and
+    is_intra(offsets)``) — the two encodings are not interchangeable.
+
+    Rows come back in write order: groups in append order, rows in order
+    within each group.  That matches the enumeration
+    :func:`iter_link_cells` counts against.
+
+    NOTE :func:`~zarr_vectors.encoding.ragged.decode_ragged_blob` yields
+    one entry per *group* — an ``(M_k, ncols)`` block — not one per row.
+    A whole-family write files a cell's rows as a single group and each
+    append adds another, so the groups must be concatenated; treating the
+    group count as a row count mis-parses every multi-record cell.
+    """
+    if flat:
+        # Intra-chunk at delta 0: flat concatenation, group bounds in the
+        # link_fragments sidecar.  A cell-wide read wants every row, so
+        # the sidecar is not consulted.
+        return np.frombuffer(blob, dtype=np.int64).reshape(-1, ncols)
+    groups = decode_ragged_blob(blob, np.dtype(np.int64), ncols=ncols)
+    if not groups:
+        return np.empty((0, ncols), dtype=np.int64)
+    return np.concatenate(
+        [np.asarray(g, dtype=np.int64).reshape(-1, ncols) for g in groups],
+        axis=0,
+    )
+
+
+def read_links(
     level_group: FsGroup,
     *,
     delta: int = 0,
 ) -> list[tuple[tuple[ChunkCoords, int], ...]]:
-    """Read all cross-chunk link records under ``cross_chunk_links/<delta>/``.
+    """Read every link record under ``links/<delta>/``.
 
-    Records are returned in cell-key-sorted order (and within each
-    cell in write order).  Each record is a tuple of
-    ``(chunk_coords, vi)`` endpoints in **original input order** —
-    canonical sorting and ``perm_idx`` encoding are reversed here so
-    callers see the same record shape they wrote.  This works uniformly
-    for directed families (``perm_idx=0`` makes the reversal a no-op).
+    The whole-family counterpart to :func:`write_links`, and the inverse
+    of its placement: each cell's source chunk plus the array's offsets
+    segment reconstruct the record's endpoint chunks, and ``perm_idx``
+    (where present) reverses the canonical sort — so callers see the same
+    record shape they wrote.  Intra-chunk links are included; they are
+    the all-zero-offsets array, not a separate family.
 
-    For a ``store="duplicate"`` family each logical record was written to
-    several cells, so it is returned **once per copy** — callers wanting
-    unique links should dedupe, or query with
-    :func:`read_cross_chunk_links_for_tuple`.
+    Records are returned in **(offsets segment, cell) sorted order**, and
+    within a cell in write order.  :func:`read_link_attributes`
+    enumerates identically — that shared order is the only thing aligning
+    attribute rows to link records, so the two must not drift.
+
+    For a ``store="duplicate"`` family each logical record was filed in
+    several cells, so it is returned **once per copy** — dedupe, or query
+    a single location with :func:`read_links_for_tuple`.
 
     Returns ``[]`` when the ``<delta>`` family is absent or empty.
     """
-    full_name = cross_chunk_links_path(delta)
-    if not level_group.array_exists(full_name):
+    family = links_group_path(delta)
+    if not level_group.array_exists(family):
         return []
-    meta = level_group.read_array_meta(full_name) or {}
-    if "link_width" not in meta or "sid_ndim" not in meta:
+    fam_meta = level_group.read_array_meta(family) or {}
+    if "link_width" not in fam_meta or "sid_ndim" not in fam_meta:
         return []
-    link_width = int(meta["link_width"])
-    sid_ndim = int(meta["sid_ndim"])
+    link_width = int(fam_meta["link_width"])
+    sid_ndim = int(fam_meta["sid_ndim"])
+    directed = bool(fam_meta.get("directed", False))
+    store = str(fam_meta.get("store", "canonical"))
 
     from zarr_vectors.encoding.ragged import decode_ragged_blob
     from zarr_vectors.spatial.boundary import apply_perm_inverse
 
-    record_len = 1 + link_width  # [perm_idx, vi_0, ..., vi_{L-1}]
+    # Must be _link_scales, not _derive_level_scales: the latter derives
+    # its rank from the root chunk_shape, but an attribute-binned store
+    # prepends a bin axis to every chunk key, so the scales need padding
+    # to sid_ndim.  The write path anchors through _link_scales — reading
+    # with a differently-ranked scale would silently anchor elsewhere.
+    scale_src, scale_trg = _link_scales(level_group, delta, sid_ndim)
+
     out: list[tuple[tuple[ChunkCoords, int], ...]] = []
-    for cell_key in sorted(level_group.list_chunks(full_name)):
-        canonical_chunks = parse_cell_key(
-            cell_key, sid_ndim=sid_ndim, link_width=link_width,
-        )
-        blob = level_group.read_bytes(full_name, cell_key)
-        rows = decode_ragged_blob(
-            blob, np.dtype(np.int64), ncols=record_len,
-        )
-        if not rows:
-            continue
-        # Decode the whole cell once into an (R, record_len) array and pull
-        # the perm column + vi columns out in two C-level conversions,
-        # instead of ``np.asarray(row).reshape(-1)`` + per-element int casts
-        # per record.
-        rows_arr = np.asarray(rows, dtype=np.int64).reshape(len(rows), record_len)
-        perm_list = rows_arr[:, 0].tolist()
-        vi_list = rows_arr[:, 1:1 + link_width].tolist()
-        if link_width == 2:
-            # The only 2-endpoint perms are identity (0) and swap (1);
-            # avoid the per-row Lehmer decode in apply_perm_inverse.
-            cc0, cc1 = canonical_chunks[0], canonical_chunks[1]
-            for perm_idx, (v0, v1) in zip(perm_list, vi_list):
-                ep0 = (cc0, v0)
-                ep1 = (cc1, v1)
-                out.append((ep0, ep1) if perm_idx == 0 else (ep1, ep0))
-        else:
-            for perm_idx, vi_canonical in zip(perm_list, vi_list):
-                canonical_endpoints = list(zip(canonical_chunks, vi_canonical))
-                out.append(tuple(apply_perm_inverse(
-                    canonical_endpoints, perm_idx, link_width,
-                )))
+    for seg in list_link_offsets(level_group, delta):
+        arr_name = f"{family}/{seg}"
+        try:
+            offsets = parse_offsets(
+                seg, sid_ndim=sid_ndim, link_width=link_width,
+            )
+        except ValueError as e:
+            raise ArrayError(
+                f"{arr_name}: offsets segment {seg!r} does not match the "
+                f"family's sid_ndim={sid_ndim} link_width={link_width}: {e}"
+            ) from e
+        arr_meta = level_group.read_array_meta(arr_name) or {}
+        # Trust the stored width; fall back to recomputing it from the
+        # family policy for an array written before it was stamped.
+        # Guessing here would silently mis-parse every row in the cell.
+        has_perm = bool(arr_meta.get(
+            "has_perm",
+            links_has_perm(
+                offsets, delta=delta, directed=directed, store=store,
+            ),
+        ))
+        ncols = (1 + link_width) if has_perm else link_width
+        flat = delta == 0 and is_intra(offsets)
+        chunks_cache: dict[ChunkCoords, tuple[ChunkCoords, ...]] = {}
+
+        for cell_key in sorted(level_group.list_chunks(arr_name)):
+            blob = level_group.read_bytes(arr_name, cell_key)
+            if not blob:
+                continue
+            src = _parse_chunk_key(cell_key)
+            rows_arr = _link_cell_rows(blob, ncols=ncols, flat=flat)
+            if rows_arr.size == 0:
+                continue
+
+            if src not in chunks_cache:
+                chunks_cache[src] = cell_endpoint_chunks(
+                    src, offsets, scale_src, scale_trg,
+                )
+            chunks = chunks_cache[src]
+
+            if has_perm:
+                perm_list = rows_arr[:, 0].tolist()
+                vi_list = rows_arr[:, 1:1 + link_width].tolist()
+            else:
+                # Identity placement only: rows are already input order.
+                perm_list = None
+                vi_list = rows_arr[:, :link_width].tolist()
+
+            if perm_list is None:
+                for vis in vi_list:
+                    out.append(tuple(zip(chunks, vis)))
+            elif link_width == 2:
+                # The only 2-endpoint perms are identity (0) and swap (1);
+                # avoid the per-row Lehmer decode in apply_perm_inverse.
+                cc0, cc1 = chunks[0], chunks[1]
+                for perm_idx, (v0, v1) in zip(perm_list, vi_list):
+                    ep0 = (cc0, v0)
+                    ep1 = (cc1, v1)
+                    out.append((ep0, ep1) if perm_idx == 0 else (ep1, ep0))
+            else:
+                for perm_idx, vi_placed in zip(perm_list, vi_list):
+                    placed_endpoints = list(zip(chunks, vi_placed))
+                    out.append(tuple(apply_perm_inverse(
+                        placed_endpoints, perm_idx, link_width,
+                    )))
     return out
 
 
-def read_cross_chunk_links_for_tuple(
+def _link_tuple_cell(
+    level_group: FsGroup,
+    chunk_tuple: Sequence[ChunkCoords],
+    delta: int,
+) -> tuple[
+    tuple[ChunkCoords, ...],
+    ChunkCoords,
+    tuple[ChunkCoords, ...],
+    tuple[int, int, bool, str],
+] | None:
+    """Resolve an L-chunk tuple to the one ``(offsets, source, chunks)``
+    cell that can hold its records, plus the family policy.
+
+    The single definition :func:`read_links_for_tuple` and
+    :func:`read_link_attributes_for_tuple` both consult, so a tuple cannot
+    resolve to one cell in the links family and a different one in the
+    attribute family that parallels it.
+
+    Inverts :func:`~zarr_vectors.spatial.boundary._cell_placements` for a
+    query that knows chunks but not vertex indices:
+
+    - An **undirected canonical** family at delta 0 sorts its endpoints by
+      ``(chunk, vi)``.  A ``vi`` only breaks ties between endpoints already
+      in the same chunk, so it never reorders the chunk sequence — sorting
+      the chunks alone reproduces the placement exactly, and callers may
+      pass any order.
+    - Every other family leads with input endpoint 0: ``directed`` and
+      cross-level (``delta != 0``) force the identity placement, and
+      ``duplicate`` files one copy per distinct incident chunk of which
+      the identity is always one.  The tuple is taken as given, so its
+      order is meaningful.
+
+    Offsets are anchor-projected, which is what makes a ``delta != 0``
+    query resolve against the owning level's chunk grid rather than
+    differencing two incommensurable grids.
+
+    Returns ``None`` when the family is absent or carries no policy.
+    """
+    policy = link_family_policy(level_group, delta)
+    if policy is None:
+        return None
+    link_width, sid_ndim, directed, store = policy
+    if len(chunk_tuple) != link_width:
+        raise ArrayError(
+            f"chunk_tuple has {len(chunk_tuple)} chunks; expected "
+            f"link_width={link_width}"
+        )
+    chunks = tuple(tuple(int(c) for c in ch) for ch in chunk_tuple)
+    if sid_ndim is None:
+        # Family group predating the sid_ndim stamp: the query's own arity
+        # is the only evidence, and the arity check below is then vacuous.
+        sid_ndim = len(chunks[0]) if chunks else 0
+    for c in chunks:
+        if len(c) != sid_ndim:
+            raise ArrayError(
+                f"chunk_tuple element {c} has arity {len(c)}; "
+                f"expected sid_ndim={sid_ndim}"
+            )
+
+    if delta == 0 and not directed and store == "canonical":
+        chunks = tuple(sorted(chunks))
+    src = chunks[0]
+
+    from zarr_vectors.spatial.boundary import anchor_chunk
+
+    scale_src, scale_trg = _link_scales(level_group, delta, sid_ndim)
+    anchor = anchor_chunk(src, scale_src, scale_trg)
+    offsets = tuple(
+        tuple(int(c) - int(a) for c, a in zip(ch, anchor)) for ch in chunks[1:]
+    )
+    return offsets, src, chunks, (link_width, sid_ndim, directed, store)
+
+
+def read_links_for_tuple(
     level_group: FsGroup,
     chunk_tuple: Sequence[ChunkCoords],
     *,
@@ -3138,111 +4135,129 @@ def read_cross_chunk_links_for_tuple(
 ) -> list[tuple[tuple[ChunkCoords, int], ...]]:
     """Read records that span exactly the L chunks in ``chunk_tuple``.
 
-    For an **undirected** family the input chunk-tuple is canonical-sorted
-    internally, so callers may pass the chunks in any order.  For a
-    **directed** family the tuple selects a specific directional cell —
-    ``(A, B)`` and ``(B, A)`` are different cells — so the order matters.
+    The single-cell counterpart to :func:`read_links`: the tuple resolves
+    to exactly one ``(offsets, source)`` cell, so only that cell is
+    fetched.  See :func:`_link_tuple_cell` for how the tuple maps to it —
+    in particular an **undirected canonical** family sorts the tuple
+    internally (pass the chunks in any order), while a **directed** or
+    **duplicate** family reads it as input order (``(A, B)`` and ``(B, A)``
+    are different cells).  An all-equal tuple reads that chunk's
+    intra-chunk links, which are no longer a separate family.
     ``len(chunk_tuple)`` must equal the family's ``link_width``.
 
     Returns ``[]`` if no records exist for that exact L-tuple.
     Records are returned in write order, each in original input
     endpoint order (``perm_idx`` is reversed for the caller).
     """
-    full_name = cross_chunk_links_path(delta)
-    if not level_group.array_exists(full_name):
+    resolved = _link_tuple_cell(level_group, chunk_tuple, delta)
+    if resolved is None:
         return []
-    meta = level_group.read_array_meta(full_name) or {}
-    if "link_width" not in meta or "sid_ndim" not in meta:
-        return []
-    link_width = int(meta["link_width"])
-    sid_ndim = int(meta["sid_ndim"])
-    directed = bool(meta.get("directed", False))
-    if len(chunk_tuple) != link_width:
-        raise ArrayError(
-            f"chunk_tuple has {len(chunk_tuple)} chunks; expected "
-            f"link_width={link_width}"
-        )
-    for c in chunk_tuple:
-        if len(c) != sid_ndim:
-            raise ArrayError(
-                f"chunk_tuple element {c} has arity {len(c)}; "
-                f"expected sid_ndim={sid_ndim}"
-            )
+    offsets, src, chunks, (link_width, _sid_ndim, directed, store) = resolved
 
-    # Directed cells key on input order; undirected canonical-sort so any
-    # caller ordering resolves to the one canonical cell.
-    if directed:
-        query_chunks = tuple(tuple(c) for c in chunk_tuple)
-    else:
-        query_chunks = tuple(sorted(tuple(c) for c in chunk_tuple))
-    cell_key = format_cell_key(query_chunks)
-    if not level_group.chunk_exists(full_name, cell_key):
+    full_name = links_path(delta, offsets)
+    key = _chunk_key(src)
+    if not level_group.chunk_exists(full_name, key):
+        return []
+    blob = level_group.read_bytes(full_name, key)
+    if not blob:
         return []
 
-    from zarr_vectors.encoding.ragged import decode_ragged_blob
+    arr_meta = level_group.read_array_meta(full_name) or {}
+    # Trust the stored width; fall back to recomputing it from the family
+    # policy for an array written before it was stamped.  Guessing here
+    # would silently mis-parse every row in the cell.
+    has_perm = bool(arr_meta.get(
+        "has_perm",
+        links_has_perm(offsets, delta=delta, directed=directed, store=store),
+    ))
+    ncols = (1 + link_width) if has_perm else link_width
+    rows_arr = _link_cell_rows(
+        blob, ncols=ncols, flat=(delta == 0 and is_intra(offsets)),
+    )
+    if rows_arr.size == 0:
+        return []
+
     from zarr_vectors.spatial.boundary import apply_perm_inverse
 
-    record_len = 1 + link_width
-    blob = level_group.read_bytes(full_name, cell_key)
-    rows = decode_ragged_blob(
-        blob, np.dtype(np.int64), ncols=record_len,
-    )
     out: list[tuple[tuple[ChunkCoords, int], ...]] = []
-    for row in rows:
-        row_arr = np.asarray(row).reshape(-1)
-        perm_idx = int(row_arr[0])
-        vi_cell = [int(v) for v in row_arr[1:1 + link_width]]
-        cell_endpoints = list(zip(query_chunks, vi_cell))
-        input_order = apply_perm_inverse(
-            cell_endpoints, perm_idx, link_width,
-        )
-        out.append(tuple(input_order))
+    if not has_perm:
+        # Identity placement only: rows are already input order.
+        for vis in rows_arr[:, :link_width].tolist():
+            out.append(tuple(zip(chunks, vis)))
+        return out
+    for row in rows_arr.tolist():
+        perm_idx = int(row[0])
+        placed_endpoints = list(zip(chunks, row[1:1 + link_width]))
+        out.append(tuple(apply_perm_inverse(
+            placed_endpoints, perm_idx, link_width,
+        )))
     return out
 
 
-def read_cross_chunk_link_attributes(
+def read_link_attributes(
     level_group: FsGroup,
     attr_name: str,
     dtype: np.dtype | str | None = None,
     *,
     delta: int = 0,
 ) -> npt.NDArray:
-    """Read per-link attribute data under ``cross_chunk_link_attributes/<name>/<delta>/``.
+    """Read every per-link attribute row under ``link_attributes/<name>/<delta>/``.
 
-    Returns rows in cell-key-sorted order — the same order as
-    :func:`read_cross_chunk_links` returns records.
+    The whole-family counterpart to :func:`write_link_attributes`, and the
+    attribute-side mirror of :func:`read_links`: rows come back in
+    **(offsets segment, cell) sorted order**, which is exactly the order
+    :func:`read_links` returns records, so attribute row ``i`` belongs to
+    link record ``i``.  That shared enumeration is the ONLY thing aligning
+    the two — nothing on disk ties a row to a record — so the two
+    functions must not drift.
+
+    Args:
+        level_group: Resolution level group.
+        attr_name: Attribute name.
+        dtype: Parse the stored bytes as this dtype instead of the one on
+            the array's meta.
+        delta: Level delta.
 
     Returns:
-        Array of shape ``(num_links,)`` or ``(num_links, *row_shape)``.
+        Array of shape ``(num_links,)`` or ``(num_links, *row_shape)``;
+        empty when the family is absent or holds no rows.
     """
-    full_name = cross_chunk_link_attributes_path(attr_name, delta)
-    if not level_group.array_exists(full_name):
+    group_path = link_attributes_group_path(attr_name, delta)
+    if not level_group.array_exists(group_path):
         return np.array([], dtype=dtype or np.float32)
-    meta = level_group.read_array_meta(full_name) or {}
-    if dtype is None:
-        dtype = np.dtype(meta["dtype"])
-    else:
-        dtype = np.dtype(dtype)
-    row_shape = tuple(meta.get("row_shape", ()))
-    row_size = int(np.prod(row_shape)) if row_shape else 1
-    row_bytes = dtype.itemsize * row_size
 
-    chunks: list[npt.NDArray] = []
-    for cell_key in sorted(level_group.list_chunks(full_name)):
-        blob = level_group.read_bytes(full_name, cell_key)
-        if not blob:
-            continue
-        n = len(blob) // row_bytes
-        arr = np.frombuffer(blob, dtype=dtype).reshape(
-            (n, *row_shape) if row_shape else (n,),
+    blocks: list[npt.NDArray] = []
+    row_shape: tuple[int, ...] = ()
+    out_dtype = np.dtype(dtype) if dtype is not None else np.dtype(np.float32)
+    for seg in list_link_attribute_offsets(level_group, attr_name, delta):
+        full_name = f"{group_path}/{seg}"
+        meta = level_group.read_array_meta(full_name) or {}
+        # ``dtype`` / ``row_shape`` come from each array's own meta — a
+        # bare byte blob is undecodable without them.
+        out_dtype = (
+            np.dtype(dtype) if dtype is not None else np.dtype(meta["dtype"])
         )
-        chunks.append(arr.copy())
-    if not chunks:
-        return np.empty((0, *row_shape), dtype=dtype) if row_shape else np.empty((0,), dtype=dtype)
-    return np.concatenate(chunks, axis=0)
+        row_shape = tuple(meta.get("row_shape", ()))
+        row_size = int(np.prod(row_shape)) if row_shape else 1
+        row_bytes = out_dtype.itemsize * row_size
+        for cell_key in sorted(level_group.list_chunks(full_name)):
+            blob = level_group.read_bytes(full_name, cell_key)
+            if not blob:
+                continue
+            n = len(blob) // row_bytes
+            arr = np.frombuffer(blob, dtype=out_dtype).reshape(
+                (n, *row_shape) if row_shape else (n,),
+            )
+            blocks.append(arr.copy())
+    if not blocks:
+        return (
+            np.empty((0, *row_shape), dtype=out_dtype) if row_shape
+            else np.empty((0,), dtype=out_dtype)
+        )
+    return np.concatenate(blocks, axis=0)
 
 
-def read_cross_chunk_link_attributes_for_tuple(
+def read_link_attributes_for_tuple(
     level_group: FsGroup,
     attr_name: str,
     chunk_tuple: Sequence[ChunkCoords],
@@ -3252,11 +4267,18 @@ def read_cross_chunk_link_attributes_for_tuple(
 ) -> npt.NDArray:
     """Read per-link attribute rows for the cell spanning ``chunk_tuple``.
 
-    Returns rows in the same order as
-    :func:`read_cross_chunk_links_for_tuple` returns records for the
-    same chunk-tuple (cell write order).
+    Returns rows in the same order :func:`read_links_for_tuple` returns
+    records for the same tuple (cell write order).  The cell is resolved
+    by :func:`_link_tuple_cell` against the **links** family's policy —
+    attribute meta carries no ``directed`` / ``store`` — so both readers
+    land on the same cell by construction.
     """
-    full_name = cross_chunk_link_attributes_path(attr_name, delta)
+    resolved = _link_tuple_cell(level_group, chunk_tuple, delta)
+    if resolved is None:
+        return np.array([], dtype=dtype or np.float32)
+    offsets, src, _chunks, _policy = resolved
+
+    full_name = link_attributes_path(attr_name, delta, offsets)
     if not level_group.array_exists(full_name):
         return np.array([], dtype=dtype or np.float32)
     meta = level_group.read_array_meta(full_name) or {}
@@ -3268,19 +4290,13 @@ def read_cross_chunk_link_attributes_for_tuple(
     row_size = int(np.prod(row_shape)) if row_shape else 1
     row_bytes = dtype.itemsize * row_size
 
-    # Cell keys must match the parallel links family — read its `directed`
-    # flag (attribute meta doesn't carry it) to pick the same ordering.
-    links_meta = level_group.read_array_meta(
-        cross_chunk_links_path(delta)
-    ) or {}
-    if bool(links_meta.get("directed", False)):
-        query_chunks = tuple(tuple(c) for c in chunk_tuple)
-    else:
-        query_chunks = tuple(sorted(tuple(c) for c in chunk_tuple))
-    cell_key = format_cell_key(query_chunks)
-    if not level_group.chunk_exists(full_name, cell_key):
-        return np.empty((0, *row_shape), dtype=dtype) if row_shape else np.empty((0,), dtype=dtype)
-    blob = level_group.read_bytes(full_name, cell_key)
+    key = _chunk_key(src)
+    if not level_group.chunk_exists(full_name, key):
+        return (
+            np.empty((0, *row_shape), dtype=dtype) if row_shape
+            else np.empty((0,), dtype=dtype)
+        )
+    blob = level_group.read_bytes(full_name, key)
     n = len(blob) // row_bytes
     return np.frombuffer(blob, dtype=dtype).reshape(
         (n, *row_shape) if row_shape else (n,),
@@ -3320,7 +4336,7 @@ def _list_deltas_under(level_group: FsGroup, group_path: str) -> list[int]:
     Returns the sorted list of integers parsed from immediate child
     names that look like delta segments (``"0"``, ``"+N"``, ``"-N"``).
     Returns an empty list when the parent group is absent.  Used by the
-    public ``list_link_deltas`` / ``list_cross_link_deltas`` helpers
+    public ``list_link_deltas`` / ``list_link_attribute_deltas`` helpers
     (and indirectly by readers and validators that walk the multiscale
     link layout).
     """
@@ -3344,21 +4360,9 @@ def list_link_deltas(level_group: FsGroup) -> list[int]:
     return _list_deltas_under(level_group, LINKS)
 
 
-def list_cross_link_deltas(level_group: FsGroup) -> list[int]:
-    """Sorted list of ``<delta>`` values present under ``cross_chunk_links/``."""
-    return _list_deltas_under(level_group, CROSS_CHUNK_LINKS)
-
-
 def list_link_attribute_deltas(level_group: FsGroup, name: str) -> list[int]:
     """Sorted list of ``<delta>`` values present under ``link_attributes/<name>/``."""
     return _list_deltas_under(level_group, f"{LINK_ATTRIBUTES}/{name}")
-
-
-def list_cross_chunk_link_attribute_deltas(
-    level_group: FsGroup, name: str,
-) -> list[int]:
-    """Sorted list of ``<delta>`` values under ``cross_chunk_link_attributes/<name>/``."""
-    return _list_deltas_under(level_group, f"{CROSS_CHUNK_LINK_ATTRIBUTES}/{name}")
 
 
 def resolve_chunk_keys(
@@ -3457,9 +4461,14 @@ def _read_modify_write_blob(
     """
     try:
         raw = level_group.read_bytes(full_name, key)
-        existing = decode_fn(raw)
     except StoreError:
-        existing = initial
+        raw = b""
+    # An allocated-but-never-written cell reads back b"" — the vlen fill
+    # value — which means "nothing here yet", not "corrupt".  Only StoreError
+    # used to signal absence; since every per-chunk array became a single
+    # vlen array, absence usually arrives as empty bytes instead, and
+    # decode_fn raises ArrayError on those.  Treat both as absent.
+    existing = decode_fn(raw) if raw else initial
     combined = merge_fn(existing)
     level_group.write_bytes(full_name, key, encode_fn(combined))
     return combined, existing

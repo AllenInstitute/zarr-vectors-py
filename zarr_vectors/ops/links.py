@@ -1,18 +1,25 @@
-"""Link edits: intra-chunk + cross-chunk + convention-aware.
+"""Link edits: cell-addressed + convention-aware.
 
-Three storage shapes are involved:
+Connectivity is one family.  ``links/<delta>/<offsets>/`` is a rank-D
+vlen array whose cell is the record's **source** chunk; ``offsets`` are
+the other endpoints' chunk offsets relative to that source, so endpoint
+``k``'s index is local to ``src + offsets[k - 1]``.  An intra-chunk link
+is simply one whose offsets are all zero — not a separate shape — and a
+cross-chunk link one whose offsets are not.  Every link therefore lives
+in a cell addressed by ``(offsets, source_chunk)``, which is exactly what
+:class:`~zarr_vectors.ops.refs.LinkRef` names.
 
-- ``links/<delta>/<chunk>``: per-chunk ragged ints, one group per
-  vertex fragment.  Indices are chunk-local.  This is where intra-chunk
-  edges live; under ``implicit_sequential_with_branches`` it also holds
-  branch-override rows (child → parent pairs that contradict the
-  implicit ``parent = i-1`` baseline).
-- ``cross_chunk_links/<delta>/data``: global flat array of
-  ``(chunk_coords, vertex_idx)`` endpoint records.  This is where
-  edges spanning chunks live.
-- ``link_attributes/<name>/<delta>/<chunk>`` /
-  ``cross_chunk_link_attributes/<name>/<delta>/data``: per-link
-  attribute payloads parallel to the link rows.
+``link_attributes/<name>/<delta>/<offsets>/`` mirrors it cell for cell.
+
+Under ``implicit_sequential_with_branches`` the intra cell additionally
+holds branch-override rows (child → parent pairs contradicting the
+implicit ``parent = i-1`` baseline).
+
+Placement is never decided here: records route through
+:func:`zarr_vectors.core.arrays._partition_links`, the same choke point
+the whole-family writer uses, so an edit lands in the cell a rewrite
+would have chosen.  Because the ref names a cell, a staged append knows
+its row index immediately — no post-flush prediction.
 
 Convention contract:
 
@@ -41,7 +48,8 @@ from zarr_vectors.constants import (
     LINKS_IMPLICIT_SEQUENTIAL,
 )
 from zarr_vectors.exceptions import EditError
-from zarr_vectors.ops.refs import CrossChunkLinkRef, LinkRef
+from zarr_vectors.ops.change_set import LinkCell, link_cell
+from zarr_vectors.ops.refs import LinkRef
 from zarr_vectors.typing import ChunkCoords
 
 if TYPE_CHECKING:
@@ -49,99 +57,223 @@ if TYPE_CHECKING:
 
 
 # ---------------------------------------------------------------------
-# Intra-chunk link edits
+# Link edits
 # ---------------------------------------------------------------------
+
+def _link_family_settings(
+    session: EditSession, level: int, delta: int, link_width: int,
+) -> tuple[int, bool, str]:
+    """``(link_width, directed, store)`` for ``links/<delta>/``.
+
+    The family group owns the policy every cell under it shares; absent
+    means the family does not exist yet and this edit's defaults create
+    it.
+    """
+    from zarr_vectors.core.arrays import link_family_policy
+    from zarr_vectors.core.store import get_resolution_level
+
+    level_group = get_resolution_level(session.root, level)
+    policy = link_family_policy(level_group, delta)
+    if policy is None:
+        return (link_width, False, "canonical")
+    fam_width, _sid_ndim, directed, store = policy
+    return (int(fam_width), bool(directed), str(store))
+
+
+def _require_ref_cell(
+    session: EditSession, ref: LinkRef, op: str,
+) -> tuple[object, LinkCell, npt.NDArray[np.integer]]:
+    """Load the cell ``ref`` addresses and bounds-check it.
+
+    Returns ``(builder, cell, row_group)`` where ``cell`` is the
+    ``(delta, offsets)`` :data:`LinkCell`.  Raises :class:`EditError`
+    when the cell, the fragment or the row is absent — a stale ref must
+    not silently edit the wrong row.
+    """
+    from zarr_vectors.core.paths import intra_offsets
+
+    link_width, _directed, _store = _link_family_settings(
+        session, ref.level, ref.delta, 2,
+    )
+    offsets = (
+        intra_offsets(len(ref.chunk), link_width)
+        if ref.offsets is None else ref.offsets
+    )
+    builder = session._builder(ref.level, ref.chunk)
+    groups = builder.require_links(
+        session.root, delta=ref.delta, link_width=link_width, offsets=offsets,
+    )
+    if ref.fragment >= len(groups):
+        raise EditError(
+            f"{op}: fragment {ref.fragment} out of range for chunk "
+            f"{ref.chunk} cell delta={ref.delta} offsets={ref.offsets} "
+            f"({len(groups)} groups)"
+        )
+    group = groups[ref.fragment]
+    if ref.row >= group.shape[0]:
+        raise EditError(
+            f"{op}: row {ref.row} out of range in fragment {ref.fragment} "
+            f"(size {group.shape[0]})"
+        )
+    return builder, link_cell(ref.delta, offsets), group
+
 
 def add_link_in_session(
     session: EditSession,
     *,
     level: int,
-    src: int,
-    dst: int,
+    src: int | None = None,
+    dst: int | None = None,
     chunk: ChunkCoords | None = None,
+    endpoints: list[tuple[ChunkCoords, int]] | None = None,
     fragment: int | None = None,
     delta: int = 0,
     attrs: dict[str, npt.ArrayLike] | None = None,
     update_objects: bool = False,
-) -> LinkRef | CrossChunkLinkRef:
-    """Append a link.
+) -> LinkRef:
+    """Append a link at any offset and any level delta.
+
+    Two spellings of the same operation:
+
+    - ``endpoints=[(chunk, vi), ...]`` — the general form.  Every
+      endpoint names its own chunk, so the record may span chunks or
+      levels.
+    - ``src=`` / ``dst=`` / ``chunk=`` — shorthand for the common
+      two-endpoint case where both indices are local to one chunk; it
+      expands to ``endpoints=[(chunk, src), (chunk, dst)]``.
+
+    Placement is delegated to the core partitioner, so the record lands
+    in the cell a whole-family rewrite would have chosen — including the
+    all-zero (intra) cell when every endpoint shares a chunk.  Nothing
+    here special-cases intra vs cross.
 
     Args:
-        src, dst: chunk-local vertex indices when ``chunk`` is given;
-            otherwise interpreted as global indices and routed to
-            cross-chunk storage when the endpoints fall in different
-            chunks (currently raised; multi-chunk routing is a future
-            iteration).
-        chunk: required for intra-chunk add (``delta=0``).  The link is
-            written into the link group for ``fragment`` (default: the
-            first fragment in the chunk).
-        delta: ``0`` for intra-level, non-zero for cross-level (not yet
-            supported by this helper — call write_chunk_links directly).
+        endpoints: Full ``(chunk_coords, vertex_index)`` per endpoint.
+        src, dst, chunk: Shorthand for a one-chunk two-endpoint record.
+        fragment: Which row group of the target cell receives the row.
+            Only meaningful for the intra cell, whose groups track vertex
+            fragments; defaults to the chunk's first fragment.  Ignored
+            for other cells, which have no per-vertex-fragment meaning.
+        delta: ``0`` intra-level, non-zero cross-level.
         attrs: per-link attribute values to write alongside the new row.
+        update_objects: merge the endpoints' objects when the new edge
+            bridges two OIDs.
+
+    Returns:
+        A :class:`LinkRef` naming the row just staged.  Under
+        ``store="duplicate"`` the record is filed in several cells; the
+        ref names the first in sorted cell order.
     """
     _check_link_convention(session, write_branch_entry=True, level=level)
-    if delta != 0:
+
+    if endpoints is None:
+        if chunk is None or src is None or dst is None:
+            raise EditError(
+                "add_link requires either endpoints=[(chunk, vi), ...] or "
+                "all of src=, dst= and chunk=."
+            )
+        endpoints = [(chunk, int(src)), (chunk, int(dst))]
+    elif src is not None or dst is not None:
         raise EditError(
-            f"add_link(delta={delta}) is not supported in this iteration; "
-            f"use the multi-resolution coarsen pipeline for cross-level links."
+            "add_link takes endpoints= or src=/dst=, not both."
         )
-    if chunk is None:
+    record = [
+        (tuple(int(c) for c in cc), int(vi)) for cc, vi in endpoints
+    ]
+    if len(record) < 2:
         raise EditError(
-            "add_link requires chunk= to be supplied so the row can be "
-            "placed in the correct per-chunk link group."
+            f"add_link needs at least 2 endpoints, got {len(record)}"
         )
 
-    builder = session._builder(level, chunk)
-    link_width = 2
-    groups = builder.require_links(session.root, delta=0, link_width=link_width)
-    if not groups:
-        raise EditError(
-            f"add_link: chunk {chunk} has no vertex fragments yet; add a "
-            f"vertex first or call add_fragment()."
-        )
-    target_frag = 0 if fragment is None else int(fragment)
-    if target_frag < 0 or target_frag >= len(groups):
-        raise EditError(
-            f"add_link: fragment {target_frag} out of range for chunk "
-            f"{chunk} (has {len(groups)} fragments)"
-        )
-    row = np.asarray([int(src), int(dst)], dtype=np.int64)
-    new_row_idx = builder.append_link_row(0, target_frag, row)
+    from zarr_vectors.core.arrays import (
+        _pack_link_rows,
+        _partition_links,
+        links_has_perm,
+    )
+    from zarr_vectors.core.paths import parse_offsets
+    from zarr_vectors.core.store import get_resolution_level
 
-    if attrs:
-        _write_link_attr_row(
-            session, level, chunk, target_frag, new_row_idx, attrs,
+    sid_ndim = len(record[0][0])
+    link_width, directed, store = _link_family_settings(
+        session, level, delta, len(record),
+    )
+    if len(record) != link_width:
+        raise EditError(
+            f"add_link: record has {len(record)} endpoints but "
+            f"links/{delta} is a link_width={link_width} family."
         )
-
-    session._mark_edit(level)
-    new_ref = LinkRef(
-        level=level,
-        chunk=tuple(int(c) for c in chunk),
-        fragment=target_frag,
-        row=new_row_idx,
-        delta=0,
+    level_group = get_resolution_level(session.root, level)
+    buckets = _partition_links(
+        level_group, [record], link_width, sid_ndim,
+        delta=delta, directed=directed, store=store,
     )
 
+    new_ref: LinkRef | None = None
+    for (seg, src_chunk), entries in sorted(buckets.items()):
+        offsets = parse_offsets(seg, sid_ndim=sid_ndim, link_width=link_width)
+        builder = session._builder(level, src_chunk)
+        groups = builder.require_links(
+            session.root, delta=delta, link_width=link_width, offsets=offsets,
+        )
+        cell = link_cell(delta, offsets)
+        if cell[1] is None:
+            # Intra rows are indexed per vertex fragment, so the chunk must
+            # already have one to address.
+            if not groups:
+                raise EditError(
+                    f"add_link: chunk {src_chunk} has no vertex fragments "
+                    f"yet; add a vertex first or call add_fragment()."
+                )
+            target_frag = 0 if fragment is None else int(fragment)
+            if target_frag < 0 or target_frag >= len(groups):
+                raise EditError(
+                    f"add_link: fragment {target_frag} out of range for "
+                    f"chunk {src_chunk} (has {len(groups)} fragments)"
+                )
+        else:
+            target_frag = 0
+        rows = _pack_link_rows(
+            entries,
+            has_perm=links_has_perm(
+                offsets, delta=delta, directed=directed, store=store,
+            ),
+            link_width=link_width,
+            dtype=np.int64,
+        )
+        for row in rows:
+            row_idx = builder.append_link_row(cell, target_frag, row)
+        ref = LinkRef(
+            level=level, chunk=src_chunk, fragment=target_frag,
+            row=row_idx, delta=delta, offsets=offsets,
+        )
+        if new_ref is None:
+            new_ref = ref
+            if attrs:
+                _write_link_attr_row(session, ref, attrs)
+
+    if new_ref is None:  # unreachable: one record always buckets somewhere
+        raise EditError(f"add_link: record {record} produced no placement")
+
+    session._mark_edit(level)
+
     if update_objects:
-        # If the two endpoints belong to different OIDs at ``level``,
-        # merge them.  When the OID lookup is ambiguous (unreferenced
-        # fragment, or src/dst point at the same OID) the call is a
-        # no-op beyond the link row write.
+        # If the endpoints belong to different OIDs at ``level``, merge
+        # them.  Each endpoint resolves against its own chunk, so this
+        # works for a cross-chunk edge too.  When the OID lookup is
+        # ambiguous (unreferenced fragment, or both endpoints in one OID)
+        # the call is a no-op beyond the link row write.
         from zarr_vectors.ops.objects import _merge_objects_impl, _oid_for_endpoint
-        oid_src = _oid_for_endpoint(
-            session, level=level, chunk=new_ref.chunk, vertex_chunk_local=int(src),
-        )
-        oid_dst = _oid_for_endpoint(
-            session, level=level, chunk=new_ref.chunk, vertex_chunk_local=int(dst),
-        )
-        if (
-            oid_src is not None
-            and oid_dst is not None
-            and oid_src != oid_dst
-        ):
+        oids = {
+            _oid_for_endpoint(
+                session, level=level, chunk=cc, vertex_chunk_local=vi,
+            )
+            for cc, vi in record
+        }
+        oids.discard(None)
+        if len(oids) > 1:
             _merge_objects_impl(
                 session,
-                oids=[oid_src, oid_dst],
+                oids=sorted(int(o) for o in oids),
                 level=level,
                 atomic=session.atomic,
             )
@@ -158,44 +290,47 @@ def edit_link_in_session(
     update_objects: bool = False,
 ) -> None:
     _check_link_convention(session, write_branch_entry=True, level=ref.level)
-    if ref.delta != 0:
+    builder, cell, group = _require_ref_cell(session, ref, "edit_link")
+
+    if new_endpoints is not None and not ref.is_intra:
+        # Endpoints are chunk-local index pairs, which only describes a
+        # row of the intra cell.  Re-pointing a cross-cell record can move
+        # it to a different cell entirely, so it is a remove + add, not an
+        # in-place rewrite.
         raise EditError(
-            f"edit_link(delta={ref.delta}) is not supported; "
-            f"cross-level links are managed by the coarsen pipeline."
-        )
-    builder = session._builder(ref.level, ref.chunk)
-    groups = builder.require_links(session.root, delta=0, link_width=2)
-    if ref.fragment < 0 or ref.fragment >= len(groups):
-        raise EditError(
-            f"edit_link: fragment {ref.fragment} out of range for chunk "
-            f"{ref.chunk}"
-        )
-    group = groups[ref.fragment]
-    if ref.row < 0 or ref.row >= group.shape[0]:
-        raise EditError(
-            f"edit_link: row {ref.row} out of range in fragment "
-            f"{ref.fragment} (size {group.shape[0]})"
+            f"edit_link(new_endpoints=...) needs an intra-chunk link; "
+            f"{ref} is in cell offsets={ref.offsets}.  Re-point it with "
+            f"remove_link(ref) + add_link(endpoints=[...]) so the record "
+            f"is re-routed to the cell its new endpoints imply."
         )
 
     # Capture the pre-edit endpoints so update_objects can run split
     # against the OIDs that held the OLD edge (before we change it).
-    old_src, old_dst = int(group[ref.row, 0]), int(group[ref.row, 1])
+    # Intra only: elsewhere column 0 may be perm_idx, and a link_width=1
+    # cell has no column 1 at all.
+    if ref.is_intra:
+        old_src, old_dst = int(group[ref.row, 0]), int(group[ref.row, 1])
 
     if new_endpoints is not None:
         src, dst = int(new_endpoints[0]), int(new_endpoints[1])
         new_row = np.asarray([src, dst], dtype=group.dtype)
         if atomic:
-            new_idx = builder.append_link_row(0, ref.fragment, new_row)
+            new_idx = builder.append_link_row(cell, ref.fragment, new_row)
             target_row = new_idx
         else:
-            builder.overwrite_link_row(0, ref.fragment, ref.row, new_row)
+            builder.overwrite_link_row(cell, ref.fragment, ref.row, new_row)
             target_row = ref.row
     else:
         target_row = ref.row
 
     if new_attrs:
         _write_link_attr_row(
-            session, ref.level, ref.chunk, ref.fragment, target_row, new_attrs,
+            session,
+            LinkRef(
+                level=ref.level, chunk=ref.chunk, fragment=ref.fragment,
+                row=target_row, delta=ref.delta, offsets=ref.offsets,
+            ),
+            new_attrs,
         )
     session._mark_edit(ref.level)
 
@@ -266,30 +401,30 @@ def remove_link_in_session(
     group (links have no OID identity, so atomic == minimal for the
     remove case — the ``atomic`` kwarg only affects the
     ``update_objects=True`` split pass).
+
+    Works on any cell: the ref names the row's address, so an intra and a
+    cross-chunk link are dropped the same way.  ``update_objects=True``
+    is intra-only — the split pass reads the dropped row as a pair of
+    chunk-local indices.
     """
     _check_link_convention(session, write_branch_entry=True, level=ref.level)
-    if ref.delta != 0:
-        raise EditError(
-            f"remove_link(delta={ref.delta}) is not supported; "
-            f"cross-level links are managed by the coarsen pipeline."
-        )
-    builder = session._builder(ref.level, ref.chunk)
-    builder.require_links(session.root, delta=0, link_width=2)
+    builder, cell, group = _require_ref_cell(session, ref, "remove_link")
 
     # Capture the endpoints of the row we're about to drop so the
     # update_objects=True split pass can target the right OID(s).
     old_src, old_dst = None, None
     if update_objects:
-        groups = builder.link_groups.get(0)
-        if (
-            groups is not None
-            and 0 <= ref.fragment < len(groups)
-            and 0 <= ref.row < groups[ref.fragment].shape[0]
-        ):
-            old_src = int(groups[ref.fragment][ref.row, 0])
-            old_dst = int(groups[ref.fragment][ref.row, 1])
+        if not ref.is_intra:
+            raise EditError(
+                f"remove_link(update_objects=True) needs an intra-chunk "
+                f"link; {ref} is in cell offsets={ref.offsets}.  Drop it "
+                f"with update_objects=False and adjust object membership "
+                f"explicitly."
+            )
+        old_src = int(group[ref.row, 0])
+        old_dst = int(group[ref.row, 1])
 
-    builder.drop_link_row(0, ref.fragment, ref.row)
+    builder.drop_link_row(cell, ref.fragment, ref.row)
     session._mark_edit(ref.level)
 
     if update_objects and old_src is not None and old_dst is not None:
@@ -320,7 +455,13 @@ def remove_link_in_session(
 
 
 # ---------------------------------------------------------------------
-# Cross-chunk link edits
+# Cross-chunk spellings
+#
+# Kept as named entry points because "add a link spanning chunks" is a
+# distinct intent worth naming, but they are no longer a separate
+# mechanism: each is the general path with endpoints that happen to
+# straddle chunks.  A record whose endpoints all land in one chunk routes
+# to the intra cell here exactly as it would through add_link.
 # ---------------------------------------------------------------------
 
 def add_cross_chunk_link_in_session(
@@ -329,63 +470,41 @@ def add_cross_chunk_link_in_session(
     level: int,
     endpoints: list[tuple[ChunkCoords, int]],
     delta: int = 0,
-) -> CrossChunkLinkRef:
-    """Stage an append into ``cross_chunk_links/<delta>/data``."""
-    _check_link_convention(session, write_branch_entry=True, level=level)
-    from zarr_vectors.ops.change_set import CrossChunkLinkOp
-    payload = [
-        (tuple(int(c) for c in cc), int(vi)) for cc, vi in endpoints
-    ]
-    session._ccl_ops.append(
-        CrossChunkLinkOp(op="append", delta=int(delta), payload=payload),
-    )
-    session._mark_edit(level)
-    # The row index is only known after flush; we return a ref pointing
-    # at the optimistic post-append position so callers can chain edits
-    # within the same session (flush_ccl_ops applies ops in order).
-    return CrossChunkLinkRef(
-        level=level,
-        row=_predict_ccl_row_index(session, level, delta),
-        delta=int(delta),
+) -> LinkRef:
+    """Append a link given full ``(chunk, vertex_index)`` endpoints."""
+    return add_link_in_session(
+        session, level=level, endpoints=endpoints, delta=delta,
     )
 
 
 def edit_cross_chunk_link_in_session(
     session: EditSession,
-    ref: CrossChunkLinkRef,
+    ref: LinkRef,
     *,
     new_endpoints: list[tuple[ChunkCoords, int]],
     atomic: bool,
-) -> None:
+) -> LinkRef:
+    """Re-point a link at new ``(chunk, vertex_index)`` endpoints.
+
+    New endpoints may imply a different cell, so this is a re-route, not
+    an in-place rewrite: the record is added at its new address and the
+    old row dropped unless ``atomic`` keeps it.  Returns the new ref —
+    the old one is stale either way, since dropping a row shifts the rows
+    after it within its group.
+    """
     _check_link_convention(session, write_branch_entry=True, level=ref.level)
-    from zarr_vectors.ops.change_set import CrossChunkLinkOp
-    payload = [
-        (tuple(int(c) for c in cc), int(vi)) for cc, vi in new_endpoints
-    ]
-    if atomic:
-        # Atomic = append the new row, leave the old one in place.
-        session._ccl_ops.append(
-            CrossChunkLinkOp(op="append", delta=ref.delta, payload=payload),
-        )
-    else:
-        session._ccl_ops.append(
-            CrossChunkLinkOp(
-                op="overwrite", delta=ref.delta,
-                payload=payload, index=ref.row,
-            ),
-        )
-    session._mark_edit(ref.level)
+    if not atomic:
+        remove_link_in_session(session, ref, atomic=False)
+    return add_link_in_session(
+        session, level=ref.level, endpoints=new_endpoints, delta=ref.delta,
+    )
 
 
 def remove_cross_chunk_link_in_session(
     session: EditSession,
-    ref: CrossChunkLinkRef,
+    ref: LinkRef,
 ) -> None:
-    from zarr_vectors.ops.change_set import CrossChunkLinkOp
-    session._ccl_ops.append(
-        CrossChunkLinkOp(op="delete", delta=ref.delta, index=ref.row),
-    )
-    session._mark_edit(ref.level)
+    remove_link_in_session(session, ref, atomic=True)
 
 
 # ---------------------------------------------------------------------
@@ -535,8 +654,9 @@ def reorder_vertices_implicit(
     chunk-local indices in DFS order.  Edges along the spine then
     collapse under the ``implicit_sequential_with_branches`` baseline
     (``parent[i] = i-1`` over the reader's chunk-sorted concatenation);
-    only true branch overrides remain in ``links/0/<chunk>`` /
-    ``cross_chunk_links/0``.
+    only true branch overrides remain, in ``links/0/<offsets>/<chunk>`` —
+    the all-zero offsets cell for a within-chunk override, a non-zero one
+    for an override whose endpoints straddle chunks.
 
     Objects whose link graph is not a tree (cycles, multi-parent,
     disconnected within their manifest) are skipped with a
@@ -569,20 +689,26 @@ def reorder_vertices_implicit(
     import warnings
 
     from zarr_vectors.core.arrays import (
+        finalize_links,
+        list_link_offsets,
         read_all_object_manifests,
         read_chunk_link_attributes,
         read_chunk_links,
         read_chunk_vertices,
-        read_cross_chunk_link_attributes,
-        read_cross_chunk_links,
+        read_link_attributes,
+        read_links,
         read_vertex_fragment_index,
         write_chunk_fragment_attributes,
         write_chunk_links,
         write_chunk_vertices,
-        write_cross_chunk_links,
+        write_link_attribute_cells,
+        write_link_attributes,
+        write_link_cells,
+        write_links,
         write_object_index,
     )
     from zarr_vectors.core.metadata import RootMetadata
+    from zarr_vectors.core.paths import links_group_path
     from zarr_vectors.core.store import get_resolution_level
 
     _empty_report = lambda: {
@@ -711,10 +837,23 @@ def reorder_vertices_implicit(
                     continue
                 oid_edges[co[0]].append((cv, pv))
 
-    all_ccls = read_cross_chunk_links(level_group, delta=0)
+    # read_links returns the whole family, intra cells included; the loop
+    # above already collected those from the per-chunk read, so take only
+    # the records that actually span chunks.
+    #
+    # Keep each record's index into the *unfiltered* family: the parallel
+    # attribute family is one row per record over that same full set, so
+    # Phase F must index it by the original position, not by the position
+    # within this filtered list.
+    _all_records = read_links(level_group, delta=0)
+    cross_src_idx = [
+        i for i, record in enumerate(_all_records)
+        if len({tuple(cc) for cc, _vi in record}) > 1
+    ]
+    all_ccls = [_all_records[i] for i in cross_src_idx]
     for record in all_ccls:
         if len(record) != 2:
-            continue  # only handle edge-shaped (link_width=2) CCLs
+            continue  # only handle edge-shaped (link_width=2) records
         (cc_a, vi_a), (cc_b, vi_b) = record
         va = (tuple(cc_a), int(vi_a))
         vb = (tuple(cc_b), int(vi_b))
@@ -1056,11 +1195,11 @@ def reorder_vertices_implicit(
     new_ccl_records: list = []
     new_ccl_attr_rows: dict = {}  # fname -> list of attribute rows in new record order
 
-    ccl_attr_names = _list_cross_chunk_link_attribute_names(level_group, delta=0)
+    ccl_attr_names = _list_link_attribute_names(level_group, delta=0)
     ccl_attrs: dict = {}
     for fname in ccl_attr_names:
         try:
-            ccl_attrs[fname] = read_cross_chunk_link_attributes(
+            ccl_attrs[fname] = read_link_attributes(
                 level_group, fname, delta=0,
             )
         except Exception:
@@ -1068,12 +1207,15 @@ def reorder_vertices_implicit(
         new_ccl_attr_rows[fname] = []
 
     for i, record in enumerate(all_ccls):
+        # ``src_i`` indexes the full family that the attribute rows
+        # parallel; ``i`` only indexes the cross-spanning subset.
+        src_i = cross_src_idx[i]
         if len(record) != 2:
             # Pass through (e.g. triangle CCLs, link_width != 2).
             new_ccl_records.append(record)
             for fname in ccl_attr_names:
-                if ccl_attrs[fname] is not None and i < ccl_attrs[fname].shape[0]:
-                    new_ccl_attr_rows[fname].append(ccl_attrs[fname][i])
+                if ccl_attrs[fname] is not None and src_i < ccl_attrs[fname].shape[0]:
+                    new_ccl_attr_rows[fname].append(ccl_attrs[fname][src_i])
             continue
         (cc_a, vi_a), (cc_b, vi_b) = record
         va = (tuple(cc_a), int(vi_a))
@@ -1097,8 +1239,8 @@ def reorder_vertices_implicit(
         )
         new_ccl_records.append(new_record)
         for fname in ccl_attr_names:
-            if ccl_attrs[fname] is not None and i < ccl_attrs[fname].shape[0]:
-                new_ccl_attr_rows[fname].append(ccl_attrs[fname][i])
+            if ccl_attrs[fname] is not None and src_i < ccl_attrs[fname].shape[0]:
+                new_ccl_attr_rows[fname].append(ccl_attrs[fname][src_i])
 
     # Append new branch overrides discovered in Phase D
     for (parent_endpoint, child_endpoint) in new_cross_branches:
@@ -1116,25 +1258,45 @@ def reorder_vertices_implicit(
             if src is not None and src.shape[0] > 0:
                 new_ccl_attr_rows[fname].append(np.zeros_like(src[0]))
 
+    # Only the cross-spanning records reach here — Phase E owns the
+    # all-zero-offsets (intra) array.  ``write_links(mode="replace")``
+    # scopes its delete to the offset arrays these records target, so the
+    # intra array survives; do not widen that scope.
+    cross_partition = None
     if new_ccl_records:
-        write_cross_chunk_links(
+        cross_partition = write_links(
             level_group, new_ccl_records, sid_ndim=sid_ndim,
             delta=0, link_width=2, mode="replace",
         )
     else:
-        # write_cross_chunk_links short-circuits on empty input — drop
-        # the family ourselves so stale records don't survive.
-        from zarr_vectors.core.paths import cross_chunk_links_path
-        full_name = cross_chunk_links_path(0)
-        if level_group.array_exists(full_name):
-            level_group.delete_subtree(full_name)
+        # write_links short-circuits on empty input, so drop the stale
+        # cross-offset arrays ourselves.  Delete per segment rather than
+        # the whole links/<0> group: that group now also holds the intra
+        # links Phase E just rewrote, and a family-wide wipe would
+        # silently destroy them.
+        from zarr_vectors.core.paths import is_intra, parse_offsets
+
+        for seg in list_link_offsets(level_group, 0):
+            try:
+                offs = parse_offsets(seg, sid_ndim=sid_ndim, link_width=2)
+            except ValueError:
+                continue
+            if is_intra(offs):
+                continue
+            level_group.delete_subtree(f"{links_group_path(0)}/{seg}")
+
     for fname in ccl_attr_names:
         rows = new_ccl_attr_rows[fname]
-        if rows and ccl_attrs[fname] is not None:
-            from zarr_vectors.core.arrays import write_cross_chunk_link_attributes
+        if rows and ccl_attrs[fname] is not None and cross_partition is not None:
             arr = np.stack(rows, axis=0) if rows[0].ndim > 0 else np.asarray(rows)
-            write_cross_chunk_link_attributes(
-                level_group, fname, arr, dtype=arr.dtype, delta=0,
+            # Pass the partition from the matching write_links: rows are in
+            # input order, and the partition is what maps them onto the
+            # (offsets, cell) layout that writer chose.
+            write_link_attributes(
+                level_group, fname, arr,
+                num_links=cross_partition.num_links,
+                partition=cross_partition,
+                delta=0,
             )
 
     # --- Phase G: manifests + convention flip ------------------------
@@ -1275,48 +1437,31 @@ def _list_fragment_attribute_names(level_group) -> list:
 
 
 def _list_link_attribute_names(level_group, *, delta: int = 0) -> list:
+    """Attribute names with a ``link_attributes/<name>/<delta>/`` family.
+
+    Covers every link attribute at this delta — intra and cross-chunk
+    alike — since the offsets arrays all hang under the one delta group.
+    """
     from zarr_vectors.constants import LINK_ATTRIBUTES
+    from zarr_vectors.core.paths import format_delta
     try:
         g = level_group.zarr_group.get(LINK_ATTRIBUTES)
     except Exception:
         return []
     if g is None:
         return []
+    # format_delta, not str: delta=+1 is the directory "+1", so str(delta)
+    # would look for "1" and silently match nothing.
+    segment = format_delta(delta)
     names: list = []
     try:
         for name in sorted(list(g.group_keys())):
             sub = g.get(name)
             if sub is None:
                 continue
-            # link_attributes/<name>/<delta> is a single vlen array, so
-            # the delta child lives under array_keys (not group_keys).
             try:
                 delta_children = set(sub.array_keys()) | set(sub.group_keys())
-                if str(delta) in delta_children:
-                    names.append(name)
-            except Exception:
-                continue
-    except Exception:
-        return []
-    return names
-
-
-def _list_cross_chunk_link_attribute_names(level_group, *, delta: int = 0) -> list:
-    from zarr_vectors.constants import CROSS_CHUNK_LINK_ATTRIBUTES
-    try:
-        g = level_group.zarr_group.get(CROSS_CHUNK_LINK_ATTRIBUTES)
-    except Exception:
-        return []
-    if g is None:
-        return []
-    names: list = []
-    try:
-        for name in sorted(list(g.group_keys())):
-            sub = g.get(name)
-            if sub is None:
-                continue
-            try:
-                if str(delta) in list(sub.group_keys()):
+                if segment in delta_children:
                     names.append(name)
             except Exception:
                 continue
@@ -1461,48 +1606,20 @@ def _auto_materialise_to_explicit(
 
 def _write_link_attr_row(
     session: EditSession,
-    level: int,
-    chunk: ChunkCoords,
-    fragment: int,
-    row: int,
+    link_ref: LinkRef,
     attrs: dict[str, npt.ArrayLike],
 ) -> None:
-    """RMW a per-link attribute row.  Delegates to the attributes
-    module's per-link path."""
+    """RMW a per-link attribute row in the cell mirroring ``link_ref``.
+
+    Delegates to the attributes module's per-link path.
+    """
     from zarr_vectors.ops.attributes import _edit_link_attr
     from zarr_vectors.ops.refs import AttributeRef
     for name, val in attrs.items():
-        ref = AttributeRef(
-            scope="link",
-            name=name,
-            target=LinkRef(
-                level=level, chunk=chunk, fragment=fragment,
-                row=row, delta=0,
-            ),
+        _edit_link_attr(
+            session,
+            AttributeRef(scope="link", name=name, target=link_ref),
+            val,
         )
-        _edit_link_attr(session, ref, val)
 
 
-def _predict_ccl_row_index(
-    session: EditSession,
-    level: int,
-    delta: int,
-) -> int:
-    """Best-effort guess of the row index a new CCL append will land at.
-
-    Reads the current array length on disk plus any pending appends in
-    this session for the same (level, delta).
-    """
-    from zarr_vectors.core.arrays import read_cross_chunk_links
-    from zarr_vectors.core.store import get_resolution_level
-    try:
-        level_group = get_resolution_level(session.root, level)
-        current = read_cross_chunk_links(level_group, delta=delta)
-        base = len(current)
-    except Exception:
-        base = 0
-    pending = sum(
-        1 for op in session._ccl_ops
-        if op.delta == delta and op.op == "append"
-    )
-    return base + pending - 1  # the just-appended op's row

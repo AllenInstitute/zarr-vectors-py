@@ -7,12 +7,30 @@ from pathlib import Path
 import numpy as np
 
 from zarr_vectors.core.arrays import (
-    list_chunk_keys, read_all_object_manifests, read_chunk_vertices, read_cross_chunk_links,
+    list_chunk_keys, read_all_object_manifests, read_chunk_vertices,
 )
 from zarr_vectors.core.store import (
     get_resolution_level, list_resolution_levels, open_store, read_root_metadata,
 )
+from zarr_vectors.typing import ChunkCoords
 from zarr_vectors.validate.structure import ValidationResult
+
+
+def _lex_sign(offset: ChunkCoords) -> int:
+    """Sign of a chunk offset under lexicographic order.
+
+    ``+1`` when the first non-zero component is positive, ``-1`` when it
+    is negative, ``0`` for the all-zero offset.  This is the ordering the
+    canonical sort induces: sorting endpoints by ``(chunk, vi)`` puts the
+    lex-smallest chunk first, so every stored offset in a canonical
+    intra-level family is lex-non-negative.
+    """
+    for c in offset:
+        if int(c) > 0:
+            return 1
+        if int(c) < 0:
+            return -1
+    return 0
 
 
 def validate_consistency(store_path: str | Path) -> ValidationResult:
@@ -98,7 +116,7 @@ def validate_consistency(store_path: str | Path) -> ValidationResult:
 
         for ck in chunk_keys:
             try:
-                groups = read_chunk_vertices(lg, ck, dtype=np.float32, ndim=ndim)
+                groups = read_chunk_vertices(lg, ck, ndim=ndim)
             except Exception as e:
                 result.add_error(f"{prefix}: chunk {ck} decode failed: {e}")
                 continue
@@ -177,96 +195,115 @@ def validate_consistency(store_path: str | Path) -> ValidationResult:
         except Exception:
             pass
 
-        # Walk every cross_chunk_links/<delta>/ family.  Two passes:
+        # Walk every links/<delta>/ family.  Two passes:
         #
-        # (a) Structural pass — for each cell key, parse the dotted
-        #     canonical chunk-tuple and check the cell-key arity
-        #     (sid_ndim * link_width) and the canonical-sort
-        #     invariant (chunks non-decreasing in lex order).
+        # (a) Structural pass — for each <offsets> segment, parse the
+        #     dotted relative-offset tuples and check the canonical-sort
+        #     invariant (offsets non-negative and non-decreasing in lex
+        #     order) on the intra-level, undirected, single-copy families
+        #     where it applies.
         # (b) Endpoint-presence pass — read records in input order
-        #     via read_cross_chunk_links so endpoint 0 is the
-        #     owning-level source.  For delta=0 every endpoint must
-        #     exist in this level's chunk grid; for delta != 0 only
-        #     endpoint 0 is constrained here.
-        from zarr_vectors.core.arrays import list_cross_link_deltas
-        from zarr_vectors.core.paths import (
-            cross_chunk_links_path, parse_cell_key,
+        #     via read_links so endpoint 0 is the owning-level
+        #     source.  For delta=0 every endpoint must exist in this
+        #     level's chunk grid; for delta != 0 only endpoint 0 is
+        #     constrained here.
+        from zarr_vectors.core.arrays import (
+            list_link_deltas,
+            list_link_offsets,
+            read_links,
         )
-        for d in list_cross_link_deltas(lg):
-            family = cross_chunk_links_path(d)
+        from zarr_vectors.core.paths import links_group_path, parse_offsets
+        for d in list_link_deltas(lg):
+            family = links_group_path(d)
             try:
                 family_meta = lg.read_array_meta(family) or {}
                 link_width = int(family_meta.get("link_width", 2))
-                ccl_sid_ndim = int(family_meta.get("sid_ndim", 0))
+                link_sid_ndim = int(family_meta.get("sid_ndim", 0))
                 directed = bool(family_meta.get("directed", False))
                 store = str(family_meta.get("store", "canonical"))
             except Exception:
                 continue
-            if ccl_sid_ndim == 0:
+            if link_sid_ndim == 0:
                 continue
 
-            # The canonical-sort invariant (chunks non-decreasing in the
-            # cell key) only holds for an undirected, single-cell family.
-            # Directed cells key on input endpoint order, and duplicate
-            # cells lead with each incident chunk, so both legitimately
-            # break lex ordering — skip the check for them.
-            enforce_canonical = not directed and store == "canonical"
-            cell_keys = sorted(lg.list_chunks(family))
-            for ckey in cell_keys:
+            # Under the offset layout the canonical-sort invariant is a
+            # property of the *directory name*, so it costs one parse per
+            # offset array rather than one per cell.  It only holds for an
+            # undirected, single-copy, intra-level family: directed
+            # segments key on input endpoint order, duplicate families lead
+            # with each incident chunk, and cross-level records are never
+            # sorted (their source is always input endpoint 0) — all three
+            # legitimately carry lex-negative offsets.
+            enforce_canonical = (
+                not directed and store == "canonical" and d == 0
+            )
+            segments = list_link_offsets(lg, d)
+            for seg in segments:
                 try:
-                    canonical_chunks = parse_cell_key(
-                        ckey, sid_ndim=ccl_sid_ndim, link_width=link_width,
+                    offsets = parse_offsets(
+                        seg, sid_ndim=link_sid_ndim, link_width=link_width,
                     )
                 except ValueError as exc:
                     result.add_error(
-                        f"{prefix}: ccl[delta={d}] cell {ckey!r} "
-                        f"malformed: {exc}"
+                        f"{prefix}: links[delta={d}] offsets segment "
+                        f"{seg!r} malformed: {exc}"
                     )
                     continue
-                if enforce_canonical:
-                    for i in range(1, link_width):
-                        if canonical_chunks[i] < canonical_chunks[i - 1]:
-                            result.add_error(
-                                f"{prefix}: ccl[delta={d}] cell {ckey!r} "
-                                f"violates canonical-sort invariant"
-                            )
-                            break
+                if not enforce_canonical:
+                    continue
+                # All-zero offsets are the intra-chunk array — legal, and
+                # deduped by the vertex-index tie-break rather than by the
+                # offset sign.
+                for i, off in enumerate(offsets):
+                    if _lex_sign(off) < 0:
+                        result.add_error(
+                            f"{prefix}: links[delta={d}] segment {seg!r} "
+                            f"offset {i + 1} is lexicographically negative; "
+                            f"a canonical family stores each record once, "
+                            f"under the positive offset"
+                        )
+                    if i and offsets[i] < offsets[i - 1]:
+                        result.add_error(
+                            f"{prefix}: links[delta={d}] segment {seg!r} "
+                            f"offsets are not non-decreasing; violates the "
+                            f"canonical-sort invariant"
+                        )
 
             try:
-                ccl = read_cross_chunk_links(lg, delta=d)
+                links = read_links(lg, delta=d)
             except Exception:
-                ccl = []
+                links = []
 
-            # read_cross_chunk_links returns one row per on-disk record
-            # (physical, so duplicated copies are counted); it must match
-            # the family's recorded num_physical_records.
+            # read_links returns one row per on-disk record (physical, so
+            # duplicated copies are counted); it must match the family's
+            # recorded num_physical_records.
             if "num_physical_records" in family_meta:
                 expected_phys = int(family_meta["num_physical_records"])
-                if expected_phys != len(ccl):
+                if expected_phys != len(links):
                     result.add_error(
-                        f"{prefix}: ccl[delta={d}] num_physical_records="
-                        f"{expected_phys} != {len(ccl)} rows on disk"
+                        f"{prefix}: links[delta={d}] num_physical_records="
+                        f"{expected_phys} != {len(links)} rows on disk"
                     )
-            for record in ccl:
+            for record in links:
                 # record is a tuple of (chunk_coords, vi) endpoints
                 # in input order; endpoint 0 is the owning-level
                 # source side.
                 src_chunk = record[0][0]
                 if src_chunk not in chunk_fragment_counts:
                     result.add_error(
-                        f"{prefix}: ccl[delta={d}] refs non-existent "
+                        f"{prefix}: links[delta={d}] refs non-existent "
                         f"source chunk {src_chunk}"
                     )
                 if d == 0:
                     for ep_chunk, _ in record[1:]:
                         if ep_chunk not in chunk_fragment_counts:
                             result.add_error(
-                                f"{prefix}: ccl[delta=0] refs "
+                                f"{prefix}: links[delta=0] refs "
                                 f"non-existent chunk {ep_chunk}"
                             )
             result.add_pass(
-                f"{prefix}: ccl[delta={d}] validated "
-                f"({len(ccl)} links across {len(cell_keys)} cells)"
+                f"{prefix}: links[delta={d}] validated "
+                f"({len(links)} links across {len(segments)} offset arrays)"
             )
 
     return result

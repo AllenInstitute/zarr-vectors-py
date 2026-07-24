@@ -2,33 +2,34 @@
 
 Supports two modes:
 
-- **General graph**: arbitrary undirected/directed edges. All edges stored
-  explicitly in ``links/`` (intra-chunk) and ``cross_chunk_links/``
-  (inter-chunk).  ``links_convention: "explicit"``.
+- **General graph**: arbitrary undirected/directed edges.  Every edge is
+  stored explicitly in ``links/0/<offsets>/`` — the all-zero offsets
+  array holds the intra-chunk edges, the rest hold the boundary-crossing
+  ones.  ``links_convention: "explicit"``.
 
 - **Skeleton (tree)**: nodes reordered depth-first, parent links mostly
-  sequential.  Only branch points (parent ≠ i−1) stored in ``links/``.
+  sequential.  Only branch points (parent ≠ i−1) need an intra-chunk
+  record, but *every* boundary-crossing edge is still explicit — implicit
+  sequential order does not span chunks.
   ``links_convention: "implicit_sequential_with_branches"``.
 
 Edge attributes (weight, type, etc.) are stored in ``link_attributes/``
-parallel to the ``links/`` array.
+mirroring the ``links/`` family cell for cell.
 """
 
 from __future__ import annotations
 
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import numpy as np
 import numpy.typing as npt
 
 from zarr_vectors.constants import (
     CROSS_CHUNK_EXPLICIT,
-    CROSS_CHUNK_LINKS,
     FRAGMENT_ATTRIBUTES,
     GEOM_GRAPH,
     GEOM_SKELETON,
     LINK_FRAGMENTS,
-    LINKS,
     LINKS_EXPLICIT,
     LINKS_IMPLICIT_BRANCHES,
     OBJIDX_STANDARD,
@@ -37,26 +38,23 @@ from zarr_vectors.constants import (
 )
 from zarr_vectors.core.arrays import (
     create_attribute_array,
-    create_cross_chunk_links_array,
     create_fragment_attribute_array,
-    create_link_attributes_array,
     create_links_array,
     create_object_attributes_array,
     create_object_index_array,
     create_vertices_array,
     list_chunk_keys,
+    list_link_offsets,
     resolve_chunk_keys,
     read_all_object_manifests,
-    read_chunk_links,
     read_chunk_vertices,
-    read_cross_chunk_links,
+    read_links,
     read_object_vertices,
     write_chunk_attributes,
     write_chunk_fragment_attributes,
-    write_chunk_link_attributes,
-    write_chunk_links,
     write_chunk_vertices,
-    write_cross_chunk_links,
+    write_link_attributes,
+    write_links,
     write_object_attributes,
     write_object_index,
 )
@@ -70,6 +68,7 @@ from zarr_vectors.core.metadata import (
     RootMetadata,
     get_level_chunk_shape,
 )
+from zarr_vectors.core.paths import links_group_path
 from zarr_vectors.core.store import (
     _apply_out_of_bounds_policy,
     _create_or_open_store,
@@ -83,10 +82,7 @@ from zarr_vectors.core.store import (
     read_root_metadata,
 )
 from zarr_vectors.exceptions import ArrayError
-from zarr_vectors.spatial.boundary import (
-    build_vertex_chunk_mapping,
-    partition_edges,
-)
+from zarr_vectors.spatial.boundary import build_vertex_chunk_mapping
 from zarr_vectors.spatial.chunking import (
     assign_bins,
     assign_chunks,
@@ -98,9 +94,11 @@ from zarr_vectors.typing import (
     BoundingBox,
     ChunkCoords,
     ChunkShape,
-    CrossChunkLink,
     ObjectManifest,
 )
+
+if TYPE_CHECKING:
+    from zarr_vectors.core.store import ReadSource
 
 
 # ===================================================================
@@ -339,46 +337,33 @@ def write_graph(
         chunk_assignments, n_nodes, chunk_list
     )
 
-    # For skeletons with implicit branches: extract only branch links
+    # Select the edges that need an explicit record, then hand them to
+    # ``write_links`` in global ``(chunk, vertex)`` form and let it route
+    # each to the offsets array that names where its endpoints sit.  A
+    # record is intra-chunk exactly when both endpoints share a chunk —
+    # the all-zero-offsets case (``paths.is_intra``).
+    e_chunk = vertex_chunks[edges]                      # (M, 2)
+    is_cross = e_chunk[:, 0] != e_chunk[:, 1]
     if is_tree:
-        edges_to_store, edge_attr_to_store = _extract_branch_links(
-            edges, edge_attributes
-        )
+        # Depth-first order implies the non-branch parents, but only
+        # within a chunk: a boundary-crossing edge is always explicit.
+        store_mask = is_cross | _branch_mask(edges)
     else:
-        edges_to_store = edges
-        edge_attr_to_store = edge_attributes
+        store_mask = np.ones(n_edges, dtype=bool)
+    store_rows = np.flatnonzero(store_mask)
 
-    # Partition edges
-    intra_edges, cross_links = partition_edges(
-        edges_to_store, vertex_chunks, vertex_local, chunk_list
-    )
-
-    # Record which original edges (rows in edges_to_store) landed
-    # intra-chunk in each chunk, so per-edge attributes can be sliced
-    # in the same order partition_edges built `intra_edges`.
-    intra_edge_orig_indices: dict[ChunkCoords, npt.NDArray[np.int64]] = {}
-    if edge_attr_to_store and edge_attributes:
-        e_src_chunk = vertex_chunks[edges_to_store[:, 0]]
-        e_dst_chunk = vertex_chunks[edges_to_store[:, 1]]
-        intra_mask = e_src_chunk == e_dst_chunk
-        intra_orig_idx = np.where(intra_mask)[0]
-        intra_chunk_of = e_src_chunk[intra_mask]
-        for chunk_idx in np.unique(intra_chunk_of):
-            sel = intra_chunk_of == chunk_idx
-            coord = chunk_list[int(chunk_idx)]
-            intra_edge_orig_indices[coord] = intra_orig_idx[sel]
-
-    # Also partition the full edge set to get cross-chunk links for ALL edges
-    # (not just branch links for skeletons).  We only need the cross-links
-    # here — the intra branch links come from the partition above — so skip
-    # the redundant intra-dict build over the full edge set.
-    if is_tree:
-        _, all_cross_links = partition_edges(
-            edges, vertex_chunks, vertex_local, chunk_list,
-            include_intra=False,
+    # Records stay in edge order, which ``partition_records_by_offset``
+    # preserves within each cell — that is what lets the per-edge
+    # attribute rows below be a plain ``[store_rows]`` slice.
+    link_records: list[list[tuple[ChunkCoords, int]]] = [
+        [(chunk_list[ca], la), (chunk_list[cb], lb)]
+        for ca, la, cb, lb in zip(
+            e_chunk[store_rows, 0].tolist(),
+            vertex_local[edges[store_rows, 0]].tolist(),
+            e_chunk[store_rows, 1].tolist(),
+            vertex_local[edges[store_rows, 1]].tolist(),
         )
-    else:
-        all_cross_links = cross_links
+    ]
 
     # Write vertices per chunk (one fragment per object per chunk)
     object_manifests: dict[int, ObjectManifest] = {}
@@ -399,17 +384,12 @@ def write_graph(
         bin_count=session_bin_count,
     ):
         create_vertices_array(level_group, dtype=dtype)
-        create_links_array(level_group, link_width=link_width, delta=0)
         create_object_index_array(level_group)
-        create_cross_chunk_links_array(level_group, delta=0)
+        # The links and link_attributes families are created by the writes
+        # below, which know the offsets arrays each record lands in.
         if node_attributes:
             for name, data in node_attributes.items():
                 create_attribute_array(level_group, name, dtype=str(data.dtype))
-        if edge_attributes:
-            for name, data in edge_attributes.items():
-                create_link_attributes_array(
-                    level_group, name, dtype=str(data.dtype), delta=0,
-                )
         if object_attributes:
             for _name in object_attributes:
                 create_object_attributes_array(level_group, _name)
@@ -483,29 +463,32 @@ def write_graph(
                         dtype=fragment_attr_dtypes[fname],
                     )
 
-        # Write intra-chunk links
-        for chunk_coords in chunk_list:
-            if chunk_coords in intra_edges:
-                local_edges = intra_edges[chunk_coords]
-                # One link group per chunk (all edges in one group)
-                write_chunk_links(level_group, chunk_coords, [local_edges], delta=0)
+        # One write for every edge, intra and cross alike — sid_ndim is
+        # widened when chunk keys carry an attribute-bin prefix.
+        partition = write_links(
+            level_group, link_records, idx_ndim, delta=0,
+            link_width=link_width,
+        )
+        # Backstop: `arrays_present` advertises the family, and the
+        # per-cell editors in ops/ write into an array that must already
+        # exist — a tree whose every edge is implied leaves write_links
+        # nothing to create.  Must run *after* it: an array present but
+        # untargeted makes write_links recount the family off disk, which
+        # inside this deferred write session reads back empty.
+        create_links_array(
+            level_group, link_width=link_width, delta=0, sid_ndim=idx_ndim,
+        )
 
-                if edge_attr_to_store and edge_attributes:
-                    orig_idx = intra_edge_orig_indices.get(chunk_coords)
-                    if orig_idx is not None and len(orig_idx) > 0:
-                        for name, data in edge_attr_to_store.items():
-                            write_chunk_link_attributes(
-                                level_group, name, chunk_coords,
-                                [np.asarray(data[orig_idx])],
-                                dtype=data.dtype,
-                                delta=0,
-                            )
-
-        # Write cross-chunk links — widen sid_ndim when prefixed.
-        if all_cross_links:
-            write_cross_chunk_links(
-                level_group, all_cross_links, sid_ndim=idx_ndim, delta=0,
-            )
+        # Per-edge attributes follow the same partition, so cross-chunk
+        # edges get theirs too — before the offset merge only the
+        # intra-chunk writer had an attribute counterpart to call.
+        if edge_attributes and len(store_rows) > 0:
+            for name, data in edge_attributes.items():
+                write_link_attributes(
+                    level_group, name, np.asarray(data)[store_rows],
+                    num_links=partition.num_links, partition=partition,
+                    delta=0,
+                )
 
         # Write object index
         write_object_index(level_group, object_manifests, sid_ndim=idx_ndim)
@@ -520,8 +503,11 @@ def write_graph(
         "node_count": n_nodes,
         "edge_count": n_edges,
         "chunk_count": len(chunk_list),
-        "intra_edge_count": sum(len(e) for e in intra_edges.values()),
-        "cross_edge_count": len(all_cross_links),
+        # Intra vs cross is now an offsets property: a stored record is
+        # intra iff both endpoints share a chunk.  Trees store only their
+        # branch edges intra-chunk, hence the `store_mask` term.
+        "intra_edge_count": int(np.count_nonzero(store_mask & ~is_cross)),
+        "cross_edge_count": int(np.count_nonzero(is_cross)),
         "object_count": len(object_manifests),
         "kind": "skeleton" if is_tree else "graph",
     }
@@ -532,7 +518,7 @@ def write_graph(
 # ===================================================================
 
 def read_graph(
-    store_path: str,
+    store_path: ReadSource,
     *,
     level: int = 0,
     object_ids: list[int] | None = None,
@@ -544,7 +530,8 @@ def read_graph(
     """Read a graph or skeleton from a zarr vectors store.
 
     Args:
-        store_path: Path to the store.
+        store_path: URL or path to the store, a pre-built zarr Store,
+            or an already-open Group.
         level: Resolution level.
         object_ids: Optional object ID filter.
         bbox: Optional bounding box filter.
@@ -560,6 +547,18 @@ def read_graph(
         - ``edges``: ``(M, 2)`` edge list (remapped to output indices)
         - ``node_count``, ``edge_count``
     """
+    if object_ids is not None:
+        # Declared and documented, but never applied — the filter was
+        # never implemented here (``read_polylines`` does implement it).
+        # Silently returning the unfiltered store is the worst outcome:
+        # the caller believes they scoped the read.  Fail loudly until
+        # someone implements it.
+        raise NotImplementedError(
+            "read_graph(object_ids=...) is not implemented: the filter would be "
+            "silently ignored and you would get the whole level back. "
+            "Filter the returned arrays yourself, or use read_polylines, "
+            "which does implement object_ids."
+        )
     root = open_store(store_path, backend=backend)
     root_meta = read_root_metadata(root)
     level_group = get_resolution_level(root, level)
@@ -577,14 +576,6 @@ def read_graph(
     try:
         vmeta = level_group.read_array_meta(VERTICES)
         dtype = np.dtype(vmeta.get("dtype", "float32"))
-    except Exception:
-        pass
-
-    # Get link width
-    link_width = 2
-    try:
-        lmeta = level_group.read_array_meta("links/0")
-        link_width = lmeta.get("link_width", 2)
     except Exception:
         pass
 
@@ -624,22 +615,21 @@ def read_graph(
             return _empty_graph_result(ndim)
         chunk_keys = [k for k in chunk_keys if k and k[0] == filter_bin]
 
-    # Prefetch every chunk (vertices, offsets, edges) and the cross-chunk
-    # edges in one async gather.  Subsequent ``read_bytes`` calls below
-    # hit the cache instead of paying one round-trip per chunk.
+    # Prefetch every chunk (vertices, offsets) and the whole links family
+    # in one async gather.  Subsequent ``read_bytes`` calls below hit the
+    # cache instead of paying one round-trip per chunk.  ``links/0`` is a
+    # group of one array per offsets segment, so the plan enumerates them
+    # — and each array's cells are keyed by *source* chunk, which for the
+    # non-zero offsets is not the ``chunk_keys`` set.
     _chunk_key_strs = [".".join(str(c) for c in cc) for cc in chunk_keys]
-    _ccl_family = f"{CROSS_CHUNK_LINKS}/0"
-    _ccl_cell_keys = (
-        level_group.list_chunks(_ccl_family)
-        if level_group.array_exists(_ccl_family) else []
-    )
     _prefetch_plan: list[tuple[str, list[str]]] = [
         (VERTICES, _chunk_key_strs),
         (VERTEX_FRAGMENTS, _chunk_key_strs),
-        (f"{LINKS}/0", _chunk_key_strs),
         (LINK_FRAGMENTS, _chunk_key_strs),
-        (_ccl_family, _ccl_cell_keys),
     ]
+    for _seg in list_link_offsets(level_group, 0):
+        _seg_path = f"{links_group_path(0)}/{_seg}"
+        _prefetch_plan.append((_seg_path, level_group.list_chunks(_seg_path)))
     _batched_reads_cm = level_group.batched_reads(_prefetch_plan)
     _batched_reads_cm.__enter__()
     try:
@@ -668,51 +658,27 @@ def read_graph(
 
         positions_out = np.concatenate(all_positions, axis=0)
 
-        # Intra-chunk edges: O(1) offset lookup, vectorized remap.
+        # Edges (delta=0; cross-pyramid-level edges live under delta != 0
+        # and are not part of a single-level read).  One family, so intra
+        # and cross records come back from one call already in global
+        # ``(chunk, vertex)`` form — a single remap covers both.  A record
+        # touching a chunk outside ``chunk_keys`` has no offset and is
+        # dropped, which is what applies the bbox/chunks filter to edges.
         all_edges: list[npt.NDArray] = []
-        for chunk_coords in chunk_keys:
-            try:
-                link_groups = read_chunk_links(
-                    level_group, chunk_coords, link_width=link_width, delta=0,
-                )
-            except ArrayError:
+        src_global: list[int] = []
+        dst_global: list[int] = []
+        for (chunk_a, vi_a), (chunk_b, vi_b) in read_links(level_group, delta=0):
+            oa = chunk_offsets.get(chunk_a)
+            ob = chunk_offsets.get(chunk_b)
+            if oa is None or ob is None:
                 continue
-            chunk_offset = chunk_offsets[chunk_coords]
-            for lg in link_groups:
-                if len(lg) > 0:
-                    all_edges.append(
-                        (lg.astype(np.int64, copy=False) + chunk_offset)
-                    )
-
-        # Cross-chunk edges (delta=0; cross-pyramid-level edges live
-        # under delta != 0 and are not part of a single-level read).
-        # Vectorized remap: build offset/local arrays first, then a
-        # single column_stack — avoids the per-edge ``np.array([[ga, gb]])``
-        # allocation in the original loop.
-        try:
-            ccl = read_cross_chunk_links(level_group, delta=0)
-            if ccl:
-                off_a: list[int] = []
-                off_b: list[int] = []
-                vi_a_list: list[int] = []
-                vi_b_list: list[int] = []
-                for (chunk_a, vi_a), (chunk_b, vi_b) in ccl:
-                    oa = chunk_offsets.get(chunk_a)
-                    ob = chunk_offsets.get(chunk_b)
-                    if oa is None or ob is None:
-                        continue
-                    off_a.append(oa)
-                    off_b.append(ob)
-                    vi_a_list.append(int(vi_a))
-                    vi_b_list.append(int(vi_b))
-                if off_a:
-                    remapped_cross = np.column_stack([
-                        np.asarray(off_a, dtype=np.int64) + np.asarray(vi_a_list, dtype=np.int64),
-                        np.asarray(off_b, dtype=np.int64) + np.asarray(vi_b_list, dtype=np.int64),
-                    ])
-                    all_edges.append(remapped_cross)
-        except (ArrayError, Exception):
-            pass
+            src_global.append(oa + int(vi_a))
+            dst_global.append(ob + int(vi_b))
+        if src_global:
+            all_edges.append(np.column_stack([
+                np.asarray(src_global, dtype=np.int64),
+                np.asarray(dst_global, dtype=np.int64),
+            ]))
 
         # For skeletons: reconstruct full edge set from implicit sequential + branch links
         if is_tree:
@@ -886,6 +852,20 @@ def _reorder_tree(
     return new_positions, new_edges, new_node_attrs, edge_attributes, reorder_map
 
 
+def _branch_mask(edges: npt.NDArray) -> npt.NDArray[np.bool_]:
+    """Rows of a tree edge list that depth-first order does not imply.
+
+    ``edges`` is ``(M, 2)`` ``[child, parent]``.  In a depth-first
+    ordered tree most edges have ``parent == child - 1``; the rest are
+    branch points and are the only ones needing an explicit intra-chunk
+    record.  The single definition of that predicate — the write path
+    selects records with it, :func:`_extract_branch_links` slices with it.
+    """
+    if len(edges) == 0:
+        return np.zeros(0, dtype=bool)
+    return edges[:, 1] != (edges[:, 0] - 1)
+
+
 def _extract_branch_links(
     edges: npt.NDArray,
     edge_attributes: dict[str, npt.NDArray] | None,
@@ -906,11 +886,7 @@ def _extract_branch_links(
     if len(edges) == 0:
         return edges, edge_attributes
 
-    children = edges[:, 0]
-    parents = edges[:, 1]
-
-    # Non-sequential: parent != child - 1
-    is_branch = parents != (children - 1)
+    is_branch = _branch_mask(edges)
     branch_edges = edges[is_branch]
 
     branch_attrs = None

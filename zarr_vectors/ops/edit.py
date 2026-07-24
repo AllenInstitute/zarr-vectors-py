@@ -30,14 +30,12 @@ import numpy.typing as npt
 from zarr_vectors.exceptions import EditError
 from zarr_vectors.ops.change_set import (
     ChunkChangeBuilder,
-    CrossChunkLinkOp,
     EditReport,
     ManifestOp,
     OidPrefix,
 )
 from zarr_vectors.ops.refs import (
     AttributeRef,
-    CrossChunkLinkRef,
     FragmentRef,
     LinkRef,
     ObjectRef,
@@ -116,10 +114,10 @@ class EditSession:
         # for fail-fast (raises EditError) behaviour.
         self.auto_materialise_links = bool(auto_materialise_links)
 
-        # Per-(level, chunk) builders, lazily filled.
+        # Per-(level, chunk) builders, lazily filled.  Link edits — intra
+        # and cross-chunk alike — stage into the builder of their record's
+        # source chunk, so there is no separate pending-link queue.
         self._builders: dict[tuple[int, ChunkCoords], ChunkChangeBuilder] = {}
-        # Per-level pending CCL operations.
-        self._ccl_ops: list[CrossChunkLinkOp] = []
         # Per-level pending manifest ops, keyed by (level, oid).
         self._manifest_ops: dict[tuple[int, int], ManifestOp] = {}
         # Per-level manifest cache (lazy, populated on first lookup).
@@ -189,15 +187,22 @@ class EditSession:
         """
         return {
             "dirty_chunks": [
-                {"level": lv, "chunk": list(cc), "appended_fragments": list(
-                    b.appended_fragments,
-                )}
+                {
+                    "level": lv,
+                    "chunk": list(cc),
+                    "appended_fragments": list(b.appended_fragments),
+                    "link_cells": [
+                        {"delta": delta, "offsets": (
+                            None if offsets is None
+                            else [list(o) for o in offsets]
+                        )}
+                        for (delta, offsets), dirty
+                        in sorted(b.links_dirty.items(), key=repr)
+                        if dirty
+                    ],
+                }
                 for (lv, cc), b in self._builders.items()
                 if b.is_dirty()
-            ],
-            "ccl_ops": [
-                {"op": op.op, "delta": op.delta, "index": op.index}
-                for op in self._ccl_ops
             ],
             "manifest_ops": [
                 {
@@ -405,19 +410,20 @@ class EditSession:
         self,
         *,
         level: int,
-        src: int,
-        dst: int,
+        src: int | None = None,
+        dst: int | None = None,
         chunk: ChunkCoords | None = None,
+        endpoints: list[tuple[ChunkCoords, int]] | None = None,
         fragment: int | None = None,
         delta: int = 0,
         attrs: dict[str, npt.ArrayLike] | None = None,
         update_objects: bool = False,
-    ) -> LinkRef | CrossChunkLinkRef:
+    ) -> LinkRef:
         from zarr_vectors.ops.links import add_link_in_session
         return add_link_in_session(
             self,
             level=level, src=src, dst=dst,
-            chunk=chunk, fragment=fragment,
+            chunk=chunk, endpoints=endpoints, fragment=fragment,
             delta=delta, attrs=attrs,
             update_objects=update_objects,
         )
@@ -435,16 +441,19 @@ class EditSession:
             self, ref, atomic=atomic_eff, update_objects=update_objects,
         )
 
+    # Cross-chunk spellings.  ``add_link(endpoints=...)`` does the same
+    # work — a link spanning chunks is not a different mechanism, only a
+    # record whose endpoints carry different chunks.
     def edit_cross_chunk_link(
         self,
-        ref: CrossChunkLinkRef,
+        ref: LinkRef,
         *,
         new_endpoints: list[tuple[ChunkCoords, int]],
         atomic: bool | None = None,
-    ) -> None:
+    ) -> LinkRef:
         from zarr_vectors.ops.links import edit_cross_chunk_link_in_session
         atomic_eff = self.atomic if atomic is None else bool(atomic)
-        edit_cross_chunk_link_in_session(
+        return edit_cross_chunk_link_in_session(
             self, ref, new_endpoints=new_endpoints, atomic=atomic_eff,
         )
 
@@ -454,7 +463,7 @@ class EditSession:
         level: int,
         endpoints: list[tuple[ChunkCoords, int]],
         delta: int = 0,
-    ) -> CrossChunkLinkRef:
+    ) -> LinkRef:
         from zarr_vectors.ops.links import add_cross_chunk_link_in_session
         return add_cross_chunk_link_in_session(
             self, level=level, endpoints=endpoints, delta=delta,
@@ -462,7 +471,7 @@ class EditSession:
 
     def remove_cross_chunk_link(
         self,
-        ref: CrossChunkLinkRef,
+        ref: LinkRef,
     ) -> None:
         from zarr_vectors.ops.links import remove_cross_chunk_link_in_session
         remove_cross_chunk_link_in_session(self, ref)
@@ -949,10 +958,17 @@ class EditSession:
         # 1. Apply dirty chunks via batched_writes for parallelism.
         from zarr_vectors.core.store import commit, get_resolution_level
         from zarr_vectors.core.arrays import (
+            create_links_array,
+            finalize_links,
             write_chunk_attributes,
             write_chunk_links,
             write_chunk_vertices,
         )
+
+        # Link families whose cells this flush rewrote.  Per-cell writes
+        # don't maintain the family-wide counts, so each needs one
+        # finalize_links pass once every cell is on disk.
+        touched_link_families: set[tuple[int, int]] = set()
 
         with self.root.batched_writes():
             for (level, cc), builder in self._builders.items():
@@ -964,13 +980,27 @@ class EditSession:
                         level_group, cc, builder.vertex_groups,
                         dtype=builder.vertex_dtype,
                     )
-                for delta, dirty in builder.links_dirty.items():
+                for cell, dirty in builder.links_dirty.items():
                     if not dirty:
                         continue
-                    write_chunk_links(
-                        level_group, cc, builder.link_groups[delta],
-                        delta=delta,
+                    delta, offsets = cell
+                    link_width, directed, store = builder.link_policy.get(
+                        cell, (2, False, "canonical"),
                     )
+                    if offsets is not None:
+                        # A cell the family may never have held before;
+                        # stamp the array with the family's policy so the
+                        # reader decodes it at the right width.
+                        create_links_array(
+                            level_group, link_width, dtype="int64",
+                            delta=delta, sid_ndim=len(cc), offsets=offsets,
+                            directed=directed, store=store, exist_ok=True,
+                        )
+                    write_chunk_links(
+                        level_group, cc, builder.link_groups[cell],
+                        delta=delta, offsets=offsets, link_width=link_width,
+                    )
+                    touched_link_families.add((level, delta))
                 for name, dirty in builder.attrs_dirty.items():
                     if not dirty:
                         continue
@@ -980,8 +1010,10 @@ class EditSession:
                     )
                 self._report.touched_chunks.append((level, tuple(cc)))
 
-        # 2. Apply CCL ops grouped by (level, delta).
-        self._flush_ccl_ops()
+        # 2. Reconcile each touched family's counts.  Outside the batch so
+        # the scan sees every cell this flush wrote.
+        for level, delta in sorted(touched_link_families):
+            finalize_links(get_resolution_level(self.root, level), delta=delta)
 
         # 3. Apply manifest ops grouped by level.
         self._flush_manifest_ops()
@@ -1004,62 +1036,6 @@ class EditSession:
 
         self._closed = True
         return self._report
-
-    def _flush_ccl_ops(self) -> None:
-        if not self._ccl_ops:
-            return
-        from zarr_vectors.core.arrays import (
-            read_cross_chunk_links,
-            write_cross_chunk_links,
-        )
-        from zarr_vectors.core.metadata import RootMetadata
-        from zarr_vectors.core.paths import cross_chunk_links_path
-        from zarr_vectors.core.store import get_resolution_level
-
-        meta = RootMetadata.from_dict(self.root.attrs.to_dict())
-        sid_ndim = meta.sid_ndim
-
-        # Group by (level, delta).  Only level 0 is the common edit
-        # target today; we still group generically.
-        from collections import defaultdict
-        groups: dict[tuple[int, int], list[CrossChunkLinkOp]] = defaultdict(list)
-        for op in self._ccl_ops:
-            groups[(0, op.delta)].append(op)
-
-        for (level, delta), ops in groups.items():
-            level_group = get_resolution_level(self.root, level)
-            # Preserve the family's directed/store policy across the
-            # read-modify-rewrite, else editing a directed or duplicate
-            # family would silently revert it to canonical undirected.
-            fam_meta = level_group.read_array_meta(
-                cross_chunk_links_path(delta)
-            ) or {}
-            directed = bool(fam_meta.get("directed", False))
-            store = str(fam_meta.get("store", "canonical"))
-            current = read_cross_chunk_links(level_group, delta=delta)
-            if store == "duplicate":
-                # read_cross_chunk_links returns physical copies; collapse
-                # to logical records (first-seen order) so the rewrite
-                # re-expands them once rather than squaring the fan-out.
-                seen: set = set()
-                current = [
-                    r for r in current if not (r in seen or seen.add(r))
-                ]
-            # Apply ops in submission order.
-            rows: list[list[tuple[ChunkCoords, int]]] = [list(r) for r in current]
-            for op in ops:
-                if op.op == "append":
-                    rows.append(list(op.payload or []))
-                elif op.op == "delete":
-                    if op.index is not None and 0 <= op.index < len(rows):
-                        rows.pop(op.index)
-                elif op.op == "overwrite":
-                    if op.index is not None and 0 <= op.index < len(rows):
-                        rows[op.index] = list(op.payload or [])
-            write_cross_chunk_links(
-                level_group, rows, sid_ndim, delta=delta,
-                directed=directed, store=store,
-            )
 
     def _flush_manifest_ops(self) -> None:
         if not self._manifest_ops:
@@ -1102,7 +1078,6 @@ class EditSession:
         from zarr_vectors.core.store import discard_changes
         discard_changes(self.root)
         self._builders.clear()
-        self._ccl_ops.clear()
         self._manifest_ops.clear()
         self._closed = True
 
@@ -1204,20 +1179,21 @@ def add_link(
     root: Group,
     *,
     level: int,
-    src: int,
-    dst: int,
+    src: int | None = None,
+    dst: int | None = None,
     chunk: ChunkCoords | None = None,
+    endpoints: list[tuple[ChunkCoords, int]] | None = None,
     fragment: int | None = None,
     delta: int = 0,
     attrs: dict[str, npt.ArrayLike] | None = None,
     update_objects: bool = False,
     atomic: bool = True,
     message: str = "add_link",
-) -> tuple[LinkRef | CrossChunkLinkRef, EditReport]:
+) -> tuple[LinkRef, EditReport]:
     with EditSession(root, atomic=atomic, refresh_pyramid=False, message=message) as ed:
         ref = ed.add_link(
             level=level, src=src, dst=dst, chunk=chunk,
-            fragment=fragment, delta=delta, attrs=attrs,
+            endpoints=endpoints, fragment=fragment, delta=delta, attrs=attrs,
             update_objects=update_objects,
         )
     return ref, ed.report
@@ -1243,7 +1219,13 @@ def add_cross_chunk_link(
     endpoints: list[tuple[ChunkCoords, int]],
     delta: int = 0,
     message: str = "add_cross_chunk_link",
-) -> tuple[CrossChunkLinkRef, EditReport]:
+) -> tuple[LinkRef, EditReport]:
+    """Append a link from full ``(chunk, vertex_index)`` endpoints.
+
+    Equivalent to ``add_link(endpoints=...)``: endpoints spanning chunks
+    are not a separate storage path, they merely route to a non-zero
+    offsets cell.
+    """
     with EditSession(root, atomic=True, refresh_pyramid=False, message=message) as ed:
         ref = ed.add_cross_chunk_link(level=level, endpoints=endpoints, delta=delta)
     return ref, ed.report
@@ -1251,10 +1233,11 @@ def add_cross_chunk_link(
 
 def remove_cross_chunk_link(
     root: Group,
-    ref: CrossChunkLinkRef,
+    ref: LinkRef,
     *,
     message: str = "remove_cross_chunk_link",
 ) -> EditReport:
+    """Drop a link by ref.  Equivalent to ``remove_link``."""
     with EditSession(root, atomic=True, refresh_pyramid=False, message=message) as ed:
         ed.remove_cross_chunk_link(ref)
     return ed.report

@@ -26,6 +26,17 @@ from zarr_vectors.exceptions import StoreError
 from zarr_vectors.types.points import read_points, write_points
 
 
+def _cell_array(root, name, grid_shape=(3, 4, 5)):
+    """Allocate a per-chunk vlen array to read cells from.
+
+    ``write_bytes`` no longer conjures a per-cell group for an
+    unallocated name — every per-chunk array is one grid-shaped vlen
+    array — so keys are coord tuples within ``grid_shape``.
+    """
+    root.create_sharded_chunk_array(name, grid_shape)
+    return name
+
+
 def test_batched_reads_empty_plan_is_noop(tmp_store_path):
     root = create_store(str(tmp_store_path))
     with root.batched_reads([]):
@@ -36,11 +47,11 @@ def test_batched_reads_round_trip(tmp_store_path):
     """Bytes written via the sync path read back identically through a
     batched_reads block (cache hit)."""
     root = create_store(str(tmp_store_path))
+    _cell_array(root, "read_test")
     payloads = {
         "0.0.0": b"first chunk bytes",
         "1.0.0": b"\x00" * 32,
         "2.3.4": np.arange(100, dtype=np.uint8).tobytes(),
-        "empty": b"",
     }
     for k, v in payloads.items():
         root.write_bytes("read_test", k, v)
@@ -55,6 +66,8 @@ def test_batched_reads_cache_miss_falls_through(tmp_store_path):
     """A read for an (array, key) not in the plan still returns correct
     data — the cache miss drops through to the sync path."""
     root = create_store(str(tmp_store_path))
+    _cell_array(root, "planned_arr")
+    _cell_array(root, "unplanned_arr")
     root.write_bytes("planned_arr", "0.0.0", b"planned-data")
     root.write_bytes("unplanned_arr", "0.0.0", b"unplanned-data")
 
@@ -119,10 +132,10 @@ def test_batched_reads_falls_back_to_sync_for_icechunk_like_store(
     monkeypatch.setattr(_batch_reader, "_is_icechunk_store", lambda _store: True)
 
     root = create_store(str(tmp_store_path))
+    _cell_array(root, "fallback_arr")
     payloads = {
         "0.0.0": b"icechunk-fallback-data",
         "1.0.0": np.arange(32, dtype=np.uint8).tobytes(),
-        "empty": b"",
     }
     for k, v in payloads.items():
         root.write_bytes("fallback_arr", k, v)
@@ -137,6 +150,7 @@ def test_batched_reads_clears_cache_on_exception(tmp_store_path):
     """If the block raises, the cache is dropped so subsequent reads
     don't accidentally serve stale data."""
     root = create_store(str(tmp_store_path))
+    _cell_array(root, "err_arr")
     root.write_bytes("err_arr", "0.0.0", b"data")
     plan = [("err_arr", ["0.0.0"])]
     with pytest.raises(RuntimeError, match="boom"):
@@ -148,14 +162,41 @@ def test_batched_reads_clears_cache_on_exception(tmp_store_path):
 
 
 def test_batched_reads_missing_chunk_omitted_from_cache(tmp_store_path):
-    """A plan entry pointing at a non-existent chunk is silently skipped
-    in the cache — and read_bytes raises StoreError, same as in the
-    unbatched path."""
+    """A plan entry for an unwritten in-grid cell is skipped in the cache,
+    and the batched read agrees with the unbatched one.
+
+    Note the semantics changed with the single-array layout: an
+    allocated-but-never-written cell reads back ``b""`` — the vlen fill
+    value — rather than raising.  It used to raise because each cell was
+    its own sub-array, so absence was a missing node.  Now absence and an
+    explicitly-written empty payload are byte-identical; ``chunk_exists``
+    (the presence manifest) is what separates them.
+
+    What matters here is that batching does not change the answer.
+    """
     root = create_store(str(tmp_store_path))
+    _cell_array(root, "partial_arr")
     root.write_bytes("partial_arr", "0.0.0", b"present")
 
-    plan = [("partial_arr", ["0.0.0", "missing.key"])]
+    unbatched = root.read_bytes("partial_arr", "2.3.4")
+    assert unbatched == b""
+    assert root.chunk_exists("partial_arr", "0.0.0") is True
+    assert root.chunk_exists("partial_arr", "2.3.4") is False
+
+    plan = [("partial_arr", ["0.0.0", "2.3.4"])]
     with root.batched_reads(plan):
         assert root.read_bytes("partial_arr", "0.0.0") == b"present"
-        with pytest.raises(StoreError, match="not found"):
-            root.read_bytes("partial_arr", "missing.key")
+        # The batched path must agree with the sync path exactly.
+        assert root.read_bytes("partial_arr", "2.3.4") == unbatched
+
+
+def test_read_bytes_raises_for_out_of_grid_coords(tmp_store_path):
+    """Out-of-grid coords still raise — that is a real error, not absence.
+
+    Keeps the distinction the test above relies on: `b""` means "in the
+    grid, nothing written"; StoreError means "not addressable at all".
+    """
+    root = create_store(str(tmp_store_path))
+    _cell_array(root, "bounded_arr", grid_shape=(2, 2, 2))
+    with pytest.raises(StoreError):
+        root.read_bytes("bounded_arr", "9.9.9")

@@ -7,23 +7,24 @@
   in one array are logically consistent with values in another. L3 checks
   read all chunks of all arrays at each level.
 
-**Fragment-index arithmetic check**
-: Verification that the fragment-index blob in `vertex_fragments/<chunk>`
-  is self-consistent: magic and version are correct, the range bitmap's
-  popcount matches the header's `R`, CSR offsets are monotone, and every
-  range fragment's `[start, start + count)` and every explicit fragment's
-  indices lie in `[0, vertex_count_in_chunk)`.
+**Decode check**
+: Verification that a chunk's blob decodes at all. L3 does not
+  independently re-derive the fragment-index byte arithmetic; it decodes
+  each chunk through the normal reader and reports any decoder exception
+  as an error. Malformed magic, version, or offsets therefore surface as
+  a decode failure rather than as a named per-field check.
 
 **Manifest integrity**
-: Verification that every block in `object_index/data` references a chunk
-  that exists at the level and a fragment that exists in that chunk's
-  `vertex_fragments/` blob, and that decoding the manifest yields exactly
-  one fragment per fragment reference (no out-of-range indices).
+: Verification that every `(chunk_coords, fragment_index)` pair in a
+  decoded object manifest names a chunk present at the level and a
+  fragment index below that chunk's fragment count.
 
-**Attribute alignment**
-: Verification that the length of each `attributes/<name>/` chunk slice
-  equals the length of the corresponding `vertices/` chunk slice. Misaligned
-  attributes indicate a bug in the writer's vertex-reordering logic.
+**Directory-name invariant**
+: An invariant that L3 checks by parsing an *array path segment* rather
+  than by reading cell contents. Under the offset layout the
+  canonical-sort property of a link family is a property of its
+  `<offsets>` directory name, so checking it costs one parse per offset
+  array rather than one per record.
 
 ---
 
@@ -43,119 +44,132 @@ full-size production stores unless a specific consistency issue is suspected.
 
 ## Technical reference
 
-### Fragment-index arithmetic checks
+L3 is implemented by
+[`validate_consistency`](../../../zarr_vectors/validate/consistency.py).
+It walks every resolution level and, within each, performs the checks
+below. Checks are reported as free-text messages on a
+`ValidationResult`; they do not carry stable machine-readable check IDs
+(see [Validation overview](overview.md#validationresult-api)).
 
-For every non-empty chunk in `vertices/` and `vertex_fragments/`:
+### Chunk decode and vertex checks
 
-| Check | Rule | Failure type |
-|-------|------|--------------|
-| `frag_magic` | First 4 bytes equal `0x5A56_4647` (`'ZVFG'`) | Error |
-| `frag_version` | Header `version` field equals 1 | Error |
-| `frag_popcount` | Header `num_range_fragments` equals `popcount(bitmap[0:F])` | Error |
-| `frag_bitmap_padding` | Bitmap bytes beyond `ceil(F/8)` are zero | Warning |
-| `frag_csr_monotone` | `explicit_offsets[0] == 0` and `explicit_offsets[i+1] >= explicit_offsets[i]` | Error |
-| `frag_range_in_bounds` | Every range fragment's `start + count ≤ vertex_count_in_chunk` and `start >= 0` | Error |
-| `frag_indices_in_bounds` | Every explicit fragment's indices lie in `[0, vertex_count_in_chunk)` | Error |
-| `frag_indices_non_negative` | Every entry of `explicit_indices` is `>= 0` | Error |
-| `frag_vg_order` | At level 0 with `shared_fragments=False`: vertices in fragment `f`'s row slice all share the same bin flat index | Error |
+For every chunk key at the level:
 
-For `link_fragments/<chunk>`, the same checks apply with
-`vertex_count_in_chunk` replaced by `link_count_in_chunk` (rows of
-`links/0/<chunk>`).
+| Rule | Failure type |
+|------|--------------|
+| The chunk's vertex blob decodes via `read_chunk_vertices` | Error |
+| Each decoded fragment is 2-D with `shape[1] == sid_ndim` | Error |
+| No fragment contains NaN / Inf | Warning |
+| The level's `vertex_count` attribute, **if present**, equals the total decoded vertex count | Error |
 
-The `frag_vg_order` check is the most expensive: it requires computing the
-bin flat index of every vertex and comparing to the writer-emitted fragment
-order. It runs by default at L3 but can be disabled with
-`skip_vg_order_check=True` for large stores where only fragment-index
-arithmetic is needed:
+A level with no chunk keys emits a warning (`no chunk data`) and is
+otherwise skipped.
+
+### Bin-layout checks (point-cloud stores only)
+
+These run **only** when the store's `geometry_types` contains
+`point_cloud` and none of `polyline`, `streamline`, `line`, `graph`,
+`skeleton`, `mesh`, **and** the level has no `object_index` — i.e. only
+for undifferentiated point clouds where fragments really do correspond
+to bins. Other types use fragments for segments, endpoints, or
+per-object partitions, so a fragment-per-bin rule does not apply to
+them. They also require at least one axis with `bins_per_chunk > 1`.
+
+| Rule | Failure type |
+|------|--------------|
+| A chunk's fragment count does not exceed the product of `bins_per_chunk` | Error |
+| Each fragment's points lie within their bin's bounds (tolerance `1e-4`) | Warning |
+
+The bin-bounds check is a **spot check**: it examines at most the first
+3 chunks per level, not every chunk.
+
+`bins_per_chunk` is computed from the level's *effective* chunk shape
+(honouring a per-level `chunk_shape` override) and the level's
+effective bin shape.
+
+### Object manifest checks
+
+Read via `read_all_object_manifests`. Failures to read the manifests at
+all are silently skipped (the store may legitimately have none).
+
+| Rule | Failure type |
+|------|--------------|
+| Every manifest entry's `chunk_coords` names a chunk present at this level | Error |
+| Every manifest entry's `fragment_index` is `<` that chunk's decoded fragment count | Error |
+
+### Link checks
+
+The walker enumerates every `<delta>` under `links/` via
+`list_link_deltas` and validates each family independently. A family
+whose metadata cannot be read, or whose `sid_ndim` is `0`, is skipped.
+Family-wide policy (`link_width`, `sid_ndim`, `directed`, `store`) is
+read from the `links/<delta>/` **group**.
+
+#### Offsets-segment checks (directory names)
+
+For every `<offsets>` array in the family:
+
+| Rule | Failure type |
+|------|--------------|
+| The segment parses under the family's `sid_ndim` / `link_width` (`parse_offsets`) | Error |
+
+The remaining segment checks are **gated** on the family being
+undirected, single-copy, and intra-level:
 
 ```python
-result = validate("scan.zarrvectors", level=3, skip_vg_order_check=True)
+enforce_canonical = (not directed) and store == "canonical" and delta == 0
 ```
 
-### Attribute alignment checks
+| Rule (only when `enforce_canonical`) | Failure type |
+|------|--------------|
+| Each offset is lexicographically non-negative — its first non-zero component is `> 0` | Error |
+| The offsets within a segment are non-decreasing | Error |
 
-For every chunk at every level:
+The all-zero offsets segment (the intra-chunk array) is **legal** and
+passes both: its lex-sign is `0`, not negative. Intra-chunk records are
+deduplicated by the vertex-index tie-break in the canonical sort, not
+by the offset sign.
 
-| Check | Rule | Failure type |
-|-------|------|--------------|
-| `attr_length_matches` | `len(attributes[name][chunk])` equals `len(vertices[chunk])` for all named attributes | Error |
-| `attr_no_nan_default` | No NaN values in float attributes unless `fill_value = NaN` is declared | Warning |
-| `obj_attr_length` | `len(object_attributes[name])` equals `object_index.shape[0]` | Error |
+The gate matters, because all three excluded cases legitimately carry
+lexicographically negative offsets:
 
-### Object index checks
+- **`directed=True`** — endpoint order is data, so `A→B` and `B→A` file
+  under opposite offsets (`0.0.+1` vs `0.0.-1`).
+- **`store="duplicate"`** — each incident chunk leads in its own copy.
+- **`delta != 0`** — cross-level records are never sorted; their source
+  is always input endpoint 0.
 
-| Check | Rule | Failure type |
-|-------|------|--------------|
-| `obj_index_offsets_monotone` | `object_index/offsets` is monotonically non-decreasing and `offsets[0] == 0` | Error |
-| `obj_index_blob_decodes` | Every per-object manifest blob decodes via `decode_object_manifest_blocks` without error | Error |
-| `obj_index_valid_chunks` | Every block's `chunk_coords` names a chunk in the level's chunk grid | Error |
-| `obj_index_valid_fragments` | Every block's `fragment_index` (single mode), `[start, start + count)` (range mode), or index list (explicit mode) names fragments present in the chunk's `vertex_fragments/` blob | Error |
-| `obj_index_no_double_share` | When `LevelMetadata.shared_fragments == False`: no `(chunk_coords, fragment_index)` pair appears in more than one manifest | Error |
+#### Record checks
 
-### Cross-chunk link checks
+| Rule | Failure type |
+|------|--------------|
+| `num_physical_records` in the family metadata, **if present**, equals the number of rows `read_links` returns | Error |
+| Every record's endpoint-0 (source) chunk is present at this level | Error |
+| For `delta == 0` only: every other endpoint's chunk is present at this level | Error |
 
-The L3 walker enumerates every `<delta>` subdir under
-`cross_chunk_links/` via `list_cross_link_deltas` (see
-[`zarr_vectors/validate/consistency.py`](../../../zarr_vectors/validate/consistency.py))
-and validates each independently.
+`read_links` returns one row per **physical** record, so a
+`store="duplicate"` family counts each copy — which is exactly what
+`num_physical_records` records.
 
-| Check | Rule | Failure type |
-|-------|------|--------------|
-| `ccl_chunk_coords_arity` | Every endpoint's chunk-coord tuple has length `sid_ndim` | Error |
-| `ccl_src_chunk_exists` | For every `<delta>`: endpoint A's chunk_coords name a chunk present in the owning level's chunk grid (i.e. exists in `vertex_fragments/`) | Error |
-| `ccl_tgt_chunk_exists` | For `delta == 0` only: endpoint B's chunk_coords name a chunk present in the owning level's chunk grid | Error |
-| `ccl_tgt_chunk_at_offset_level` | For `delta != 0`: endpoint B's chunk_coords are validated when the walker reaches level `source_level + delta` | Error |
-| `ccl_attribute_length` | For every `cross_chunk_link_attributes/<name>/<delta>/`: meta `num_links` matches the parallel `cross_chunk_links/<delta>/` meta | Error |
-| `ccl_no_polyline_cycles` | For polyline/streamline stores at `delta == 0`: the directed graph formed by intra-level cross-chunk links contains no cycles | Error |
-| `ccl_no_duplicate_undirected` | For undirected graph stores at `delta == 0`: no link `[a, b]` co-exists with `[b, a]` | Error |
-
-### Edge index checks
-
-For polyline, streamline, graph, and skeleton types:
-
-| Check | Rule | Failure type |
-|-------|------|--------------|
-| `edge_indices_in_bounds` | All local vertex indices in `links/<delta>/` are in `[0, N_chunk)` or equal `−1` | Error |
-| `no_self_loops` | No edge has `src == dst` | Error |
-| `polyline_continuity` | For polyline/streamline: every non-terminal vertex has exactly one outgoing intra-chunk edge (or a cross-chunk link as continuation) | Error |
-
-### Mesh face checks
-
-| Check | Rule | Failure type |
-|-------|------|--------------|
-| `face_indices_valid` | All positive face indices in `[0, N_chunk)` | Error |
-| `boundary_indices_decodable` | All negative face indices decode to valid global vertex IDs | Error |
-| `no_degenerate_faces` | No face has two or more identical vertex indices | Error |
-
-### Pyramid consistency checks (L3 component)
-
-| Check | Rule | Failure type |
-|-------|------|--------------|
-| `vertex_count_non_increasing` | Total vertex count at level N ≤ total vertex count at level N-1 | Error |
-| `attribute_names_match` | Attribute name sets are identical across all levels | Warning |
+For `delta != 0` only endpoint 0 is constrained here: the other
+endpoints live at level `owning + delta` and are validated against that
+level's own grid when the walker reaches it.
 
 ### Example L3 report (abbreviated)
 
 ```
-Level 3 validation of scan.zarrvectors
-========================================
-Checking 0 (125 chunks)…
-PASS  frag_magic [0]                all chunks: magic 0x5A56_4647 ✓
-PASS  frag_popcount [0]              all chunks: R == popcount(bitmap) ✓
-PASS  frag_range_in_bounds [0]      all range fragments in bounds
-PASS  frag_vg_order [0]             all vertices in correct fragment order
-PASS  attr_length_matches [0]       intensity/: 125/125 chunks aligned
-ERROR ccl_different_chunks [0]      2 links found where src chunk == dst chunk
-                                    (links at rows 14502, 87331)
-PASS  edge_indices_in_bounds [0]    all intra-chunk edges valid
-PASS  vertex_count_non_increasing   level 1 (82453) ≤ level 0 (100000) ✓
-
-Level 3 validation: FAIL — 47 passed, 0 warnings, 1 error
+Level 3 validation: FAIL
+  4 passed, 1 warnings, 2 errors
+  ERROR: resolution_0: links[delta=0] segment '0.0.-1' offset 1 is
+         lexicographically negative; a canonical family stores each
+         record once, under the positive offset
+  ERROR: resolution_0: links[delta=0] refs non-existent source chunk (7, 2, 1)
+  WARN:  resolution_0: chunk (3, 0, 0) fragment[2] NaN/Inf
 ```
 
-The error above (`ccl_different_chunks`) indicates that the writer
-erroneously generated cross-chunk links for same-chunk vertex pairs — the
-most common correctness bug in cross-chunk link generation. See
-[Cross-chunk links](../object_model/cross_chunk_links.md) for the
-correct generation algorithm.
+The first error is the characteristic cross-chunk-link writer bug under
+the offset layout: an undirected canonical family must store each
+record exactly once, under the lexicographically positive offset. Both
+`0.0.+1` and `0.0.-1` existing means the writer canonicalised
+inconsistently. See [Links](../object_model/links.md) for the correct
+generation algorithm.

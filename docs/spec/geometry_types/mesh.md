@@ -10,15 +10,18 @@
 **`GEOM_MESH`**
 : The geometry type constant `"mesh"`.
 
-**`links/<delta>/`**
-: The array storing triplets of local-chunk vertex indices for each
-  triangle in a chunk. Shape `(F, 3)` int32 per chunk.
+**`links/<delta>/<offsets>/`**
+: The link family holding faces. `link_width` is the face arity —
+  taken from `faces.shape[1]`, so `3` for triangles and `4` for quads —
+  and MUST be `>= 3`. Each record is `link_width` endpoints; endpoint
+  `k`'s vertex index is local to chunk `src + o_k`.
 
 **Winding order**
-: The orientation convention for face normals. ZVF defaults to
-  counter-clockwise winding (CCW) when viewed from outside the surface,
-  which implies outward-facing normals. Declared in root `.zattrs` under
-  `"winding_order"`.
+: The orientation convention for face normals — conventionally
+  counter-clockwise when viewed from outside the surface, implying
+  outward-facing normals. ZVF does **not** declare this in metadata; it
+  preserves each face's input vertex order verbatim via `perm_idx`, so
+  whatever winding the producer used survives a round-trip.
 
 **Draco compression**
 : An optional codec applied to mesh geometry (`vertices/` and `links/<delta>/`)
@@ -26,9 +29,11 @@
   Requires `zarr-vectors[draco]`.
 
 **Boundary face**
-: A triangle in one chunk that references a vertex stored in a different
-  chunk. Mesh stores do not use `cross_chunk_links/`; instead, boundary
-  faces are handled via global vertex ID remapping at read time.
+: A face whose vertices do not all lie in one chunk. There is no special
+  mechanism for it: a boundary face is an ordinary record in the one
+  link family, filed under the `<offsets>` naming where its other
+  vertices' chunks sit relative to its source chunk. An intra-chunk face
+  is the same record with all-zero offsets.
 
 ---
 
@@ -41,10 +46,11 @@ spatial extent and the faces whose centroid falls within that extent.
 
 Mesh chunking introduces a subtlety that does not arise for point clouds
 or streamlines: a face may reference vertices in multiple chunks (the face
-straddles a chunk boundary). ZVF handles this by storing boundary faces in
-the chunk containing the face centroid and using global vertex IDs to
-reference vertices in other chunks. The `object_index/` maps each mesh
-object (distinct connected surface) to its constituent chunks.
+straddles a chunk boundary). ZVF handles this with the same link family
+it uses for intra-chunk faces — the face is filed under the offsets
+naming where its other vertices sit, and each endpoint's index stays
+local to its own chunk. The `object_index/` maps each mesh object
+(distinct connected surface) to its constituent chunks.
 
 ---
 
@@ -56,29 +62,64 @@ object (distinct connected surface) to its constituent chunks.
 |-----------|----------|-------------|
 | `vertices/` | Yes | Vertex positions, shape `(N, D)` float32 per chunk |
 | `vertex_fragments/` | Yes | Fragment index over `vertices/` rows |
-| `links/<delta>/` | Yes | Triangle vertex triplets, shape `(F, 3)` int32 per chunk |
-| `link_fragments/` | Yes (`<delta>=0`) | Fragment index over `links/0/` rows |
+| `links/0/0.0.0/` | Raw: yes | Faces whose vertices share a chunk. **Draco: absent** — see below |
+| `links/0/<offsets>/` | When a face straddles chunks | Boundary faces; offsets name the other vertices' chunks |
+| `link_fragments/` | Yes (with `links/0/0.0.0/`) | Fragment index over the intra array's rows |
 | `object_index/` | Yes | Per-object manifest blobs naming fragments |
 | `attributes/<name>/` | No | Per-vertex attributes (normals, UVs, colours) |
 | `object_attributes/<name>/` | No | Per-mesh attributes (volume, surface area) |
 
-No `links/<delta>/` and no `cross_chunk_links/`. Face-level cross-chunk
-references use the global vertex ID mechanism described below.
+There is no `cross_chunk_links/` array and no global-vertex-ID
+mechanism: boundary faces are records with non-zero offsets in the same
+family.
+
+### Face storage and Draco
+
+Which faces reach the link family depends on `encoding`:
+
+| `encoding` | Intra-chunk faces | Boundary faces |
+|------------|-------------------|----------------|
+| `"raw"` (default) | `links/0/0.0.0/` | `links/0/<offsets>/` |
+| `"draco"` (3-D only) | Embedded in the chunk's Draco bitstream, in chunk-local indices | `links/0/<offsets>/` |
+
+Draco mode applies only when `encoding == "draco"` **and** `sid_ndim ==
+3`; otherwise the raw path is used. Draco removes only the *intra-chunk*
+faces from the family — boundary faces have no chunk whose bitstream
+could hold them, so they stay in `links/`. A Draco mesh with no
+boundary-crossing face therefore has an **empty** link family;
+`write_meshes` still calls `create_links_array` afterwards so the family
+is advertised in `arrays_present` for the per-cell editors in `ops/`.
+
+### Face policy and winding
+
+The family is written **undirected** with `store="canonical"`, so
+`write_links` canonical-sorts each face's endpoints and stores it once.
+Winding is not lost: `perm_idx` records the permutation the sort
+applied, and `apply_perm_inverse` recovers the original vertex order —
+and therefore the face normal — on read. This is why the family can be
+undirected despite winding being significant.
+
+Records stay in input face order within each cell, so a parallel
+`link_attributes/<name>/0/<offsets>/` array stays row-aligned.
 
 ### Root `.zattrs` type-specific keys
 
 ```json
 {
-  "geometry_type": "mesh",
-  "winding_order":  "ccw",
-  "closed_surface": true
+  "geometry_type":    "mesh",
+  "links_convention": "explicit"
 }
 ```
 
-| Key | Type | Default | Description |
-|-----|------|---------|-------------|
-| `winding_order` | `string` | `"ccw"` | Face winding order: `"ccw"` (counter-clockwise) or `"cw"` (clockwise). |
-| `closed_surface` | `bool` | `false` | Whether each mesh object is a closed watertight surface. If `true`, L4 validation checks for watertightness. |
+`mesh` declares no type-specific root keys of its own.
+
+> **`winding_order` and `closed_surface` are not root metadata keys.**
+> Neither is written, read, or validated by any shipped code, and
+> `write_mesh` accepts neither as an argument. Winding is preserved
+> per-face by `perm_idx` (see *Face policy and winding* above), not by a
+> store-wide declaration; ZVF's convention is that a face's **input**
+> vertex order is authoritative and is recovered exactly on read.
+> Watertightness is not declared or checked.
 
 ### Face encoding and boundary faces
 
@@ -149,7 +190,6 @@ write_mesh(
     faces=faces,         # (F, 3) int32 — global vertex indices
     chunk_shape=(100.0, 100.0, 100.0),
     bin_shape=(25.0, 25.0, 25.0),
-    winding_order="ccw",
 )
 ```
 
@@ -187,14 +227,19 @@ result = read_mesh("cells.zarrvectors", object_ids=[42, 107])
 
 ### Validation
 
-L1: `vertices/`, `vertex_fragments/`, `links/<delta>/`, `link_fragments/`
-(at `<delta>=0`), and `object_index/` exist.
+L1: `vertices/` exists at every level. `links/` and `object_index/` are
+recorded when present but are **not** required at L1.
 
-L3:
-- All positive face vertex indices are in `[0, N_chunk)`.
-- No degenerate faces (all three vertex indices distinct).
-- Negative face vertex indices decode to valid global vertex IDs.
+L3: offsets segments parse; the family being undirected, canonical and
+intra-level, offsets are lex-non-negative and non-decreasing; every
+record's endpoint chunks exist at the level.
 
-L4 (if `closed_surface = true`):
-- Each mesh object is watertight: every edge is shared by exactly two faces.
-- No boundary edges.
+L4 (mesh-specific): the `links/0/` family's `link_width` MUST be `>= 3`
+— a `link_width` between 1 and 2 is an error. A mesh store with no link
+metadata at all emits a warning, not an error (this is the Draco
+no-boundary-face case). `links_convention` MUST be `explicit`.
+
+**Not checked at any level:** face vertex indices within a chunk,
+degenerate faces, watertightness, boundary edges, or winding
+consistency. There is no `closed_surface` key in the shipped code. See
+[Validation overview](../validation/overview.md).

@@ -8,7 +8,7 @@ from pathlib import Path
 import numpy as np
 import pytest
 
-from zarr_vectors.core.arrays import read_chunk_links, read_cross_chunk_links
+from zarr_vectors.core.arrays import read_chunk_links, read_links
 from zarr_vectors.core.store import open_store
 from zarr_vectors.exceptions import EditError
 from zarr_vectors.ops import (
@@ -21,6 +21,19 @@ from zarr_vectors.ops import (
     remove_link,
 )
 from zarr_vectors.types.graphs import write_graph
+
+
+def read_cross_links(level_group, *, delta: int = 0) -> list:
+    """Records spanning more than one chunk.
+
+    ``read_links`` returns the whole family — intra-chunk links are the
+    all-zero-offsets array, not a separate family — so tests that care
+    about the pre-merge ``cross_chunk_links`` set filter for it.
+    """
+    return [
+        record for record in read_links(level_group, delta=delta)
+        if len({tuple(cc) for cc, _vi in record}) > 1
+    ]
 
 
 @pytest.fixture
@@ -151,19 +164,19 @@ class TestCrossChunkLink:
             kind="graph",
         )
         root = open_store(str(path), mode="r+")
-        before = read_cross_chunk_links(root["0"], delta=0)
+        before = read_cross_links(root["0"], delta=0)
         endpoints = [((0, 0, 0), 0), ((1, 1, 1), 0)]
         ref, _ = add_cross_chunk_link(
             root, level=0, endpoints=endpoints, delta=0,
         )
-        after = read_cross_chunk_links(root["0"], delta=0)
+        after = read_cross_links(root["0"], delta=0)
         assert len(after) == len(before) + 1
 
     def test_edit_preserves_directed_family(self, tmp_path: Path) -> None:
-        # A directed cross-chunk family must stay directed across an edit
+        # A directed family must stay directed across an edit
         # (read-modify-rewrite would otherwise revert it to canonical).
-        from zarr_vectors.core.arrays import write_cross_chunk_links
-        from zarr_vectors.core.paths import cross_chunk_links_path
+        from zarr_vectors.core.arrays import write_links
+        from zarr_vectors.core.paths import links_group_path
 
         path = tmp_path / "store.zv"
         positions = np.array(
@@ -177,14 +190,43 @@ class TestCrossChunkLink:
             kind="graph",
         )
         root = open_store(str(path), mode="r+")
-        # Replace the family with a directed one (input-order cell).
-        write_cross_chunk_links(
+        # directed/store is family-wide — every offsets array under the
+        # delta decodes against the <delta> group's policy — so flipping it
+        # means dropping the family, not replacing one offset array within
+        # it.  write_links rejects the in-place flip on purpose.
+        root["0"].delete_subtree(links_group_path(0))
+        write_links(
             root["0"], [[((1, 1, 1), 0), ((0, 0, 0), 0)]],
             sid_ndim=3, delta=0, directed=True,
         )
         add_cross_chunk_link(
             root, level=0, endpoints=[((0, 0, 0), 0), ((1, 1, 1), 0)], delta=0,
         )
-        meta = root["0"].read_array_meta(cross_chunk_links_path(0))
+        meta = root["0"].read_array_meta(links_group_path(0))
         assert meta["directed"] is True
         assert meta["num_links"] == 2
+
+    def test_cannot_flip_family_policy_in_place(self, tmp_path: Path) -> None:
+        # The flip guard itself: directed/store live on the <delta> group,
+        # so a partial replace that leaves sibling offset arrays behind
+        # cannot change them — those siblings would keep decoding against
+        # the old policy and silently mis-parse their perm column.
+        from zarr_vectors.core.arrays import write_links
+
+        path = tmp_path / "store.zv"
+        positions = np.array(
+            [[10.0, 10.0, 10.0], [70.0, 70.0, 70.0]], dtype=np.float32,
+        )
+        edges = np.array([[0, 1]], dtype=np.int64)
+        write_graph(
+            str(path), positions, edges,
+            chunk_shape=(50.0, 50.0, 50.0),
+            bounds=([0.0, 0.0, 0.0], [100.0, 100.0, 100.0]),
+            kind="graph",
+        )
+        root = open_store(str(path), mode="r+")
+        with pytest.raises(Exception, match="family-wide"):
+            write_links(
+                root["0"], [[((1, 1, 1), 0), ((0, 0, 0), 0)]],
+                sid_ndim=3, delta=0, directed=True,
+            )

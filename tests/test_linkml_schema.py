@@ -135,12 +135,29 @@ def test_level_metadata_with_attribute_chunking_validates(schema):
     [
         ("VerticesMeta",
          {"zv_array": "vertices", "dtype": "float32", "encoding": "raw"}),
+        # Intra-chunk (all-zero offsets): rows are L ints, no perm_idx.
         ("LinksMeta",
-         {"zv_array": "links", "dtype": "int64", "link_width": 2,
-          "level_delta": 0}),
+         {"zv_array": "links", "dtype": "int64", "offsets": [[0, 0, 0]],
+          "has_perm": False, "link_width": 2, "level_delta": 0}),
+        # Cross-level: source is always input endpoint 0, so no perm_idx.
         ("LinksMeta",
-         {"zv_array": "links", "dtype": "int64", "link_width": 2,
-          "level_delta": 1}),
+         {"zv_array": "links", "dtype": "int64", "offsets": [[0, 0, 0]],
+          "has_perm": False, "link_width": 2, "level_delta": 1}),
+        # Non-intra at delta 0, undirected => a non-identity placement is
+        # possible, so rows widen to 1 + L with a leading perm_idx.
+        ("LinksMeta",
+         {"zv_array": "links", "dtype": "int64", "offsets": [[0, 0, 1]],
+          "has_perm": True, "link_width": 2, "level_delta": 0}),
+        # L=3 triangle face spanning two neighbours.
+        ("LinksMeta",
+         {"zv_array": "links", "dtype": "int64",
+          "offsets": [[0, 0, 1], [0, 1, 0]], "has_perm": True,
+          "link_width": 3, "level_delta": 0}),
+        # link_width == 1 (parent refs): no other endpoint, so the offsets
+        # list is empty and the array sits at the ``self`` segment.
+        ("LinksMeta",
+         {"zv_array": "links", "dtype": "int64", "offsets": [],
+          "has_perm": False, "link_width": 1, "level_delta": 1}),
         ("AttributeMeta",
          {"zv_array": "attribute", "name": "intensity", "dtype": "float32"}),
         ("ObjectIndexMeta",
@@ -153,25 +170,83 @@ def test_level_metadata_with_attribute_chunking_validates(schema):
         ("GroupingsAttributeMeta",
          {"zv_array": "groupings_attribute", "name": "label",
           "dtype": "int32", "shape": [5]}),
-        ("CrossChunkLinksMeta",
-         {"zv_array": "cross_chunk_links", "num_links": 12, "sid_ndim": 3,
-          "level_delta": 0, "link_width": 2}),
-        ("CrossChunkLinksMeta",
-         {"zv_array": "cross_chunk_links", "num_links": 5, "sid_ndim": 3,
-          "level_delta": -1, "link_width": 1}),
-        ("CrossChunkLinksMeta",
-         {"zv_array": "cross_chunk_links", "num_links": 4, "sid_ndim": 3,
-          "level_delta": 0, "link_width": 3}),
+        # --- links family group: policy, pre-finalize (no counts yet) ---
+        ("LinksFamilyMeta",
+         {"zv_array": "links_family", "level_delta": 0, "link_width": 2,
+          "directed": False, "store": "canonical", "sid_ndim": 3}),
+        # Post-finalize: duplicate store, physical rows exceed logical.
+        ("LinksFamilyMeta",
+         {"zv_array": "links_family", "level_delta": 0, "link_width": 2,
+          "directed": False, "store": "duplicate", "sid_ndim": 3,
+          "num_links": 12, "num_physical_records": 20}),
+        ("LinksFamilyMeta",
+         {"zv_array": "links_family", "level_delta": -1, "link_width": 1,
+          "directed": True, "store": "canonical", "sid_ndim": 3,
+          "num_links": 5, "num_physical_records": 5}),
+        # create_links_family stamps no sid_ndim when it isn't known, and
+        # finalize_links preserves that absence rather than inventing one.
+        ("LinksFamilyMeta",
+         {"zv_array": "links_family", "level_delta": 0, "link_width": 2,
+          "directed": False, "store": "canonical"}),
+        # --- link attributes -------------------------------------------
         ("LinkAttributeMeta",
          {"zv_array": "link_attribute", "name": "weight", "dtype": "float32",
-          "level_delta": 0}),
-        ("CrossChunkLinkAttributeMeta",
-         {"zv_array": "cross_chunk_link_attribute", "name": "weight",
-          "dtype": "float32", "level_delta": 1, "num_links": 7}),
+          "offsets": [[0, 0, 0]], "level_delta": 0}),
+        # write_link_attributes also stamps row_shape (tail dims per row).
+        ("LinkAttributeMeta",
+         {"zv_array": "link_attribute", "name": "weight", "dtype": "float32",
+          "row_shape": [], "offsets": [[0, 0, 1]], "level_delta": 0}),
+        ("LinkAttributeMeta",
+         {"zv_array": "link_attribute", "name": "rgb", "dtype": "uint8",
+          "row_shape": [3], "offsets": [[0, 0, 0]], "level_delta": 1}),
+        ("LinkAttributeFamilyMeta",
+         {"zv_array": "link_attribute_family", "name": "weight",
+          "level_delta": 1}),
+        ("LinkAttributeFamilyMeta",
+         {"zv_array": "link_attribute_family", "name": "weight",
+          "level_delta": 1, "num_links": 7}),
     ],
 )
 def test_per_array_zattrs_shapes_validate(schema, defs_name, instance):
     _validate(schema, defs_name, instance)
+
+
+@pytest.mark.parametrize(
+    "offsets,delta,directed,store,expected",
+    [
+        # Intra (all-zero offsets): identity placement, input order kept.
+        ([(0, 0, 0)], 0, False, "canonical", False),
+        ([(0, 0, 0)], 0, False, "duplicate", False),
+        ([(0, 0, 0)], 0, True, "canonical", False),
+        # link_width == 1: empty offsets counts as intra.
+        ([], 0, False, "canonical", False),
+        # Cross-level: endpoints are distinguished by level, so the source
+        # is always input endpoint 0 => identity placement.
+        ([(0, 0, 1)], 1, False, "canonical", False),
+        ([(0, 0, 1)], -1, False, "duplicate", False),
+        # Non-intra at delta 0: perm_idx exactly when a non-identity
+        # placement is possible.
+        ([(0, 0, 1)], 0, False, "canonical", True),
+        ([(0, 0, 1)], 0, False, "duplicate", True),
+        ([(0, 0, 1)], 0, True, "duplicate", True),
+        ([(0, 0, 1)], 0, True, "canonical", False),
+    ],
+)
+def test_has_perm_rule_matches_shipped_writer(
+    offsets, delta, directed, store, expected,
+):
+    """The ``has_perm`` rule documented on ``LinksMeta`` must match the
+    writer's own discriminator.
+
+    ``links_has_perm`` is the single definition the writer and reader
+    consult to agree on record width, so if it moves, the schema prose
+    (and the ``has_perm`` values in the cases above) are stale.
+    """
+    from zarr_vectors.core.arrays import links_has_perm
+
+    assert links_has_perm(
+        offsets, delta=delta, directed=directed, store=store,
+    ) is expected
 
 
 # ===================================================================
@@ -203,10 +278,35 @@ def test_object_sparsity_out_of_range_rejected(schema):
 
 
 def test_per_array_wrong_discriminator_rejected(schema):
-    # zv_array says "vertices" but we're validating against LinksMeta —
-    # the LinksMeta class has equals_string: links, so the wrong tag
-    # must be rejected.
-    instance = {"zv_array": "vertices", "dtype": "int64", "link_width": 2}
+    # Otherwise-valid LinksMeta whose only defect is the tag: zv_array
+    # says "vertices" but LinksMeta has equals_string: links.  Keep every
+    # other slot present so this fails on the discriminator alone and not
+    # incidentally on a missing required slot.
+    instance = {"zv_array": "vertices", "dtype": "int64",
+                "offsets": [[0, 0, 0]], "has_perm": False,
+                "link_width": 2, "level_delta": 0}
+    with pytest.raises(jsonschema.ValidationError):
+        _validate(schema, "LinksMeta", instance)
+
+
+def test_links_family_tag_not_interchangeable_with_links(schema):
+    """The family group and its offsets arrays are distinct shapes.
+
+    Both live under ``links/<delta>/`` and share slot names, so a reader
+    that confused the two would silently decode policy as records.
+    """
+    family = {"zv_array": "links_family", "level_delta": 0, "link_width": 2,
+              "directed": False, "store": "canonical", "sid_ndim": 3}
+    with pytest.raises(jsonschema.ValidationError):
+        _validate(schema, "LinksMeta", family)
+
+
+def test_links_meta_missing_has_perm_rejected(schema):
+    """``has_perm`` is the record-width discriminator: rows are L ints, or
+    1 + L when true.  A writer that drops it leaves readers guessing a
+    width, which mis-parses silently rather than raising."""
+    instance = {"zv_array": "links", "dtype": "int64",
+                "offsets": [[0, 0, 1]], "link_width": 2, "level_delta": 0}
     with pytest.raises(jsonschema.ValidationError):
         _validate(schema, "LinksMeta", instance)
 

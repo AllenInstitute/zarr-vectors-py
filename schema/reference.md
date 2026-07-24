@@ -16,14 +16,14 @@ Name: zarr_vectors
 | [AttributeMeta](AttributeMeta.md) | `` |
 | [Axis](Axis.md) | One axis of the spatial index |
 | [BoundingBox](BoundingBox.md) | Two parallel ``ndim``-length arrays representing the global ``(min_corner, ma... |
-| [CrossChunkLinkAttributeMeta](CrossChunkLinkAttributeMeta.md) | `` |
-| [CrossChunkLinksMeta](CrossChunkLinksMeta.md) | `` |
 | [CRS](CRS.md) | Free-form coordinate reference system metadata |
 | [FragmentAttributeMeta](FragmentAttributeMeta.md) | `` |
 | [GroupingsAttributeMeta](GroupingsAttributeMeta.md) | `` |
 | [GroupingsMeta](GroupingsMeta.md) | `` |
 | [LevelMetadata](LevelMetadata.md) | Per-resolution-level `` |
+| [LinkAttributeFamilyMeta](LinkAttributeFamilyMeta.md) | `` |
 | [LinkAttributeMeta](LinkAttributeMeta.md) | `` |
+| [LinksFamilyMeta](LinksFamilyMeta.md) | `` |
 | [LinksMeta](LinksMeta.md) | `` |
 | [ObjectAttributeMeta](ObjectAttributeMeta.md) | `` |
 | [ObjectIndexMeta](ObjectIndexMeta.md) | `` |
@@ -51,10 +51,12 @@ Name: zarr_vectors
 | [cross_level_depth](cross_level_depth.md) | Maximum absolute level delta for which cross-pyramid-level link arrays are ma... |
 | [cross_level_storage](cross_level_storage.md) | Whether cross-level link arrays are written in both directions (``explicit``:... |
 | [crs](crs.md) | Optional coordinate reference system metadata (free-form dict matching whatev... |
+| [directed](directed.md) | When true, endpoint order is meaningful and preserved (no canonical sort): ``... |
 | [dtype](dtype.md) | Numpy dtype string of the array's value type (e |
 | [encoding](encoding.md) | How the chunk bytes are encoded |
 | [format_capabilities](format_capabilities.md) | Optional 0 |
 | [geometry_types](geometry_types.md) | One or more geometry kinds present in the store |
+| [has_perm](has_perm.md) | Whether each row of this links array carries a leading ``perm_idx`` column — ... |
 | [inherited_num_objects](inherited_num_objects.md) | OID-space size inherited from the parent level (= ``parent_level |
 | [level](level.md) | Resolution level index (0 = full resolution) |
 | [level_delta](level_delta.md) | Pyramid-level delta between the source side (the level that owns this array) ... |
@@ -64,16 +66,20 @@ Name: zarr_vectors
 | [min_corner](min_corner.md) | Per-axis minima |
 | [name](name.md) | NGFF axis or attribute name (e |
 | [num_groups](num_groups.md) | Total grouping count |
-| [num_links](num_links.md) | Total cross-chunk link count |
+| [num_links](num_links.md) | Family-wide *logical* link count — one per input record, however many physica... |
 | [num_objects](num_objects.md) | Total object count this array carries |
+| [num_physical_records](num_physical_records.md) | On-disk record row count across every offsets array and cell of a ``links/<de... |
 | [object_index_convention](object_index_convention.md) |  |
 | [object_sparsity](object_sparsity.md) | Fraction of objects retained at this level |
+| [offsets](offsets.md) | The ``link_width - 1`` relative offsets naming this array, each of ``sid_ndim... |
 | [parent_level](parent_level.md) | Source level index (None for level 0) |
 | [preserves_object_ids](preserves_object_ids.md) | True for levels written by the per-object pyramid regime |
 | [reduction_factor](reduction_factor.md) | Multi-resolution coarsening factor (≥ 2) |
+| [row_shape](row_shape.md) | Tail dimensions of one attribute row (``[]`` for a 1-D per-link attribute), l... |
 | [shape](shape.md) | Shape of a dense per-object/per-group array |
 | [shared_fragments](shared_fragments.md) | True when per-chunk fragments may be referenced by multiple objects' manifest... |
 | [sid_ndim](sid_ndim.md) | Number of spatial-index dimensions encoded in chunk keys |
+| [store](store.md) | Cell-duplication policy for a links family; see CrossChunkStore |
 | [type](type.md) | NGFF axis type — "space", "time", or "channel" |
 | [unit](unit.md) | NGFF unit string (e |
 | [vertex_count](vertex_count.md) | Total number of vertices at this level |
@@ -85,6 +91,7 @@ Name: zarr_vectors
 
 | Enumeration | Description |
 | --- | --- |
+| [CrossChunkStore](CrossChunkStore.md) | Cell-duplication policy for a ``links/<delta>/`` family |
 | [CrossChunkStrategy](CrossChunkStrategy.md) | How connectivity that crosses chunk boundaries is represented |
 | [CrossLevelStorage](CrossLevelStorage.md) | How cross-pyramid-level edges are stored in the multiscale links layout (``li... |
 | [Encoding](Encoding.md) | Per-array encoding of vertex data |
@@ -382,6 +389,7 @@ attributes:
     owner: AttributeMeta
     domain_of:
     - VerticesMeta
+    - LinksFamilyMeta
     - LinksMeta
     - AttributeMeta
     - FragmentAttributeMeta
@@ -389,9 +397,8 @@ attributes:
     - ObjectAttributeMeta
     - GroupingsMeta
     - GroupingsAttributeMeta
-    - CrossChunkLinksMeta
+    - LinkAttributeFamilyMeta
     - LinkAttributeMeta
-    - CrossChunkLinkAttributeMeta
     range: ZvArrayTag
     required: true
     equals_string: attribute
@@ -408,8 +415,8 @@ attributes:
     - FragmentAttributeMeta
     - ObjectAttributeMeta
     - GroupingsAttributeMeta
+    - LinkAttributeFamilyMeta
     - LinkAttributeMeta
-    - CrossChunkLinkAttributeMeta
     range: string
     required: true
   dtype:
@@ -426,7 +433,6 @@ attributes:
     - ObjectAttributeMeta
     - GroupingsAttributeMeta
     - LinkAttributeMeta
-    - CrossChunkLinkAttributeMeta
     range: string
     required: true
   channel_names:
@@ -591,8 +597,8 @@ attributes:
     - FragmentAttributeMeta
     - ObjectAttributeMeta
     - GroupingsAttributeMeta
+    - LinkAttributeFamilyMeta
     - LinkAttributeMeta
-    - CrossChunkLinkAttributeMeta
     range: string
     required: true
   type:
@@ -2192,13 +2198,16 @@ range: CrossLevelStorage
 
 ---
 search:
-  boost: 10.0
+  boost: 2.0
 ---
 
-# Class: CrossChunkLinkAttributeMeta 
+
+# Enum: CrossChunkStore 
 
 
-_``.zattrs`` for each ``cross_chunk_link_attributes/<name>/<delta>/`` parent group.  In 0.8 the parallel link family was split into per-cell arrays keyed on the canonical-sorted L-tuple of endpoint chunks.  This attribute family mirrors that layout: per-cell byte blobs with one row per record, in the same write order as the matching cell.  ``num_links`` MUST equal the parallel CCL family's ``num_links``._
+
+
+_Cell-duplication policy for a ``links/<delta>/`` family.  Governs only the boundary-crossing (non-zero offsets) arrays: an intra-chunk record has a single incident chunk, so both values place it identically._
 
 __
 
@@ -2206,59 +2215,22 @@ __
 
 <div data-search-exclude markdown="1">
 
+URI: [zv:CrossChunkStore](https://w3id.org/zarr-vectors/schema/0.5/CrossChunkStore)
 
-
-URI: [zv:CrossChunkLinkAttributeMeta](https://w3id.org/zarr-vectors/schema/0.5/CrossChunkLinkAttributeMeta)
-
-
-
-
-
-```mermaid
- classDiagram
-    class CrossChunkLinkAttributeMeta
-    click CrossChunkLinkAttributeMeta href "../CrossChunkLinkAttributeMeta/"
-      CrossChunkLinkAttributeMeta : dtype
-        
-      CrossChunkLinkAttributeMeta : level_delta
-        
-      CrossChunkLinkAttributeMeta : name
-        
-      CrossChunkLinkAttributeMeta : num_links
-        
-      CrossChunkLinkAttributeMeta : zv_array
-        
-          
-    
-        
-        
-        CrossChunkLinkAttributeMeta --> "1" ZvArrayTag : zv_array
-        click ZvArrayTag href "../ZvArrayTag/"
-    
-
-        
-      
-```
+## Permissible Values
+| Value | Meaning | Description |
+| --- | --- | --- |
+| canonical | None | Each record is filed in exactly one cell — the source chunk of its canonical-... |
+| duplicate | None | Each record is filed under one cell per distinct incident chunk as independen... |
 
 
 
-
-<!-- no inheritance hierarchy -->
 
 ## Slots
 
-| Name | Cardinality and Range | Description | Inheritance |
-| ---  | --- | --- | --- |
-| [zv_array](zv_array.md) | 1 <br/> [ZvArrayTag](ZvArrayTag.md) | Discriminator slot identifying the kind of per-array `` | direct |
-| [name](name.md) | 1 <br/> [String](String.md) | NGFF axis or attribute name (e | direct |
-| [dtype](dtype.md) | 1 <br/> [String](String.md) | Numpy dtype string of the array's value type (e | direct |
-| [level_delta](level_delta.md) | 1 <br/> [Integer](Integer.md) | Pyramid-level delta between the source side (the level that owns this array) ... | direct |
-| [num_links](num_links.md) | 1 <br/> [Integer](Integer.md) | Total cross-chunk link count | direct |
-
-
-
-
-
+| Name | Description |
+| ---  | --- |
+| [store](store.md) | Cell-duplication policy for a links family; see CrossChunkStore |
 
 
 
@@ -2283,416 +2255,40 @@ URI: [zv:CrossChunkLinkAttributeMeta](https://w3id.org/zarr-vectors/schema/0.5/C
 
 
 
-## Mappings
-
-| Mapping Type | Mapped Value |
-| ---  | ---  |
-| self | zv:CrossChunkLinkAttributeMeta |
-| native | zv:CrossChunkLinkAttributeMeta |
-
-
-
-
 
 
 ## LinkML Source
 
-### Direct
-
 <details>
 ```yaml
-name: CrossChunkLinkAttributeMeta
-description: '``.zattrs`` for each ``cross_chunk_link_attributes/<name>/<delta>/``
-  parent group.  In 0.8 the parallel link family was split into per-cell arrays keyed
-  on the canonical-sorted L-tuple of endpoint chunks.  This attribute family mirrors
-  that layout: per-cell byte blobs with one row per record, in the same write order
-  as the matching cell.  ``num_links`` MUST equal the parallel CCL family''s ``num_links``.
+name: CrossChunkStore
+description: 'Cell-duplication policy for a ``links/<delta>/`` family.  Governs only
+  the boundary-crossing (non-zero offsets) arrays: an intra-chunk record has a single
+  incident chunk, so both values place it identically.
 
   '
 from_schema: https://w3id.org/zarr-vectors/schema/0.5
 rank: 1000
-slots:
-- zv_array
-- name
-- dtype
-- level_delta
-- num_links
-slot_usage:
-  zv_array:
-    name: zv_array
-    required: true
-    equals_string: cross_chunk_link_attribute
+permissible_values:
+  canonical:
+    text: canonical
+    description: 'Each record is filed in exactly one cell — the source chunk of its
+      canonical-sorted endpoints, or of its input order when ``directed``.  Fewest
+      cells.
+
+      '
+  duplicate:
+    text: duplicate
+    description: 'Each record is filed under one cell per distinct incident chunk
+      as independent physical copies, so incidence reads become a prefix scan.  ``num_physical_records``
+      then exceeds ``num_links``.
+
+      '
 
 ```
 </details>
 
-### Induced
-
-<details>
-```yaml
-name: CrossChunkLinkAttributeMeta
-description: '``.zattrs`` for each ``cross_chunk_link_attributes/<name>/<delta>/``
-  parent group.  In 0.8 the parallel link family was split into per-cell arrays keyed
-  on the canonical-sorted L-tuple of endpoint chunks.  This attribute family mirrors
-  that layout: per-cell byte blobs with one row per record, in the same write order
-  as the matching cell.  ``num_links`` MUST equal the parallel CCL family''s ``num_links``.
-
-  '
-from_schema: https://w3id.org/zarr-vectors/schema/0.5
-rank: 1000
-slot_usage:
-  zv_array:
-    name: zv_array
-    required: true
-    equals_string: cross_chunk_link_attribute
-attributes:
-  zv_array:
-    name: zv_array
-    description: 'Discriminator slot identifying the kind of per-array ``.zattrs``
-      block.  Each writer in ``core/arrays.py`` stamps the corresponding token from
-      :class:`ZvArrayTag`.
-
-      '
-    from_schema: https://w3id.org/zarr-vectors/schema/0.5
-    rank: 1000
-    owner: CrossChunkLinkAttributeMeta
-    domain_of:
-    - VerticesMeta
-    - LinksMeta
-    - AttributeMeta
-    - FragmentAttributeMeta
-    - ObjectIndexMeta
-    - ObjectAttributeMeta
-    - GroupingsMeta
-    - GroupingsAttributeMeta
-    - CrossChunkLinksMeta
-    - LinkAttributeMeta
-    - CrossChunkLinkAttributeMeta
-    range: ZvArrayTag
-    required: true
-    equals_string: cross_chunk_link_attribute
-  name:
-    name: name
-    description: NGFF axis or attribute name (e.g. "x", "intensity").
-    from_schema: https://w3id.org/zarr-vectors/schema/0.5
-    rank: 1000
-    slot_uri: schema:name
-    owner: CrossChunkLinkAttributeMeta
-    domain_of:
-    - Axis
-    - AttributeMeta
-    - FragmentAttributeMeta
-    - ObjectAttributeMeta
-    - GroupingsAttributeMeta
-    - LinkAttributeMeta
-    - CrossChunkLinkAttributeMeta
-    range: string
-    required: true
-  dtype:
-    name: dtype
-    description: Numpy dtype string of the array's value type (e.g. "float32").
-    from_schema: https://w3id.org/zarr-vectors/schema/0.5
-    rank: 1000
-    owner: CrossChunkLinkAttributeMeta
-    domain_of:
-    - VerticesMeta
-    - LinksMeta
-    - AttributeMeta
-    - FragmentAttributeMeta
-    - ObjectAttributeMeta
-    - GroupingsAttributeMeta
-    - LinkAttributeMeta
-    - CrossChunkLinkAttributeMeta
-    range: string
-    required: true
-  level_delta:
-    name: level_delta
-    description: 'Pyramid-level delta between the source side (the level that owns
-      this array) and the target side of the edges.  ``0`` for intra-level arrays
-      (the only kind written pre-0.4), ``+N`` for edges from this level to ``this_level
-      + N`` (coarser), ``-N`` for edges to ``this_level - N`` (finer).
-
-      '
-    from_schema: https://w3id.org/zarr-vectors/schema/0.5
-    rank: 1000
-    owner: CrossChunkLinkAttributeMeta
-    domain_of:
-    - LinksMeta
-    - CrossChunkLinksMeta
-    - LinkAttributeMeta
-    - CrossChunkLinkAttributeMeta
-    range: integer
-    required: true
-  num_links:
-    name: num_links
-    description: Total cross-chunk link count.
-    from_schema: https://w3id.org/zarr-vectors/schema/0.5
-    rank: 1000
-    owner: CrossChunkLinkAttributeMeta
-    domain_of:
-    - CrossChunkLinksMeta
-    - CrossChunkLinkAttributeMeta
-    range: integer
-    required: true
-    minimum_value: 0
-
-```
-</details></div>
-
-
----
-
----
-search:
-  boost: 10.0
----
-
-# Class: CrossChunkLinksMeta 
-
-
-_``.zattrs`` for a ``cross_chunk_links/<delta>/`` parent group. In 0.8 the family stores per-cell arrays keyed on the canonical-sorted L-tuple of endpoint chunks (``cross_chunk_links/<delta>/<x.y.z...>`` — exactly ``sid_ndim * link_width`` dotted components).  Each cell holds records spanning that exact L-tuple of chunks; each record is ``[perm_idx, vi_0, ..., vi_{L-1}]`` int64s, where ``perm_idx`` is the Lehmer code of the canonical→input-order permutation (so readers can recover original endpoint order — mesh-face winding, directed-edge direction).  Source-side endpoint (input endpoint 0) lives at the array's own resolution level; target-side endpoints live at ``this_level + level_delta``.  ``num_links`` is the family- wide total record count._
-
-__
-
-
-
-<div data-search-exclude markdown="1">
-
-
-
-URI: [zv:CrossChunkLinksMeta](https://w3id.org/zarr-vectors/schema/0.5/CrossChunkLinksMeta)
-
-
-
-
-
-```mermaid
- classDiagram
-    class CrossChunkLinksMeta
-    click CrossChunkLinksMeta href "../CrossChunkLinksMeta/"
-      CrossChunkLinksMeta : level_delta
-        
-      CrossChunkLinksMeta : link_width
-        
-      CrossChunkLinksMeta : num_links
-        
-      CrossChunkLinksMeta : sid_ndim
-        
-      CrossChunkLinksMeta : zv_array
-        
-          
-    
-        
-        
-        CrossChunkLinksMeta --> "1" ZvArrayTag : zv_array
-        click ZvArrayTag href "../ZvArrayTag/"
-    
-
-        
-      
-```
-
-
-
-
-<!-- no inheritance hierarchy -->
-
-## Slots
-
-| Name | Cardinality and Range | Description | Inheritance |
-| ---  | --- | --- | --- |
-| [zv_array](zv_array.md) | 1 <br/> [ZvArrayTag](ZvArrayTag.md) | Discriminator slot identifying the kind of per-array `` | direct |
-| [num_links](num_links.md) | 1 <br/> [Integer](Integer.md) | Total cross-chunk link count | direct |
-| [sid_ndim](sid_ndim.md) | 1 <br/> [Integer](Integer.md) | Number of spatial-index dimensions encoded in chunk keys | direct |
-| [level_delta](level_delta.md) | 1 <br/> [Integer](Integer.md) | Pyramid-level delta between the source side (the level that owns this array) ... | direct |
-| [link_width](link_width.md) | 1 <br/> [Integer](Integer.md) | Width of a links row (1 for parent→child metanode references, 2 for edges, 3 ... | direct |
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-## Identifier and Mapping Information
-
-
-
-
-
-### Schema Source
-
-
-* from schema: https://w3id.org/zarr-vectors/schema/0.5
-
-
-
-
-## Mappings
-
-| Mapping Type | Mapped Value |
-| ---  | ---  |
-| self | zv:CrossChunkLinksMeta |
-| native | zv:CrossChunkLinksMeta |
-
-
-
-
-
-
-## LinkML Source
-
-### Direct
-
-<details>
-```yaml
-name: CrossChunkLinksMeta
-description: '``.zattrs`` for a ``cross_chunk_links/<delta>/`` parent group. In 0.8
-  the family stores per-cell arrays keyed on the canonical-sorted L-tuple of endpoint
-  chunks (``cross_chunk_links/<delta>/<x.y.z...>`` — exactly ``sid_ndim * link_width``
-  dotted components).  Each cell holds records spanning that exact L-tuple of chunks;
-  each record is ``[perm_idx, vi_0, ..., vi_{L-1}]`` int64s, where ``perm_idx`` is
-  the Lehmer code of the canonical→input-order permutation (so readers can recover
-  original endpoint order — mesh-face winding, directed-edge direction).  Source-side
-  endpoint (input endpoint 0) lives at the array''s own resolution level; target-side
-  endpoints live at ``this_level + level_delta``.  ``num_links`` is the family- wide
-  total record count.
-
-  '
-from_schema: https://w3id.org/zarr-vectors/schema/0.5
-rank: 1000
-slots:
-- zv_array
-- num_links
-- sid_ndim
-- level_delta
-- link_width
-slot_usage:
-  zv_array:
-    name: zv_array
-    required: true
-    equals_string: cross_chunk_links
-
-```
-</details>
-
-### Induced
-
-<details>
-```yaml
-name: CrossChunkLinksMeta
-description: '``.zattrs`` for a ``cross_chunk_links/<delta>/`` parent group. In 0.8
-  the family stores per-cell arrays keyed on the canonical-sorted L-tuple of endpoint
-  chunks (``cross_chunk_links/<delta>/<x.y.z...>`` — exactly ``sid_ndim * link_width``
-  dotted components).  Each cell holds records spanning that exact L-tuple of chunks;
-  each record is ``[perm_idx, vi_0, ..., vi_{L-1}]`` int64s, where ``perm_idx`` is
-  the Lehmer code of the canonical→input-order permutation (so readers can recover
-  original endpoint order — mesh-face winding, directed-edge direction).  Source-side
-  endpoint (input endpoint 0) lives at the array''s own resolution level; target-side
-  endpoints live at ``this_level + level_delta``.  ``num_links`` is the family- wide
-  total record count.
-
-  '
-from_schema: https://w3id.org/zarr-vectors/schema/0.5
-rank: 1000
-slot_usage:
-  zv_array:
-    name: zv_array
-    required: true
-    equals_string: cross_chunk_links
-attributes:
-  zv_array:
-    name: zv_array
-    description: 'Discriminator slot identifying the kind of per-array ``.zattrs``
-      block.  Each writer in ``core/arrays.py`` stamps the corresponding token from
-      :class:`ZvArrayTag`.
-
-      '
-    from_schema: https://w3id.org/zarr-vectors/schema/0.5
-    rank: 1000
-    owner: CrossChunkLinksMeta
-    domain_of:
-    - VerticesMeta
-    - LinksMeta
-    - AttributeMeta
-    - FragmentAttributeMeta
-    - ObjectIndexMeta
-    - ObjectAttributeMeta
-    - GroupingsMeta
-    - GroupingsAttributeMeta
-    - CrossChunkLinksMeta
-    - LinkAttributeMeta
-    - CrossChunkLinkAttributeMeta
-    range: ZvArrayTag
-    required: true
-    equals_string: cross_chunk_links
-  num_links:
-    name: num_links
-    description: Total cross-chunk link count.
-    from_schema: https://w3id.org/zarr-vectors/schema/0.5
-    rank: 1000
-    owner: CrossChunkLinksMeta
-    domain_of:
-    - CrossChunkLinksMeta
-    - CrossChunkLinkAttributeMeta
-    range: integer
-    required: true
-    minimum_value: 0
-  sid_ndim:
-    name: sid_ndim
-    description: Number of spatial-index dimensions encoded in chunk keys.
-    from_schema: https://w3id.org/zarr-vectors/schema/0.5
-    rank: 1000
-    owner: CrossChunkLinksMeta
-    domain_of:
-    - ObjectIndexMeta
-    - CrossChunkLinksMeta
-    range: integer
-    required: true
-    minimum_value: 1
-  level_delta:
-    name: level_delta
-    description: 'Pyramid-level delta between the source side (the level that owns
-      this array) and the target side of the edges.  ``0`` for intra-level arrays
-      (the only kind written pre-0.4), ``+N`` for edges from this level to ``this_level
-      + N`` (coarser), ``-N`` for edges to ``this_level - N`` (finer).
-
-      '
-    from_schema: https://w3id.org/zarr-vectors/schema/0.5
-    rank: 1000
-    owner: CrossChunkLinksMeta
-    domain_of:
-    - LinksMeta
-    - CrossChunkLinksMeta
-    - LinkAttributeMeta
-    - CrossChunkLinkAttributeMeta
-    range: integer
-    required: true
-  link_width:
-    name: link_width
-    description: 'Width of a links row (1 for parent→child metanode references, 2
-      for edges, 3 for triangle faces, 4 for quads).
-
-      '
-    from_schema: https://w3id.org/zarr-vectors/schema/0.5
-    rank: 1000
-    owner: CrossChunkLinksMeta
-    domain_of:
-    - LinksMeta
-    - CrossChunkLinksMeta
-    range: integer
-    required: true
-    minimum_value: 1
-
-```
-</details></div>
+</div>
 
 
 ---
@@ -2720,7 +2316,7 @@ URI: [zv:CrossChunkStrategy](https://w3id.org/zarr-vectors/schema/0.5/CrossChunk
 | Value | Meaning | Description |
 | --- | --- | --- |
 | boundary_deduplication | None | Vertices on a chunk boundary are duplicated in each chunk |
-| explicit_links | None | A ``cross_chunk_links`` array bridges the boundary |
+| explicit_links | None | Links with a non-zero offsets segment bridge the boundary |
 | both | None | Both boundary duplication and explicit links are present |
 
 
@@ -2771,7 +2367,12 @@ permissible_values:
     description: Vertices on a chunk boundary are duplicated in each chunk.
   explicit_links:
     text: explicit_links
-    description: A ``cross_chunk_links`` array bridges the boundary.
+    description: 'Links with a non-zero offsets segment bridge the boundary. This
+      value is semantic — it records the authoring intent, not a distinct physical
+      family: since 0.9.0 a boundary-crossing link is an ordinary record in ``links/<delta>/<offsets>/``
+      whose offsets are not all zero.
+
+      '
   both:
     text: both
     description: Both boundary duplication and explicit links are present.
@@ -2795,7 +2396,7 @@ search:
 
 
 
-_How cross-pyramid-level edges are stored in the multiscale links layout (``links/<delta>/`` and ``cross_chunk_links/<delta>/``)._
+_How cross-pyramid-level edges are stored in the multiscale links layout (``links/<delta>/``)._
 
 __
 
@@ -2852,7 +2453,7 @@ URI: [zv:CrossLevelStorage](https://w3id.org/zarr-vectors/schema/0.5/CrossLevelS
 ```yaml
 name: CrossLevelStorage
 description: 'How cross-pyramid-level edges are stored in the multiscale links layout
-  (``links/<delta>/`` and ``cross_chunk_links/<delta>/``).
+  (``links/<delta>/``).
 
   '
 from_schema: https://w3id.org/zarr-vectors/schema/0.5
@@ -3320,6 +2921,112 @@ URI: [xsd:decimal](http://www.w3.org/2001/XMLSchema#decimal)
 
 ---
 search:
+  boost: 5.0
+---
+
+# Slot: directed 
+
+
+_When true, endpoint order is meaningful and preserved (no canonical sort): ``A→B`` and ``B→A`` occupy distinct cells and every stored ``perm_idx`` is 0.  Family-wide; defaults to false (undirected)._
+
+__
+
+
+
+<div data-search-exclude markdown="1">
+
+
+
+URI: [zv:directed](https://w3id.org/zarr-vectors/schema/0.5/directed)
+<!-- no inheritance hierarchy -->
+
+
+
+
+
+## Applicable Classes
+
+| Name | Description | Modifies Slot |
+| --- | --- | --- |
+| [LinksFamilyMeta](LinksFamilyMeta.md) | `` |  no  |
+
+
+
+
+
+
+## Properties
+
+### Type and Range
+
+| Property | Value |
+| --- | --- |
+| Range | [Boolean](Boolean.md) |
+| Domain Of | [LinksFamilyMeta](LinksFamilyMeta.md) |
+
+### Cardinality and Requirements
+
+| Property | Value |
+| --- | --- |
+
+
+
+
+
+
+
+
+
+
+## Identifier and Mapping Information
+
+
+
+
+
+### Schema Source
+
+
+* from schema: https://w3id.org/zarr-vectors/schema/0.5
+
+
+
+
+## Mappings
+
+| Mapping Type | Mapped Value |
+| ---  | ---  |
+| self | zv:directed |
+| native | zv:directed |
+
+
+
+
+## LinkML Source
+
+<details>
+```yaml
+name: directed
+description: 'When true, endpoint order is meaningful and preserved (no canonical
+  sort): ``A→B`` and ``B→A`` occupy distinct cells and every stored ``perm_idx`` is
+  0.  Family-wide; defaults to false (undirected).
+
+  '
+from_schema: https://w3id.org/zarr-vectors/schema/0.5
+rank: 1000
+domain_of:
+- LinksFamilyMeta
+range: boolean
+required: false
+
+```
+</details></div>
+
+
+---
+
+---
+search:
   boost: 1.0
 ---# Type: Double 
 
@@ -3416,7 +3123,6 @@ URI: [zv:dtype](https://w3id.org/zarr-vectors/schema/0.5/dtype)
 | [ObjectAttributeMeta](ObjectAttributeMeta.md) | `` |  no  |
 | [GroupingsAttributeMeta](GroupingsAttributeMeta.md) | `` |  no  |
 | [LinkAttributeMeta](LinkAttributeMeta.md) | `` |  no  |
-| [CrossChunkLinkAttributeMeta](CrossChunkLinkAttributeMeta.md) | `` |  no  |
 
 
 
@@ -3430,7 +3136,7 @@ URI: [zv:dtype](https://w3id.org/zarr-vectors/schema/0.5/dtype)
 | Property | Value |
 | --- | --- |
 | Range | [String](String.md) |
-| Domain Of | [VerticesMeta](VerticesMeta.md), [LinksMeta](LinksMeta.md), [AttributeMeta](AttributeMeta.md), [FragmentAttributeMeta](FragmentAttributeMeta.md), [ObjectAttributeMeta](ObjectAttributeMeta.md), [GroupingsAttributeMeta](GroupingsAttributeMeta.md), [LinkAttributeMeta](LinkAttributeMeta.md), [CrossChunkLinkAttributeMeta](CrossChunkLinkAttributeMeta.md) |
+| Domain Of | [VerticesMeta](VerticesMeta.md), [LinksMeta](LinksMeta.md), [AttributeMeta](AttributeMeta.md), [FragmentAttributeMeta](FragmentAttributeMeta.md), [ObjectAttributeMeta](ObjectAttributeMeta.md), [GroupingsAttributeMeta](GroupingsAttributeMeta.md), [LinkAttributeMeta](LinkAttributeMeta.md) |
 
 ### Cardinality and Requirements
 
@@ -3487,7 +3193,6 @@ domain_of:
 - ObjectAttributeMeta
 - GroupingsAttributeMeta
 - LinkAttributeMeta
-- CrossChunkLinkAttributeMeta
 range: string
 required: true
 
@@ -3772,7 +3477,7 @@ URI: [zv:FormatCapability](https://w3id.org/zarr-vectors/schema/0.5/FormatCapabi
 | preserved_object_ids | None | At least one level was written with ID-preserving sparsification (``LevelMeta... |
 | shared_fragments | None | At least one level stores per-chunk fragments that may be referenced by multi... |
 | fragment_index | None | The store uses the v0 |
-| multiscale_links | None | Store uses the 0 |
+| multiscale_links | None | Store uses the multiscale links layout (``links/<delta>/<offsets>/`` and ``li... |
 
 
 
@@ -3845,9 +3550,11 @@ permissible_values:
       '
   multiscale_links:
     text: multiscale_links
-    description: 'Store uses the 0.4 multiscale links layout (``links/<delta>/``,
-      ``cross_chunk_links/<delta>/``, ``link_attributes/<name>/<delta>/`` and ``cross_chunk_link_attributes/<name>/<delta>/``)
-      and may contain cross-pyramid-level edges (``delta != 0``).
+    description: 'Store uses the multiscale links layout (``links/<delta>/<offsets>/``
+      and ``link_attributes/<name>/<delta>/<offsets>/``) and may contain cross-pyramid-level
+      edges (``delta != 0``).  Since 0.9.0 there is no separate cross-chunk family
+      — a cross-chunk link is a link with a non-zero offsets segment — so this token
+      now marks only the presence of ``delta != 0`` arrays.
 
       '
 
@@ -4023,6 +3730,7 @@ attributes:
     owner: FragmentAttributeMeta
     domain_of:
     - VerticesMeta
+    - LinksFamilyMeta
     - LinksMeta
     - AttributeMeta
     - FragmentAttributeMeta
@@ -4030,9 +3738,8 @@ attributes:
     - ObjectAttributeMeta
     - GroupingsMeta
     - GroupingsAttributeMeta
-    - CrossChunkLinksMeta
+    - LinkAttributeFamilyMeta
     - LinkAttributeMeta
-    - CrossChunkLinkAttributeMeta
     range: ZvArrayTag
     required: true
     equals_string: fragment_attribute
@@ -4049,8 +3756,8 @@ attributes:
     - FragmentAttributeMeta
     - ObjectAttributeMeta
     - GroupingsAttributeMeta
+    - LinkAttributeFamilyMeta
     - LinkAttributeMeta
-    - CrossChunkLinkAttributeMeta
     range: string
     required: true
   dtype:
@@ -4067,7 +3774,6 @@ attributes:
     - ObjectAttributeMeta
     - GroupingsAttributeMeta
     - LinkAttributeMeta
-    - CrossChunkLinkAttributeMeta
     range: string
     required: true
   channel_names:
@@ -4439,6 +4145,7 @@ attributes:
     owner: GroupingsAttributeMeta
     domain_of:
     - VerticesMeta
+    - LinksFamilyMeta
     - LinksMeta
     - AttributeMeta
     - FragmentAttributeMeta
@@ -4446,9 +4153,8 @@ attributes:
     - ObjectAttributeMeta
     - GroupingsMeta
     - GroupingsAttributeMeta
-    - CrossChunkLinksMeta
+    - LinkAttributeFamilyMeta
     - LinkAttributeMeta
-    - CrossChunkLinkAttributeMeta
     range: ZvArrayTag
     required: true
     equals_string: groupings_attribute
@@ -4465,8 +4171,8 @@ attributes:
     - FragmentAttributeMeta
     - ObjectAttributeMeta
     - GroupingsAttributeMeta
+    - LinkAttributeFamilyMeta
     - LinkAttributeMeta
-    - CrossChunkLinkAttributeMeta
     range: string
     required: true
   dtype:
@@ -4483,7 +4189,6 @@ attributes:
     - ObjectAttributeMeta
     - GroupingsAttributeMeta
     - LinkAttributeMeta
-    - CrossChunkLinkAttributeMeta
     range: string
     required: true
   shape:
@@ -4647,6 +4352,7 @@ attributes:
     owner: GroupingsMeta
     domain_of:
     - VerticesMeta
+    - LinksFamilyMeta
     - LinksMeta
     - AttributeMeta
     - FragmentAttributeMeta
@@ -4654,9 +4360,8 @@ attributes:
     - ObjectAttributeMeta
     - GroupingsMeta
     - GroupingsAttributeMeta
-    - CrossChunkLinksMeta
+    - LinkAttributeFamilyMeta
     - LinkAttributeMeta
-    - CrossChunkLinkAttributeMeta
     range: ZvArrayTag
     required: true
     equals_string: groupings
@@ -4671,6 +4376,116 @@ attributes:
     range: integer
     required: true
     minimum_value: 0
+
+```
+</details></div>
+
+
+---
+
+---
+search:
+  boost: 5.0
+---
+
+# Slot: has_perm 
+
+
+_Whether each row of this links array carries a leading ``perm_idx`` column — i.e. whether rows are ``1 + link_width`` ints rather than ``link_width``.  True exactly when a non-identity endpoint placement is possible: non-intra ``offsets`` AND ``level_delta == 0`` AND (``store="duplicate"`` OR not ``directed``).  Readers must take the record width from this stamp rather than inferring it: decoding physical bytes at the logical width does not reliably raise, it silently fabricates rows._
+
+__
+
+
+
+<div data-search-exclude markdown="1">
+
+
+
+URI: [zv:has_perm](https://w3id.org/zarr-vectors/schema/0.5/has_perm)
+<!-- no inheritance hierarchy -->
+
+
+
+
+
+## Applicable Classes
+
+| Name | Description | Modifies Slot |
+| --- | --- | --- |
+| [LinksMeta](LinksMeta.md) | `` |  no  |
+
+
+
+
+
+
+## Properties
+
+### Type and Range
+
+| Property | Value |
+| --- | --- |
+| Range | [Boolean](Boolean.md) |
+| Domain Of | [LinksMeta](LinksMeta.md) |
+
+### Cardinality and Requirements
+
+| Property | Value |
+| --- | --- |
+| Required | Yes |
+
+
+
+
+
+
+
+
+
+
+## Identifier and Mapping Information
+
+
+
+
+
+### Schema Source
+
+
+* from schema: https://w3id.org/zarr-vectors/schema/0.5
+
+
+
+
+## Mappings
+
+| Mapping Type | Mapped Value |
+| ---  | ---  |
+| self | zv:has_perm |
+| native | zv:has_perm |
+
+
+
+
+## LinkML Source
+
+<details>
+```yaml
+name: has_perm
+description: 'Whether each row of this links array carries a leading ``perm_idx``
+  column — i.e. whether rows are ``1 + link_width`` ints rather than ``link_width``.  True
+  exactly when a non-identity endpoint placement is possible: non-intra ``offsets``
+  AND ``level_delta == 0`` AND (``store="duplicate"`` OR not ``directed``).  Readers
+  must take the record width from this stamp rather than inferring it: decoding physical
+  bytes at the logical width does not reliably raise, it silently fabricates rows.
+
+  '
+from_schema: https://w3id.org/zarr-vectors/schema/0.5
+rank: 1000
+domain_of:
+- LinksMeta
+range: boolean
+required: true
 
 ```
 </details></div>
@@ -5120,10 +4935,10 @@ URI: [zv:level_delta](https://w3id.org/zarr-vectors/schema/0.5/level_delta)
 
 | Name | Description | Modifies Slot |
 | --- | --- | --- |
+| [LinksFamilyMeta](LinksFamilyMeta.md) | `` |  no  |
 | [LinksMeta](LinksMeta.md) | `` |  no  |
-| [CrossChunkLinksMeta](CrossChunkLinksMeta.md) | `` |  no  |
+| [LinkAttributeFamilyMeta](LinkAttributeFamilyMeta.md) | `` |  no  |
 | [LinkAttributeMeta](LinkAttributeMeta.md) | `` |  no  |
-| [CrossChunkLinkAttributeMeta](CrossChunkLinkAttributeMeta.md) | `` |  no  |
 
 
 
@@ -5137,7 +4952,7 @@ URI: [zv:level_delta](https://w3id.org/zarr-vectors/schema/0.5/level_delta)
 | Property | Value |
 | --- | --- |
 | Range | [Integer](Integer.md) |
-| Domain Of | [LinksMeta](LinksMeta.md), [CrossChunkLinksMeta](CrossChunkLinksMeta.md), [LinkAttributeMeta](LinkAttributeMeta.md), [CrossChunkLinkAttributeMeta](CrossChunkLinkAttributeMeta.md) |
+| Domain Of | [LinksFamilyMeta](LinksFamilyMeta.md), [LinksMeta](LinksMeta.md), [LinkAttributeFamilyMeta](LinkAttributeFamilyMeta.md), [LinkAttributeMeta](LinkAttributeMeta.md) |
 
 ### Cardinality and Requirements
 
@@ -5192,10 +5007,10 @@ description: 'Pyramid-level delta between the source side (the level that owns t
 from_schema: https://w3id.org/zarr-vectors/schema/0.5
 rank: 1000
 domain_of:
+- LinksFamilyMeta
 - LinksMeta
-- CrossChunkLinksMeta
+- LinkAttributeFamilyMeta
 - LinkAttributeMeta
-- CrossChunkLinkAttributeMeta
 range: integer
 required: true
 
@@ -5608,8 +5423,8 @@ URI: [zv:link_width](https://w3id.org/zarr-vectors/schema/0.5/link_width)
 
 | Name | Description | Modifies Slot |
 | --- | --- | --- |
+| [LinksFamilyMeta](LinksFamilyMeta.md) | `` |  no  |
 | [LinksMeta](LinksMeta.md) | `` |  no  |
-| [CrossChunkLinksMeta](CrossChunkLinksMeta.md) | `` |  no  |
 
 
 
@@ -5623,7 +5438,7 @@ URI: [zv:link_width](https://w3id.org/zarr-vectors/schema/0.5/link_width)
 | Property | Value |
 | --- | --- |
 | Range | [Integer](Integer.md) |
-| Domain Of | [LinksMeta](LinksMeta.md), [CrossChunkLinksMeta](CrossChunkLinksMeta.md) |
+| Domain Of | [LinksFamilyMeta](LinksFamilyMeta.md), [LinksMeta](LinksMeta.md) |
 
 ### Cardinality and Requirements
 
@@ -5683,8 +5498,8 @@ description: 'Width of a links row (1 for parent→child metanode references, 2 
 from_schema: https://w3id.org/zarr-vectors/schema/0.5
 rank: 1000
 domain_of:
+- LinksFamilyMeta
 - LinksMeta
-- CrossChunkLinksMeta
 range: integer
 required: true
 minimum_value: 1
@@ -5700,10 +5515,254 @@ search:
   boost: 10.0
 ---
 
+# Class: LinkAttributeFamilyMeta 
+
+
+_``.zattrs`` for a ``link_attributes/<name>/<delta>/`` **group**. There is no separate cross-chunk attribute family: an intra-chunk link's attributes live under the all-zero offsets segment, exactly like the links themselves._
+
+_``num_links`` is stamped by the whole-family writer and MUST then equal the parallel ``links/<delta>/`` family's ``num_links``.  It is absent when the family was created without data (the per-cell writers do not stamp it)._
+
+__
+
+
+
+<div data-search-exclude markdown="1">
+
+
+
+URI: [zv:LinkAttributeFamilyMeta](https://w3id.org/zarr-vectors/schema/0.5/LinkAttributeFamilyMeta)
+
+
+
+
+
+```mermaid
+ classDiagram
+    class LinkAttributeFamilyMeta
+    click LinkAttributeFamilyMeta href "../LinkAttributeFamilyMeta/"
+      LinkAttributeFamilyMeta : level_delta
+        
+      LinkAttributeFamilyMeta : name
+        
+      LinkAttributeFamilyMeta : num_links
+        
+      LinkAttributeFamilyMeta : zv_array
+        
+          
+    
+        
+        
+        LinkAttributeFamilyMeta --> "1" ZvArrayTag : zv_array
+        click ZvArrayTag href "../ZvArrayTag/"
+    
+
+        
+      
+```
+
+
+
+
+<!-- no inheritance hierarchy -->
+
+## Slots
+
+| Name | Cardinality and Range | Description | Inheritance |
+| ---  | --- | --- | --- |
+| [zv_array](zv_array.md) | 1 <br/> [ZvArrayTag](ZvArrayTag.md) | Discriminator slot identifying the kind of per-array `` | direct |
+| [name](name.md) | 1 <br/> [String](String.md) | NGFF axis or attribute name (e | direct |
+| [level_delta](level_delta.md) | 1 <br/> [Integer](Integer.md) | Pyramid-level delta between the source side (the level that owns this array) ... | direct |
+| [num_links](num_links.md) | 0..1 <br/> [Integer](Integer.md) | Family-wide *logical* link count — one per input record, however many physica... | direct |
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+## Identifier and Mapping Information
+
+
+
+
+
+### Schema Source
+
+
+* from schema: https://w3id.org/zarr-vectors/schema/0.5
+
+
+
+
+## Mappings
+
+| Mapping Type | Mapped Value |
+| ---  | ---  |
+| self | zv:LinkAttributeFamilyMeta |
+| native | zv:LinkAttributeFamilyMeta |
+
+
+
+
+
+
+## LinkML Source
+
+### Direct
+
+<details>
+```yaml
+name: LinkAttributeFamilyMeta
+description: '``.zattrs`` for a ``link_attributes/<name>/<delta>/`` **group**. There
+  is no separate cross-chunk attribute family: an intra-chunk link''s attributes live
+  under the all-zero offsets segment, exactly like the links themselves.
+
+  ``num_links`` is stamped by the whole-family writer and MUST then equal the parallel
+  ``links/<delta>/`` family''s ``num_links``.  It is absent when the family was created
+  without data (the per-cell writers do not stamp it).
+
+  '
+from_schema: https://w3id.org/zarr-vectors/schema/0.5
+rank: 1000
+slots:
+- zv_array
+- name
+- level_delta
+- num_links
+slot_usage:
+  zv_array:
+    name: zv_array
+    required: true
+    equals_string: link_attribute_family
+
+```
+</details>
+
+### Induced
+
+<details>
+```yaml
+name: LinkAttributeFamilyMeta
+description: '``.zattrs`` for a ``link_attributes/<name>/<delta>/`` **group**. There
+  is no separate cross-chunk attribute family: an intra-chunk link''s attributes live
+  under the all-zero offsets segment, exactly like the links themselves.
+
+  ``num_links`` is stamped by the whole-family writer and MUST then equal the parallel
+  ``links/<delta>/`` family''s ``num_links``.  It is absent when the family was created
+  without data (the per-cell writers do not stamp it).
+
+  '
+from_schema: https://w3id.org/zarr-vectors/schema/0.5
+rank: 1000
+slot_usage:
+  zv_array:
+    name: zv_array
+    required: true
+    equals_string: link_attribute_family
+attributes:
+  zv_array:
+    name: zv_array
+    description: 'Discriminator slot identifying the kind of per-array ``.zattrs``
+      block.  Each writer in ``core/arrays.py`` stamps the corresponding token from
+      :class:`ZvArrayTag`.
+
+      '
+    from_schema: https://w3id.org/zarr-vectors/schema/0.5
+    rank: 1000
+    owner: LinkAttributeFamilyMeta
+    domain_of:
+    - VerticesMeta
+    - LinksFamilyMeta
+    - LinksMeta
+    - AttributeMeta
+    - FragmentAttributeMeta
+    - ObjectIndexMeta
+    - ObjectAttributeMeta
+    - GroupingsMeta
+    - GroupingsAttributeMeta
+    - LinkAttributeFamilyMeta
+    - LinkAttributeMeta
+    range: ZvArrayTag
+    required: true
+    equals_string: link_attribute_family
+  name:
+    name: name
+    description: NGFF axis or attribute name (e.g. "x", "intensity").
+    from_schema: https://w3id.org/zarr-vectors/schema/0.5
+    rank: 1000
+    slot_uri: schema:name
+    owner: LinkAttributeFamilyMeta
+    domain_of:
+    - Axis
+    - AttributeMeta
+    - FragmentAttributeMeta
+    - ObjectAttributeMeta
+    - GroupingsAttributeMeta
+    - LinkAttributeFamilyMeta
+    - LinkAttributeMeta
+    range: string
+    required: true
+  level_delta:
+    name: level_delta
+    description: 'Pyramid-level delta between the source side (the level that owns
+      this array) and the target side of the edges.  ``0`` for intra-level arrays
+      (the only kind written pre-0.4), ``+N`` for edges from this level to ``this_level
+      + N`` (coarser), ``-N`` for edges to ``this_level - N`` (finer).
+
+      '
+    from_schema: https://w3id.org/zarr-vectors/schema/0.5
+    rank: 1000
+    owner: LinkAttributeFamilyMeta
+    domain_of:
+    - LinksFamilyMeta
+    - LinksMeta
+    - LinkAttributeFamilyMeta
+    - LinkAttributeMeta
+    range: integer
+    required: true
+  num_links:
+    name: num_links
+    description: 'Family-wide *logical* link count — one per input record, however
+      many physical copies ``store`` filed.  Absent on a ``links/<delta>/`` group
+      until ``finalize_links`` has run, and on a ``link_attributes/<name>/<delta>/``
+      group created without data.
+
+      '
+    from_schema: https://w3id.org/zarr-vectors/schema/0.5
+    rank: 1000
+    owner: LinkAttributeFamilyMeta
+    domain_of:
+    - LinksFamilyMeta
+    - LinkAttributeFamilyMeta
+    range: integer
+    required: false
+    minimum_value: 0
+
+```
+</details></div>
+
+
+---
+
+---
+search:
+  boost: 10.0
+---
+
 # Class: LinkAttributeMeta 
 
 
-_``.zattrs`` for each ``link_attributes/<name>/<delta>/`` array. Parallel to the ``links/<delta>/`` array of the same ``<delta>``._
+_``.zattrs`` for one ``link_attributes/<name>/<delta>/<offsets>/`` array.  Mirrors the ``links/<delta>/<offsets>/`` array of the same ``<delta>`` and ``<offsets>`` cell-for-cell — same cells, same per-cell row order — so attribute rows align 1:1 with link records without storing a row id._
+
+_Rows never carry the links array's ``perm_idx`` column: that column describes a record's placement, not its value, so ``has_perm`` has no analogue here and a row is exactly ``row_shape`` worth of ``dtype``.  A ``store="duplicate"`` family replicates an attribute value alongside each physical copy of its record, so cells stay row-aligned with the links array they mirror._
 
 __
 
@@ -5728,6 +5787,10 @@ URI: [zv:LinkAttributeMeta](https://w3id.org/zarr-vectors/schema/0.5/LinkAttribu
       LinkAttributeMeta : level_delta
         
       LinkAttributeMeta : name
+        
+      LinkAttributeMeta : offsets
+        
+      LinkAttributeMeta : row_shape
         
       LinkAttributeMeta : zv_array
         
@@ -5755,6 +5818,8 @@ URI: [zv:LinkAttributeMeta](https://w3id.org/zarr-vectors/schema/0.5/LinkAttribu
 | [zv_array](zv_array.md) | 1 <br/> [ZvArrayTag](ZvArrayTag.md) | Discriminator slot identifying the kind of per-array `` | direct |
 | [name](name.md) | 1 <br/> [String](String.md) | NGFF axis or attribute name (e | direct |
 | [dtype](dtype.md) | 1 <br/> [String](String.md) | Numpy dtype string of the array's value type (e | direct |
+| [offsets](offsets.md) | 1 <br/> [Integer](Integer.md) | The ``link_width - 1`` relative offsets naming this array, each of ``sid_ndim... | direct |
+| [row_shape](row_shape.md) | * <br/> [Integer](Integer.md) | Tail dimensions of one attribute row (``[]`` for a 1-D per-link attribute), l... | direct |
 | [level_delta](level_delta.md) | 1 <br/> [Integer](Integer.md) | Pyramid-level delta between the source side (the level that owns this array) ... | direct |
 
 
@@ -5804,8 +5869,16 @@ URI: [zv:LinkAttributeMeta](https://w3id.org/zarr-vectors/schema/0.5/LinkAttribu
 <details>
 ```yaml
 name: LinkAttributeMeta
-description: '``.zattrs`` for each ``link_attributes/<name>/<delta>/`` array. Parallel
-  to the ``links/<delta>/`` array of the same ``<delta>``.
+description: '``.zattrs`` for one ``link_attributes/<name>/<delta>/<offsets>/`` array.  Mirrors
+  the ``links/<delta>/<offsets>/`` array of the same ``<delta>`` and ``<offsets>``
+  cell-for-cell — same cells, same per-cell row order — so attribute rows align 1:1
+  with link records without storing a row id.
+
+  Rows never carry the links array''s ``perm_idx`` column: that column describes a
+  record''s placement, not its value, so ``has_perm`` has no analogue here and a row
+  is exactly ``row_shape`` worth of ``dtype``.  A ``store="duplicate"`` family replicates
+  an attribute value alongside each physical copy of its record, so cells stay row-aligned
+  with the links array they mirror.
 
   '
 from_schema: https://w3id.org/zarr-vectors/schema/0.5
@@ -5814,6 +5887,8 @@ slots:
 - zv_array
 - name
 - dtype
+- offsets
+- row_shape
 - level_delta
 slot_usage:
   zv_array:
@@ -5829,8 +5904,16 @@ slot_usage:
 <details>
 ```yaml
 name: LinkAttributeMeta
-description: '``.zattrs`` for each ``link_attributes/<name>/<delta>/`` array. Parallel
-  to the ``links/<delta>/`` array of the same ``<delta>``.
+description: '``.zattrs`` for one ``link_attributes/<name>/<delta>/<offsets>/`` array.  Mirrors
+  the ``links/<delta>/<offsets>/`` array of the same ``<delta>`` and ``<offsets>``
+  cell-for-cell — same cells, same per-cell row order — so attribute rows align 1:1
+  with link records without storing a row id.
+
+  Rows never carry the links array''s ``perm_idx`` column: that column describes a
+  record''s placement, not its value, so ``has_perm`` has no analogue here and a row
+  is exactly ``row_shape`` worth of ``dtype``.  A ``store="duplicate"`` family replicates
+  an attribute value alongside each physical copy of its record, so cells stay row-aligned
+  with the links array they mirror.
 
   '
 from_schema: https://w3id.org/zarr-vectors/schema/0.5
@@ -5853,6 +5936,7 @@ attributes:
     owner: LinkAttributeMeta
     domain_of:
     - VerticesMeta
+    - LinksFamilyMeta
     - LinksMeta
     - AttributeMeta
     - FragmentAttributeMeta
@@ -5860,9 +5944,8 @@ attributes:
     - ObjectAttributeMeta
     - GroupingsMeta
     - GroupingsAttributeMeta
-    - CrossChunkLinksMeta
+    - LinkAttributeFamilyMeta
     - LinkAttributeMeta
-    - CrossChunkLinkAttributeMeta
     range: ZvArrayTag
     required: true
     equals_string: link_attribute
@@ -5879,8 +5962,8 @@ attributes:
     - FragmentAttributeMeta
     - ObjectAttributeMeta
     - GroupingsAttributeMeta
+    - LinkAttributeFamilyMeta
     - LinkAttributeMeta
-    - CrossChunkLinkAttributeMeta
     range: string
     required: true
   dtype:
@@ -5897,9 +5980,45 @@ attributes:
     - ObjectAttributeMeta
     - GroupingsAttributeMeta
     - LinkAttributeMeta
-    - CrossChunkLinkAttributeMeta
     range: string
     required: true
+  offsets:
+    name: offsets
+    description: 'The ``link_width - 1`` relative offsets naming this array, each
+      of ``sid_ndim`` signed components, as a list of integer lists. Offsets are relative
+      to the record''s SOURCE chunk: ``vi_k`` is local to ``src + o_k``.  The implicit
+      ``o_0 = 0`` (the source itself) is never encoded, so ``link_width == 1`` carries
+      an empty list.  Redundant with the path segment that encodes the same offsets,
+      but stamping it lets readers decode without knowing ``sid_ndim``.
+
+      '
+    from_schema: https://w3id.org/zarr-vectors/schema/0.5
+    rank: 1000
+    owner: LinkAttributeMeta
+    domain_of:
+    - LinksMeta
+    - LinkAttributeMeta
+    range: integer
+    required: true
+    array:
+      dimensions:
+      - alias: offset
+      - alias: component
+  row_shape:
+    name: row_shape
+    description: 'Tail dimensions of one attribute row (``[]`` for a 1-D per-link
+      attribute), letting a reader reconstruct shape from a bare byte blob.  Stamped
+      by the writers that lay down attribute bytes; absent on an array created empty.
+
+      '
+    from_schema: https://w3id.org/zarr-vectors/schema/0.5
+    rank: 1000
+    owner: LinkAttributeMeta
+    domain_of:
+    - LinkAttributeMeta
+    range: integer
+    required: false
+    multivalued: true
   level_delta:
     name: level_delta
     description: 'Pyramid-level delta between the source side (the level that owns
@@ -5912,10 +6031,10 @@ attributes:
     rank: 1000
     owner: LinkAttributeMeta
     domain_of:
+    - LinksFamilyMeta
     - LinksMeta
-    - CrossChunkLinksMeta
+    - LinkAttributeFamilyMeta
     - LinkAttributeMeta
-    - CrossChunkLinkAttributeMeta
     range: integer
     required: true
 
@@ -6114,10 +6233,382 @@ search:
   boost: 10.0
 ---
 
+# Class: LinksFamilyMeta 
+
+
+_``.zattrs`` for a ``links/<delta>/`` **group** — the family-wide policy every offsets array beneath it decodes against, which is why it lives on the group rather than being repeated per array._
+
+_Since 0.9.0 connectivity is one family: there is no separate ``cross_chunk_links/``.  An intra-chunk link is a link whose relative offsets are all zero; a cross-chunk link is one whose offsets are non-zero._
+
+_Two policy flags govern how a boundary-crossing record is placed: ``directed`` (endpoint order is data, so ``A→B`` and ``B→A`` stay distinct) and ``store`` (``canonical`` = one cell per record; ``duplicate`` = one cell per distinct incident chunk).  The source-side endpoint (input endpoint 0) lives at the level owning the array; target-side endpoints live at ``this_level + level_delta``._
+
+_``num_links`` is the family-wide *logical* record count (one per input record) and ``num_physical_records`` the on-disk row count; both are absent until ``finalize_links`` has run, since the decentralized per-cell writers leave them for it to fill in. ``sid_ndim`` is likewise optional: a family may be stamped without it, and readers then recover offsets from each array's own ``offsets`` meta._
+
+__
+
+
+
+<div data-search-exclude markdown="1">
+
+
+
+URI: [zv:LinksFamilyMeta](https://w3id.org/zarr-vectors/schema/0.5/LinksFamilyMeta)
+
+
+
+
+
+```mermaid
+ classDiagram
+    class LinksFamilyMeta
+    click LinksFamilyMeta href "../LinksFamilyMeta/"
+      LinksFamilyMeta : directed
+        
+      LinksFamilyMeta : level_delta
+        
+      LinksFamilyMeta : link_width
+        
+      LinksFamilyMeta : num_links
+        
+      LinksFamilyMeta : num_physical_records
+        
+      LinksFamilyMeta : sid_ndim
+        
+      LinksFamilyMeta : store
+        
+          
+    
+        
+        
+        LinksFamilyMeta --> "0..1" CrossChunkStore : store
+        click CrossChunkStore href "../CrossChunkStore/"
+    
+
+        
+      LinksFamilyMeta : zv_array
+        
+          
+    
+        
+        
+        LinksFamilyMeta --> "1" ZvArrayTag : zv_array
+        click ZvArrayTag href "../ZvArrayTag/"
+    
+
+        
+      
+```
+
+
+
+
+<!-- no inheritance hierarchy -->
+
+## Slots
+
+| Name | Cardinality and Range | Description | Inheritance |
+| ---  | --- | --- | --- |
+| [zv_array](zv_array.md) | 1 <br/> [ZvArrayTag](ZvArrayTag.md) | Discriminator slot identifying the kind of per-array `` | direct |
+| [level_delta](level_delta.md) | 1 <br/> [Integer](Integer.md) | Pyramid-level delta between the source side (the level that owns this array) ... | direct |
+| [link_width](link_width.md) | 1 <br/> [Integer](Integer.md) | Width of a links row (1 for parent→child metanode references, 2 for edges, 3 ... | direct |
+| [directed](directed.md) | 0..1 <br/> [Boolean](Boolean.md) | When true, endpoint order is meaningful and preserved (no canonical sort): ``... | direct |
+| [store](store.md) | 0..1 <br/> [CrossChunkStore](CrossChunkStore.md) | Cell-duplication policy for a links family; see CrossChunkStore | direct |
+| [sid_ndim](sid_ndim.md) | 0..1 <br/> [Integer](Integer.md) | Number of spatial-index dimensions encoded in chunk keys and in each offset | direct |
+| [num_links](num_links.md) | 0..1 <br/> [Integer](Integer.md) | Family-wide *logical* link count — one per input record, however many physica... | direct |
+| [num_physical_records](num_physical_records.md) | 0..1 <br/> [Integer](Integer.md) | On-disk record row count across every offsets array and cell of a ``links/<de... | direct |
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+## Identifier and Mapping Information
+
+
+
+
+
+### Schema Source
+
+
+* from schema: https://w3id.org/zarr-vectors/schema/0.5
+
+
+
+
+## Mappings
+
+| Mapping Type | Mapped Value |
+| ---  | ---  |
+| self | zv:LinksFamilyMeta |
+| native | zv:LinksFamilyMeta |
+
+
+
+
+
+
+## LinkML Source
+
+### Direct
+
+<details>
+```yaml
+name: LinksFamilyMeta
+description: '``.zattrs`` for a ``links/<delta>/`` **group** — the family-wide policy
+  every offsets array beneath it decodes against, which is why it lives on the group
+  rather than being repeated per array.
+
+  Since 0.9.0 connectivity is one family: there is no separate ``cross_chunk_links/``.  An
+  intra-chunk link is a link whose relative offsets are all zero; a cross-chunk link
+  is one whose offsets are non-zero.
+
+  Two policy flags govern how a boundary-crossing record is placed: ``directed`` (endpoint
+  order is data, so ``A→B`` and ``B→A`` stay distinct) and ``store`` (``canonical``
+  = one cell per record; ``duplicate`` = one cell per distinct incident chunk).  The
+  source-side endpoint (input endpoint 0) lives at the level owning the array; target-side
+  endpoints live at ``this_level + level_delta``.
+
+  ``num_links`` is the family-wide *logical* record count (one per input record) and
+  ``num_physical_records`` the on-disk row count; both are absent until ``finalize_links``
+  has run, since the decentralized per-cell writers leave them for it to fill in.
+  ``sid_ndim`` is likewise optional: a family may be stamped without it, and readers
+  then recover offsets from each array''s own ``offsets`` meta.
+
+  '
+from_schema: https://w3id.org/zarr-vectors/schema/0.5
+rank: 1000
+slots:
+- zv_array
+- level_delta
+- link_width
+- directed
+- store
+- sid_ndim
+- num_links
+- num_physical_records
+slot_usage:
+  zv_array:
+    name: zv_array
+    required: true
+    equals_string: links_family
+  sid_ndim:
+    name: sid_ndim
+    description: 'Number of spatial-index dimensions encoded in chunk keys and in
+      each offset.  Optional on a links family: writers stamp it only when known,
+      and ``finalize_links`` preserves its absence rather than inventing one.
+
+      '
+    required: false
+
+```
+</details>
+
+### Induced
+
+<details>
+```yaml
+name: LinksFamilyMeta
+description: '``.zattrs`` for a ``links/<delta>/`` **group** — the family-wide policy
+  every offsets array beneath it decodes against, which is why it lives on the group
+  rather than being repeated per array.
+
+  Since 0.9.0 connectivity is one family: there is no separate ``cross_chunk_links/``.  An
+  intra-chunk link is a link whose relative offsets are all zero; a cross-chunk link
+  is one whose offsets are non-zero.
+
+  Two policy flags govern how a boundary-crossing record is placed: ``directed`` (endpoint
+  order is data, so ``A→B`` and ``B→A`` stay distinct) and ``store`` (``canonical``
+  = one cell per record; ``duplicate`` = one cell per distinct incident chunk).  The
+  source-side endpoint (input endpoint 0) lives at the level owning the array; target-side
+  endpoints live at ``this_level + level_delta``.
+
+  ``num_links`` is the family-wide *logical* record count (one per input record) and
+  ``num_physical_records`` the on-disk row count; both are absent until ``finalize_links``
+  has run, since the decentralized per-cell writers leave them for it to fill in.
+  ``sid_ndim`` is likewise optional: a family may be stamped without it, and readers
+  then recover offsets from each array''s own ``offsets`` meta.
+
+  '
+from_schema: https://w3id.org/zarr-vectors/schema/0.5
+rank: 1000
+slot_usage:
+  zv_array:
+    name: zv_array
+    required: true
+    equals_string: links_family
+  sid_ndim:
+    name: sid_ndim
+    description: 'Number of spatial-index dimensions encoded in chunk keys and in
+      each offset.  Optional on a links family: writers stamp it only when known,
+      and ``finalize_links`` preserves its absence rather than inventing one.
+
+      '
+    required: false
+attributes:
+  zv_array:
+    name: zv_array
+    description: 'Discriminator slot identifying the kind of per-array ``.zattrs``
+      block.  Each writer in ``core/arrays.py`` stamps the corresponding token from
+      :class:`ZvArrayTag`.
+
+      '
+    from_schema: https://w3id.org/zarr-vectors/schema/0.5
+    rank: 1000
+    owner: LinksFamilyMeta
+    domain_of:
+    - VerticesMeta
+    - LinksFamilyMeta
+    - LinksMeta
+    - AttributeMeta
+    - FragmentAttributeMeta
+    - ObjectIndexMeta
+    - ObjectAttributeMeta
+    - GroupingsMeta
+    - GroupingsAttributeMeta
+    - LinkAttributeFamilyMeta
+    - LinkAttributeMeta
+    range: ZvArrayTag
+    required: true
+    equals_string: links_family
+  level_delta:
+    name: level_delta
+    description: 'Pyramid-level delta between the source side (the level that owns
+      this array) and the target side of the edges.  ``0`` for intra-level arrays
+      (the only kind written pre-0.4), ``+N`` for edges from this level to ``this_level
+      + N`` (coarser), ``-N`` for edges to ``this_level - N`` (finer).
+
+      '
+    from_schema: https://w3id.org/zarr-vectors/schema/0.5
+    rank: 1000
+    owner: LinksFamilyMeta
+    domain_of:
+    - LinksFamilyMeta
+    - LinksMeta
+    - LinkAttributeFamilyMeta
+    - LinkAttributeMeta
+    range: integer
+    required: true
+  link_width:
+    name: link_width
+    description: 'Width of a links row (1 for parent→child metanode references, 2
+      for edges, 3 for triangle faces, 4 for quads).
+
+      '
+    from_schema: https://w3id.org/zarr-vectors/schema/0.5
+    rank: 1000
+    owner: LinksFamilyMeta
+    domain_of:
+    - LinksFamilyMeta
+    - LinksMeta
+    range: integer
+    required: true
+    minimum_value: 1
+  directed:
+    name: directed
+    description: 'When true, endpoint order is meaningful and preserved (no canonical
+      sort): ``A→B`` and ``B→A`` occupy distinct cells and every stored ``perm_idx``
+      is 0.  Family-wide; defaults to false (undirected).
+
+      '
+    from_schema: https://w3id.org/zarr-vectors/schema/0.5
+    rank: 1000
+    owner: LinksFamilyMeta
+    domain_of:
+    - LinksFamilyMeta
+    range: boolean
+    required: false
+  store:
+    name: store
+    description: 'Cell-duplication policy for a links family; see CrossChunkStore.
+      Family-wide; defaults to ``canonical``.
+
+      '
+    from_schema: https://w3id.org/zarr-vectors/schema/0.5
+    rank: 1000
+    owner: LinksFamilyMeta
+    domain_of:
+    - LinksFamilyMeta
+    range: CrossChunkStore
+    required: false
+  sid_ndim:
+    name: sid_ndim
+    description: 'Number of spatial-index dimensions encoded in chunk keys and in
+      each offset.  Optional on a links family: writers stamp it only when known,
+      and ``finalize_links`` preserves its absence rather than inventing one.
+
+      '
+    from_schema: https://w3id.org/zarr-vectors/schema/0.5
+    rank: 1000
+    owner: LinksFamilyMeta
+    domain_of:
+    - LinksFamilyMeta
+    - ObjectIndexMeta
+    range: integer
+    required: false
+    minimum_value: 1
+  num_links:
+    name: num_links
+    description: 'Family-wide *logical* link count — one per input record, however
+      many physical copies ``store`` filed.  Absent on a ``links/<delta>/`` group
+      until ``finalize_links`` has run, and on a ``link_attributes/<name>/<delta>/``
+      group created without data.
+
+      '
+    from_schema: https://w3id.org/zarr-vectors/schema/0.5
+    rank: 1000
+    owner: LinksFamilyMeta
+    domain_of:
+    - LinksFamilyMeta
+    - LinkAttributeFamilyMeta
+    range: integer
+    required: false
+    minimum_value: 0
+  num_physical_records:
+    name: num_physical_records
+    description: 'On-disk record row count across every offsets array and cell of
+      a ``links/<delta>/`` family.  Equals ``num_links`` for ``store=canonical``;
+      larger when ``store=duplicate`` replicates a record across its incident-chunk
+      cells.  Stamped by ``finalize_links``.
+
+      '
+    from_schema: https://w3id.org/zarr-vectors/schema/0.5
+    rank: 1000
+    owner: LinksFamilyMeta
+    domain_of:
+    - LinksFamilyMeta
+    range: integer
+    required: false
+    minimum_value: 0
+
+```
+</details></div>
+
+
+---
+
+---
+search:
+  boost: 10.0
+---
+
 # Class: LinksMeta 
 
 
-_``.zattrs`` for a ``links/<delta>/`` array.  Under the 0.4 multiscale layout, each delta segment carries its own meta block; ``level_delta=0`` is the intra-level array (the only one written pre-0.4)._
+_``.zattrs`` for a single ``links/<delta>/<offsets>/`` array: a rank-D vlen array over the level's chunk grid, one cell per **source** chunk, holding the records whose source chunk is that cell._
+
+_The ``offsets`` segment names the array: ``link_width - 1`` relative offsets, each of ``sid_ndim`` signed components.  Record ``vi_k`` is local to chunk ``src + o_k``; the implicit ``o_0 = 0`` (the source itself) is never encoded.  All-zero offsets is the intra-chunk array; non-zero offsets hold records whose other endpoints sit that far away.  ``link_width == 1`` (parent→child metanode refs) has no other endpoint and so carries an empty ``offsets`` list, written at the ``self`` segment._
+
+_``has_perm`` is the record-width discriminator.  Rows are ``L`` ints normally; when ``has_perm`` is true they are ``1 + L`` (``[perm_idx, vi_0, ..., vi_{L-1}]``), where ``perm_idx`` is the Lehmer code of the canonical→input-order permutation, letting readers recover the original endpoint order (mesh-face winding, directed-edge direction).  It is true exactly when a non-identity placement is possible — non-intra offsets AND ``level_delta == 0`` AND (``store="duplicate"`` OR not ``directed``) — so an intra-chunk link never pays the extra 8 bytes for a value that is always 0._
 
 __
 
@@ -6139,9 +6630,13 @@ URI: [zv:LinksMeta](https://w3id.org/zarr-vectors/schema/0.5/LinksMeta)
     click LinksMeta href "../LinksMeta/"
       LinksMeta : dtype
         
+      LinksMeta : has_perm
+        
       LinksMeta : level_delta
         
       LinksMeta : link_width
+        
+      LinksMeta : offsets
         
       LinksMeta : zv_array
         
@@ -6168,6 +6663,8 @@ URI: [zv:LinksMeta](https://w3id.org/zarr-vectors/schema/0.5/LinksMeta)
 | ---  | --- | --- | --- |
 | [zv_array](zv_array.md) | 1 <br/> [ZvArrayTag](ZvArrayTag.md) | Discriminator slot identifying the kind of per-array `` | direct |
 | [dtype](dtype.md) | 1 <br/> [String](String.md) | Numpy dtype string of the array's value type (e | direct |
+| [offsets](offsets.md) | 1 <br/> [Integer](Integer.md) | The ``link_width - 1`` relative offsets naming this array, each of ``sid_ndim... | direct |
+| [has_perm](has_perm.md) | 1 <br/> [Boolean](Boolean.md) | Whether each row of this links array carries a leading ``perm_idx`` column — ... | direct |
 | [link_width](link_width.md) | 1 <br/> [Integer](Integer.md) | Width of a links row (1 for parent→child metanode references, 2 for edges, 3 ... | direct |
 | [level_delta](level_delta.md) | 1 <br/> [Integer](Integer.md) | Pyramid-level delta between the source side (the level that owns this array) ... | direct |
 
@@ -6218,9 +6715,24 @@ URI: [zv:LinksMeta](https://w3id.org/zarr-vectors/schema/0.5/LinksMeta)
 <details>
 ```yaml
 name: LinksMeta
-description: '``.zattrs`` for a ``links/<delta>/`` array.  Under the 0.4 multiscale
-  layout, each delta segment carries its own meta block; ``level_delta=0`` is the
-  intra-level array (the only one written pre-0.4).
+description: '``.zattrs`` for a single ``links/<delta>/<offsets>/`` array: a rank-D
+  vlen array over the level''s chunk grid, one cell per **source** chunk, holding
+  the records whose source chunk is that cell.
+
+  The ``offsets`` segment names the array: ``link_width - 1`` relative offsets, each
+  of ``sid_ndim`` signed components.  Record ``vi_k`` is local to chunk ``src + o_k``;
+  the implicit ``o_0 = 0`` (the source itself) is never encoded.  All-zero offsets
+  is the intra-chunk array; non-zero offsets hold records whose other endpoints sit
+  that far away.  ``link_width == 1`` (parent→child metanode refs) has no other endpoint
+  and so carries an empty ``offsets`` list, written at the ``self`` segment.
+
+  ``has_perm`` is the record-width discriminator.  Rows are ``L`` ints normally; when
+  ``has_perm`` is true they are ``1 + L`` (``[perm_idx, vi_0, ..., vi_{L-1}]``), where
+  ``perm_idx`` is the Lehmer code of the canonical→input-order permutation, letting
+  readers recover the original endpoint order (mesh-face winding, directed-edge direction).  It
+  is true exactly when a non-identity placement is possible — non-intra offsets AND
+  ``level_delta == 0`` AND (``store="duplicate"`` OR not ``directed``) — so an intra-chunk
+  link never pays the extra 8 bytes for a value that is always 0.
 
   '
 from_schema: https://w3id.org/zarr-vectors/schema/0.5
@@ -6228,6 +6740,8 @@ rank: 1000
 slots:
 - zv_array
 - dtype
+- offsets
+- has_perm
 - link_width
 - level_delta
 slot_usage:
@@ -6244,9 +6758,24 @@ slot_usage:
 <details>
 ```yaml
 name: LinksMeta
-description: '``.zattrs`` for a ``links/<delta>/`` array.  Under the 0.4 multiscale
-  layout, each delta segment carries its own meta block; ``level_delta=0`` is the
-  intra-level array (the only one written pre-0.4).
+description: '``.zattrs`` for a single ``links/<delta>/<offsets>/`` array: a rank-D
+  vlen array over the level''s chunk grid, one cell per **source** chunk, holding
+  the records whose source chunk is that cell.
+
+  The ``offsets`` segment names the array: ``link_width - 1`` relative offsets, each
+  of ``sid_ndim`` signed components.  Record ``vi_k`` is local to chunk ``src + o_k``;
+  the implicit ``o_0 = 0`` (the source itself) is never encoded.  All-zero offsets
+  is the intra-chunk array; non-zero offsets hold records whose other endpoints sit
+  that far away.  ``link_width == 1`` (parent→child metanode refs) has no other endpoint
+  and so carries an empty ``offsets`` list, written at the ``self`` segment.
+
+  ``has_perm`` is the record-width discriminator.  Rows are ``L`` ints normally; when
+  ``has_perm`` is true they are ``1 + L`` (``[perm_idx, vi_0, ..., vi_{L-1}]``), where
+  ``perm_idx`` is the Lehmer code of the canonical→input-order permutation, letting
+  readers recover the original endpoint order (mesh-face winding, directed-edge direction).  It
+  is true exactly when a non-identity placement is possible — non-intra offsets AND
+  ``level_delta == 0`` AND (``store="duplicate"`` OR not ``directed``) — so an intra-chunk
+  link never pays the extra 8 bytes for a value that is always 0.
 
   '
 from_schema: https://w3id.org/zarr-vectors/schema/0.5
@@ -6269,6 +6798,7 @@ attributes:
     owner: LinksMeta
     domain_of:
     - VerticesMeta
+    - LinksFamilyMeta
     - LinksMeta
     - AttributeMeta
     - FragmentAttributeMeta
@@ -6276,9 +6806,8 @@ attributes:
     - ObjectAttributeMeta
     - GroupingsMeta
     - GroupingsAttributeMeta
-    - CrossChunkLinksMeta
+    - LinkAttributeFamilyMeta
     - LinkAttributeMeta
-    - CrossChunkLinkAttributeMeta
     range: ZvArrayTag
     required: true
     equals_string: links
@@ -6296,8 +6825,47 @@ attributes:
     - ObjectAttributeMeta
     - GroupingsAttributeMeta
     - LinkAttributeMeta
-    - CrossChunkLinkAttributeMeta
     range: string
+    required: true
+  offsets:
+    name: offsets
+    description: 'The ``link_width - 1`` relative offsets naming this array, each
+      of ``sid_ndim`` signed components, as a list of integer lists. Offsets are relative
+      to the record''s SOURCE chunk: ``vi_k`` is local to ``src + o_k``.  The implicit
+      ``o_0 = 0`` (the source itself) is never encoded, so ``link_width == 1`` carries
+      an empty list.  Redundant with the path segment that encodes the same offsets,
+      but stamping it lets readers decode without knowing ``sid_ndim``.
+
+      '
+    from_schema: https://w3id.org/zarr-vectors/schema/0.5
+    rank: 1000
+    owner: LinksMeta
+    domain_of:
+    - LinksMeta
+    - LinkAttributeMeta
+    range: integer
+    required: true
+    array:
+      dimensions:
+      - alias: offset
+      - alias: component
+  has_perm:
+    name: has_perm
+    description: 'Whether each row of this links array carries a leading ``perm_idx``
+      column — i.e. whether rows are ``1 + link_width`` ints rather than ``link_width``.  True
+      exactly when a non-identity endpoint placement is possible: non-intra ``offsets``
+      AND ``level_delta == 0`` AND (``store="duplicate"`` OR not ``directed``).  Readers
+      must take the record width from this stamp rather than inferring it: decoding
+      physical bytes at the logical width does not reliably raise, it silently fabricates
+      rows.
+
+      '
+    from_schema: https://w3id.org/zarr-vectors/schema/0.5
+    rank: 1000
+    owner: LinksMeta
+    domain_of:
+    - LinksMeta
+    range: boolean
     required: true
   link_width:
     name: link_width
@@ -6309,8 +6877,8 @@ attributes:
     rank: 1000
     owner: LinksMeta
     domain_of:
+    - LinksFamilyMeta
     - LinksMeta
-    - CrossChunkLinksMeta
     range: integer
     required: true
     minimum_value: 1
@@ -6326,10 +6894,10 @@ attributes:
     rank: 1000
     owner: LinksMeta
     domain_of:
+    - LinksFamilyMeta
     - LinksMeta
-    - CrossChunkLinksMeta
+    - LinkAttributeFamilyMeta
     - LinkAttributeMeta
-    - CrossChunkLinkAttributeMeta
     range: integer
     required: true
 
@@ -6577,8 +7145,8 @@ URI: [schema:name](http://schema.org/name)
 | [FragmentAttributeMeta](FragmentAttributeMeta.md) | `` |  no  |
 | [ObjectAttributeMeta](ObjectAttributeMeta.md) | `` |  no  |
 | [GroupingsAttributeMeta](GroupingsAttributeMeta.md) | `` |  no  |
+| [LinkAttributeFamilyMeta](LinkAttributeFamilyMeta.md) | `` |  no  |
 | [LinkAttributeMeta](LinkAttributeMeta.md) | `` |  no  |
-| [CrossChunkLinkAttributeMeta](CrossChunkLinkAttributeMeta.md) | `` |  no  |
 
 
 
@@ -6592,7 +7160,7 @@ URI: [schema:name](http://schema.org/name)
 | Property | Value |
 | --- | --- |
 | Range | [String](String.md) |
-| Domain Of | [Axis](Axis.md), [AttributeMeta](AttributeMeta.md), [FragmentAttributeMeta](FragmentAttributeMeta.md), [ObjectAttributeMeta](ObjectAttributeMeta.md), [GroupingsAttributeMeta](GroupingsAttributeMeta.md), [LinkAttributeMeta](LinkAttributeMeta.md), [CrossChunkLinkAttributeMeta](CrossChunkLinkAttributeMeta.md) |
+| Domain Of | [Axis](Axis.md), [AttributeMeta](AttributeMeta.md), [FragmentAttributeMeta](FragmentAttributeMeta.md), [ObjectAttributeMeta](ObjectAttributeMeta.md), [GroupingsAttributeMeta](GroupingsAttributeMeta.md), [LinkAttributeFamilyMeta](LinkAttributeFamilyMeta.md), [LinkAttributeMeta](LinkAttributeMeta.md) |
 | Slot URI | [schema:name](http://schema.org/name) |
 
 ### Cardinality and Requirements
@@ -6649,8 +7217,8 @@ domain_of:
 - FragmentAttributeMeta
 - ObjectAttributeMeta
 - GroupingsAttributeMeta
+- LinkAttributeFamilyMeta
 - LinkAttributeMeta
-- CrossChunkLinkAttributeMeta
 range: string
 required: true
 
@@ -6905,7 +7473,9 @@ search:
 # Slot: num_links 
 
 
-_Total cross-chunk link count._
+_Family-wide *logical* link count — one per input record, however many physical copies ``store`` filed.  Absent on a ``links/<delta>/`` group until ``finalize_links`` has run, and on a ``link_attributes/<name>/<delta>/`` group created without data._
+
+__
 
 
 
@@ -6924,8 +7494,8 @@ URI: [zv:num_links](https://w3id.org/zarr-vectors/schema/0.5/num_links)
 
 | Name | Description | Modifies Slot |
 | --- | --- | --- |
-| [CrossChunkLinksMeta](CrossChunkLinksMeta.md) | `` |  no  |
-| [CrossChunkLinkAttributeMeta](CrossChunkLinkAttributeMeta.md) | `` |  no  |
+| [LinksFamilyMeta](LinksFamilyMeta.md) | `` |  no  |
+| [LinkAttributeFamilyMeta](LinkAttributeFamilyMeta.md) | `` |  no  |
 
 
 
@@ -6939,13 +7509,12 @@ URI: [zv:num_links](https://w3id.org/zarr-vectors/schema/0.5/num_links)
 | Property | Value |
 | --- | --- |
 | Range | [Integer](Integer.md) |
-| Domain Of | [CrossChunkLinksMeta](CrossChunkLinksMeta.md), [CrossChunkLinkAttributeMeta](CrossChunkLinkAttributeMeta.md) |
+| Domain Of | [LinksFamilyMeta](LinksFamilyMeta.md), [LinkAttributeFamilyMeta](LinkAttributeFamilyMeta.md) |
 
 ### Cardinality and Requirements
 
 | Property | Value |
 | --- | --- |
-| Required | Yes |
 ### Value Constraints
 
 | Property | Value |
@@ -6992,14 +7561,18 @@ URI: [zv:num_links](https://w3id.org/zarr-vectors/schema/0.5/num_links)
 <details>
 ```yaml
 name: num_links
-description: Total cross-chunk link count.
+description: 'Family-wide *logical* link count — one per input record, however many
+  physical copies ``store`` filed.  Absent on a ``links/<delta>/`` group until ``finalize_links``
+  has run, and on a ``link_attributes/<name>/<delta>/`` group created without data.
+
+  '
 from_schema: https://w3id.org/zarr-vectors/schema/0.5
 rank: 1000
 domain_of:
-- CrossChunkLinksMeta
-- CrossChunkLinkAttributeMeta
+- LinksFamilyMeta
+- LinkAttributeFamilyMeta
 range: integer
-required: true
+required: false
 minimum_value: 0
 
 ```
@@ -7109,6 +7682,120 @@ domain_of:
 - ObjectIndexMeta
 range: integer
 required: true
+minimum_value: 0
+
+```
+</details></div>
+
+
+---
+
+---
+search:
+  boost: 5.0
+---
+
+# Slot: num_physical_records 
+
+
+_On-disk record row count across every offsets array and cell of a ``links/<delta>/`` family.  Equals ``num_links`` for ``store=canonical``; larger when ``store=duplicate`` replicates a record across its incident-chunk cells.  Stamped by ``finalize_links``._
+
+__
+
+
+
+<div data-search-exclude markdown="1">
+
+
+
+URI: [zv:num_physical_records](https://w3id.org/zarr-vectors/schema/0.5/num_physical_records)
+<!-- no inheritance hierarchy -->
+
+
+
+
+
+## Applicable Classes
+
+| Name | Description | Modifies Slot |
+| --- | --- | --- |
+| [LinksFamilyMeta](LinksFamilyMeta.md) | `` |  no  |
+
+
+
+
+
+
+## Properties
+
+### Type and Range
+
+| Property | Value |
+| --- | --- |
+| Range | [Integer](Integer.md) |
+| Domain Of | [LinksFamilyMeta](LinksFamilyMeta.md) |
+
+### Cardinality and Requirements
+
+| Property | Value |
+| --- | --- |
+### Value Constraints
+
+| Property | Value |
+| --- | --- |
+| Minimum Value | 0 |
+
+
+
+
+
+
+
+
+
+
+
+
+## Identifier and Mapping Information
+
+
+
+
+
+### Schema Source
+
+
+* from schema: https://w3id.org/zarr-vectors/schema/0.5
+
+
+
+
+## Mappings
+
+| Mapping Type | Mapped Value |
+| ---  | ---  |
+| self | zv:num_physical_records |
+| native | zv:num_physical_records |
+
+
+
+
+## LinkML Source
+
+<details>
+```yaml
+name: num_physical_records
+description: 'On-disk record row count across every offsets array and cell of a ``links/<delta>/``
+  family.  Equals ``num_links`` for ``store=canonical``; larger when ``store=duplicate``
+  replicates a record across its incident-chunk cells.  Stamped by ``finalize_links``.
+
+  '
+from_schema: https://w3id.org/zarr-vectors/schema/0.5
+rank: 1000
+domain_of:
+- LinksFamilyMeta
+range: integer
+required: false
 minimum_value: 0
 
 ```
@@ -7469,6 +8156,7 @@ attributes:
     owner: ObjectAttributeMeta
     domain_of:
     - VerticesMeta
+    - LinksFamilyMeta
     - LinksMeta
     - AttributeMeta
     - FragmentAttributeMeta
@@ -7476,9 +8164,8 @@ attributes:
     - ObjectAttributeMeta
     - GroupingsMeta
     - GroupingsAttributeMeta
-    - CrossChunkLinksMeta
+    - LinkAttributeFamilyMeta
     - LinkAttributeMeta
-    - CrossChunkLinkAttributeMeta
     range: ZvArrayTag
     required: true
     equals_string: object_attribute
@@ -7495,8 +8182,8 @@ attributes:
     - FragmentAttributeMeta
     - ObjectAttributeMeta
     - GroupingsAttributeMeta
+    - LinkAttributeFamilyMeta
     - LinkAttributeMeta
-    - CrossChunkLinkAttributeMeta
     range: string
     required: true
   dtype:
@@ -7513,7 +8200,6 @@ attributes:
     - ObjectAttributeMeta
     - GroupingsAttributeMeta
     - LinkAttributeMeta
-    - CrossChunkLinkAttributeMeta
     range: string
     required: true
   shape:
@@ -7835,6 +8521,7 @@ attributes:
     owner: ObjectIndexMeta
     domain_of:
     - VerticesMeta
+    - LinksFamilyMeta
     - LinksMeta
     - AttributeMeta
     - FragmentAttributeMeta
@@ -7842,9 +8529,8 @@ attributes:
     - ObjectAttributeMeta
     - GroupingsMeta
     - GroupingsAttributeMeta
-    - CrossChunkLinksMeta
+    - LinkAttributeFamilyMeta
     - LinkAttributeMeta
-    - CrossChunkLinkAttributeMeta
     range: ZvArrayTag
     required: true
     equals_string: object_index
@@ -7866,11 +8552,135 @@ attributes:
     rank: 1000
     owner: ObjectIndexMeta
     domain_of:
+    - LinksFamilyMeta
     - ObjectIndexMeta
-    - CrossChunkLinksMeta
     range: integer
     required: true
     minimum_value: 1
+
+```
+</details></div>
+
+
+---
+
+---
+search:
+  boost: 5.0
+---
+
+# Slot: offsets 
+
+
+_The ``link_width - 1`` relative offsets naming this array, each of ``sid_ndim`` signed components, as a list of integer lists. Offsets are relative to the record's SOURCE chunk: ``vi_k`` is local to ``src + o_k``.  The implicit ``o_0 = 0`` (the source itself) is never encoded, so ``link_width == 1`` carries an empty list.  Redundant with the path segment that encodes the same offsets, but stamping it lets readers decode without knowing ``sid_ndim``._
+
+__
+
+
+
+<div data-search-exclude markdown="1">
+
+
+
+URI: [zv:offsets](https://w3id.org/zarr-vectors/schema/0.5/offsets)
+<!-- no inheritance hierarchy -->
+
+
+
+
+
+## Applicable Classes
+
+| Name | Description | Modifies Slot |
+| --- | --- | --- |
+| [LinksMeta](LinksMeta.md) | `` |  no  |
+| [LinkAttributeMeta](LinkAttributeMeta.md) | `` |  no  |
+
+
+
+
+
+
+## Properties
+
+### Type and Range
+
+| Property | Value |
+| --- | --- |
+| Range | [Integer](Integer.md) |
+| Domain Of | [LinksMeta](LinksMeta.md), [LinkAttributeMeta](LinkAttributeMeta.md) |
+
+### Cardinality and Requirements
+
+| Property | Value |
+| --- | --- |
+| Required | Yes |
+<details>
+<summary>Advanced Properties</summary>
+**Array Configuration:**
+
+- **Dimensions:** DimensionExpression({'alias': 'offset'}) x DimensionExpression({'alias': 'component'})
+
+</details>
+
+
+
+
+
+
+
+
+
+
+
+## Identifier and Mapping Information
+
+
+
+
+
+### Schema Source
+
+
+* from schema: https://w3id.org/zarr-vectors/schema/0.5
+
+
+
+
+## Mappings
+
+| Mapping Type | Mapped Value |
+| ---  | ---  |
+| self | zv:offsets |
+| native | zv:offsets |
+
+
+
+
+## LinkML Source
+
+<details>
+```yaml
+name: offsets
+description: 'The ``link_width - 1`` relative offsets naming this array, each of ``sid_ndim``
+  signed components, as a list of integer lists. Offsets are relative to the record''s
+  SOURCE chunk: ``vi_k`` is local to ``src + o_k``.  The implicit ``o_0 = 0`` (the
+  source itself) is never encoded, so ``link_width == 1`` carries an empty list.  Redundant
+  with the path segment that encodes the same offsets, but stamping it lets readers
+  decode without knowing ``sid_ndim``.
+
+  '
+from_schema: https://w3id.org/zarr-vectors/schema/0.5
+rank: 1000
+domain_of:
+- LinksMeta
+- LinkAttributeMeta
+range: integer
+required: true
+array:
+  dimensions:
+  - alias: offset
+  - alias: component
 
 ```
 </details></div>
@@ -8600,6 +9410,114 @@ search:
   boost: 5.0
 ---
 
+# Slot: row_shape 
+
+
+_Tail dimensions of one attribute row (``[]`` for a 1-D per-link attribute), letting a reader reconstruct shape from a bare byte blob.  Stamped by the writers that lay down attribute bytes; absent on an array created empty._
+
+__
+
+
+
+<div data-search-exclude markdown="1">
+
+
+
+URI: [zv:row_shape](https://w3id.org/zarr-vectors/schema/0.5/row_shape)
+<!-- no inheritance hierarchy -->
+
+
+
+
+
+## Applicable Classes
+
+| Name | Description | Modifies Slot |
+| --- | --- | --- |
+| [LinkAttributeMeta](LinkAttributeMeta.md) | `` |  no  |
+
+
+
+
+
+
+## Properties
+
+### Type and Range
+
+| Property | Value |
+| --- | --- |
+| Range | [Integer](Integer.md) |
+| Domain Of | [LinkAttributeMeta](LinkAttributeMeta.md) |
+
+### Cardinality and Requirements
+
+| Property | Value |
+| --- | --- |
+| Multivalued | Yes |
+
+
+
+
+
+
+
+
+
+
+## Identifier and Mapping Information
+
+
+
+
+
+### Schema Source
+
+
+* from schema: https://w3id.org/zarr-vectors/schema/0.5
+
+
+
+
+## Mappings
+
+| Mapping Type | Mapped Value |
+| ---  | ---  |
+| self | zv:row_shape |
+| native | zv:row_shape |
+
+
+
+
+## LinkML Source
+
+<details>
+```yaml
+name: row_shape
+description: 'Tail dimensions of one attribute row (``[]`` for a 1-D per-link attribute),
+  letting a reader reconstruct shape from a bare byte blob.  Stamped by the writers
+  that lay down attribute bytes; absent on an array created empty.
+
+  '
+from_schema: https://w3id.org/zarr-vectors/schema/0.5
+rank: 1000
+domain_of:
+- LinkAttributeMeta
+range: integer
+required: false
+multivalued: true
+
+```
+</details></div>
+
+
+---
+
+---
+search:
+  boost: 5.0
+---
+
 # Slot: shape 
 
 
@@ -8832,8 +9750,8 @@ URI: [zv:sid_ndim](https://w3id.org/zarr-vectors/schema/0.5/sid_ndim)
 
 | Name | Description | Modifies Slot |
 | --- | --- | --- |
+| [LinksFamilyMeta](LinksFamilyMeta.md) | `` |  yes  |
 | [ObjectIndexMeta](ObjectIndexMeta.md) | `` |  no  |
-| [CrossChunkLinksMeta](CrossChunkLinksMeta.md) | `` |  no  |
 
 
 
@@ -8847,7 +9765,7 @@ URI: [zv:sid_ndim](https://w3id.org/zarr-vectors/schema/0.5/sid_ndim)
 | Property | Value |
 | --- | --- |
 | Range | [Integer](Integer.md) |
-| Domain Of | [ObjectIndexMeta](ObjectIndexMeta.md), [CrossChunkLinksMeta](CrossChunkLinksMeta.md) |
+| Domain Of | [LinksFamilyMeta](LinksFamilyMeta.md), [ObjectIndexMeta](ObjectIndexMeta.md) |
 
 ### Cardinality and Requirements
 
@@ -8904,8 +9822,8 @@ description: Number of spatial-index dimensions encoded in chunk keys.
 from_schema: https://w3id.org/zarr-vectors/schema/0.5
 rank: 1000
 domain_of:
+- LinksFamilyMeta
 - ObjectIndexMeta
-- CrossChunkLinksMeta
 range: integer
 required: true
 minimum_value: 1
@@ -8976,6 +9894,111 @@ URI: [xsd:string](http://www.w3.org/2001/XMLSchema#string)
 
 
 </div>
+
+
+---
+
+---
+search:
+  boost: 5.0
+---
+
+# Slot: store 
+
+
+_Cell-duplication policy for a links family; see CrossChunkStore. Family-wide; defaults to ``canonical``._
+
+__
+
+
+
+<div data-search-exclude markdown="1">
+
+
+
+URI: [zv:store](https://w3id.org/zarr-vectors/schema/0.5/store)
+<!-- no inheritance hierarchy -->
+
+
+
+
+
+## Applicable Classes
+
+| Name | Description | Modifies Slot |
+| --- | --- | --- |
+| [LinksFamilyMeta](LinksFamilyMeta.md) | `` |  no  |
+
+
+
+
+
+
+## Properties
+
+### Type and Range
+
+| Property | Value |
+| --- | --- |
+| Range | [CrossChunkStore](CrossChunkStore.md) |
+| Domain Of | [LinksFamilyMeta](LinksFamilyMeta.md) |
+
+### Cardinality and Requirements
+
+| Property | Value |
+| --- | --- |
+
+
+
+
+
+
+
+
+
+
+## Identifier and Mapping Information
+
+
+
+
+
+### Schema Source
+
+
+* from schema: https://w3id.org/zarr-vectors/schema/0.5
+
+
+
+
+## Mappings
+
+| Mapping Type | Mapped Value |
+| ---  | ---  |
+| self | zv:store |
+| native | zv:store |
+
+
+
+
+## LinkML Source
+
+<details>
+```yaml
+name: store
+description: 'Cell-duplication policy for a links family; see CrossChunkStore. Family-wide;
+  defaults to ``canonical``.
+
+  '
+from_schema: https://w3id.org/zarr-vectors/schema/0.5
+rank: 1000
+domain_of:
+- LinksFamilyMeta
+range: CrossChunkStore
+required: false
+
+```
+</details></div>
 
 
 ---
@@ -9707,6 +10730,7 @@ attributes:
     owner: VerticesMeta
     domain_of:
     - VerticesMeta
+    - LinksFamilyMeta
     - LinksMeta
     - AttributeMeta
     - FragmentAttributeMeta
@@ -9714,9 +10738,8 @@ attributes:
     - ObjectAttributeMeta
     - GroupingsMeta
     - GroupingsAttributeMeta
-    - CrossChunkLinksMeta
+    - LinkAttributeFamilyMeta
     - LinkAttributeMeta
-    - CrossChunkLinkAttributeMeta
     range: ZvArrayTag
     required: true
     equals_string: vertices
@@ -9734,7 +10757,6 @@ attributes:
     - ObjectAttributeMeta
     - GroupingsAttributeMeta
     - LinkAttributeMeta
-    - CrossChunkLinkAttributeMeta
     range: string
     required: true
   encoding:
@@ -9793,6 +10815,7 @@ URI: [zv:zv_array](https://w3id.org/zarr-vectors/schema/0.5/zv_array)
 | Name | Description | Modifies Slot |
 | --- | --- | --- |
 | [VerticesMeta](VerticesMeta.md) | `` |  yes  |
+| [LinksFamilyMeta](LinksFamilyMeta.md) | `` |  yes  |
 | [LinksMeta](LinksMeta.md) | `` |  yes  |
 | [AttributeMeta](AttributeMeta.md) | `` |  yes  |
 | [FragmentAttributeMeta](FragmentAttributeMeta.md) | `` |  yes  |
@@ -9800,9 +10823,8 @@ URI: [zv:zv_array](https://w3id.org/zarr-vectors/schema/0.5/zv_array)
 | [ObjectAttributeMeta](ObjectAttributeMeta.md) | `` |  yes  |
 | [GroupingsMeta](GroupingsMeta.md) | `` |  yes  |
 | [GroupingsAttributeMeta](GroupingsAttributeMeta.md) | `` |  yes  |
-| [CrossChunkLinksMeta](CrossChunkLinksMeta.md) | `` |  yes  |
+| [LinkAttributeFamilyMeta](LinkAttributeFamilyMeta.md) | `` |  yes  |
 | [LinkAttributeMeta](LinkAttributeMeta.md) | `` |  yes  |
-| [CrossChunkLinkAttributeMeta](CrossChunkLinkAttributeMeta.md) | `` |  yes  |
 
 
 
@@ -9816,7 +10838,7 @@ URI: [zv:zv_array](https://w3id.org/zarr-vectors/schema/0.5/zv_array)
 | Property | Value |
 | --- | --- |
 | Range | [ZvArrayTag](ZvArrayTag.md) |
-| Domain Of | [VerticesMeta](VerticesMeta.md), [LinksMeta](LinksMeta.md), [AttributeMeta](AttributeMeta.md), [FragmentAttributeMeta](FragmentAttributeMeta.md), [ObjectIndexMeta](ObjectIndexMeta.md), [ObjectAttributeMeta](ObjectAttributeMeta.md), [GroupingsMeta](GroupingsMeta.md), [GroupingsAttributeMeta](GroupingsAttributeMeta.md), [CrossChunkLinksMeta](CrossChunkLinksMeta.md), [LinkAttributeMeta](LinkAttributeMeta.md), [CrossChunkLinkAttributeMeta](CrossChunkLinkAttributeMeta.md) |
+| Domain Of | [VerticesMeta](VerticesMeta.md), [LinksFamilyMeta](LinksFamilyMeta.md), [LinksMeta](LinksMeta.md), [AttributeMeta](AttributeMeta.md), [FragmentAttributeMeta](FragmentAttributeMeta.md), [ObjectIndexMeta](ObjectIndexMeta.md), [ObjectAttributeMeta](ObjectAttributeMeta.md), [GroupingsMeta](GroupingsMeta.md), [GroupingsAttributeMeta](GroupingsAttributeMeta.md), [LinkAttributeFamilyMeta](LinkAttributeFamilyMeta.md), [LinkAttributeMeta](LinkAttributeMeta.md) |
 
 ### Cardinality and Requirements
 
@@ -9870,6 +10892,7 @@ from_schema: https://w3id.org/zarr-vectors/schema/0.5
 rank: 1000
 domain_of:
 - VerticesMeta
+- LinksFamilyMeta
 - LinksMeta
 - AttributeMeta
 - FragmentAttributeMeta
@@ -9877,9 +10900,8 @@ domain_of:
 - ObjectAttributeMeta
 - GroupingsMeta
 - GroupingsAttributeMeta
-- CrossChunkLinksMeta
+- LinkAttributeFamilyMeta
 - LinkAttributeMeta
-- CrossChunkLinkAttributeMeta
 range: ZvArrayTag
 required: true
 
@@ -10032,17 +11054,17 @@ URI: [zv:ZvArrayTag](https://w3id.org/zarr-vectors/schema/0.5/ZvArrayTag)
 | --- | --- | --- |
 | vertices | None |  |
 | vertex_fragments | None | Per-chunk fragment-index group for ``vertices/<chunk>`` (v0 |
-| link_fragments | None | Per-chunk fragment-index group for ``links/0/<chunk>`` (v0 |
-| links | None |  |
+| link_fragments | None | Per-chunk fragment-index group for the intra-chunk link array at ``links/0/<a... |
+| links_family | None | The ``links/<delta>/`` group carrying family-wide policy for every offsets ar... |
+| links | None | One ``links/<delta>/<offsets>/`` array — a rank-D vlen array whose cell is th... |
 | attribute | None |  |
 | fragment_attribute | None | Per-fragment attribute array (``fragment_attributes/<name>/<chunk>``) |
 | object_index | None |  |
 | object_attribute | None |  |
 | groupings | None |  |
 | groupings_attribute | None |  |
-| cross_chunk_links | None |  |
-| link_attribute | None |  |
-| cross_chunk_link_attribute | None |  |
+| link_attribute_family | None | The ``link_attributes/<name>/<delta>/`` group |
+| link_attribute | None | One ``link_attributes/<name>/<delta>/<offsets>/`` array, mirroring the matchi... |
 
 
 
@@ -10100,13 +11122,25 @@ permissible_values:
       '
   link_fragments:
     text: link_fragments
-    description: 'Per-chunk fragment-index group for ``links/0/<chunk>`` (v0.6+, delta
-      == 0 only).  Splits the v0.5 inline self-describing header into a sibling group
-      so link bytes can be addressed uniformly with vertex bytes.
+    description: 'Per-chunk fragment-index group for the intra-chunk link array at
+      ``links/0/<all-zero offsets>/<chunk>``.  Keyed by chunk ALONE — it carries no
+      delta and no offsets segment — so exactly one array may write it.  Every other
+      offsets segment, and every ``delta != 0`` array, uses an inline self-describing
+      blob and has no sidecar.
+
+      '
+  links_family:
+    text: links_family
+    description: 'The ``links/<delta>/`` group carrying family-wide policy for every
+      offsets array beneath it.  See ``LinksFamilyMeta``.
 
       '
   links:
     text: links
+    description: 'One ``links/<delta>/<offsets>/`` array — a rank-D vlen array whose
+      cell is the record''s SOURCE chunk.  See ``LinksMeta``.
+
+      '
   attribute:
     text: attribute
   fragment_attribute:
@@ -10126,12 +11160,17 @@ permissible_values:
     text: groupings
   groupings_attribute:
     text: groupings_attribute
-  cross_chunk_links:
-    text: cross_chunk_links
+  link_attribute_family:
+    text: link_attribute_family
+    description: 'The ``link_attributes/<name>/<delta>/`` group.  See ``LinkAttributeFamilyMeta``.
+
+      '
   link_attribute:
     text: link_attribute
-  cross_chunk_link_attribute:
-    text: cross_chunk_link_attribute
+    description: 'One ``link_attributes/<name>/<delta>/<offsets>/`` array, mirroring
+      the matching links array cell-for-cell.  See ``LinkAttributeMeta``.
+
+      '
 
 ```
 </details>

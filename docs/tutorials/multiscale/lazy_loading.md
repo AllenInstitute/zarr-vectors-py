@@ -4,9 +4,9 @@ The ZVF read functions (`read_points`, `read_polylines`, etc.) are eager:
 they fetch and return all requested data immediately. For large stores or
 remote datasets, an eager read of the full store is impractical.
 
-The **lazy API** provides a `open_zv` object that opens the store
-metadata without reading any array data. Array slices are fetched on demand
-— only when accessed. This is the recommended access pattern for:
+The **lazy API** provides `open_zv`, which opens the store metadata
+without reading any array data. Vertex and attribute data are fetched only
+when you call `.compute()`. This is the recommended access pattern for:
 
 - Stores too large to fit in memory.
 - Remote stores (S3, GCS) where each array fetch is a network request.
@@ -25,284 +25,259 @@ from zarr_vectors.lazy import open_zv
 # Opens metadata only — no vertex data fetched
 store = open_zv("synchrotron.zarrvectors")
 
-print(store.geometry_type)           # "point_cloud"
-print(store.spatial_dims)            # 3
-print(store.chunk_shape)             # (200.0, 200.0, 200.0)
-print(store.levels)                  # [0, 1, 2, 3]
-print(store.vertex_count(level=0))   # 500000 (from metadata, no data read)
-print(store.vertex_count(level=2))   # 8022
-print(store.bounding_box)            # (array([0,0,0]), array([2000,2000,2000]))
+print(store.geometry_types)   # ['point_cloud']
+print(store.ndim)             # 3
+print(store.chunk_shape)      # (200.0, 200.0, 200.0)
+print(store.bin_shape)        # (200.0, 200.0, 200.0)
+print(store.levels)           # [0, 1, 2, 3]
+print(store.bounds)           # ([0.07, 1.52, 0.12], [399.2, 398.1, 399.8])
+print(store.zv_version)       # '0.9.0'
 ```
 
-Opening a remote store is identical — pass an fsspec URL:
+`ZVStore` is a **metadata handle**. Its full public surface is:
+
+| Member | Kind | Meaning |
+|--------|------|---------|
+| `levels` | property | `list[int]` of resolution levels present |
+| `ndim` | property | spatial dimensionality |
+| `chunk_shape` | property | chunk shape in world units |
+| `bin_shape` | property | level-0 bin shape |
+| `base_bin_shape` | property | base bin shape from root metadata |
+| `bins_per_chunk` | property | bins per chunk per axis |
+| `bounds` | property | `(lo, hi)` store bounds |
+| `geometry_types` | property | `list[str]` |
+| `zv_version` | property | format version string |
+| `headers` | property | parsed store headers |
+| `path` / `url` | property | store location |
+| `object_levels(oid)` | method | levels at which `oid` is present |
+| `set_backend(...)` | method | swap the storage backend |
+| `store[level]` | `__getitem__` | the `ZVLevel` for that level |
+
+There is no `store.read(...)`, no `store.iter_chunks(...)`, and no
+`raw_array(...)`. `ZVStore` is also **not** a context manager and has no
+`close()` — there is nothing to release, since it holds no open handles
+or cache of its own.
+
+Opening a remote store is identical — pass a cloud URL:
 
 ```python
-import s3fs
 from zarr_vectors.lazy import open_zv
 
-# 0.4+: backend layer auto-routes cloud URLs via obstore (or fsspec).
-# Public access works without explicit anon=True.
-"s3://open-neuro/synchrotron.zarrvectors"
-)
-print(store.vertex_count(level=0))   # metadata only — one S3 LIST request
+# The backend layer auto-routes cloud URLs via obstore (or fsspec).
+store = open_zv("s3://open-neuro/synchrotron.zarrvectors")
+print(store.levels)   # metadata only
+```
+
+`open_zv` accepts `backend=` and `storage_options=` for explicit backend
+selection and credentials; any extra keyword arguments are forwarded to
+the backend. It does **not** take `cache_size`, `n_workers`, or
+`prefetch`.
+
+---
+
+## Working with a level
+
+Index the store to get a `ZVLevel`. This is where the data lives.
+
+```python
+level = store[0]
+
+print(level.level_index)     # 0
+print(level.vertex_count)    # 500000 — from metadata, no data read
+print(level.chunk_count)     # 8
+print(level.chunk_keys)      # [(0,0,0), (0,0,1), (0,1,0), ...]
+print(level.bin_ratio)       # (1, 1, 1) — or None
+```
+
+Note that `ZVLevel.bin_shape` and `ZVLevel.bin_ratio` are **optional**:
+they read the per-level metadata and return `None` when the level does
+not declare them (a single-level store written without a pyramid
+typically does not). `ZVStore.bin_shape`, by contrast, always resolves —
+it falls back to `base_bin_shape` or `chunk_shape`. Guard accordingly.
+
+### Level-of-detail selection
+
+There is no automatic level-selection helper. Pick a level from the
+metadata yourself, comparing each level's bin shape against a target
+resolution and falling back to the store-wide value when a level does not
+declare one:
+
+```python
+def level_for_resolution(store, target):
+    """Coarsest level whose bin shape is still finer than `target`."""
+    best = store.levels[0]
+    for lv in store.levels:
+        shape = store[lv].bin_shape or store.bin_shape
+        if max(shape) <= target:
+            best = lv
+    return best
+
+lv = level_for_resolution(store, 200.0)
+print(lv, store[lv].vertex_count)
 ```
 
 ---
 
-## Level-of-detail reads
+## Fetching data
 
-### Automatic level selection
-
-`auto_level` selects the coarsest level whose bin size is smaller than
-a given target resolution:
+Vertices and attributes are lazy collections. Nothing is read until
+`.compute()`.
 
 ```python
-# Load the coarsest level adequate for a 200 µm resolution viewport
-result = store.read(target_resolution=200.0)
-print(result["level"])           # 2 (bin_shape = [200, 200, 200] at level 2)
-print(result["vertex_count"])    # 8022
+level = store[0]
 
-# Load for a detailed 50 µm view
-result = store.read(target_resolution=50.0)
-print(result["level"])           # 0 (finest level; bin_shape = [50, 50, 50])
+# Lazy handle — no I/O yet
+verts = level.vertices
+
+# Now fetch
+positions = verts.compute()      # (N, D) numpy array
+print(positions.shape)
 ```
 
-`target_resolution` is compared against `bin_shape` at each level. The
-selected level is the highest level `N` such that
-`max(bin_shape[N]) ≤ target_resolution`.
+### Attributes
 
-### Bbox + level-of-detail
-
-Combine spatial restriction with level selection for viewport-driven reads:
+`level.attributes` is a **dict-like proxy**, not a dict: it supports
+`acc[name]` and `name in acc` only. It is not iterable — do not call
+`list()` or `for ... in` on it, as it has no `__iter__` and will not
+terminate.
 
 ```python
-# Viewport: 500³ µm region, medium detail
-result = store.read(
-    bbox=(np.array([800., 800., 800.]), np.array([1300., 1300., 1300.])),
-    target_resolution=100.0,
+attrs = level.attributes
+
+if "intensity" in attrs:
+    values = attrs["intensity"].compute()   # (N,) numpy array
+    print(values.shape, values.dtype)
+```
+
+### Filtering before fetching
+
+`level.filter(...)` returns a `ZVView` — still lazy. This is the way to
+restrict a read spatially or by object:
+
+```python
+import numpy as np
+
+view = level.filter(
+    bbox=(np.array([0., 0., 0.]), np.array([200., 200., 200.])),
 )
-print(result["level"])           # level where bin_shape ≤ 100 µm
+
+# Still no data read. Materialise either the vertices...
+positions = view.vertices.compute()
+print(positions.shape)
+
+# ...or the whole filtered result
+result = view.compute()
 print(result["vertex_count"])
+print(result["positions"].shape)
 ```
 
-### Explicit level override
+`filter` accepts `bbox`, `object_ids`, and `group_ids`, and views can be
+chained with a further `.filter(...)`. `view.compute()` returns a dict
+with `positions`, `vertex_count`, and — where the type has them —
+`object_ids`.
+
+---
+
+## Parallel and out-of-core access with Dask
+
+`to_delayed()` is the supported way to process a level chunk by chunk:
+it returns one delayed object per chunk, each yielding that chunk's
+`(M, D)` vertex array when computed.
 
 ```python
-result = store.read(level=1, bbox=(lo, hi))
+delayeds = store[0].vertices.to_delayed()
+print(len(delayeds))          # one per chunk
+
+# With Dask installed these are dask.delayed objects; without it, a
+# synchronous fallback with the same .compute() interface.
+first_chunk = delayeds[0].compute()
+print(first_chunk.shape)
+```
+
+This gives you memory-bounded streaming: process one delayed at a time
+rather than materialising the level.
+
+```python
+total = 0
+for d in store[0].vertices.to_delayed():
+    total += len(d.compute())
+print(total)
 ```
 
 ---
 
-## Streaming large stores chunk by chunk
+## Per-object level lookup
 
-For datasets that do not fit in memory, iterate over chunks instead of
-loading the full store at once:
-
-### Iterate over all chunks at a level
-
-```python
-for chunk_coord, chunk_data in store.iter_chunks(level=0):
-    positions  = chunk_data["positions"]    # (N_chunk, 3) float32
-    attributes = chunk_data["attributes"]
-    # Process this chunk — e.g. compute statistics, write to database
-    yield process_chunk(positions, attributes)
-```
-
-### Iterate over chunks in a bounding box
+For discrete-object types (polylines, graphs, skeletons, meshes) in an
+ID-preserving pyramid, `object_levels` reports the levels at which an
+object is present — useful for a viewer choosing an LOD per object.
 
 ```python
-lo = np.array([0., 0., 0.])
-hi = np.array([500., 500., 500.])
-
-for chunk_coord, chunk_data in store.iter_chunks(level=0, bbox=(lo, hi)):
-    print(chunk_coord, chunk_data["positions"].shape)
+print(store.object_levels(0))    # e.g. [0, 1, 2]
+print(store[0].has_object(0))    # True
+print(store[0].has_object(999))  # False
 ```
 
-This yields only the chunks that overlap the bbox, in row-major order.
-Each chunk is fetched and decompressed exactly once.
+`object_levels` returns `[]` for an object that is present nowhere.
 
-### Streaming statistics over a large point cloud
-
-```python
-total_count = 0
-intensity_sum = 0.0
-
-for _, chunk_data in store.iter_chunks(level=0):
-    n = len(chunk_data["positions"])
-    total_count   += n
-    intensity_sum += chunk_data["attributes"]["intensity"].sum()
-
-mean_intensity = intensity_sum / total_count
-print(f"Mean intensity over {total_count} points: {mean_intensity:.4f}")
-```
+Both are meaningful only where an `object_index/` exists. An
+undifferentiated point cloud has no object index, and `has_object` raises
+`KeyError` rather than returning `False` on such a store — check
+`geometry_types` first if the type is not known ahead of time.
 
 ---
 
-## Lazy array access
+## Fragment indices
 
-The `open_zv` exposes each array as a lazy `zarr.Array` that can
-be sliced directly:
+To inspect a chunk's fragment index directly, use
+`read_fragment_index` from `zarr_vectors.encoding.fragments`, passing the
+level's underlying group:
 
 ```python
-# Access the raw vertices array for level 0 without reading it
-verts_array = store.raw_array("vertices", level=0)
-print(verts_array.shape)    # (Cx, Cy, Cz, N_max, 3)
-print(verts_array.dtype)    # float32
+from zarr_vectors.encoding.fragments import read_fragment_index
+from zarr_vectors.core.store import open_store, get_resolution_level
 
-# Read one specific chunk (fetches only that chunk from disk/S3)
-chunk_verts = verts_array[2, 3, 1]   # chunk at grid coord (2,3,1)
-print(chunk_verts.shape)    # (N_max, 3) — may include fill-value rows
+root = open_store("scan.zarrvectors", mode="r")
+level_group = get_resolution_level(root, 0)
 
-# Access the fragment index for one chunk
-from zarr_vectors.core.arrays import read_fragment_index
+fidx = read_fragment_index(level_group, "vertex_fragments", (2, 3, 1))
+print(fidx.num_fragments)          # F: fragments in chunk (2,3,1)
+print(fidx.num_range_fragments)    # R: how many are range fragments
+print(fidx.is_range(0))            # bool — cheap, single bit lookup
+start, count = fidx.range(0)       # row range, if fragment 0 is a range
+rows = fidx.indices(0)             # explicit row indices otherwise
+```
 
-fidx = read_fragment_index(store.level_group(0), "vertex_fragments", (2, 3, 1))
-print(fidx.num_fragments)              # F: number of fragments in chunk (2,3,1)
-print(fidx.num_range_fragments)        # R: number of range fragments
-start, count = fidx.range(0)           # first fragment's row range (if it's a range)
-rows = fidx.indices(0)                 # row indices into vertices/<2.3.1>
+`ChunkFragmentIndex` exposes `num_fragments`, `num_range_fragments`,
+`is_range(f)`, `range(f)`, `indices(f)`, and `indices_view(f)`. No
+fragment payload is materialised until `range`/`indices`/`indices_view`
+is called.
+
+For the vertex fragment index specifically, `core.arrays` offers a
+narrower helper that needs no array name:
+
+```python
+from zarr_vectors.core.arrays import read_vertex_fragment_index
+
+fidx = read_vertex_fragment_index(level_group, (2, 3, 1))
 ```
 
 See [Fragment-index arrays](../../spec/layout/fragment_index_arrays.md) for the
 byte layout and the full `ChunkFragmentIndex` API.
 
-### Accessing object attributes without loading vertices
-
-```python
-# Read all per-streamline FA values without fetching vertex data
-fa_array = store.raw_array("object_attributes/mean_fa", level=0)
-fa_values = fa_array[:]   # shape (n_objects,) — one request
-
-# Filter objects by FA
-high_fa_ids = np.where(fa_values > 0.5)[0]
-print(f"{len(high_fa_ids)} high-FA streamlines")
-```
-
 ---
 
-## Remote stores (S3 / GCS)
+## Performance on object stores
 
-### S3 with credentials
+Remote stores have per-request latency (~50–200 ms for S3). To keep
+request counts down:
 
-```python
-import s3fs
-from zarr_vectors.lazy import open_zv
+1. Read metadata first (`store.levels`, `store[lv].vertex_count`) and
+   decide *which* level you need before fetching any vertices.
+2. Filter before computing — `level.filter(bbox=...)` restricts what
+   `.compute()` will fetch.
+3. Prefer a coarse level for overviews; only drop to level 0 for detail.
+4. Use `to_delayed()` with a Dask scheduler to overlap fetches.
 
-store = open_zv("s3://my-bucket/dataset/tracts.zarrvectors")
-```
-
-### GCS
-
-```python
-import gcsfs
-from zarr_vectors.lazy import open_zv
-
-store = open_zv("gs://my-bucket/tracts.zarrvectors")
-```
-
-### Performance on object stores
-
-Remote stores have per-request latency (~50–200 ms for S3). The lazy API
-minimises requests by:
-
-1. Reading consolidated metadata in a single request (if available).
-2. Batching chunk reads for spatial queries (multiple chunks fetched in
-   parallel if `n_workers > 1`).
-3. Caching decompressed chunks in an LRU cache (configurable size).
-
-```python
-store = open_zv(
-    "s3://my-bucket/tracts.zarrvectors",
-    cache_size=256,     # cache up to 256 decompressed chunks in memory
-    n_workers=8,        # fetch up to 8 chunks in parallel
-)
-```
-
-### Prefetching for sequential access
-
-When iterating over chunks sequentially, enable prefetch to overlap
-decompression of future chunks with processing of the current one:
-
-```python
-for chunk_coord, chunk_data in store.iter_chunks(level=1, prefetch=4):
-    # Process current chunk while next 4 are fetching in the background
-    yield analyse(chunk_data)
-```
-
----
-
-## open_zv API summary
-
-```python
-from zarr_vectors.lazy import open_zv
-
-store = open_zv(path_or_store)
-
-# Metadata (no data I/O)
-store.geometry_type           # str
-store.spatial_dims            # int
-store.chunk_shape             # tuple
-store.bin_shape               # tuple (at level 0)
-store.levels                  # list[int]
-store.n_objects               # int (for discrete-object types)
-store.bounding_box            # (lo, hi) arrays
-
-# Per-level metadata
-store.vertex_count(level)     # int
-store.bin_shape_at(level)     # tuple
-store.bin_ratio_at(level)     # tuple
-store.object_count_at(level)  # int (discrete-object types)
-
-# Data reads
-store.read(level, bbox, target_resolution, attributes)
-store.iter_chunks(level, bbox, prefetch, n_workers)
-store.raw_array(array_path, level)
-
-# Utilities
-store.close()
-store.__enter__() / store.__exit__()   # context manager
-```
-
-### Using as a context manager
-
-```python
-with open_zv("scan.zarrvectors") as store:
-    result = store.read(level=2)
-# Store is closed and cache is freed on exit
-```
-
----
-
-## Common patterns
-
-### Thumbnail generation
-
-Load the coarsest level for a quick full-volume thumbnail:
-
-```python
-store    = open_zv("scan.zarrvectors")
-coarsest = store.levels[-1]
-result   = store.read(level=coarsest)
-# Use result["positions"] to render a low-density overview
-```
-
-### Memory-bounded streaming
-
-Process a store in chunks, keeping peak memory under a target:
-
-```python
-MEMORY_LIMIT_BYTES = 1 * 1024**3   # 1 GB
-
-chunk_bytes   = store.vertex_count(level=0) / len(list(store.iter_chunks(level=0))) * 12
-chunks_at_once = int(MEMORY_LIMIT_BYTES / chunk_bytes)
-
-batch = []
-for i, (coord, data) in enumerate(store.iter_chunks(level=0)):
-    batch.append(data["positions"])
-    if len(batch) >= chunks_at_once:
-        process_batch(np.concatenate(batch))
-        batch.clear()
-
-if batch:
-    process_batch(np.concatenate(batch))
-```
+Caching and parallelism are properties of the backend and the Dask
+scheduler you run under, not options on `open_zv`.

@@ -15,16 +15,30 @@
 
 **Per-chunk array**
 : Every per-spatial-chunk array (`vertices/`, `vertex_fragments/`,
-  `links/<delta>/`, `vertex_attributes/<name>/`, …) is a **single** Zarr v3
-  vlen-bytes array whose shape is the level's chunk grid. One cell holds
-  one spatial chunk's payload bytes; the chunk files live under the `c/`
-  sub-tree (`c/i/j/k`). A spatial chunk at absolute coord `c` maps to cell
-  `c - origin`, where `origin = floor(min_corner / chunk_shape)` is stored
-  in the array's `chunk_grid_origin` attribute (absent ⇒ zero origin). The
-  set of non-empty cells is listed in the array's `nonempty_chunks`
-  attribute. `cross_chunk_links/<delta>/` is the one exception — its cells
-  are keyed by endpoint-chunk tuples (not a spatial grid), so each cell is
-  its own small array under a group.
+  `links/<delta>/<offsets>/`, `vertex_attributes/<name>/`, …) is a
+  **single** Zarr v3 vlen-bytes array whose shape is the level's chunk
+  grid. One cell holds one spatial chunk's payload bytes; the chunk files
+  live under the `c/` sub-tree (`c/i/j/k`). A spatial chunk at absolute
+  coord `c` maps to cell `c - origin`, where
+  `origin = floor(min_corner / chunk_shape)` is stored in the array's
+  `chunk_grid_origin` attribute (absent ⇒ zero origin). The set of
+  non-empty cells is listed in the array's `nonempty_chunks` attribute.
+
+  This pattern is now **universal — there is no exception.** Before 0.9.0
+  `cross_chunk_links/<delta>/` was one: its cells were keyed by
+  endpoint-chunk tuples rather than a spatial grid, so each cell was its
+  own small array under a group. That family is gone. Connectivity is a
+  single family whose arrays are ordinary rank-D grids over the chunk
+  grid, one cell per **source** chunk — so every per-chunk array in a
+  store now shares the same shape, the same `c/i/j/k` key scheme, and the
+  same sharding behaviour. See [Links](../object_model/links.md).
+
+**Family group**
+: `links/<delta>/` and `link_attributes/<name>/<delta>/` are **groups**,
+  not arrays. Their children are one per-chunk array per distinct
+  relative-offset segment (`links/<delta>/<offsets>/`). The group carries
+  the family-wide policy (`link_width`, `sid_ndim`, `directed`, `store`);
+  the arrays carry only what decodes their own cells.
 
 **`metadata.json`**
 : A plain-text JSON file at the store root containing human-readable
@@ -99,11 +113,14 @@ dataset.zarrvectors/
 
 ### Full annotated tree (streamline / polyline)
 
-The streamline tree adds connectivity and object-model arrays. Under
-the 0.4 multiscale-links layout, every link-family array carries a
-signed `<delta>` segment that says how many pyramid levels its edges
-span (`0` = intra-level, `+N` / `-N` = N levels coarser / finer). See
-[Links and cross-chunk links](../object_model/cross_chunk_links.md).
+The streamline tree adds connectivity and object-model arrays. Every
+link-family path carries two segments: a signed `<delta>` saying how many
+pyramid levels its records span (`0` = intra-level, `+N` / `-N` = N levels
+coarser / finer), and an `<offsets>` segment saying where the record's
+other endpoints sit relative to its **source** chunk. An intra-chunk link
+is simply one whose offsets are all zero (`0.0.0` for an edge in a 3-D
+store) — there is no separate cross-chunk family. See
+[Links](../object_model/links.md).
 
 ```
 tracts.zarrvectors/
@@ -119,31 +136,33 @@ tracts.zarrvectors/
     ├── vertices/                # vertex positions
     ├── vertex_fragments/        # fragment index over vertices/ rows
     │
-    ├── links/                   # connectivity (per spatial chunk)
-    │   └── 0/                   # <delta>=0 → intra-level edges
-    │       ├── zarr.json        # link_width=2 for streamline/polyline
-    │       └── c/ …             # one file per chunk_key
-    │
-    ├── link_fragments/          # fragment index over links/0/ rows (delta=0)
-    │   ├── zarr.json
-    │   └── c/ …
-    │
-    ├── cross_chunk_links/       # inter-chunk edges (global flat blob)
-    │   └── 0/
-    │       ├── zarr.json        # num_links, sid_ndim, level_delta=0
-    │       └── data             # 2*(sid_ndim+1) int64s per link
-    │
-    ├── link_attributes/         # per-edge attrs, parallel to links/<delta>/
-    │   └── weight/
-    │       └── 0/
+    ├── links/                   # connectivity — ONE family
+    │   └── 0/                   # <delta>=0 GROUP; zarr.json carries the
+    │       │                    #   family policy: link_width=2, sid_ndim,
+    │       │                    #   directed, store (+ counts after finalize)
+    │       ├── 0.0.0/           # <offsets> all-zero → intra-chunk edges
+    │       │   ├── zarr.json    #   has_perm=false; flat rows + link_fragments
+    │       │   └── c/ …         #   one file per SOURCE chunk
+    │       ├── 0.0.+1/          # edges to the +z neighbour
+    │       │   ├── zarr.json    #   has_perm=true (undirected canonical)
+    │       │   └── c/ …         #   inline ragged blob; no sidecar
+    │       └── 0.+1.0/          # edges to the +y neighbour
     │           ├── zarr.json
     │           └── c/ …
     │
-    ├── cross_chunk_link_attributes/    # per-CCL attrs (NEW in 0.4)
-    │   └── weight/                     # parallel to cross_chunk_links/<delta>/data
-    │       └── 0/
-    │           ├── zarr.json           # num_links matches CCL meta
-    │           └── data
+    ├── link_fragments/          # fragment index over links/0/0.0.0/ rows ONLY
+    │   ├── zarr.json            #   (keyed by chunk alone — no delta/offsets)
+    │   └── c/ …
+    │
+    ├── link_attributes/         # per-record attrs, mirroring links/ cell-for-cell
+    │   └── weight/
+    │       └── 0/               # <delta> GROUP
+    │           ├── 0.0.0/       # same <offsets> segments as links/0/
+    │           │   ├── zarr.json
+    │           │   └── c/ …
+    │           └── 0.0.+1/
+    │               ├── zarr.json
+    │               └── c/ …
     │
     ├── attributes/              # per-vertex attributes (e.g. FA, MD)
     │
@@ -169,14 +188,21 @@ to the link arrays. A typical level-0 tree under
 
 ```
 0/
-├── links/
-│   ├── 0/                   # intra-level edges
-│   └── +1/                  # cross-level: source local → coarse local (same chunk_key)
-├── cross_chunk_links/
-│   ├── 0/                   # intra-level inter-chunk edges
-│   └── +1/                  # cross-level inter-chunk edges
-└── …
+└── links/
+    ├── 0/                   # intra-level records
+    │   ├── 0.0.0/           #   both endpoints in the source chunk
+    │   └── 0.0.+1/          #   endpoint one chunk along +z
+    └── +1/                  # cross-level: source → level+1
+        ├── 0.0.0/           #   parent in the anchored chunk
+        └── 0.0.+1/          #   parent one COARSE chunk along +z
 ```
+
+Under `<delta> != 0` the offsets are measured against the source chunk
+**re-anchored into the target level's grid**, not against the raw
+coordinate difference — see
+[the anchor](../object_model/links.md#cross-level-placement-the-anchor).
+Every `<delta> != 0` array has `has_perm=false` and uses the inline blob
+encoding with no `link_fragments/` sidecar.
 
 At an intermediate level (e.g. `1`), both `+1` (drill up to
 level 2) and `-1` (drill down to level 0) appear. See
@@ -193,20 +219,24 @@ neuron.zarrvectors/
     ├── vertices/
     ├── vertex_fragments/
     ├── links/
-    │   └── 0/                   # link_width=2 for graphs / skeletons
-    ├── link_fragments/          # fragment index over links/0/ rows
-    ├── cross_chunk_links/
-    │   └── 0/
+    │   └── 0/                   # GROUP — link_width=2 for graphs / skeletons
+    │       ├── 0.0.0/           #   intra-chunk edges
+    │       ├── 0.0.+1/          #   edges crossing into the +z neighbour
+    │       └── 0.+1.0/          #   … one array per distinct offset
+    ├── link_fragments/          # fragment index over links/0/0.0.0/ rows
     ├── link_attributes/
     │   └── weight/
     │       └── 0/
-    ├── cross_chunk_link_attributes/
-    │   └── weight/
-    │       └── 0/
+    │           ├── 0.0.0/
+    │           └── 0.0.+1/
     ├── attributes/
     ├── object_index/
     └── object_attributes/
 ```
+
+A skeleton's parent references use `link_width=1`, whose single endpoint
+leaves no offsets to encode — those arrays are named by the literal
+segment `links/<delta>/self/`.
 
 ### Full annotated tree (mesh)
 
@@ -219,14 +249,18 @@ brain.zarrvectors/
     ├── vertices/
     ├── vertex_fragments/
     ├── links/
-    │   └── 0/                   # link_width=3 for triangle meshes
-    ├── link_fragments/          # fragment index over links/0/ rows
-    ├── cross_chunk_links/
-    │   └── 0/
+    │   └── 0/                       # GROUP — link_width=3 for triangle meshes
+    │       ├── 0.0.0_0.0.0/         #   face wholly inside the source chunk
+    │       ├── 0.0.+1_0.0.+1/       #   face straddling the +z boundary
+    │       └── 0.0.+1_0.+1.0/       #   face spanning source, +z and +y
+    ├── link_fragments/              # fragment index over links/0/0.0.0_0.0.0/ rows
     ├── attributes/
     ├── object_index/
     └── object_attributes/
 ```
+
+A face carries `link_width - 1 = 2` offsets, joined by `_` — so a mesh's
+offsets segments are twice as long as an edge's.
 
 ### Parametric objects
 
@@ -268,11 +302,11 @@ Per-vertex and per-object custom attributes must be placed under
 | `0/` | All types | At least one level required |
 | `vertices/` | All types | |
 | `vertex_fragments/` | All types | Required for spatial queries; see [Fragment-index arrays](fragment_index_arrays.md) |
-| `link_fragments/` | polyline, streamline, graph, skeleton, mesh | Present at `<delta>=0` whenever `links/0/` is present |
-| `links/<delta>/` | polyline, streamline, graph, skeleton (`link_width=2`); mesh (`link_width=3`) | `<delta>=0` for intra-level edges; `<delta>=±N` for cross-pyramid-level edges (0.4+) |
-| `cross_chunk_links/<delta>/` | Any geometry whose objects can span multiple chunks | `<delta>=0` always; `±N` when `cross_level_depth > 0` |
-| `link_attributes/<name>/<delta>/` | Any geometry that wrote `edge_attributes` | Parallel to `links/<delta>/` |
-| `cross_chunk_link_attributes/<name>/<delta>/` | Any geometry with cross-chunk per-edge attrs (0.4+) | Parallel to `cross_chunk_links/<delta>/data` |
+| `link_fragments/` | polyline, streamline, graph, skeleton, mesh | Pairs with `links/0/<all-zero offsets>/` **only**; keyed by chunk alone. See [Fragment-index arrays](fragment_index_arrays.md) |
+| `links/<delta>/` | polyline, streamline, graph, skeleton (`link_width=2`); mesh (`link_width=3`) | A **group**, not an array. Carries the family policy; `<delta>=0` intra-level, `±N` cross-pyramid-level |
+| `links/<delta>/<offsets>/` | as above | One per-chunk array per distinct offset. All-zero offsets = intra-chunk; `self` when `link_width=1` |
+| `link_attributes/<name>/<delta>/` | Any geometry that wrote `edge_attributes` | A **group**, mirroring `links/<delta>/` |
+| `link_attributes/<name>/<delta>/<offsets>/` | as above | Mirrors `links/<delta>/<offsets>/` cell-for-cell |
 | `attributes/` | All types | Optional if no per-vertex attributes |
 | `object_index/` | polyline, streamline, graph, skeleton, mesh | |
 | `object_attributes/` | Any type | Optional |

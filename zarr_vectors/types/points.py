@@ -14,7 +14,7 @@ Supports three point cloud variants:
 
 from __future__ import annotations
 
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import numpy as np
 import numpy.typing as npt
@@ -102,6 +102,9 @@ from zarr_vectors.typing import (
     ObjectManifest,
     FragmentRef,
 )
+
+if TYPE_CHECKING:
+    from zarr_vectors.core.store import ReadSource
 
 
 def write_points(
@@ -519,7 +522,7 @@ def write_points(
 
 
 def read_points(
-    store_path: str,
+    store_path: ReadSource,
     *,
     level: int = 0,
     bbox: BoundingBox | None = None,
@@ -537,7 +540,8 @@ def read_points(
     must accept a point for it to appear in the output.
 
     Args:
-        store_path: Path to the ZV store.
+        store_path: URL or path to the ZV store, a pre-built zarr
+            Store, or an already-open Group.
         level: Resolution level to read (default 0).
         bbox: Optional bounding box filter as ``(min_corner, max_corner)``.
         object_ids: Optional list of object IDs to read.

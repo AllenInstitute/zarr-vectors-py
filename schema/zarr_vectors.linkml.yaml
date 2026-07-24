@@ -56,18 +56,27 @@ enums:
       boundary_deduplication:
         description: Vertices on a chunk boundary are duplicated in each chunk.
       explicit_links:
-        description: A ``cross_chunk_links`` array bridges the boundary.
+        description: >
+          Links with a non-zero offsets segment bridge the boundary.
+          This value is semantic — it records the authoring intent, not a
+          distinct physical family: since 0.9.0 a boundary-crossing link
+          is an ordinary record in ``links/<delta>/<offsets>/`` whose
+          offsets are not all zero.
       both:
         description: Both boundary duplication and explicit links are present.
 
   CrossChunkStore:
     description: >
-      Cell-duplication policy for a ``cross_chunk_links/<delta>/`` family.
+      Cell-duplication policy for a ``links/<delta>/`` family.  Governs
+      only the boundary-crossing (non-zero offsets) arrays: an
+      intra-chunk record has a single incident chunk, so both values
+      place it identically.
     permissible_values:
       canonical:
         description: >
-          Each record is filed in exactly one cell (canonical-sorted
-          endpoints, or input order when ``directed``).  Fewest cells.
+          Each record is filed in exactly one cell — the source chunk of
+          its canonical-sorted endpoints, or of its input order when
+          ``directed``.  Fewest cells.
       duplicate:
         description: >
           Each record is filed under one cell per distinct incident chunk
@@ -77,7 +86,7 @@ enums:
   CrossLevelStorage:
     description: >
       How cross-pyramid-level edges are stored in the multiscale links
-      layout (``links/<delta>/`` and ``cross_chunk_links/<delta>/``).
+      layout (``links/<delta>/``).
     permissible_values:
       none:
         description: No cross-level link arrays are emitted (``cross_level_depth=0``).
@@ -137,11 +146,13 @@ enums:
           explicit CSR; see :mod:`zarr_vectors.encoding.fragments`).
       multiscale_links:
         description: >
-          Store uses the 0.4 multiscale links layout
-          (``links/<delta>/``, ``cross_chunk_links/<delta>/``,
-          ``link_attributes/<name>/<delta>/`` and
-          ``cross_chunk_link_attributes/<name>/<delta>/``) and
-          may contain cross-pyramid-level edges (``delta != 0``).
+          Store uses the multiscale links layout
+          (``links/<delta>/<offsets>/`` and
+          ``link_attributes/<name>/<delta>/<offsets>/``) and may contain
+          cross-pyramid-level edges (``delta != 0``).  Since 0.9.0 there
+          is no separate cross-chunk family — a cross-chunk link is a
+          link with a non-zero offsets segment — so this token now marks
+          only the presence of ``delta != 0`` arrays.
 
   ZvArrayTag:
     description: >
@@ -156,11 +167,20 @@ enums:
           Replaces the v0.5 ``vertex_group_offsets``.
       link_fragments:
         description: >
-          Per-chunk fragment-index group for ``links/0/<chunk>`` (v0.6+,
-          delta == 0 only).  Splits the v0.5 inline self-describing
-          header into a sibling group so link bytes can be addressed
-          uniformly with vertex bytes.
+          Per-chunk fragment-index group for the intra-chunk link array
+          at ``links/0/<all-zero offsets>/<chunk>``.  Keyed by chunk
+          ALONE — it carries no delta and no offsets segment — so exactly
+          one array may write it.  Every other offsets segment, and every
+          ``delta != 0`` array, uses an inline self-describing blob and
+          has no sidecar.
+      links_family:
+        description: >
+          The ``links/<delta>/`` group carrying family-wide policy for
+          every offsets array beneath it.  See ``LinksFamilyMeta``.
       links:
+        description: >
+          One ``links/<delta>/<offsets>/`` array — a rank-D vlen array
+          whose cell is the record's SOURCE chunk.  See ``LinksMeta``.
       attribute:
       fragment_attribute:
         description: >
@@ -173,9 +193,15 @@ enums:
       object_attribute:
       groupings:
       groupings_attribute:
-      cross_chunk_links:
+      link_attribute_family:
+        description: >
+          The ``link_attributes/<name>/<delta>/`` group.  See
+          ``LinkAttributeFamilyMeta``.
       link_attribute:
-      cross_chunk_link_attribute:
+        description: >
+          One ``link_attributes/<name>/<delta>/<offsets>/`` array,
+          mirroring the matching links array cell-for-cell.  See
+          ``LinkAttributeMeta``.
 
 # ===================================================================
 # Classes
@@ -279,13 +305,72 @@ classes:
         equals_string: vertices
         required: true
 
+  LinksFamilyMeta:
+    description: >
+      ``.zattrs`` for a ``links/<delta>/`` **group** — the family-wide
+      policy every offsets array beneath it decodes against, which is why
+      it lives on the group rather than being repeated per array.
+
+      Since 0.9.0 connectivity is one family: there is no separate
+      ``cross_chunk_links/``.  An intra-chunk link is a link whose
+      relative offsets are all zero; a cross-chunk link is one whose
+      offsets are non-zero.
+
+      Two policy flags govern how a boundary-crossing record is placed:
+      ``directed`` (endpoint order is data, so ``A→B`` and ``B→A`` stay
+      distinct) and ``store`` (``canonical`` = one cell per record;
+      ``duplicate`` = one cell per distinct incident chunk).  The
+      source-side endpoint (input endpoint 0) lives at the level owning
+      the array; target-side endpoints live at ``this_level +
+      level_delta``.
+
+      ``num_links`` is the family-wide *logical* record count (one per
+      input record) and ``num_physical_records`` the on-disk row count;
+      both are absent until ``finalize_links`` has run, since the
+      decentralized per-cell writers leave them for it to fill in.
+      ``sid_ndim`` is likewise optional: a family may be stamped without
+      it, and readers then recover offsets from each array's own
+      ``offsets`` meta.
+    slots: [zv_array, level_delta, link_width, directed, store, sid_ndim,
+            num_links, num_physical_records]
+    slot_usage:
+      zv_array:
+        equals_string: links_family
+        required: true
+      sid_ndim:
+        required: false
+        description: >
+          Number of spatial-index dimensions encoded in chunk keys and in
+          each offset.  Optional on a links family: writers stamp it only
+          when known, and ``finalize_links`` preserves its absence rather
+          than inventing one.
+
   LinksMeta:
     description: >
-      ``.zattrs`` for a ``links/<delta>/`` array.  Under the 0.4
-      multiscale layout, each delta segment carries its own meta block;
-      ``level_delta=0`` is the intra-level array (the only one written
-      pre-0.4).
-    slots: [zv_array, dtype, link_width, level_delta]
+      ``.zattrs`` for a single ``links/<delta>/<offsets>/`` array: a
+      rank-D vlen array over the level's chunk grid, one cell per
+      **source** chunk, holding the records whose source chunk is that
+      cell.
+
+      The ``offsets`` segment names the array: ``link_width - 1`` relative
+      offsets, each of ``sid_ndim`` signed components.  Record ``vi_k`` is
+      local to chunk ``src + o_k``; the implicit ``o_0 = 0`` (the source
+      itself) is never encoded.  All-zero offsets is the intra-chunk
+      array; non-zero offsets hold records whose other endpoints sit that
+      far away.  ``link_width == 1`` (parent→child metanode refs) has no
+      other endpoint and so carries an empty ``offsets`` list, written at
+      the ``self`` segment.
+
+      ``has_perm`` is the record-width discriminator.  Rows are ``L``
+      ints normally; when ``has_perm`` is true they are ``1 + L``
+      (``[perm_idx, vi_0, ..., vi_{L-1}]``), where ``perm_idx`` is the
+      Lehmer code of the canonical→input-order permutation, letting
+      readers recover the original endpoint order (mesh-face winding,
+      directed-edge direction).  It is true exactly when a non-identity
+      placement is possible — non-intra offsets AND ``level_delta == 0``
+      AND (``store="duplicate"`` OR not ``directed``) — so an intra-chunk
+      link never pays the extra 8 bytes for a value that is always 0.
+    slots: [zv_array, dtype, offsets, has_perm, link_width, level_delta]
     slot_usage:
       zv_array:
         equals_string: links
@@ -345,58 +430,41 @@ classes:
         equals_string: groupings_attribute
         required: true
 
-  CrossChunkLinksMeta:
+  LinkAttributeFamilyMeta:
     description: >
-      ``.zattrs`` for a ``cross_chunk_links/<delta>/`` parent group.
-      In 0.8 the family stores per-cell arrays keyed on the
-      canonical-sorted L-tuple of endpoint chunks
-      (``cross_chunk_links/<delta>/<x.y.z...>`` — exactly
-      ``sid_ndim * link_width`` dotted components).  Each cell
-      holds records spanning that exact L-tuple of chunks; each
-      record is ``[perm_idx, vi_0, ..., vi_{L-1}]`` int64s, where
-      ``perm_idx`` is the Lehmer code of the canonical→input-order
-      permutation (so readers can recover original endpoint order
-      — mesh-face winding, directed-edge direction).  Source-side
-      endpoint (input endpoint 0) lives at the array's own
-      resolution level; target-side endpoints live at
-      ``this_level + level_delta``.  ``num_links`` is the family-
-      wide *logical* record count (one per input record).
+      ``.zattrs`` for a ``link_attributes/<name>/<delta>/`` **group**.
+      There is no separate cross-chunk attribute family: an intra-chunk
+      link's attributes live under the all-zero offsets segment, exactly
+      like the links themselves.
 
-      Two family-level policy flags govern cell placement:
-      ``directed`` (endpoint order preserved, so ``A→B`` and ``B→A``
-      are distinct cells) and ``store`` (``canonical`` = one cell per
-      record; ``duplicate`` = one cell per distinct incident chunk).
-      ``num_physical_records`` is the on-disk row count, which exceeds
-      ``num_links`` under ``duplicate``.
-    slots: [zv_array, num_links, num_physical_records, sid_ndim, level_delta, link_width, directed, store]
+      ``num_links`` is stamped by the whole-family writer and MUST then
+      equal the parallel ``links/<delta>/`` family's ``num_links``.  It is
+      absent when the family was created without data (the per-cell
+      writers do not stamp it).
+    slots: [zv_array, name, level_delta, num_links]
     slot_usage:
       zv_array:
-        equals_string: cross_chunk_links
+        equals_string: link_attribute_family
         required: true
 
   LinkAttributeMeta:
     description: >
-      ``.zattrs`` for each ``link_attributes/<name>/<delta>/`` array.
-      Parallel to the ``links/<delta>/`` array of the same ``<delta>``.
-    slots: [zv_array, name, dtype, level_delta]
+      ``.zattrs`` for one ``link_attributes/<name>/<delta>/<offsets>/``
+      array.  Mirrors the ``links/<delta>/<offsets>/`` array of the same
+      ``<delta>`` and ``<offsets>`` cell-for-cell — same cells, same
+      per-cell row order — so attribute rows align 1:1 with link records
+      without storing a row id.
+
+      Rows never carry the links array's ``perm_idx`` column: that column
+      describes a record's placement, not its value, so ``has_perm`` has
+      no analogue here and a row is exactly ``row_shape`` worth of
+      ``dtype``.  A ``store="duplicate"`` family replicates an attribute
+      value alongside each physical copy of its record, so cells stay
+      row-aligned with the links array they mirror.
+    slots: [zv_array, name, dtype, offsets, row_shape, level_delta]
     slot_usage:
       zv_array:
         equals_string: link_attribute
-        required: true
-
-  CrossChunkLinkAttributeMeta:
-    description: >
-      ``.zattrs`` for each ``cross_chunk_link_attributes/<name>/<delta>/``
-      parent group.  In 0.8 the parallel link family was split into
-      per-cell arrays keyed on the canonical-sorted L-tuple of
-      endpoint chunks.  This attribute family mirrors that layout:
-      per-cell byte blobs with one row per record, in the same
-      write order as the matching cell.  ``num_links`` MUST equal
-      the parallel CCL family's ``num_links``.
-    slots: [zv_array, name, dtype, level_delta, num_links]
-    slot_usage:
-      zv_array:
-        equals_string: cross_chunk_link_attribute
         required: true
 
 # ===================================================================
@@ -633,28 +701,72 @@ slots:
     minimum_value: 0
     required: true
   num_links:
-    description: Total cross-chunk link count.
+    description: >
+      Family-wide *logical* link count — one per input record, however
+      many physical copies ``store`` filed.  Absent on a
+      ``links/<delta>/`` group until ``finalize_links`` has run, and on a
+      ``link_attributes/<name>/<delta>/`` group created without data.
     range: integer
     minimum_value: 0
-    required: true
+    required: false
   num_physical_records:
     description: >
-      On-disk record row count across all cells of a
-      ``cross_chunk_links/<delta>/`` family.  Equals ``num_links`` for
+      On-disk record row count across every offsets array and cell of a
+      ``links/<delta>/`` family.  Equals ``num_links`` for
       ``store=canonical``; larger when ``store=duplicate`` replicates a
-      record across its incident-chunk cells.
+      record across its incident-chunk cells.  Stamped by
+      ``finalize_links``.
     range: integer
     minimum_value: 0
+    required: false
+  offsets:
+    description: >
+      The ``link_width - 1`` relative offsets naming this array, each of
+      ``sid_ndim`` signed components, as a list of integer lists.
+      Offsets are relative to the record's SOURCE chunk: ``vi_k`` is
+      local to ``src + o_k``.  The implicit ``o_0 = 0`` (the source
+      itself) is never encoded, so ``link_width == 1`` carries an empty
+      list.  Redundant with the path segment that encodes the same
+      offsets, but stamping it lets readers decode without knowing
+      ``sid_ndim``.
+    range: integer
+    array:
+      dimensions:
+        - alias: offset
+        - alias: component
+    required: true
+  has_perm:
+    description: >
+      Whether each row of this links array carries a leading ``perm_idx``
+      column — i.e. whether rows are ``1 + link_width`` ints rather than
+      ``link_width``.  True exactly when a non-identity endpoint
+      placement is possible: non-intra ``offsets`` AND ``level_delta ==
+      0`` AND (``store="duplicate"`` OR not ``directed``).  Readers must
+      take the record width from this stamp rather than inferring it:
+      decoding physical bytes at the logical width does not reliably
+      raise, it silently fabricates rows.
+    range: boolean
+    required: true
+  row_shape:
+    description: >
+      Tail dimensions of one attribute row (``[]`` for a 1-D
+      per-link attribute), letting a reader reconstruct shape from a bare
+      byte blob.  Stamped by the writers that lay down attribute bytes;
+      absent on an array created empty.
+    range: integer
+    multivalued: true
     required: false
   directed:
     description: >
       When true, endpoint order is meaningful and preserved (no canonical
       sort): ``A→B`` and ``B→A`` occupy distinct cells and every stored
-      ``perm_idx`` is 0.  Defaults to false (undirected).
+      ``perm_idx`` is 0.  Family-wide; defaults to false (undirected).
     range: boolean
     required: false
   store:
-    description: Cell-duplication policy; see CrossChunkStore.
+    description: >
+      Cell-duplication policy for a links family; see CrossChunkStore.
+      Family-wide; defaults to ``canonical``.
     range: CrossChunkStore
     required: false
   sid_ndim:

@@ -109,3 +109,9 @@ warn_unused_configs = true
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+# pytest resets warning filters per test, so the import-time filter in
+# zarr_vectors/__init__.py does not reach it — silence the vlen-bytes /
+# unstable-dtype warning here too so the summary is not flooded.
+filterwarnings = [
+    "ignore::zarr.errors.UnstableSpecificationWarning",
+]

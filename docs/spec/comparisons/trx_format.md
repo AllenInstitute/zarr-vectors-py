@@ -79,8 +79,10 @@ array in `streamlines/data.float32.npy`. Streamline boundaries are given
 by `streamlines/offsets.int64.npy` (cumulative sum of streamline lengths).
 
 ZVF stores vertices chunked spatially. The equivalent of the TRX offset
-table is the combination of `object_index/` (primary fragment per streamline)
-and `cross_chunk_links/` (inter-chunk continuations).
+table is `object_index/`, whose per-streamline manifest enumerates every
+`(chunk, fragment)` the streamline touches, in traversal order. (Before
+ZVF 0.6.0 this took a primary fragment plus a cross-chunk-link walk;
+the manifest now enumerates the chunks directly.)
 
 #### `dpp` → `attributes/`
 

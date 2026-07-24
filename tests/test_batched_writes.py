@@ -5,6 +5,11 @@ Covers:
 * Empty context (no-op flush).
 * Single-flush round-trip — write a handful of bytes blobs in batched
   mode and confirm they read back via the normal ``read_bytes`` path.
+
+Cell writes go through an explicitly allocated chunk array with
+coord-tuple keys.  ``write_bytes`` no longer conjures a per-cell group
+for an unallocated name — every per-chunk array is a single grid-shaped
+vlen array, and the grid has to come from somewhere.
 * ``write_points`` end-to-end against a ``MemoryStore`` while batching
   is active.
 * Nesting is rejected with ``StoreError``.
@@ -32,22 +37,48 @@ def test_batched_writes_empty_block_is_noop(tmp_store_path):
     assert "zarr_vectors" in re.attrs.to_dict()
 
 
+def _cell_array(root, name="batch_test", grid_shape=(3, 4, 5)):
+    """Allocate a per-chunk vlen array to write cells into.
+
+    ``write_bytes`` no longer conjures a per-cell group for an
+    unallocated name — every per-chunk array is one grid-shaped vlen
+    array, and the grid has to come from somewhere.  Keys are therefore
+    coord tuples within ``grid_shape``.
+    """
+    root.create_sharded_chunk_array(name, grid_shape)
+    return name
+
+
 def test_batched_writes_round_trip(tmp_store_path):
     """Bytes written inside a batched_writes block read back identically."""
     root = create_store(str(tmp_store_path))
+    name = _cell_array(root)
     payloads = {
         "0.0.0": b"first chunk bytes",
         "1.0.0": b"\x00" * 32,
         "2.3.4": np.arange(100, dtype=np.uint8).tobytes(),
-        "empty": b"",
     }
     with root.batched_writes():
         for k, v in payloads.items():
-            root.write_bytes("batch_test", k, v)
+            root.write_bytes(name, k, v)
 
     # Read back through the normal sync path.
     for k, v in payloads.items():
-        assert root.read_bytes("batch_test", k) == v
+        assert root.read_bytes(name, k) == v
+
+
+def test_batched_writes_empty_payload_round_trips(tmp_store_path):
+    """An explicitly-written empty cell reads back as empty bytes.
+
+    b"" is also the vlen fill value, so an empty write and an absent cell
+    are byte-identical — presence is what ``nonempty_chunks`` tracks, not
+    the payload.
+    """
+    root = create_store(str(tmp_store_path))
+    name = _cell_array(root)
+    with root.batched_writes():
+        root.write_bytes(name, "0.0.1", b"")
+    assert root.read_bytes(name, "0.0.1") == b""
 
 
 def test_batched_writes_nesting_rejected(tmp_store_path):
@@ -128,10 +159,10 @@ def test_batched_writes_falls_back_to_sync_for_icechunk_like_store(
     monkeypatch.setattr(_batch_writer, "_is_icechunk_store", lambda _store: True)
 
     root = create_store(str(tmp_store_path))
+    root.create_sharded_chunk_array("fallback_arr", (3, 4, 5))
     payloads = {
         "0.0.0": b"chunk-bytes-via-fallback",
         "1.0.0": np.arange(64, dtype=np.uint8).tobytes(),
-        "empty": b"",
     }
     with root.batched_writes():
         root.write_array_meta("fallback_arr", {"zv_array": "vertices", "dtype": "float32"})
@@ -148,12 +179,13 @@ def test_batched_writes_handles_exception_cleanly(tmp_store_path):
     """If the batch block raises, the queue is cleared and the Group
     stays usable for subsequent writes."""
     root = create_store(str(tmp_store_path))
+    name = _cell_array(root)
     with pytest.raises(RuntimeError):
         with root.batched_writes():
-            root.write_bytes("batch_test", "k1", b"queued")
+            root.write_bytes(name, "0.0.0", b"queued")
             raise RuntimeError("simulated mid-batch failure")
     # Queue must be cleared so the next batched block works.
     assert root._pending_writes is None
     with root.batched_writes():
-        root.write_bytes("batch_test", "k2", b"after-recovery")
-    assert root.read_bytes("batch_test", "k2") == b"after-recovery"
+        root.write_bytes(name, "1.0.0", b"after-recovery")
+    assert root.read_bytes(name, "1.0.0") == b"after-recovery"

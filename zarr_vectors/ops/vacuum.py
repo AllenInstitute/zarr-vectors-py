@@ -127,8 +127,8 @@ def vacuum(
         )
 
         # Compact every per-object attribute array.  Use ``children()``
-        # to cover both layouts: legacy Option-G arrays appear under
-        # ``group_keys()``, 0.8.1 standalone arrays under ``array_keys()``.
+        # to cover both layouts: legacy per-chunk-array groups appear under
+        # ``group_keys()``, standalone arrays under ``array_keys()``.
         if OBJECT_ATTRIBUTES in level_group:
             for name in level_group[OBJECT_ATTRIBUTES].children():
                 try:

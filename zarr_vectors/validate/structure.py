@@ -108,16 +108,15 @@ def validate_structure(store_path: str | Path) -> ValidationResult:
                      "object_index", "object_attributes", "groups"]:
             if (level_dir / opt).exists():
                 result.add_pass(f"{ln}/{opt}/ exists")
-        # Multiscale link layout (0.4+): list every <delta> segment.
-        for prefix in ["links", "cross_chunk_links"]:
-            pdir = level_dir / prefix
-            if not pdir.exists():
-                continue
-            deltas = sorted(d.name for d in pdir.iterdir() if d.is_dir())
+        # Multiscale link layout (0.4+): list every <delta> segment.  All
+        # connectivity lives under the single ``links/`` family since 0.9.0.
+        links_dir = level_dir / "links"
+        if links_dir.exists():
+            deltas = sorted(d.name for d in links_dir.iterdir() if d.is_dir())
             if deltas:
-                result.add_pass(f"{ln}/{prefix}/ exists (deltas: {','.join(deltas)})")
+                result.add_pass(f"{ln}/links/ exists (deltas: {','.join(deltas)})")
             else:
-                result.add_warning(f"{ln}/{prefix}/ exists but has no <delta> subdirs")
+                result.add_warning(f"{ln}/links/ exists but has no <delta> subdirs")
 
     if (root / "parametric").exists():
         result.add_pass("parametric/ group exists")

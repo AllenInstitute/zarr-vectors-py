@@ -24,7 +24,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import numpy as np
 import numpy.typing as npt
@@ -59,6 +59,9 @@ from zarr_vectors.core.store import (
 )
 from zarr_vectors.spatial.chunking import assign_chunks, compute_bounds
 from zarr_vectors.typing import ChunkCoords, ObjectManifest
+
+if TYPE_CHECKING:
+    from zarr_vectors.core.store import ReadSource
 
 
 # ===================================================================
@@ -298,7 +301,7 @@ def add_geometry(
 # ===================================================================
 
 def read_composite(
-    store_path: str | Path,
+    store_path: ReadSource,
     level: int = 0,
 ) -> dict[str, dict[str, Any]]:
     """Read all geometry types from a composite store.
@@ -307,8 +310,7 @@ def read_composite(
         ``{geometry_type: {"positions": ..., "vertex_count": ..., ...}}``
         for each geometry type present in the store.
     """
-    store_path = Path(store_path)
-    root = open_store(str(store_path))
+    root = open_store(store_path)
     meta = read_root_metadata(root)
     ndim = meta.sid_ndim
 

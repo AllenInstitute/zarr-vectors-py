@@ -162,15 +162,15 @@ def test_read_array_missing_raises(tmp_store_path: Path):
 
 
 def test_read_array_on_group_raises(tmp_store_path: Path):
-    """An Option-G logical array (a group of chunk arrays) is not a
-    standard array — ``read_array`` should reject it.
+    """A Zarr *group* is not a standard array — ``read_array`` should
+    reject it.  ``links/<delta>`` is exactly such a family group: it
+    holds one chunk array per ``<offsets>`` segment, never cells of its
+    own.
     """
     root = create_store(str(tmp_store_path))
-    # Create the legacy Option-G layout: a group with a single-chunk
-    # uint8 array inside.
-    root.write_bytes("legacy/attr", "data", b"hello")
+    root.require_group("links/0")
     with pytest.raises(StoreError, match="not an Array"):
-        root.read_array("legacy/attr")
+        root.read_array("links/0")
 
 
 # ---------------------------------------------------------------------------
@@ -241,19 +241,21 @@ def test_standalone_array_exists_true_for_standard_array(
     assert root.standalone_array_exists("p/q")
 
 
-def test_standalone_array_exists_false_for_legacy_group(
+def test_standalone_array_exists_false_for_group(
     tmp_store_path: Path,
 ):
-    """A legacy Option-G logical array is a group, not an array —
-    ``standalone_array_exists`` must say False so migration code can
-    distinguish layouts.
+    """A ``links/<delta>`` family group is a group, not an array —
+    ``standalone_array_exists`` must say False so callers that have to
+    allocate a chunk array can tell it apart from one already there.
     """
     root = create_store(str(tmp_store_path))
-    root.write_bytes("legacy/attr", "data", b"hello")
-    assert not root.standalone_array_exists("legacy/attr")
-    # But the legacy ``array_exists`` (which checks for a group) does
-    # report True — the two methods are complementary.
-    assert root.array_exists("legacy/attr")
+    root.require_group("links/0")
+    assert not root.standalone_array_exists("links/0")
+    # But ``array_exists`` (True for either node type) does report True
+    # — the two methods are complementary.  Code that guards an
+    # allocation on ``array_exists`` will therefore skip it when a group
+    # sits at the path and never create the array it needed.
+    assert root.array_exists("links/0")
 
 
 def test_standalone_array_exists_false_for_missing_path(
