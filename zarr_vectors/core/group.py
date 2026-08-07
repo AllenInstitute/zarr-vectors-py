@@ -399,6 +399,10 @@ class Group:
         from zarr_vectors.core._batch_reader import flush_prefetch
 
         self._prefetch_cache = flush_prefetch(self._zarr, plan)
+        # No node cache here, deliberately: :meth:`read_bytes` answers from
+        # ``_prefetch_cache`` before it resolves a node, so inside this block
+        # there is nothing left for one to cache.  (Measured: adding one
+        # changes the store round-trip count not at all.)
         try:
             yield
         finally:
@@ -1074,9 +1078,13 @@ class Group:
 
         The coordinator half of ``write_bytes(..., record_presence=False)``:
         workers write cell payloads without touching the shared manifest
-        attribute, then one caller runs this once to restore it.  Chunk
-        objects are listed by prefix rather than read, so the cost is one
-        listing per array, not one GET per cell.
+        attribute, then one caller runs this once to restore it.  The
+        listing bounds *which* cells to consider; the cells themselves
+        still have to be read, because a cell written with an empty
+        payload is an object on disk that must not be recorded as
+        present.  Those reads go out as one :func:`asyncio.gather` — the
+        same prefetch :meth:`batched_reads` uses — so the cost is one
+        listing plus one round-trip per array rather than a GET per cell.
 
         Only meaningful for an **unsharded** array, where each cell is its
         own object at ``<array>/c/i/j/k`` and therefore visible in the
@@ -1095,7 +1103,7 @@ class Group:
         base = self._zarr.path.strip("/")
         prefix = f"{base}/{array_name}/c/" if base else f"{array_name}/c/"
         origin = _grid_origin(arr)
-        keys: set[str] = set()
+        candidates: list[str] = []
         for stored in _list_store_prefix(self._zarr.store, prefix):
             # ``c/i/j/k`` → cell index (i, j, k) → absolute coord.
             parts = stored[len(prefix):].split("/")
@@ -1109,8 +1117,20 @@ class Group:
                 index if origin is None
                 else tuple(i + o for i, o in zip(index, origin))
             )
-            if _vlen_get_cell(arr, index):
-                keys.add(_format_chunk_key(coords))
+            candidates.append(_format_chunk_key(coords))
+
+        keys: set[str] = set()
+        if candidates:
+            from zarr_vectors.core._batch_reader import flush_prefetch
+
+            # flush_prefetch applies the grid origin itself and omits any
+            # cell that reads back empty or missing, so a key surviving in
+            # the cache is exactly the ``if _vlen_get_cell(...)`` this
+            # replaced.  It also carries the icechunk serial fallback.
+            cells = flush_prefetch(self._zarr, [(array_name, candidates)])
+            keys = {
+                chunk_key for (_name, chunk_key), data in cells.items() if data
+            }
         arr.attrs[_NONEMPTY_CHUNKS_ATTR] = sorted(keys)
         return sorted(keys)
 
