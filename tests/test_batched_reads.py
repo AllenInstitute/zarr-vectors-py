@@ -105,7 +105,7 @@ def test_batched_reads_via_read_points_memory_store():
 
 def test_batched_reads_via_read_points_localstore(tmp_path):
     """Same end-to-end against a LocalStore — covers the path that the
-    benchmark notebook exercises."""
+    benchmark notebooks (zarr-vectors-tools) exercise."""
     url = str(tmp_path / "batch_read_points.zarr")
     rng = np.random.default_rng(7)
     positions = rng.uniform(0, 1000, (1000, 3)).astype(np.float32)

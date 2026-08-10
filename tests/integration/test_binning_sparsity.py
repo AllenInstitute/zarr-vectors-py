@@ -224,7 +224,10 @@ class TestOMEZarrMetadata:
             chunk_shape=(200., 200., 200.),
             bin_shape=(50., 50., 50.),
         )
-        build_pyramid(store, factors=[(2.0, 1.0), (4.0, 1.0)])
+        # Coarsen factors are per-level ratios against the level below, so
+        # these compound to bins of 100 then 200 (scales 2x and 4x) from the
+        # 50-unit root bin. Spelled [2, 4] they would now give 100 then 400.
+        build_pyramid(store, factors=[(2.0, 1.0), (2.0, 1.0)])
 
         root = open_store(store, mode="r+")
         ms = write_multiscale_metadata(root)

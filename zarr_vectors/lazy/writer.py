@@ -70,6 +70,15 @@ class ZVWriter:
     """
 
     def __init__(self, level: ZVLevel) -> None:
+        import warnings
+
+        warnings.warn(
+            "ZVWriter is superseded by Dataset.add_* and Dataset.writing(). "
+            "It has no downstream users, so this deprecation costs nothing to "
+            "act on.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
         self._level = level
         self._group = level._group
         self._committed = False

@@ -26,6 +26,43 @@ try:
 except Exception:  # pragma: no cover - older/newer zarr without the class
     pass
 
+# The data-oriented API.  Prefer these: they describe the data, and they
+# are the surface that stays stable when the storage layer changes.
+from zarr_vectors.api import (
+    Attributes,
+    AttributeSpec,
+    Axis,
+    CellRef,
+    CellSet,
+    Dataset,
+    EditPlan,
+    FormatError,
+    Grid,
+    GridCapacity,
+    Layout,
+    Level,
+    ObjectCatalog,
+    Query,
+    ReadError,
+    ReadResult,
+    Schema,
+    SchemaConflict,
+    Selection,
+    SizeHints,
+    StorageOptions,
+    aopen,
+    create,
+    create_dataset,
+    open,
+    open_dataset,
+    open_or_create,
+    require_format,
+)
+
+# The storage layer.  Still supported, still exported, but a caller who
+# reaches for these is describing where bytes live rather than what the
+# data is -- which is precisely the coupling that makes every internal
+# change a downstream break.
 from zarr_vectors.core.backends import detect_scheme
 from zarr_vectors.core.group import Group
 from zarr_vectors.core.store import (
@@ -58,6 +95,36 @@ except ImportError:
         __version__ = "0.0.0+unknown"
 
 __all__ = [
+    # --- data-oriented API ---
+    "open",
+    "open_dataset",
+    "create",
+    "create_dataset",
+    "open_or_create",
+    "aopen",
+    "require_format",
+    "Dataset",
+    "EditPlan",
+    "Level",
+    "Grid",
+    "GridCapacity",
+    "CellRef",
+    "CellSet",
+    "ObjectCatalog",
+    "Query",
+    "Selection",
+    "ReadResult",
+    "ReadError",
+    "Attributes",
+    "Schema",
+    "Layout",
+    "StorageOptions",
+    "AttributeSpec",
+    "SizeHints",
+    "Axis",
+    "SchemaConflict",
+    "FormatError",
+    # --- storage layer ---
     "Group",
     "FsGroup",
     "create_store",

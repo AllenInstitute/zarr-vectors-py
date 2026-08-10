@@ -33,9 +33,10 @@ Public surface mirrors the legacy :class:`FsGroup` for back-compat:
 from __future__ import annotations
 
 import warnings
+from collections.abc import Iterator, Sequence
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Any, Iterator, Sequence
+from typing import Any
 
 import numpy as np
 import zarr
@@ -45,6 +46,8 @@ from zarr.storage import LocalStore
 
 from zarr_vectors.core._vlen import (
     cell_region as _vlen_cell_region,
+)
+from zarr_vectors.core._vlen import (
     region_to_bytes as _vlen_region_to_bytes,
 )
 from zarr_vectors.exceptions import StoreError
@@ -878,6 +881,36 @@ class Group:
         node = self._require_array_node(path)
         # Slice-then-extract, never scalar-index: see core._vlen.
         return _vlen_region_to_bytes(node[index:index + 1])
+
+    def read_vlen_elements(self, path: str, indices: Sequence[int]) -> list[bytes]:
+        """Read MANY elements of the vlen-bytes array at ``path``, at once.
+
+        The plural form exists because the singular one, called in a
+        loop, is one request per element — which is exactly the shape a
+        selective read is trying to avoid.  One coordinate selection
+        fetches only the zarr chunks the wanted rows actually fall in,
+        so reading a hundred of twenty-one million object manifests costs
+        a handful of reads rather than a hundred, or than all of them.
+
+        Results are returned in the order of ``indices``, so a caller can
+        zip them against the ids that produced them without re-sorting.
+        """
+        if not len(indices):
+            return []
+        cached = self._offline_array(path)
+        if cached is not None:
+            return [_vlen_region_to_bytes(cached[i:i + 1]) for i in indices]
+        node = self._require_array_node(path)
+        idx = np.asarray(indices, dtype=np.int64)
+        try:
+            selected = node.get_coordinate_selection((idx,))
+        except Exception:
+            # Not every store supports coordinate selection; one read per
+            # element is slower but identical in result.
+            return [
+                _vlen_region_to_bytes(node[int(i):int(i) + 1]) for i in indices
+            ]
+        return [bytes(b) for b in np.asarray(selected).ravel()]
 
     # ---------------- native-sharded chunk array (sharding_indexed) -------
 

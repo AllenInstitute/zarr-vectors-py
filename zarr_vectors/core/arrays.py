@@ -13,13 +13,13 @@ the store or encoding modules directly.
 from __future__ import annotations
 
 import warnings
+from collections.abc import Iterator, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass
-from typing import Any, Iterator, Literal, Sequence
+from typing import Any, Literal
 
 import numpy as np
 import numpy.typing as npt
-import zarr
 from zarr.codecs import VLenBytesCodec
 from zarr.errors import UnstableSpecificationWarning
 
@@ -48,8 +48,12 @@ from zarr_vectors.core.paths import (
     parse_delta,
     parse_offsets,
 )
-from zarr_vectors.core._vlen import region_to_bytes as _vlen_region_to_bytes
-from zarr_vectors.core.store import FsGroup
+# Group, not FsGroup: FsGroup is a no-op subclass that create_store and
+# open_store return only when the backing store happens to be a
+# LocalStore, so annotating these functions with it was already wrong for
+# every cloud-backed store. Annotation-only change; nothing moves.
+from zarr_vectors.core.group import Group
+from zarr_vectors.core.store import FsGroup  # noqa: F401  (re-exported for callers)
 from zarr_vectors.encoding.fragments import (
     ChunkFragmentIndex,
     decode_fragments,
@@ -69,7 +73,6 @@ from zarr_vectors.typing import (
     CrossChunkLink,
     ObjectManifest,
 )
-
 
 # Sentinel for read-side ``default=...`` soft-fail kwargs.  Lets callers
 # distinguish "did not pass default" (caller wants the raise) from
@@ -111,7 +114,7 @@ def _parse_chunk_key(key: str) -> ChunkCoords:
 
 @contextmanager
 def _maybe_batched_reads(
-    level_group: FsGroup,
+    level_group: Group,
     plan: list[tuple[str, list[str]]],
 ):
     """Open a single-chunk prefetch unless one is already active.
@@ -131,7 +134,7 @@ def _maybe_batched_reads(
 
 
 def _short_circuit_existing(
-    level_group: FsGroup,
+    level_group: Group,
     full_name: str,
     exist_ok: bool,
 ) -> bool:
@@ -226,7 +229,7 @@ def _default_fill_value_for_dtype(dtype: np.dtype) -> Any:
 _UNSET = object()
 
 
-def _derive_native_config(level_group: FsGroup) -> dict[str, Any] | None:
+def _derive_native_config(level_group: Group) -> dict[str, Any] | None:
     """Best-effort single-array grid config from the store's metadata.
 
     Lets writers that don't open an explicit
@@ -282,7 +285,7 @@ def _derive_native_config(level_group: FsGroup) -> dict[str, Any] | None:
 
 
 def _derive_level_scales(
-    level_group: FsGroup, delta: int,
+    level_group: Group, delta: int,
 ) -> tuple[tuple[int, ...], tuple[int, ...]]:
     """Return ``(scale_src, scale_trg)`` for records spanning ``delta`` levels.
 
@@ -348,7 +351,7 @@ def _derive_level_scales(
 
 
 def _ensure_array_dir(
-    level_group: FsGroup,
+    level_group: Group,
     array_name: str,
     *,
     attributes: dict[str, Any] | None = None,
@@ -436,7 +439,7 @@ def _ensure_array_dir(
 
 
 def _array_matches_layout(
-    level_group: FsGroup, array_name: str, cfg: dict[str, Any],
+    level_group: Group, array_name: str, cfg: dict[str, Any],
 ) -> bool:
     """Whether an existing single vlen array can be reused as-is under an
     explicit session, rather than recreated to match ``cfg``.
@@ -493,7 +496,7 @@ def level_grid_layout(
 
 @contextmanager
 def open_write_session(
-    level_group: FsGroup,
+    level_group: Group,
     *,
     compressor: Any = None,
     shard_shape: int | tuple[int, ...] | None = None,
@@ -618,7 +621,7 @@ def read_zv_array_tag(meta: dict) -> str | None:
 # ===================================================================
 
 def create_vertices_array(
-    level_group: FsGroup,
+    level_group: Group,
     dtype: str = "float32",
     encoding: str = "raw",
     *,
@@ -683,7 +686,7 @@ def links_has_perm(
 
 
 def create_links_family(
-    level_group: FsGroup,
+    level_group: Group,
     *,
     delta: int = 0,
     link_width: int = 2,
@@ -743,7 +746,7 @@ def create_links_family(
 
 
 def create_links_array(
-    level_group: FsGroup,
+    level_group: Group,
     link_width: int,
     dtype: str = "int64",
     *,
@@ -867,7 +870,7 @@ def create_links_array(
 
 
 def create_attribute_array(
-    level_group: FsGroup,
+    level_group: Group,
     name: str,
     dtype: str = "float32",
     channel_names: list[str] | None = None,
@@ -912,7 +915,7 @@ def create_attribute_array(
 
 
 def create_fragment_attribute_array(
-    level_group: FsGroup,
+    level_group: Group,
     name: str,
     dtype: str = "float32",
     channel_names: list[str] | None = None,
@@ -965,7 +968,7 @@ def create_fragment_attribute_array(
 
 
 def create_object_index_array(
-    level_group: FsGroup,
+    level_group: Group,
     *,
     exist_ok: bool = True,
 ) -> None:
@@ -985,7 +988,7 @@ def create_object_index_array(
 
 
 def create_object_attributes_array(
-    level_group: FsGroup,
+    level_group: Group,
     name: str,
     dtype: str = "float32",
     num_channels: int = 1,
@@ -1020,7 +1023,7 @@ def create_object_attributes_array(
 
 
 def create_groupings_array(
-    level_group: FsGroup,
+    level_group: Group,
     *,
     exist_ok: bool = True,
 ) -> None:
@@ -1041,7 +1044,7 @@ def create_groupings_array(
 
 
 def create_groupings_attributes_array(
-    level_group: FsGroup,
+    level_group: Group,
     name: str,
     dtype: str = "float32",
     num_channels: int = 1,
@@ -1070,7 +1073,7 @@ def create_groupings_attributes_array(
 
 
 def create_link_attributes_array(
-    level_group: FsGroup,
+    level_group: Group,
     name: str,
     dtype: str = "float32",
     *,
@@ -1122,7 +1125,7 @@ def create_link_attributes_array(
 # ===================================================================
 
 def write_chunk_vertices(
-    level_group: FsGroup,
+    level_group: Group,
     chunk_coords: ChunkCoords,
     groups: list[npt.NDArray[np.floating]],
     dtype: np.dtype | str = np.float32,
@@ -1184,7 +1187,7 @@ def _infer_link_width(link_groups: Sequence[npt.NDArray[np.integer]]) -> int:
 
 
 def write_chunk_links(
-    level_group: FsGroup,
+    level_group: Group,
     chunk_coords: ChunkCoords,
     link_groups: list[npt.NDArray[np.integer]],
     dtype: np.dtype | str = np.int64,
@@ -1319,7 +1322,7 @@ def write_chunk_links(
 
 
 def write_chunk_fragments(
-    level_group: FsGroup,
+    level_group: Group,
     chunk_coords: ChunkCoords,
     new_fragments: list,
     *,
@@ -1404,7 +1407,7 @@ def write_chunk_fragments(
 
 
 def write_chunk_attributes(
-    level_group: FsGroup,
+    level_group: Group,
     attr_name: str,
     chunk_coords: ChunkCoords,
     attr_groups: list[npt.NDArray],
@@ -1454,7 +1457,7 @@ def write_chunk_attributes(
 
 
 def write_chunk_fragment_attributes(
-    level_group: FsGroup,
+    level_group: Group,
     attr_name: str,
     chunk_coords: ChunkCoords,
     data: npt.NDArray,
@@ -1495,7 +1498,7 @@ def write_chunk_fragment_attributes(
 
 
 def write_chunk_link_attributes(
-    level_group: FsGroup,
+    level_group: Group,
     attr_name: str,
     chunk_coords: ChunkCoords,
     attr_groups: list[npt.NDArray],
@@ -1544,7 +1547,7 @@ def write_chunk_link_attributes(
 
 
 def write_object_index(
-    level_group: FsGroup,
+    level_group: Group,
     manifests: dict[int, ObjectManifest],
     sid_ndim: int,
     *,
@@ -1602,7 +1605,7 @@ def write_object_index(
 
 
 def _write_object_index_manifests(
-    level_group: FsGroup,
+    level_group: Group,
     manifest_blobs: list[bytes],
 ) -> None:
     """Write ``object_index/manifests`` as a single ragged vlen-bytes array.
@@ -1643,7 +1646,7 @@ def _write_object_index_manifests(
 
 
 def write_object_attributes(
-    level_group: FsGroup,
+    level_group: Group,
     attr_name: str,
     data: npt.NDArray,
     *,
@@ -1751,7 +1754,7 @@ def write_object_attributes(
 
 
 def read_object_attribute_present_mask(
-    level_group: FsGroup,
+    level_group: Group,
     attr_name: str,
 ) -> npt.NDArray[np.uint8] | None:
     """Reconstruct the ``(O,)`` byte present-mask for an object attribute.
@@ -1799,7 +1802,7 @@ def read_object_attribute_present_mask(
 
 
 def write_groupings(
-    level_group: FsGroup,
+    level_group: Group,
     groups: dict[int, list[int] | range],
 ) -> None:
     """Write group memberships as a single vlen-bytes Zarr v3 array.
@@ -1853,7 +1856,7 @@ def write_groupings(
 
 
 def write_groupings_attributes(
-    level_group: FsGroup,
+    level_group: Group,
     attr_name: str,
     data: npt.NDArray,
 ) -> None:
@@ -1988,7 +1991,7 @@ def _pad_scale(scale: Sequence[int], sid_ndim: int) -> tuple[int, ...]:
 
 
 def _link_scales(
-    level_group: FsGroup, delta: int, sid_ndim: int,
+    level_group: Group, delta: int, sid_ndim: int,
 ) -> tuple[tuple[int, ...], tuple[int, ...]]:
     """``(scale_src, scale_trg)`` fitted to ``sid_ndim`` — see
     :func:`_derive_level_scales` and :func:`_pad_scale`."""
@@ -1997,7 +2000,7 @@ def _link_scales(
 
 
 def _partition_links(
-    level_group: FsGroup,
+    level_group: Group,
     records: Sequence[Sequence[tuple[ChunkCoords, int]]],
     link_width: int,
     sid_ndim: int,
@@ -2083,7 +2086,7 @@ def _pack_link_rows(
 
 
 def write_links(
-    level_group: FsGroup,
+    level_group: Group,
     links: list[list[tuple[ChunkCoords, int]]] | list[CrossChunkLink],
     sid_ndim: int,
     *,
@@ -2296,7 +2299,7 @@ def write_links(
 
 
 def _stamp_link_family_meta(
-    level_group: FsGroup,
+    level_group: Group,
     *,
     delta: int,
     link_width: int,
@@ -2331,7 +2334,7 @@ def _stamp_link_family_meta(
 
 
 def write_link_attributes(
-    level_group: FsGroup,
+    level_group: Group,
     attr_name: str,
     attr_data: npt.NDArray,
     *,
@@ -2497,7 +2500,7 @@ def write_link_attributes(
 
 
 def _read_attr_cell(
-    level_group: FsGroup, full_name: str, key: str, like: npt.NDArray,
+    level_group: Group, full_name: str, key: str, like: npt.NDArray,
 ) -> npt.NDArray:
     """Decode one attribute cell as ``(M, *row_shape)``, matching ``like``.
 
@@ -2545,7 +2548,7 @@ def _parse_offsets_for_family(
     return parse_offsets(seg, sid_ndim=sid_ndim, link_width=link_width)
 
 
-def list_link_offsets(level_group: FsGroup, delta: int = 0) -> list[str]:
+def list_link_offsets(level_group: Group, delta: int = 0) -> list[str]:
     """Sorted offsets segments present under ``links/<delta>/``.
 
     ``links/<delta>`` is a group whose children are one array per
@@ -2566,7 +2569,7 @@ def list_link_offsets(level_group: FsGroup, delta: int = 0) -> list[str]:
 
 
 def list_link_attribute_offsets(
-    level_group: FsGroup, name: str, delta: int = 0,
+    level_group: Group, name: str, delta: int = 0,
 ) -> list[str]:
     """Sorted offsets segments under ``link_attributes/<name>/<delta>/``.
 
@@ -2583,7 +2586,7 @@ def list_link_attribute_offsets(
 
 
 def _decode_link_cell(
-    level_group: FsGroup,
+    level_group: Group,
     chunk_coords: ChunkCoords,
     *,
     delta: int,
@@ -2639,7 +2642,7 @@ def _decode_link_cell(
 
 
 def link_family_policy(
-    level_group: FsGroup, delta: int,
+    level_group: Group, delta: int,
 ) -> tuple[int, int | None, bool, str] | None:
     """``(link_width, sid_ndim, directed, store)`` from the family group.
 
@@ -2662,8 +2665,8 @@ def link_family_policy(
 
 
 def iter_link_cells(
-    level_group: FsGroup, delta: int,
-) -> "Iterator[tuple[str, tuple[ChunkCoords, ...], ChunkCoords, list[npt.NDArray[np.integer]]]]":
+    level_group: Group, delta: int,
+) -> Iterator[tuple[str, tuple[ChunkCoords, ...], ChunkCoords, list[npt.NDArray[np.integer]]]]:
     """Yield ``(segment, offsets, source_chunk, groups)`` for every cell.
 
     Enumeration order is the canonical one every reader shares: offsets
@@ -2712,7 +2715,7 @@ def iter_link_cells(
 
 
 def _derive_partition_from_links(
-    level_group: FsGroup,
+    level_group: Group,
     delta: int,
 ) -> LinkPartition:
     """Re-derive a :class:`LinkPartition` from the on-disk link records.
@@ -2761,7 +2764,7 @@ def _derive_partition_from_links(
 
 
 def write_link_cells(
-    level_group: FsGroup,
+    level_group: Group,
     links: list[list[tuple[ChunkCoords, int]]] | list[CrossChunkLink],
     sid_ndim: int,
     *,
@@ -2875,7 +2878,7 @@ def write_link_cells(
 
 
 def write_link_attribute_cells(
-    level_group: FsGroup,
+    level_group: Group,
     attr_name: str,
     attr_data: npt.NDArray,
     *,
@@ -2938,7 +2941,7 @@ def write_link_attribute_cells(
 
 
 def finalize_links(
-    level_group: FsGroup,
+    level_group: Group,
     *,
     delta: int = 0,
 ) -> LinkPartition:
@@ -3035,7 +3038,7 @@ def finalize_links(
 # Reading data
 # ===================================================================
 
-def vertices_dtype(level_group: FsGroup) -> np.dtype:
+def vertices_dtype(level_group: Group) -> np.dtype:
     """The element dtype ``vertices/`` declares.
 
     A cell is a flat buffer with no inline header, so the Zarr
@@ -3055,7 +3058,7 @@ def vertices_dtype(level_group: FsGroup) -> np.dtype:
 
 
 def read_chunk_vertices(
-    level_group: FsGroup,
+    level_group: Group,
     chunk_coords: ChunkCoords,
     dtype: np.dtype | str | None = None,
     ndim: int = 3,
@@ -3114,7 +3117,7 @@ def read_chunk_vertices(
 
 
 def read_fragment(
-    level_group: FsGroup,
+    level_group: Group,
     chunk_coords: ChunkCoords,
     fragment_index: int,
     dtype: np.dtype | str = np.float32,
@@ -3174,7 +3177,7 @@ def read_fragment(
 
 
 def read_chunk_links(
-    level_group: FsGroup,
+    level_group: Group,
     chunk_coords: ChunkCoords,
     dtype: np.dtype | str = np.int64,
     link_width: int | None = None,
@@ -3291,7 +3294,7 @@ def read_chunk_links(
 
 
 def read_chunk_link_fragment(
-    level_group: FsGroup,
+    level_group: Group,
     chunk_coords: ChunkCoords,
     fragment_index: int,
     dtype: np.dtype | str = np.int64,
@@ -3372,7 +3375,7 @@ def read_chunk_link_fragment(
 
 
 def read_chunk_attributes(
-    level_group: FsGroup,
+    level_group: Group,
     attr_name: str,
     chunk_coords: ChunkCoords,
     dtype: np.dtype | str = np.float32,
@@ -3465,7 +3468,7 @@ def read_chunk_attributes(
 
 
 def read_chunk_fragment_attributes(
-    level_group: FsGroup,
+    level_group: Group,
     attr_name: str,
     chunk_coords: ChunkCoords,
     dtype: np.dtype | str = np.float32,
@@ -3537,7 +3540,7 @@ def read_chunk_fragment_attributes(
 
 
 def read_chunk_link_attributes(
-    level_group: FsGroup,
+    level_group: Group,
     attr_name: str,
     chunk_coords: ChunkCoords,
     dtype: np.dtype | str = np.float32,
@@ -3622,7 +3625,7 @@ def read_chunk_link_attributes(
     return out
 
 
-def _infer_vert_ndim(level_group: FsGroup) -> int:
+def _infer_vert_ndim(level_group: Group) -> int:
     """Best-effort lookup of the spatial-index dimensionality.
 
     Reads NGFF ``multiscales[0].axes`` length from root attrs.  Falls
@@ -3645,7 +3648,7 @@ def _infer_vert_ndim(level_group: FsGroup) -> int:
 
 
 def read_object_manifest(
-    level_group: FsGroup,
+    level_group: Group,
     object_id: int,
 ) -> ObjectManifest:
     """Read the ordered fragment reference list for one object.
@@ -3673,11 +3676,11 @@ def read_object_manifest(
     # This 1-D manifests array shares that rule with the N-D cell readers.
     blob = level_group.read_vlen_element(f"{OBJECT_INDEX}/manifests", object_id)
     blocks = decode_object_manifest_blocks(blob, sid_ndim=sid_ndim)
-    return _expand_blocks(blocks)
+    return expand_manifest_blocks(blocks)
 
 
 def read_all_object_manifests(
-    level_group: FsGroup,
+    level_group: Group,
 ) -> list[ObjectManifest]:
     """Read all object manifests at once.
 
@@ -3695,9 +3698,73 @@ def read_all_object_manifests(
     # chokepoint the offline snapshot can serve (see Group.offline_reads).
     blobs = level_group.read_vlen_array(f"{OBJECT_INDEX}/manifests")
     return [
-        _expand_blocks(decode_object_manifest_blocks(b, sid_ndim=sid_ndim))
+        expand_manifest_blocks(decode_object_manifest_blocks(b, sid_ndim=sid_ndim))
         for b in blobs
     ]
+
+
+def read_object_manifests(
+    level_group: Group,
+    *,
+    ids: Sequence[int] | None = None,
+) -> dict[int, ObjectManifest]:
+    """Read the manifests of specific objects.
+
+    ``read_all_object_manifests`` decodes every manifest in the store,
+    which is the step that hangs on a large one: at twenty-one million
+    objects it materialises and decodes twenty-one million Python
+    manifests even when the caller needs a hundred.  Naming the ids turns
+    that into one coordinate selection.
+
+    Downstream had to reach for the private ``_expand_blocks``, the
+    ``OBJECT_INDEX_LAYOUT_V1`` sentinel and a raw
+    ``zarr_group[...].get_coordinate_selection`` to do this, which means
+    a consumer pinned to three internals purely to avoid an O(N) decode.
+
+    Args:
+        level_group: Resolution level group.
+        ids: Object ids to read.  ``None`` reads them all, which is the
+            same work as ``read_all_object_manifests`` and is offered so
+            a caller need not branch.
+
+    Returns:
+        ``{object_id: [(chunk_coords, fragment_index), ...]}``.  Ids that
+        do not exist are simply absent, so a caller can pass a superset
+        without pre-filtering.
+    """
+    meta = level_group.read_array_meta(OBJECT_INDEX)
+    sid_ndim = meta["sid_ndim"]
+    num_objects = int(meta.get("num_objects", 0))
+    _require_object_index_v1(meta)
+    if num_objects == 0:
+        return {}
+
+    path = f"{OBJECT_INDEX}/manifests"
+    if ids is None:
+        blobs = level_group.read_vlen_array(path)
+        wanted = list(range(len(blobs)))
+    else:
+        wanted = sorted({int(i) for i in ids if 0 <= int(i) < num_objects})
+        if not wanted:
+            return {}
+        # One coordinate selection, not one request per id: the plural
+        # read is the whole point, and it goes through the Group so it
+        # stays serveable from an offline snapshot like every other read.
+        blobs = level_group.read_vlen_elements(path, wanted)
+
+    return {
+        oid: expand_manifest_blocks(decode_object_manifest_blocks(blob, sid_ndim=sid_ndim))
+        for oid, blob in zip(wanted, blobs)
+    }
+
+
+def object_count(level_group: Group) -> int:
+    """How many objects this level declares, without decoding any of them."""
+    try:
+        meta = level_group.read_array_meta(OBJECT_INDEX)
+    except Exception:
+        return 0
+    return int(meta.get("num_objects", 0) or 0)
 
 
 def _require_object_index_v1(meta: dict[str, Any]) -> None:
@@ -3719,7 +3786,7 @@ def _require_object_index_v1(meta: dict[str, Any]) -> None:
         )
 
 
-def _expand_blocks(
+def expand_manifest_blocks(
     blocks: list[tuple[ChunkCoords, Any]],
 ) -> ObjectManifest:
     """Expand v0.6 manifest blocks to the legacy
@@ -3748,7 +3815,7 @@ def _expand_blocks(
 
 
 def read_object_vertices(
-    level_group: FsGroup,
+    level_group: Group,
     object_id: int,
     dtype: np.dtype | str = np.float32,
     ndim: int = 3,
@@ -3789,7 +3856,7 @@ def read_object_vertices(
 
 
 def read_object_attributes(
-    level_group: FsGroup,
+    level_group: Group,
     attr_name: str,
     dtype: np.dtype | str | None = None,
 ) -> npt.NDArray:
@@ -3816,7 +3883,7 @@ def read_object_attributes(
 
 
 def read_group_object_ids(
-    level_group: FsGroup,
+    level_group: Group,
     group_id: int,
 ) -> Sequence[int]:
     """Read the object IDs belonging to a group.
@@ -3845,7 +3912,7 @@ def read_group_object_ids(
 
 
 def read_all_groupings(
-    level_group: FsGroup,
+    level_group: Group,
 ) -> list[Sequence[int]]:
     """Read all group memberships.
 
@@ -3869,7 +3936,7 @@ def read_all_groupings(
 
 
 def read_groupings_attributes(
-    level_group: FsGroup,
+    level_group: Group,
     attr_name: str,
     dtype: np.dtype | str | None = None,
 ) -> npt.NDArray:
@@ -3905,7 +3972,7 @@ def cell_endpoint_chunks(
 
 
 def _link_cell_rows(
-    blob: bytes, *, ncols: int, flat: bool,
+    blob: bytes, *, ncols: int, flat: bool, dtype: np.dtype | str = np.int64,
 ) -> npt.NDArray[np.int64]:
     """Decode one link cell's bytes into its ``(M, ncols)`` physical rows.
 
@@ -3915,9 +3982,21 @@ def _link_cell_rows(
     :func:`write_chunk_links` wrote under (``delta == 0 and
     is_intra(offsets)``) — the two encodings are not interchangeable.
 
+    ``dtype`` is the *cell's own* declared element type, which
+    :func:`write_chunk_links` stamped onto the array and which a caller
+    reads back off ``read_array_meta``.  It is not always int64: an
+    int32-declared array (BRIDGE stamps its per-chunk node graph int32 via
+    ``create_node_graph_array``) holds half as many bytes per element, so
+    decoding it at a fixed int64 yields a quarter of the rows on an even
+    element count and raises ``cannot reshape array of size N`` on an odd
+    one.  :func:`iter_link_cells` already honours the stamp; this is the
+    same rule, so the two readers agree on the same bytes.  The fallback
+    stays int64 for arrays written before the dtype was stamped.
+
     Rows come back in write order: groups in append order, rows in order
     within each group.  That matches the enumeration
-    :func:`iter_link_cells` counts against.
+    :func:`iter_link_cells` counts against.  Values are widened to int64 on
+    return regardless of the on-disk width, so callers see one row type.
 
     NOTE :func:`~zarr_vectors.encoding.ragged.decode_ragged_blob` yields
     one entry per *group* — an ``(M_k, ncols)`` block — not one per row.
@@ -3925,12 +4004,17 @@ def _link_cell_rows(
     append adds another, so the groups must be concatenated; treating the
     group count as a row count mis-parses every multi-record cell.
     """
+    cell_dtype = np.dtype(dtype)
     if flat:
         # Intra-chunk at delta 0: flat concatenation, group bounds in the
         # link_fragments sidecar.  A cell-wide read wants every row, so
         # the sidecar is not consulted.
-        return np.frombuffer(blob, dtype=np.int64).reshape(-1, ncols)
-    groups = decode_ragged_blob(blob, np.dtype(np.int64), ncols=ncols)
+        return (
+            np.frombuffer(blob, dtype=cell_dtype)
+            .reshape(-1, ncols)
+            .astype(np.int64, copy=False)
+        )
+    groups = decode_ragged_blob(blob, cell_dtype, ncols=ncols)
     if not groups:
         return np.empty((0, ncols), dtype=np.int64)
     return np.concatenate(
@@ -3940,7 +4024,7 @@ def _link_cell_rows(
 
 
 def read_links(
-    level_group: FsGroup,
+    level_group: Group,
     *,
     delta: int = 0,
 ) -> list[tuple[tuple[ChunkCoords, int], ...]]:
@@ -3975,7 +4059,6 @@ def read_links(
     directed = bool(fam_meta.get("directed", False))
     store = str(fam_meta.get("store", "canonical"))
 
-    from zarr_vectors.encoding.ragged import decode_ragged_blob
     from zarr_vectors.spatial.boundary import apply_perm_inverse
 
     # Must be _link_scales, not _derive_level_scales: the latter derives
@@ -4009,6 +4092,10 @@ def read_links(
         ))
         ncols = (1 + link_width) if has_perm else link_width
         flat = delta == 0 and is_intra(offsets)
+        # Per-ARRAY, not per-family: each offsets segment carries its own
+        # element width (BRIDGE's intra node graph is int32 while its seam
+        # segments are int64), so this must be read inside the segment loop.
+        cell_dtype = np.dtype(arr_meta.get("dtype", "int64"))
         chunks_cache: dict[ChunkCoords, tuple[ChunkCoords, ...]] = {}
 
         for cell_key in sorted(level_group.list_chunks(arr_name)):
@@ -4016,7 +4103,9 @@ def read_links(
             if not blob:
                 continue
             src = _parse_chunk_key(cell_key)
-            rows_arr = _link_cell_rows(blob, ncols=ncols, flat=flat)
+            rows_arr = _link_cell_rows(
+                blob, ncols=ncols, flat=flat, dtype=cell_dtype,
+            )
             if rows_arr.size == 0:
                 continue
 
@@ -4055,7 +4144,7 @@ def read_links(
 
 
 def _link_tuple_cell(
-    level_group: FsGroup,
+    level_group: Group,
     chunk_tuple: Sequence[ChunkCoords],
     delta: int,
 ) -> tuple[
@@ -4128,7 +4217,7 @@ def _link_tuple_cell(
 
 
 def read_links_for_tuple(
-    level_group: FsGroup,
+    level_group: Group,
     chunk_tuple: Sequence[ChunkCoords],
     *,
     delta: int = 0,
@@ -4173,6 +4262,7 @@ def read_links_for_tuple(
     ncols = (1 + link_width) if has_perm else link_width
     rows_arr = _link_cell_rows(
         blob, ncols=ncols, flat=(delta == 0 and is_intra(offsets)),
+        dtype=np.dtype(arr_meta.get("dtype", "int64")),
     )
     if rows_arr.size == 0:
         return []
@@ -4195,7 +4285,7 @@ def read_links_for_tuple(
 
 
 def read_link_attributes(
-    level_group: FsGroup,
+    level_group: Group,
     attr_name: str,
     dtype: np.dtype | str | None = None,
     *,
@@ -4258,7 +4348,7 @@ def read_link_attributes(
 
 
 def read_link_attributes_for_tuple(
-    level_group: FsGroup,
+    level_group: Group,
     attr_name: str,
     chunk_tuple: Sequence[ChunkCoords],
     dtype: np.dtype | str | None = None,
@@ -4308,7 +4398,7 @@ def read_link_attributes_for_tuple(
 # ===================================================================
 
 def list_chunk_keys(
-    level_group: FsGroup,
+    level_group: Group,
     array_name: str = VERTICES,
 ) -> list[ChunkCoords]:
     """List all chunk coordinates that have data for an array.
@@ -4330,7 +4420,7 @@ def list_chunk_keys(
     return sorted(coords)
 
 
-def _list_deltas_under(level_group: FsGroup, group_path: str) -> list[int]:
+def _list_deltas_under(level_group: Group, group_path: str) -> list[int]:
     """List signed level-delta segments present under a group path.
 
     Returns the sorted list of integers parsed from immediate child
@@ -4355,18 +4445,18 @@ def _list_deltas_under(level_group: FsGroup, group_path: str) -> list[int]:
     return sorted(deltas)
 
 
-def list_link_deltas(level_group: FsGroup) -> list[int]:
+def list_link_deltas(level_group: Group) -> list[int]:
     """Sorted list of ``<delta>`` values present under ``links/`` in a level."""
     return _list_deltas_under(level_group, LINKS)
 
 
-def list_link_attribute_deltas(level_group: FsGroup, name: str) -> list[int]:
+def list_link_attribute_deltas(level_group: Group, name: str) -> list[int]:
     """Sorted list of ``<delta>`` values present under ``link_attributes/<name>/``."""
     return _list_deltas_under(level_group, f"{LINK_ATTRIBUTES}/{name}")
 
 
 def resolve_chunk_keys(
-    level_group: FsGroup,
+    level_group: Group,
     chunk_shape: tuple[float, ...],
     *,
     bbox: tuple[npt.NDArray, npt.NDArray] | None = None,
@@ -4429,7 +4519,7 @@ def resolve_chunk_keys(
 
 
 def count_fragments(
-    level_group: FsGroup,
+    level_group: Group,
     chunk_coords: ChunkCoords,
 ) -> int:
     """Count fragments in a chunk by reading the fragment-index header."""
@@ -4441,7 +4531,7 @@ def count_fragments(
 # ===================================================================
 
 def _read_modify_write_blob(
-    level_group: FsGroup,
+    level_group: Group,
     full_name: str,
     key: str,
     *,
@@ -4475,7 +4565,7 @@ def _read_modify_write_blob(
 
 
 def read_vertex_fragment_index(
-    level_group: FsGroup,
+    level_group: Group,
     chunk_coords: ChunkCoords,
 ) -> ChunkFragmentIndex:
     """Read and decode the ``vertex_fragments/<chunk>`` blob.
@@ -4489,7 +4579,7 @@ def read_vertex_fragment_index(
 
 
 def read_link_fragment_index(
-    level_group: FsGroup,
+    level_group: Group,
     chunk_coords: ChunkCoords,
 ) -> ChunkFragmentIndex:
     """Read and decode the ``link_fragments/<chunk>`` blob (delta=0 only)."""
@@ -4575,7 +4665,7 @@ def _slice_vertex_range(
 
 
 def _read_vertex_offsets(
-    level_group: FsGroup,
+    level_group: Group,
     chunk_coords: ChunkCoords,
     *,
     bytes_per_vertex: int | None = None,
@@ -4620,3 +4710,8 @@ def _read_vertex_offsets(
     return offsets
 
 
+
+
+# Downstream imports the pre-promotion spelling; keep it resolving so a
+# consumer is not broken by a rename that gains them nothing.
+_expand_blocks = expand_manifest_blocks

@@ -95,8 +95,12 @@ def coarsen_level(
         store_path: Path to the zarr vectors store.
         source_level: Level to read from.
         target_level: Level to write to (must not exist).
-        coarsen_factor: Per-object vertex aggregation factor (≥ 1).
-            ``1.0`` is the identity (no aggregation).
+        coarsen_factor: Per-object vertex aggregation factor (>= 1),
+            expressed as a **ratio against the source level's bin**, not the
+            root's: the target bin is ``source_level.bin_shape *
+            coarsen_factor``, seeded from the root's effective bin at level 0.
+            Factors therefore compound down a pyramid.  ``1.0`` is the identity
+            (no aggregation).
         sparsity_factor: Object-dropping factor (≥ 1).  Survivors keep
             their OIDs; dropped objects leave empty manifest slots.
             ``1.0`` is the identity (no drop).
@@ -168,7 +172,6 @@ def _per_object_coarsen(
     root = open_store(str(store_path), mode="r+")
     root_meta = read_root_metadata(root)
     ndim = root_meta.sid_ndim
-    base_bin = root_meta.effective_bin_shape
 
     # Source level's chunk_shape — may itself be a per-level override.
     try:
@@ -176,6 +179,16 @@ def _per_object_coarsen(
     except Exception:
         src_level_meta = None
     source_chunk_shape = get_level_chunk_shape(root_meta, src_level_meta)
+
+    # The bin ``coarsen_factor`` multiplies is the SOURCE LEVEL's, not the
+    # root's, so factors compose per level: ``[2, 2, 2]`` bins at 2x, 4x and 8x
+    # the root bin rather than 2x three times over.  Level 0 carries no
+    # bin_shape of its own, so the root's effective bin seeds the chain.
+    _src_bin = getattr(src_level_meta, "bin_shape", None) if src_level_meta else None
+    base_bin = (
+        tuple(float(b) for b in _src_bin) if _src_bin
+        else root_meta.effective_bin_shape
+    )
 
     # Target level's chunk_shape = source × chunk_scale_factor (per-axis).
     if isinstance(chunk_scale_factor, (tuple, list)):
@@ -287,6 +300,7 @@ def _per_object_coarsen(
         _write_empty_preserve_level(
             root, source_level, target_level,
             base_bin=base_bin,
+            root_bin=root_meta.effective_bin_shape,
             coarsen_factor=coarsen_factor,
             sparsity_factor=sparsity_factor,
             inherited_num_objects=n_src_objects,
@@ -303,6 +317,8 @@ def _per_object_coarsen(
     all_pos = np.concatenate(flat_positions, axis=0)
 
     # Target bin shape: source bin_shape × coarsen_factor.
+    # Target bin shape: the SOURCE level's bin_shape x coarsen_factor, so the
+    # factor is a per-level ratio and successive levels compound.
     target_bin_shape = tuple(float(b) * float(coarsen_factor) for b in base_bin)
 
     # Compute per-vertex bin coords: (N, ndim) int64.
@@ -344,7 +360,14 @@ def _per_object_coarsen(
         vertex_count=int(n_metavertices),
         arrays_present=arrays_present,
         bin_shape=target_bin_shape,
-        bin_ratio=tuple(max(1, int(round(coarsen_factor))) for _ in range(ndim)),
+        # Fold-change relative to LEVEL 0, not to the source level: this is
+        # what becomes the NGFF ``scale`` transform. With per-level coarsen
+        # factors the two differ — [2, 2] is ratio 2 then 4 — so it has to be
+        # derived from the bin shapes rather than echoing coarsen_factor.
+        bin_ratio=tuple(
+            max(1, int(round(float(t) / float(r))))
+            for t, r in zip(target_bin_shape, root_meta.effective_bin_shape)
+        ),
         chunk_shape=target_chunk_shape_override,
         object_sparsity=(1.0 / sparsity_factor),
         coarsening_method=COARSEN_PER_OBJECT,
@@ -549,11 +572,16 @@ def _write_empty_preserve_level(
     target_level: int,
     *,
     base_bin: tuple[float, ...],
+    root_bin: tuple[float, ...],
     coarsen_factor: float,
     sparsity_factor: float,
     inherited_num_objects: int,
 ) -> None:
-    """Write an empty ID-preserving level when no surviving object has vertices."""
+    """Write an empty ID-preserving level when no surviving object has vertices.
+
+    ``base_bin`` is the SOURCE level's bin (what ``coarsen_factor`` multiplies);
+    ``root_bin`` is level 0's, needed for the level-0-relative ``bin_ratio``.
+    """
     ndim = len(base_bin)
     target_bin_shape = tuple(float(b) * float(coarsen_factor) for b in base_bin)
     level_meta = LevelMetadata(
@@ -561,7 +589,12 @@ def _write_empty_preserve_level(
         vertex_count=0,
         arrays_present=[VERTICES, "object_index"],
         bin_shape=target_bin_shape,
-        bin_ratio=tuple(max(1, int(round(coarsen_factor))) for _ in range(ndim)),
+        # Level-0-relative, as above — it is the NGFF scale, not the per-level
+        # factor.
+        bin_ratio=tuple(
+            max(1, int(round(float(t) / float(r))))
+            for t, r in zip(target_bin_shape, root_bin)
+        ),
         object_sparsity=(1.0 / sparsity_factor),
         coarsening_method=COARSEN_PER_OBJECT,
         parent_level=source_level,
@@ -885,7 +918,9 @@ def build_pyramid(
     Args:
         store_path: Path to the store with level 0.
         factors: List of ``(coarsen_factor, sparsity_factor)`` tuples,
-            one per coarser level.
+            one per coarser level.  ``coarsen_factor`` is a **per-level ratio
+            against the level below**, so factors compound: ``[(2, 1), (2, 1),
+            (2, 1)]`` bins at 2x, 4x and 8x the root bin.
         chunk_scale_factors: Optional per-level multipliers applied to
             the source level's ``chunk_shape`` to derive each target
             level's ``chunk_shape``.  Aligned with ``factors`` (same
