@@ -73,9 +73,12 @@ class ZVWriter:
         import warnings
 
         warnings.warn(
-            "ZVWriter is superseded by Dataset.add_* and Dataset.writing(). "
-            "It has no downstream users, so this deprecation costs nothing to "
-            "act on.",
+            "ZVWriter is superseded by Dataset.add_* for creating geometry "
+            "and Dataset.editing() for per-element edits. Note that "
+            "add_node_attribute_sync / add_face_attribute_sync have NO "
+            "replacement on Dataset -- a bulk per-vertex attribute column is "
+            "not an edit -- so use "
+            "zarr_vectors.building.write_vertex_attribute for those.",
             DeprecationWarning,
             stacklevel=2,
         )
@@ -289,8 +292,11 @@ class ZVWriter:
             self._group.derive_nonempty_chunks, f"{subpath}/{name}",
         )
 
-        # Make sure the level metadata advertises the new array.
-        await asyncio.to_thread(self._touch_arrays_present, f"{subpath}/{name}")
+        # Make sure the level metadata advertises the new array.  The
+        # FAMILY, not "<family>/<name>": every other writer in core records
+        # the family and every reader gates on it, so the per-name entry
+        # this used to add was read by nothing at all.
+        await asyncio.to_thread(self._touch_arrays_present, subpath)
 
     async def _write_per_face_attribute(
         self,
@@ -363,9 +369,7 @@ class ZVWriter:
 
         await asyncio.gather(*(_write_one(cc, sub) for cc, sub in slices))
 
-        await asyncio.to_thread(
-            self._touch_arrays_present, f"face_attributes/{name}",
-        )
+        await asyncio.to_thread(self._touch_arrays_present, "face_attributes")
 
     def _touch_arrays_present(self, entry: str) -> None:
         """Add ``entry`` to the level's ``arrays_present`` if missing."""

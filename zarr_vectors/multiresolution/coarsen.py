@@ -83,6 +83,7 @@ def coarsen_level(
     sparsity_seed: int | None = None,
     cross_level_storage: str = XLEVEL_NONE,
     method: str = COARSEN_PER_OBJECT,
+    options: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Coarsen a single level and write it to the store.
 
@@ -125,6 +126,14 @@ def coarsen_level(
             method registered by ``zarr-vectors-tools`` via
             :mod:`zarr_vectors.multiresolution.registry` (raises if that
             package is not installed).
+        options: Extra keywords for a registered ``method``, forwarded
+            verbatim.  A strategy's own knobs (a polyline coarsener's
+            ``coarsen_mode``, a codec, a worker pool) were unreachable
+            through this entry point, so a caller who wanted one had to
+            bypass the dispatch and import the strategy directly —
+            defeating the registry.  Ignored by the built-in
+            ``"per_object"`` method, which takes no extra keywords; passing
+            options with it raises rather than silently dropping them.
 
     Returns:
         Summary dict.  Always includes ``method``,
@@ -142,10 +151,16 @@ def coarsen_level(
         cross_level_storage=cross_level_storage,
     )
     if method == COARSEN_PER_OBJECT:
+        if options:
+            raise CoarseningError(
+                f"method='{COARSEN_PER_OBJECT}' takes no extra options; got "
+                f"{sorted(options)}. Those keywords belong to a registered "
+                f"strategy — pass method= as well."
+            )
         return _per_object_coarsen(**kwargs)
     # Advanced coarsening methods live in zarr-vectors-tools.
     from zarr_vectors.multiresolution.registry import require_coarsen_strategy
-    return require_coarsen_strategy(method)(**kwargs)
+    return require_coarsen_strategy(method)(**kwargs, **(options or {}))
 
 
 def _per_object_coarsen(
@@ -905,6 +920,7 @@ def build_pyramid(
     cross_level_depth: int = DEFAULT_CROSS_LEVEL_DEPTH,
     cross_level_storage: str = DEFAULT_CROSS_LEVEL_STORAGE,
     method: str = COARSEN_PER_OBJECT,
+    options: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Build a multi-resolution pyramid for an existing store.
 
@@ -984,6 +1000,7 @@ def build_pyramid(
             sparsity_seed=sparsity_seed,
             cross_level_storage=cross_level_storage,
             method=method,
+            options=options,
         ))
 
     # Compose deeper-delta cross-level links from the inline-emitted +1
@@ -998,7 +1015,11 @@ def build_pyramid(
     return {
         "levels_created": len(summaries),
         "level_specs": summaries,
-        "method": COARSEN_PER_OBJECT,
+        # The method actually used, not the built-in: this reported
+        # "per_object" even when every level had been produced by a
+        # registered strategy, so the one field naming what built the
+        # pyramid was wrong exactly when it mattered.
+        "method": method,
         "cross_level_depth": cross_level_depth,
         "cross_level_storage": cross_level_storage,
     }

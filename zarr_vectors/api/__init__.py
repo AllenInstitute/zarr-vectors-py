@@ -41,6 +41,22 @@ from zarr_vectors.api.schema import (
 )
 from zarr_vectors.api.select import Query, Selection
 
+
+def coarsen_methods() -> tuple[str, ...]:
+    """Every coarsening method ``build_pyramid(method=...)`` will accept.
+
+    Core's ``"per_object"`` plus whatever a strategy package registered on
+    import.  Offered because the alternative was calling ``build_pyramid``
+    with a name and finding out from the exception — the registry knew the
+    answer and nothing asked it.
+    """
+    from zarr_vectors.constants import COARSEN_PER_OBJECT
+    from zarr_vectors.multiresolution.registry import (
+        registered_coarsen_strategies,
+    )
+
+    return tuple(sorted({COARSEN_PER_OBJECT, *registered_coarsen_strategies()}))
+
 # Aliases for callers who do not `import zarr_vectors as zv` and would
 # otherwise shadow the builtin.
 open_dataset = open
@@ -69,6 +85,7 @@ __all__ = [
     "SizeHints",
     "StorageOptions",
     "aopen",
+    "coarsen_methods",
     "create",
     "create_dataset",
     "open",

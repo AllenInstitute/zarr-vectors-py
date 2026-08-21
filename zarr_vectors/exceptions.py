@@ -17,6 +17,21 @@ class StoreError(ZVError):
     """Raised when a ZV store cannot be created, opened, or is structurally invalid."""
 
 
+class ShardedPresenceError(StoreError):
+    """Presence was asked to be derived for a natively-sharded array.
+
+    A shard packs many cells into one storage object whose inner index is
+    not derivable from key names, so the listing a presence rebuild walks
+    finds nothing and the manifest would be rewritten to (almost) empty --
+    turning a stale manifest into a destroyed one, with every packed cell
+    silently invisible to ``list_chunks``.
+
+    Its own subclass rather than a bare :class:`StoreError` so a caller
+    looping over a level's mixed arrays can skip this one case without
+    also swallowing a genuine store failure.
+    """
+
+
 class MetadataError(ZVError):
     """Raised when metadata is missing, malformed, or fails schema validation."""
 

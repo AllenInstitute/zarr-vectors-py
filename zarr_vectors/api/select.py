@@ -53,7 +53,16 @@ class Selection:
     among those objects" — the reading a caller expects from chaining.
     """
 
-    level: int = 0
+    level: int | None = None
+    """Which resolution level, or ``None`` for "not specified".
+
+    ``None``, not ``0``.  Level 0 is a real level -- the full-resolution
+    one -- so using it as the unset sentinel made asking for it
+    indistinguishable from not asking, and
+    ``ds.level(1).select(...).select(level=0)`` silently stayed on 1.
+    :meth:`Level.select` fills this in, so a Selection reaching a reader
+    always has a concrete level.
+    """
     bbox: tuple[Sequence[float], Sequence[float]] | None = None
     near: tuple[Sequence[float], float] | None = None
     objects: Sequence[int] | None = None
@@ -65,6 +74,23 @@ class Selection:
     The honest replacement for ``chunks=[(3, 1, 2), ...]``: a caller who
     genuinely needs to target storage regions gets the references from
     the grid rather than constructing coordinates they had to derive.
+
+    See ``cells_split`` for the one place the replacement is not exact.
+    """
+    cells_split: bool = True
+    """Whether a partly-kept object is SPLIT at the cell boundary.
+
+    ``read_*(chunks=...)`` emits each surviving contiguous run of a
+    polyline as its own polyline, so an object re-entering the region
+    comes back as several parts.  Filtering an already-assembled
+    ``ReadResult`` instead keeps it as one part with the outside vertices
+    dropped.  Both are defensible; they are not the same answer, and
+    exporters depend on the split one (a TRK streamline count legitimately
+    exceeds the source object count).
+
+    ``True`` (the default) preserves the reader's behaviour by passing
+    ``cells`` down as ``chunks=`` where the reader accepts it.  ``False``
+    asks for the post-filtered reading.
     """
     attributes: Sequence[str] | str = "all"
     limit: int | None = None
@@ -84,13 +110,14 @@ class Selection:
                 (a_lo, a_hi), (b_lo, b_hi) = _as_bbox(bbox), _as_bbox(other.bbox)
                 bbox = (np.maximum(a_lo, b_lo), np.minimum(a_hi, b_hi))
         return Selection(
-            level=other.level if other.level != 0 else self.level,
+            level=other.level if other.level is not None else self.level,
             bbox=bbox,
             near=other.near if other.near is not None else self.near,
             objects=_intersect_ids(self.objects, other.objects),
             groups=_intersect_ids(self.groups, other.groups),
             where={**(self.where or {}), **(other.where or {})} or None,
             cells=other.cells if other.cells is not None else self.cells,
+            cells_split=self.cells_split and other.cells_split,
             attributes=(
                 other.attributes if other.attributes != "all" else self.attributes
             ),
@@ -130,6 +157,13 @@ class Selection:
             out["group_ids"] = list(self.groups)
         if self.where and "attribute_filter" in supports:
             out["attribute_filter"] = dict(self.where)
+        if self.cells is not None and self.cells_split and "chunks" in supports:
+            # Down to the reader, where segment structure still exists, so
+            # a partly-kept object splits at the boundary the way
+            # read_*(chunks=) has always split it.  Without this the cells
+            # term was applied only after assembly and quietly changed the
+            # part count.
+            out["chunks"] = [tuple(int(c) for c in ref.coords) for ref in self.cells]
         if (
             self.attributes != "all"
             and not isinstance(self.attributes, str)
@@ -149,6 +183,14 @@ class Selection:
             self.near is not None
             or self.limit is not None
             or self.cells is not None
+        )
+
+    def cells_pushed_down(self, *, supports: Sequence[str]) -> bool:
+        """Whether ``cells`` reached the reader rather than the post-filter."""
+        return (
+            self.cells is not None
+            and self.cells_split
+            and "chunks" in supports
         )
 
 
@@ -249,18 +291,64 @@ class Query:
         """
         return self._level.plan(self._selection)
 
+    def cells(self) -> Any:
+        """The grid cells this query touches — from metadata, reading nothing.
+
+        What a caller shards work across processes on: each worker takes a
+        slice of these and reads only its own. :meth:`plan` already
+        computes the answer (it is pure metadata arithmetic); this is the
+        cell-shaped view of it, without the array paths and without a
+        caller having to know that a plan's ``cells`` are
+        ``(array, key)`` pairs across several families.
+
+        Deduplicated across families — ``vertices`` and
+        ``vertex_fragments`` name the same cell of the same grid — and
+        returned as a :class:`~zarr_vectors.api.grid.CellSet`, so it feeds
+        straight back into ``select(cells=...)``.
+        """
+        from zarr_vectors.api.grid import CellRef, CellSet
+
+        refs = set()
+        for request in self.plan().cells:
+            try:
+                refs.add(CellRef(tuple(
+                    int(part) for part in request.key.split(".")
+                )))
+            except ValueError:
+                continue
+        return CellSet(refs)
+
     def iter_cells(self) -> Any:
-        """Stream the result one chunk at a time.
+        """Stream the result one cell at a time.
 
         Not available yet: streaming needs the facade to drive the read
         itself.  Delegating to a reader that materialises everything and
         then yielding from it would have the signature of streaming and
         none of the benefit, which is worse than not offering it.
+
+        The contract it will honour, pinned here so nobody codes to a
+        guess in the meantime:
+
+        * yields ``(CellRef, ReadResult)`` pairs, one per cell that
+          :meth:`cells` names, in sorted key order;
+        * each :class:`~zarr_vectors.api.result.ReadResult` covers exactly
+          that cell, cut into ``parts`` the way ``Selection.cells_split``
+          asks for — so the same object spanning two cells appears as one
+          part in each, and summing part counts is not the same as
+          reading the whole query;
+        * per-cell failures arrive in that result's ``errors``, not as an
+          exception, so one unreadable cell does not end the stream;
+        * ``sum(r.vertex_count for _, r in q.iter_cells()) == q.count()``.
+
+        Use :meth:`cells` today: take the cell references, and read each
+        with ``select(cells=[ref])``.
         """
         raise NotImplementedError(
             "Query.iter_cells() arrives with the resolver phase. The legacy "
             "readers materialise the whole result, so a generator over one "
-            "would use the same peak memory while implying it does not."
+            "would use the same peak memory while implying it does not. "
+            "Until then: Query.cells() gives the cell references, and "
+            "select(cells=[ref]).read() reads one."
         )
 
     def __repr__(self) -> str:

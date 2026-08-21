@@ -36,7 +36,7 @@ import warnings
 from collections.abc import Iterator, Sequence
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 import numpy as np
 import zarr
@@ -44,13 +44,23 @@ from zarr.codecs import VLenBytesCodec
 from zarr.errors import UnstableSpecificationWarning
 from zarr.storage import LocalStore
 
+from zarr_vectors.constants import (
+    VERTEX_FRAGMENTS as _VERTEX_FRAGMENTS_ARRAY,
+)
+from zarr_vectors.constants import (
+    VERTICES as _VERTICES_ARRAY,
+)
 from zarr_vectors.core._vlen import (
     cell_region as _vlen_cell_region,
 )
 from zarr_vectors.core._vlen import (
     region_to_bytes as _vlen_region_to_bytes,
 )
-from zarr_vectors.exceptions import StoreError
+from zarr_vectors.exceptions import ShardedPresenceError, StoreError
+
+# Where ``LevelMetadata`` lives on a level group's attrs.  Duplicated
+# rather than imported because ``core.metadata`` imports this module.
+_LEVEL_META_KEY = "zarr_vectors_level"
 
 # Node-cache sentinel for "this path was probed and is genuinely absent",
 # as distinct from "this path was never prefetched".  Only the async
@@ -142,6 +152,19 @@ class Group:
     # Groups and ``_ABSENT`` markers, populated up-front by the async
     # primer).  See :meth:`_lookup_node`.
     _node_cache: dict[str, Any] | None = None
+    # True when ``_node_cache`` was opened by :meth:`cached_nodes` — a
+    # read-only block, so Groups may be cached alongside Arrays and the
+    # cache may be shared with derived handles.  False for the
+    # :meth:`batched_writes` cache, which is Arrays-only and stays put.
+    _node_cache_readonly: bool = False
+    # Set once this handle has dealt with the level's
+    # ``fragments_tile`` claim, so a bulk write of N chunks checks it
+    # once rather than N times.  See :meth:`_clear_fragments_tile`.
+    _tiling_claim_settled: bool = False
+    # Per-array presence manifests, cached for the same read-only session
+    # as ``_node_cache`` and keyed the same way.  See
+    # :meth:`_chunk_listing` and :class:`_ChunkListing`.
+    _listing_cache: dict[str, _ChunkListing] | None = None
     # Active offline-read snapshot, or None for normal store-backed
     # reads.  When set, reads must not touch the store: a miss records
     # itself and raises rather than falling through to a synchronous GET.
@@ -166,6 +189,9 @@ class Group:
         self._active_codecs = None
         self._native_sharded_config = None
         self._node_cache = None
+        self._node_cache_readonly = False
+        self._listing_cache = None
+        self._tiling_claim_settled = False
 
     @classmethod
     def _from_zarr(
@@ -177,12 +203,26 @@ class Group:
         instance._pending_array_metas = None
         instance._prefetch_cache = None
         instance._active_codecs = None
-        instance._node_cache = None
         # An offline snapshot covers the whole tree, so a Group derived
         # from one stays offline; without this a level group would fall
         # back to the store and issue the very sync read the snapshot
         # exists to avoid.  Everything else stays per-instance.
         instance._offline = _parent._offline if _parent is not None else None
+        # A read-only node cache covers the whole tree for the same
+        # reason: a reader resolves the root, then the level, then each
+        # array beneath it, and the lookups worth collapsing are spread
+        # across all three handles.  Only the read-only variant
+        # propagates -- a :meth:`batched_writes` cache stays on the Group
+        # that opened it, because that block creates nodes as it goes and
+        # a derived handle has no way to learn about an invalidation.
+        share = (
+            _parent is not None
+            and _parent._node_cache is not None
+            and _parent._node_cache_readonly
+        )
+        instance._node_cache = _parent._node_cache if share else None
+        instance._node_cache_readonly = share
+        instance._listing_cache = _parent._listing_cache if share else None
         return instance
 
     @classmethod
@@ -320,6 +360,10 @@ class Group:
                 finish.  Cell payloads themselves are independent objects
                 and never race.
         """
+        if array_name in (_VERTICES_ARRAY, _VERTEX_FRAGMENTS_ARRAY):
+            # Either write can break the tiling a level may be claiming:
+            # the index directly, the buffer by changing its row count.
+            self._clear_fragments_tile()
         sharded_arr = self._sharded_chunk_array(array_name)
         if sharded_arr is None:
             raise StoreError(
@@ -401,15 +445,120 @@ class Group:
             return
         from zarr_vectors.core._batch_reader import flush_prefetch
 
-        self._prefetch_cache = flush_prefetch(self._zarr, plan)
-        # No node cache here, deliberately: :meth:`read_bytes` answers from
-        # ``_prefetch_cache`` before it resolves a node, so inside this block
-        # there is nothing left for one to cache.  (Measured: adding one
-        # changes the store round-trip count not at all.)
+        # Hand over the array handles we already hold, and the direct-read
+        # specs derived from them.  Inside a :meth:`cached_nodes` block
+        # that is all of them, so the prefetch resolves nothing and
+        # derives nothing -- it goes straight to the cells.
+        names = {name for name, _ in plan}
+        self._prefetch_cache = flush_prefetch(
+            self._zarr, plan,
+            {name: self._sharded_chunk_array(name) for name in names},
+            specs={name: self._direct_spec_cached(name) for name in names},
+        )
+        # No node cache opened here, deliberately: :meth:`read_bytes`
+        # answers from ``_prefetch_cache`` before it resolves a node, so
+        # inside this block there is nothing left for one to cache.
+        # (Measured: adding one changes the store round-trip count not at
+        # all.)  The lookups a read *does* repeat happen on either side of
+        # this block -- ``read_array_meta``, ``list_chunks``, the level
+        # handle itself -- which is what :meth:`cached_nodes` covers.
         try:
             yield
         finally:
             self._prefetch_cache = None
+
+    @contextmanager
+    def cached_nodes(self) -> Iterator[None]:
+        """Resolve each node at most once for the duration of one read.
+
+        A reader resolves the same handful of nodes over and over: the
+        level group, ``vertices``, ``vertex_fragments``, one array per
+        requested attribute -- once to read its metadata, again to list
+        its chunk keys, again per chunk read that misses the prefetch.
+        Every one of those is a ``zarr.json`` GET, and against a store
+        holding a single point that was the whole cost of the query: a
+        one-point ``read_points`` issued nine metadata reads to fetch two
+        chunk objects.
+
+        Read-only by contract, which is what lets it cache more than
+        :meth:`batched_writes` can.  Nothing inside the block creates or
+        deletes a node, so a *negative* result cannot go stale and Groups
+        are as cacheable as Arrays; and because the cache is keyed
+        root-relative it is shared with every Group derived inside the
+        block, so the level handle a reader opens on entry hits the same
+        cache the root does.
+
+        Writes inside the block are not supported -- a mutation would
+        leave a handle cached past the node it points at.  Nesting is a
+        no-op: the outer block already covers the inner one.
+
+        Example::
+
+            root = open_store(store_path)
+            with root.cached_nodes():
+                level_group = get_resolution_level(root, level)
+                ...
+        """
+        if self._node_cache is not None:
+            # Already inside a cache block (or a batched-writes one, whose
+            # cache is narrower but still correct for reads).  Re-entering
+            # would swap the dict out from under the outer block on exit.
+            yield
+            return
+        self._node_cache = {}
+        self._node_cache_readonly = True
+        self._listing_cache = {}
+        try:
+            yield
+        finally:
+            self._node_cache = None
+            self._node_cache_readonly = False
+            self._listing_cache = None
+
+    def prime_nodes(self, paths: Sequence[str]) -> None:
+        """Resolve several nodes in one round-trip, into the active cache.
+
+        :meth:`cached_nodes` stops a node being resolved *twice*; this
+        stops the first resolutions being paid one after another.  A
+        point read needs three nodes — the level group, ``vertices``,
+        ``vertex_fragments`` — and resolving them as they come up is
+        three serial ``zarr.json`` reads before any data moves, which on
+        a single-chunk query was most of the query.  Asked for together
+        they cost one gather.
+
+        A no-op outside a :meth:`cached_nodes` block (there is nowhere to
+        put the result), under :meth:`offline_reads` (the snapshot is
+        already primed, and its misses are the caller's signal), and for
+        any path already cached.  Speculative by design: a path that does
+        not exist caches as absent, which is an answer the reader wants
+        just as much.
+
+        Args:
+            paths: Node paths relative to this Group.  Order is
+                irrelevant; duplicates are collapsed.
+        """
+        cache = self._node_cache
+        if (
+            cache is None
+            or not self._node_cache_readonly
+            or self._offline is not None
+        ):
+            return
+        missing = {p for p in paths if self._full_path(p) not in cache}
+        if not missing:
+            return
+        from zarr.core.sync import sync
+
+        from zarr_vectors.core.aio import _resolve_nodes
+
+        try:
+            resolved = sync(_resolve_nodes(self._zarr._async_group, missing))
+        except Exception:
+            # Priming is an optimisation; a failure here must not fail
+            # the read.  Every path falls back to its own lookup.
+            return
+        for path, node in resolved.items():
+            cache[self._full_path(path)] = node
 
     @contextmanager
     def offline_reads(self, session: _OfflineSession) -> Iterator[None]:
@@ -450,6 +599,55 @@ class Group:
             yield
         finally:
             self._offline = None
+
+    @contextmanager
+    def chunk_array_codecs(self, compressor: Any) -> Iterator[None]:
+        """Set the codec pipeline for chunk arrays *created* inside the block.
+
+        The creation half of :meth:`batched_writes` on its own: it selects the
+        codecs new per-chunk arrays are stamped with and changes nothing else.
+        Writes inside the block stay synchronous and immediate.
+
+        That separation is the point. ``batched_writes`` is the only other way
+        to reach the session codec, and it also defers every write to a single
+        flush on exit — which a caller that read-modify-writes a cell cannot
+        use, because the read would not see what the same block just wrote
+        (``write_chunk_fragments(mode="append")`` and every
+        ``nonempty_chunks`` stamp do exactly that). A writer that wants
+        compression but not deferral had no way to ask.
+
+        Only *creation* is affected, and only for arrays that do not exist
+        yet: an array already on disk keeps the pipeline it was stamped with,
+        since its written cells are encoded under it. To change an existing
+        store's codecs, delete the arrays and rewrite them.
+
+        Args:
+            compressor: See
+                :func:`zarr_vectors.encoding.compression.resolve_compressor`.
+                ``None``/``"none"``/``False`` means no compression,
+                ``"zstd"`` is zarr v3's default (level 0), ``"blosc"`` is
+                Blosc(Zstd, BitShuffle, l5), or pass an explicit codec list
+                such as ``[{"name": "zstd", "configuration": {"level": 5}}]``.
+
+        Example::
+
+            with level_group.chunk_array_codecs("zstd"):
+                create_vertices_array(level_group, dtype="float32")
+                write_chunk_vertices(level_group, cc, [positions])
+        """
+        if self._pending_writes is not None:
+            raise StoreError(
+                "chunk_array_codecs() cannot be nested inside batched_writes() "
+                "— that block already carries its own compressor="
+            )
+        from zarr_vectors.encoding.compression import resolve_compressor
+
+        previous = self._active_codecs
+        self._active_codecs = resolve_compressor(compressor)
+        try:
+            yield
+        finally:
+            self._active_codecs = previous
 
     @contextmanager
     def batched_writes(self, compressor: Any = None) -> Iterator[None]:
@@ -656,16 +854,111 @@ class Group:
             return False
         return _vlen_get_cell(sharded_arr, index) != b""
 
+    def _chunk_listing(self, array_name: str) -> _ChunkListing:
+        """The presence manifest for ``array_name``, session-cached.
+
+        Trusts the per-array manifest written by :meth:`write_bytes`;
+        without it we would have to fetch every shard index to find
+        non-empty cells.  A family group (``links/<delta>``) is not a
+        chunk array and holds no cells of its own, so it lists empty.
+
+        Inside a :meth:`cached_nodes` block the manifest is read, sorted
+        and parsed once and every reader shares the result.  Outside one,
+        a fresh listing is built per call — the same work the reader did
+        before this cache existed, so nothing regresses.
+        """
+        cache = self._listing_cache
+        key = self._full_path(array_name)
+        if cache is not None:
+            hit = cache.get(key)
+            if hit is not None:
+                return hit
+        arr = self._sharded_chunk_array(array_name)
+        present = (
+            arr.attrs.get(_NONEMPTY_CHUNKS_ATTR) if arr is not None else None
+        )
+        listing = _ChunkListing(sorted(present) if present else [])
+        if cache is not None:
+            cache[key] = listing
+        return listing
+
     def list_chunks(self, array_name: str) -> list[str]:
-        # Trust the per-array presence manifest written by
-        # ``write_bytes``; without it we'd have to fetch every shard
-        # index to find non-empty cells.  A family group (``links/<delta>``)
-        # is not a chunk array and holds no cells of its own.
+        """The dotted chunk keys this array holds data for, sorted."""
+        return self._chunk_listing(array_name).keys
+
+    def list_chunk_coords(self, array_name: str) -> list[tuple[int, ...]]:
+        """:meth:`list_chunks`, parsed to coordinate tuples and sorted.
+
+        The form every reader actually wants, and the one worth caching:
+        the strings come off the presence manifest already, but turning
+        125 of them into tuples is 125 splits and 375 ``int`` calls, paid
+        on every read no matter how few chunks the query goes on to
+        touch.  Inside a :meth:`cached_nodes` block the parse happens
+        once; outside it, every call parses, exactly as before.
+        """
+        return self._chunk_listing(array_name).coords()
+
+    def chunk_present_set(self, array_name: str) -> frozenset[tuple[int, ...]]:
+        """:meth:`list_chunk_coords` as a set, for membership tests.
+
+        See :meth:`_ChunkListing.present` for why a reader wants it.
+        """
+        return self._chunk_listing(array_name).present()
+
+    def chunk_index_by_spatial(
+        self, array_name: str, nd: int,
+    ) -> dict[tuple[int, ...], list[tuple[int, ...]]]:
+        """Present coordinates grouped by their trailing ``nd`` axes.
+
+        See :meth:`_ChunkListing.by_spatial`.
+        """
+        return self._chunk_listing(array_name).by_spatial(nd)
+
+    def _direct_spec_cached(self, array_name: str) -> Any:
+        """The local-filesystem direct-read spec for ``array_name``.
+
+        Rebuilding it means re-reading the array's metadata and
+        reconstructing an ``ArraySpec`` — 13.6 us of a 285 us warm
+        one-point read, paid again on every read of a session even though
+        the node it describes was resolved once.
+
+        Outside a :meth:`cached_nodes` block it is derived per call, as
+        before; caching there would mean building a throwaway listing
+        record to hold it.
+        """
+        from zarr_vectors.core._batch_reader import _direct_spec
+
+        cache = self._listing_cache
+        if cache is None:
+            return _direct_spec(
+                self._zarr, array_name, self._sharded_chunk_array(array_name),
+            )
+        listing = self._chunk_listing(array_name)
+        if not listing.spec_known:
+            listing.set_spec(_direct_spec(
+                self._zarr, array_name,
+                self._sharded_chunk_array(array_name),
+            ))
+        return listing.spec
+
+    def chunk_grid_bounds(
+        self, array_name: str,
+    ) -> tuple[tuple[int, ...] | None, tuple[int, ...]] | None:
+        """``(origin, shape)`` of ``array_name``'s cell grid, or None.
+
+        The grid the chunk keys live in: cell ``i`` of the array holds
+        absolute chunk coord ``i + origin`` (``origin`` is ``None`` for a
+        zero origin, which is how it is stored).  A box resolver needs
+        this to clamp — ``chunks_intersecting_bbox`` speaks absolute
+        coords and knows nothing of the store's extent, so an unclamped
+        box can name vastly more cells than the grid could ever hold.
+
+        ``None`` when the path holds no chunk array.
+        """
         arr = self._sharded_chunk_array(array_name)
         if arr is None:
-            return []
-        present = arr.attrs.get(_NONEMPTY_CHUNKS_ATTR)
-        return sorted(present) if present else []
+            return None
+        return _grid_origin(arr), tuple(int(s) for s in arr.shape)
 
     # ---------------- array metadata ----------------
 
@@ -774,6 +1067,65 @@ class Group:
 
         if attributes:
             arr.attrs.update(_json_safe(attributes))
+
+    def extend_array(
+        self,
+        path: str,
+        rows: Any,
+        *,
+        attributes: dict[str, Any] | None = None,
+    ) -> int:
+        """Append ``rows`` along axis 0, leaving existing rows untouched.
+
+        The cheap half of an append.  :meth:`write_array` recreates the
+        array from a full in-memory copy, so growing one by read →
+        concatenate → write costs the whole array on every call; a writer
+        that appends once per spatial chunk therefore pays
+        O(chunks x rows) over a build, and each call is slower than the
+        last.  This resizes in place and writes only the new region, so
+        the cost is the rows actually added — provided the array is
+        chunked along axis 0, which is why :func:`write_object_attributes`
+        gives its arrays a bounded row chunk when it creates them.
+
+        Args:
+            path: Logical path of an existing array.
+            rows: Rows to append.  Tail dimensions must match the array's.
+            attributes: Merged into the array's attributes block after the
+                write.
+
+        Returns:
+            The array's new length along axis 0.
+
+        Notes:
+            An array whose attributes block records its own ``shape`` (what
+            :meth:`write_array` stamps, and what the O(1) length readers key
+            on) has it restamped from the resized array — so the recorded
+            shape cannot drift from the real one across an append.
+
+        Raises:
+            StoreError: If ``path`` does not exist or is not an array.
+            ValueError: If the tail dimensions do not match.
+        """
+        arr = self._require_array_node(path)
+        row_data = np.asarray(rows)
+        if tuple(row_data.shape[1:]) != tuple(arr.shape[1:]):
+            raise ValueError(
+                f"extend_array shape mismatch at {path!r}: existing "
+                f"{arr.shape} vs new {row_data.shape} — tail dimensions "
+                f"must match"
+            )
+        n0 = int(arr.shape[0])
+        total = n0 + int(row_data.shape[0])
+        if total != n0:
+            arr.resize((total,) + tuple(arr.shape[1:]))
+            arr[n0:total] = row_data.astype(arr.dtype, copy=False)
+        stamped = dict(attributes) if attributes else {}
+        if "shape" in arr.attrs:
+            stamped["shape"] = [total, *arr.shape[1:]]
+        if stamped:
+            arr.attrs.update(_json_safe(stamped))
+        self._invalidate_node(path)
+        return total
 
     def read_array(self, path: str) -> np.ndarray:
         """Read a chunked Zarr array at ``path`` as a numpy array."""
@@ -1015,7 +1367,7 @@ class Group:
         # follow (one per cell of this array) would otherwise each re-read
         # the ``zarr.json`` we have in hand.
         if self._node_cache is not None:
-            self._node_cache[array_name] = arr
+            self._node_cache[self._full_path(array_name)] = arr
 
     def _lookup_node(self, path: str) -> zarr.Array | zarr.Group | None:
         """Return the Zarr node at ``path``, or ``None`` if absent.
@@ -1069,17 +1421,54 @@ class Group:
             offline.misses.add(full)
             return None
         cache = self._node_cache
+        # Keyed root-relative, like the offline snapshot: a read-only
+        # cache is shared with every Group derived from this one, and a
+        # bare relative path means different nodes from different points
+        # in the tree (root's "vertices" is not level 0's "vertices").
+        cache_key = self._full_path(path) if cache is not None else path
         if cache is not None:
-            hit = cache.get(path)
+            hit = cache.get(cache_key)
             if hit is not None:
                 return None if hit is _ABSENT else hit
         try:
             node = self._zarr[path]
         except KeyError:
             return None
-        if cache is not None and isinstance(node, zarr.Array):
-            cache[path] = node
+        if cache is not None and (
+            isinstance(node, zarr.Array) or self._node_cache_readonly
+        ):
+            cache[cache_key] = node
         return node
+
+    def _clear_fragments_tile(self) -> None:
+        """Drop this level's ``fragments_tile`` claim, if it holds one.
+
+        Called from :meth:`write_bytes` for the two arrays the claim is
+        about.  That is the total chokepoint — ``write_chunk_vertices``
+        and ``write_chunk_fragments`` both persist through it, and a
+        batched write queues through it too — so a claim cannot outlive
+        the layout it describes.
+
+        Cheap by construction: the level group's attributes are already
+        in memory, and the store write happens at most once per handle
+        and only for a level that actually carries the flag.  A writer
+        stamping the flag *after* its chunk writes therefore trips this
+        once, harmlessly, while the flag is still absent.
+        """
+        if self._tiling_claim_settled:
+            return
+        self._tiling_claim_settled = True
+        try:
+            level = self._zarr.attrs.get(_LEVEL_META_KEY)
+        except Exception:
+            return
+        if not isinstance(level, dict) or not level.get("fragments_tile"):
+            return
+        self._zarr.attrs.update({
+            _LEVEL_META_KEY: {
+                k: v for k, v in level.items() if k != "fragments_tile"
+            },
+        })
 
     def _invalidate_node(self, path: str) -> None:
         """Drop ``path`` and everything beneath it from the node cache.
@@ -1087,14 +1476,15 @@ class Group:
         Called by every method that creates, replaces, or deletes a node,
         so a cached handle can never outlive the node it points at.
         """
-        cache = self._node_cache
-        if not cache:
-            return
-        prefix = f"{path}/"
-        for key in [
-            k for k in cache if k == path or k.startswith(prefix)
-        ]:
-            del cache[key]
+        full = self._full_path(path)
+        prefix = f"{full}/"
+        for cache in (self._node_cache, self._listing_cache):
+            if not cache:
+                continue
+            for key in [
+                k for k in cache if k == full or k.startswith(prefix)
+            ]:
+                del cache[key]
 
     def _sharded_chunk_array(self, array_name: str) -> zarr.Array | None:
         """Return the multidim vlen-bytes Zarr array at ``array_name``
@@ -1106,7 +1496,12 @@ class Group:
         node = self._lookup_node(array_name)
         return node if isinstance(node, zarr.Array) else None
 
-    def derive_nonempty_chunks(self, array_name: str) -> list[str]:
+    def derive_nonempty_chunks(
+        self,
+        array_name: str,
+        *,
+        on_sharded: Literal["raise", "skip"] = "raise",
+    ) -> list[str]:
         """Rebuild ``array_name``'s ``nonempty_chunks`` from the store listing.
 
         The coordinator half of ``write_bytes(..., record_presence=False)``:
@@ -1126,12 +1521,39 @@ class Group:
         coordinator pass that runs *after* this, which is the same
         ordering :func:`zarr_vectors.sharding.shard_store` already
         requires.  Returns the sorted keys now recorded.
+
+        Args:
+            on_sharded: What to do when ``array_name`` *is* natively
+                sharded.  ``"raise"`` (the default) raises
+                :class:`~zarr_vectors.exceptions.ShardedPresenceError`;
+                ``"skip"`` returns the manifest already recorded, without
+                rewriting it, for a caller legitimately looping over a
+                level's mixed arrays.
+
+        Until this guard existed the ordering above was documented here
+        and enforced nowhere: running against a sharded array rewrote the
+        manifest from a listing that resolves nothing, so a store with
+        1605 recorded cells came back with 2 and the rest became
+        unreachable through ``list_chunks`` — no exception, no warning.
+        Returning an empty list under ``"skip"`` would be the same bug
+        wearing a keyword, hence the read.
         """
         arr = self._sharded_chunk_array(array_name)
         if arr is None:
             raise StoreError(
                 f"{array_name!r} in {self._zarr.path or '<root>'} is not a "
                 f"chunk array; nothing to derive presence for"
+            )
+        if getattr(arr, "shards", None) is not None:
+            if on_sharded == "skip":
+                return sorted(arr.attrs.get(_NONEMPTY_CHUNKS_ATTR, []) or [])
+            raise ShardedPresenceError(
+                f"Cannot derive presence for {array_name!r} in "
+                f"{self._zarr.path or '<root>'}: it is natively sharded, so "
+                f"its cells are packed into shard objects the key listing "
+                f"cannot resolve and the manifest would be rewritten to "
+                f"(almost) empty. Rebuild presence BEFORE sharding, or pass "
+                f"on_sharded='skip' to leave this array's manifest alone."
             )
         base = self._zarr.path.strip("/")
         prefix = f"{base}/{array_name}/c/" if base else f"{array_name}/c/"
@@ -1399,6 +1821,88 @@ def _coord_to_index(
     if origin is None:
         return coords
     return tuple(c - o for c, o in zip(coords, origin))
+
+
+class _ChunkListing:
+    """One chunk array's presence manifest, in the forms readers ask for.
+
+    Built once per :meth:`Group.cached_nodes` session from the array's
+    ``nonempty_chunks`` attribute.  Every derived form is lazy: an array a
+    read only lists never pays the coordinate parse, and a read that never
+    resolves a bounding box never builds the spatial index.
+    """
+
+    __slots__ = (
+        "keys", "_coords", "_present", "_by_spatial", "_by_spatial_nd",
+        "_spec", "_spec_known",
+    )
+
+    def __init__(self, keys: list[str]) -> None:
+        self.keys = keys
+        self._coords: list[tuple[int, ...]] | None = None
+        self._present: frozenset[tuple[int, ...]] | None = None
+        self._by_spatial: dict[tuple[int, ...], list[tuple[int, ...]]] | None = None
+        self._by_spatial_nd: int | None = None
+        # The direct-read spec rides along: it is per-array, has the same
+        # lifetime, and is dropped by the same invalidation.  Tracked with
+        # a separate flag because ``None`` is a real answer -- it means
+        # "this array is not direct-readable", which is worth caching too.
+        self._spec: Any = None
+        self._spec_known = False
+
+    @property
+    def spec_known(self) -> bool:
+        return self._spec_known
+
+    @property
+    def spec(self) -> Any:
+        return self._spec
+
+    def set_spec(self, spec: Any) -> None:
+        self._spec = spec
+        self._spec_known = True
+
+    def coords(self) -> list[tuple[int, ...]]:
+        """The keys parsed to coordinate tuples, in numeric order.
+
+        Keys that do not parse are skipped — the manifest should hold
+        nothing else, but a stray entry is not worth failing a read over.
+        """
+        if self._coords is None:
+            self._coords = sorted(
+                c for c in (_parse_chunk_coords(k) for k in self.keys)
+                if c is not None
+            )
+        return self._coords
+
+    def present(self) -> frozenset[tuple[int, ...]]:
+        """The same coordinates as a set, for membership tests.
+
+        What lets a bounding box be resolved from the box side: the box
+        names a handful of cells and asks which of them exist, instead of
+        asking every cell in the level whether it is in the box.
+        """
+        if self._present is None:
+            self._present = frozenset(self.coords())
+        return self._present
+
+    def by_spatial(self, nd: int) -> dict[tuple[int, ...], list[tuple[int, ...]]]:
+        """Coordinates grouped by their trailing ``nd`` (spatial) axes.
+
+        The index a box-side lookup needs on a store whose keys carry a
+        leading non-spatial axis — ``chunk_by_attribute``, or a rechunk by
+        a computed dimension — where one spatial cell maps to one key per
+        bin.  On an ordinary store this is an identity grouping and pure
+        overhead, which is why callers check arity first and use
+        :meth:`present` instead.
+        """
+        if self._by_spatial is None or self._by_spatial_nd != nd:
+            index: dict[tuple[int, ...], list[tuple[int, ...]]] = {}
+            for c in self.coords():
+                index.setdefault(c[-nd:], []).append(c)
+            self._by_spatial = index
+            self._by_spatial_nd = nd
+        return self._by_spatial
 
 
 def _parse_chunk_coords(key: str) -> tuple[int, ...] | None:

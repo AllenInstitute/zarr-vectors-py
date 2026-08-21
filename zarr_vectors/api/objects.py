@@ -45,8 +45,21 @@ class ObjectCatalog:
     def __init__(self, level: Level) -> None:
         self._level = level
 
+    def _group(self) -> Any:
+        from zarr_vectors.core.store import get_resolution_level
+
+        return get_resolution_level(
+            self._level.dataset._group, self._level.index,
+        )
+
     def __len__(self) -> int:
-        """How many objects exist, from metadata alone."""
+        """How many object SLOTS exist, from metadata alone.
+
+        Slots, not objects.  A sparsified pyramid level keeps a dropped
+        object's id as an empty manifest so ids stay stable across levels,
+        so this counts those too.  :attr:`count` is the number actually
+        present; :attr:`slots` is this, named for what it is.
+        """
         from zarr_vectors.core.arrays import object_count
         from zarr_vectors.core.store import get_resolution_level
 
@@ -59,8 +72,24 @@ class ObjectCatalog:
         return object_count(group)
 
     @property
-    def count(self) -> int:
+    def slots(self) -> int:
+        """How many ids this level addresses, present or not."""
         return len(self)
+
+    @property
+    def count(self) -> int:
+        """How many objects are actually here.
+
+        Reads the stamped ``num_present`` where available and decodes the
+        manifests otherwise, so it is correct on stores written before
+        that field existed and merely slower.
+        """
+        from zarr_vectors.core.arrays import object_present_count
+
+        try:
+            return object_present_count(self._group())
+        except Exception:
+            return len(self)
 
     def __getitem__(self, key: int | Sequence[int] | slice) -> ReadResult:
         """Read one object, or several, by id."""
@@ -75,14 +104,34 @@ class ObjectCatalog:
     def __iter__(self) -> Iterator[int]:
         return iter(self.ids())
 
-    def ids(self) -> npt.NDArray[Any]:
-        """Every object id present at this level.
+    def ids(self, *, present: bool = True) -> npt.NDArray[Any]:
+        """Object ids at this level.
 
-        Reads the manifests' *count*, not their contents — an id is
-        present if it has a manifest row, and that is answerable from
-        metadata.
+        Args:
+            present: When True (the default), only ids that actually hold
+                geometry.  When False, every addressable slot.
+
+        This used to return ``arange(slot_count)`` unconditionally, which
+        is wrong for exactly the stores this package builds: a sparsified
+        level reports every dropped id as present, and reading one gives
+        ``vertex_count == 0`` — indistinguishable from an empty region.
         """
-        return np.arange(len(self), dtype=np.int64)
+        if not present:
+            return np.arange(len(self), dtype=np.int64)
+        try:
+            return np.flatnonzero(self.present_mask()).astype(np.int64)
+        except Exception:
+            return np.arange(len(self), dtype=np.int64)
+
+    def present_mask(self) -> npt.NDArray[Any]:
+        """Per-slot boolean: does this id hold any geometry?
+
+        Decodes the manifests — there is no cheaper exact answer per id.
+        Use :attr:`count` when only the total is needed.
+        """
+        from zarr_vectors.core.arrays import object_present_mask
+
+        return object_present_mask(self._group())
 
     def manifests(self, ids: Sequence[int] | None = None) -> dict[int, Any]:
         """Where each object's fragments live.
@@ -92,13 +141,21 @@ class ObjectCatalog:
         that such a tool imported three private names to get it.
         """
         from zarr_vectors.core.arrays import read_object_manifests
-        from zarr_vectors.core.store import get_resolution_level
 
-        group = get_resolution_level(self._level.dataset._group, self._level.index)
-        return read_object_manifests(group, ids=ids)
+        return read_object_manifests(self._group(), ids=ids)
 
     def __contains__(self, object_id: int) -> bool:
-        return 0 <= int(object_id) < len(self)
+        """Whether this id holds geometry — not merely whether it is in range."""
+        oid = int(object_id)
+        if not (0 <= oid < len(self)):
+            return False
+        try:
+            return bool(self.present_mask()[oid])
+        except Exception:
+            return True
 
     def __repr__(self) -> str:
-        return f"ObjectCatalog(level={self._level.index}, count={len(self)})"
+        return (
+            f"ObjectCatalog(level={self._level.index}, "
+            f"count={self.count}, slots={self.slots})"
+        )

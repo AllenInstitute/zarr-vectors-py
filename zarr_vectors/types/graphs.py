@@ -25,6 +25,7 @@ import numpy as np
 import numpy.typing as npt
 
 from zarr_vectors.constants import (
+    RESOLUTION_PREFIX,
     CROSS_CHUNK_EXPLICIT,
     FRAGMENT_ATTRIBUTES,
     GEOM_GRAPH,
@@ -37,6 +38,7 @@ from zarr_vectors.constants import (
     VERTICES,
 )
 from zarr_vectors.core.arrays import (
+    stamp_fragments_tile,
     create_attribute_array,
     create_fragment_attribute_array,
     create_links_array,
@@ -70,6 +72,7 @@ from zarr_vectors.core.metadata import (
 )
 from zarr_vectors.core.paths import links_group_path
 from zarr_vectors.core.store import (
+    FsGroup,
     _apply_out_of_bounds_policy,
     _create_or_open_store,
     _ensure_root_metadata_for_write,
@@ -498,6 +501,11 @@ def write_graph(
             for _name, _data in object_attributes.items():
                 write_object_attributes(level_group, _name, np.asarray(_data))
 
+        # Record the tiling layout just written, so a later bulk read
+    # can return each chunk's buffer without reading its fragment
+    # index.  Verified against what is on disk, and stamped after
+    # the chunk writes -- see stamp_fragments_tile.
+    stamp_fragments_tile(level_group, ndim)
     _finalize_write(root, "write_graph" if not is_tree else "write_skeleton")
     return {
         "node_count": n_nodes,
@@ -560,6 +568,42 @@ def read_graph(
             "which does implement object_ids."
         )
     root = open_store(store_path, backend=backend)
+    with root.cached_nodes():
+        # One node-resolution pass for the whole read, and every
+        # node it needs asked for in a single gather rather than
+        # resolved one at a time as the code reaches them.
+        prefix = f"{RESOLUTION_PREFIX}{level}"
+        root.prime_nodes([
+            prefix,
+            f"{prefix}/{VERTICES}",
+            f"{prefix}/{VERTEX_FRAGMENTS}",
+            f"{prefix}/{LINK_FRAGMENTS}",
+        ])
+        return _read_graph(
+            root,
+            level=level,
+            object_ids=object_ids,
+            bbox=bbox,
+            chunks=chunks,
+            attribute_filter=attribute_filter,
+        )
+
+
+def _read_graph(
+    root: FsGroup,
+    *,
+    level: int,
+    object_ids: list[int] | None,
+    bbox: BoundingBox | None,
+    chunks: list[ChunkCoords] | None,
+    attribute_filter: dict[str, Any] | None,
+) -> dict[str, Any]:
+    """Body of :func:`read_graph`, against an already-open store.
+
+    Split out only so the caller can hold a
+    :meth:`Group.cached_nodes` block open across the whole read;
+    the two halves are one function.
+    """
     root_meta = read_root_metadata(root)
     level_group = get_resolution_level(root, level)
     ndim = root_meta.sid_ndim

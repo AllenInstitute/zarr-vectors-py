@@ -402,6 +402,13 @@ class Dataset:
         self, *, factors: Sequence[tuple[float, float]], method: str = "per_object",
         **kw: Any,
     ) -> dict[str, Any]:
+        """Build coarser levels.
+
+        ``method`` selects the coarsener: ``"per_object"`` is core's, and
+        anything :func:`coarsen_methods` also lists comes from an
+        installed strategy package.  Pass that strategy's own knobs as
+        ``options={...}``.
+        """
         from zarr_vectors.multiresolution.coarsen import build_pyramid
 
         out = build_pyramid(self.url, factors=list(factors), method=method, **kw)

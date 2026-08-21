@@ -19,6 +19,7 @@ import numpy as np
 import numpy.typing as npt
 
 from zarr_vectors.constants import (
+    RESOLUTION_PREFIX,
     CROSS_CHUNK_EXPLICIT,
     GEOM_LINE,
     LINKS_IMPLICIT_SEQUENTIAL,
@@ -28,6 +29,7 @@ from zarr_vectors.constants import (
 )
 from zarr_vectors.constants import OBJECT_INDEX
 from zarr_vectors.core.arrays import (
+    stamp_fragments_tile,
     create_attribute_array,
     create_object_attributes_array,
     create_object_index_array,
@@ -350,6 +352,11 @@ def write_lines(
             for name, data in line_attributes.items():
                 write_object_attributes(level_group, name, np.asarray(data))
 
+        # Record the tiling layout just written, so a later bulk read
+    # can return each chunk's buffer without reading its fragment
+    # index.  Verified against what is on disk, and stamped after
+    # the chunk writes -- see stamp_fragments_tile.
+    stamp_fragments_tile(level_group, ndim)
     _finalize_write(root, "write_lines")
     return {
         "line_count": n_lines,
@@ -386,6 +393,40 @@ def read_lines(
         - ``line_count``: number of lines returned
     """
     root = open_store(store_path, backend=backend)
+    with root.cached_nodes():
+        # One node-resolution pass for the whole read, and every
+        # node it needs asked for in a single gather rather than
+        # resolved one at a time as the code reaches them.
+        prefix = f"{RESOLUTION_PREFIX}{level}"
+        root.prime_nodes([
+            prefix,
+            f"{prefix}/{VERTICES}",
+            f"{prefix}/{VERTEX_FRAGMENTS}",
+            f"{prefix}/{OBJECT_INDEX}",
+        ])
+        return _read_lines(
+            root,
+            level=level,
+            object_ids=object_ids,
+            bbox=bbox,
+            attribute_filter=attribute_filter,
+        )
+
+
+def _read_lines(
+    root: FsGroup,
+    *,
+    level: int,
+    object_ids: list[int] | None,
+    bbox: BoundingBox | None,
+    attribute_filter: dict[str, Any] | None,
+) -> dict[str, Any]:
+    """Body of :func:`read_lines`, against an already-open store.
+
+    Split out only so the caller can hold a
+    :meth:`Group.cached_nodes` block open across the whole read;
+    the two halves are one function.
+    """
     root_meta = read_root_metadata(root)
     level_group = get_resolution_level(root, level)
     ndim = root_meta.sid_ndim
