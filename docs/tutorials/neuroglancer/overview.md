@@ -18,8 +18,10 @@ translates ZVF stores into Neuroglancer layers on the fly.
 
 Neuroglancer's data source plugins expect data in specific binary formats
 (precomputed, N5, OME-Zarr). ZVF stores vertex data as spatially chunked
-Zarr arrays with a fragment index — a structure Neuroglancer does not understand
-without a mediating translation layer.
+Zarr arrays — `vertices/` cells addressed by chunk coordinate, with a
+`vertex_fragments/` index that slices each cell into per-bin or per-object
+runs — a structure Neuroglancer does not understand without a mediating
+translation layer.
 
 `zv-ngtools` provides that layer: it runs a local HTTP file server that
 intercepts Neuroglancer's chunk requests, reads the requested spatial
@@ -42,7 +44,9 @@ a Neuroglancer browser tab. The server:
 
 LOD is driven by the ZVF resolution pyramid: as the user zooms out in
 Neuroglancer, the server switches to coarser levels automatically, using
-the `bin_shape` at each level to select the appropriate resolution.
+each level's bin shape to select the appropriate resolution. That number is
+`ds.level(i).resolution` on the supported api; see
+[LOD and resolution level control](local_viewer.md#lod-and-resolution-level-control).
 
 ```
 Python process                         Browser
@@ -118,9 +122,58 @@ ZVF stores and Neuroglancer image volumes can be displayed together when
 they share a coordinate system. Neuroglancer uses a global coordinate space
 for all layers; each layer specifies its own coordinate transform.
 
-`zv-ngtools` reads the `coordinate_system` and `multiscales.axes` fields
-from the ZVF store's `.zattrs` to set the Neuroglancer layer transform.
-Stores declared in `RAS` (Right-Anterior-Superior) space are automatically
+A ZVF store is a Zarr **v3** group, so its root document is `zarr.json`.
+There is no `.zattrs` — that is the Zarr v2 spelling — and no `metadata.json`.
+Everything a viewer needs sits in that one file, under two attribute keys:
+
+- `attributes.zarr_vectors` — the store-level fields: `zv_version`, `bounds`,
+  `chunk_shape`, `base_bin_shape`, `geometry_types`, the convention flags, and
+  an optional `crs` naming the coordinate system. `crs` is written only when
+  one was declared, so a reader must treat it as absent by default.
+- `attributes.multiscales` — an OME-NGFF 0.4 block. `axes` names and types each
+  axis (plus a `unit` when the schema declared one), and
+  **`datasets[i].coordinateTransformations` is the key that carries the `scale`
+  and `translation` a viewer needs for the layer transform.**
+
+```python
+import json, pathlib
+
+root = json.loads(pathlib.Path("scan.zarrvectors/zarr.json").read_text())
+multiscales = root["attributes"]["multiscales"][0]
+
+print([axis["name"] for axis in multiscales["axes"]])
+for dataset in multiscales["datasets"]:
+    print(dataset["path"], dataset["coordinateTransformations"])
+```
+
+```
+['x', 'y', 'z']
+0 [{'type': 'scale', 'scale': [1.0, 1.0, 1.0]}, {'type': 'translation', 'translation': [15.625, 15.625, 15.625]}]
+1 [{'type': 'scale', 'scale': [2.0, 2.0, 2.0]}, {'type': 'translation', 'translation': [31.25, 31.25, 31.25]}]
+```
+
+`scale` is a multiplier on the root's `base_bin_shape`, not an absolute size:
+level 1's `[2, 2, 2]` against a `base_bin_shape` of `31.25` is a bin shape of
+`62.5` world units, and `translation` is half of that — the offset of the bin
+centre. The supported api assembles the same number, so a tool reading through
+`zarr-vectors-py` never has to multiply the two out itself:
+
+```python
+import zarr_vectors as zv
+
+ds = zv.open("scan.zarrvectors")
+print(ds.axes)
+for index in ds.levels:
+    print(index, ds.level(index).resolution)
+```
+
+```
+({'name': 'x', 'type': 'space'}, {'name': 'y', 'type': 'space'}, {'name': 'z', 'type': 'space'})
+0 (31.25, 31.25, 31.25)
+1 (62.5, 62.5, 62.5)
+```
+
+Stores that declare a `crs` of `RAS` (Right-Anterior-Superior) are automatically
 aligned with Neuroglancer's default RAS coordinate system.
 
 For stores in voxel space, pass an explicit affine when loading:
@@ -149,5 +202,7 @@ Before working through the detailed tutorials:
 
 Optionally, for best performance:
 
-- [ ] A multi-level pyramid (run `build_pyramid` first)
-- [ ] Consolidated metadata (`zarr.consolidate_metadata`)
+- [ ] A multi-level pyramid (run `ds.build_pyramid(factors=[(2.0, 1.0)])` first)
+- [ ] Consolidated metadata (`zarr.consolidate_metadata`) — this works on a ZVF
+      store, but zarr-python warns as it writes that consolidated metadata is not
+      part of the Zarr v3 specification and other implementations may ignore it

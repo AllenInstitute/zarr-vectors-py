@@ -10,9 +10,19 @@ reductions, per-vertex attributes (normals, UV coordinates, scalars), and
 multi-mesh stores that pack thousands of mesh objects into a single
 spatially indexed store.
 
-All examples on this page use only the core `zarr-vectors` API.
+All examples on this page use only the core `zarr-vectors` package.
 OBJ/STL/PLY converters live in **`zarr-vectors-tools`**; Draco
 compression requires `zarr-vectors[draco]`.
+
+`write_mesh` and `read_mesh` come from `zarr_vectors.types`, which is
+**undecided** — neither promised nor disowned. The writers are also
+exported from `zarr_vectors.building` and supported there; the readers
+cannot be retired until the data api can carry per-vertex attributes for
+every geometry, and pointing you at a lossy replacement would be worse
+than leaving them here. Everything else on this page uses the two
+supported surfaces: `zarr_vectors` itself for reading data, and
+`zarr_vectors.building` for the physical layout. Ask at runtime with
+`zv.stability("zarr_vectors.types")`.
 
 ---
 
@@ -22,7 +32,7 @@ compression requires `zarr-vectors[draco]`.
 
 ```python
 import numpy as np
-from zarr_vectors.types.meshes import write_mesh
+from zarr_vectors.building import write_mesh
 
 # Generate a simple icosphere (demonstration only)
 # In practice, load from OBJ, STL, PLY, or a segmentation pipeline
@@ -100,7 +110,7 @@ Draco compression is enabled with `encoding="draco"` (the default is
 with `draco_quantization_bits`, which defaults to `11`:
 
 ```python
-from zarr_vectors.types.meshes import write_mesh
+from zarr_vectors.building import write_mesh
 
 summary = write_mesh(
     "brain_draco.zarrvectors",
@@ -131,12 +141,17 @@ most visualisation and analysis workflows.
 # Check whether a store's vertices are Draco-encoded.
 # The encoding is recorded on the vertices array, not in root attrs —
 # there is no "draco_compressed" root attribute.
-from zarr_vectors.core.store import open_store, get_resolution_level
+from zarr_vectors.building import get_resolution_level, open_store
 
 level_group = get_resolution_level(open_store("brain_draco.zarrvectors", mode="r"), 0)
 meta = level_group.read_array_meta("vertices")
 print(meta["encoding"])            # 'raw' or 'draco'
 ```
+
+`open_store` and `get_resolution_level` are `zarr_vectors.building`
+names. They used to be imported from `zarr_vectors.core.store`; that
+module is internal, and the two functions are re-exported from
+`building` unchanged.
 
 **Important:** Draco-compressed stores are not readable without
 `zarr-vectors[draco]` installed. Communicate the compression requirement
@@ -167,30 +182,68 @@ the `vertices` array). Face indices are consistent: face `k` is defined by
 
 `read_mesh` takes no `attributes=` argument and never returns an
 `"attributes"` key — it returns only `vertices`, `faces`, `vertex_count`,
-and `face_count`. Read per-vertex attributes through the lazy API:
+and `face_count`. Read per-vertex attributes through the data API:
 
 ```python
-from zarr_vectors.lazy import open_zv
+import zarr_vectors as zv
 
-level = open_zv("brain_surface.zarrvectors")[0]
+level = zv.open("brain_surface.zarrvectors").level(0)
+print(level.attribute_names("vertex"))   # ('curvature', 'normal', 'thickness')
 
-curvature = level.attributes["curvature"].compute()   # (V,)
-thickness = level.attributes["thickness"].compute()   # (V,)
+result    = level.read()
+curvature = result.attributes["curvature"]   # (V,)
+thickness = result.attributes["thickness"]   # (V,)
 ```
 
-**Vector attributes come back flat.** A `(V, C)` attribute such as
-`normal` reads back as a 1-D `(V * C,)` array — the component shape is
-not restored. Reshape it yourself:
+Earlier versions of this page reached for `zarr_vectors.lazy.open_zv`
+here. That module is internal, and `open_zv` now emits a
+`DeprecationWarning` explaining why: the lazy layer reads chunk by chunk
+in Python and opens no batched-read block, so against an object store it
+is slower than the eager path it was meant to improve on. `zv.open`
+returns a `Dataset` that drives the batching engine instead.
+
+**Vector attributes do not come back.** `write_mesh` flattens a `(V, C)`
+attribute such as `normal` into a `(V * C,)` column and records its
+stored width as 1. The level still lists the name, but `read()` drops it,
+because a column of `V * C` rows cannot be paired with `V` positions
+without guessing:
 
 ```python
-if "normal" in level.attributes:
-    normals = level.attributes["normal"].compute()    # (V*3,) — flat!
-    normals = normals.reshape(-1, 3)                  # (V, 3)
+print(level.attribute_names("vertex"))   # ('curvature', 'normal', 'thickness')
+print(result.attributes.names())         # ('curvature', 'thickness') — no 'normal'
 ```
 
-These arrays are in stored order for the whole level, so they align with
-an unfiltered `read_mesh(...)["vertices"]` but not with a bbox-filtered
-one.
+Fetch it from the building surface, which hands back the flat column for
+you to reshape. `chunk_local_to_global_offsets` gives the chunk order the
+readers concatenate in, so the reshaped array lines up row-for-row with
+`result.positions`:
+
+```python
+import numpy as np
+from zarr_vectors.building import (
+    chunk_local_to_global_offsets,
+    get_resolution_level,
+    open_store,
+    read_chunk_attributes,
+)
+
+level_group = get_resolution_level(
+    open_store("brain_surface.zarrvectors", mode="r"), 0,
+)
+_offsets, chunk_keys, total = chunk_local_to_global_offsets(level_group)
+
+flat = np.concatenate([
+    fragment
+    for cc in chunk_keys
+    for fragment in read_chunk_attributes(level_group, "normal", cc)
+])                                       # (V*3,) — flat!
+normals = flat.reshape(-1, 3)            # (V, 3)
+```
+
+Both routes are in stored order for the whole level, so they align with
+an unfiltered read but not with a bbox-filtered one. A narrowed read says
+so rather than mis-pairing values with positions: it comes back with
+`attributes_read == False` and an empty `attributes`.
 
 ### Spatial bbox query
 
@@ -223,7 +276,7 @@ indices into the combined vertex space:
 
 ```python
 import numpy as np
-from zarr_vectors.types.meshes import write_mesh
+from zarr_vectors.building import write_mesh
 
 vert_blocks, face_blocks, oid_blocks = [], [], []
 cell_volumes, cell_types = [], []
@@ -256,12 +309,39 @@ own object so the per-object uniformity check is trivially satisfied.
 
 ### Reading cells
 
-> **Known limitation.** `read_mesh` accepts an `object_ids=` argument,
-> but in the current version it has **no effect** — the parameter is
-> never applied, so you get the whole level back regardless of what you
-> pass. There is currently no way to read a single mesh object out of a
-> multi-mesh store via `read_mesh`. Use `bbox=` or `chunks=` to restrict
-> a read spatially, which does work.
+> **Known limitation.** `read_mesh` accepts an `object_ids=` argument
+> but does not implement it, and says so rather than pretending:
+>
+> ```pycon
+> >>> read_mesh("cells.zarrvectors", object_ids=[3])
+> NotImplementedError: read_mesh(object_ids=...) is not implemented: the filter
+> would be silently ignored and you would get the whole level back. Filter the
+> returned arrays yourself, or use read_polylines, which does implement object_ids.
+> ```
+>
+> `level.objects[3]` on the data API goes through the same reader and
+> raises the same error, so a mesh object cannot be read by id from
+> either supported surface. Use `bbox=` or `chunks=` to restrict a read
+> spatially, which does work, or read one object's vertices through
+> `zarr_vectors.building` (below).
+
+One object's vertices *can* be gathered by following its manifest, which
+is what `object_index/manifests/` is for:
+
+```python
+import numpy as np
+from zarr_vectors.building import (
+    get_resolution_level, open_store, read_object_vertices,
+)
+
+level_group = get_resolution_level(open_store("cells.zarrvectors", mode="r"), 0)
+fragments = read_object_vertices(level_group, 3, ndim=3)   # per-chunk pieces
+cell_3 = np.concatenate(fragments)                         # (V_3, 3)
+```
+
+That gives you vertices, not faces: reassembling one object's faces still
+means reading the level and filtering. This is the gap to report rather
+than a reason to import from `core`.
 
 ```python
 from zarr_vectors.types.meshes import read_mesh
@@ -289,17 +369,23 @@ print(result["face_count"])
 ```
 
 There is no `return_object_ids` option — passing it raises `TypeError`.
-To discover which cells have geometry in a region, use the lazy API's
-object helpers:
+To ask which cells a store holds, use the level's object catalogue:
 
 ```python
-from zarr_vectors.lazy import open_zv
+import zarr_vectors as zv
 
-store = open_zv("cells.zarrvectors")
-level = store[0]
-print(level.present_oids)        # object IDs present at this level
-print(level.has_object(42))      # True / False
+level = zv.open("cells.zarrvectors").level(0)
+print(level.objects)                       # ObjectCatalog(level=0, count=6, slots=6)
+print(level.objects.ids())                 # ids that actually hold geometry
+print(level.objects.ids(present=False))    # every addressable slot
+print(42 in level.objects)                 # True / False
+print(len(level.objects))                  # slot count, from metadata; reads nothing
 ```
+
+The catalogue answers for the whole level, not for a region.
+`select(bbox=...).object_ids()` comes back **empty** on a mesh store —
+the mesh reader does not carry per-vertex object ids — so there is no
+per-region object listing for meshes on either surface.
 
 ---
 
@@ -318,31 +404,39 @@ from zarr_vectors.validate import validate
 result = validate("brain.zarrvectors", level=4)
 print(result.summary())
 # Level 4 validation: PASS
-#   29 passed, 0 warnings, 0 errors
+#   26 passed, 0 warnings, 0 errors
 ```
 
-For closed surfaces, level 4 additionally checks watertightness (every
-edge shared by exactly two faces). Enable this check by setting
-`closed_surface = true` in root `.zattrs`:
+The count moves with what the store contains — it is how many assertions
+ran, not a score.
 
-```python
-from zarr_vectors.core.store import open_store
+Beyond the generic checks, level 4 asks two things of a mesh: that the
+declared `links_convention` is `explicit`, and that the delta-0 links
+family has `link_width >= 3`. A mesh store with no link metadata at all
+is a warning rather than an error — that is the Draco no-boundary-face
+case.
 
-root = open_store("cell.zarrvectors", mode="r+")
-root.attrs["closed_surface"] = True
-# Now validate(cell.zarrvectors, level=4) checks watertightness
-```
+**There is no `closed_surface` flag and no watertightness check.**
+Earlier versions of this page said the check could be switched on by
+setting `closed_surface = true` in root `.zattrs`. Both halves were
+wrong. No shipped code writes, reads or validates that key, and `.zattrs`
+is Zarr v2 spelling: a v3 store keeps its root fields in `zarr.json`,
+under `attributes.zarr_vectors`. Watertightness, boundary edges,
+degenerate faces and winding consistency are checked at no level, so
+check them yourself before writing if they matter.
 
 ---
 
 ## Common pitfalls
 
 **Face indices are global, not local.**
-When calling `write_mesh` with a single mesh, `faces` must use 0-based
-indices into the `vertices` array you are passing. When calling with
-a list of per-object arrays, each face array uses local indices into
-its own per-object `vertices` array; the writer handles global index
-conversion automatically.
+`faces` must use 0-based indices into the `vertices` array you are
+passing — always, including in a multi-mesh store, where you offset each
+cell's face indices into the combined vertex space yourself (see
+[Writing a multi-mesh store](#writing-a-multi-mesh-store)). There is no
+list-of-per-object-arrays form that would convert local indices for you;
+passing lists fails on the shape check with `ValueError: too many values
+to unpack (expected 2)`.
 
 **Draco changes vertex positions slightly.**
 Draco quantises vertex positions to integers before compression. Even at
@@ -352,16 +446,15 @@ downstream numerical computation on vertex coordinates). For visualisation,
 11-bit quantisation is imperceptible.
 
 **Winding order inconsistency between files.**
-Different mesh tools use different winding conventions. `ingest_obj`
-defaults to CCW (the OBJ standard) but some exporters produce CW meshes
-without declaring it. If your rendered normals point inward, pass
-`winding_order="cw"` at ingest time or flip normals post-hoc:
-
-```python
-ingest_obj("inverted.obj", "inverted.zarrvectors",
-           chunk_shape=(10., 10., 10.),
-           winding_order="cw")
-```
+Different mesh tools use different winding conventions, and some
+exporters produce CW meshes without declaring it. Nothing in this package
+can help: `write_mesh` has no `winding_order` argument, no root key
+records one, and no validation level checks winding consistency. What
+`write_mesh` guarantees is narrower and more useful — the input vertex
+order of each face is recovered exactly on read. If your rendered normals
+point inward, fix it at ingest time (the OBJ/STL/PLY converters in
+**`zarr-vectors-tools`** are where a winding option would live) or flip
+the normals post-hoc.
 
 **Boundary face resolution requires fetching extra chunks.**
 A face whose centroid is in chunk A but one vertex is in chunk B requires

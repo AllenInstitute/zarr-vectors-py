@@ -65,10 +65,15 @@ viewer.add("scan.zarrvectors", name="synchrotron_scan")
 viewer.add("zarr_vectors:///path/to/scan.zarrvectors")
 ```
 
-`add()` reads the root `.zattrs` of the store, determines the geometry
-type, and registers the appropriate Neuroglancer layer type. The store is
-not read in full at this point — data is fetched on demand as the viewer
-pans and zooms.
+`add()` reads the store's root `zarr.json`, determines the geometry type,
+and registers the appropriate Neuroglancer layer type. A ZVF store is a Zarr
+v3 group, so `zarr.json` is its root document — there is no `.zattrs`, which
+is the Zarr v2 spelling. The geometry type is
+`attributes.zarr_vectors.geometry_types`, and the layer transform comes from
+`attributes.multiscales`; see
+[Coordinate system alignment](overview.md#coordinate-system-alignment) for the
+full shape of that document. The store is not read in full at this point —
+data is fetched on demand as the viewer pans and zooms.
 
 ### From S3
 
@@ -203,16 +208,24 @@ By default, `zv-ngtools` selects the resolution level based on the
 Neuroglancer viewport's screen resolution at the current zoom. As the
 user zooms out, coarser levels are served automatically.
 
-The LOD decision uses:
+The decision needs one number per level: that level's bin shape, the finest
+region a spatial read can isolate. The supported api exposes it as
+`Level.resolution`, so the selection is a plain scan over `Dataset.levels`:
 
 ```python
-# Pseudocode inside the zv-ngtools request handler
-def select_level(store, requested_resolution_um):
-    for level in reversed(store.levels):   # coarsest first
-        if store.bin_shape_at(level).max() <= requested_resolution_um:
-            return level
-    return 0   # finest level if nothing coarser qualifies
+import zarr_vectors as zv
+
+ds = zv.open("tracts.zarrvectors")
+
+def select_level(ds, requested_resolution_um):
+    for index in reversed(ds.levels):      # coarsest first
+        if max(ds.level(index).resolution) <= requested_resolution_um:
+            return index
+    return ds.levels[0]                    # finest level if nothing coarser qualifies
 ```
+
+`ds.levels` is ascending with the finest level first, so `ds.levels[0]` is the
+fall-through when no coarser level is good enough.
 
 ### Force a specific level
 
