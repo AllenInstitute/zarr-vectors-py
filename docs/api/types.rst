@@ -6,6 +6,14 @@ accept either a local path string, a ``zarr.storage.Store`` object, or
 an fsspec mapper as the first argument. All read functions return a typed
 result dictionary documented on each function's page.
 
+``zarr_vectors.types`` is *undecided* tier in ``zarr_vectors/_stability.py``
+— superseded by the :doc:`api` surface, but not deprecated: "The five
+store-creating writers are promoted into ``building`` and are supported
+there. The readers are superseded by ``Level.read()`` / ``ReadResult``, but
+cannot be deprecated until the api can carry per-vertex attributes for every
+geometry — pointing callers at a lossy replacement is worse than leaving
+them here."
+
 Point clouds
 ------------
 
@@ -42,19 +50,6 @@ Meshes
 ------
 
 .. automodule:: zarr_vectors.types.meshes
-   :members:
-   :undoc-members:
-   :show-inheritance:
-
-Multi-resolution coarsening
----------------------------
-
-.. automodule:: zarr_vectors.multiresolution.coarsen
-   :members:
-   :undoc-members:
-   :show-inheritance:
-
-.. automodule:: zarr_vectors.multiresolution.object_selection
    :members:
    :undoc-members:
    :show-inheritance:
