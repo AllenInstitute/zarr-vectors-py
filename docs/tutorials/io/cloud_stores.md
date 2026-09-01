@@ -604,7 +604,7 @@ True 42
 ```
 
 `shard_shape` is expressed in *inner-chunk* units — one inner chunk is
-one ZVF spatial chunk. An `int` broadcasts to every axis; a tuple sets
+one Zarr Vectors spatial chunk. An `int` broadcasts to every axis; a tuple sets
 each axis explicitly. Pass `arrays=[...]` to convert only selected
 logical arrays. The result is plain Zarr v3, readable by any conformant
 implementation; no ZV-specific metadata is involved. See the

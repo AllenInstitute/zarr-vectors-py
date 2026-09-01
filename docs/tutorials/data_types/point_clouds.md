@@ -1,6 +1,6 @@
 # Point clouds
 
-Point clouds are the simplest ZVF geometry type: a collection of spatial
+Point clouds are the simplest Zarr Vectors geometry type: a collection of spatial
 positions with optional per-vertex scalar or vector attributes. They arise
 in synchrotron absorption imaging (HiP-CT, micro-CT), single-molecule
 localisation microscopy (STORM, PALM, MINFLUX), spatial transcriptomics
@@ -252,7 +252,7 @@ pyramids](#multi-resolution-pyramids) below, which builds one into this store.
 
 ## Spatial bounding-box queries
 
-ZVF queries target individual bins — not full chunks — so for a point cloud the
+Zarr Vectors queries target individual bins — not full chunks — so for a point cloud the
 box is vertex-exact: the count is the true number of points inside it, not the
 contents of the chunks it overlaps.
 

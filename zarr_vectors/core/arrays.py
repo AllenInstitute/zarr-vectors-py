@@ -1779,7 +1779,7 @@ def _write_object_index_manifests(
 
     chunk_size = min(OBJECT_INDEX_MANIFEST_BUCKET, n)
     # zarr 3.x's variable-length bytes dtype lacks a finalised V3 spec
-    # (zarr-extensions tracks it); the warning is informational and ZVF
+    # (zarr-extensions tracks it); the warning is informational and Zarr Vectors
     # is alpha — accept it and silence at the call site so writes stay
     # quiet.  Revisit if the spec lands incompatibly.
     with warnings.catch_warnings():

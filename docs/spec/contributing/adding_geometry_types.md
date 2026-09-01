@@ -14,17 +14,17 @@
 
 **Write function**
 : The `write_<type>()` function in `zarr_vectors/types/<type>.py` that
-  accepts raw geometry data and writes a conforming ZVF store.
+  accepts raw geometry data and writes a conforming Zarr Vectors store.
 
 **Read function**
-: The `read_<type>()` function that reads a ZVF store of the given type
+: The `read_<type>()` function that reads a Zarr Vectors store of the given type
   and returns a typed result dict.
 
 ---
 
 ## Introduction
 
-Adding a new geometry type to ZVF requires changes at every layer of the
+Adding a new geometry type to Zarr Vectors requires changes at every layer of the
 stack: a new type constant, type-specific arrays, a writer, a reader, a
 validator, a lazy loader, and documentation. This page provides a step-by-
 step checklist for contributors adding a new type, using the existing types

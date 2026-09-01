@@ -4,20 +4,20 @@
 viewer for petascale volumetric data, widely used in connectomics, brain
 imaging, and synchrotron science. It natively understands several data
 formats (OME-Zarr image volumes, Neuroglancer precomputed, N5), but does
-not have native support for the Zarr Vector Format.
+not have native support for the Zarr Vectors.
 
 [`zv-ngtools`](https://github.com/BRIDGE-Neuroscience/zv-ngtools) bridges
 this gap. It is a fork of
 [`ngtools`](https://github.com/neuroscales/ngtools) — a collection of
 Neuroglancer utilities — extended with a `zarr_vectors` layer type that
-translates ZVF stores into Neuroglancer layers on the fly.
+translates Zarr Vectors stores into Neuroglancer layers on the fly.
 
 ---
 
-## Why Neuroglancer cannot read ZVF natively
+## Why Neuroglancer cannot read Zarr Vectors natively
 
 Neuroglancer's data source plugins expect data in specific binary formats
-(precomputed, N5, OME-Zarr). ZVF stores vertex data as spatially chunked
+(precomputed, N5, OME-Zarr). Zarr Vectors stores vertex data as spatially chunked
 Zarr arrays — `vertices/` cells addressed by chunk coordinate, with a
 `vertex_fragments/` index that slices each cell into per-bin or per-object
 runs — a structure Neuroglancer does not understand without a mediating
@@ -25,7 +25,7 @@ translation layer.
 
 `zv-ngtools` provides that layer: it runs a local HTTP file server that
 intercepts Neuroglancer's chunk requests, reads the requested spatial
-region from a ZVF store using `zarr-vectors-py`, and returns the data in
+region from a Zarr Vectors store using `zarr-vectors-py`, and returns the data in
 a format Neuroglancer expects.
 
 ---
@@ -39,10 +39,10 @@ a Neuroglancer browser tab. The server:
 
 1. Receives chunk requests from Neuroglancer (HTTP range requests).
 2. Uses `zarr-vectors-py` to read the requested fragment slices.
-3. Translates the ZVF data to the Neuroglancer layer protocol.
+3. Translates the Zarr Vectors data to the Neuroglancer layer protocol.
 4. Returns the response to the browser.
 
-LOD is driven by the ZVF resolution pyramid: as the user zooms out in
+LOD is driven by the Zarr Vectors resolution pyramid: as the user zooms out in
 Neuroglancer, the server switches to coarser levels automatically, using
 each level's bin shape to select the appropriate resolution. That number is
 `ds.level(i).resolution` on the supported api; see
@@ -65,7 +65,7 @@ where the data lives on local disk or a mounted network share.
 
 ### Path B — Precomputed export for static hosting
 
-Convert a ZVF store to the Neuroglancer precomputed format and upload to
+Convert a Zarr Vectors store to the Neuroglancer precomputed format and upload to
 a public HTTP server (S3, GCS, nginx). Neuroglancer fetches the data
 directly without any intermediary Python process.
 
@@ -89,11 +89,11 @@ workflow.
 | Load TRK / TCK tractography | ✓ | ✓ |
 | Load NIfTI, MGH, TIFF | ✓ | ✓ |
 | Load `.zarrvectors` stores | ✗ | ✓ |
-| ZVF-aware LOD selection | ✗ | ✓ |
+| Zarr Vectors-aware LOD selection | ✗ | ✓ |
 | `zarr_vectors` layer type | ✗ | ✓ |
-| Precomputed export from ZVF | ✗ | ✓ |
+| Precomputed export from Zarr Vectors | ✗ | ✓ |
 | Point cloud layer rendering | ✗ | ✓ |
-| Streamline layer rendering | ✗ (only TRK/TCK) | ✓ (from ZVF) |
+| Streamline layer rendering | ✗ (only TRK/TCK) | ✓ (from Zarr Vectors) |
 
 The `zarr://` URL scheme (for OME-Zarr stores) works identically in both
 forks. Only the `zarr_vectors://` scheme is new.
@@ -102,7 +102,7 @@ forks. Only the `zarr_vectors://` scheme is new.
 
 ## Layer type mapping
 
-| ZVF geometry type | Neuroglancer layer type | Notes |
+| Zarr Vectors geometry type | Neuroglancer layer type | Notes |
 |------------------|------------------------|-------|
 | `point_cloud` | `annotation` (point) | Rendered as 3-D points; size and colour from attributes |
 | `line` | `annotation` (line) | Rendered as line segments |
@@ -118,11 +118,11 @@ server-side translation step.
 
 ## Coordinate system alignment
 
-ZVF stores and Neuroglancer image volumes can be displayed together when
+Zarr Vectors stores and Neuroglancer image volumes can be displayed together when
 they share a coordinate system. Neuroglancer uses a global coordinate space
 for all layers; each layer specifies its own coordinate transform.
 
-A ZVF store is a Zarr **v3** group, so its root document is `zarr.json`.
+A Zarr Vectors store is a Zarr **v3** group, so its root document is `zarr.json`.
 There is no `.zattrs` — that is the Zarr v2 spelling — and no `metadata.json`.
 Everything a viewer needs sits in that one file, under two attribute keys:
 
@@ -203,6 +203,6 @@ Before working through the detailed tutorials:
 Optionally, for best performance:
 
 - [ ] A multi-level pyramid (run `ds.build_pyramid(factors=[(2.0, 1.0)])` first)
-- [ ] Consolidated metadata (`zarr.consolidate_metadata`) — this works on a ZVF
+- [ ] Consolidated metadata (`zarr.consolidate_metadata`) — this works on a Zarr Vectors
       store, but zarr-python warns as it writes that consolidated metadata is not
       part of the Zarr v3 specification and other implementations may ignore it

@@ -5,7 +5,7 @@ from electron microscopy segmentation, brain or organ surfaces from MRI
 reconstruction, organelle hulls from fluorescence segmentation, or any
 other closed or open triangulated surface.
 
-ZVF meshes support optional Draco compression for significant size
+Zarr Vectors meshes support optional Draco compression for significant size
 reductions, per-vertex attributes (normals, UV coordinates, scalars), and
 multi-mesh stores that pack thousands of mesh objects into a single
 spatially indexed store.
@@ -263,7 +263,7 @@ print(result["face_count"])      # faces with centroid in the bbox region
 
 ## Multi-mesh stores
 
-For segmentation datasets with thousands of cell objects, a single ZVF
+For segmentation datasets with thousands of cell objects, a single Zarr Vectors
 store is far more efficient than per-cell OBJ files:
 
 ### Writing a multi-mesh store

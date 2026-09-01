@@ -1,6 +1,6 @@
 # Validation and repair
 
-The `zarr-vectors` validator checks ZVF stores for conformance at five
+The `zarr-vectors` validator checks Zarr Vectors stores for conformance at five
 levels of increasing thoroughness. This tutorial covers running validation
 and interpreting results.
 

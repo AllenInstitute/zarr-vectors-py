@@ -1,7 +1,7 @@
 Validation
 ==========
 
-Five-level conformance validator for ZVF stores. See
+Five-level conformance validator for Zarr Vectors stores. See
 :doc:`/spec/validation/overview` for a full description of each level.
 
 ``zarr_vectors.validate`` is *undecided* tier in

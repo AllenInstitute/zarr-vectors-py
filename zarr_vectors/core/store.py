@@ -1,8 +1,9 @@
-"""ZV store creation, opening, and management.
+"""Zarr Vectors store creation, opening, and management.
 
-Naming: the on-disk format is referred to as **ZV** (Zarr Vectors).  The
-older ``ZVF`` initialism may still appear in archived doc text but is
-not used in the wire format.
+Naming: the format is **Zarr Vectors**.  ``zv`` is its short form, and the
+one the wire format uses -- the ``zv_array`` discriminator on every array,
+and the ``.zv`` store extension alongside the canonical
+``.zarrvectors``.
 
 All storage I/O routes through a :class:`zarr.abc.store.Store` wrapped
 by the :class:`Group` abstraction in :mod:`zarr_vectors.core.group`.

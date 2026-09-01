@@ -1,6 +1,6 @@
 # Graphs and skeletons
 
-ZVF provides two graph-structured geometry types. Use `skeleton` for
+Zarr Vectors provides two graph-structured geometry types. Use `skeleton` for
 neuronal morphologies, vascular trees, and any other branching structure
 that must align to the SWC convention. Use `graph` for arbitrary
 connectivity — vascular networks with anastomoses, synaptic connectivity
@@ -162,7 +162,7 @@ ArrayError: attribute_filter requires a store written with chunk_by_attribute
 
 ## Multi-skeleton stores
 
-For connectome-scale datasets with thousands of neurons, a single ZVF
+For connectome-scale datasets with thousands of neurons, a single Zarr Vectors
 store is far more efficient than per-neuron files. SWC-directory ingest
 and SWC ID-mapping helpers live in **`zarr-vectors-tools`**.
 
@@ -457,7 +457,7 @@ assert nx.is_forest(G), "edges contain a cycle"
 
 **SWC parent ID −1 vs 0.**
 Some SWC tools use parent ID `0` (1-indexed) for the root; others use
-`-1` (ZVF convention). SWC ingest lives in **`zarr-vectors-tools`**, so
+`-1` (Zarr Vectors convention). SWC ingest lives in **`zarr-vectors-tools`**, so
 consult that package for how it detects the root convention. Writing
 through the core `write_graph` API, you supply `edges` directly and the
 convention is whatever you encode.

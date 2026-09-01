@@ -15,14 +15,14 @@
 
 **Inner chunk**
 : The logical unit of data within a shard, equivalent to a normal Zarr v3
-  chunk. In the ZVF context, the inner chunk corresponds to one ZVF spatial
-  chunk. The inner chunk shape must equal the ZVF `chunk_shape` expressed
+  chunk. In the Zarr Vectors context, the inner chunk corresponds to one Zarr Vectors spatial
+  chunk. The inner chunk shape must equal the Zarr Vectors `chunk_shape` expressed
   in array coordinates.
 
 **Outer chunk** (shard shape)
 : The number of inner chunks grouped into one shard, expressed as a tuple.
   An outer chunk of `(4, 4, 4)` means each shard contains `4 × 4 × 4 = 64`
-  inner chunks (ZVF spatial chunks).
+  inner chunks (Zarr Vectors spatial chunks).
 
 **Shard index**
 : A fixed-size lookup table appended to the end of each shard file that
@@ -38,15 +38,15 @@ a fine `chunk_shape` chosen for query performance results in a very large
 number of small files (or S3 objects), which is expensive to manage and
 slow to list.
 
-With sharding, you keep the logical ZVF `chunk_shape` small (good for
-queries), but multiple ZVF chunks are packed into a single shard file. A
-reader fetching one ZVF chunk makes one HTTP request to the shard file (or
+With sharding, you keep the logical Zarr Vectors `chunk_shape` small (good for
+queries), but multiple Zarr Vectors chunks are packed into a single shard file. A
+reader fetching one Zarr Vectors chunk makes one HTTP request to the shard file (or
 uses HTTP range requests to fetch only the relevant byte range), exactly
 as if each chunk were a separate file — but the object count is reduced by
 the shard factor.
 
 Sharding is available natively in Zarr v3 and does not require changes to
-the ZVF data model. It is purely a storage-layer optimisation. The fragment index,
+the Zarr Vectors data model. It is purely a storage-layer optimisation. The fragment index,
 object model, and multiscale metadata are identical with or without sharding.
 
 ---
@@ -68,7 +68,7 @@ object model, and multiscale metadata are identical with or without sharding.
 
 Sharding is configured via the `codec_config` argument to write functions,
 or by passing a pre-configured Zarr array spec. A minimal sharding
-configuration for a 3-D ZVF store:
+configuration for a 3-D Zarr Vectors store:
 
 ```python
 from zarr_vectors.types.points import write_points
@@ -76,14 +76,14 @@ from zarr_vectors.types.points import write_points
 write_points(
     "scan.zarrvectors",
     positions,
-    chunk_shape=(100.0, 100.0, 100.0),   # ZVF logical chunk — the inner chunk
+    chunk_shape=(100.0, 100.0, 100.0),   # Zarr Vectors logical chunk — the inner chunk
     bin_shape=(25.0, 25.0, 25.0),
     shard_shape=(4, 4, 4),               # 4×4×4 = 64 inner chunks per shard
 )
 ```
 
-This produces one shard file per `(4, 4, 4)` block of the ZVF chunk grid.
-Each shard contains up to 64 ZVF chunks. The total number of shard files is
+This produces one shard file per `(4, 4, 4)` block of the Zarr Vectors chunk grid.
+Each shard contains up to 64 Zarr Vectors chunks. The total number of shard files is
 `ceil(grid_shape[d] / 4) for d in [0,1,2]` — a factor of 64 fewer files
 than without sharding.
 
@@ -115,29 +115,29 @@ When `shard_shape` is specified, the `zarr.json` for each array uses the
 ```
 
 The `chunk_shape` inside the sharding configuration is the *inner* chunk
-shape (one ZVF spatial chunk). The shard shape is inferred from the outer
+shape (one Zarr Vectors spatial chunk). The shard shape is inferred from the outer
 array chunk grid.
 
-### Relationship between shard shape and ZVF chunk shape
+### Relationship between shard shape and Zarr Vectors chunk shape
 
-The ZVF `chunk_shape` (physical units) maps to the *inner* chunk of the
+The Zarr Vectors `chunk_shape` (physical units) maps to the *inner* chunk of the
 sharding codec. The shard shape (outer chunk) is expressed in inner-chunk
 units (integers), not in physical units:
 
 ```
-ZVF chunk_shape = (100, 100, 100) µm
+Zarr Vectors chunk_shape = (100, 100, 100) µm
 shard_shape     = (4, 4, 4) inner chunks
 → each shard covers (400, 400, 400) µm of physical space
 ```
 
-Readers that understand the shard index can fetch a single ZVF chunk with
+Readers that understand the shard index can fetch a single Zarr Vectors chunk with
 one HTTP range request; readers that do not understand sharding must fetch
 the entire shard file. `zarr-vectors-py` always uses shard-indexed reads
 when the sharding codec is present.
 
 ### Read behaviour with sharding
 
-When reading a single ZVF chunk from a sharded store:
+When reading a single Zarr Vectors chunk from a sharded store:
 
 1. Identify the shard containing the requested inner chunk.
 2. Fetch only the shard index (last `n_inner_chunks × 16 bytes` of the
@@ -145,7 +145,7 @@ When reading a single ZVF chunk from a sharded store:
 3. Look up the byte offset and length of the requested inner chunk.
 4. Fetch the inner chunk data (second HTTP range request).
 
-Total: **2 HTTP requests** for one ZVF chunk, regardless of shard size.
+Total: **2 HTTP requests** for one Zarr Vectors chunk, regardless of shard size.
 Without sharding, it is **1 HTTP request** per chunk but many more objects.
 
 ### Write behaviour with sharding
@@ -169,7 +169,7 @@ A good shard shape balances:
   shard, a small shard shape minimises wasted range-request bytes.
 - **Write parallelism:** shards are the unit of write locking. A shard
   shape of `(1, 1, 1)` disables sharding (each shard is one inner chunk);
-  this is useful if you need exactly one file per ZVF chunk.
+  this is useful if you need exactly one file per Zarr Vectors chunk.
 
 A practical default for Neuroglancer-style serving:
 
@@ -181,7 +181,7 @@ shard_shape = (8, 8, 8)   # 512 inner chunks per shard, ~25–200 MB per shard
 
 The `vertex_fragments/` and `link_fragments/` arrays benefit especially
 from sharding. Unlike `vertices/`, which may have large chunks, fragment-
-index chunks are small (typically tens to a few hundred bytes per ZVF
+index chunks are small (typically tens to a few hundred bytes per Zarr Vectors
 spatial chunk — header plus a short range table plus a tiny CSR when
 fragments are explicit). Without sharding, a large store creates millions
 of tiny files for the fragment indices alone. With sharding, many
@@ -197,11 +197,11 @@ to ensure consumers are aware of the requirement.
 
 ### Implementation notes (zarr-vectors-py)
 
-* Each ZVF logical array (`vertices`, `vertex_fragments`,
+* Each Zarr Vectors logical array (`vertices`, `vertex_fragments`,
   `links/<delta>/<offsets>`, `link_fragments`,
   `link_attributes/<name>/<delta>/<offsets>`, attribute arrays, ...) maps
   to a single Zarr v3 vlen-bytes array whose shape is the level's chunk
-  grid. One cell of that array holds one ZVF spatial chunk's payload
+  grid. One cell of that array holds one Zarr Vectors spatial chunk's payload
   bytes; absent chunks are vlen-bytes `b""` (the codec's fill value).
 
   ```{note}
@@ -217,7 +217,7 @@ to ensure consumers are aware of the requirement.
   may be migrated.
   ```
 * The sharding codec is configured with `chunk_shape = (1,)*ndim`
-  (one ZVF chunk per inner Zarr chunk) and an outer chunk shape equal
+  (one Zarr Vectors chunk per inner Zarr chunk) and an outer chunk shape equal
   to `shard_shape`. zarr-python ≥ 3.2 exposes this directly via the
   `shards=` kwarg on `create_array`.
 * A per-array `nonempty_chunks` attribute (a sorted list of chunk

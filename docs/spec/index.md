@@ -1,7 +1,7 @@
 # Specification
 
-This section is the authoritative reference for the **Zarr Vector Format
-(ZVF)** as implemented in `zarr-vectors-py`. It is written to serve two
+This section is the authoritative reference for the **Zarr Vectors
+(ZV)** as implemented in `zarr-vectors-py`. It is written to serve two
 audiences simultaneously:
 
 - **Users** who want to understand precisely what the format does and why,
@@ -19,7 +19,7 @@ worked examples.
 
 ## Design goals
 
-ZVF was designed to satisfy the following constraints simultaneously:
+Zarr Vectors was designed to satisfy the following constraints simultaneously:
 
 **Cloud-native random access.** Spatial queries should require only the
 minimum number of I/O operations, whether the store is on a local file
@@ -28,7 +28,7 @@ chunking at the chunk level and sub-chunk indexing at the bin level.
 
 **Multi-resolution out of the box.** Viewers that render large-scale 3-D
 data (Neuroglancer, napari, custom WebGL) need coarser representations for
-overview rendering. ZVF encodes resolution pyramids natively, with
+overview rendering. Zarr Vectors encodes resolution pyramids natively, with
 OME-Zarr-compatible metadata so any NGFF-aware viewer can discover them.
 
 **Geometry-type agnostic layout.** Points, streamlines, graphs, and meshes
@@ -37,7 +37,7 @@ handles all types; type-specific logic lives only in the arrays present
 within each chunk group (e.g. meshes have a `links/<delta>` array that point
 clouds do not).
 
-**Format transparency.** A ZVF store is a plain Zarr v3 directory tree.
+**Format transparency.** A Zarr Vectors store is a plain Zarr v3 directory tree.
 No binary wrapper, no proprietary codec required for the base format. Every
 array can be opened with the standard `zarr` library.
 
@@ -51,9 +51,9 @@ validator without access to the original authors.
 
 | Specification | Relationship |
 |---------------|-------------|
-| [Zarr v3 core spec](https://zarr-specs.readthedocs.io/en/latest/v3/core/v3.0.html) | ZVF stores are valid Zarr v3 stores. All array storage, codec, and metadata conventions are inherited from Zarr v3. |
-| [OME-Zarr NGFF](https://ngff.openmicroscopy.org/) | ZVF borrows the `multiscales` JSON block for resolution pyramid metadata. ZVF-specific keys are additive extensions. |
-| [Allen Institute ZVF spec](https://github.com/AllenInstitute/zarr_vectors) | The original specification by Forest Collman. `zarr-vectors-py` implements and extends this spec. |
+| [Zarr v3 core spec](https://zarr-specs.readthedocs.io/en/latest/v3/core/v3.0.html) | Zarr Vectors stores are valid Zarr v3 stores. All array storage, codec, and metadata conventions are inherited from Zarr v3. |
+| [OME-Zarr NGFF](https://ngff.openmicroscopy.org/) | Zarr Vectors borrows the `multiscales` JSON block for resolution pyramid metadata. Zarr Vectors-specific keys are additive extensions. |
+| [Allen Institute Zarr Vectors specification](https://github.com/AllenInstitute/zarr_vectors) | The original specification by Forest Collman. `zarr-vectors-py` implements and extends this spec. |
 | [Neuroglancer precomputed](https://github.com/google/neuroglancer/tree/master/src/datasource/precomputed) | A related format for static Neuroglancer hosting. See [comparison](comparisons/neuroglancer_precomputed.md). |
 | [TRX format](https://tractography-file-format.github.io/) | A streamline-specific format. See [comparison](comparisons/trx_format.md). |
 

@@ -50,7 +50,7 @@ with LocalNeuroglancer() as viewer:
 
 ---
 
-## Loading a ZVF store
+## Loading a Zarr Vectors store
 
 ### From local disk
 
@@ -66,7 +66,7 @@ viewer.add("zarr_vectors:///path/to/scan.zarrvectors")
 ```
 
 `add()` reads the store's root `zarr.json`, determines the geometry type,
-and registers the appropriate Neuroglancer layer type. A ZVF store is a Zarr
+and registers the appropriate Neuroglancer layer type. A Zarr Vectors store is a Zarr
 v3 group, so `zarr.json` is its root document — there is no `.zattrs`, which
 is the Zarr v2 spelling. The geometry type is
 `attributes.zarr_vectors.geometry_types`, and the layer transform comes from
@@ -97,13 +97,13 @@ viewer.add("zarr_vectors://gs://my-bucket/tracts.zarrvectors")
 # Load a registered OME-Zarr image volume (upstream ngtools feature)
 viewer.add("zarr:///path/to/em_volume.zarr", name="EM")
 
-# Overlay ZVF layers on the same coordinate space
+# Overlay Zarr Vectors layers on the same coordinate space
 viewer.add("neurons.zarrvectors", name="neurons")
 viewer.add("tracts.zarrvectors",  name="tracts")
 viewer.add("vessels.zarrvectors", name="vessels")
 ```
 
-All layers must share the same physical coordinate system. If your ZVF
+All layers must share the same physical coordinate system. If your Zarr Vectors
 store is in voxel space and the image is in RAS mm, supply a transform
 (see [Coordinate transforms](#coordinate-transforms) below).
 
@@ -241,7 +241,7 @@ viewer.set_level("tracts", level=None) # restore automatic LOD
 
 ## Coordinate transforms
 
-If a ZVF store and an image volume are in different coordinate spaces,
+If a Zarr Vectors store and an image volume are in different coordinate spaces,
 apply a transform when loading:
 
 ```python
@@ -263,7 +263,7 @@ viewer.add(
 ```
 
 The transform is stored in the Neuroglancer layer state and applied when
-rendering. It does not modify the ZVF store.
+rendering. It does not modify the Zarr Vectors store.
 
 ---
 
@@ -319,7 +319,7 @@ viewer.set_state(saved_state)
 
 ### Sharing a Neuroglancer link
 
-If the ZVF stores are accessible via a public URL (S3 with public read,
+If the Zarr Vectors stores are accessible via a public URL (S3 with public read,
 or a running file server), the Neuroglancer state URL can be shared:
 
 ```python

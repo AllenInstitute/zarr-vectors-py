@@ -1279,7 +1279,7 @@ class Group:
         """Allocate a vlen-bytes Zarr array for per-chunk blobs.
 
         A single Zarr v3 array whose shape equals the level's chunk
-        grid; each cell holds one ZVF spatial chunk's payload.  When
+        grid; each cell holds one Zarr Vectors spatial chunk's payload.  When
         ``shard_shape`` is provided the ``sharding_indexed`` codec packs
         many cells into a single storage object — the standard cloud
         layout described in
@@ -1294,9 +1294,9 @@ class Group:
                 :func:`zarr_vectors.spatial.chunking.compute_grid_shape`.
             shard_shape: Outer-chunk shape in *inner-chunk* units.
                 ``None`` (default) creates an unsharded array — one
-                storage object per ZVF chunk, same I/O cost as the
+                storage object per Zarr Vectors chunk, same I/O cost as the
                 legacy layout but already in the new structural form.
-                A typical cloud workload uses ``(8, 8, 8)``: 512 ZVF
+                A typical cloud workload uses ``(8, 8, 8)``: 512 Zarr Vectors
                 chunks per storage object.
             compressors: BytesBytes compressor list (already stripped of
                 the ``bytes`` serializer, i.e. the ``create_array``

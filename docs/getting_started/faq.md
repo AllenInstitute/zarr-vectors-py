@@ -4,7 +4,7 @@
 
 ### What is the relationship between zarr-vectors and Zarr v3?
 
-`zarr-vectors` is built *on top of* Zarr v3. A ZVF store is a valid Zarr v3
+`zarr-vectors` is built *on top of* Zarr v3. A Zarr Vectors store is a valid Zarr v3
 store: all arrays inside it can be opened with the standard `zarr` Python
 library. `zarr-vectors` adds conventions on top of Zarr — the directory
 layout, the metadata blocks carried in each `zarr.json`, the fragment index
@@ -13,7 +13,7 @@ arrays, and the OME-Zarr-compatible multiscale metadata. The root
 (`zv_version`, `bounds`, `chunk_shape`, `base_bin_shape`, `geometry_types`, …)
 and the per-level scale/translation transforms under `attributes.multiscales`;
 each level's own `zarr.json` holds `attributes.zarr_vectors_level`. There is no
-`.zattrs` anywhere in a ZVF store — that is the Zarr **v2** spelling, and ZVF
+`.zattrs` anywhere in a Zarr Vectors store — that is the Zarr **v2** spelling, and Zarr Vectors
 is v3-only.
 
 You could read the raw position arrays directly with `zarr.open()`, but you
@@ -22,22 +22,22 @@ that `zarr-vectors` provides.
 
 ### What is the relationship between zarr-vectors and OME-Zarr?
 
-ZVF borrows the `multiscales` JSON block from the OME-Zarr NGFF
+Zarr Vectors borrows the `multiscales` JSON block from the OME-Zarr NGFF
 specification so that resolution pyramids are discoverable by any OME-Zarr-
-aware viewer. ZVF is not a strict subset of OME-Zarr: the two formats target
-different data (OME-Zarr is primarily for dense image volumes; ZVF is for
+aware viewer. Zarr Vectors is not a strict subset of OME-Zarr: the two formats target
+different data (OME-Zarr is primarily for dense image volumes; Zarr Vectors is for
 sparse vector geometry). The comparison page
-[ZVF and OME-Zarr](../spec/comparisons/ome_zarr.md) documents exactly which
-fields are shared and which are ZVF-specific extensions.
+[Zarr Vectors and OME-Zarr](../spec/comparisons/ome_zarr.md) documents exactly which
+fields are shared and which are Zarr Vectors-specific extensions.
 
 ### Why does the store have a `.zarrvectors` extension? Is it required?
 
 The `.zarrvectors` extension is a convention, not a requirement enforced by
 the file system or the library. You can name your store anything. The
-extension helps tools (and humans) identify ZVF stores at a glance and is
+extension helps tools (and humans) identify Zarr Vectors stores at a glance and is
 used by `zv-ngtools` to auto-detect the store type when loading layers.
 
-### Can I open a ZVF store with plain `zarr.open()`?
+### Can I open a Zarr Vectors store with plain `zarr.open()`?
 
 Yes. The underlying arrays are standard Zarr v3, so `zarr.open_group(path)`
 works and the group's `attrs` are the `zarr_vectors` and `multiscales` blocks
@@ -206,23 +206,23 @@ import from an internal module. `build_pyramid` covers the common case.
 
 ## Formats and interoperability
 
-### Can I convert a ZVF store back to TRK / SWC / OBJ?
+### Can I convert a Zarr Vectors store back to TRK / SWC / OBJ?
 
 Yes, using the converters and CLI in the companion package
 **`zarr-vectors-tools`**.
 
-### How do I visualise a ZVF store in Neuroglancer?
+### How do I visualise a Zarr Vectors store in Neuroglancer?
 
 Use [`zv-ngtools`](https://github.com/BRIDGE-Neuroscience/zv-ngtools), a
-fork of `ngtools` that adds a ZVF layer type. It can serve a local
+fork of `ngtools` that adds a Zarr Vectors layer type. It can serve a local
 `.zarrvectors` store to a Neuroglancer instance running in your browser.
 See [Neuroglancer integration](../tutorials/neuroglancer/overview.md).
 
-### Is ZVF compatible with the Neuroglancer precomputed format?
+### Is Zarr Vectors compatible with the Neuroglancer precomputed format?
 
-ZVF and Neuroglancer precomputed are distinct formats that share some
+Zarr Vectors and Neuroglancer precomputed are distinct formats that share some
 design goals (spatial chunking, multiscale support). `zv-ngtools` includes
-a precomputed export tool that converts a ZVF store to the Neuroglancer
+a precomputed export tool that converts a Zarr Vectors store to the Neuroglancer
 precomputed annotation or skeleton format for static hosting.
 See [Format comparisons](../spec/comparisons/neuroglancer_precomputed.md)
 for a detailed comparison.

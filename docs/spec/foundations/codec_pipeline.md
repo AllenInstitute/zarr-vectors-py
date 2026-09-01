@@ -38,7 +38,7 @@
 
 **Fill value**
 : The value written to a chunk position that is not explicitly stored. In
-  Zarr v3, the fill value is declared per array in `zarr.json`. ZVF uses
+  Zarr v3, the fill value is declared per array in `zarr.json`. Zarr Vectors uses
   `0.0` for floating-point position arrays and `-1` for integer index
   arrays.
 
@@ -47,7 +47,7 @@
 ## Introduction
 
 A Zarr v3 codec pipeline controls how chunk data is serialised to bytes and
-compressed before storage. ZVF does not mandate a specific codec; any Zarr
+compressed before storage. Zarr Vectors does not mandate a specific codec; any Zarr
 v3-compatible pipeline is valid. However, `zarr-vectors-py` ships with
 sensible defaults and provides helper functions to configure specialised
 pipelines for specific geometry types (e.g. Draco for meshes).
@@ -141,7 +141,7 @@ requested OID (~16K objects per chunk).
 The Zarr V3 specification for variable-length byte arrays is still
 in development (tracked at
 [zarr-extensions](https://github.com/zarr-developers/zarr-extensions/tree/main/data-types));
-ZVF 0.x stores written with `vlen-bytes` may need to be re-encoded if
+Zarr Vectors 0.x stores written with `vlen-bytes` may need to be re-encoded if
 the eventual spec lands incompatibly.
 
 Legacy stores written before this layout change have
@@ -219,7 +219,7 @@ Codecs requiring extras:
 - `draco` — requires `zarr-vectors[draco]`
 - `sharding_indexed` — built into Zarr v3 ≥ 2.18; no extra required
 
-When distributing ZVF stores, prefer the default Blosc pipeline for
+When distributing Zarr Vectors stores, prefer the default Blosc pipeline for
 maximum compatibility. Document any use of non-default codecs prominently
 (e.g. in the store's `.zattrs` `"notes"` field) so consumers know what
 is required.

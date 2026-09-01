@@ -1,7 +1,7 @@
 Geometry types
 ==============
 
-Read and write functions for each ZVF geometry type. All write functions
+Read and write functions for each Zarr Vectors geometry type. All write functions
 accept either a local path string, a ``zarr.storage.Store`` object, or
 an fsspec mapper as the first argument. All read functions return a typed
 result dictionary documented on each function's page.

@@ -14,8 +14,8 @@ sits on a local filesystem or a cloud object store (S3, GCS). Resolution
 pyramids are encoded natively so viewers like Neuroglancer can stream data
 progressively at any scale.
 
-The library implements the `Zarr Vector Format
-<https://github.com/AllenInstitute/zarr_vectors>`_ originally specified by
+The library implements `Zarr Vectors
+<https://github.com/AllenInstitute/zarr_vectors>`_, originally specified by
 Forest Collman at the Allen Institute for Brain Sciences, extended with
 separated chunk/bin sizes, per-level sparsity, and OME-Zarr-compatible
 multiscale metadata.
@@ -78,7 +78,7 @@ Where to start
      - Which modules are supported, which are internal, and how to ask at
        runtime.
    * - :doc:`spec/index`
-     - Full technical specification for the Zarr Vector Format.
+     - Full technical specification for Zarr Vectors.
 
 
 .. toctree::

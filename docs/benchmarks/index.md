@@ -26,8 +26,8 @@ dependency it does not otherwise need.
 
 | Suite | Question it answers | Notebooks |
 |-------|--------------------|-----------|
-| `benchmarks/formats/` | How does ZVF compare to the format I use today? | 3 |
-| `benchmarks/internals/` | How does ZVF scale along one axis? — size, geometry type, backend, pyramid depth, bbox query, chunk shape, codec, edit cost | 8 |
+| `benchmarks/formats/` | How does Zarr Vectors compare to the format I use today? | 3 |
+| `benchmarks/internals/` | How does Zarr Vectors scale along one axis? — size, geometry type, backend, pyramid depth, bbox query, chunk shape, codec, edit cost | 8 |
 
 The vertex-scaling analysis that used to be published on this page —
 zarr-vectors versus a pandas / CSV baseline, with the crossover table

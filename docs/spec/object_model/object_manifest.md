@@ -1,12 +1,12 @@
 # Object manifest
 
-```{admonition} Format change in ZVF 0.6.0
+```{admonition} Format change in Zarr Vectors 0.6.0
 :class: note
 
-Prior to ZVF 0.6.0 the `object_index/` array was a fixed-shape
+Prior to Zarr Vectors 0.6.0 the `object_index/` array was a fixed-shape
 `(n_objects, 2)` `int64` table storing one *primary-fragment address*
 per object; reading a multi-chunk object required walking
-`cross_chunk_links/` forwards from the primary fragment. ZVF 0.6.0
+`cross_chunk_links/` forwards from the primary fragment. Zarr Vectors 0.6.0
 replaced this with a self-contained per-object manifest stored
 as a ragged `uint8` blob: every chunk the object touches, and
 every fragment within each chunk, is enumerated directly.
@@ -18,7 +18,7 @@ records with non-zero offsets in the `links/0/<offsets>/` family
 chunks an object touches.
 ```
 
-```{admonition} Format change in ZVF 0.9.0
+```{admonition} Format change in Zarr Vectors 0.9.0
 :class: note
 
 The `cross_chunk_links/` and `cross_chunk_link_attributes/` families
@@ -31,7 +31,7 @@ referenced links since the walk was removed in 0.6.0.
 
 **Object manifest**
 : The full description of where an object's vertices live across
-  the ZVF store. Encoded as a sequence of **manifest blocks**, one
+  the Zarr Vectors store. Encoded as a sequence of **manifest blocks**, one
   per chunk the object touches.
 
 **Manifest block**
@@ -136,7 +136,7 @@ assignment* section below.
 
 #### Why a single ragged array
 
-Pre-vlen ZVF stored `object_index` as two single-chunked byte blobs
+Pre-vlen Zarr Vectors stored `object_index` as two single-chunked byte blobs
 (`data` and `offsets`), so reading one object's manifest required
 loading the entire offsets table (8 × `num_objects` bytes) and the
 entire concatenated data blob, regardless of which OID was requested.
@@ -153,7 +153,7 @@ async pipeline.
 The Zarr V3 specification for variable-length byte arrays is still in
 development (tracked at
 [zarr-extensions](https://github.com/zarr-developers/zarr-extensions/tree/main/data-types)).
-ZVF 0.x stores written with `vlen-bytes` may need to be re-encoded if
+Zarr Vectors 0.x stores written with `vlen-bytes` may need to be re-encoded if
 the eventual spec lands incompatibly.
 ```
 

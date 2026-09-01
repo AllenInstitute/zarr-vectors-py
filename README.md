@@ -5,7 +5,7 @@
 
 **Tools for Zarr Vectors Data**
 
-`zarr-vectors-py` is a Python package for reading, writing, and managing large-scale vector geometry data in the zarr vectors format — a chunked, cloud-native format built on Zarr v3 for multiscale points, lines, streamlines, graphs, skeletons, and meshes.
+`zarr-vectors-py` is a Python package for reading, writing, and managing large-scale vector geometry data in the Zarr Vectors format — a chunked, cloud-native format built on Zarr v3 for multiscale points, lines, streamlines, graphs, skeletons, and meshes.
 
 The package supports supervoxel-level spatial binning with separated chunk and bin sizes, per-level object sparsity for balanced multi-resolution pyramids, and OME-Zarr-compatible multiscale metadata.
 
@@ -86,8 +86,10 @@ Fuller walkthroughs live in the
 
 ## Store Layout
 
-A store is a plain Zarr v3 group. Only five entries always exist; everything else
-appears when the matching data is written.
+A store is a plain Zarr v3 group. `.zarrvectors` is the canonical extension and
+`.zv` the accepted short form — nothing in the format reads either, so a store
+opens the same whichever it carries. Only five entries always exist; everything
+else appears when the matching data is written.
 
 ```
 dataset.zarrvectors/

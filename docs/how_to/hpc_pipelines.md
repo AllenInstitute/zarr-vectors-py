@@ -1,6 +1,6 @@
 # HPC pipelines
 
-This guide covers writing ZVF stores from HPC (High Performance Computing)
+This guide covers writing Zarr Vectors stores from HPC (High Performance Computing)
 environments: SLURM job arrays, MPI parallel writes, Lustre/GPFS file system
 optimisation, and sharding read work across ranks.
 

@@ -6,11 +6,11 @@ local filesystems.  Every per-chunk array is a multidim vlen-bytes Zarr
 array whose shape is the level's chunk grid; this module owns the one
 thing that distinguishes its two packings:
 
-* **Unsharded** — one storage object per ZVF chunk, at
+* **Unsharded** — one storage object per Zarr Vectors chunk, at
   ``<array>/c/i/j/k``.
 * **Sharded** — Zarr v3's built-in ``sharding_indexed`` codec packs the
   chunk-grid cells into outer-chunk shards.  One storage object per
-  shard (default 512 ZVF chunks per shard).
+  shard (default 512 Zarr Vectors chunks per shard).
 
 The logical layout is identical either way — only the codec pipeline in
 each array's ``zarr.json`` changes — so both are read transparently by
@@ -182,7 +182,7 @@ def shard_store(
     Args:
         store_path: Path or URL to the ZV store.
         shard_shape: Outer-chunk shape in *inner-chunk* units (one
-            inner chunk == one ZVF spatial chunk).  An ``int`` is
+            inner chunk == one Zarr Vectors spatial chunk).  An ``int`` is
             broadcast to every axis (e.g. ``8`` → ``(8,8,8)`` for a
             3-D store).  A tuple sets the per-axis shard shape
             explicitly.  Default ``8`` ≈ 512 inner chunks per shard,

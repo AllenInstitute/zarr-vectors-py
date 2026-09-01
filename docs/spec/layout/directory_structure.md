@@ -3,10 +3,15 @@
 ## Terms
 
 **Store root**
-: The top-level directory (or object-store prefix) of a ZVF store.
-  Conventionally named with a `.zarrvectors` extension. Contains the root
-  `zarr.json`, root `.zattrs`, all resolution level groups, and
-  `metadata.json`.
+: The top-level directory (or object-store prefix) of a Zarr Vectors store.
+  Contains the root `zarr.json` and all resolution level groups.
+
+  **File extension.** `.zarrvectors` is the canonical extension and the one
+  to prefer in documentation, examples and generated output. `.zv` is an
+  accepted short form, useful where path length matters — deep scratch
+  hierarchies on HPC filesystems, say. The two are interchangeable: nothing
+  in the format reads the extension, and a store opens the same either way.
+  A store with no extension at all is still a valid store.
 
 **Resolution level group**
 : A Zarr group at path `<N>/` within the store root, where `N`
@@ -55,7 +60,7 @@
 
 ## Introduction
 
-The on-disk layout of a ZVF store follows a clear hierarchy: store root →
+The on-disk layout of a Zarr Vectors store follows a clear hierarchy: store root →
 resolution levels → array groups → chunk files. Every path in the hierarchy
 has a defined meaning; there are no opaque binary blobs. This page documents
 every node in the tree for each supported geometry type.
@@ -89,7 +94,7 @@ same three-level store.
 dataset.zarrvectors/
 │
 ├── zarr.json                    # Zarr v3 root group metadata
-├── .zattrs                      # ZVF root metadata (see root_metadata.md)
+├── .zattrs                      # Zarr Vectors root metadata (see root_metadata.md)
 ├── metadata.json                # human-readable summary
 │
 ├── 0/                # full-resolution level
@@ -311,7 +316,7 @@ Per-vertex and per-object custom attributes must be placed under
 | Path | Required for | Notes |
 |------|-------------|-------|
 | `zarr.json` (root) | All types | Zarr v3 group node |
-| `.zattrs` (root) | All types | ZVF root metadata |
+| `.zattrs` (root) | All types | Zarr Vectors root metadata |
 | `metadata.json` | All types | Recommended; not read by API |
 | `0/` | All types | At least one level required |
 | `vertices/` | All types | |

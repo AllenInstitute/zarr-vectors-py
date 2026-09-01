@@ -39,7 +39,7 @@
 
 ## Introduction
 
-`chunk_shape` is the single most consequential parameter in a ZVF store.
+`chunk_shape` is the single most consequential parameter in a Zarr Vectors store.
 It controls both the physical layout of data on disk (or in object storage)
 and the unit of I/O: every read operation fetches at least one full chunk,
 and every write operation produces at least one full chunk file.
@@ -87,13 +87,13 @@ that is roughly equal in physical extent per axis often performs better:
 The `vertices/` Zarr array has logical shape `(*chunk_grid_shape, N_max, D)`
 where each element of `chunk_grid_shape` is the number of chunks along
 that axis. The Zarr chunk shape (the unit of storage for the Zarr array
-itself) is `(1, 1, …, 1, N_max, D)` — one Zarr chunk per ZVF spatial
+itself) is `(1, 1, …, 1, N_max, D)` — one Zarr chunk per Zarr Vectors spatial
 chunk.
 
-The ZVF `chunk_shape` (physical units) and the Zarr chunk shape (array
+The Zarr Vectors `chunk_shape` (physical units) and the Zarr chunk shape (array
 elements) are related only through the vertex density of the data. There
 is no direct mathematical mapping between them; the Zarr array's chunk
-dimensions are set by `N_max` (maximum expected vertices per ZVF chunk),
+dimensions are set by `N_max` (maximum expected vertices per Zarr Vectors chunk),
 not by `chunk_shape`.
 
 ### How chunk coordinates are computed
@@ -140,7 +140,7 @@ dataset).
 
 #### Local file system
 
-Each ZVF spatial chunk corresponds to one file on disk. File-system
+Each Zarr Vectors spatial chunk corresponds to one file on disk. File-system
 performance is sensitive to:
 
 - **Inode overhead.** Every file incurs metadata overhead. On Linux ext4,

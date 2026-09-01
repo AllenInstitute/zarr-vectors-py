@@ -31,7 +31,7 @@
 ## Introduction
 
 Fragments are the bridge between the chunk-level I/O of Zarr and the
-bin-level spatial queries of ZVF. A small binary **fragment index**
+bin-level spatial queries of Zarr Vectors. A small binary **fragment index**
 sits alongside each chunk's vertex payload, naming the row ranges
 that belong to each fragment.
 
