@@ -65,6 +65,20 @@ implementing new geometry types, validation tools, or custom readers. It is
 also useful for debugging: if a store fails validation, the first step is
 often to inspect the directory tree directly.
 
+```{figure} ../../_static/figures/zarr-vectors-store-structure.png
+:alt: Panel a, the directory tree of a three-level Zarr Vectors store with the base level expanded into vertices, vertex_attributes, links by level and chunk offset, vertex_fragments, link_fragments, object_index and groups. Panel b, vertices and links drawn across levels 0, 1 and 2, showing links that stay within a chunk, links carrying a chunk offset, links carrying a level offset, and objects split into fragments across chunks.
+:width: 100%
+:name: fig-store-structure
+:figclass: zv-figure
+
+**Zarr Vectors data structure.** How vector items are divided across the Zarr
+arrays of a store. **a** — Directory structure of an example store containing
+three levels, with the array structure of the base level expanded. **b** —
+Items a store can represent: vertices, links and their offsets between chunks
+and between resolution levels, and objects and object fragments, across the
+same three-level store.
+```
+
 ---
 
 ## Technical reference
