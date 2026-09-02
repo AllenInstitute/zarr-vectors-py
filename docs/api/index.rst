@@ -51,7 +51,8 @@ Two pages below document **undecided** modules — neither promised nor disowned
     given a compatibility promise."
 
 Treat both as internal until that changes. (``zarr_vectors.composite`` is
-undecided too, and undocumented, because multi-geometry stores are unfinished.)
+undecided too, and undocumented: multi-geometry stores round-trip, but the
+layout they use to namespace each geometry has not been specified.)
 
 Asking at runtime
 -----------------

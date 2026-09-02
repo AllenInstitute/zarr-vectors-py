@@ -605,6 +605,13 @@ def _is_per_chunk_array(name: str) -> bool:
     if name in {VERTICES, VERTEX_FRAGMENTS, LINK_FRAGMENTS}:
         return True
     parts = name.split("/")
+    # Composite stores namespace one vertices array per geometry kind,
+    # ``vertices_<geometry_type>``.  Same chunk grid and same vlen-bytes
+    # layout as ``vertices`` -- only the name is qualified -- so the same
+    # answer has to come back for it, or ``_ensure_array_dir`` allocates a
+    # group and every later ``write_bytes`` to it raises.
+    if len(parts) == 1 and name.startswith(VERTICES + "_"):
+        return True
     if len(parts) == 2 and parts[0] in (VERTEX_ATTRIBUTES, FRAGMENT_ATTRIBUTES):
         return True
     # links/<delta>/<offsets>

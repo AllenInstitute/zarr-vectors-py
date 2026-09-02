@@ -74,8 +74,12 @@ UNDECIDED: dict[str, str] = {
         "never been given a compatibility promise."
     ),
     "zarr_vectors.composite": (
-        "Multi-geometry stores are unfinished — add_geometry currently "
-        "raises on its own documented example."
+        "Multi-geometry stores round-trip now — add_geometry allocates its "
+        "namespaced per-chunk arrays and its documented example passes — but "
+        "the namespacing itself is unreviewed: a composite store's geometries "
+        "live at vertices_<type>, which no other reader in the library knows "
+        "how to find. Undecided until that layout is either specified or "
+        "replaced."
     ),
 }
 
