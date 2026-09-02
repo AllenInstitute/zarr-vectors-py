@@ -117,6 +117,11 @@ OBJECT_IDS_SORTED_ATTR = "object_ids_sorted"
 # Objects per zarr chunk of ``object_index/manifests``.  A single-object
 # read fetches only the chunk containing the requested oid, so this sets
 # the read amplification ceiling (~16K manifest blobs per fetch).
+#
+# Applied UNCONDITIONALLY by every writer of that array -- never clamped to
+# the blob count of whichever write happens to create it.  ``resize`` cannot
+# change a chunk shape, so the creating write fixes this number for the life
+# of the store; see ``_write_object_index_manifests``.
 OBJECT_INDEX_MANIFEST_BUCKET = 16_384
 
 #: Largest ``object_index/manifests`` array the writers will allocate.
@@ -2344,7 +2349,25 @@ def _write_object_index_manifests(
     if n == 0:
         return
 
-    chunk_size = min(OBJECT_INDEX_MANIFEST_BUCKET, n)
+    # A fixed bucket, NOT clamped to the current blob count -- the same rule
+    # and the same reason as ``write_object_attributes`` below, and as
+    # ``ObjectIndexAppender._open_manifests_truncated``, which both already
+    # pass the constant unconditionally.
+    #
+    # Clamping here was silently catastrophic, because ``mode="append"`` on an
+    # absent array routes through this branch with only the FIRST caller's
+    # blobs, and every later append merely ``resize()``s -- which cannot change
+    # ``chunk_shape``. In a per-spatial-chunk parallel build the first flush is
+    # whichever worker won the store lock, typically a sparse edge chunk
+    # emitting a few dozen objects, so a 19.5M-object index inherited a
+    # ~20-blob chunk and materialised ~933,000 files in one directory instead
+    # of ~1,200. That exhausted a 1,000,000-inode filesystem quota mid-run and
+    # took the build down with EDQUOT. Two stores built by identical code
+    # differed 20x in file count on first-write ordering alone.
+    #
+    # Zarr allows a chunk larger than the array, and only materialises chunks
+    # that intersect the shape, so a small store still costs exactly one file.
+    chunk_size = OBJECT_INDEX_MANIFEST_BUCKET
     # zarr 3.x's variable-length bytes dtype lacks a finalised V3 spec
     # (zarr-extensions tracks it); the warning is informational and Zarr Vectors
     # is alpha — accept it and silence at the call site so writes stay
