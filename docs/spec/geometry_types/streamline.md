@@ -43,7 +43,7 @@ the data (step size is required to correctly interpret arc lengths).
 
 The `streamline` type also aligns closely with the TRX format's metadata
 model. See [TRX format comparison](../comparisons/trx_format.md) for a
-detailed mapping between TRX fields and ZVF `streamline` metadata.
+detailed mapping between TRX fields and Zarr Vectors `streamline` metadata.
 
 ---
 
@@ -74,7 +74,7 @@ array — that family was merged into `links/`. See
 
 ### Streamline-specific root `.zattrs` keys
 
-In addition to the shared ZVF root metadata, streamline stores may include:
+In addition to the shared Zarr Vectors root metadata, streamline stores may include:
 
 ```json
 {
@@ -172,7 +172,7 @@ units in root `.zattrs`:
 }
 ```
 
-ZVF does not store or apply affine transforms internally. If alignment to
+Zarr Vectors does not store or apply affine transforms internally. If alignment to
 a reference image is required, apply the affine before writing or store it
 in `custom_metadata`.
 

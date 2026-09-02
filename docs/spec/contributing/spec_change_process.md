@@ -3,7 +3,7 @@
 ## Terms
 
 **RFC (Request for Comments)**
-: A structured discussion issue proposing a change to the ZVF specification.
+: A structured discussion issue proposing a change to the Zarr Vectors specification.
   An RFC is required before opening a PR that changes the format
   (`.zattrs` schema, array schemas, validation rules, or geometry type
   definitions). Code-only changes (bug fixes, new ingest formats, new
@@ -29,7 +29,7 @@
 
 ## Introduction
 
-The ZVF specification is a living document. The format will evolve as new
+The Zarr Vectors specification is a living document. The format will evolve as new
 use cases emerge, as implementation experience reveals design issues, and
 as the broader Zarr and OME-Zarr ecosystems change. This page documents
 the process for proposing, discussing, and ratifying specification changes.
@@ -143,7 +143,7 @@ When adding a new spec page:
 
 - Define all terms used on the page in the Terms section.
 - Write the Introduction at a level accessible to a competent Python
-  developer who is new to ZVF.
+  developer who is new to Zarr Vectors.
 - Include full JSON examples, pseudocode, or worked numerical examples
   in the Technical reference.
 - Add a Validation subsection listing which checks apply and at which level.

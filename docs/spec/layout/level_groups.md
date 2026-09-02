@@ -138,7 +138,7 @@ The `zarr.json` at a level group path is a plain Zarr v3 group node:
 }
 ```
 
-No ZVF-specific keys are placed in the group's `zarr.json`; all ZVF
+No Zarr Vectors-specific keys are placed in the group's `zarr.json`; all Zarr Vectors
 metadata lives in `.zattrs`.
 
 ### Adding and removing levels at runtime

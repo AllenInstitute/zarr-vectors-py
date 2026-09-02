@@ -277,3 +277,49 @@ def test_header_constants_in_blob() -> None:
     assert flags == 0
     assert f == 1
     assert r == 1
+
+
+# ---------------------------------------------------------------------------
+# ChunkFragmentIndex.tiles — the predicate the bulk readers short-circuit on
+# ---------------------------------------------------------------------------
+
+
+def test_tiles_true_for_contiguous_ranges_covering_the_buffer() -> None:
+    fi = _roundtrip([(0, 4), (4, 6), (10, 2)])
+    assert fi.tiles(12) is True
+
+
+def test_tiles_false_when_the_last_range_stops_short() -> None:
+    """A buffer longer than the fragments means rows nobody references —
+    returning it whole would hand back data the fragments exclude."""
+    fi = _roundtrip([(0, 4), (4, 6)])
+    assert fi.tiles(12) is False
+    assert fi.tiles(10) is True
+
+
+def test_tiles_false_when_a_row_is_skipped() -> None:
+    fi = _roundtrip([(0, 4), (5, 5)])
+    assert fi.tiles(10) is False
+
+
+def test_tiles_false_when_ranges_are_out_of_order() -> None:
+    """Concatenating these does not reproduce the buffer — same rows,
+    different order — so the shortcut must not fire."""
+    fi = _roundtrip([(5, 5), (0, 5)])
+    assert fi.tiles(10) is False
+
+
+def test_tiles_false_when_the_first_range_does_not_start_at_zero() -> None:
+    fi = _roundtrip([(1, 9)])
+    assert fi.tiles(10) is False
+
+
+def test_tiles_false_for_any_explicit_fragment() -> None:
+    fi = _roundtrip([(0, 5), np.array([5, 7, 9], dtype=np.int64)])
+    assert fi.num_explicit_fragments == 1
+    assert fi.tiles(10) is False
+
+
+def test_tiles_false_for_an_empty_index() -> None:
+    fi = _roundtrip([])
+    assert fi.tiles(0) is False

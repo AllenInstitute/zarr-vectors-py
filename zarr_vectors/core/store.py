@@ -1,8 +1,9 @@
-"""ZV store creation, opening, and management.
+"""Zarr Vectors store creation, opening, and management.
 
-Naming: the on-disk format is referred to as **ZV** (Zarr Vectors).  The
-older ``ZVF`` initialism may still appear in archived doc text but is
-not used in the wire format.
+Naming: the format is **Zarr Vectors**.  ``zv`` is its short form, and the
+one the wire format uses -- the ``zv_array`` discriminator on every array,
+and the ``.zv`` store extension alongside the canonical
+``.zarrvectors``.
 
 All storage I/O routes through a :class:`zarr.abc.store.Store` wrapped
 by the :class:`Group` abstraction in :mod:`zarr_vectors.core.group`.
@@ -12,6 +13,7 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
+from collections.abc import Sequence
 from typing import TYPE_CHECKING, Any
 from urllib.parse import unquote, urlparse
 
@@ -472,13 +474,8 @@ def create_store(
     # on the existing array, so a compressor passed only to a downstream
     # writer would silently never reach the largest arrays in the store.  Open
     # the codec session here, or not at all.
-    # The warm create fixes the vertices/vertex_fragments codec pipeline for
-    # the life of the store: every later create_vertices_array short-circuits
-    # on the existing array, so a compressor passed only to a downstream
-    # writer would silently never reach the largest arrays in the store.  Open
-    # the codec session here, or not at all.
     if compressor:
-        with level0.batched_writes(compressor=compressor):
+        with level0.chunk_array_codecs(compressor):
             create_vertices_array(
                 level0, dtype=vertex_dtype, encoding=vertex_encoding,
             )
@@ -1231,6 +1228,8 @@ def create_resolution_level(
     root: Group,
     level: int,
     level_metadata: LevelMetadata,
+    *,
+    strict: bool = True,
 ) -> Group:
     """Create a new resolution level group within the store.
 
@@ -1244,6 +1243,20 @@ def create_resolution_level(
     derive them from the NGFF block (see :func:`read_level_metadata`).
     """
     level_metadata.validate()
+    if strict:
+        # LevelMetadata.validate() deliberately checks only what a level
+        # can know about itself, so the cross-level invariants had a
+        # validator that no write path called: a level whose bins do not
+        # tile its chunks was writable, and only a later validate() run --
+        # if anyone ran one -- rejected the store it had already produced.
+        # strict=False is the escape for a caller deliberately staging an
+        # inconsistent level, not a reason to skip the check by default.
+        from zarr_vectors.core.metadata import (
+            validate_level_chunk_shape_against_root,
+        )
+        validate_level_chunk_shape_against_root(
+            read_root_metadata(root), level_metadata,
+        )
     group_name = f"{RESOLUTION_PREFIX}{level}"
     level_group = root.require_group(group_name)
     payload = level_metadata.to_dict()
@@ -1278,25 +1291,32 @@ def create_resolution_level(
                 len(level_metadata.bin_ratio) if level_metadata.bin_ratio
                 else (len(level_metadata.bin_shape) if level_metadata.bin_shape else 1)
             )
-        if level_metadata.bin_ratio is not None:
-            scale = [float(r) for r in level_metadata.bin_ratio]
-        elif level_metadata.bin_shape is not None and base_bin is not None:
+        if level_metadata.bin_shape is not None and base_bin is not None:
             # Derive the NGFF scale from bin_shape (this level's ÷ the
-            # root's) rather than defaulting to 1.0.  This branch is
-            # reached whenever bin_shape is set, so a caller that only
-            # sets bin_shape — letting the ratio be implied, e.g. so
-            # cumulative-across-levels bin_shape math is the single
-            # source of truth — was silently getting a wrong,
-            # non-cumulative scale=1.0 baked into the transform.
+            # root's).  ``bin_shape`` is preferred over ``bin_ratio``
+            # because the OTHER half of this same transform — the
+            # translation below — is bin_shape/2, so sourcing the two
+            # halves from different fields lets one transform contradict
+            # itself.  It did: a coarsen_factor of 1.5 on a root bin of 8
+            # gave bin_shape 12, translation 6.0 (right) and, via a
+            # bin_ratio rounded to 2, scale 2.0 (33% wrong) — invisible
+            # through the ZV API and visible in any NGFF viewer.
             #
-            # Plain float division, not compute_bin_ratio: the NGFF
-            # scale is a float multiplier with no integer requirement,
-            # unlike the separately-typed ``bin_ratio: tuple[int, ...]``
-            # field, so a fractional coarsen factor must not raise.
+            # It also covers the case a caller sets only bin_shape,
+            # letting the ratio be implied so cumulative-across-levels
+            # bin_shape math is the single source of truth; that used to
+            # fall through to a non-cumulative scale of 1.0.
+            #
+            # Plain float division, not compute_bin_ratio: the NGFF scale
+            # is a float multiplier with no integer requirement, so a
+            # fractional coarsen factor must not raise.
             scale = [
                 (float(bs) / float(bb)) if bb else 1.0
                 for bb, bs in zip(base_bin, level_metadata.bin_shape)
             ]
+        elif level_metadata.bin_ratio is not None:
+            # No bin_shape to derive from — the ratio is all there is.
+            scale = [float(r) for r in level_metadata.bin_ratio]
         else:
             scale = [1.0] * ndim
         translation = (
@@ -1306,6 +1326,153 @@ def create_resolution_level(
         )
         upsert_level_transform(root, level, scale=scale, translation=translation)
     return level_group
+
+
+#: Level-metadata fields that are DERIVED, and therefore refused by
+#: :func:`update_level_metadata`.
+#:
+#: ``bin_shape`` / ``bin_ratio`` live in the NGFF ``multiscales`` block:
+#: :func:`create_resolution_level` pops them from the level payload and
+#: :func:`read_level_metadata` rebuilds them from the transform, so writing
+#: them here produces keys no reader consults.  ``chunk_shape`` and
+#: ``bounds`` are worse than dead -- they feed ``level_grid_layout``, so
+#: changing one after arrays exist would size the NEXT allocated array to a
+#: different grid than the arrays already on disk, which is a layout change
+#: reached through a metadata-only call.
+_DERIVED_LEVEL_FIELDS: dict[str, str] = {
+    "bin_shape": "the NGFF multiscales block; use upsert_level_transform",
+    "bin_ratio": "the NGFF multiscales block; use upsert_level_transform",
+    "chunk_shape": (
+        "the level's array grids; changing it after allocation would "
+        "mis-size every later array. Rewrite the level instead"
+    ),
+    "bounds": (
+        "the level's array grids; changing it after allocation would "
+        "mis-size every later array. Rewrite the level instead"
+    ),
+}
+
+
+def update_level_metadata(
+    level_group: Group,
+    *,
+    arrays_present: list[str] | None = None,
+    add_arrays_present: str | list[str] | None = None,
+    **fields: Any,
+) -> LevelMetadata:
+    """Read-modify-write one level's ``zarr_vectors_level`` block.
+
+    There was nothing between :func:`create_resolution_level` and
+    :func:`read_level_metadata`, so a caller needing to correct a count or
+    advertise an array after the fact reached around the API entirely --
+    one consumer opened the store with raw zarr inside an
+    ``except Exception: pass``.  This is the supported spelling.
+
+    Coordinator-side: the level's attrs are ONE blob shared by every array
+    in it, so two concurrent callers race exactly the way ``nonempty_chunks``
+    does.  Call it once, after a parallel phase, not from inside one.
+
+    Args:
+        arrays_present: Replace the family list outright.
+        add_arrays_present: Add one or more families, keeping the rest.
+        **fields: Any other ``LevelMetadata`` field. Derived fields are
+            refused -- see :data:`_DERIVED_LEVEL_FIELDS`.
+
+    Returns:
+        The level metadata as it now stands.
+
+    Raises:
+        MetadataError: On an unknown field, or a derived one.
+    """
+    import dataclasses
+
+    bad = sorted(set(fields) & set(_DERIVED_LEVEL_FIELDS))
+    if bad:
+        why = "; ".join(f"{k} is owned by {_DERIVED_LEVEL_FIELDS[k]}" for k in bad)
+        raise MetadataError(
+            f"update_level_metadata() cannot set {bad}: {why}."
+        )
+    known = {f.name for f in dataclasses.fields(LevelMetadata)}
+    unknown = sorted(set(fields) - known)
+    if unknown:
+        raise MetadataError(
+            f"update_level_metadata() got unknown field(s) {unknown}; "
+            f"LevelMetadata has {sorted(known)}"
+        )
+
+    attrs = level_group.attrs.to_dict()
+    block = dict(attrs.get("zarr_vectors_level", {}))
+
+    if arrays_present is not None and add_arrays_present is not None:
+        raise MetadataError(
+            "pass arrays_present (replace) or add_arrays_present (extend), "
+            "not both"
+        )
+    if arrays_present is not None:
+        block["arrays_present"] = list(arrays_present)
+    if add_arrays_present is not None:
+        extra = (
+            [add_arrays_present] if isinstance(add_arrays_present, str)
+            else list(add_arrays_present)
+        )
+        current = list(block.get("arrays_present", []))
+        for name in extra:
+            if name not in current:
+                current.append(name)
+        block["arrays_present"] = current
+
+    for key, value in fields.items():
+        block[key] = value
+
+    level_group.attrs.update({"zarr_vectors_level": block})
+    # Built from the level block alone, so the derived fields come back
+    # None -- they live in the root's NGFF transform, which is exactly why
+    # they are refused above.  Use read_level_metadata(root, level) for a
+    # fully-resolved view.
+    return LevelMetadata.from_dict({"zarr_vectors_level": block})
+
+
+def update_root_metadata(
+    root: Group,
+    *,
+    add_capabilities: Sequence[str] = (),
+    **fields: Any,
+) -> RootMetadata:
+    """Read-modify-write the root ``zarr_vectors`` block.
+
+    Same contract and same warning as :func:`update_level_metadata`.
+    ``add_capabilities`` is separated out because stamping one is the
+    common case and appending to a list through ``**fields`` would mean
+    reading it first -- which is the read-modify-write this exists to own.
+
+    Raises:
+        MetadataError: On an unknown field.
+    """
+    import dataclasses
+
+    known = {f.name for f in dataclasses.fields(RootMetadata)}
+    unknown = sorted(set(fields) - known)
+    if unknown:
+        raise MetadataError(
+            f"update_root_metadata() got unknown field(s) {unknown}; "
+            f"RootMetadata has {sorted(known)}"
+        )
+
+    attrs = root.attrs.to_dict()
+    block = dict(attrs.get("zarr_vectors", {}))
+    if add_capabilities:
+        caps = list(block.get("format_capabilities", []) or [])
+        for cap in add_capabilities:
+            if cap not in caps:
+                caps.append(cap)
+        block["format_capabilities"] = caps
+    for key, value in fields.items():
+        block[key] = value
+    root.attrs.update({"zarr_vectors": block})
+    # Re-read rather than construct: RootMetadata is assembled from the
+    # zarr_vectors block AND the NGFF multiscales axes, so building it
+    # from this block alone raises on the missing half.
+    return read_root_metadata(root)
 
 
 def get_resolution_level(root: Group, level: int) -> Group:
@@ -1376,7 +1543,11 @@ def read_level_metadata(root: Group, level: int) -> LevelMetadata:
             lm.bin_ratio = None
             lm.bin_shape = None
         else:
-            lm.bin_ratio = tuple(int(round(s)) for s in scale)
+            # NOT int(round(s)): the scale is the authoritative record of
+            # the fold change, and rounding it here made a fractional
+            # factor unable to round-trip even once the writer stamped it
+            # correctly — 1.5 went out and 2 came back.
+            lm.bin_ratio = tuple(float(s) for s in scale)
             if translation is not None:
                 lm.bin_shape = tuple(2.0 * t for t in translation)
     return lm

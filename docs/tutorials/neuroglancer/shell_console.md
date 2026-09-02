@@ -53,7 +53,7 @@ nglocal --fileserver-port 9200 --neuroglancer-port 9400
 
 ---
 
-## Loading ZVF stores
+## Loading Zarr Vectors stores
 
 ### By file path
 
@@ -66,7 +66,7 @@ nglocal --fileserver-port 9200 --neuroglancer-port 9400
 # Loaded: white_matter → streamline layer
 ```
 
-Paths ending in `.zarrvectors` are automatically recognised as ZVF stores
+Paths ending in `.zarrvectors` are automatically recognised as Zarr Vectors stores
 and the `zarr_vectors://` scheme is inferred. Absolute paths:
 
 ```bash
@@ -93,7 +93,7 @@ and the `zarr_vectors://` scheme is inferred. Absolute paths:
 
 ### Tab completion for file paths
 
-Tab completion works for local file paths and for ZVF stores: pressing
+Tab completion works for local file paths and for Zarr Vectors stores: pressing
 Tab after a partial path expands it, showing only `.zarrvectors` directories
 and common image formats.
 

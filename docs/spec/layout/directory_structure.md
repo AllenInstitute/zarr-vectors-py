@@ -3,10 +3,15 @@
 ## Terms
 
 **Store root**
-: The top-level directory (or object-store prefix) of a ZVF store.
-  Conventionally named with a `.zarrvectors` extension. Contains the root
-  `zarr.json`, root `.zattrs`, all resolution level groups, and
-  `metadata.json`.
+: The top-level directory (or object-store prefix) of a Zarr Vectors store.
+  Contains the root `zarr.json` and all resolution level groups.
+
+  **File extension.** `.zarrvectors` is the canonical extension and the one
+  to prefer in documentation, examples and generated output. `.zv` is an
+  accepted short form, useful where path length matters — deep scratch
+  hierarchies on HPC filesystems, say. The two are interchangeable: nothing
+  in the format reads the extension, and a store opens the same either way.
+  A store with no extension at all is still a valid store.
 
 **Resolution level group**
 : A Zarr group at path `<N>/` within the store root, where `N`
@@ -55,7 +60,7 @@
 
 ## Introduction
 
-The on-disk layout of a ZVF store follows a clear hierarchy: store root →
+The on-disk layout of a Zarr Vectors store follows a clear hierarchy: store root →
 resolution levels → array groups → chunk files. Every path in the hierarchy
 has a defined meaning; there are no opaque binary blobs. This page documents
 every node in the tree for each supported geometry type.
@@ -64,6 +69,20 @@ Understanding the directory structure is essential for contributors
 implementing new geometry types, validation tools, or custom readers. It is
 also useful for debugging: if a store fails validation, the first step is
 often to inspect the directory tree directly.
+
+```{figure} ../../_static/figures/zarr-vectors-store-structure.png
+:alt: Panel a, the directory tree of a three-level Zarr Vectors store with the base level expanded into vertices, vertex_attributes, links by level and chunk offset, vertex_fragments, link_fragments, object_index and groups. Panel b, vertices and links drawn across levels 0, 1 and 2, showing links that stay within a chunk, links carrying a chunk offset, links carrying a level offset, and objects split into fragments across chunks.
+:width: 100%
+:name: fig-store-structure
+:figclass: zv-figure
+
+**Zarr Vectors data structure.** How vector items are divided across the Zarr
+arrays of a store. **a** — Directory structure of an example store containing
+three levels, with the array structure of the base level expanded. **b** —
+Items a store can represent: vertices, links and their offsets between chunks
+and between resolution levels, and objects and object fragments, across the
+same three-level store.
+```
 
 ---
 
@@ -75,7 +94,7 @@ often to inspect the directory tree directly.
 dataset.zarrvectors/
 │
 ├── zarr.json                    # Zarr v3 root group metadata
-├── .zattrs                      # ZVF root metadata (see root_metadata.md)
+├── .zattrs                      # Zarr Vectors root metadata (see root_metadata.md)
 ├── metadata.json                # human-readable summary
 │
 ├── 0/                # full-resolution level
@@ -297,7 +316,7 @@ Per-vertex and per-object custom attributes must be placed under
 | Path | Required for | Notes |
 |------|-------------|-------|
 | `zarr.json` (root) | All types | Zarr v3 group node |
-| `.zattrs` (root) | All types | ZVF root metadata |
+| `.zattrs` (root) | All types | Zarr Vectors root metadata |
 | `metadata.json` | All types | Recommended; not read by API |
 | `0/` | All types | At least one level required |
 | `vertices/` | All types | |

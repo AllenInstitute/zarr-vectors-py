@@ -14,7 +14,7 @@
 **SWC convention**
 : The de facto standard file format for neuronal morphology, defined by
   Cannon et al. (1998). An SWC file stores one vertex per row with columns:
-  `id, type, x, y, z, radius, parent_id`. ZVF skeletons follow the SWC
+  `id, type, x, y, z, radius, parent_id`. Zarr Vectors skeletons follow the SWC
   vertex type taxonomy and store `radius` and `type` as per-vertex
   attributes.
 
@@ -42,10 +42,10 @@ aligned to the SWC morphology convention. It is the appropriate type for
 neuronal morphologies, vascular trees, and any other branching tree-
 structured shape that will be read by or compared to SWC-compatible tools.
 
-ZVF skeletons store all the information present in an SWC file (position,
+Zarr Vectors skeletons store all the information present in an SWC file (position,
 radius, type, parent relationship) plus the spatial indexing and multi-
-resolution features of ZVF. The `ingest_swc` and `export_swc` functions
-provide lossless round-tripping between SWC and ZVF for standard SWC files.
+resolution features of Zarr Vectors. The `ingest_swc` and `export_swc` functions
+provide lossless round-tripping between SWC and Zarr Vectors for standard SWC files.
 
 ---
 

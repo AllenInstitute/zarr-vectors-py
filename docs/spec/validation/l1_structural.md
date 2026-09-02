@@ -7,7 +7,7 @@
   store, without reading array data or interpreting metadata values.
 
 **Required path**
-: A store path that must exist for a valid ZVF store. Missing required
+: A store path that must exist for a valid Zarr Vectors store. Missing required
   paths are L1 errors. L1's required set is **geometry-type
   independent** — see *Scope* below.
 
@@ -28,7 +28,7 @@ does not interpret metadata values.
 
 L1 is the fastest validation level and is appropriate as a first triage
 step when opening an unfamiliar store. An L1 failure means the store is
-structurally incomplete and cannot be read by any ZVF reader.
+structurally incomplete and cannot be read by any Zarr Vectors reader.
 
 ### Scope
 

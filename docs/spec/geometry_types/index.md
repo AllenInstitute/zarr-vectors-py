@@ -1,8 +1,8 @@
 # Geometry types
 
-ZVF defines seven geometry types. Each type is identified by a string
+Zarr Vectors defines seven geometry types. Each type is identified by a string
 constant stored in the root `.zattrs` under `"geometry_type"`. A single
-ZVF store holds exactly one geometry type; multi-type datasets require
+Zarr Vectors store holds exactly one geometry type; multi-type datasets require
 multiple stores.
 
 ## Type constants

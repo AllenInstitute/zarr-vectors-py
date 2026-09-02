@@ -2,7 +2,7 @@
 
 This page documents the full Python API for managing layers in a
 `LocalNeuroglancer` instance: programmatic rendering control, coordinate
-transforms, compositing multiple ZVF layers, and Neuroglancer state
+transforms, compositing multiple Zarr Vectors layers, and Neuroglancer state
 serialisation. For the interactive shell, see [Shell console](shell_console.md).
 
 ---
@@ -80,7 +80,7 @@ viewer.set_attribute_shader("tracts", attribute="mean_fa",
 ### Custom GLSL shaders
 
 For full rendering control, write a Neuroglancer GLSL shader string.
-ZVF attribute names are accessible as `prop_<name>()` in the shader:
+Zarr Vectors attribute names are accessible as `prop_<name>()` in the shader:
 
 ```python
 # Streamlines: colour by FA, desaturate low-FA streamlines
@@ -208,7 +208,7 @@ print(info["current_level"])        # e.g. 1 (auto-selected)
 
 ---
 
-## Compositing multiple ZVF layers
+## Compositing multiple Zarr Vectors layers
 
 A common pattern in connectomics is to layer point clouds, skeletons,
 tractography, and meshes over an image volume in a single viewer state.
@@ -296,9 +296,9 @@ print(url)
 # https://neuroglancer-demo.appspot.com/#!{...json-encoded state...}
 ```
 
-For ZVF layers, the URL embeds `zarr_vectors://s3://...` source URLs.
+For Zarr Vectors layers, the URL embeds `zarr_vectors://s3://...` source URLs.
 The recipient needs `zv-ngtools` installed and running locally to open
-ZVF layers from such a link.
+Zarr Vectors layers from such a link.
 
 ### Partial state: save only layer settings
 

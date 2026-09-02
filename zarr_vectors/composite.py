@@ -40,8 +40,8 @@ from zarr_vectors.constants import (
     VERTICES,
 )
 from zarr_vectors.core.arrays import (
+    _ensure_array_dir,
     create_object_index_array,
-    create_vertices_array,
     list_chunk_keys,
     read_chunk_vertices,
     write_chunk_vertices,
@@ -415,8 +415,14 @@ def _write_namespaced_vertices(
     positions = np.asarray(positions, dtype=np.float32)
     n_verts = len(positions)
 
-    arr_group = level_group.require_group(array_name)
-    arr_group.attrs.update({
+    # Allocate the per-chunk array before writing into it.  Since 0.9.0
+    # every per-chunk family is ONE vlen-bytes array over the level's
+    # chunk grid, so ``require_group`` here produced a group that
+    # ``write_bytes`` then refused -- the namespaced writer was left
+    # behind when the rest of the module migrated.
+    _ensure_array_dir(level_group, array_name)
+    level_group.write_array_meta(array_name, {
+        "zv_array": VERTICES,
         "dtype": "float32",
         "ndim": ndim,
         "vertex_count": n_verts,

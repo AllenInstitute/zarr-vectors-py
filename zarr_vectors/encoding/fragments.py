@@ -258,6 +258,60 @@ class ChunkFragmentIndex:
     def num_explicit_fragments(self) -> int:
         return self.num_fragments - self.num_range_fragments
 
+    @property
+    def vertex_extent(self) -> int:
+        """Number of underlying vertices this index spans.
+
+        ``max(referenced vertex index) + 1`` across every fragment — the
+        length of the ``vertices`` array the chunk's per-vertex attributes
+        align 1:1 with.
+
+        Computed as two reductions over the whole ``_range_table`` /
+        ``_csr_indices`` buffers rather than a per-fragment loop, because
+        the number of fragments is unbounded: a BRIDGE chunk carries one
+        range fragment plus a path-fragment twin per polyline, and at
+        ~187k twins the loop form cost ~0.9 s **per attribute per read**,
+        which is what made a neighbourhood load scale with how much of the
+        store was already built.
+        """
+        extent = 0
+        if self._range_table.size:
+            ends = self._range_table[:, 0] + self._range_table[:, 1]
+            extent = int(ends.max())
+        if self._csr_indices.size:
+            extent = max(extent, int(self._csr_indices.max()) + 1)
+        return extent
+
+    def tiles(self, n_rows: int) -> bool:
+        """Do the fragments partition ``[0, n_rows)`` in fragment order?
+
+        True only when every fragment is a range, the first starts at row
+        0, each one begins where the last ended, and the last ends at
+        ``n_rows``.  Under that condition concatenating the fragments
+        reproduces the underlying buffer exactly — same rows, same order
+        — so a caller that only wants the concatenation can skip the
+        partition entirely.  It is the layout every bulk writer produces,
+        because it assigns rows bin by bin; a level written per object
+        and then edited is where it stops holding.
+
+        Decided from the range table as two whole-array comparisons
+        rather than a per-fragment loop, because the fragment count is
+        unbounded — the check has to stay cheap on the chunks it does
+        *not* fire for.
+        """
+        if self.num_explicit_fragments:
+            return False
+        table = self._range_table
+        if table.shape[0] != self.num_fragments or table.shape[0] == 0:
+            return False
+        starts = table[:, 0]
+        ends = starts + table[:, 1]
+        return bool(
+            starts[0] == 0
+            and int(ends[-1]) == n_rows
+            and np.array_equal(ends[:-1], starts[1:])
+        )
+
     def is_range(self, f: int) -> bool:
         """Return True if fragment ``f`` is a contiguous range.
 

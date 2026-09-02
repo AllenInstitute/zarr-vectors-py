@@ -50,7 +50,7 @@ with LocalNeuroglancer() as viewer:
 
 ---
 
-## Loading a ZVF store
+## Loading a Zarr Vectors store
 
 ### From local disk
 
@@ -65,10 +65,15 @@ viewer.add("scan.zarrvectors", name="synchrotron_scan")
 viewer.add("zarr_vectors:///path/to/scan.zarrvectors")
 ```
 
-`add()` reads the root `.zattrs` of the store, determines the geometry
-type, and registers the appropriate Neuroglancer layer type. The store is
-not read in full at this point — data is fetched on demand as the viewer
-pans and zooms.
+`add()` reads the store's root `zarr.json`, determines the geometry type,
+and registers the appropriate Neuroglancer layer type. A Zarr Vectors store is a Zarr
+v3 group, so `zarr.json` is its root document — there is no `.zattrs`, which
+is the Zarr v2 spelling. The geometry type is
+`attributes.zarr_vectors.geometry_types`, and the layer transform comes from
+`attributes.multiscales`; see
+[Coordinate system alignment](overview.md#coordinate-system-alignment) for the
+full shape of that document. The store is not read in full at this point —
+data is fetched on demand as the viewer pans and zooms.
 
 ### From S3
 
@@ -92,13 +97,13 @@ viewer.add("zarr_vectors://gs://my-bucket/tracts.zarrvectors")
 # Load a registered OME-Zarr image volume (upstream ngtools feature)
 viewer.add("zarr:///path/to/em_volume.zarr", name="EM")
 
-# Overlay ZVF layers on the same coordinate space
+# Overlay Zarr Vectors layers on the same coordinate space
 viewer.add("neurons.zarrvectors", name="neurons")
 viewer.add("tracts.zarrvectors",  name="tracts")
 viewer.add("vessels.zarrvectors", name="vessels")
 ```
 
-All layers must share the same physical coordinate system. If your ZVF
+All layers must share the same physical coordinate system. If your Zarr Vectors
 store is in voxel space and the image is in RAS mm, supply a transform
 (see [Coordinate transforms](#coordinate-transforms) below).
 
@@ -203,16 +208,24 @@ By default, `zv-ngtools` selects the resolution level based on the
 Neuroglancer viewport's screen resolution at the current zoom. As the
 user zooms out, coarser levels are served automatically.
 
-The LOD decision uses:
+The decision needs one number per level: that level's bin shape, the finest
+region a spatial read can isolate. The supported api exposes it as
+`Level.resolution`, so the selection is a plain scan over `Dataset.levels`:
 
 ```python
-# Pseudocode inside the zv-ngtools request handler
-def select_level(store, requested_resolution_um):
-    for level in reversed(store.levels):   # coarsest first
-        if store.bin_shape_at(level).max() <= requested_resolution_um:
-            return level
-    return 0   # finest level if nothing coarser qualifies
+import zarr_vectors as zv
+
+ds = zv.open("tracts.zarrvectors")
+
+def select_level(ds, requested_resolution_um):
+    for index in reversed(ds.levels):      # coarsest first
+        if max(ds.level(index).resolution) <= requested_resolution_um:
+            return index
+    return ds.levels[0]                    # finest level if nothing coarser qualifies
 ```
+
+`ds.levels` is ascending with the finest level first, so `ds.levels[0]` is the
+fall-through when no coarser level is good enough.
 
 ### Force a specific level
 
@@ -228,7 +241,7 @@ viewer.set_level("tracts", level=None) # restore automatic LOD
 
 ## Coordinate transforms
 
-If a ZVF store and an image volume are in different coordinate spaces,
+If a Zarr Vectors store and an image volume are in different coordinate spaces,
 apply a transform when loading:
 
 ```python
@@ -250,7 +263,7 @@ viewer.add(
 ```
 
 The transform is stored in the Neuroglancer layer state and applied when
-rendering. It does not modify the ZVF store.
+rendering. It does not modify the Zarr Vectors store.
 
 ---
 
@@ -306,7 +319,7 @@ viewer.set_state(saved_state)
 
 ### Sharing a Neuroglancer link
 
-If the ZVF stores are accessible via a public URL (S3 with public read,
+If the Zarr Vectors stores are accessible via a public URL (S3 with public read,
 or a running file server), the Neuroglancer state URL can be shared:
 
 ```python

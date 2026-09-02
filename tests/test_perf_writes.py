@@ -57,7 +57,10 @@ PERF_BUDGET = {
     "read_mesh": 4.0,        # ~1s per-cell reads (mesh has fewer cross-chunk records)
 }
 
-N = 10_000  # smaller than benchmarks/02 so CI stays under 30s total
+# Smaller than the N used by the 02_data_types benchmark notebook (which
+# lives in zarr-vectors-tools, benchmarks/internals/) so CI stays under
+# 30s total.
+N = 10_000
 
 
 @pytest.fixture(scope="module")

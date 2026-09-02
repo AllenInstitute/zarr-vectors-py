@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "zarr-vectors"
 dynamic = ["version"]
-description = "Python utilities for the Zarr Vector Format (ZVF) — cloud-native storage for points, lines, streamlines, graphs, and meshes."
+description = "Python utilities for Zarr Vectors — cloud-native storage for points, lines, streamlines, graphs, and meshes."
 readme = "README.md"
 license = {text = "BSD-3-Clause"}
 requires-python = ">=3.11"

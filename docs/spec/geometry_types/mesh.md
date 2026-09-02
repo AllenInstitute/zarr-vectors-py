@@ -4,7 +4,7 @@
 
 **Mesh**
 : A piecewise-linear surface represented by a set of vertices and a set of
-  triangular faces. Each face is a triplet of vertex indices. ZVF stores
+  triangular faces. Each face is a triplet of vertex indices. Zarr Vectors stores
   closed or open surface meshes; there is no requirement of watertightness.
 
 **`GEOM_MESH`**
@@ -19,7 +19,7 @@
 **Winding order**
 : The orientation convention for face normals — conventionally
   counter-clockwise when viewed from outside the surface, implying
-  outward-facing normals. ZVF does **not** declare this in metadata; it
+  outward-facing normals. Zarr Vectors does **not** declare this in metadata; it
   preserves each face's input vertex order verbatim via `perm_idx`, so
   whatever winding the producer used survives a round-trip.
 
@@ -39,14 +39,14 @@
 
 ## Introduction
 
-The `mesh` type stores triangulated surface meshes in the ZVF spatial
+The `mesh` type stores triangulated surface meshes in the Zarr Vectors spatial
 chunking framework. Like other geometry types, the mesh is partitioned
 into spatial chunks; each chunk holds the vertices that fall within its
 spatial extent and the faces whose centroid falls within that extent.
 
 Mesh chunking introduces a subtlety that does not arise for point clouds
 or streamlines: a face may reference vertices in multiple chunks (the face
-straddles a chunk boundary). ZVF handles this with the same link family
+straddles a chunk boundary). Zarr Vectors handles this with the same link family
 it uses for intra-chunk faces — the face is filed under the offsets
 naming where its other vertices sit, and each endpoint's index stays
 local to its own chunk. The `object_index/` maps each mesh object
@@ -117,7 +117,7 @@ Records stay in input face order within each cell, so a parallel
 > Neither is written, read, or validated by any shipped code, and
 > `write_mesh` accepts neither as an argument. Winding is preserved
 > per-face by `perm_idx` (see *Face policy and winding* above), not by a
-> store-wide declaration; ZVF's convention is that a face's **input**
+> store-wide declaration; Zarr Vectors' convention is that a face's **input**
 > vertex order is authoritative and is recovered exactly on read.
 > Watertightness is not declared or checked.
 

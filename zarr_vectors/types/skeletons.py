@@ -449,6 +449,11 @@ def write_skeleton_cross_chunk_links(
 
 
 def finalize_skeleton_store(root) -> None:
+    # No ``fragments_tile`` stamp here, deliberately.  This finalises a
+    # DECENTRALISED write -- many workers, each owning some chunks -- so
+    # the layout is exactly the one whose tiling nothing can vouch for
+    # from here.  The claim stays absent, which costs a coarser read and
+    # promises nothing untrue.
     _finalize_write(root, "write_skeleton_chunked")
 
 

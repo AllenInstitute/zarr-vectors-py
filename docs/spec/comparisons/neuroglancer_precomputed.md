@@ -1,4 +1,4 @@
-# ZVF and Neuroglancer precomputed
+# Zarr Vectors and Neuroglancer precomputed
 
 ## Terms
 
@@ -28,22 +28,22 @@
 **`info` file**
 : The JSON metadata file at the root of a Neuroglancer precomputed layer
   that declares the data type, scales, voxel resolution, chunk sizes, and
-  layer-specific configuration. Analogous to ZVF's root `.zattrs`.
+  layer-specific configuration. Analogous to Zarr Vectors' root `.zattrs`.
 
 ---
 
 ## Introduction
 
-ZVF and Neuroglancer precomputed share the same fundamental goal —
+Zarr Vectors and Neuroglancer precomputed share the same fundamental goal —
 spatially indexed, multi-resolution storage of 3-D geometry data — but
 were designed for different constraints. Precomputed is a read-only static
 serving format: data is written once and served over HTTP to Neuroglancer
-clients. ZVF is a read-write cloud-native format: data can be read and
+clients. Zarr Vectors is a read-write cloud-native format: data can be read and
 written from any Zarr-compatible environment, and the format is not tied
 to any specific viewer.
 
 Understanding the relationship between the two formats is important for
-users of `zv-ngtools`, which translates ZVF stores into Neuroglancer layers
+users of `zv-ngtools`, which translates Zarr Vectors stores into Neuroglancer layers
 and optionally exports them to precomputed format for static hosting.
 
 ---
@@ -72,23 +72,23 @@ Precomputed annotations do not support:
 - Per-annotation scalar attributes (only `id`, `type`, and geometry).
 - Discrete object model with per-object retrieval by ID.
 
-#### ZVF equivalent
+#### Zarr Vectors equivalent
 
-| Precomputed type | Closest ZVF type | Notes |
+| Precomputed type | Closest Zarr Vectors type | Notes |
 |-----------------|-----------------|-------|
-| `point` | `point_cloud` | ZVF adds per-vertex attributes and multi-resolution |
-| `line` | `line` | ZVF adds per-vertex attributes |
-| `axis_aligned_bounding_box` | `mesh` (degenerate box) | No native ZVF bbox type; store as 8-vertex mesh |
-| `ellipsoid` | `parametric/` group | Stored as parameter tuple; no native render in ZVF viewers |
+| `point` | `point_cloud` | Zarr Vectors adds per-vertex attributes and multi-resolution |
+| `line` | `line` | Zarr Vectors adds per-vertex attributes |
+| `axis_aligned_bounding_box` | `mesh` (degenerate box) | No native Zarr Vectors bbox type; store as 8-vertex mesh |
+| `ellipsoid` | `parametric/` group | Stored as parameter tuple; no native render in Zarr Vectors viewers |
 
-ZVF is strictly richer than precomputed annotations: all precomputed
-annotation types can be represented in ZVF (with some loss of compactness),
+Zarr Vectors is strictly richer than precomputed annotations: all precomputed
+annotation types can be represented in Zarr Vectors (with some loss of compactness),
 but not vice versa (streamlines, graphs, and skeletons have no precomputed
 annotation equivalent).
 
 #### `zv-ngtools` translation
 
-`zv-ngtools` serves ZVF point clouds and line stores as Neuroglancer
+`zv-ngtools` serves Zarr Vectors point clouds and line stores as Neuroglancer
 annotation layers by translating fragment slices to annotation chunk binaries
 on the fly:
 
@@ -119,9 +119,9 @@ shard files) that packs many skeletons into fewer files for cloud efficiency.
 Attribute support: precomputed skeletons support per-vertex `vertex_attributes`
 (float scalars and float vectors) stored alongside vertex positions.
 
-#### ZVF skeleton vs precomputed skeleton
+#### Zarr Vectors skeleton vs precomputed skeleton
 
-| Property | ZVF `skeleton` | Precomputed skeleton |
+| Property | Zarr Vectors `skeleton` | Precomputed skeleton |
 |----------|---------------|---------------------|
 | Spatial index | Yes (fragment index + chunk grid) | No (direct file per object) |
 | Multi-resolution | Yes | No |
@@ -135,7 +135,7 @@ Attribute support: precomputed skeletons support per-vertex `vertex_attributes`
 #### Export to precomputed skeletons
 
 The precomputed-skeletons exporter (and its CLI subcommand) lives in the
-companion package **`zarr-vectors-tools`**. It translates a ZVF skeleton
+companion package **`zarr-vectors-tools`**. It translates a Zarr Vectors skeleton
 store to the Neuroglancer sharded skeleton format, writing one shard
 file per chunk. The output can be served directly by any HTTP server;
 add the layer URL to Neuroglancer as a `skeletons` data source.
@@ -156,9 +156,9 @@ fragment covering one spatial chunk. Fragments are packed into shard files.
 Draco compression is supported. A per-object manifest JSON declares which
 fragment shards contain each object.
 
-#### ZVF mesh vs precomputed mesh
+#### Zarr Vectors mesh vs precomputed mesh
 
-| Property | ZVF `mesh` | Precomputed mesh (sharded) |
+| Property | Zarr Vectors `mesh` | Precomputed mesh (sharded) |
 |----------|-----------|---------------------------|
 | Spatial indexing | Chunk + fragment index | Fragment grid |
 | Draco compression | Optional | Supported |
@@ -167,10 +167,10 @@ fragment shards contain each object.
 | Write API | Yes | No |
 | Viewer support | Via zv-ngtools | Native Neuroglancer |
 
-The ZVF mesh fragment model (faces assigned to chunks by centroid) is
+The Zarr Vectors mesh fragment model (faces assigned to chunks by centroid) is
 intentionally similar to the Neuroglancer sharded fragment model. The
 `precomputed_export` tool in `zv-ngtools` exploits this similarity to
-produce precomputed shard files directly from ZVF chunk data with minimal
+produce precomputed shard files directly from Zarr Vectors chunk data with minimal
 transformation.
 
 #### Export to precomputed meshes
@@ -178,9 +178,9 @@ transformation.
 The precomputed-meshes exporter (and its CLI subcommand) lives in the
 companion package **`zarr-vectors-tools`**.
 
-### Summary: choosing between ZVF and precomputed
+### Summary: choosing between Zarr Vectors and precomputed
 
-| Use case | ZVF | Precomputed |
+| Use case | Zarr Vectors | Precomputed |
 |----------|-----|-------------|
 | Cloud-native read-write pipeline | ✓ | ✗ |
 | Static Neuroglancer serving (no write needed) | Via export | ✓ |
@@ -190,6 +190,6 @@ companion package **`zarr-vectors-tools`**.
 | Native Neuroglancer support (no extra tools) | Via zv-ngtools | ✓ |
 | Arbitrary query API (Python, Julia, R) | ✓ | ✗ |
 
-For most new projects that originate data computationally, ZVF is the
+For most new projects that originate data computationally, Zarr Vectors is the
 primary format. Precomputed export is a one-way publication step for
 sharing with Neuroglancer users who do not have `zv-ngtools` installed.

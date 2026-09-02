@@ -7,6 +7,8 @@ from pathlib import Path
 import numpy as np
 
 from zarr_vectors.core.arrays import (
+    chunk_fragments_tile,
+    read_chunk_vertex_buffer,
     list_chunk_keys, read_all_object_manifests, read_chunk_vertices,
 )
 from zarr_vectors.core.store import (
@@ -114,6 +116,15 @@ def validate_consistency(store_path: str | Path) -> ValidationResult:
         check_bin_layout = is_point_cloud_only and not has_object_index
         chunks_checked_for_bin_bounds = 0
 
+        # A level claiming ``fragments_tile`` is telling readers they may
+        # return a chunk's whole buffer without consulting its fragment
+        # index.  A claim that does not hold is a silent wrong answer --
+        # rows nothing references come back -- so it is worth confirming
+        # against what is actually stored.
+        claims_tiling = bool(
+            getattr(level_meta_obj, "fragments_tile", False),
+        )
+
         for ck in chunk_keys:
             try:
                 groups = read_chunk_vertices(lg, ck, ndim=ndim)
@@ -122,6 +133,19 @@ def validate_consistency(store_path: str | Path) -> ValidationResult:
                 continue
 
             chunk_fragment_counts[ck] = len(groups)
+
+            if claims_tiling:
+                # Against the BUFFER's row count, not the fragments' total.
+                # Those two differ exactly when rows go unreferenced, which
+                # is the case the claim must not be allowed to hide.
+                buf = read_chunk_vertex_buffer(lg, ck, ndim=ndim, default=None)
+                n_rows = 0 if buf is None else len(buf)
+                if not chunk_fragments_tile(lg, ck, n_rows):
+                    result.add_error(
+                        f"{prefix}: fragments_tile is set but chunk {ck} "
+                        f"does not tile its buffer"
+                    )
+                    claims_tiling = False   # one report per level is enough
 
             # Check fragment count doesn't exceed bins_per_chunk
             # (only for undifferentiated point clouds with explicit bins)

@@ -8,7 +8,7 @@ please cite the software repository:
 ```bibtex
 @software{zarr_vectors_py,
   author       = {{BRIDGE Neuroscience}},
-  title        = {{zarr-vectors-py: Python tools for the Zarr Vector Format}},
+  title        = {{zarr-vectors-py: Python tools for the Zarr Vectors}},
   year         = {2024},
   publisher    = {GitHub},
   url          = {https://github.com/BRIDGE-Neuroscience/zarr-vectors-py},
@@ -18,9 +18,9 @@ please cite the software repository:
 }
 ```
 
-## The Zarr Vector Format specification
+## The Zarr Vectors specification
 
-The ZVF format was originally specified by Forest Collman at the Allen
+The Zarr Vectors format was originally specified by Forest Collman at the Allen
 Institute for Brain Sciences. Please also cite the upstream specification:
 
 ```bibtex
@@ -67,7 +67,7 @@ please also cite:
 A suggested acknowledgement sentence for methods sections:
 
 > "Vector geometry data (streamlines / point clouds / skeletons) were
-> stored and served using the Zarr Vector Format [Collman, 2023] as
+> stored and served using the Zarr Vectors [Collman, 2023] as
 > implemented in `zarr-vectors-py` [BRIDGE Neuroscience, 2024] and
 > visualised using Neuroglancer [Google] via `zv-ngtools`
 > [BRIDGE Neuroscience, 2024]."

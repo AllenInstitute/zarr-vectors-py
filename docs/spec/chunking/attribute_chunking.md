@@ -10,7 +10,7 @@
   over chunk keys instead of a full-store scan.
 
 **Leading chunk axis**
-: The first dimension of a chunk key. For a spatial-only ZVF store the
+: The first dimension of a chunk key. For a spatial-only Zarr Vectors store the
   leading axis is the first spatial dim; for an attribute-chunked store
   the leading axis is the attribute bin index. Chunk keys go from
   `z.y.x` to `attr_bin.z.y.x`.
@@ -40,7 +40,7 @@
 
 ## Introduction
 
-ZVF chunks data spatially by default — points, vertices, faces, edges
+Zarr Vectors chunks data spatially by default — points, vertices, faces, edges
 are bucketed by their position in a fixed-size 3D grid. This is correct
 for *spatial-locality* queries ("give me everything in this bounding
 box") but wrong for *categorical* queries ("give me everything for gene
