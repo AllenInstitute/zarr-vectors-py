@@ -8,6 +8,25 @@ from __future__ import annotations
 from pathlib import Path
 
 import numpy as np
+import pytest
+
+
+def _assert_born_sharded(node, name, shard_shape):
+    """Assert ``node`` is a genuinely native-sharded Zarr v3 array.
+
+    Not just "is an Array": the point of a born-sharded write is that
+    the array carries Zarr v3's own ``sharding_indexed`` codec with the
+    requested outer shape, and that its inner chunk is one Zarr Vectors
+    spatial cell — so any standards-compliant Zarr v3 reader sees a
+    shard, not a directory of one object per cell.
+    """
+    import zarr
+
+    assert isinstance(node, zarr.Array), (name, type(node))
+    codec_names = {c.to_dict().get("name") for c in node.metadata.codecs}
+    assert "sharding_indexed" in codec_names, (name, codec_names)
+    assert node.shards == shard_shape, (name, node.shards, shard_shape)
+    assert node.chunks == (1,) * len(shard_shape), (name, node.chunks)
 
 
 def _make_streamlines(rng, n=100, ndim=3):
@@ -63,7 +82,14 @@ class TestLazyDaskParallel:
     """Lazy API with explicit dask.compute parallelism."""
 
     def test_dask_compute_chunks(self, tmp_path: Path) -> None:
-        import dask
+        # dask is genuinely optional here: zarr_vectors.lazy imports it
+        # under try/except and falls back to eager _FakeDelayed objects
+        # when it is absent (lazy/arrays.py, HAS_DASK), and nothing in
+        # pyproject.toml declares it.  This test is about the *real*
+        # dask path, so skip where dask is missing rather than fail —
+        # the same convention the obstore / fsspec / icechunk /
+        # jsonschema tests already use.
+        dask = pytest.importorskip("dask")
         from zarr_vectors.types.points import write_points
         from zarr_vectors.lazy import open_zv
 
@@ -163,16 +189,11 @@ class TestBornShardedWrites:
         )
 
         # vertices and vertex_fragments are sharded Zarr arrays at
-        # creation time — no migration step needed.
+        # creation time — no migration step needed.  A point cloud has
+        # no link families, so every per-chunk name here is a leaf array.
         zg = zarr.open_group(store)
         for name in ("0/vertices", "0/vertex_fragments"):
-            node = zg[name]
-            assert isinstance(node, zarr.Array), (name, type(node))
-            codec_names = {
-                c.to_dict().get("name") for c in node.metadata.codecs
-            }
-            assert "sharding_indexed" in codec_names, (name, codec_names)
-            assert node.shards == (2, 2, 2)
+            _assert_born_sharded(zg[name], name, (2, 2, 2))
 
         r = read_points(store)
         assert r["vertex_count"] == 500
@@ -207,10 +228,34 @@ class TestBornShardedWrites:
         )
 
         zg = zarr.open_group(store)
-        for name in ("0/vertices", "0/vertex_fragments",
-                     "0/links/0", "0/link_fragments"):
-            node = zg[name]
-            assert isinstance(node, zarr.Array), (name, type(node))
+        for name in ("0/vertices", "0/vertex_fragments", "0/link_fragments"):
+            _assert_born_sharded(zg[name], name, (2, 2, 2))
+
+        # Under the merged links layout, ``links/<delta>`` is a GROUP
+        # whose children are one array per relative-offset segment
+        # (``0.0.0`` for the intra-chunk edges, ``+1.+1.+1`` for the
+        # cross-chunk one).  Those per-offset arrays are what has to be
+        # born sharded — asserting on the group itself would only be
+        # asserting that a group is not an array.
+        links_delta = zg["0/links/0"]
+        assert isinstance(links_delta, zarr.Group), type(links_delta)
+        offset_arrays = dict(links_delta.members())
+        assert set(offset_arrays) == {"0.0.0", "+1.+1.+1"}, sorted(offset_arrays)
+        for segment, node in offset_arrays.items():
+            _assert_born_sharded(node, f"0/links/0/{segment}", (2, 2, 2))
+
+        # The sharding is real on disk, not just in the metadata: the
+        # three occupied cells of ``vertices`` — chunks (0,0,0), (1,1,1)
+        # and (2,2,2) — fall into two 2x2x2 shards, so they cost two
+        # storage objects rather than one per cell.
+        cells = np.asarray(zg["0/vertices"][...]).ravel()
+        occupied = sum(1 for cell in cells if len(cell) > 0)
+        assert occupied == 3, occupied
+        objects = [
+            f for f in (Path(store) / "0" / "vertices").rglob("*")
+            if f.is_file() and f.name != "zarr.json"
+        ]
+        assert len(objects) == 2, sorted(str(f) for f in objects)
 
         r = read_graph(store)
         assert r["node_count"] == 7

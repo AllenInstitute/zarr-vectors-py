@@ -363,6 +363,50 @@ def is_sharded(level_group: Group, array_name: str) -> bool:
     return array_is_sharded(level_group, array_name)
 
 
+def link_endpoint_scales(
+    level_group: Group, delta: int, sid_ndim: int,
+) -> tuple[tuple[int, ...], tuple[int, ...]]:
+    """The ``(scale_src, scale_trg)`` pair the link placement arithmetic takes.
+
+    Each is the per-axis integer multiple of the root ``chunk_shape``
+    that a level's own ``chunk_shape`` represents: ``scale_src`` for the
+    level ``level_group`` names, ``scale_trg`` for ``level + delta``.
+    They exist because two levels of a pyramid built with
+    ``chunk_scale_factor > 1`` index grids of different cell sizes, so
+    their chunk coordinates cannot be differenced directly.
+
+    Promoted because :func:`cell_endpoint_chunks` is exported and *needs*
+    these two, and until now the only way to obtain them was a private
+    helper — an argument on a supported function with no supported
+    provenance.  Reconstructing them from :func:`read_root_metadata` and
+    :func:`chunk_scale_from_root` is possible but gets the padding rule
+    wrong: a store chunked by an attribute prepends a bin axis to every
+    chunk key, so the scales must be padded with leading 1s to
+    ``sid_ndim`` or the rank check rejects the store.  This is the same
+    value the readers and writers anchor through, so a caller
+    reconstructing a cell agrees with the code that placed it.
+
+    Args:
+        level_group: The level the *source* endpoint lives at.
+        delta: Level delta of the link family — ``0`` for links within
+            one level, non-zero for cross-level ones.
+        sid_ndim: Rank of the chunk keys in this family, which is
+            ``link_family_policy(level_group, delta)[1]`` and may exceed
+            the spatial rank on an attribute-binned store.
+
+    Returns:
+        ``(scale_src, scale_trg)``, each ``sid_ndim`` ints.  Both are
+        all-ones when the metadata cannot be read or the target level
+        does not exist yet.  That is exactly right for a default pyramid
+        and makes the anchor a no-op; it is *wrong* for one built with
+        ``chunk_scale_factor > 1``, so call this only once the target
+        level and its ``LevelMetadata`` are on disk.
+    """
+    from zarr_vectors.core.arrays import _link_scales
+
+    return _link_scales(level_group, int(delta), int(sid_ndim))
+
+
 def write_object_manifests(
     level_group: Group,
     manifest_blobs: list[bytes],
@@ -558,6 +602,7 @@ __all__ = [
     "level_grid_layout",
     "link_attributes_group_path",
     "link_attributes_path",
+    "link_endpoint_scales",
     "link_family_policy",
     "links_group_path",
     "links_has_perm",

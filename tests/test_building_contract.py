@@ -55,6 +55,53 @@ _ALLOWED_UNCOVERED = frozenset({
     # Removed from core entirely; the remaining references are prose in
     # migration notes, and one consumer not yet moved to read_links.
     "read_cross_chunk_links",
+    # Editing belongs to the api surface: ``Dataset.editing()`` returns an
+    # EditPlan that wraps both VertexRef constructors, and its ``.session``
+    # is the documented escape hatch for the rest.  The one importer is the
+    # paper benchmark, which measures the physical primitive on purpose.
+    # (EditPlan has no fragment-level operation, which is a real gap -- but
+    # it is api's gap to close, not a reason to open a second supported
+    # door onto editing here.)
+    "EditSession",
+    "FragmentRef",
+    "VertexRef",
+    # Imported only to monkeypatch ``.indices`` and count fragment decodes
+    # in a downstream regression test.  The value itself already comes back
+    # from the exported read_vertex_fragment_index; exporting the class
+    # would additionally promise the decode entry point that test is
+    # deliberately reaching behind.
+    "ChunkFragmentIndex",
+    # Reaching past: list_chunk_keys(level_group, array_name=...) returns
+    # coordinate tuples for ANY array.  Both downstream reimplementations
+    # start from Group.list_chunks, which hands back raw key strings.
+    "_parse_chunk_key",
+    # resolve_chunk_keys is list_chunk_keys AND chunks_intersecting_bbox,
+    # both exported; the single call site passes neither filter, so it is
+    # list_chunk_keys spelled long.
+    "resolve_chunk_keys",
+    # Reaching past: the supported link decoders are iter_link_cells,
+    # read_links and read_chunk_links.  The one importer is the profiler,
+    # reimplementing read_links' inner loop to measure a vectorised
+    # replacement for it.
+    "_link_cell_rows",
+    # A missing capability, now filled: this is the private spelling of
+    # building.link_endpoint_scales, promoted because cell_endpoint_chunks
+    # is exported and its scale arguments had no supported source.  The
+    # profiler should move to the public name.
+    "_link_scales",
+    # Reaching past: array_is_sharded(level_group, array_name) is the
+    # promoted spelling.  Both call sites resolve a zarr node through
+    # Group.zarr_group first, which is the reach it was added to remove.
+    "_is_native_sharded",
+    # The path a builder actually needs is composed by links_path and
+    # link_attributes_path; segments come back from list_link_offsets, and
+    # parse_offsets is the exported inverse.  Only the profiler wants the
+    # bare segment, as a dict key matching the partitioner's own.
+    "format_offsets",
+    # write_links takes records in the same (chunk_coords, vertex_idx) form
+    # and does this placement itself.  The buckets alone are wanted only by
+    # the profiler, whose subject IS the partitioner.
+    "partition_records_by_offset",
 })
 
 
