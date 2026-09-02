@@ -707,6 +707,11 @@ __all__ = [
     "OBJECT_ATTRIBUTES",
     "OBJECT_INDEX",
     "OBJECT_INDEX_LAYOUT_V1",
+    # Exported so a consumer can audit an existing store's manifest chunking
+    # without importing from ``core``: the number is fixed at array-creation
+    # time and cannot be changed afterwards, so "is this store chunked
+    # correctly?" is a question only an outside reader can answer, and it needs
+    # the reference value to answer it against.
     "OBJECT_INDEX_MANIFEST_BUCKET",
     "ObjectIndexAppender",
     "RechunkSpec",
