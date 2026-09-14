@@ -1041,7 +1041,7 @@ class EditSession:
     def _flush_manifest_ops(self) -> None:
         if not self._manifest_ops:
             return
-        from zarr_vectors.core.arrays import write_object_index
+        from zarr_vectors.core.arrays import patch_object_manifests
         from zarr_vectors.core.metadata import RootMetadata
         from zarr_vectors.core.store import get_resolution_level
 
@@ -1056,20 +1056,15 @@ class EditSession:
 
         for level, ops in by_level.items():
             level_group = get_resolution_level(self.root, level)
-            # Start from disk state then apply ops.
-            manifests = list(self._all_manifests_for(level))
-            max_oid = len(manifests) - 1
+            # Only the rows this flush actually changed. Rebuilding the
+            # whole index instead made a single-vertex edit cost the
+            # object count: 3.3s and 414 MB on a 400,000-object store,
+            # for one changed row.
+            updates: dict[int, list[tuple[ChunkCoords, int]]] = {}
             for op in ops:
                 oid = op.new_oid if op.new_oid is not None else op.object_id
-                if oid > max_oid:
-                    manifests.extend([] for _ in range(oid - max_oid))
-                    max_oid = oid
-                manifests[oid] = list(op.new_manifest or [])
-            manifest_dict = {i: m for i, m in enumerate(manifests)}
-            write_object_index(
-                level_group, manifest_dict, sid_ndim,
-                total_objects=len(manifests),
-            )
+                updates[int(oid)] = list(op.new_manifest or [])
+            patch_object_manifests(level_group, updates, sid_ndim)
 
     def _refresh_now(self, source_level: int) -> None:
         from zarr_vectors.ops.refresh import rebuild_pyramid_from_level
