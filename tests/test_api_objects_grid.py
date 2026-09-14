@@ -160,13 +160,19 @@ class TestObjectCatalog:
 
 class TestGrid:
     def test_plan_predicts_the_allocation_before_the_store_exists(self):
+        # 9, not 8: bounds are inclusive, so a vertex at exactly 800 has
+        # to be storable and it lands in cell 8.  The store allocates
+        # floor(hi/c) - floor(lo/c) + 1 -- predicting ceil(extent/c) was
+        # one plane short, which is the failure Grid.plan exists to catch.
         grid = zv.Grid.plan(([0, 0, 0], [800, 800, 800]), cell_size=(100.0,) * 3)
-        assert grid.shape == (8, 8, 8)
-        assert grid.cells == 512
+        assert grid.shape == (9, 9, 9)
+        assert grid.cells == 729
 
     def test_plan_from_a_target_cell_count(self):
+        # target_cells=n asks for n cell-WIDTHS; the allocation is n + 1
+        # planes when the upper bound lands on a boundary.
         grid = zv.Grid.plan(([0, 0, 0], [800, 800, 800]), target_cells=4)
-        assert grid.shape == (4, 4, 4)
+        assert grid.shape == (5, 5, 5)
         assert grid.cell_shape == (200.0, 200.0, 200.0)
 
     def test_a_levels_grid_matches_how_it_was_written(self, cloud):
@@ -191,6 +197,9 @@ class TestGrid:
         assert not grid.holds(zv.CellRef((99, 0, 0)))
 
     def test_capacity_flags_an_unwieldy_grid(self):
+        # target_cells=1 allocates 2x2x2 = 8 cells, not 1, so the vertex
+        # count has to clear the 64 MB/cell target eight times over for
+        # this to still be testing what it says.
         tiny = zv.Grid.plan(([0, 0, 0], [800, 800, 800]), target_cells=1)
         verdict = tiny.capacity(n_vertices=2_000_000_000)
         assert not verdict.fits
@@ -202,7 +211,7 @@ class TestGrid:
 
     def test_capacity_str_is_readable(self):
         grid = zv.Grid.plan(([0, 0, 0], [800, 800, 800]), target_cells=8)
-        assert "512 cells" in str(grid.capacity(n_vertices=1000))
+        assert "729 cells" in str(grid.capacity(n_vertices=1000))
 
 
 class TestCellSelection:
@@ -310,3 +319,58 @@ class TestGridSpeaksTheStoresFrame:
         """
         assert zv.Grid(shape=(), cell_shape=(100.0,) * 3).anchor == (0, 0, 0)
         assert list(zv.Grid(shape=(), cell_shape=())) == []
+
+
+class TestGridPlanMatchesTheAllocator:
+    """A prediction that disagrees with the allocation is worse than none.
+
+    ``Grid.plan`` restated the allocator's arithmetic as
+    ``ceil(extent/cell)`` instead of calling it, and the two differ
+    whenever the upper bound lands on a cell boundary or the lower one
+    does not.  Both are ordinary: ``Layout(cells=n)`` on round bounds
+    produces the first, and any store not starting at zero the second.
+    """
+
+    @pytest.mark.parametrize(
+        "bounds,cell",
+        [
+            (([0, 0, 0], [800, 800, 800]), (100.0,) * 3),
+            (([1050, 1050, 1050], [2050, 2050, 2050]), (200.0,) * 3),
+            (([150, 150, 150], [950, 950, 950]), (200.0,) * 3),
+            (([0, 0, 0], [1000, 1000, 1000]), (1000.0,) * 3),
+            (([-500, -500, -500], [500, 500, 500]), (200.0,) * 3),
+        ],
+    )
+    def test_plan_agrees_with_the_allocator(self, bounds, cell):
+        from zarr_vectors.core.arrays import level_grid_layout
+
+        grid = zv.Grid.plan(bounds, cell_size=cell)
+        origin, shape = level_grid_layout(bounds, cell)
+        assert (grid.anchor, grid.shape) == (origin, shape)
+
+    def test_a_point_on_the_upper_bound_is_inside_the_allocation(self):
+        """The boundary case ``ceil`` could never express."""
+        grid = zv.Grid.plan(([0, 0, 0], [800, 800, 800]), cell_size=(100.0,) * 3)
+        assert grid.holds(grid.cell_of([800.0, 800.0, 800.0]))
+
+    def test_a_levels_grid_matches_the_array_on_disk(self, offset_cloud):
+        """The oracle: ask the store what it actually allocated."""
+        level = zv.open(offset_cloud).level(0)
+        origin, shape = level.store.chunk_grid_bounds("vertices")
+        assert level.grid.anchor == tuple(origin or (0, 0, 0))
+        assert level.grid.shape == shape
+
+    def test_iterating_names_every_cell_the_bounds_cover(self, offset_cloud):
+        ds = zv.open(offset_cloud)
+        grid = ds.level(0).grid
+        assert set(grid) == set(grid.cells_in(ds.bounds))
+        assert all(grid.holds(ref) for ref in grid.cells_in(ds.bounds))
+
+    def test_iterating_partitions_the_level_exactly(self, offset_cloud):
+        """What hpc_pipelines.md promises when it shards work by cell."""
+        level = zv.open(offset_cloud).level(0)
+        total = sum(
+            level.select(cells=[ref]).read().vertex_count
+            for ref in level.grid
+        )
+        assert total == level.read().vertex_count

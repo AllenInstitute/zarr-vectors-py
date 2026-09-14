@@ -173,11 +173,51 @@ def compute_bounds(
     )
 
 
+def grid_layout(
+    bounds: BoundingBox,
+    chunk_shape: ChunkShape,
+) -> tuple[tuple[int, ...], tuple[int, ...]]:
+    """``(origin, shape)`` of the chunk grid these bounds allocate.
+
+    ``origin`` is the absolute chunk coord of cell 0 — ``floor(lo / c)``,
+    the value a store stamps as its ``chunk_grid_origin``.  ``shape`` is
+    ``floor(hi / c) - origin + 1``.
+
+    Bounds are **inclusive**: a vertex exactly on ``hi`` has to be
+    storable, and it lands in cell ``floor(hi / c)``.  That is why this is
+    not ``ceil((hi - lo) / c)`` — see :func:`compute_grid_shape`, which
+    counts cell-widths across the extent and is one short whenever the
+    upper bound falls on a boundary, or whenever the lower bound does not.
+
+    The single definition of the allocation.  Anything that predicts the
+    grid — the allocator, and :meth:`zarr_vectors.api.grid.Grid.plan` —
+    calls this rather than restating it, because a prediction that
+    disagrees with the allocation is the whole failure those predictions
+    exist to prevent.
+    """
+    lo = np.asarray(bounds[0], dtype=np.float64)
+    hi = np.asarray(bounds[1], dtype=np.float64)
+    cs = np.asarray(chunk_shape, dtype=np.float64)
+    origin = tuple(int(np.floor(mn / c)) for mn, c in zip(lo, cs))
+    shape = tuple(
+        max(1, int(np.floor(mx / c)) - o + 1)
+        for mx, c, o in zip(hi, cs, origin)
+    )
+    return origin, shape
+
+
 def compute_grid_shape(
     bounds: BoundingBox,
     chunk_shape: ChunkShape,
 ) -> tuple[int, ...]:
     """Compute number of chunks per dimension.
+
+    .. warning::
+       This counts cell-widths across the extent (``ceil((hi-lo)/c)``).
+       It is **not** the allocation: bounds are inclusive, so a store
+       spans ``floor(hi/c) - floor(lo/c) + 1`` cells, which is larger
+       whenever ``hi`` lands on a cell boundary or ``lo`` does not.
+       Use :func:`grid_layout` to predict what a store will allocate.
 
     Args:
         bounds: ``(min_corner, max_corner)``.

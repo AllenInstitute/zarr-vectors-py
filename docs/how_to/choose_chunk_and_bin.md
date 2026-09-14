@@ -41,7 +41,9 @@ print(resolved.chunk_shape, resolved.bin_shape)
 Those are exactly the values an older version of this page told you to pass by
 hand as `chunk_shape=(500., 500., 500.)`. The rule of thumb behind `cells=8`
 is unchanged: aim for roughly 10 000–100 000 vertices in each cell, which here
-is 10 000 000 / 8³ ≈ 19 500.
+is 10 000 000 / 729 ≈ 13 700.  (`cells=8` asks for eight cell *widths*; the
+allocation is 9³, because bounds are inclusive and a vertex on the far face has
+to land somewhere.)
 
 Check it before writing anything:
 
@@ -52,8 +54,8 @@ print(grid.capacity(n_vertices=10_000_000))
 ```
 
 ```text
-Grid(8x8x8 cells of (500.0, 500.0, 500.0))
-8x8x8 = 512 cells, ~0.2 MB/cell -- fits
+Grid(9x9x9 cells of (500.0, 500.0, 500.0))
+9x9x9 = 729 cells, ~0.2 MB/cell -- fits
 ```
 
 ---
@@ -106,7 +108,7 @@ print(zv.Grid.plan(((0.0, 0.0, 0.0), (4000.0, 4000.0, 4000.0)),
 
 ```text
 (500.0, 500.0, 500.0)
-Grid(8x8x8 cells of (500.0, 500.0, 500.0))
+Grid(9x9x9 cells of (500.0, 500.0, 500.0))
 ```
 
 When it does not divide exactly, `cell_size` keeps the size you asked for and
@@ -191,12 +193,12 @@ whose cells are too big:
 ```python
 coarse = zv.Grid.plan(((0.0, 0.0, 0.0), (4000.0, 4000.0, 4000.0)), target_cells=1)
 print(coarse)
-print(coarse.capacity(n_vertices=10_000_000))
+print(coarse.capacity(n_vertices=100_000_000))
 ```
 
 ```text
-Grid(1x1x1 cells of (4000.0, 4000.0, 4000.0))
-1x1x1 = 1 cells, ~120.0 MB/cell -- does not fit: ~120 MB per cell exceeds the 67 MB target; use more cells
+Grid(2x2x2 cells of (4000.0, 4000.0, 4000.0))
+2x2x2 = 8 cells, ~150.0 MB/cell -- does not fit: ~150 MB per cell exceeds the 67 MB target; use more cells
 ```
 
 `fits` is an upper-bound check only. Nothing warns you about cells that are
@@ -263,8 +265,8 @@ print(zv.Grid.plan(bounds, target_cells=(8, 8, 2)))
 ```
 
 ```text
-Grid(8x8x8 cells of (256.0, 256.0, 64.0))
-Grid(8x8x2 cells of (256.0, 256.0, 256.0))
+Grid(9x9x9 cells of (256.0, 256.0, 64.0))
+Grid(9x9x3 cells of (256.0, 256.0, 256.0))
 ```
 
 `zv.Layout(cells=(8, 8, 2))` takes the same per-axis form. This matters for
@@ -293,7 +295,7 @@ Typical query 50³ µm, cell size 200³ µm:
 ### Bins per cell and index overhead
 
 The fragment index holds one 16-byte entry per bin, plus a small header and
-bitmap. Measured on a 5×5×5-cell store of 100 000 points, one
+bitmap. Measured on a store of 100 000 points occupying 125 cells, one
 `vertex_fragments` blob per cell:
 
 | `subcells` | Bins per cell (3-D) | Index bytes per cell |
@@ -354,10 +356,10 @@ for cells in (8, 16, 40, 80):
 ```
 
 ```text
-cells=8   cell=  1000 um     512 cells   4687.5 kB/cell 1 read per viewport
-cells=16  cell=   500 um    4096 cells    585.9 kB/cell 1 read per viewport
-cells=40  cell=   200 um   64000 cells     37.5 kB/cell 1 read per viewport
-cells=80  cell=   100 um  512000 cells      4.7 kB/cell 8 read per viewport
+cells=8   cell=  1000 um     729 cells   3292.2 kB/cell 1 read per viewport
+cells=16  cell=   500 um    4913 cells    488.5 kB/cell 1 read per viewport
+cells=40  cell=   200 um   68921 cells     34.8 kB/cell 1 read per viewport
+cells=80  cell=   100 um  531441 cells      4.5 kB/cell 8 read per viewport
 ```
 
 `cells=16` is the answer. It is the only row in the 50 KB–50 MB band:
@@ -436,8 +438,8 @@ print(r.chunk_shape, r.bin_shape)
 
 A 30 mm bundle width spans between 3 and 4 of those 9 mm bins per axis, inside
 the 2–8 target. If the pipeline needs the round 50 mm grid rather than the
-round cell count, `zv.Layout(cell_size=(50.0, 50.0, 50.0))` gives the same
-4×4×4 allocation with the outermost cells overhanging the bounds:
+round cell count, `zv.Layout(cell_size=(50.0, 50.0, 50.0))` gives a 4×4×4
+allocation with the outermost cells overhanging the bounds:
 
 ```python
 print(zv.Grid.plan(bounds, cell_size=(50.0, 50.0, 50.0)))
@@ -528,7 +530,7 @@ print(ds.select(bbox=((100.0, 100.0, 100.0), (200.0, 200.0, 200.0))).count())
 ```
 
 ```text
-Grid(1x1x1 cells of (1000.0, 1000.0, 1000.0))
+Grid(2x2x2 cells of (1000.0, 1000.0, 1000.0))
 100000
 0
 ```
@@ -565,8 +567,8 @@ print(f"min={counts.min()} median={int(np.median(counts))} "
 ```
 
 ```text
-Grid(5x5x5 cells of (200.0, 200.0, 200.0)) 125/125 occupied
-min=746 median=799 p95=848 max=864
+Grid(6x6x6 cells of (200.0, 200.0, 200.0)) 125/216 occupied
+min=740 median=798 p95=853 max=870
 ```
 
 (That is the quickstart's 100 000 uniformly-distributed points, so the spread

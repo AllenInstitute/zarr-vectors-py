@@ -494,15 +494,11 @@ def level_grid_layout(
     ``ceil(max_corner / chunk_shape)`` would also be one short whenever a
     point lands exactly on a chunk boundary — ``floor(..) + 1`` is exact.
     """
-    min_corner = np.asarray(bounds[0], dtype=np.float64)
-    max_corner = np.asarray(bounds[1], dtype=np.float64)
-    cs = np.asarray(chunk_shape, dtype=np.float64)
-    origin = tuple(int(np.floor(mn / c)) for mn, c in zip(min_corner, cs))
-    grid_shape = tuple(
-        max(1, int(np.floor(mx / c)) - o + 1)
-        for mx, c, o in zip(max_corner, cs, origin)
-    )
-    return origin, grid_shape
+    from zarr_vectors.spatial.chunking import grid_layout
+
+    # One definition, in the pure-numpy module, so the api's Grid can
+    # predict this allocation by calling it rather than by restating it.
+    return grid_layout((bounds[0], bounds[1]), chunk_shape)
 
 
 @contextmanager

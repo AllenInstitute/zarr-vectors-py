@@ -40,11 +40,11 @@ print(grid.capacity(n_vertices=500_000_000))
 ```
 
 ```text
-Grid(20x20x20 cells of (500.0, 500.0, 500.0)) 8000
-20x20x20 = 8000 cells, ~0.8 MB/cell -- fits
+Grid(21x21x21 cells of (500.0, 500.0, 500.0)) 9261
+21x21x21 = 9261 cells, ~0.6 MB/cell -- fits
 ```
 
-8000 cells and ~0.8 MB each: that sizes the `--array` range and tells you a
+9261 cells and ~0.6 MB each: that sizes the `--array` range and tells you a
 task holding a few hundred cells stays well inside a modest `--mem`.
 
 ### Partitions must be disjoint

@@ -126,6 +126,20 @@ class Grid:
         answer can change a decision.  A consumer that discovers after the
         fact that its chunk ids exceed the allocation has already written
         a store it must throw away.
+
+        The shape comes from
+        :func:`~zarr_vectors.spatial.chunking.grid_layout` — the function
+        the allocator itself calls — rather than from a restatement of it.
+        A restatement is what this used to be, and it was one plane short:
+        ``ceil((hi - lo) / size)`` counts cell-widths across the extent,
+        but bounds are inclusive, so a store spans
+        ``floor(hi/size) - floor(lo/size) + 1`` cells.
+
+        That makes ``target_cells=n`` produce ``n + 1`` cells per axis
+        when the upper bound lands exactly on a cell boundary: a vertex at
+        ``hi`` has to be storable, and it lands in cell ``floor(hi/size)``.
+        The extra plane is what the store really allocates; reporting
+        ``n`` is the failure this method exists to prevent.
         """
         lo = [float(v) for v in bounds[0]]
         hi = [float(v) for v in bounds[1]]
@@ -143,7 +157,9 @@ class Grid:
             )
         else:
             size = tuple(e or 1.0 for e in extent)
-        shape = tuple(max(1, math.ceil(e / s)) for e, s in zip(extent, size))
+        from zarr_vectors.spatial.chunking import grid_layout
+
+        _origin, shape = grid_layout((lo, hi), size)
         return cls(shape=shape, cell_shape=size, origin=tuple(lo))
 
     # ---------------- geometry ----------------

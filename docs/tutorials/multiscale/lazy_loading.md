@@ -300,9 +300,11 @@ CellSet(0 cell(s))
 100000 100000
 ```
 
-`cells_in` is inclusive of the far edge, so it can name references just past
-the allocation; `Grid.holds(ref)` is the guard. The loop is memory-bounded:
-peak usage is one cell, not one level.
+`cells_in` names every cell a box touches, so for a box larger than the
+store's own bounds it can reach past the allocation; `Grid.holds(ref)` is the
+guard. Asked for the bounds themselves, as here, it names exactly the
+allocation and the guard passes everything. The loop is memory-bounded: peak
+usage is one cell, not one level.
 
 ---
 
@@ -346,7 +348,7 @@ print(len(counts), sum(counts))
 ```
 
 ```text
-125 100000
+216 100000
 ```
 
 This is the supported replacement for the lazy layer's `to_delayed()`. A

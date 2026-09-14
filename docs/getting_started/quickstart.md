@@ -129,8 +129,8 @@ print(grid.shape, grid.cell_shape)
 ```
 
 ```text
-Grid(5x5x5 cells of (200.0, 200.0, 200.0))
-(5, 5, 5) (200.0, 200.0, 200.0)
+Grid(6x6x6 cells of (200.0, 200.0, 200.0))
+(6, 6, 6) (200.0, 200.0, 200.0)
 ```
 
 Storage geometry is no longer accepted anywhere on this surface:
