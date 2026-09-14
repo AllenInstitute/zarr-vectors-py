@@ -740,6 +740,7 @@ def build_vertex_chunk_mapping(
 
 def chunk_local_to_global_offsets(
     level_group,
+    ndim: int | None = None,
 ) -> tuple[dict[ChunkCoords, int], list[ChunkCoords], int]:
     """Build the per-chunk → global vertex-index offset table.
 
@@ -754,6 +755,11 @@ def chunk_local_to_global_offsets(
 
     Args:
         level_group: An open :class:`FsGroup` for one resolution level.
+        ndim: Coordinate columns per vertex.  ``None`` derives it from
+            the store's NGFF axes.  Passing the wrong value here does not
+            fail -- it silently scales every offset, which is why this
+            used to be hardcoded to 3 and gave wrong answers on any 2D
+            store.
 
     Returns:
         ``(offsets, chunk_keys, total_vertices)`` where:
@@ -765,7 +771,7 @@ def chunk_local_to_global_offsets(
     """
     # Imported lazily to avoid circular import with core.arrays which
     # depends on this module's other helpers.
-    from zarr_vectors.core.arrays import list_chunk_keys
+    from zarr_vectors.core.arrays import _infer_vert_ndim, list_chunk_keys
 
     chunk_keys = list_chunk_keys(level_group)
     offsets: dict[ChunkCoords, int] = {}
@@ -777,7 +783,7 @@ def chunk_local_to_global_offsets(
         itemsize = np.dtype(dtype_str).itemsize
     except Exception:
         itemsize = 4  # float32 default
-    ndim_meta = 3  # ndim is not stored; default to 3
+    ndim_meta = int(ndim) if ndim else _infer_vert_ndim(level_group)
     row_size = ndim_meta * itemsize
 
     for cc in chunk_keys:

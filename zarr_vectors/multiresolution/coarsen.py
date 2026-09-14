@@ -713,21 +713,29 @@ def _reconstruct_chunk_assignments(
     ``build_vertex_chunk_mapping`` for in-memory edge partitioning.
 
     Returns the assignments dict and the total vertex count.
+
+    Counts come from the size of each stored blob, not from decoding it.
+    The old form called ``read_chunk_vertices`` on every chunk purely to
+    sum ``fragment.shape[0]`` -- a full decode of the level's coordinate
+    data to learn how many rows it had. This runs twice per coarsen step
+    and once per level again in the finalize pass, so a pyramid paid for
+    several complete decodes it never looked at.
     """
-    chunk_keys = list_chunk_keys(level_group, VERTICES)
+    from zarr_vectors.spatial.boundary import chunk_local_to_global_offsets
+
+    offsets, chunk_keys, total = chunk_local_to_global_offsets(
+        level_group, ndim,
+    )
     assignments: dict[ChunkCoords, npt.NDArray[np.int64]] = {}
-    cursor = 0
-    for cc in chunk_keys:
-        try:
-            fragments = read_chunk_vertices(level_group, cc, ndim=ndim)
-        except ArrayError:
+    for i, cc in enumerate(chunk_keys):
+        start = offsets[cc]
+        end = offsets[chunk_keys[i + 1]] if i + 1 < len(chunk_keys) else total
+        if end <= start:
+            # An empty chunk contributes no vertices, and the old form
+            # skipped it rather than storing an empty range.
             continue
-        n = sum(int(fragment.shape[0]) for fragment in fragments)
-        if n == 0:
-            continue
-        assignments[cc] = np.arange(cursor, cursor + n, dtype=np.int64)
-        cursor += n
-    return assignments, cursor
+        assignments[cc] = np.arange(start, end, dtype=np.int64)
+    return assignments, total
 
 
 def _decode_parent_from_plus_one(
