@@ -20,6 +20,7 @@ from collections.abc import Sequence
 from typing import TYPE_CHECKING, Any
 
 import numpy as np
+import numpy.typing as npt
 
 from zarr_vectors.api.result import Attributes, ReadResult
 from zarr_vectors.api.select import Query, Selection
@@ -135,6 +136,31 @@ def _narrows(selection: Selection) -> bool:
         selection.where is not None,
         selection.cells is not None,
     ))
+
+
+def _rows_in(
+    rows: npt.NDArray[np.int64], wanted: set[tuple[int, ...]],
+) -> npt.NDArray[np.bool_]:
+    """Which of ``rows`` appear in ``wanted``, without a Python loop.
+
+    A cell post-filter asks this once per vertex, and asking it with
+    ``tuple(row) in wanted`` builds a Python tuple per vertex: 4.4s and
+    358 MB to keep one sixty-fourth of five million points.  Viewing each
+    row as a single structured scalar turns it into one ``np.isin``.
+    """
+    if not wanted:
+        return np.zeros(len(rows), dtype=bool)
+    width = rows.shape[1]
+    dt = np.dtype([(f"f{i}", np.int64) for i in range(width)])
+    want = np.asarray(sorted(wanted), dtype=np.int64)
+    if want.ndim != 2 or want.shape[1] != width:
+        # A ref of a different arity cannot match any row, and reshaping
+        # it to force a comparison would invent an answer.
+        return np.zeros(len(rows), dtype=bool)
+    return np.isin(
+        np.ascontiguousarray(rows).view(dt).ravel(),
+        np.ascontiguousarray(want).view(dt).ravel(),
+    )
 
 
 class Level:
@@ -510,7 +536,10 @@ class Level:
 
         from dataclasses import replace as _replace
 
-        from zarr_vectors.core.arrays import read_chunk_attributes
+        from zarr_vectors.core.arrays import (
+            _maybe_batched_reads,
+            read_chunk_attributes,
+        )
         from zarr_vectors.spatial.boundary import chunk_local_to_global_offsets
 
         try:
@@ -525,18 +554,35 @@ class Level:
                 # without knowing which vertices survived, and guessing
                 # would silently mis-pair values with positions.
                 return result
+            # One gather for every (attribute, cell) pair rather than a
+            # sequential read each. On an object store the unbatched form
+            # is one round-trip per cell per attribute, and even locally
+            # the fixed per-cell cost dominates: reading one attribute of
+            # a 64-cell level took 0.96s against 0.04s for the positions.
+            from zarr_vectors.constants import VERTEX_ATTRIBUTES
+
+            key_strs = [
+                cc if isinstance(cc, str) else ".".join(str(int(c)) for c in cc)
+                for cc in chunk_keys
+            ]
+            plan = [
+                (f"{VERTEX_ATTRIBUTES}/{name}", key_strs) for name in wanted
+            ]
             gathered: dict[str, Any] = {}
-            for name in wanted:
-                cols = [
-                    read_chunk_attributes(level_group, name, cc)
-                    for cc in chunk_keys
-                ]
-                flat = [np.asarray(g) for per_chunk in cols for g in per_chunk]
-                if not flat:
-                    continue
-                col = np.concatenate(flat, axis=0)
-                if col.shape[0] == result.vertex_count:
-                    gathered[name] = col
+            with _maybe_batched_reads(level_group, plan):
+                for name in wanted:
+                    cols = [
+                        read_chunk_attributes(level_group, name, cc)
+                        for cc in chunk_keys
+                    ]
+                    flat = [
+                        np.asarray(g) for per_chunk in cols for g in per_chunk
+                    ]
+                    if not flat:
+                        continue
+                    col = np.concatenate(flat, axis=0)
+                    if col.shape[0] == result.vertex_count:
+                        gathered[name] = col
             if not gathered:
                 return result
             return _replace(
@@ -597,9 +643,7 @@ class Level:
             idx = np.floor(
                 np.asarray(result.positions, dtype=np.float64) / cell
             ).astype(np.int64)
-            keep &= np.array(
-                [tuple(row) in wanted for row in idx], dtype=bool
-            )
+            keep &= _rows_in(idx, wanted)
         if selection.near is not None:
             centre, radius = selection.near
             offset = result.positions - np.asarray(centre, dtype=result.positions.dtype)
