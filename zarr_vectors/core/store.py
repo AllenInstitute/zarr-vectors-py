@@ -940,6 +940,7 @@ def open_store(
     *,
     backend: str | None = None,
     storage_options: dict[str, Any] | None = None,
+    require_zv: bool = True,
     **backend_kwargs: Any,
 ) -> Group:
     """Open an existing ZV store.
@@ -964,6 +965,12 @@ def open_store(
             layer).  Callers that need to mutate must open with
             ``mode="r+"``.
         backend: Force a particular backend (auto-detect by default).
+        require_zv: When True (the default), a root with no
+            ``zarr_vectors`` attribute block raises :class:`StoreError`.
+            Pass False to get the handle anyway — for
+            :func:`zarr_vectors.validate.structure.validate_structure`,
+            whose job is to report that condition rather than be stopped
+            by it.
         **backend_kwargs: Forwarded to the backend constructor.
 
     Returns:
@@ -1032,6 +1039,12 @@ def open_store(
 
     attrs = root.attrs.to_dict()
     if "zarr_vectors" not in attrs:
+        if not require_zv:
+            # The one caller that passes False is the structural
+            # validator, whose job is to REPORT this rather than be
+            # stopped by it.  Raising here would mean the check exists in
+            # two places and the one written to describe it can never run.
+            return root
         raise StoreError(
             f"Not a valid ZV store: missing 'zarr_vectors' in root attrs "
             f"at {root.url}"

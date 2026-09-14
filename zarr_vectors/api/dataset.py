@@ -422,7 +422,14 @@ class Dataset:
         """
         from zarr_vectors.multiresolution.coarsen import build_pyramid
 
-        out = build_pyramid(self.url, factors=list(factors), method=method, **kw)
+        # The handle, not ``self.url``.  ``Group.url`` is ``repr(store)``
+        # for anything that is not a LocalStore, so re-opening it failed
+        # outright on a memory- or object-backed dataset; and even for a
+        # URL it dropped this dataset's StorageOptions, so credentials and
+        # a forced backend were silently lost.  Passing the handle also
+        # means a dataset opened ``mode="r"`` can no longer write a
+        # pyramid -- the old path re-opened as ``"r+"`` and escalated.
+        out = build_pyramid(self._group, factors=list(factors), method=method, **kw)
         self._levels.clear()
         self._meta = None
         return out
@@ -430,7 +437,10 @@ class Dataset:
     def validate(self, *, level: int = 3) -> Any:
         from zarr_vectors.validate import validate as _validate
 
-        return _validate(self.url, level=level)
+        # Likewise.  This one was broken for LOCAL stores too: ``url`` is a
+        # ``file://`` URI and level 1 did a raw ``Path()`` on it, so every
+        # validation through this method failed at level 1 and returned.
+        return _validate(self._group, level=level)
 
     def commit(self, message: str = "zarr-vectors write") -> str | None:
         """Commit, for backends that have transactions.  ``None`` otherwise."""

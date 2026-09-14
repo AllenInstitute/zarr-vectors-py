@@ -458,10 +458,9 @@ CLI) live in the companion package **`zarr-vectors-tools`**.
 
 ## Validation
 
-Validation levels 1–5 check progressively deeper properties of the store. Call
-the module function with a filesystem path rather than `Dataset.validate()`,
-which hands the validator a `file://` URL and reports `FAIL` on a perfectly
-good local store:
+Validation levels 1–5 check progressively deeper properties of the store. The
+module function takes a path, a URL or an open handle; `Dataset.validate()` is
+the same check reached from a dataset:
 
 ```python
 from zarr_vectors.validate import validate

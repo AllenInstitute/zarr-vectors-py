@@ -16,7 +16,7 @@ between objects, and per-object OIDs are preserved across levels.
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import numpy as np
 import numpy.typing as npt
@@ -72,7 +72,7 @@ from zarr_vectors.typing import ChunkCoords
 # ===================================================================
 
 def coarsen_level(
-    store_path: str | Path,
+    store_path: str | Path | Group,
     source_level: int,
     target_level: int,
     *,
@@ -165,7 +165,7 @@ def coarsen_level(
 
 def _per_object_coarsen(
     *,
-    store_path: str | Path,
+    store_path: str | Path | Group,
     source_level: int,
     target_level: int,
     coarsen_factor: float,
@@ -184,7 +184,7 @@ def _per_object_coarsen(
     objects`` (`schema/zarr_vectors.linkml.yaml` schema captures the
     persistent metadata side).
     """
-    root = open_store(str(store_path), mode="r+")
+    root = open_store(store_path, mode="r+")
     root_meta = read_root_metadata(root)
     ndim = root_meta.sid_ndim
 
@@ -712,7 +712,7 @@ def _decode_parent_from_plus_one(
 
 
 def _finalize_cross_level_for_store(
-    store_path: str | Path,
+    store_path: str | Path | Group,
     *,
     cross_level_depth: int,
     cross_level_storage: str,
@@ -728,7 +728,7 @@ def _finalize_cross_level_for_store(
 
     ``cross_level_depth=-1`` means "walk all available level pairs".
     """
-    root = open_store(str(store_path), mode="r+")
+    root = open_store(store_path, mode="r+")
     _stamp_root_cross_level(
         root, depth=cross_level_depth, storage=cross_level_storage,
     )
@@ -911,7 +911,7 @@ def _write_cross_level_edges(
 # ===================================================================
 
 def build_pyramid(
-    store_path: str | Path,
+    store_path: str | Path | Group,
     *,
     factors: list[tuple[float, float]],
     chunk_scale_factors: list[int | tuple[int, ...]] | None = None,

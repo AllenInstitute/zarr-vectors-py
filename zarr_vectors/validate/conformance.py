@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 import numpy as np
 
@@ -17,6 +18,9 @@ from zarr_vectors.core.store import (
 )
 from zarr_vectors.validate.structure import ValidationResult
 
+if TYPE_CHECKING:  # pragma: no cover - typing only
+    from zarr_vectors.core.group import Group
+
 GEOMETRY_LINK_REQ: dict[str, set[str]] = {
     GEOM_POINT_CLOUD: set(),
     GEOM_LINE: {LINKS_IMPLICIT_SEQUENTIAL},
@@ -28,12 +32,12 @@ GEOMETRY_LINK_REQ: dict[str, set[str]] = {
 }
 
 
-def validate_conformance(store_path: str | Path) -> ValidationResult:
+def validate_conformance(store_path: str | Path | Group) -> ValidationResult:
     """Level 4: verify geometry-specific conformance."""
     result = ValidationResult(level=4)
 
     try:
-        root = open_store(str(store_path))
+        root = open_store(store_path)
         meta = read_root_metadata(root)
     except Exception as e:
         result.add_error(f"Cannot open store: {e}")
@@ -120,12 +124,12 @@ def validate_conformance(store_path: str | Path) -> ValidationResult:
     return result
 
 
-def validate_multiresolution(store_path: str | Path) -> ValidationResult:
+def validate_multiresolution(store_path: str | Path | Group) -> ValidationResult:
     """Level 5: verify multi-resolution pyramid conformance."""
     result = ValidationResult(level=5)
 
     try:
-        root = open_store(str(store_path))
+        root = open_store(store_path)
         meta = read_root_metadata(root)
     except Exception as e:
         result.add_error(f"Cannot open store: {e}")

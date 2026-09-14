@@ -50,7 +50,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
-from typing import Any, Sequence
+from typing import TYPE_CHECKING, Any, Sequence
 
 from zarr_vectors.core.group import _parse_chunk_coords
 from zarr_vectors.core.store import (
@@ -165,7 +165,7 @@ def _normalise_shard_shape(
 
 
 def shard_store(
-    store_path: str | Path,
+    store_path: str | Path | Group,
     *,
     shard_shape: int | Sequence[int] = 8,
     arrays: list[str] | None = None,
@@ -196,9 +196,8 @@ def shard_store(
         Stats dict with ``arrays_sharded``, ``chunks_packed``,
         ``shard_shape``.
     """
-    store_path = Path(store_path) if isinstance(store_path, str) else store_path
 
-    root = open_store(str(store_path), mode="r+")
+    root = open_store(store_path, mode="r+")
 
     arrays_sharded = 0
     chunks_packed = 0
@@ -286,7 +285,7 @@ def shard_store(
 
 
 def unshard_store(
-    store_path: str | Path,
+    store_path: str | Path | Group,
     *,
     arrays: list[str] | None = None,
 ) -> dict[str, Any]:
@@ -301,8 +300,7 @@ def unshard_store(
     """
     import zarr
 
-    store_path = Path(store_path) if isinstance(store_path, str) else store_path
-    root = open_store(str(store_path), mode="r+")
+    root = open_store(store_path, mode="r+")
 
     arrays_unsharded = 0
     chunks_extracted = 0
@@ -356,7 +354,7 @@ def unshard_store(
 
 
 def reshard(
-    store_path: str | Path,
+    store_path: str | Path | Group,
     shard_shape: int | Sequence[int] | None,
     *,
     arrays: list[str] | None = None,
@@ -377,7 +375,7 @@ def reshard(
         ran.
     """
     if shard_shape is None:
-        if not is_sharded(str(store_path)):
+        if not is_sharded(store_path):
             return {"action": "noop", "message": "already unsharded"}
         result = unshard_store(store_path, arrays=arrays)
         return {"action": "unshard", **result}
@@ -391,10 +389,10 @@ def reshard(
 # ===================================================================
 
 
-def is_sharded(store_path: str | Path) -> bool:
+def is_sharded(store_path: str | Path | Group) -> bool:
     """True iff any array in the store uses the ``sharding_indexed`` codec."""
     try:
-        root = open_store(str(store_path))
+        root = open_store(store_path)
     except Exception:
         return False
     for level_idx in list_resolution_levels(root):
@@ -409,7 +407,7 @@ def is_sharded(store_path: str | Path) -> bool:
     return False
 
 
-def get_shard_info(store_path: str | Path) -> dict[str, Any]:
+def get_shard_info(store_path: str | Path | Group) -> dict[str, Any]:
     """Return a summary of the store's sharding state.
 
     The result has keys:
@@ -421,7 +419,7 @@ def get_shard_info(store_path: str | Path) -> dict[str, Any]:
     """
     import zarr
 
-    root = open_store(str(store_path))
+    root = open_store(store_path)
     arrays: list[dict[str, Any]] = []
     shard_count = 0
 

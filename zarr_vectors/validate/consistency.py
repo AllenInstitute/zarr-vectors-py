@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 import numpy as np
 
@@ -16,6 +17,9 @@ from zarr_vectors.core.store import (
 )
 from zarr_vectors.typing import ChunkCoords
 from zarr_vectors.validate.structure import ValidationResult
+
+if TYPE_CHECKING:  # pragma: no cover - typing only
+    from zarr_vectors.core.group import Group
 
 
 def _lex_sign(offset: ChunkCoords) -> int:
@@ -35,12 +39,12 @@ def _lex_sign(offset: ChunkCoords) -> int:
     return 0
 
 
-def validate_consistency(store_path: str | Path) -> ValidationResult:
+def validate_consistency(store_path: str | Path | Group) -> ValidationResult:
     """Level 3: verify internal data consistency."""
     result = ValidationResult(level=3)
 
     try:
-        root = open_store(str(store_path))
+        root = open_store(store_path)
         meta = read_root_metadata(root)
     except Exception as e:
         result.add_error(f"Cannot open store: {e}")

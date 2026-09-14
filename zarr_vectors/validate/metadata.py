@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 from zarr_vectors.constants import (
     CROSS_CHUNK_DEDUP, CROSS_CHUNK_BOTH, CROSS_CHUNK_EXPLICIT,
@@ -14,17 +15,20 @@ from zarr_vectors.core.store import (
 )
 from zarr_vectors.validate.structure import ValidationResult
 
+if TYPE_CHECKING:  # pragma: no cover - typing only
+    from zarr_vectors.core.group import Group
+
 VALID_LINKS = {LINKS_EXPLICIT, LINKS_IMPLICIT_SEQUENTIAL, LINKS_IMPLICIT_BRANCHES}
 VALID_OBJIDX = {OBJIDX_STANDARD, OBJIDX_IDENTITY}
 VALID_CROSS = {CROSS_CHUNK_EXPLICIT, CROSS_CHUNK_DEDUP, CROSS_CHUNK_BOTH}
 
 
-def validate_metadata(store_path: str | Path) -> ValidationResult:
+def validate_metadata(store_path: str | Path | Group) -> ValidationResult:
     """Level 2: verify all metadata is well-formed."""
     result = ValidationResult(level=2)
 
     try:
-        root = open_store(str(store_path))
+        root = open_store(store_path)
     except Exception as e:
         result.add_error(f"Cannot open store: {e}")
         return result

@@ -692,10 +692,9 @@ Level 5 validation: PASS
 (That warning appears because `build_pyramid` wrote a links array into the
 point-cloud store; a freshly written point cloud has none.)
 
-Use the module function rather than `Dataset.validate()`: the method hands the
-dataset's `file://` URL to a path-based validator and reports `FAIL` on a
-perfectly good local store. Note also that `zarr_vectors.validate` is one of
-the `undecided` modules above. See
+`Dataset.validate(level=...)` is the same check reached from an open dataset —
+it passes its own handle, so it works on any backend. Note that
+`zarr_vectors.validate` is one of the `undecided` modules above. See
 [Validation](../tutorials/io/validation_and_repair.md) for what each level
 checks.
 
