@@ -14,6 +14,7 @@ Supports three point cloud variants:
 
 from __future__ import annotations
 
+import itertools
 from typing import TYPE_CHECKING, Any
 
 import numpy as np
@@ -849,7 +850,9 @@ def _read_points(
     )
     has_bins = any(b > 1 for b in bins_per_chunk) and keys_are_spatial
 
-    chunk_fragment_targets: dict[ChunkCoords, list[int]] | None = None
+    # ``None`` for a chunk means every bin in it is wanted -- see the
+    # bin-targeting block below.
+    chunk_fragment_targets: dict[ChunkCoords, list[int] | None] | None = None
     chunk_keys_set: set[ChunkCoords] = set()
 
     # A bulk read wants every fragment of every chunk concatenated, which
@@ -883,30 +886,80 @@ def _read_points(
 
     with level_group.batched_reads(prefetch_plan):
         if bbox is not None and has_bins:
-            # Bin-level targeting: only decode matching fragments
-            from zarr_vectors.spatial.chunking import (
-                bin_to_chunk,
-                bin_to_fragment_index,
-                bins_intersecting_bbox,
-            )
-            target_bins = bins_intersecting_bbox(
-                np.asarray(bbox[0]), np.asarray(bbox[1]),
-                effective_bin,
-            )
-            # Group target bins by chunk
-            chunk_fragment_targets = {}
-            for bc in target_bins:
-                cc = bin_to_chunk(bc, bins_per_chunk)
-                fragment_index = bin_to_fragment_index(bc, cc, bins_per_chunk)
-                if cc not in chunk_fragment_targets:
-                    chunk_fragment_targets[cc] = []
-                chunk_fragment_targets[cc].append(fragment_index)
+            # Bin-level targeting: only decode matching fragments.
+            #
+            # Walks the bins *inside each occupied chunk*, not the bins
+            # of the box. Enumerating the box meant a whole-domain query
+            # materialised one tuple per bin in the declared grid --
+            # 14,526,784 of them on a 1,000-point store, 94.6s to return
+            # those thousand points, against 0.12s to read the level
+            # outright -- and then discarded all but the occupied ones.
+            # ``chunk_keys`` is already the occupied chunks the box
+            # touches, so intersecting per chunk bounds the work by the
+            # data. The bins kept are identical: a bin outside the box's
+            # bin range is dropped either way.
+            from zarr_vectors.spatial.chunking import bin_to_fragment_index
 
-            # Only read from chunks that have data
+            bin_lo = np.floor(
+                np.asarray(bbox[0], dtype=np.float64)
+                / np.asarray(effective_bin, dtype=np.float64)
+            ).astype(np.int64)
+            bin_hi = np.floor(
+                np.asarray(bbox[1], dtype=np.float64)
+                / np.asarray(effective_bin, dtype=np.float64)
+            ).astype(np.int64)
+
+            chunk_fragment_targets = {}
+            for cc in chunk_keys:
+                # Local bin range within this chunk that the box covers.
+                axis_ranges: list[range] = []
+                for d, bpc in enumerate(bins_per_chunk):
+                    base = int(cc[d]) * int(bpc)
+                    lo = max(0, int(bin_lo[d]) - base)
+                    hi = min(int(bpc) - 1, int(bin_hi[d]) - base)
+                    if lo > hi:
+                        axis_ranges = []
+                        break
+                    axis_ranges.append(range(lo, hi + 1))
+                if not axis_ranges:
+                    continue
+                if all(
+                    len(r) == int(bpc)
+                    for r, bpc in zip(axis_ranges, bins_per_chunk)
+                ):
+                    # Every bin in the chunk is inside the box. Naming
+                    # them individually would only be to rediscover that
+                    # they are all of them, so say so with the sentinel
+                    # and let the read below take the buffer whole.
+                    chunk_fragment_targets[cc] = None
+                    continue
+                chunk_fragment_targets[cc] = [
+                    bin_to_fragment_index(
+                        tuple(
+                            int(cc[d]) * int(bins_per_chunk[d]) + local[d]
+                            for d in range(len(bins_per_chunk))
+                        ),
+                        cc,
+                        bins_per_chunk,
+                    )
+                    for local in itertools.product(*axis_ranges)
+                ]
+
             chunk_keys_set = set(chunk_keys)
             all_positions = []
             for cc, fragment_indices in chunk_fragment_targets.items():
-                if cc not in chunk_keys_set:
+                if fragment_indices is None:
+                    # Whole chunk wanted. One read rather than one per
+                    # bin: at 64 bins per chunk the per-bin form decodes
+                    # the same buffer 64 times to reassemble it.
+                    try:
+                        rows = read_chunk_vertex_rows(
+                            level_group, cc, dtype=dtype, ndim=ndim,
+                        )
+                    except ArrayError:
+                        continue
+                    if len(rows) > 0:
+                        all_positions.append(rows)
                     continue
                 for fragment_index in fragment_indices:
                     try:
