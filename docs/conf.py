@@ -12,7 +12,17 @@ sys.path.insert(0, os.path.abspath(".."))
 project = "zarr-vectors"
 copyright = "2024, BRIDGE Neuroscience. Aligned to the Zarr Vectors specification by Forest Collman, Allen Institute for Brain Sciences."
 author = "BRIDGE Neuroscience"
-release = "0.1.0"
+# From the installed package, not a literal: the version comes from the
+# git tag via setuptools-scm and moves with every commit, so a hard-coded
+# one is stale the moment it is written.  It was pinned at "0.1.0" while
+# the package was on 0.2.x.
+try:
+    from importlib.metadata import version as _pkg_version
+
+    release = _pkg_version("zarr-vectors")
+except Exception:  # pragma: no cover - docs build without an install
+    release = "0.0.0+unknown"
+version = release.split("+")[0]
 
 # -- General configuration ----------------------------------------------------
 extensions = [
@@ -95,7 +105,7 @@ html_theme_options = {
     "sidebar_hide_name": False,
     "navigation_with_keys": True,
     "top_of_page_button": "edit",
-    "source_repository": "https://github.com/BRIDGE-Neuroscience/zarr-vectors-py/",
+    "source_repository": "https://github.com/AllenInstitute/zarr-vectors-py/",
     "source_branch": "main",
     "source_directory": "docs/",
 }
@@ -107,7 +117,7 @@ html_css_files = ["custom.css"]
 
 # Show "Edit on GitHub" links
 html_context = {
-    "github_user":    "BRIDGE-Neuroscience",
+    "github_user":    "AllenInstitute",
     "github_repo":    "zarr-vectors-py",
     "github_version": "main",
     "doc_path":       "docs",

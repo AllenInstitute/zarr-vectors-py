@@ -11,7 +11,7 @@ please cite the software repository:
   title        = {{zarr-vectors-py: Python tools for the Zarr Vectors}},
   year         = {2024},
   publisher    = {GitHub},
-  url          = {https://github.com/BRIDGE-Neuroscience/zarr-vectors-py},
+  url          = {https://github.com/AllenInstitute/zarr-vectors-py},
   note         = {Aligned to the Zarr Vectors specification by Forest Collman,
                   Allen Institute for Brain Sciences.
                   \url{https://github.com/AllenInstitute/zarr_vectors}}
@@ -43,7 +43,7 @@ If you use the Neuroglancer integration (`zv-ngtools`) in your work:
   title        = {{zv-ngtools: Neuroglancer integration for zarr-vectors}},
   year         = {2024},
   publisher    = {GitHub},
-  url          = {https://github.com/BRIDGE-Neuroscience/zv-ngtools},
+  url          = {https://github.com/AllenInstitute/zv-ngtools},
   note         = {Fork of ngtools by Yael Balbastre (neuroscales/ngtools).
                   \url{https://github.com/neuroscales/ngtools}}
 }

@@ -1,3 +1,13 @@
+> [!NOTE]
+> **Historical.** This plan was written against the pre-0.9 layout and is
+> kept for the reasoning, not as instructions. Several paths it names no
+> longer exist: `cross_chunk_links/` was merged into `links/` in 0.9.0 (a
+> cross-chunk link is now one whose relative chunk offset is non-zero),
+> and per-chunk arrays are no longer `vertices/<chunk>/` sub-arrays but
+> cells of a single vlen-bytes array whose shape is the level's chunk
+> grid. See `zarr_vectors/constants.py` for the format changelog and
+> `docs/spec/object_model/links.md` for the layout that replaced it.
+
 # zarr-vectors-py: append-mode write APIs + idempotent creates + soft-fail reads
 
 ## Mission

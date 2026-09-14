@@ -213,7 +213,7 @@ Yes, using the converters and CLI in the companion package
 
 ### How do I visualise a Zarr Vectors store in Neuroglancer?
 
-Use [`zv-ngtools`](https://github.com/BRIDGE-Neuroscience/zv-ngtools), a
+Use [`zv-ngtools`](https://github.com/AllenInstitute/zv-ngtools), a
 fork of `ngtools` that adds a Zarr Vectors layer type. It can serve a local
 `.zarrvectors` store to a Neuroglancer instance running in your browser.
 See [Neuroglancer integration](../tutorials/neuroglancer/overview.md).
@@ -268,7 +268,7 @@ and the slowest.
 ### How do I report a bug?
 
 Open an issue on the
-[GitHub repository](https://github.com/BRIDGE-Neuroscience/zarr-vectors-py/issues).
+[GitHub repository](https://github.com/AllenInstitute/zarr-vectors-py/issues).
 Include the output of `zarr_vectors.validate.validate(store, level=3)` if
 the issue is store-related.
 
