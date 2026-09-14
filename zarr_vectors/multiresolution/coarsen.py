@@ -299,8 +299,6 @@ def _per_object_coarsen(
     # ``all_pos``. On a million vertices the peak was 68 times the data.
     per_object_count: dict[int, int] = {}
     flat_positions: list[np.ndarray] = []
-    flat_oid_of_v: list[int] = []
-    next_global = 0
     for oid in keep_oids:
         manifest = src_manifests[oid]
         parts: list[np.ndarray] = []
@@ -315,8 +313,6 @@ def _per_object_coarsen(
         obj_positions = np.concatenate(parts, axis=0)
         per_object_count[oid] = int(obj_positions.shape[0])
         flat_positions.append(obj_positions)
-        flat_oid_of_v.extend([oid] * obj_positions.shape[0])
-        next_global += obj_positions.shape[0]
 
     # The source fragments have been copied into the flat array and are
     # not read again; releasing them here keeps the source level and the
@@ -486,12 +482,14 @@ def _per_object_coarsen(
         # rows for survivors copied over.  Layout matches the source's
         # OID space (which already equals n_src_objects).
         out_data = np.zeros_like(src_data)
-        for oid in keep_oids:
-            if oid < len(src_data):
-                out_data[oid] = src_data[oid]
+        # One scatter each, rather than a Python iteration per surviving
+        # object over a column that is already an array.
+        keep_arr = np.asarray(keep_oids, dtype=np.int64)
+        keep_arr = keep_arr[keep_arr < len(src_data)]
+        if keep_arr.size:
+            out_data[keep_arr] = src_data[keep_arr]
         mask = np.zeros(n_src_objects, dtype=np.uint8)
-        for oid in keep_oids:
-            mask[oid] = 1
+        mask[np.asarray(keep_oids, dtype=np.int64)] = 1
         create_object_attributes_array(level_group, attr_name)
         write_object_attributes(level_group, attr_name, out_data, present_mask=mask)
 
@@ -559,22 +557,26 @@ def _emit_inline_cross_level_links(
     this after the ``create_resolution_level`` for ``source_level + 1``
     (step 6 of :func:`_per_object_coarsen`).
     """
-    # bin_key_bytes → mv_idx (bin-key-ordered, matches np.unique output).
+    # Metavertex ids are positions in this sorted key array -- which is
+    # what lets the per-vertex lookup below be a searchsorted instead of
+    # a dict with one bytes key per metavertex.
     unique_keys = np.unique(bin_keys)
-    bin_key_to_mv: dict[bytes, int] = {
-        bytes(k): i for i, k in enumerate(unique_keys)
-    }
 
     # mv_idx → chunk-major-flat coarse index.
     coarse_chunk_assignments, n_coarse = _reconstruct_chunk_assignments(
         level_group, ndim,
     )
-    mv_to_coarse_global: dict[int, int] = {}
+    # Dense map, so an array rather than a dict with one entry per
+    # metavertex: at a million metavertices the dict was ~150 MB of
+    # interpreter objects to express a permutation of range(M).
+    mv_to_coarse_global = np.full(len(unique_keys), -1, dtype=np.int64)
     for cc, mv_indices_for_chunk in sorted(coarse_chunk_assignments_mv.items()):
-        for local_vg, mv_idx in enumerate(mv_indices_for_chunk.tolist()):
-            mv_to_coarse_global[int(mv_idx)] = int(
-                coarse_chunk_assignments[cc][local_vg]
-            )
+        mv_idx_arr = np.asarray(mv_indices_for_chunk, dtype=np.int64)
+        if mv_idx_arr.size == 0:
+            continue
+        mv_to_coarse_global[mv_idx_arr] = np.asarray(
+            coarse_chunk_assignments[cc], dtype=np.int64,
+        )[: mv_idx_arr.size]
 
     # Build fine→coarse parent[] by re-walking source in chunk-major order.
     fine_chunk_assignments, n_fine = _reconstruct_chunk_assignments(
@@ -600,10 +602,20 @@ def _emit_inline_cross_level_links(
                 np.asarray(fragment, dtype=np.float32) / bin_shape_arr,
             ).astype(np.int64)
             local_keys = np.ascontiguousarray(local_bins).view(key_dtype).ravel()
-            for j in range(n_local):
-                mv = bin_key_to_mv.get(bytes(local_keys[j]))
-                if mv is not None:
-                    parent[cursor + j] = mv_to_coarse_global[int(mv)]
+            # One searchsorted per fragment, not one dict lookup per
+            # vertex. ``unique_keys`` is np.unique output and therefore
+            # sorted, so the position it returns IS the metavertex index.
+            # The old form allocated a bytes object per vertex, which was
+            # the hottest Python loop in the coarsener.
+            pos = np.searchsorted(unique_keys, local_keys)
+            np.clip(pos, 0, len(unique_keys) - 1, out=pos)
+            # A key the coarse level never produced has no parent; the
+            # caller relies on those staying -1.
+            hit = unique_keys[pos] == local_keys
+            if hit.any():
+                parent[cursor + np.flatnonzero(hit)] = mv_to_coarse_global[
+                    pos[hit]
+                ]
             cursor += n_local
 
     _write_cross_level_edges(
