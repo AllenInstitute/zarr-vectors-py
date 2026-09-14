@@ -3,7 +3,7 @@
 ## Terms
 
 **Spatial dimensionality (D)**
-: The number of spatial axes in the coordinate system of a ZVF store. The
+: The number of spatial axes in the coordinate system of a Zarr Vectors store. The
   most common value is `D = 3` (x, y, z). Values of `D = 2` (planar data)
   and `D = 4` (e.g. x, y, z, t for time-series tractography) are also valid.
   `D` is declared in the store's root `.zattrs` metadata and must be
@@ -33,13 +33,13 @@
 
 ## Introduction
 
-The Zarr Vector Format is not inherently three-dimensional. The spatial
+The Zarr Vectors is not inherently three-dimensional. The spatial
 dimensionality `D` is a property of each individual store, declared at
 write time and embedded in the root metadata. All format rules (chunk grid,
 bin grid, fragment index addressing, bounding-box queries) generalise
 straightforwardly to arbitrary `D`.
 
-In practice, the vast majority of ZVF stores are three-dimensional (x, y,
+In practice, the vast majority of Zarr Vectors stores are three-dimensional (x, y,
 z), matching the dimensionality of the volumetric image data they are
 registered against. Two-dimensional stores arise in planar microscopy
 contexts. Four-dimensional stores (`x, y, z, t`) are an emerging use case

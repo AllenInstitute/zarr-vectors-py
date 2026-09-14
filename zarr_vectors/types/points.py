@@ -21,6 +21,7 @@ import numpy.typing as npt
 
 from zarr_vectors.constants import (
     CROSS_CHUNK_EXPLICIT,
+    RESOLUTION_PREFIX,
     FRAGMENT_ATTRIBUTES,
     GEOM_POINT_CLOUD,
     LINKS_IMPLICIT_SEQUENTIAL,
@@ -31,6 +32,9 @@ from zarr_vectors.constants import (
     VERTICES,
 )
 from zarr_vectors.core.arrays import (
+    chunk_fragments_tile as _chunk_tiles,
+    read_chunk_vertex_buffer,
+    stamp_fragments_tile,
     create_attribute_array,
     create_fragment_attribute_array,
     create_groupings_array,
@@ -43,7 +47,7 @@ from zarr_vectors.core.arrays import (
     read_all_groupings,
     read_all_object_manifests,
     read_chunk_attributes,
-    read_chunk_vertices,
+    read_chunk_vertex_rows,
     read_group_object_ids,
     read_groupings_attributes,
     read_object_attributes,
@@ -90,7 +94,6 @@ from zarr_vectors.exceptions import ArrayError
 from zarr_vectors.spatial.chunking import (
     assign_bins,
     assign_chunks,
-    chunks_intersecting_bbox,
     compute_bounds,
     group_bins_by_chunk,
 )
@@ -511,6 +514,11 @@ def write_points(
             create_groupings_attributes_array(level_group, name)
             write_groupings_attributes(level_group, name, data)
 
+        # Record the tiling layout just written, so a later bulk read
+    # can return each chunk's buffer without reading its fragment
+    # index.  Verified against what is on disk, and stamped after
+    # the chunk writes -- see stamp_fragments_tile.
+    stamp_fragments_tile(level_group, ndim)
     _finalize_write(root, "write_points")
     return {
         "vertex_count": n_vertices,
@@ -560,6 +568,50 @@ def read_points(
         - ``vertex_count``: total vertices returned
     """
     root = open_store(store_path, backend=backend)
+    # One node-resolution pass for the whole read.  Everything below
+    # resolves the same handful of nodes repeatedly -- the level group,
+    # ``vertices``, ``vertex_fragments``, one array per attribute -- and
+    # each unclaimed resolution is a ``zarr.json`` GET.  On a query that
+    # touches a single chunk those GETs were the read.
+    with root.cached_nodes():
+        # Ask for every node the read will need in one gather, rather
+        # than resolving them one at a time as the code reaches them.
+        prefix = f"{RESOLUTION_PREFIX}{level}"
+        root.prime_nodes([
+            prefix,
+            f"{prefix}/{VERTICES}",
+            f"{prefix}/{VERTEX_FRAGMENTS}",
+            *(f"{prefix}/{VERTEX_ATTRIBUTES}/{name}"
+              for name in (attribute_names or ())),
+        ])
+        return _read_points(
+            root,
+            level=level,
+            bbox=bbox,
+            object_ids=object_ids,
+            group_ids=group_ids,
+            chunks=chunks,
+            attribute_names=attribute_names,
+            attribute_filter=attribute_filter,
+        )
+
+
+def _read_points(
+    root: FsGroup,
+    *,
+    level: int,
+    bbox: BoundingBox | None,
+    object_ids: list[int] | None,
+    group_ids: list[int] | None,
+    chunks: list[ChunkCoords] | None,
+    attribute_names: list[str] | None,
+    attribute_filter: dict[str, Any] | None,
+) -> dict[str, Any]:
+    """Body of :func:`read_points`, against an already-open store.
+
+    Split out only so the caller can hold a :meth:`Group.cached_nodes`
+    block open across the whole read; the two halves are one function.
+    """
     root_meta = read_root_metadata(root)
     level_group = get_resolution_level(root, level)
     ndim = root_meta.sid_ndim
@@ -591,8 +643,16 @@ def read_points(
 
     # Pre-resolve the chunks whitelist once (intersected with bbox-implied
     # chunks) so both code paths can reuse it.
+    #
+    # A ``bbox`` alone counts.  It used to be ignored here unless the
+    # caller also passed ``chunks``, which meant the prefetch plan below
+    # was built for every chunk in the level and the box was applied as a
+    # mask afterwards: a one-point query cost the same as reading the
+    # whole store.  ``resolve_chunk_keys`` already narrows 125 chunks to
+    # 1 for a 0.1% box in well under a millisecond -- it just was not
+    # being asked.
     chunk_set: set[ChunkCoords] | None = None
-    if chunks is not None:
+    if chunks is not None or bbox is not None:
         chunk_set = set(
             resolve_chunk_keys(
                 level_group, level_chunk_shape,
@@ -659,9 +719,17 @@ def read_points(
         return result
 
     # Path 2: read by bounding box or read all
-    chunk_keys = list_chunk_keys(level_group)
+    #
+    # ``resolve_chunk_keys`` above already listed the level and
+    # intersected it with the filters, and its result is sorted — so when
+    # it ran, its answer *is* this list, and listing again only re-reads
+    # the presence manifest and re-parses every key string in it.  That
+    # was two full listings per read, both of them O(chunks in the level)
+    # for a query that may touch one.
     if chunk_set is not None:
-        chunk_keys = [k for k in chunk_keys if k in chunk_set]
+        chunk_keys = sorted(chunk_set)
+    else:
+        chunk_keys = list_chunk_keys(level_group)
 
     # attribute_filter: restrict to chunks with the matching leading bin
     # index.  Cheap pre-filter on the chunk key — drops scans drastically
@@ -700,20 +768,43 @@ def read_points(
 
     effective_bin = root_meta.effective_bin_shape
     bins_per_chunk = root_meta.bins_per_chunk
-    has_bins = any(b > 1 for b in bins_per_chunk)
+    # Bin-level targeting resolves a bin to a *spatial* chunk coord, so it
+    # cannot name a chunk in a store whose keys carry a leading
+    # attribute-bin axis.  Those fall through to chunk-level targeting:
+    # coarser, but it returns the data instead of nothing.
+    keys_are_spatial = (
+        not chunk_keys or len(chunk_keys[0]) == len(level_chunk_shape)
+    )
+    has_bins = any(b > 1 for b in bins_per_chunk) and keys_are_spatial
 
     chunk_fragment_targets: dict[ChunkCoords, list[int]] | None = None
     chunk_keys_set: set[ChunkCoords] = set()
 
-    # Build the prefetch plan: VERTICES + VERTEX_FRAGMENTS for every
-    # chunk we may touch, plus each requested attribute array.  Cache
+    # A bulk read wants every fragment of every chunk concatenated, which
+    # on a level whose fragments tile their buffers is just the buffer.
+    # The level says whether that holds; the first chunk read re-checks
+    # it (below), so a claim that has gone stale costs one wasted index
+    # read rather than a wrong answer.
+    bulk = (
+        bbox is None
+        and object_ids is None
+        and chunk_set is None
+        and not attribute_filter
+    )
+    skip_fragments = bulk and bool(
+        getattr(level_meta, "fragments_tile", False),
+    )
+
+    # Build the prefetch plan: VERTICES for every chunk we may touch,
+    # VERTEX_FRAGMENTS unless the level has told us we will not need it —
+    # and that omission is the saving, since the index costs an object
+    # read and a decompression per chunk, not just its decode.  Cache
     # misses fall through to the sync ``read_bytes`` path so this is
     # purely a perf optimisation — correctness is unaffected.
     chunk_key_strs = [".".join(str(c) for c in cc) for cc in chunk_keys]
-    prefetch_plan: list[tuple[str, list[str]]] = [
-        (VERTICES, chunk_key_strs),
-        (VERTEX_FRAGMENTS, chunk_key_strs),
-    ]
+    prefetch_plan: list[tuple[str, list[str]]] = [(VERTICES, chunk_key_strs)]
+    if not skip_fragments:
+        prefetch_plan.append((VERTEX_FRAGMENTS, chunk_key_strs))
     if attribute_names:
         for attr_name in attribute_names:
             prefetch_plan.append((f"{VERTEX_ATTRIBUTES}/{attr_name}", chunk_key_strs))
@@ -756,38 +847,60 @@ def read_points(
                         continue
 
         elif bbox is not None:
-            # Chunk-level targeting (old stores without bins)
-            target_chunks = set(chunks_intersecting_bbox(
-                np.asarray(bbox[0]), np.asarray(bbox[1]),
-                level_chunk_shape,
-            ))
-            chunk_keys = [k for k in chunk_keys if k in target_chunks]
-
+            # Chunk-level targeting (old stores without bins).
+            #
+            # ``chunk_keys`` is already exactly the chunks the box
+            # touches -- ``resolve_chunk_keys`` above intersected the
+            # level with it.  Re-deriving that intersection here cost a
+            # second full enumeration of the box, which on a large box
+            # over a fine grid is the one operation that has to be
+            # avoided: ``chunks_intersecting_bbox`` materialises the
+            # whole cartesian product with no clamp.
             all_positions = []
             for chunk_coords in chunk_keys:
                 try:
-                    groups = read_chunk_vertices(
+                    rows = read_chunk_vertex_rows(
                         level_group, chunk_coords, dtype=dtype, ndim=ndim
                     )
                 except ArrayError:
                     continue
-                for fragment in groups:
-                    if len(fragment) > 0:
-                        all_positions.append(fragment)
+                if len(rows) > 0:
+                    all_positions.append(rows)
 
         else:
-            # Read all
+            # Read all.  Neither this path nor the chunk-level bbox one
+            # above cares which fragment a row came from -- both
+            # concatenate every fragment in the chunk -- so they ask for
+            # the concatenation directly and let
+            # ``read_chunk_vertex_rows`` skip the partition on the chunks
+            # whose fragments already tile their buffer.
             all_positions = []
-            for chunk_coords in chunk_keys:
+            trusted = skip_fragments
+            for i, chunk_coords in enumerate(chunk_keys):
                 try:
-                    groups = read_chunk_vertices(
-                        level_group, chunk_coords, dtype=dtype, ndim=ndim
-                    )
+                    if trusted:
+                        rows = read_chunk_vertex_buffer(
+                            level_group, chunk_coords, dtype=dtype, ndim=ndim,
+                        )
+                        if i == 0 and not _chunk_tiles(
+                            level_group, chunk_coords, len(rows),
+                        ):
+                            # The level's claim does not hold here, so it
+                            # is worth nothing anywhere.  Fall back for
+                            # this chunk and every one after it.
+                            trusted = False
+                            rows = read_chunk_vertex_rows(
+                                level_group, chunk_coords,
+                                dtype=dtype, ndim=ndim,
+                            )
+                    else:
+                        rows = read_chunk_vertex_rows(
+                            level_group, chunk_coords, dtype=dtype, ndim=ndim
+                        )
                 except ArrayError:
                     continue
-                for fragment in groups:
-                    if len(fragment) > 0:
-                        all_positions.append(fragment)
+                if len(rows) > 0:
+                    all_positions.append(rows)
 
         if not all_positions:
             return _empty_result(ndim)

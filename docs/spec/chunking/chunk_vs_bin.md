@@ -4,11 +4,11 @@
 
 **I/O unit**
 : The minimum amount of data that can be read from or written to storage in
-  a single operation. In ZVF, the I/O unit is one chunk.
+  a single operation. In Zarr Vectors, the I/O unit is one chunk.
 
 **Spatial query unit**
 : The minimum spatial region that can be retrieved with a single index
-  lookup. In ZVF, the spatial query unit is one bin.
+  lookup. In Zarr Vectors, the spatial query unit is one bin.
 
 **Read amplification**
 : The ratio of data loaded from storage to data actually needed by a query.
@@ -16,7 +16,7 @@
   them has amplification proportional to `2 × chunk_volume / 6 × bin_volume`.
 
 **Separation of concerns**
-: The design principle behind ZVF's two-level spatial hierarchy. `chunk_shape`
+: The design principle behind Zarr Vectors' two-level spatial hierarchy. `chunk_shape`
   is chosen to optimise file I/O efficiency; `bin_shape` is chosen to
   optimise spatial query granularity. The two choices are made independently.
 
@@ -24,13 +24,13 @@
 
 ## Introduction
 
-Earlier ZVF implementations (and many competing formats) used a single
+Earlier Zarr Vectors implementations (and many competing formats) used a single
 spatial parameter — the chunk size — for both I/O and spatial indexing.
 This forced an uncomfortable trade-off: small chunks gave fine query
 granularity but poor I/O efficiency; large chunks gave efficient I/O but
 coarse query granularity.
 
-ZVF solves this by separating the two concerns. `chunk_shape` controls the
+Zarr Vectors solves this by separating the two concerns. `chunk_shape` controls the
 physical file layout and can be set large for I/O efficiency. `bin_shape`
 controls the spatial index granularity and can be set small for query
 precision. The two are independently configurable, subject only to the
@@ -38,7 +38,7 @@ divisibility constraint.
 
 This separation was a deliberate architectural decision in the development
 of `zarr-vectors-py` and represents one of the most important differences
-between ZVF and simpler chunked formats.
+between Zarr Vectors and simpler chunked formats.
 
 ---
 

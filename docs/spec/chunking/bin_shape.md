@@ -9,7 +9,7 @@
   axis `d` is `chunk_shape[d] / bin_shape[d]`.
 
 **Supervoxel bin**
-: The finest spatial subdivision in ZVF. Each bin is a rectangular region
+: The finest spatial subdivision in Zarr Vectors. Each bin is a rectangular region
   of physical space whose size is `bin_shape`. Bins tile the interior of
   each chunk exactly, with no gaps or overlaps. All vertices whose position
   falls within a bin are stored together as a fragment (fragment).
@@ -39,10 +39,10 @@
 
 ## Introduction
 
-Bins are the unit of spatial querying in ZVF. When you issue a bounding-box
+Bins are the unit of spatial querying in Zarr Vectors. When you issue a bounding-box
 query, the query engine does not load entire chunks — it identifies which
 bins overlap the query region and reads only those bins' vertices. This
-sub-chunk spatial resolution is what makes ZVF efficient for small targeted
+sub-chunk spatial resolution is what makes Zarr Vectors efficient for small targeted
 queries on large datasets.
 
 `bin_shape` is the parameter that controls this query granularity. A smaller
@@ -186,7 +186,7 @@ larger `bin_shape` (fewer bins) reduces fragment index overhead.
 ### Effect on multiscale pyramids
 
 At coarser resolution levels, the effective bin shape grows proportionally
-with `bin_ratio`. This is the mechanism by which ZVF achieves spatial
+with `bin_ratio`. This is the mechanism by which Zarr Vectors achieves spatial
 downsampling: the bin grid at level 1 is half as fine as at level 0 (for
 `bin_ratio = (2, 2, 2)`), so each bin at level 1 covers 8× the volume and
 contains up to 8× as many merged vertices.

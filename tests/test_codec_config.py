@@ -195,3 +195,97 @@ def test_compression_reduces_disk_size(positions: np.ndarray) -> None:
         f"zstd store ({store_bytes(s_zstd)} B) was not smaller than "
         f"default uncompressed store ({store_bytes(s_default)} B)"
     )
+
+
+# ---------------------------------------------------------------------------
+# chunk_array_codecs — the creation half of batched_writes, on its own
+# ---------------------------------------------------------------------------
+
+def _codecs_of(store_path, array_name):
+    meta = json.loads(
+        (Path(store_path) / "0" / array_name / "zarr.json").read_text()
+    )
+    return [c.get("name") for c in meta.get("codecs", [])]
+
+
+def test_chunk_array_codecs_stamps_arrays_created_inside_it():
+    from zarr_vectors.core.arrays import create_vertices_array, write_chunk_vertices
+    from zarr_vectors.core.store import create_store, get_resolution_level
+
+    with tempfile.TemporaryDirectory() as td:
+        path = Path(td) / "s.zarrvectors"
+        root = create_store(
+            path, bounds=[[0, 0, 0], [8, 8, 8]], chunk_shape=(8, 8, 8),
+            geometry_types=["point_cloud"],
+        )
+        lg = get_resolution_level(root, 0)
+        # create_store warm-creates ``vertices``; drop it so this test is about
+        # what the session does rather than what already existed.
+        lg.delete_subtree("vertices")
+        lg.delete_subtree("vertex_fragments")
+
+        with lg.chunk_array_codecs("zstd"):
+            create_vertices_array(lg, dtype="float32")
+            # Writes inside the block are immediate, not deferred — that is the
+            # whole reason this exists next to batched_writes.
+            write_chunk_vertices(
+                lg, (0, 0, 0),
+                [np.zeros((4, 3), dtype=np.float32)], dtype=np.float32,
+            )
+            assert lg.chunk_exists("vertices", "0.0.0"), (
+                "write inside chunk_array_codecs was deferred; it must not be"
+            )
+
+        assert "zstd" in _codecs_of(path, "vertices")
+
+
+def test_chunk_array_codecs_restores_the_previous_selection():
+    from zarr_vectors.core.arrays import create_attribute_array
+    from zarr_vectors.core.store import create_store, get_resolution_level
+
+    with tempfile.TemporaryDirectory() as td:
+        path = Path(td) / "s.zarrvectors"
+        root = create_store(
+            path, bounds=[[0, 0, 0], [8, 8, 8]], chunk_shape=(8, 8, 8),
+            geometry_types=["point_cloud"],
+        )
+        lg = get_resolution_level(root, 0)
+        with lg.chunk_array_codecs("zstd"):
+            create_attribute_array(lg, "inside", dtype="float32")
+        create_attribute_array(lg, "outside", dtype="float32")
+
+        assert "zstd" in _codecs_of(path, "vertex_attributes/inside")
+        assert "zstd" not in _codecs_of(path, "vertex_attributes/outside")
+
+
+def test_chunk_array_codecs_refuses_to_nest_in_batched_writes():
+    from zarr_vectors.core.store import create_store, get_resolution_level
+    from zarr_vectors.exceptions import StoreError
+
+    with tempfile.TemporaryDirectory() as td:
+        path = Path(td) / "s.zarrvectors"
+        root = create_store(
+            path, bounds=[[0, 0, 0], [8, 8, 8]], chunk_shape=(8, 8, 8),
+            geometry_types=["point_cloud"],
+        )
+        lg = get_resolution_level(root, 0)
+        with pytest.raises(StoreError, match="batched_writes"):
+            with lg.batched_writes(compressor="zstd"):
+                with lg.chunk_array_codecs("blosc"):
+                    pass
+
+
+def test_create_store_compressor_reaches_the_warm_created_arrays():
+    """``vertices`` / ``vertex_fragments`` are allocated by create_store, and
+    every later create_vertices_array short-circuits on them — so if the
+    compressor does not reach here it reaches nothing that matters."""
+    from zarr_vectors.core.store import create_store
+
+    with tempfile.TemporaryDirectory() as td:
+        path = Path(td) / "s.zarrvectors"
+        create_store(
+            path, bounds=[[0, 0, 0], [8, 8, 8]], chunk_shape=(8, 8, 8),
+            geometry_types=["point_cloud"], compressor="zstd",
+        )
+        assert "zstd" in _codecs_of(path, "vertices")
+        assert "zstd" in _codecs_of(path, "vertex_fragments")

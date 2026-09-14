@@ -33,7 +33,7 @@
 ## Introduction
 
 The `graph` type stores an arbitrary vertex–edge graph, spatially chunked
-like all other ZVF types. It is appropriate for connectivity data that does
+like all other Zarr Vectors types. It is appropriate for connectivity data that does
 not fit the stricter topology of `skeleton` (which requires a tree): vascular
 networks with anastomoses, synaptic connectivity matrices embedded in 3-D
 space, or any general graph with cycles.

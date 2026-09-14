@@ -1,6 +1,6 @@
 # Links
 
-```{admonition} Format change in ZVF 0.9.0
+```{admonition} Format change in Zarr Vectors 0.9.0
 :class: note
 
 Prior to 0.9.0 connectivity was split across two families:

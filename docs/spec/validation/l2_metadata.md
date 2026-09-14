@@ -4,7 +4,7 @@
 
 **Schema check**
 : A validation check that reads a group's attributes and verifies that
-  its values conform to the ZVF specification — valid ranges, valid
+  its values conform to the Zarr Vectors specification — valid ranges, valid
   vocabulary tokens, and dimensional agreement with `sid_ndim`.
 
 **Divisibility constraint**
@@ -24,7 +24,7 @@
 
 L2 validation reads the store's root and per-level group attributes and
 checks that their contents are internally consistent and conform to the
-ZVF specification. No array data is read.
+Zarr Vectors specification. No array data is read.
 
 L2 catches the most common class of write-time bugs: invalid ranges,
 unrecognised vocabulary tokens, and dimensionality mismatches between
@@ -102,7 +102,7 @@ For every resolution level:
 ### What L2 does *not* check
 
 These are called out because earlier revisions of this page specified
-them and no shipped code enforces them. They are not ZVF requirements
+them and no shipped code enforces them. They are not Zarr Vectors requirements
 at L2:
 
 - **Nothing about link families.** L2 does not open

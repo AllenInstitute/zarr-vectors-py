@@ -229,6 +229,18 @@ def open_zv(
     Returns:
         A :class:`ZVStore` handle for lazy access.
     """
+    import warnings
+
+    warnings.warn(
+        "open_zv() is superseded by zarr_vectors.open(), which returns a "
+        "Dataset. The lazy layer reads chunk-by-chunk in Python and opens no "
+        "batched-read block, so against an object store it is slower than the "
+        "eager path it was meant to improve on; Dataset drives the batching "
+        "engine instead.",
+        DeprecationWarning,
+        stacklevel=2,
+    )
+
     # mode="r+" so the writer() handles returned by ZVLevel / ZVStore
     # can mutate without an extra reopen.  Pure readers pay no cost for
     # this — the actual reads still touch only the chunks they need.

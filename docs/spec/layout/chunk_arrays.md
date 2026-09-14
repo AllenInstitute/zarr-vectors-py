@@ -6,7 +6,7 @@
 : A single Zarr v3 **vlen-bytes** array within a resolution level group
   whose shape *is* the chunk grid: one array cell per spatial chunk. Each
   cell holds that chunk's payload as one opaque, variable-length byte blob
-  (ZVF-encoded vertices, edges, fragment index, attribute values, …).
+  (Zarr Vectors-encoded vertices, edges, fragment index, attribute values, …).
   Chunk files land at `<array>/c/i/j/k`.
 
 **Chunk grid origin**
@@ -29,7 +29,7 @@
 
 ## Introduction
 
-Every per-spatial-chunk quantity in a ZVF store — vertices, edges, faces,
+Every per-spatial-chunk quantity in a Zarr Vectors store — vertices, edges, faces,
 the fragment index, and per-vertex / per-fragment / per-edge attributes — is
 stored as a **single** Zarr v3 vlen-bytes array whose shape is the level's
 chunk grid. One array cell holds one spatial chunk's payload as an opaque
@@ -46,7 +46,7 @@ relationship between endpoints factored into the path instead
 (see [Links](../object_model/links.md)).
 
 This page documents the dtype, shape, chunk grid, and codec for every array
-defined by the ZVF spec, for each geometry type.
+defined by the Zarr Vectors specification, for each geometry type.
 
 ---
 
@@ -67,7 +67,7 @@ chunk.
 | Sharding | optional `shard_shape=` wraps cells in `sharding_indexed` |
 | Attributes | `chunk_grid_origin`, `nonempty_chunks`, `zv_array="vertices"`, `dtype`, `encoding` |
 
-Each cell's blob is the ZVF-encoded positions for that chunk. Within each
+Each cell's blob is the Zarr Vectors-encoded positions for that chunk. Within each
 spatial chunk the vertices are stored in **fragment order**: all vertices
 of bin (0,0,0) first, then bin (0,0,1), etc., in C-order bin index. The
 `vertex_fragments/` array encodes one fragment per non-empty bin describing

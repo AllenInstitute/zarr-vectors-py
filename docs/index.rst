@@ -14,11 +14,37 @@ sits on a local filesystem or a cloud object store (S3, GCS). Resolution
 pyramids are encoded natively so viewers like Neuroglancer can stream data
 progressively at any scale.
 
-The library implements the `Zarr Vector Format
-<https://github.com/AllenInstitute/zarr_vectors>`_ originally specified by
+The library implements `Zarr Vectors
+<https://github.com/AllenInstitute/zarr_vectors>`_, originally specified by
 Forest Collman at the Allen Institute for Brain Sciences, extended with
 separated chunk/bin sizes, per-level sparsity, and OME-Zarr-compatible
 multiscale metadata.
+
+Two module surfaces carry a compatibility promise, split by what the caller is
+doing. ``zarr_vectors.api`` is for **using** data — opening a store, selecting
+a region or a set of objects, reading it back, editing it — and is re-exported
+from the top-level package, so ``zarr_vectors.open(...)`` and
+``zarr_vectors.api.open(...)`` are the same function. ``zarr_vectors.building``
+is for **making** stores: ingest converters, pyramid builders, exporters,
+repair tools. Everything else — ``core``, ``encoding``, ``spatial``, ``lazy``,
+``ops``, ``sharding``, ``multiresolution`` and ``rechunk`` — is internal and
+changes without notice. :func:`zarr_vectors.stability` answers for any dotted
+name at runtime, so nothing here has to be taken on trust.
+
+.. figure:: _static/figures/zarr-vectors-overview.png
+   :width: 100%
+   :align: center
+   :alt: Overview of Zarr Vectors. Panel a plots file size against dataset
+         complexity, crossing the memory ceiling. Panel b shows point clouds,
+         skeletons and meshes decomposed into vertices, links, faces and
+         attributes, stacked into a resolution pyramid that supports scalable
+         read/write and multiscale visualisation.
+   :figclass: zv-figure
+
+   **Overview of Zarr Vectors.**
+   **a** — Complex and detailed derivative datasets now exceed GPU and system
+   memory. **b** — Summary of the Zarr Vectors concept, showing input data
+   types, construction, and uses.
 
 .. raw:: html
 
@@ -40,11 +66,19 @@ Where to start
    * - :doc:`getting_started/quickstart`
      - Write and query your first vector store in a few lines of Python.
    * - :doc:`getting_started/concepts`
-     - The mental model: chunk shapes, bin shapes, and resolution pyramids.
-   * - :doc:`spec/index`
-     - Full technical specification for the Zarr Vector Format.
+     - The mental model: chunks, supervoxel bins, fragments, the object model
+       and the resolution pyramid — and how ``Layout`` sets them.
+   * - :doc:`api/api`
+     - The data surface: ``open``, ``Schema``, ``select``, ``ReadResult``,
+       resolution levels and objects.
+   * - :doc:`api/building`
+     - The builder surface, for code that writes stores rather than reads
+       them: arrays, fragments, shards and manifests.
    * - :doc:`api/index`
-     - Auto-generated reference for all public functions and classes.
+     - Which modules are supported, which are internal, and how to ask at
+       runtime.
+   * - :doc:`spec/index`
+     - Full technical specification for Zarr Vectors.
 
 
 .. toctree::

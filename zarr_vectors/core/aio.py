@@ -40,17 +40,29 @@ The loop is also why misses are *recorded* rather than merely raised:
 several readers wrap optional metadata reads in ``except Exception``,
 which would swallow the signal.  See
 :class:`~zarr_vectors.core.group._OfflineSession`.
+
+That loop now lives in :mod:`zarr_vectors._engine.execute`, generalised
+over *where the bytes come from* and over whether a gap is fatal.  It
+turned out that the same three steps describe an ordinary batched sync
+read (fetch a plan, run the reader, fall through on a miss) as well as
+this one, so keeping two copies would have re-forked exactly what this
+module exists to keep single.  What remains here is the async half of
+the port — the five fetch coroutines below, which
+:class:`~zarr_vectors._engine.fetch.AsyncFetcher` drives — plus
+:func:`read_async` as the public name for the composition.
 """
 
 from __future__ import annotations
 
 import asyncio
-from typing import Any, Callable, TypeVar
+from collections.abc import Callable
+from typing import Any, TypeVar
 
 import zarr
 
-from zarr_vectors.core.group import _ABSENT, Group, _OfflineSession
-from zarr_vectors.exceptions import StoreError
+from zarr_vectors._engine.execute import aexecute
+from zarr_vectors._engine.fetch import AsyncFetcher
+from zarr_vectors.core.group import _ABSENT, Group
 
 T = TypeVar("T")
 
@@ -273,87 +285,15 @@ async def read_async(
         out = await read_async(read_points, root, bbox=bbox)
     """
     root = await open_store_async(source) if not isinstance(source, Group) else source
-    async_root = root._zarr._async_group
 
-    session = _OfflineSession()
-    wanted_nodes: set[str] = set()
-    wanted_chunks: set[tuple[str, str]] = set()
-    wanted_arrays: set[str] = set()
-    wanted_listings: set[str] = set()
+    def decode(group: Group) -> T:
+        return reader(group, **kwargs)
 
-    for _round in range(_MAX_ROUNDS):
-        # Everything discovered so far is fetched together, so a round
-        # costs one round-trip regardless of how much it covers.
-        if wanted_nodes:
-            resolved = await _resolve_nodes(async_root, wanted_nodes)
-            session.nodes.update(resolved)
-            # Queue every cell those arrays hold, so a reader that walks
-            # chunks one at a time does not cost one round per chunk.
-            wanted_chunks |= _implied_chunks(resolved) - session.chunks.keys()
-        if wanted_chunks:
-            session.chunks.update(
-                await _fetch_chunks(async_root, session.nodes, wanted_chunks)
-            )
-        if wanted_arrays:
-            session.arrays.update(await _fetch_arrays(async_root, wanted_arrays))
-        if wanted_listings:
-            session.listings.update(
-                await _fetch_listings(async_root, wanted_listings)
-            )
-
-        session.misses.clear()
-        try:
-            with root.offline_reads(session):
-                result = reader(root, **kwargs)
-        except StoreError:
-            # Expected while the snapshot is still incomplete: the miss
-            # that caused it was recorded before the raise.  Only treat
-            # it as fatal once nothing new was learned (below).
-            if not session.misses:
-                raise
-            result = None
-        else:
-            if not session.misses:
-                return result
-
-        # Sort what the reader asked for into the three request kinds.
-        # Array requests are tagged ``("array", path)`` so they cannot be
-        # confused with a ``(array_path, chunk_key)`` cell request.
-        new_nodes = {m for m in session.misses if isinstance(m, str)}
-        new_arrays = {
-            m[1] for m in session.misses
-            if isinstance(m, tuple) and m[0] == "array"
-        }
-        new_listings = {
-            m[1] for m in session.misses
-            if isinstance(m, tuple) and m[0] == "list"
-        }
-        new_chunks = {
-            m for m in session.misses
-            if isinstance(m, tuple) and m[0] not in ("array", "list")
-        }
-        # Anything already in the snapshot that still missed cannot be
-        # satisfied by fetching it again, so the round taught us nothing.
-        grew = bool(
-            (new_nodes - session.nodes.keys())
-            or (new_chunks - session.chunks.keys())
-            or (new_arrays - session.arrays.keys())
-            or (new_listings - session.listings.keys())
-        )
-        if not grew:
-            raise StoreError(
-                f"Async read stalled: {reader.__name__} still needs "
-                f"{sorted(session.misses)[:5]!r} but re-fetching yields "
-                f"nothing new. Either the object is genuinely missing, or "
-                f"this read path requires listing the store, which the "
-                f"offline snapshot cannot supply."
-            )
-        wanted_nodes |= new_nodes
-        wanted_chunks |= new_chunks
-        wanted_arrays |= new_arrays
-        wanted_listings |= new_listings
-
-    raise StoreError(
-        f"Async read of {reader.__name__} did not converge within "
-        f"{_MAX_ROUNDS} rounds."
+    return await aexecute(
+        root,
+        decode,
+        fetcher=AsyncFetcher(root),
+        label=getattr(reader, "__name__", repr(reader)),
+        what="Async read",
+        max_rounds=_MAX_ROUNDS,
     )

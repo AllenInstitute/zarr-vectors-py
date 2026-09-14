@@ -24,7 +24,9 @@ from zarr_vectors.rechunk.engine import rechunk
 from zarr_vectors.rechunk.rebin import rebin_level
 from zarr_vectors.rechunk.spec import RechunkSpec
 
-__all__ = ["RechunkSpec", "rebin_level", "rechunk", "rechunk_by_attribute"]
+__all__ = [
+    "rechunk_spatial",
+    "suggest_chunk_shape","RechunkSpec", "rebin_level", "rechunk", "rechunk_by_attribute"]
 
 
 def rechunk_by_attribute(
@@ -59,3 +61,5 @@ def rechunk_by_attribute(
         prefix_dim_name=attribute_name,
     )
     return rechunk(store_path, spec, output=output)
+
+from zarr_vectors.rechunk.spatial import rechunk_spatial, suggest_chunk_shape  # noqa: E402,F401

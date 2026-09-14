@@ -20,14 +20,14 @@
 
 ## Introduction
 
-The point cloud type is the simplest ZVF geometry: positions plus optional
+The point cloud type is the simplest Zarr Vectors geometry: positions plus optional
 per-vertex attributes, no connectivity, no object model. It is suitable for
 any dataset where vertices are independent measurements — lidar scans,
 synchrotron absorption point data, single-molecule localisation microscopy,
 gene expression spatial transcriptomics, or any other spatially indexed
 scalar field sampled at discrete positions.
 
-Point clouds support the full ZVF spatial indexing hierarchy (chunks, bins,
+Point clouds support the full Zarr Vectors spatial indexing hierarchy (chunks, bins,
 fragment index) and full multi-resolution pyramids via spatial coarsening into
 metanodes.
 

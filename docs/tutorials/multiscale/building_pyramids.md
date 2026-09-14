@@ -1,98 +1,150 @@
 # Building multi-resolution pyramids
 
-A multi-resolution pyramid stores the same dataset at progressively
-coarser spatial resolutions. Viewers and analysis pipelines select the
-appropriate level based on viewport size, memory budget, or query
-scale — loading only the data density they need.
+A multi-resolution pyramid stores the same dataset at progressively coarser
+spatial resolutions. Viewers and analysis pipelines select the appropriate
+level based on viewport size, memory budget, or query scale — loading only the
+data density they need.
 
-This tutorial covers pyramid construction for point clouds,
-streamlines, and graphs; manual single-level coarsening; and the 0.4
-cross-pyramid-level link materialisation. See the
-[Pyramid construction](../../spec/multiscale/pyramid_construction.md)
+`Dataset.build_pyramid` is the supported entry point, on the
+{doc}`api surface <../../api/api>` re-exported from the top-level package.
+The coarsening itself lives in `zarr_vectors.multiresolution`, which is
+internal and changes without notice; nothing on this page imports from it
+except the one section that documents a gap.
+
+This tutorial covers pyramid construction for point clouds, streamlines and
+graphs; cross-pyramid-level link materialisation; and level bookkeeping. See
+the [Pyramid construction](../../spec/multiscale/pyramid_construction.md)
 spec page for the algorithm and on-disk layout.
 
 ---
 
 ## Concepts recap
 
-**Coarsen factor** scales the supervoxel bin size at each level. A
-factor of `2.0` means each axis is binned 2× coarser, giving up to
-~8× fewer metanodes per unit volume in 3D.
+**Coarsen factor** scales the supervoxel bin size. It is a **per-level ratio
+against the level below**, so factors compound: `[(2, 1), (2, 1), (2, 1)]`
+bins at 2×, 4× and 8× the root bin shape.
 
-**Sparsity factor** thins discrete objects (streamlines, skeletons,
-meshes) at coarser levels. A factor of `3.0` keeps every third object
-on average. `1.0` (the default) keeps all objects.
+**Sparsity factor** thins discrete objects (streamlines, skeletons, meshes) at
+coarser levels. Unlike the coarsen factor it is **absolute, not compounding**:
+it is measured against the store's full object set, so `4.0` at two successive
+levels selects the same objects twice. See
+[Choosing thinning factors](#choosing-thinning-factors) below.
 
-**Aggregation** is not configurable. Coarsening aggregates a bin's
-source vertices into their **centroid** (a metavertex); there is no
-`agg_mode`-style choice of `mean` / `sum` / `mode` / `min` / `max`.
+**Aggregation** is not configurable. Coarsening aggregates a bin's source
+vertices into their **centroid** (a metavertex); there is no `agg_mode`-style
+choice of `mean` / `sum` / `mode` / `min` / `max`.
 
-**Coarsening method** (`method`) selects the coarsening implementation.
+**Coarsening method** (`method`) selects the coarsening implementation. Ask
+the package rather than guessing, because the registry knows and an exception
+is a poor way to find out:
+
+```python
+import zarr_vectors as zv
+
+print(zv.coarsen_methods())
+```
+
+```text
+('per_object',)
+```
+
 Core ships exactly one: `per_object` (the default) — OID-stable, with
-metavertices shared between objects. Any other name must be registered by
-**`zarr-vectors-tools`**; core raises a clear `ValueError` if it is not
-installed. See the spec page for the trade-off.
+metavertices shared between objects. Anything else in that tuple was
+registered on import by **`zarr-vectors-tools`**.
 
-**Cross-level links** are edges from a fine-level vertex to its
-coarse-level parent metanode, materialised at each adjacent level pair.
-Controlled by `cross_level_depth` and `cross_level_storage`. See
-[`examples/07_multiscale_links.ipynb`](../../../examples/07_multiscale_links.ipynb)
-for a worked example.
+**Cross-level links** are edges from a fine-level vertex to its coarse-level
+parent metanode, materialised at each adjacent level pair. Controlled by
+`cross_level_storage` and `cross_level_depth`.
 
 ---
 
 ## Point cloud pyramids
 
-Point clouds use spatial coarsening only; `sparsity_factor` is always
-ignored.
+Point clouds use spatial coarsening only; `sparsity_factor` is ignored,
+because there are no objects to thin.
 
-### Quick three-level pyramid
+### A three-level pyramid
 
 ```python
 import numpy as np
-from zarr_vectors.types.points import write_points
-from zarr_vectors.multiresolution.coarsen import build_pyramid
+import zarr_vectors as zv
 
 rng = np.random.default_rng(0)
-positions  = rng.uniform(0, 2000, (500_000, 3)).astype(np.float32)
-intensity  = rng.uniform(0, 1, 500_000).astype(np.float32)
-label      = rng.integers(0, 16, 500_000).astype(np.int32)
+positions = rng.uniform(0, 2000, (500_000, 3)).astype(np.float32)
+intensity = rng.uniform(0, 1, 500_000).astype(np.float32)
+label = rng.integers(0, 16, 500_000).astype(np.int32)
 
-write_points(
-    "synchrotron.zarrvectors",
-    positions,
-    chunk_shape=(200.0, 200.0, 200.0),
-    bin_shape=(50.0, 50.0, 50.0),
-    attributes={"intensity": intensity, "label": label},
-)
+ds = zv.create("synchrotron.zarrvectors", schema=zv.Schema(
+    bounds=((0.0, 0.0, 0.0), (2000.0, 2000.0, 2000.0)),
+    kind="point_cloud",
+    vertex_attributes={
+        "intensity": zv.AttributeSpec(dtype="float32"),
+        "label": zv.AttributeSpec(dtype="int32", categorical=True),
+    },
+    expected=zv.SizeHints(n_vertices=500_000),
+    layout=zv.Layout(cells=10),
+))
+ds.add_points(positions, attributes={"intensity": intensity, "label": label})
+print(ds.level(0).scale, ds.level(0).resolution)
 
-build_pyramid(
-    "synchrotron.zarrvectors",
+report = ds.build_pyramid(
     factors=[
-        (2.0, 1.0),         # level 1: 8× vertex reduction in 3D
-        (2.0, 1.0),         # level 2: another 8× reduction
-        (2.0, 1.0),         # level 3
+        (2.0, 1.0),     # level 1: bins 2× the root bin
+        (2.0, 1.0),     # level 2: 4×
+        (2.0, 1.0),     # level 3: 8×
     ],
+    chunk_scale_factors=[2, 2, 2],
 )
+print(report["levels_created"], [s["vertex_count"] for s in report["level_specs"]])
 ```
 
-After building, the resolution summary is roughly:
-
-```
-0:  500000 vertices
-1:   63000 vertices   (8×  reduction)
-2:    8000 vertices   (64× reduction)
-3:    1000 vertices   (512× reduction)
+```text
+(200.0, 200.0, 200.0) (50.0, 50.0, 50.0)
+3 [8000, 1000, 125]
 ```
 
-Actual counts at each level are less than `500000 / 8^N` because bins
-near the data boundary contain fewer vertices to merge.
+`zv.Layout(cells=10)` divides the 2000 µm bounds into ten cells per axis, so
+level 0 has a 200 µm chunk shape and a 50 µm bin shape. Re-open the dataset
+after building — the handle that built the pyramid keeps stale level metadata:
+
+```python
+ds = zv.open("synchrotron.zarrvectors")
+for index in ds.levels:
+    level = ds.level(index)
+    print(index, level.vertex_count, level.scale, level.resolution, level.grid.shape)
+```
+
+```text
+0 500000 (200.0, 200.0, 200.0) (50.0, 50.0, 50.0) (10, 10, 10)
+1 8000 (400.0, 400.0, 400.0) (100.0, 100.0, 100.0) (5, 5, 5)
+2 1000 (800.0, 800.0, 800.0) (200.0, 200.0, 200.0) (3, 3, 3)
+3 125 (1600.0, 1600.0, 1600.0) (400.0, 400.0, 400.0) (2, 2, 2)
+```
+
+### Reading those numbers
+
+The reduction is not `500000 / 8^N`. Coarsening emits **one metavertex per
+occupied bin**, so once the bins are saturated the count is set by the bin
+grid, not by the input:
+
+| Level | Bin shape | Bins across the 2000 µm volume | Vertices |
+|-------|-----------|--------------------------------|----------|
+| 0 | 50 µm  | —      | 500 000 |
+| 1 | 100 µm | 20³ = 8000 | 8 000 |
+| 2 | 200 µm | 10³ = 1000 | 1 000 |
+| 3 | 400 µm |  5³ =  125 |   125 |
+
+With 500 000 points spread over 8000 level-1 bins, every bin holds ~62 points
+and every one of them collapses to a single centroid — so level 1 is exactly
+the bin count. Sparse data behaves the other way: where bins are mostly empty
+the count tracks the input and the reduction really is ~`coarsen ** ndim`.
+Either way the level count is `min(source vertices, occupied bins)`, and you
+can predict the ceiling from `Level.resolution` before building.
 
 ### Choosing coarsen factors
 
-Each `(coarsen, sparsity)` tuple controls one level. For 3D data the
-per-level vertex reduction is approximately `coarsen ** 3`. A balanced
-pyramid uses the same factor at every level:
+Each `(coarsen, sparsity)` tuple produces one level from the one below. For
+3D data the per-level reduction is at most `coarsen ** 3`:
 
 | Per-level target reduction | `coarsen_factor` | 3D effect |
 |----------------------------|------------------|-----------|
@@ -101,219 +153,400 @@ pyramid uses the same factor at every level:
 | 64×   | 4.0 | each axis quartered |
 
 `factors` is isotropic: each entry scales every axis by the same
-`coarsen_factor`. For finer control, call `coarsen_level` per level
-yourself — it takes an explicit `source_level` / `target_level` pair
-plus `coarsen_factor`, `sparsity_factor`, and a `chunk_scale_factor`
-that may be a per-axis tuple:
+`coarsen_factor`.
+
+### Always pass `chunk_scale_factors`
+
+`chunk_scale_factors` takes one entry per level — a scalar, or a per-axis
+tuple — multiplying the source level's chunk shape to get the target's. Leave
+it out and coarsening still works, but every level inherits the root chunk
+shape, so `Level.scale` is identical everywhere and the level-picking helper a
+viewer relies on has nothing to distinguish levels by:
 
 ```python
-from zarr_vectors.multiresolution.coarsen import coarsen_level
-
-coarsen_level(
-    "scan.zarrvectors",
-    source_level=0,
-    target_level=1,
-    coarsen_factor=2.0,
-    chunk_scale_factor=(2, 2, 1),   # per-axis
-)
+# the same 500 000 points, built with factors= but no chunk_scale_factors
+flat = zv.open("no_chunk_scale.zarrvectors")
+for index in flat.levels:
+    level = flat.level(index)
+    print(index, level.vertex_count, level.scale, level.resolution)
+print([flat.resolution(scale=s).index for s in (200.0, 400.0, 800.0, 1600.0)])
 ```
 
-`build_pyramid` also accepts `chunk_scale_factors=` — one entry per
-level, each a scalar or a per-axis tuple — if you only need to vary the
-chunk shape rather than the coarsening itself.
+```text
+0 500000 (200.0, 200.0, 200.0) (50.0, 50.0, 50.0)
+1 8000 (200.0, 200.0, 200.0) (100.0, 100.0, 100.0)
+2 1000 (200.0, 200.0, 200.0) (200.0, 200.0, 200.0)
+3 125 (200.0, 200.0, 200.0) (400.0, 400.0, 400.0)
+[0, 0, 0, 0]
+```
+
+The vertex counts are right and `resolution` coarsens correctly, but every
+`resolution(scale=...)` query collapses to level 0. Match
+`chunk_scale_factors` to `factors` unless you have a reason not to.
 
 ### A note on attributes
 
-There is no per-attribute aggregation setting, and no `agg_mode`
-parameter on either `build_pyramid` or `coarsen_level`. Every bin's
-vertices collapse to a centroid metavertex under the one built-in
-`per_object` method. If you need categorical labels or counts handled
-differently, that behaviour is not in core.
+There is no per-attribute aggregation setting and no `agg_mode` parameter.
+Every bin's vertices collapse to a centroid metavertex under the one built-in
+`per_object` method. A coarsened level also does not inherit
+`vertex_attributes`: it gets `vertices`, `vertex_fragments`, its cross-level
+`links/`, and — where the geometry has objects — `object_index` plus the
+inherited `object_attributes`. Not `vertex_attributes`, `groups`,
+`group_attributes`, `link_attributes` or `link_fragments`.
+
+```python
+print(ds.level(0).attribute_names("vertex"))
+print(ds.level(1).attribute_names("vertex"))
+```
+
+```text
+('intensity', 'label')
+()
+```
+
+If you need categorical labels or counts carried up the pyramid, that
+behaviour is not in core.
 
 ---
 
-## Streamline / polyline pyramids
+## Streamline and polyline pyramids
 
-Polylines and streamlines use both spatial coarsening (vertex
-metanodes) and object thinning (dropping individual streamlines at
-coarser levels).
-
-### Two-stage pyramid with increasing thinning
+Polylines and streamlines use both spatial coarsening (vertex metanodes) and
+object thinning (dropping whole streamlines at coarser levels).
 
 ```python
 import numpy as np
-from zarr_vectors.types.polylines import write_polylines
-from zarr_vectors.multiresolution.coarsen import build_pyramid
+import zarr_vectors as zv
 
 rng = np.random.default_rng(0)
+starts = rng.uniform(200.0, 800.0, size=(2000, 3))
 streamlines = [
-    rng.normal(0, 30, (rng.integers(30, 120), 3)).cumsum(0).astype(np.float32)
-    for _ in range(10_000)
+    (start + rng.normal(0.0, 6.0, size=(60, 3)).cumsum(axis=0)).astype(np.float32)
+    for start in starts
 ]
 
-write_polylines(
-    "tracts.zarrvectors",
-    streamlines,
-    chunk_shape=(100.0, 100.0, 100.0),
-    bin_shape=(25.0, 25.0, 25.0),
-    geometry_type="streamline",
-)
+bundle = zv.create("bundle.zarrvectors", schema=zv.Schema(
+    bounds=((0.0, 0.0, 0.0), (1000.0, 1000.0, 1000.0)),
+    kind="polyline",
+    expected=zv.SizeHints(n_vertices=120_000, n_objects=2000),
+    layout=zv.Layout(cells=10),
+))
+bundle.add_polylines(streamlines, streamlines=True)
 
-build_pyramid(
-    "tracts.zarrvectors",
+report = bundle.build_pyramid(
     factors=[
-        (2.0, 1.0),     # L1: 8× fewer vertices, all streamlines kept
-        (2.0, 4.0),     # L2: another 8× + drop 3/4 of streamlines
-        (2.0, 4.0),     # L3: another 8× + drop another 3/4
+        (2.0,  1.0),     # L1: coarser vertices, all streamlines kept
+        (2.0,  4.0),     # L2: coarser again, keep 1 streamline in 4
+        (2.0, 16.0),     # L3: coarser again, keep 1 in 16
     ],
-    method="per_object",            # keep OIDs stable across levels
+    chunk_scale_factors=[2, 2, 2],
+    method="per_object",
     sparsity_strategy="random",
     sparsity_seed=42,
 )
+for index, spec in enumerate(report["level_specs"], start=1):
+    print(index, spec["vertex_count"], spec["objects_kept"], spec["source_objects"])
 ```
 
-Expected output:
-
-```
-0:  10000 streamlines, ~750 000 vertices
-1:  10000 streamlines, ~96 500 vertices   (8× vertex reduction)
-2:   2500 streamlines, ~3 100 vertices    (8× × 4× thinning)
-3:    625 streamlines, ~155 vertices
+```text
+1 2721 2000 2000
+2 397 500 2000
+3 37 125 2000
 ```
 
-`per_object` preserves OIDs: a streamline kept at level 3 has the same
-OID it had at level 0, with each surviving level holding the
-appropriate coarser metanode trajectory.
+`per_object` preserves OIDs: a streamline kept at level 3 has the same OID it
+had at level 0, so "the same object" is trackable across resolutions — which
+is what Neuroglancer drill-down and ID-preserving analytics need.
+
+### Choosing thinning factors
+
+Note `source_objects` in that output: it is 2000 at every level, not the
+previous level's count. **The sparsity factor is absolute** — measured against
+the store's full object set — where the coarsen factor is relative to the
+level below. Passing `4.0` at two consecutive levels with the same seed
+therefore selects the same 500 objects twice and thins nothing the second
+time. Escalate the factor instead: `1.0`, `4.0`, `16.0` gives 2000, 500 and
+125 selected objects.
+
+`objects_kept` is what the selection strategy chose. What actually carries
+geometry can be smaller, because an object can only survive at a level if it
+survived at the level below:
+
+```python
+bundle = zv.open("bundle.zarrvectors")
+for index in bundle.levels:
+    level = bundle.level(index)
+    print(index, level.vertex_count, level.objects.count, level.objects.slots)
+```
+
+```text
+0 120000 2000 2000
+1 2721 2000 2000
+2 397 500 2000
+3 37 38 2000
+```
+
+Level 3 selected 125 ids out of the 2000-id space, but only the 38 of them
+that were also present at level 2 have anything to hold. `slots` stays at 2000
+at every level — dropped objects leave addressable but empty slots — so use
+`Level.objects.count`, or `ids(present=True)`, when you need what is really
+there. See [Sparsity](../../spec/multiscale/sparsity.md) for the model.
 
 ### Sparsity strategies
 
-`sparsity_strategy` picks which objects survive at each level. **Core
-ships exactly one strategy: `"random"`** (the default).
+`sparsity_strategy` picks which objects survive. **Core ships exactly one:
+`"random"`** (the default), with `sparsity_seed` for reproducibility.
 
-```python
-build_pyramid(
-    "tracts.zarrvectors",
-    factors=[(2.0, 1.0), (2.0, 4.0)],
-    sparsity_strategy="random",
-    sparsity_seed=42,
-)
+Non-random strategies — spatial-coverage, length-ranked, attribute-ranked,
+point-thinning — live in **`zarr-vectors-tools`**, which registers them on
+import. Requesting one without that package raises rather than silently
+falling back:
+
+```pycon
+>>> bundle.build_pyramid(factors=[(2.0, 4.0)], sparsity_strategy="spatial_coverage")
+ValueError: object-selection strategy 'spatial_coverage' is not available in core
+(core provides only ['random']). It is provided by zarr-vectors-tools; install it
+with `pip install zarr-vectors-tools` (it registers its strategies on import).
+Registered: [].
 ```
 
-Non-random strategies — spatial-coverage, length-ranked,
-attribute-ranked, point-thinning — live in **`zarr-vectors-tools`**,
-which registers them on import. Requesting one without that package
-installed raises a `ValueError` naming the strategy and telling you to
-install the tools package; it does not silently fall back to `random`.
+`method=` behaves the same way, and its message names the coarseners instead:
 
-```python
-# Requires `pip install zarr-vectors-tools`
-build_pyramid(
-    "tracts.zarrvectors",
-    factors=[(2.0, 1.0), (2.0, 4.0)],
-    sparsity_strategy="spatial_coverage",
-    sparsity_seed=42,
-)
+```pycon
+>>> bundle.build_pyramid(factors=[(2.0, 1.0)], method="graph_aware")
+ValueError: coarsen method 'graph_aware' is not available in core (core provides
+only ['per_object']). It is provided by zarr-vectors-tools; install it with
+`pip install zarr-vectors-tools` (it registers its strategies on import).
+Registered: [].
 ```
 
-The same applies to `method=`: `"per_object"` is core, anything else is
-tools-registered.
+Pass a registered strategy's own knobs as `options={...}`. A strategy package
+registers itself through `zarr_vectors.building.register_coarsen_strategy` and
+`register_selection_strategy`, both of which are supported — so a third-party
+coarsener does not need an internal import either.
+
+Neither error fires on a store with no objects: a point cloud ignores the
+sparsity path entirely, so a misspelled `sparsity_strategy` goes unnoticed
+there. Check the name against a store that has objects.
 
 ---
 
-## Cross-pyramid-level link materialisation (0.4+)
+## Cross-pyramid-level links
 
-`build_pyramid` materialises edges between fine vertices and their
-coarse-level parent metanodes. These are stored under
-`links/<delta>/<offsets>/` at every adjacent level pair — one family,
-whether or not an edge's endpoints share a chunk. See
+`build_pyramid` materialises edges between fine vertices and their coarse-level
+parent metanodes, under `links/<delta>/<offsets>/`. `<delta>` is how many
+pyramid levels the record spans — `+1` at the finer level for drill-up, `-1` at
+the coarser level for drill-down — and `<offsets>` says where the other
+endpoint sits relative to the source chunk. There is no separate cross-chunk
+array: a cross-chunk link is simply one with non-zero offsets. See
 [Links](../../spec/object_model/links.md) for the on-disk layout.
 
-### Default: ±1 explicit
+### Watching what gets written
+
+The families are directories, so the easiest way to see what a set of options
+produced is to look. A small rebuild-and-inspect helper makes the variants
+below comparable:
 
 ```python
-build_pyramid(
-    "scan.zarrvectors",
-    factors=[(2.0, 1.0), (2.0, 1.0)],
-    cross_level_depth=1,                  # default
-    cross_level_storage="explicit",       # default
-)
+import os
+import shutil
+
+import numpy as np
+import zarr_vectors as zv
+
+def rebuild(name, **options):
+    """Build a fresh four-level store and report its <delta> families."""
+    shutil.rmtree(name, ignore_errors=True)
+    rng = np.random.default_rng(1)
+    ds = zv.create(name, schema=zv.Schema(
+        bounds=((0.0, 0.0, 0.0), (1000.0, 1000.0, 1000.0)),
+        kind="point_cloud",
+        expected=zv.SizeHints(n_vertices=20_000),
+        layout=zv.Layout(cells=5),
+    ))
+    ds.add_points(rng.uniform(0, 1000, (20_000, 3)).astype(np.float32))
+    ds.build_pyramid(
+        factors=[(2.0, 1.0), (2.0, 1.0), (2.0, 1.0)],
+        chunk_scale_factors=[2, 2, 2],
+        **options,
+    )
+    families = {}
+    for level in sorted(entry for entry in os.listdir(name) if entry.isdigit()):
+        links = os.path.join(name, level, "links")
+        families[int(level)] = (
+            sorted(entry for entry in os.listdir(links) if entry != "zarr.json")
+            if os.path.isdir(links) else []
+        )
+    return families, sorted(zv.open(name).capabilities)
 ```
 
-This emits, at every adjacent (fine, coarse) pair:
+### Default: `±1`, explicit
 
-- `links/+1/<offsets>/` at the fine level — the drill-up edges. Edges
-  whose target metanode shares the source chunk_key land in the all-zero
-  segment (`links/+1/0.0.0/`); those whose target sits in a different
-  chunk_key land in the segment naming that displacement (e.g.
-  `links/+1/0.0.+1/`).
-- `links/-1/<offsets>/` at the coarse level — the same edges with
-  endpoints swapped (drill-down direction).
+```python
+print(rebuild(
+    "xl_explicit.zarrvectors",
+    cross_level_depth=1,               # default
+    cross_level_storage="explicit",    # default
+))
+```
 
-Both directions are one family per delta. There is no separate
-cross-chunk array: the `<offsets>` segment *is* how a cross-chunk edge is
-distinguished from an intra-chunk one.
+```text
+({0: ['+1'], 1: ['+1', '-1'], 2: ['+1', '-1'], 3: ['-1']}, ['multiscale_links', 'shared_fragments'])
+```
+
+The `+1` family at the fine level always lands in the all-zero offsets segment
+(`links/+1/0.0.0/`), because a parent metanode sits in the cell that covers its
+children. The `-1` family at the coarse level spreads across offsets — one
+coarse cell's children live in several fine cells — so it has segments like
+`0.0.+1` and `+1.+1.+1` alongside `0.0.0`.
 
 ### Storage modes
 
+`cross_level_storage` decides which directions are written.
+
 | Mode | `+N` at fine level | `-N` at coarse level |
 |------|--------------------|----------------------|
+| `explicit` (default) | yes | yes |
+| `implicit` | yes | no — readers reconstruct by flipping `+N` |
 | `none`     | no  | no  |
-| `implicit` | yes | no (readers reconstruct by flipping `+N`) |
-| `explicit` | yes | yes |
-
-Use `"implicit"` to halve disk usage; readers will need to find the
-`+N` array at the target level and flip endpoints to drill down.
 
 ```python
-build_pyramid(
-    "scan.zarrvectors",
-    factors=[(2.0, 1.0), (2.0, 1.0)],
-    cross_level_storage="implicit",
-)
+for mode in ("explicit", "implicit", "none"):
+    families, _ = rebuild(f"xl_{mode}.zarrvectors", cross_level_storage=mode)
+    print(f"{mode:9} {families}")
 ```
+
+```text
+explicit  {0: ['+1'], 1: ['+1', '-1'], 2: ['+1', '-1'], 3: ['-1']}
+implicit  {0: ['+1'], 1: ['+1'], 2: ['+1'], 3: []}
+none      {0: [], 1: [], 2: [], 3: []}
+```
+
+Use `"implicit"` to roughly halve the link footprint; readers then find the
+`+N` array at the target level and flip endpoints to drill down.
 
 ### Multi-step deltas
 
+`cross_level_depth` governs the deltas of magnitude 2 and above. Adjacent `±1`
+arrays are emitted inline while each level is coarsened; a post-build pass then
+composes the parent maps to produce the deeper ones.
+
 ```python
-build_pyramid(
-    "scan.zarrvectors",
-    factors=[(2.0, 1.0), (2.0, 1.0), (2.0, 1.0)],     # 4 levels total
-    cross_level_depth=2,                              # emit ±1 AND ±2
-    cross_level_storage="explicit",
-)
+print(rebuild("xl_depth2.zarrvectors", cross_level_depth=2)[0])
+print(rebuild("xl_all.zarrvectors", cross_level_depth=-1)[0])
 ```
 
-`depth=2` composes parent maps across two coarsening steps so a
-level-0 vertex points straight to its level-2 metanode (single hop, no
-chained lookup). Pass `cross_level_depth=-1` to walk all available
-adjacent and skip-one pairs.
+```text
+{0: ['+1', '+2'], 1: ['+1', '+2', '-1'], 2: ['+1', '-1', '-2'], 3: ['-1', '-2']}
+{0: ['+1', '+2', '+3'], 1: ['+1', '+2', '-1'], 2: ['+1', '-1', '-2'], 3: ['-1', '-2', '-3']}
+```
+
+`depth=2` composes parent maps across two coarsening steps, so a level-0 vertex
+points straight at its level-2 metanode in a single hop, with no chained
+lookup. `cross_level_depth=-1` walks every available level pair.
 
 ### Opting out
 
+**`cross_level_depth=0` does not opt out.** Depth only governs the composed
+`|N| ≥ 2` arrays; the adjacent `±1` families are written inline by the
+coarsener and are controlled by `cross_level_storage`. Passing `depth=0` leaves
+every `±1` array on disk and merely skips the finalize pass — which also means
+the store never gets the `multiscale_links` capability stamped, so a reader
+that checks `ds.supports("multiscale_links")` decides the links are absent
+while they are sitting right there:
+
 ```python
-build_pyramid(
-    "scan.zarrvectors",
-    factors=[(2.0, 1.0), (2.0, 1.0)],
-    cross_level_depth=0,                  # no <delta != 0> arrays
-)
+print(rebuild("xl_depth0.zarrvectors", cross_level_depth=0))
+print(rebuild("xl_off.zarrvectors", cross_level_storage="none"))
 ```
 
-Use `cross_level_depth=0` when downstream consumers don't need
-drill-up/drill-down navigation — saves disk and a small post-build
-pass.
+```text
+({0: ['+1'], 1: ['+1', '-1'], 2: ['+1', '-1'], 3: ['-1']}, ['shared_fragments'])
+({0: [], 1: [], 2: [], 3: []}, ['shared_fragments'])
+```
 
-See [`examples/07_multiscale_links.ipynb`](../../../examples/07_multiscale_links.ipynb)
-for a notebook walkthrough of reading both intra-level and cross-level
-arrays at each `<delta>`.
+`cross_level_storage="none"` is what actually skips cross-level navigation —
+it saves the arrays and the post-build pass both.
+
+### Reading the link families back
+
+Inspecting `links/` is a physical question, so it belongs to the
+{doc}`builder surface <../../api/building>`:
+
+```python
+from zarr_vectors.building import (
+    open_store,
+    get_resolution_level,
+    list_link_deltas,
+    list_link_offsets,
+    read_links,
+)
+
+root = open_store("synchrotron.zarrvectors", mode="r")
+
+for index in (0, 1):
+    level_group = get_resolution_level(root, index)
+    deltas = list_link_deltas(level_group)
+    print(index, deltas, {d: list_link_offsets(level_group, d)[:3] for d in deltas})
+
+level_group = get_resolution_level(root, 0)
+up = read_links(level_group, delta=1)
+print(len(up), up[0])
+```
+
+```text
+0 [1] {1: ['0.0.0']}
+1 [-1, 1] {-1: ['+1.+1.+1', '+1.+1.0', '+1.0.+1'], 1: ['0.0.0']}
+500000 (((0, 0, 0), 0), ((0, 0, 0), 0))
+```
+
+Each record is a tuple of `(chunk_coords, fragment_index)` endpoints.
+See [Links](../../spec/object_model/links.md) and
+[Pyramid construction](../../spec/multiscale/pyramid_construction.md) for the
+layout these records use.
+
+```{note}
+`examples/07_multiscale_links.ipynb` predates the merged links layout and no
+longer imports — it reaches for `constants.CROSS_CHUNK_LINKS` and
+`core.arrays.read_cross_chunk_links`, neither of which survived FORMAT 0.9.0.
+Use the code on this page instead until the notebook is rewritten.
+```
 
 ---
 
-## Manual single-level coarsening
+## Per-level control: a gap in the supported surface
 
-For fine-grained control over individual levels, use `coarsen_level`
-directly:
+`build_pyramid` is isotropic and whole-pyramid. Two things it cannot express
+have **no replacement on `api` or `building` today**:
+
+- coarsening a *single* level, with an explicit `source_level` /
+  `target_level` pair;
+- re-coarsening every level above a given one in place after level 0 changed.
+
+Both live on internal modules. Reaching for them is reaching past the
+compatibility contract — they may move or change signature in any release, and
+an import of one is a name nobody knows is load-bearing, which is exactly how
+past layout refactors turned into downstream breaks. If you need either, the
+right move is to ask for it to be promoted into `building` rather than to
+depend on the internal spelling. It is a gap to report, not a reason to import
+from `multiresolution` or `ops`.
+
+For the common case — build the whole pyramid — `Dataset.build_pyramid` covers
+it, and `chunk_scale_factors` already accepts a per-axis tuple per level, so
+anisotropic *chunking* needs no internal import:
 
 ```python
+ds.build_pyramid(
+    factors=[(2.0, 1.0), (2.0, 1.0)],
+    chunk_scale_factors=[(2, 2, 1), (2, 2, 1)],   # per-axis, per level
+)
+```
+
+If you genuinely need one level at a time, this is the internal spelling, so
+pin your `zarr-vectors` version if you use it:
+
+```python
+# INTERNAL — zv.stability("zarr_vectors.multiresolution") == "internal"
 from zarr_vectors.multiresolution.coarsen import coarsen_level
 
 coarsen_level(
@@ -321,88 +554,160 @@ coarsen_level(
     source_level=3,
     target_level=4,
     coarsen_factor=2.0,
-    sparsity_factor=1.0,
-    method="per_object",
-    sparsity_strategy="random",
-    sparsity_seed=42,
+    chunk_scale_factor=(2, 2, 1),
 )
 ```
 
-`source_level` does not have to be 0 — chain `coarsen_level` calls to
-build pyramids one level at a time. **Note:** `coarsen_level` does
-*not* emit cross-level link arrays on its own; only `build_pyramid`
-runs the post-build `_finalize_cross_level_for_store` step. To
-materialise `<delta>` arrays after a sequence of manual `coarsen_level`
-calls, call `build_pyramid(..., factors=[(1.0, 1.0)])` once at the end
-to trigger the finalize pass.
-
-### Listing existing levels
-
-```python
-from zarr_vectors.core.store import open_store, list_resolution_levels
-
-root = open_store("synchrotron.zarrvectors", mode="r")
-print(list_resolution_levels(root))      # [0, 1, 2, 3]
+```text
+{'vertex_count': 27, 'object_count': 1, 'objects_kept': 1, 'source_objects': 1, 'method': 'per_object', 'preserves_object_ids': True, 'shared_fragments': True}
 ```
 
-### Removing a level
+`source_level` does not have to be 0, so calls chain to build a pyramid one
+level at a time. Note that `coarsen_level` emits **no** cross-level link arrays
+on its own — its `cross_level_storage` defaults to `"none"` for standalone
+callers, and the composing pass that produces `|N| ≥ 2` deltas and stamps the
+`multiscale_links` capability only runs inside `build_pyramid`. A pyramid
+assembled from `coarsen_level` calls has no `links/<delta>/` at all.
+
+The in-place re-coarsen (`zarr_vectors.ops.refresh.rebuild_pyramid_from_level`)
+is internal on the same terms; it re-runs `coarsen_level` for every level above
+its `source_level` using each target's own recorded parameters. Rebuilding with
+`Dataset.build_pyramid` after removing the stale levels is the supported way to
+get the same result.
+
+---
+
+## Listing and removing levels
+
+Level bookkeeping is builder work, and all of it is on
+`zarr_vectors.building` — including undoing the level the previous section
+added:
 
 ```python
-from zarr_vectors.core.store import remove_resolution_level
+from zarr_vectors.building import (
+    open_store, list_resolution_levels, remove_resolution_level,
+)
+
+root = open_store("synchrotron.zarrvectors", mode="r")
+print(list_resolution_levels(root))
 
 root = open_store("synchrotron.zarrvectors", mode="r+")
 remove_resolution_level(root, level_index=4)
+print(list_resolution_levels(open_store("synchrotron.zarrvectors", mode="r")))
 ```
+
+```text
+[0, 1, 2, 3, 4]
+[0, 1, 2, 3]
+```
+
+Removing a level updates the root's multiscale metadata too, so the api
+surface agrees immediately:
+
+```python
+print(zv.open("synchrotron.zarrvectors").levels)
+```
+
+```text
+(0, 1, 2, 3)
+```
+
+For a read-only listing, `Dataset.levels` needs no builder import at all.
 
 ---
 
 ## Reading pyramid levels
 
 ```python
-from zarr_vectors.types.points import read_points
+ds = zv.open("synchrotron.zarrvectors")
 
-# Read each level and compare vertex counts
-for level in range(4):
-    result = read_points("synchrotron.zarrvectors", level=level)
-    print(f"Level {level}: {result['vertex_count']:>8d} vertices")
+for index in ds.levels:
+    print(index, ds.level(index).read().vertex_count, ds.read(level=index).vertex_count)
 ```
 
-Reading a specific level with a bounding box:
+```text
+0 500000 500000
+1 8000 8000
+2 1000 1000
+3 125 125
+```
+
+`ds.level(i).read()` and `ds.read(level=i)` are the same read. A viewer
+usually wants a level by physical size rather than by index:
 
 ```python
-import numpy as np
-
-# Quick overview: coarsest level, full volume
-overview = read_points("synchrotron.zarrvectors", level=3)
-
-# Drill-down: finest level, region of interest
-detail = read_points(
-    "synchrotron.zarrvectors",
-    level=0,
-    bbox=(np.array([400., 400., 400.]),
-          np.array([600., 600., 600.])),
-)
+print(ds.resolution(scale=1600.0).index)
+print(ds.resolution(scale=200.0).index)
 ```
+
+```text
+3
+0
+```
+
+Drilling down to a region at full resolution works as expected:
+
+```python
+detail = ds.select(
+    level=0, bbox=((400.0, 400.0, 400.0), (600.0, 600.0, 600.0)),
+).read()
+print(detail, detail.vertex_count)
+```
+
+```text
+ReadResult(kind='point_cloud', vertices=533, attributes=['intensity', 'label']) 533
+```
+
+**Bounding-box queries against coarsened levels currently under-report** —
+badly, not marginally:
+
+```python
+print(ds.select(level=2, bbox=((400.0, 400.0, 400.0), (600.0, 600.0, 600.0))).read().vertex_count)
+print(ds.level(2).vertex_count)
+```
+
+```text
+0
+1000
+```
+
+For a region at low resolution, read the coarse level whole and filter in
+memory. Whole-level reads at every level are exact.
 
 ---
 
 ## Performance tips
 
 **Build levels from finest to coarsest.** `build_pyramid` does this
-automatically — each level coarsens from the previous one, not from
-level 0, so per-level work decreases as the pyramid grows.
+automatically — each level coarsens from the previous one, not from level 0,
+so per-level work decreases as the pyramid grows.
 
-**Skip cross-level emission when not needed.** If downstream consumers
-don't navigate between levels, pass `cross_level_depth=0` to skip the
-post-build pass.
+**Skip cross-level emission when you do not need it.** If downstream consumers
+never navigate between levels, `cross_level_storage="none"` saves the arrays
+and the post-build pass. `cross_level_depth=0` does not.
 
-**`method="per_object"` is the only core method, and it is OID-stable.**
-It is what you want when you need to track "the same object" across
-resolution levels (Neuroglancer drill-down, ID-preserving analytics),
-and it is the default. Alternative methods exist only if
-**`zarr-vectors-tools`** is installed to register them.
+**Size the pyramid to the bin grid, not the vertex count.** A level cannot
+have more vertices than it has occupied bins, so a factor that takes the bin
+grid below the number of cells you want on screen buys nothing but a smaller
+file.
 
-**Build pyramids on the same machine as the store.** For cloud stores
-(S3 / GCS), run `build_pyramid` from a VM in the same region as the
-bucket — pyramid building is I/O-bound on cloud, and same-region
-latency is ~10× lower than from a laptop.
+**`method="per_object"` is the only core method, and it is OID-stable.** It is
+what you want when you need to track the same object across resolution levels,
+and it is the default. Alternative methods appear in `zv.coarsen_methods()`
+only when a strategy package such as **`zarr-vectors-tools`** is installed.
+
+**Build pyramids near the store.** For cloud stores (S3 / GCS) run
+`build_pyramid` from a VM in the same region as the bucket — pyramid building
+is I/O-bound on cloud, and same-region latency is roughly an order of
+magnitude lower than from a laptop.
+
+---
+
+## See also
+
+- [Deferred reads and out-of-core access](lazy_loading.md) — choosing between
+  the levels this page builds, and reading them without loading everything.
+- {doc}`../../api/api` — `Dataset.build_pyramid`, `Level`, `Query`.
+- {doc}`../../api/building` — the builder surface used above.
+- [Pyramid construction](../../spec/multiscale/pyramid_construction.md) and
+  [Sparsity](../../spec/multiscale/sparsity.md) — the format side.

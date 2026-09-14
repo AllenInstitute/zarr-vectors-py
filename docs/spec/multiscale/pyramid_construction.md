@@ -21,7 +21,7 @@
 
 **Aggregation mode**
 : How per-vertex attributes are combined within a bin when producing a
-  metanode's attribute value. ZVF defines the token set
+  metanode's attribute value. Zarr Vectors defines the token set
   `mean`, `sum`, `mode`, `count`, `min`, `max` —
   see [`constants.VALID_AGGREGATIONS`](../../../zarr_vectors/constants.py).
   The vocabulary is normative; **core does not consume it** — see
@@ -267,7 +267,7 @@ Core implementation:
 
 ### Aggregation modes
 
-ZVF defines a canonical vocabulary of aggregation tokens
+Zarr Vectors defines a canonical vocabulary of aggregation tokens
 ([`zarr_vectors.constants.VALID_AGGREGATIONS`](../../../zarr_vectors/constants.py)):
 
 | Token | Description | Use case |

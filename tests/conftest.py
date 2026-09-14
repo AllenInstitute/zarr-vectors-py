@@ -20,7 +20,7 @@ import pytest
 
 @pytest.fixture
 def tmp_store_path(tmp_path: Path) -> Path:
-    """Return a fresh temporary directory for a ZVF store."""
+    """Return a fresh temporary directory for a Zarr Vectors store."""
     return tmp_path / "test_store.zarr"
 
 

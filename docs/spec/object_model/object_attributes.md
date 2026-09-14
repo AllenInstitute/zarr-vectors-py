@@ -33,7 +33,7 @@
 
 ## Introduction
 
-ZVF supports three levels of attribute granularity: per-vertex,
+Zarr Vectors supports three levels of attribute granularity: per-vertex,
 per-fragment, and per-object. Per-vertex attributes assign one value (or
 vector) to each vertex independently. Per-fragment attributes assign one
 value per fragment within a chunk (opt-in; useful for materializing
@@ -73,7 +73,7 @@ in `vertices[cx, cy, cz]`.
 #### Naming rules
 
 Attribute names must be valid Python identifiers (alphanumeric and
-underscores, not starting with a digit). Reserved names used by the ZVF
+underscores, not starting with a digit). Reserved names used by the Zarr Vectors
 spec:
 
 | Name | Type | Used by |

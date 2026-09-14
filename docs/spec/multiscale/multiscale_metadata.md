@@ -4,14 +4,14 @@
 
 **`multiscales` block**
 : An array of objects in root `.zattrs` that describes the resolution
-  pyramid of a ZVF store. The structure follows the
+  pyramid of a Zarr Vectors store. The structure follows the
   [OME-Zarr NGFF multiscales specification](https://ngff.openmicroscopy.org/),
-  extended with ZVF-specific keys (`bin_ratio`, `bin_shape`,
+  extended with Zarr Vectors-specific keys (`bin_ratio`, `bin_shape`,
   `object_sparsity`).
 
 **Coordinate transform**
 : An affine-like spatial transformation declared per resolution level in
-  the `multiscales` block. ZVF uses two transforms per level: a `scale`
+  the `multiscales` block. Zarr Vectors uses two transforms per level: a `scale`
   transform (encoding `bin_ratio`) and a `translation` transform (encoding
   the centroid offset of the coarsened bins).
 
@@ -23,15 +23,15 @@
   physical position.
 
 **Translation transform**
-: An additive offset per axis applied after the scale transform. For ZVF
+: An additive offset per axis applied after the scale transform. For Zarr Vectors
   metanodes (binned vertices), the translation encodes the shift from the
   bin origin to the bin centroid: `translation[d] = bin_shape[d] / 2`.
 
 **OME-Zarr compatibility**
 : The property that an OME-Zarr-aware tool (Neuroglancer, napari, OME-Zarr
-  validators) can read the `multiscales` block of a ZVF store and correctly
+  validators) can read the `multiscales` block of a Zarr Vectors store and correctly
   interpret the resolution pyramid, coordinate transforms, and axis
-  metadata, without needing to understand ZVF-specific keys.
+  metadata, without needing to understand Zarr Vectors-specific keys.
 
 ---
 
@@ -44,11 +44,11 @@ it encodes the spatial coordinate transforms that relate each coarser level
 back to physical space, following the OME-Zarr convention so that viewers
 can display multi-resolution data with correct physical alignment.
 
-By following OME-Zarr conventions, ZVF stores are discoverable by the
+By following OME-Zarr conventions, Zarr Vectors stores are discoverable by the
 existing ecosystem of OME-Zarr tools — not just `zarr-vectors-py`. A viewer
 that understands OME-Zarr multiscales (such as Neuroglancer with the
-`zarr_vectors` data source, or a napari plugin) can open any ZVF store and
-correctly interpret the resolution pyramid without ZVF-specific code.
+`zarr_vectors` data source, or a napari plugin) can open any Zarr Vectors store and
+correctly interpret the resolution pyramid without Zarr Vectors-specific code.
 
 ---
 
@@ -104,9 +104,9 @@ correctly interpret the resolution pyramid without ZVF-specific code.
 
 | Key | Required | Type | Description |
 |-----|----------|------|-------------|
-| `version` | Yes | `string` | OME-Zarr NGFF version. `"0.5"` for current ZVF stores. |
+| `version` | Yes | `string` | OME-Zarr NGFF version. `"0.5"` for current Zarr Vectors stores. |
 | `name` | No | `string` | Human-readable name for the dataset. |
-| `type` | Yes | `string` | Must be `"zarr_vectors_multiscale"` for ZVF stores. OME-Zarr tools ignore unknown `type` values. |
+| `type` | Yes | `string` | Must be `"zarr_vectors_multiscale"` for Zarr Vectors stores. OME-Zarr tools ignore unknown `type` values. |
 | `axes` | Yes | `[axis, …]` | D-length array of axis descriptors. See axis schema below. |
 | `datasets` | Yes | `[dataset, …]` | One entry per resolution level, in ascending level-index order. |
 | `coordinateTransformations` | No | `[transform, …]` | Global-level transforms applied to all levels (e.g. a global scale). |
@@ -131,17 +131,17 @@ axis in a 4-D store. `unit` follows the OME-Zarr unit vocabulary
 |-----|----------|------|-------------|
 | `path` | Yes | `string` | Path to the level group relative to the store root. |
 | `level` | Yes | `integer` | Level index. Must match the numeric suffix of `path`. |
-| `bin_ratio` | Yes (ZVF) | `[int, …]` | D-tuple. Ratio of this level's bin shape to `base_bin_shape`. |
-| `bin_shape` | Yes (ZVF) | `[float, …]` | D-tuple. Effective bin shape at this level. |
-| `object_sparsity` | No (ZVF) | `float` | Fraction of objects retained. Default `1.0`. |
+| `bin_ratio` | Yes (ZV) | `[int, …]` | D-tuple. Ratio of this level's bin shape to `base_bin_shape`. |
+| `bin_shape` | Yes (ZV) | `[float, …]` | D-tuple. Effective bin shape at this level. |
+| `object_sparsity` | No (ZV) | `float` | Fraction of objects retained. Default `1.0`. |
 | `coordinateTransformations` | Yes | `[transform, …]` | Per-level coordinate transforms. |
 
-Fields marked `(ZVF)` are ZVF extensions. OME-Zarr-aware tools will ignore
+Fields marked `(ZV)` are Zarr Vectors extensions. OME-Zarr-aware tools will ignore
 them; `zarr-vectors-py` requires them.
 
 ### Coordinate transforms
 
-ZVF uses a pair of transforms per level:
+Zarr Vectors uses a pair of transforms per level:
 
 ```
 [scale, translation]
@@ -180,17 +180,17 @@ physical position `[50.0×2 + 50.0, 100.0×2 + 50.0, 75.0×2 + 50.0]` =
 
 ### OME-Zarr compatibility notes
 
-ZVF `multiscales` blocks are valid OME-Zarr NGFF 0.5 multiscales. An
+Zarr Vectors `multiscales` blocks are valid OME-Zarr NGFF 0.5 multiscales. An
 OME-Zarr reader will:
 
 - Correctly read `axes`, `datasets[].path`, and `coordinateTransformations`.
 - Ignore `type: "zarr_vectors_multiscale"` (not a standard OME-Zarr type).
-- Ignore `bin_ratio`, `bin_shape`, `object_sparsity` (ZVF extensions).
+- Ignore `bin_ratio`, `bin_shape`, `object_sparsity` (Zarr Vectors extensions).
 - Attempt to open the `vertices/` array at each level as an image array
   (it will find a 5-D float32 array, which is valid but may not render
   sensibly in a volume viewer).
 
-This compatibility allows ZVF stores to be indexed and discovered by OME-Zarr
+This compatibility allows Zarr Vectors stores to be indexed and discovered by OME-Zarr
 metadata tools and registries, improving interoperability with the broader
 NGFF ecosystem.
 

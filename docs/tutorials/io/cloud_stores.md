@@ -1,9 +1,10 @@
 # Cloud stores
 
 ZV stores on Amazon S3, Google Cloud Storage, Azure Blob Storage, and
-public HTTP are accessed through the **backend layer** described in the
+public HTTP are reached through the **backend layer** described in the
 [store types spec page](../../spec/foundations/store_types.md). The
-read/write API is identical to local stores — only the URL changes.
+read/write API is identical to local stores — only the URL changes, and
+`zarr_vectors.api` is the surface either way.
 
 ---
 
@@ -24,25 +25,51 @@ to `fsspec` for any URL scheme it can't handle.
 
 ---
 
-## Backend resolution at a glance
+## The backend is resolved, never asked for
 
-When you pass a cloud URL to any `read_*` / `write_*` / `open_store` /
-`open_zv` call, the backend is chosen in this order:
+There is no `backend=` argument anywhere on the data API. Storage is a
+separate value, `zv.StorageOptions`, and the backend is *derived* from it:
 
-1. **Explicit `backend=` kwarg** — e.g. `backend="fsspec"` forces fsspec
-   even if obstore is installed.
-2. **`ZARR_VECTORS_BACKEND` environment variable** — e.g.
-   `export ZARR_VECTORS_BACKEND=obstore`.
-3. **URL-scheme auto-detect** — `s3://`, `gs://`, `gcs://`, `az://`,
-   `azure://`, `abfs://`, `http(s)://` → `obstore` if installed else
-   `fsspec`.
+1. **Explicit** — `zv.StorageOptions(backend="fsspec")` wins over everything.
+2. **`ZARR_VECTORS_BACKEND`** — e.g. `export ZARR_VECTORS_BACKEND=obstore`.
+3. **URL scheme** — when neither of the above is set,
+   `StorageOptions.resolve_backend` returns `None`, which is the signal to
+   let the store layer auto-detect from the scheme.
 
-If neither cloud backend is installed for a cloud URL, the call raises a
-`StoreError` with an install hint.
+```python
+import os
+import zarr_vectors as zv
 
-See [`zarr_vectors/core/backends/__init__.py`](../../../zarr_vectors/core/backends/__init__.py)
-for the canonical scheme table and
-[`tests/test_backends.py`](../../../tests/test_backends.py) for the
+print(zv.StorageOptions().resolve_backend("s3://bucket/scan.zarrvectors"))
+print(zv.StorageOptions(backend="fsspec").resolve_backend("s3://bucket/scan.zarrvectors"))
+
+os.environ["ZARR_VECTORS_BACKEND"] = "obstore"
+print(zv.StorageOptions().resolve_backend("s3://bucket/scan.zarrvectors"))
+print(zv.StorageOptions(backend="fsspec").resolve_backend("s3://bucket/scan.zarrvectors"))
+```
+
+```text
+None
+fsspec
+obstore
+fsspec
+```
+
+`None` is not "no backend": it is "nothing was forced, use the scheme".
+The scheme table it falls through to:
+
+| URL scheme | Backend |
+|------------|---------|
+| none, `file` | `local` |
+| `s3`, `gs`, `gcs`, `az`, `azure`, `abfs`, `http`, `https` | `obstore` if installed, else `fsspec` |
+| anything else (`sftp`, …) | `local` — force a backend explicitly if that is wrong |
+
+If a cloud scheme is given and neither cloud backend is installed, the
+call raises a `StoreError` naming the install command. Note the last row:
+`sftp://` is *not* in the cloud table, so reaching an SFTP host means
+saying `StorageOptions(backend="fsspec")` rather than relying on the scheme.
+
+See [`tests/test_backends.py`](../../../tests/test_backends.py) for the
 test matrix.
 
 ---
@@ -51,18 +78,15 @@ test matrix.
 
 ### Anonymous (public) read access
 
-Many open neuroscience datasets on S3 allow anonymous access. The
-backend layer handles it transparently — there's no `anon=True` kwarg
-to pass:
+Many open neuroscience datasets on S3 allow anonymous access. The backend
+layer handles it transparently — there is no `anon=True` argument to pass:
 
 ```python
-from zarr_vectors.types.points import read_points
+import zarr_vectors as zv
 
-result = read_points(
-    "s3://open-neuro-data/datasets/synchrotron.zarrvectors",
-    level=2,                                # coarse level — fast
-)
-print(result["vertex_count"])
+ds = zv.open("s3://open-neuro-data/datasets/synchrotron.zarrvectors")
+print(ds.levels)
+print(ds.level(2).vertex_count)          # coarse level — metadata only
 ```
 
 Authentication is opt-in: if the bucket allows anonymous reads, the
@@ -70,96 +94,179 @@ default backend config will use it.
 
 ### Where credentials go
 
-**The typed `read_*` / `write_*` functions take only `backend=` — a
-backend *name*.** They have no `storage_options` parameter and no
-`**backend_kwargs`, so passing `skip_signature=`, `aws_access_key_id=`,
-`region=`, or `token=` to `read_points`/`write_points`/`read_polylines`
-raises `TypeError`.
+**Credentials are backend options, and backend options live in
+`StorageOptions.options`.** That is the only channel: the data API takes
+`storage=`, and `storage` carries both the backend name and its options,
+so nothing on `open` / `create` / `add_points` / `read` has to grow a
+storage argument.
 
-Backend options belong to the store-opening functions, which do accept
-them:
+| Call | Storage argument |
+|------|------------------|
+| `zv.open(url, mode=..., storage=...)` | `storage=zv.StorageOptions(...)` |
+| `zv.create(url, schema=..., storage=...)` | `storage=zv.StorageOptions(...)` |
+| `zv.open_or_create(url, schema=..., storage=...)` | `storage=zv.StorageOptions(...)` |
+| `building.open_store(url, mode, ...)` | `backend=`, `storage_options=`, `**backend_kwargs` |
 
-| Function | Accepts |
-|----------|---------|
-| `open_store(path, mode=...)` | `backend=`, `storage_options=`, `**backend_kwargs` |
-| `open_zv(path)` | `backend=`, `storage_options=`, `**backend_kwargs` |
-| `ZVStore.set_backend(name)` | `storage_options=`, `**backend_kwargs` |
-| `read_points` / `write_points` / `read_polylines` / `read_graph` / `read_mesh` | `backend=` only |
+The `building` row is the store-construction surface, which is
+deliberately more physical; everything else goes through `StorageOptions`.
 
 Ambient credentials work without configuration — `obstore` and `fsspec`
 both read `~/.aws/credentials`, environment variables, and IAM roles — so
-for the typed readers this is the supported path:
+this is the supported path and the one to prefer:
 
 ```python
-result = read_points("s3://my-bucket/scan.zarrvectors")
+ds = zv.open("s3://my-bucket/scan.zarrvectors")
 ```
 
-To pass credentials explicitly, open the store yourself and supply
-`storage_options` (loose `**backend_kwargs` are merged into it):
+To pass credentials explicitly, put them in `options`:
 
 ```python
 import os
-from zarr_vectors.core.store import open_store
+import zarr_vectors as zv
 
-root = open_store(
+ds = zv.open(
     "s3://my-bucket/scan.zarrvectors",
     mode="r",
-    backend="obstore",
-    storage_options={
-        "aws_access_key_id":     os.environ["AWS_ACCESS_KEY_ID"],
-        "aws_secret_access_key": os.environ["AWS_SECRET_ACCESS_KEY"],
-        "region":                "us-east-1",
-    },
+    storage=zv.StorageOptions(
+        backend="obstore",
+        options={
+            "aws_access_key_id":     os.environ["AWS_ACCESS_KEY_ID"],
+            "aws_secret_access_key": os.environ["AWS_SECRET_ACCESS_KEY"],
+            "region":                "us-east-1",
+        },
+    ),
 )
 ```
 
-The same works for the lazy handle, which can also swap credentials on an
-already-open store:
+Option names match the *active* backend (`obstore` uses `aws_*` /
+`skip_signature`; `fsspec`/`s3fs` uses `key` / `secret` / `anon`), so the
+same intent is spelled two ways:
 
 ```python
-from zarr_vectors.lazy import open_zv
+anon_obstore = zv.StorageOptions(backend="obstore", options={"skip_signature": True})
+anon_fsspec  = zv.StorageOptions(backend="fsspec",  options={"anon": True})
 
-store = open_zv(
-    "s3://my-bucket/scan.zarrvectors",
-    backend="obstore",
-    storage_options={"skip_signature": True},   # force anonymous
-)
-
-store.set_backend("fsspec", storage_options={"anon": True})
+ds = zv.open("s3://open-neuro-data/scan.zarrvectors", storage=anon_obstore)
 ```
 
-Option names match the active backend (`obstore` uses `aws_*` /
-`skip_signature`; `fsspec`/`s3fs` uses `key` / `secret` / `anon`). Prefer
-ambient credentials when possible.
+There is no "swap the credentials on an open handle" call. A `Dataset`
+holds the `StorageOptions` it was opened with; to change them, open the
+URL again with different ones. That is one metadata request, and it makes
+the credentials a property of the handle rather than a mutable global.
 
 ### Writing to S3
 
 ```python
 import numpy as np
-from zarr_vectors.types.points import write_points
+import zarr_vectors as zv
 
 rng = np.random.default_rng(0)
 positions = rng.uniform(0, 1000, (100_000, 3)).astype(np.float32)
 
-write_points(
-    "s3://my-bucket/datasets/scan.zarrvectors",
-    positions,
-    chunk_shape=(500., 500., 500.),       # larger chunks = fewer S3 objects
-    bin_shape=(100., 100., 100.),
-    backend="obstore",                    # a backend *name* — no options here
+schema = zv.Schema(
+    bounds=((0.0, 0.0, 0.0), (1000.0, 1000.0, 1000.0)),
+    kind="point_cloud",
+    layout=zv.Layout(cells=2),      # 2 cells/axis = 500 µm chunks = fewer S3 objects
 )
+
+ds = zv.create(
+    "s3://my-bucket/datasets/scan.zarrvectors",
+    schema=schema,
+    storage=zv.StorageOptions(backend="obstore"),
+)
+ds.add_points(positions)
 ```
 
-`write_points` takes `backend=` only. Region and credentials come from
-the ambient environment (`AWS_REGION`, `~/.aws/config`, IAM role); there
-is no `region=` argument on the typed writers.
+Region and credentials come from the ambient environment (`AWS_REGION`,
+`~/.aws/config`, IAM role) unless you put them in `StorageOptions.options`.
 
-**Chunk size guidance for S3.** Each ZV spatial chunk becomes one S3
-object. S3 charges per PUT (write) and GET (read) request. To minimise
-cost and request count, use `chunk_shape` values that produce chunks of
-at least 100 KB compressed. For typical synchrotron point clouds at
-~100 000 vertices per chunk (float32, Blosc-compressed), this is
-roughly 200–500 µm per axis.
+### Chunk size guidance for S3
+
+Each ZV spatial chunk becomes one S3 object per array family, and S3
+charges per PUT and per GET. `zv.Layout` is where that trade-off is
+expressed — in cells per axis, not in micrometres:
+
+```python
+schema = zv.Schema(bounds=((0.0, 0.0, 0.0), (1000.0, 1000.0, 1000.0)))
+print(zv.Layout(cells=5).resolve(schema).chunk_shape)
+print(zv.Layout(cells=2).resolve(schema).chunk_shape)
+print(zv.Layout(cell_size=(500.0, 500.0, 500.0)).resolve(schema).chunk_shape)
+```
+
+```text
+(200.0, 200.0, 200.0)
+(500.0, 500.0, 500.0)
+(500.0, 500.0, 500.0)
+```
+
+Aim for chunks of at least 100 KB compressed. For typical synchrotron
+point clouds at ~100 000 vertices per chunk (float32, Blosc-compressed)
+that is roughly 200–500 µm per axis, so `cells=2`…`cells=5` over a
+1 000 µm volume. `Layout.cell_size` is the escape hatch when the grid is
+fixed from outside — a pipeline whose chunks must line up with an image
+volume, say.
+
+`Layout.compression` defaults to `"auto"`, which means "whatever
+`$ZARR_VECTORS_COMPRESSION` says, and no compressor if it says nothing".
+
+### Packing is already on for object stores
+
+`Layout.pack` decides whether many cells travel as one storage object.
+Its default is not a constant — it is resolved against the kind of store
+being written, because one object per cell is cheap on a local filesystem
+and expensive on a bucket:
+
+```python
+schema = zv.Schema(
+    bounds=((0.0, 0.0, 0.0), (1000.0, 1000.0, 1000.0)),
+    layout=zv.Layout(cells=8),
+)
+print(schema.layout.resolve(schema, store_kind="local").shard_shape)
+print(schema.layout.resolve(schema, store_kind="object").shard_shape)
+```
+
+```text
+None
+(4, 4, 4)
+```
+
+A dataset whose URL carries a cloud scheme *is* an object store as far as
+this decision goes, so writing to `s3://…` packs without being asked and
+writing to a local path does not. Forcing it either way is
+`zv.Layout(..., pack=True)` / `pack=False`.
+
+Through the `Dataset` writers the automatic shard always works out to at
+most four cells per axis, whatever you passed at create time. The shard
+shape is derived from the store's *own declared* schema, and a store does
+not record the `expected=zv.SizeHints(...)` hint — so the size-driven path
+(`Layout.target_object_bytes`) never engages on a write into an existing
+store, and the four-cell fallback is what you get:
+
+```python
+schema = zv.Schema(
+    bounds=((0.0, 0.0, 0.0), (1000.0, 1000.0, 1000.0)),
+    expected=zv.SizeHints(n_vertices=100_000),
+    layout=zv.Layout(cells=8),
+)
+ds = zv.create("packed.zarrvectors", schema=schema)
+ds.add_points(positions, layout=zv.Layout(cells=8, pack=True))
+
+from zarr_vectors.building import get_shard_info
+info = get_shard_info("packed.zarrvectors")
+print([(a["name"], a["grid_shape"], a["shard_shape"]) for a in info["arrays"]])
+```
+
+```text
+[('0/vertices', [8, 8, 8], [4, 4, 4]), ('0/vertex_fragments', [8, 8, 8], [4, 4, 4])]
+```
+
+That is a safe middle, not a tuned answer: if you want a different one,
+write the store and then choose the shard shape explicitly with
+`building.reshard` (see
+[Reducing object count with sharding](#reducing-object-count-with-sharding)
+below). The point is that the *hand-tuning step is no longer mandatory* —
+an unadorned `zv.create(...)` + `add_points(...)` against a bucket already
+produces a packed store.
 
 ### S3 bucket configuration for Neuroglancer serving
 
@@ -191,32 +298,33 @@ aws s3api put-bucket-cors \
 ## Google Cloud Storage
 
 ```python
-from zarr_vectors.types.polylines import read_polylines, write_polylines
+import zarr_vectors as zv
 
 # Read — uses Application Default Credentials
-result = read_polylines("gs://my-bucket/tracts.zarrvectors", level=1)
-print(result["polyline_count"])
+ds = zv.open("gs://my-bucket/tracts.zarrvectors")
+print(ds.level(1).objects.count)
 
-# Write
-write_polylines(
+# Write — `streamlines` is a list of (N_k, 3) arrays, one per tract
+tracts = zv.create(
     "gs://my-bucket/tracts.zarrvectors",
-    streamlines,
-    chunk_shape=(100., 100., 100.),
-    bin_shape=(25., 25., 25.),
-    geometry_type="streamline",
+    schema=zv.Schema(
+        bounds=((0.0, 0.0, 0.0), (1000.0, 1000.0, 1000.0)),
+        kind="polyline",
+        layout=zv.Layout(cells=10),
+    ),
 )
+tracts.add_polylines(streamlines, streamlines=True)
 ```
 
-To pass GCS credentials explicitly, open the store rather than calling
-the typed reader — `read_polylines` accepts `backend=` but no `token=`:
+To pass GCS credentials explicitly, put the token in `StorageOptions`:
 
 ```python
-from zarr_vectors.lazy import open_zv
-
-store = open_zv(
+ds = zv.open(
     "gs://my-bucket/tracts.zarrvectors",
-    backend="fsspec",                       # gcsfs route
-    storage_options={"token": "/path/to/service-account.json"},
+    storage=zv.StorageOptions(
+        backend="fsspec",                                   # gcsfs route
+        options={"token": "/path/to/service-account.json"},
+    ),
 )
 ```
 
@@ -231,9 +339,9 @@ gsutil cors set cors.json gs://my-bucket
 ## Azure Blob Storage
 
 ```python
-from zarr_vectors.types.points import read_points
+import zarr_vectors as zv
 
-result = read_points("az://account/container/scan.zarrvectors")
+ds = zv.open("az://account/container/scan.zarrvectors")
 # or:   "abfs://container@account.dfs.core.windows.net/scan.zarrvectors"
 ```
 
@@ -244,27 +352,44 @@ Ambient credentials follow the standard `DefaultAzureCredential` chain
 
 ## Building a pyramid on a remote store
 
-The pyramid builder takes a path or URL the same way the writers do:
+Pyramids are built through the dataset handle, so the URL and the
+credentials are already settled by the time you ask:
 
 ```python
-from zarr_vectors.multiresolution.coarsen import build_pyramid
+ds = zv.open("s3://my-bucket/scan.zarrvectors", mode="r+")
 
-build_pyramid(
-    "s3://my-bucket/scan.zarrvectors",
+print(zv.coarsen_methods())               # what this install can coarsen with
+
+report = ds.build_pyramid(
     factors=[(2.0, 1.0), (2.0, 1.0)],     # coarsen 2× per level, no sparsity
+    chunk_scale_factors=[2, 2],           # and grow the chunk with the level
+    method="per_object",
     cross_level_depth=1,                  # ±1 cross-level edges per pair
     cross_level_storage="explicit",       # write both +1 and -1
 )
+print(report["levels_created"])
 ```
+
+```text
+('per_object',)
+2
+```
+
+`method` selects the coarsener; `zv.coarsen_methods()` lists the ones this
+installation has, including any a strategy package registered on import.
+Pass a strategy's own knobs as `options={...}`.
+
+Pass `chunk_scale_factors=` alongside `factors=` — without it every level
+inherits the root chunk shape, which on a bucket means the coarse levels
+have as many objects as the fine one, for a fraction of the data.
 
 For very large datasets on cloud, the pyramid build is I/O bound. Run
 on a cloud VM in the same region as the bucket — building a pyramid
 from within AWS `us-east-1` against a bucket in the same region is
 ~10× faster than from a laptop.
 
-See [`docs/tutorials/multiscale/building_pyramids.md`](../multiscale/building_pyramids.md)
-for the full pyramid API, and [`examples/07_multiscale_links.ipynb`](../../../examples/07_multiscale_links.ipynb)
-for the cross-level link layout that `build_pyramid` produces.
+See [Building pyramids](../multiscale/building_pyramids.md) for the full
+pyramid API and for the cross-level link layout that `build_pyramid` produces.
 
 ---
 
@@ -274,65 +399,104 @@ On stores with many resolution levels and attribute arrays, opening
 the store requires one metadata request per Zarr group and array. On
 S3 with ~50 ms per request, this adds noticeable latency.
 
-Consolidated metadata packs all `.zattrs` and `zarr.json` files into a
-single `.zmetadata` key, reducing store-open latency to one request:
+A ZV store is Zarr v3, so there are **no `.zattrs` files anywhere** —
+that is the v2 spelling. Every group and array carries a `zarr.json`, and
+consolidating folds all of the descendant ones into the root `zarr.json`
+under a `consolidated_metadata` key. There is no separate `.zmetadata`
+object either; that too is v2.
 
 ```python
-import zarr
-from zarr_vectors.core.store import open_store
+import warnings
 
-root = open_store("s3://my-bucket/scan.zarrvectors", mode="r+")
-zarr.consolidate_metadata(root.zarr_group.store)
+import zarr
+import zarr_vectors as zv
+
+ds = zv.open("s3://my-bucket/scan.zarrvectors", mode="r+")
+with warnings.catch_warnings():                  # v3 consolidation warns; see below
+    warnings.simplefilter("ignore")
+    zarr.consolidate_metadata(ds.store.zarr_group.store)
 ```
 
-After consolidation, subsequent opens are dramatically faster.
-Regenerate consolidated metadata after any structural change (adding
-a resolution level, writing new attributes).
+Two things to know before reaching for this:
+
+- `zarr` warns that consolidated metadata is not part of the Zarr v3
+  specification and may not be understood by other implementations. It is
+  a performance option, not a portable one. `zarr-vectors` itself reads it
+  when it is there — a store opened after consolidation resolves every
+  level's metadata from the one root document.
+- The store fields survive it: `attributes.zarr_vectors` and
+  `attributes.multiscales` are still on the root `zarr.json` afterwards,
+  with `consolidated_metadata` added beside them.
+
+Regenerate it after any structural change (adding a resolution level,
+writing new attributes) — a stale consolidated document describes a store
+that no longer exists.
+
+`ds.store` is the documented escape hatch on `Dataset`, and
+`.zarr_group` is *not* among the promised `Group` methods, so this snippet
+reaches past the contract. `zarr-vectors` has no supported wrapper for
+consolidation; that is a gap to report rather than a reason to make a
+habit of `.zarr_group`.
 
 ---
 
-## Reading from cloud with the lazy API
+## Reading from cloud with the data API
+
+The API is the same one the [quickstart](../../getting_started/quickstart.md)
+uses. What is worth knowing on a bucket is *which calls cost requests*:
 
 ```python
-import numpy as np
-from zarr_vectors.lazy import open_zv
+import zarr_vectors as zv
 
-store = open_zv("s3://open-neuro/scan.zarrvectors")
+ds = zv.open("s3://open-neuro/scan.zarrvectors")
 
-print(store.levels)                          # metadata only — no chunk I/O
-print(store[2].vertex_count)                 # one metadata request
+print(ds.levels)                     # metadata only — no chunk I/O
+print(ds.level(2).vertex_count)      # metadata only — the count is recorded
 
 # Coarse overview — a handful of chunk requests
-coarse = store[store.levels[-1]].vertices.compute()
+coarse = ds.read(level=ds.levels[-1])
 
-# Detail in a small region — N chunk requests
-from zarr_vectors.types.points import read_points
-detail = read_points(
-    "s3://open-neuro/scan.zarrvectors",
-    bbox=(np.array([500., 500., 500.]),
-          np.array([700., 700., 700.])),
-)
+# Detail in a small region
+q = ds.select(bbox=((500.0, 500.0, 500.0), (700.0, 700.0, 700.0)))
+print(q.explain())                   # names the reader and its arguments
+print(len(q.cells()))                # how many grid cells it will touch — reads nothing
+detail = q.read()                    # only now does anything leave the machine
 ```
 
-`open_zv` accepts the same `backend=` / `**backend_kwargs` as
-`open_store`.
+`Level.vertex_count` and `Level.objects.count` answer from the level's
+recorded metadata, so counting a remote store is free. `Query.explain()`
+and `Query.cells()` are the two calls that let you predict a query's cost
+before paying it: the cell count is the number of stored objects the read
+will fetch *per array family it needs*, so a bbox that straddles a chunk
+boundary on every axis costs eight, not one.
+
+`ds.resolution(scale=...)` picks a level by physical size rather than by
+index, which is usually what a viewer wants:
+
+```python
+print(ds.resolution(scale=400.0).index)
+```
 
 ---
 
 ## Forcing a specific backend
 
-Pass `backend="obstore"` or `backend="fsspec"` to override
-auto-detection:
-
 ```python
 # Force fsspec even though obstore is installed
-read_points("s3://my-bucket/scan.zarrvectors", backend="fsspec")
+ds = zv.open(
+    "s3://my-bucket/scan.zarrvectors",
+    storage=zv.StorageOptions(backend="fsspec"),
+)
 
-# Use fsspec for a non-cloud URL (e.g. SFTP)
-read_points("sftp://host/path/scan.zarrvectors", backend="fsspec")
+# Use fsspec for a scheme the auto-detect table does not cover
+ds = zv.open(
+    "sftp://host/path/scan.zarrvectors",
+    storage=zv.StorageOptions(backend="fsspec"),
+)
 ```
 
-Or set it globally for the process:
+Or set it globally for the process, which every `StorageOptions` with no
+explicit `backend` will then pick up:
 
 ```bash
 export ZARR_VECTORS_BACKEND=fsspec
@@ -342,60 +506,125 @@ export ZARR_VECTORS_BACKEND=fsspec
 
 ## Estimating cloud storage cost
 
-A quick estimate for an S3-hosted point cloud store:
+Request cost is driven by the number of stored objects, and
+`zarr_vectors.building` can count them without decoding anything:
 
 ```python
-import zarr
-from zarr_vectors.core.store import open_store
+from zarr_vectors.building import (
+    array_is_sharded,
+    get_resolution_level,
+    list_resolution_levels,
+    open_store,
+    per_chunk_array_paths,
+)
 
 root = open_store("s3://my-bucket/scan.zarrvectors", mode="r")
-zg   = root.zarr_group
 
-# Walk every array and sum stored bytes / chunk counts.
-total_bytes  = sum(a.nbytes_stored        for _, a in zg.arrays(recurse=True))
-total_chunks = sum(a.nchunks_initialized  for _, a in zg.arrays(recurse=True))
+objects = 0
+for index in list_resolution_levels(root):
+    level = get_resolution_level(root, index)
+    for path in per_chunk_array_paths(level):
+        cells = len(level.list_chunks(path))
+        packed = array_is_sharded(level, path)
+        objects += cells
+        print(f"{index}/{path:<30} {cells:>6} cells{'  (sharded)' if packed else ''}")
 
-print(f"Total compressed size: {total_bytes / 1e9:.2f} GB")
-print(f"Total S3 objects:      {total_chunks:,}")
-print(f"Monthly S3 storage:    ~${total_bytes / 1e9 * 0.023:.2f}"
-      f"  (us-east-1 standard)")
-print(f"Cost per 1M GETs:      ~${total_chunks / 1e6 * 0.40:.4f}")
+print(f"Stored objects:    {objects:,}")
+print(f"Cost per 1M GETs:  ~${objects / 1e6 * 0.40:.4f}")
 ```
 
-This counts every chunk across all resolution levels and every array
-family — including the `links/<delta>/<offsets>/` and
-`link_attributes/<name>/<delta>/<offsets>/` arrays. Connectivity is a
-single family: intra-chunk links are the all-zero offsets segment
-(`links/0/0.0.0/`), cross-chunk links are the non-zero ones
-(`links/0/0.0.+1/`), and each `<offsets>` segment is its own array, so a
-store with many distinct offset directions has proportionally more
-objects.
+Run against a small local two-level point cloud, that prints:
+
+```text
+0/links/+1/0.0.0                    125 cells
+0/vertex_attributes/intensity       125 cells
+0/vertex_fragments                  125 cells
+0/vertices                          125 cells
+1/links/-1/+1.+1.+1                   8 cells
+1/links/-1/+1.+1.0                   12 cells
+1/links/-1/+1.0.+1                   12 cells
+1/links/-1/+1.0.0                    18 cells
+1/links/-1/0.+1.+1                   12 cells
+1/links/-1/0.+1.0                    18 cells
+1/links/-1/0.0.+1                    18 cells
+1/links/-1/0.0.0                     27 cells
+1/vertex_fragments                   27 cells
+1/vertices                           27 cells
+Stored objects:    679
+Cost per 1M GETs:  ~$0.0003
+```
+
+`per_chunk_array_paths` walks a level recursively, so the listing includes
+every array family: `links/<delta>/<offsets>/` and
+`link_attributes/<name>/<delta>/<offsets>/` as well as `vertices/`. That is
+the shape of the cost. Connectivity is a *single* family — intra-chunk
+links are the all-zero offsets segment (`links/0/0.0.0/`), cross-chunk
+links are the non-zero ones (`links/0/0.0.+1/`), and each `<offsets>`
+segment is its own array — so a store with many distinct offset directions
+has proportionally more objects. Above, one pyramid level's eight
+cross-level directions cost more objects than its vertices do.
+
+Note what the cell count is *not*: when an array is sharded, many cells
+travel in one storage object, so `array_is_sharded` is the column that
+tells you whether the number is an upper bound. Stored *bytes* are best
+asked of the bucket, which knows the compressed truth:
+
+```bash
+aws s3 ls --recursive --summarize s3://my-bucket/scan.zarrvectors
+```
 
 ---
 
 ## Reducing object count with sharding
 
 Each ZV spatial chunk is one cloud object, and per-request cost and
-latency scale with object count. `shard_store` repacks every per-chunk
-array with Zarr v3's standard `sharding_indexed` codec, so many inner
-chunks travel as one object:
+latency scale with object count. A store written to a bucket is packed
+already (see [above](#packing-is-already-on-for-object-stores)); a store
+written locally and then uploaded is not, and `shard_store` repacks it
+after the fact with Zarr v3's standard `sharding_indexed` codec:
 
 ```python
-from zarr_vectors.sharding import shard_store
+from zarr_vectors.building import get_shard_info, reshard, shard_store, unshard_store
 
 stats = shard_store(
     "s3://my-bucket/scan.zarrvectors",
-    shard_shape=8,        # outer chunk = 8 inner chunks per axis (~512 in 3-D)
+    shard_shape=4,        # outer chunk = 4 inner chunks per axis (64 in 3-D)
 )
-print(stats["arrays_sharded"], stats["chunks_packed"], stats["shard_shape"])
+print(stats)
+
+info = get_shard_info("s3://my-bucket/scan.zarrvectors")
+print(info["sharded"], info["shard_count"])
+print(info["arrays"][0])
+```
+
+```text
+{'arrays_sharded': 14, 'chunks_packed': 679, 'shard_shape': [4, 4, 4]}
+True 42
+{'name': '0/vertex_fragments', 'grid_shape': [5, 5, 5], 'shard_shape': [4, 4, 4], 'shard_count': 8}
 ```
 
 `shard_shape` is expressed in *inner-chunk* units — one inner chunk is
-one ZVF spatial chunk. An `int` broadcasts to every axis; a tuple sets
+one Zarr Vectors spatial chunk. An `int` broadcasts to every axis; a tuple sets
 each axis explicitly. Pass `arrays=[...]` to convert only selected
 logical arrays. The result is plain Zarr v3, readable by any conformant
 implementation; no ZV-specific metadata is involved. See the
 [sharding spec](../../spec/chunking/sharding.md).
+
+Two companions, both in `building`, make it reversible:
+
+```python
+reshard("s3://my-bucket/scan.zarrvectors", 2)   # change the shard shape in place
+unshard_store("s3://my-bucket/scan.zarrvectors")  # back to one object per cell
+```
+
+```text
+{'action': 'shard', 'arrays_sharded': 14, 'chunks_packed': 679, 'shard_shape': [2, 2, 2]}
+{'arrays_unsharded': 14, 'chunks_extracted': 679}
+```
+
+`reshard(path, None)` also unshards, reporting
+`{'action': 'unshard', ...}`; `get_shard_info` on an unsharded store
+reports `{'sharded': False, 'arrays': [], 'shard_count': 0}`.
 
 ---
 
@@ -403,17 +632,48 @@ implementation; no ZV-specific metadata is involved. See the
 
 When many workers write links in parallel — the common shape of a
 distributed cloud ingest — they must not race on the family-wide
-bookkeeping. The pattern is worker-writes, coordinator-finalizes,
-coordinator-shards, **in that order**:
+bookkeeping. The pattern is coordinator-creates, worker-writes,
+coordinator-finalizes, coordinator-shards, **in that order**. Every name
+below is in `zarr_vectors.building`:
 
 ```python
-# --- on each worker: write only the cells this worker owns ---
-from zarr_vectors.core.arrays import write_link_cells, write_link_attribute_cells
+from zarr_vectors.building import (
+    create_links_array,
+    create_store,
+    get_resolution_level,
+    write_link_attribute_cells,
+    write_link_cells,
+)
 
-partition = write_link_cells(level_group, batch, sid_ndim, delta=0)
+# --- on the coordinator, before any worker starts ---
+root = create_store(
+    "s3://my-bucket/edges.zarrvectors",
+    bounds=([0.0, 0.0, 0.0], [1000.0, 1000.0, 1000.0]),
+    chunk_shape=(100.0, 100.0, 100.0),
+    geometry_types=["graph"],
+    ndim=3,
+)
+level_group = get_resolution_level(root, 0)
+create_links_array(level_group, link_width=2, delta=0, sid_ndim=3)
+```
+
+Pre-creating the family is what makes the workers agree on `directed` /
+`store` / `sid_ndim` instead of racing to create it with different answers.
+
+```python
+import numpy as np
+
+# --- on each worker: write only the cells this worker owns ---
+# Each record is a list of (chunk_coords, vertex_index) endpoints.
+batch = [
+    [((0, 0, 0), 1), ((1, 0, 0), 2)],
+    [((0, 0, 0), 3), ((1, 0, 0), 4)],
+]
+partition = write_link_cells(level_group, batch, 3, delta=0)   # 3 = sid_ndim
 
 # Per-link attributes follow the same partition, so they land beside
-# the records they describe.
+# the records they describe.  One row per record, in input order.
+weights = np.array([0.5, 0.25], dtype="float32")
 write_link_attribute_cells(
     level_group, "weight", weights, partition=partition, delta=0,
 )
@@ -432,24 +692,23 @@ writes plus one finalize are equivalent to a single whole-family
 
 It is safe only while workers own **disjoint source chunks** — the
 per-cell update is read-modify-write, so two workers appending to one
-cell lose rows. A coordinator may pre-create the family with
-`create_links_array` so workers agree on `directed` / `store` /
-`sid_ndim` and don't race to create it.
+cell lose rows.
 
 ```python
 # --- on the coordinator, once every worker has finished ---
-from zarr_vectors.core.arrays import finalize_links
-from zarr_vectors.sharding import shard_store
+from zarr_vectors.building import finalize_links, shard_store
 
-part = finalize_links(level_group, delta=0)      # 1. reconcile counts
-shard_store("s3://my-bucket/scan.zarrvectors")   # 2. then shard
+part = finalize_links(level_group, delta=0)           # 1. reconcile counts
+print(part.num_links, part.num_physical_records)
+shard_store("s3://my-bucket/edges.zarrvectors")       # 2. then shard
 ```
 
 Order matters: `finalize_links` rescans every offsets array and every
 cell to recompute the counts, so it must run after all cells are on disk
 and **before** sharding. If the counts are left unreconciled, L3
 validation reports
-`links[delta=0] num_physical_records=<N> != <M> rows on disk`.
+`links[delta=0] num_physical_records=<N> != <M> rows on disk` — see
+[Validation and repair](validation_and_repair.md#l3--consistency).
 
 ### How link rows and attribute rows stay aligned
 
@@ -468,5 +727,3 @@ direction. The order is deterministic, just not the one you might guess.
 Under `store="duplicate"` a logical record is filed in several cells and
 so comes back once per copy; dedupe, or query one location with
 `read_links_for_tuple`.
-
-

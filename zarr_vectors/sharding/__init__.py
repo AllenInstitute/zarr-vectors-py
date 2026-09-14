@@ -1,6 +1,6 @@
 """Native-codec sharding for ZV stores.
 
-Sharding packs many ZVF per-chunk byte blobs into a single storage
+Sharding packs many Zarr Vectors per-chunk byte blobs into a single storage
 object via Zarr v3's built-in ``sharding_indexed`` codec.  The result
 is a fully spec-compliant Zarr store readable by any standards-compliant
 Zarr v3 implementation.

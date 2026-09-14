@@ -1,11 +1,11 @@
 # Fragment-index arrays
 
-```{admonition} Format change in ZVF 0.6.0
+```{admonition} Format change in Zarr Vectors 0.6.0
 :class: note
 
-Prior to ZVF 0.6.0 the per-chunk spatial index was a fixed-shape
+Prior to Zarr Vectors 0.6.0 the per-chunk spatial index was a fixed-shape
 `int64` array named `vertex_group_offsets/<i.j.k>` storing one
-`(offset, count)` row per bin. ZVF 0.6.0 replaced it with the
+`(offset, count)` row per bin. Zarr Vectors 0.6.0 replaced it with the
 binary **fragment-index** format described on this page. The
 semantic role is the same — locating vertices within a chunk —
 but the new format adds two capabilities: *explicit* (non-contiguous)
@@ -40,6 +40,12 @@ coarsened pyramid levels.
 : The binary blob inside one chunk that describes the F fragments
   in that chunk. Encoded in the v1 layout described below
   (magic `'ZVFG'` = `0x5A56_4647`).
+
+  The four magic bytes spell an earlier abbreviation of the format's
+  name. They are a fixed on-disk constant — every store ever written
+  carries them — so they are **not** renamed with the prose. Read them
+  as an opaque identifier, not as a name for the format, which is
+  *Zarr Vectors*.
 
 **Range bitmap**
 : A bitmap of length F (padded to bytes) inside the fragment index,
@@ -80,11 +86,11 @@ because the index no longer relies on a fixed-shape int64 table.
 ## Introduction
 
 The fragment index is the per-chunk spatial acceleration structure
-of ZVF. Without it, a bounding-box query would have to load every
+of Zarr Vectors. Without it, a bounding-box query would have to load every
 chunk's full vertex payload and filter client-side. With it, readers
 load only the byte ranges that overlap the query.
 
-The format was rewritten in ZVF 0.6.0 for two reasons:
+The format was rewritten in Zarr Vectors 0.6.0 for two reasons:
 
 1. **Shared metavertices at coarsened levels.** When the pyramid
    builder coarsens N objects whose paths share a metavertex, the
@@ -439,7 +445,7 @@ slice. An explicit fragment's row list materialises via
 Each chunk holds one fragment-index blob in the v1 byte layout
 described above. The metadata `encoding: "fragment_index_v1"` tag
 identifies the format and is the discriminator that future versions
-of ZVF will rev when the binary layout changes.
+of Zarr Vectors will rev when the binary layout changes.
 
 The blob is intentionally not compressed by default. It is already
 binary-packed (header + bitmap + dense int64 range table + uint32/int64

@@ -85,7 +85,7 @@ recognised by `LocalNeuroglancer` and the `nglocal` shell:
 # Upstream ngtools — loads an OME-Zarr image volume
 [1] load zarr:///path/to/image.zarr
 
-# zv-ngtools — loads a ZVF vector store
+# zv-ngtools — loads a Zarr Vectors store
 [1] load zarr_vectors:///path/to/tracts.zarrvectors
 [1] load zarr_vectors://s3://my-bucket/tracts.zarrvectors
 ```
@@ -93,12 +93,12 @@ recognised by `LocalNeuroglancer` and the `nglocal` shell:
 When a path ending in `.zarrvectors` is passed without a scheme,
 `zv-ngtools` infers the `zarr_vectors://` scheme automatically.
 
-### New ZVF-aware layer types
+### New Zarr Vectors-aware layer types
 
 The `zarr_vectors://` datasource registers a layer type appropriate for
 the store's `geometry_type`:
 
-| ZVF `geometry_type` | Neuroglancer layer | Rendering |
+| Zarr Vectors `geometry_type` | Neuroglancer layer | Rendering |
 |--------------------|--------------------|-----------|
 | `point_cloud` | `annotation` | 3-D points (size, colour from attributes) |
 | `line` | `annotation` | Line segment pairs |
@@ -108,7 +108,7 @@ the store's `geometry_type`:
 
 ### LOD integration
 
-The ZVF resolution pyramid drives Neuroglancer's level-of-detail rendering.
+The Zarr Vectors resolution pyramid drives Neuroglancer's level-of-detail rendering.
 As the user zooms out, `zv-ngtools` automatically selects a coarser level
 whose `bin_shape` is commensurate with the on-screen pixel size. This is
 transparent to the user: zooming in reveals finer detail without any manual

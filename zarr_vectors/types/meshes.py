@@ -21,6 +21,7 @@ import numpy as np
 import numpy.typing as npt
 
 from zarr_vectors.constants import (
+    RESOLUTION_PREFIX,
     CROSS_CHUNK_EXPLICIT,
     ENCODING_DRACO,
     ENCODING_RAW,
@@ -32,6 +33,7 @@ from zarr_vectors.constants import (
     VERTICES,
 )
 from zarr_vectors.core.arrays import (
+    stamp_fragments_tile,
     create_attribute_array,
     create_links_array,
     create_object_attributes_array,
@@ -61,6 +63,7 @@ from zarr_vectors.core.metadata import (
 )
 from zarr_vectors.core.paths import links_group_path
 from zarr_vectors.core.store import (
+    FsGroup,
     _apply_out_of_bounds_policy,
     _create_or_open_store,
     _ensure_root_metadata_for_write,
@@ -246,6 +249,22 @@ def write_mesh(
                 mask = chunk_bins == ab
                 prefixed[(int(ab),) + spatial_cc] = gi[mask]
         chunk_assignments = prefixed
+    # Group each chunk's vertices by object, so that every fragment written
+    # below belongs to exactly one object and a manifest entry can name
+    # ``(chunk, fragment)`` rather than the whole chunk.  Without this an
+    # object's manifest names chunk-wide fragments shared with every other
+    # object in that chunk, and any per-object read -- or any per-object
+    # coarsener -- pulls in all of them.
+    #
+    # Done BEFORE ``build_vertex_chunk_mapping``: the chunk-local index a face
+    # record carries is an offset into that chunk's fragments concatenated in
+    # write order (see ``_read_mesh``), so the ordering used here and the
+    # ordering written below have to be the same one.
+    for _cc, _gi in list(chunk_assignments.items()):
+        _gi = np.asarray(_gi, dtype=np.int64)
+        if _gi.size > 1:
+            _gi = _gi[np.argsort(object_ids[_gi], kind="stable")]
+        chunk_assignments[_cc] = _gi
     chunk_list = sorted(chunk_assignments.keys())
 
     vertex_chunks, vertex_local, chunk_list = build_vertex_chunk_mapping(
@@ -316,33 +335,47 @@ def write_mesh(
         for chunk_idx, chunk_coords in enumerate(chunk_list):
             global_indices = chunk_assignments[chunk_coords]
             chunk_verts = vertices[global_indices]
+            chunk_obj_ids = object_ids[global_indices]
+            # Object-grouped above, so every change of id starts a fragment.
+            frag_starts = np.concatenate((
+                [0], np.flatnonzero(np.diff(chunk_obj_ids)) + 1,
+            )).astype(np.int64)
+            split_at = frag_starts[1:]
 
             if is_draco:
-                # Draco mode: encode positions + local faces together
+                # Draco encodes one bitstream per chunk, so the per-object
+                # split cannot be expressed here: the whole chunk stays a
+                # single fragment and every object in it names fragment 0.
                 local_faces_arr = intra_faces.get(chunk_coords)
                 _write_draco_chunk(
                     level_group, chunk_coords, chunk_verts,
                     local_faces_arr, draco_quantization_bits, np_dtype,
                 )
+                for oid in np.unique(chunk_obj_ids):
+                    object_manifests.setdefault(int(oid), []).append(
+                        (chunk_coords, 0),
+                    )
             else:
                 write_chunk_vertices(
-                    level_group, chunk_coords, [chunk_verts], dtype=np_dtype,
+                    level_group, chunk_coords,
+                    np.split(chunk_verts, split_at), dtype=np_dtype,
                 )
-
-            # Track manifests: one fragment per chunk per unique object in chunk
-            chunk_obj_ids = object_ids[global_indices]
-            for oid in np.unique(chunk_obj_ids):
-                oid_int = int(oid)
-                if oid_int not in object_manifests:
-                    object_manifests[oid_int] = []
-                object_manifests[oid_int].append((chunk_coords, 0))
+                # One fragment per object, in the order just written; the
+                # fragments still tile [0, N) so the bulk-read fast path
+                # (stamp_fragments_tile) keeps its claim.
+                for frag_idx, start in enumerate(frag_starts):
+                    object_manifests.setdefault(
+                        int(chunk_obj_ids[start]), [],
+                    ).append((chunk_coords, frag_idx))
 
             # Write vertex attributes
             if vertex_attributes:
                 for name, data in vertex_attributes.items():
                     chunk_attrs = data[global_indices]
                     write_chunk_attributes(
-                        level_group, name, chunk_coords, [chunk_attrs],
+                        level_group, name, chunk_coords,
+                        ([chunk_attrs] if is_draco
+                         else np.split(chunk_attrs, split_at)),
                         dtype=data.dtype,
                     )
 
@@ -373,6 +406,11 @@ def write_mesh(
             for _name, _data in object_attributes.items():
                 write_object_attributes(level_group, _name, np.asarray(_data))
 
+        # Record the tiling layout just written, so a later bulk read
+    # can return each chunk's buffer without reading its fragment
+    # index.  Verified against what is on disk, and stamped after
+    # the chunk writes -- see stamp_fragments_tile.
+    stamp_fragments_tile(level_group, ndim)
     _finalize_write(root, "write_mesh")
     return {
         "vertex_count": n_verts,
@@ -429,6 +467,42 @@ def read_mesh(
             "which does implement object_ids."
         )
     root = open_store(store_path, backend=backend)
+    with root.cached_nodes():
+        # One node-resolution pass for the whole read, and every
+        # node it needs asked for in a single gather rather than
+        # resolved one at a time as the code reaches them.
+        prefix = f"{RESOLUTION_PREFIX}{level}"
+        root.prime_nodes([
+            prefix,
+            f"{prefix}/{VERTICES}",
+            f"{prefix}/{VERTEX_FRAGMENTS}",
+            f"{prefix}/{LINK_FRAGMENTS}",
+        ])
+        return _read_mesh(
+            root,
+            level=level,
+            bbox=bbox,
+            object_ids=object_ids,
+            chunks=chunks,
+            attribute_filter=attribute_filter,
+        )
+
+
+def _read_mesh(
+    root: FsGroup,
+    *,
+    level: int,
+    bbox: BoundingBox | None,
+    object_ids: list[int] | None,
+    chunks: list[ChunkCoords] | None,
+    attribute_filter: dict[str, Any] | None,
+) -> dict[str, Any]:
+    """Body of :func:`read_mesh`, against an already-open store.
+
+    Split out only so the caller can hold a
+    :meth:`Group.cached_nodes` block open across the whole read;
+    the two halves are one function.
+    """
     root_meta = read_root_metadata(root)
     level_group = get_resolution_level(root, level)
     ndim = root_meta.sid_ndim

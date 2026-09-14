@@ -20,7 +20,7 @@ from enum import Enum
 class ShardLayout(str, Enum):
     """Layout selector for back-compat with older shard APIs.
 
-    ``FLAT`` keeps one storage object per ZVF chunk (no sharding).
+    ``FLAT`` keeps one storage object per Zarr Vectors chunk (no sharding).
     All other values request native ``sharding_indexed`` sharding;
     the curve distinction is no longer load-bearing.
     """

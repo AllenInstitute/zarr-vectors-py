@@ -3,20 +3,20 @@
 ## Terms
 
 **Root `.zattrs`**
-: The JSON metadata file at the store root path. Contains all ZVF-level
+: The JSON metadata file at the store root path. Contains all Zarr Vectors-level
   metadata that applies to the store as a whole — geometry type, spatial
   dimensionality, base bin shape, chunk shape, coordinate system, and
   OME-Zarr multiscale metadata.
 
 **`zarr_vectors_version`**
-: A semantic version string declaring the ZVF spec version the store
+: A semantic version string declaring the Zarr Vectors specification version the store
   conforms to. Current value: `"1.0"`. Readers should check this field and
   warn on unknown versions.
 
 **`geometry_type`**
 : A string constant identifying the geometry type stored in this store.
   One of: `"point_cloud"`, `"line"`, `"polyline"`, `"streamline"`,
-  `"graph"`, `"skeleton"`, `"mesh"`. A single ZVF store holds exactly one
+  `"graph"`, `"skeleton"`, `"mesh"`. A single Zarr Vectors store holds exactly one
   geometry type.
 
 **`base_bin_shape`**
@@ -42,7 +42,7 @@
 
 ## Introduction
 
-The root `.zattrs` file is the entry point for any tool reading a ZVF store.
+The root `.zattrs` file is the entry point for any tool reading a Zarr Vectors store.
 It declares what kind of data the store contains, how it is laid out
 spatially, and how its resolution levels relate to one another. A reader can
 determine everything it needs to open and query the store from this single

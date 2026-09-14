@@ -87,7 +87,7 @@ print(GEOM_POINT_CLOUD, GEOM_STREAMLINE)
 `zarr-vectors` targets **Zarr v3** exclusively. Zarr v2 stores are not
 supported and cannot be opened with this package. If you have an existing
 v2 workflow, migrate the store using `zarr`'s built-in conversion utilities
-before ingesting into the ZVF format.
+before ingesting into the Zarr Vectors format.
 
 NumPy 2.x is supported from `zarr-vectors` 0.2 onward. Earlier releases
 require NumPy 1.x.

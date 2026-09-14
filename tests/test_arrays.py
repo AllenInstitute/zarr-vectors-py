@@ -6,8 +6,14 @@ from pathlib import Path
 
 import numpy as np
 
-from zarr_vectors.constants import LINK_FRAGMENTS, VERTEX_FRAGMENTS, VERTICES
+from zarr_vectors.constants import (
+    LINK_FRAGMENTS,
+    OBJECT_ATTRIBUTES,
+    VERTEX_FRAGMENTS,
+    VERTICES,
+)
 from zarr_vectors.core.arrays import (
+    chunk_vertex_count,
     count_fragments,
     create_attribute_array,
     create_fragment_attribute_array,
@@ -25,7 +31,9 @@ from zarr_vectors.core.arrays import (
     read_chunk_fragment_attributes,
     read_chunk_link_fragment,
     read_chunk_links,
+    read_chunk_vertex_buffer,
     read_chunk_vertices,
+    read_chunk_vertex_rows,
     read_fragment,
     read_group_object_ids,
     read_groupings_attributes,
@@ -1244,6 +1252,302 @@ class TestWriteObjectAttributesAppend:
 
 
 # ===================================================================
+# write_object_attributes(at=): rows land at the object id claimed
+# ===================================================================
+
+class TestWriteObjectAttributesAt:
+    """``at=`` pins appended rows to an object id, padding or truncating."""
+
+    def test_at_past_the_end_pads_with_the_sentinel(
+        self, tmp_path: Path,
+    ) -> None:
+        lg = _make_level_group(tmp_path)
+        create_object_attributes_array(lg, "labels", dtype="int32")
+        write_object_attributes(
+            lg, "labels", np.array([1, 2, 3], dtype=np.int32),
+        )
+        write_object_attributes(
+            lg, "labels", np.array([9], dtype=np.int32),
+            mode="append", at=5,
+        )
+        back = read_object_attributes(lg, "labels")
+        assert back.shape == (6,)
+        np.testing.assert_array_equal(back[:3], [1, 2, 3])
+        # The gap rows read back as the column's fill sentinel.
+        assert back[5] == 9
+        fill = lg.read_array_fill_value(f"{OBJECT_ATTRIBUTES}/labels")
+        np.testing.assert_array_equal(back[3:5], [fill, fill])
+
+    def test_at_behind_the_end_truncates_the_residue(
+        self, tmp_path: Path,
+    ) -> None:
+        """A torn flush left rows past the commit point; the retry reclaims them."""
+        lg = _make_level_group(tmp_path)
+        create_object_attributes_array(lg, "labels", dtype="int32")
+        write_object_attributes(
+            lg, "labels", np.array([1, 2, 3, 77, 88], dtype=np.int32),
+        )
+        write_object_attributes(
+            lg, "labels", np.array([42, 43], dtype=np.int32),
+            mode="append", at=3,
+        )
+        back = read_object_attributes(lg, "labels")
+        np.testing.assert_array_equal(back, [1, 2, 3, 42, 43])
+
+    def test_at_equal_to_the_end_is_a_plain_append(
+        self, tmp_path: Path,
+    ) -> None:
+        lg = _make_level_group(tmp_path)
+        create_object_attributes_array(lg, "labels", dtype="int32")
+        write_object_attributes(
+            lg, "labels", np.array([1, 2], dtype=np.int32),
+        )
+        write_object_attributes(
+            lg, "labels", np.array([3], dtype=np.int32),
+            mode="append", at=2,
+        )
+        np.testing.assert_array_equal(
+            read_object_attributes(lg, "labels"), [1, 2, 3],
+        )
+
+    def test_at_on_a_missing_attribute_creates_the_gap(
+        self, tmp_path: Path,
+    ) -> None:
+        lg = _make_level_group(tmp_path)
+        create_object_attributes_array(lg, "scores", dtype="int64")
+        write_object_attributes(
+            lg, "scores", np.array([7, 8], dtype=np.int64),
+            mode="append", at=2,
+        )
+        back = read_object_attributes(lg, "scores")
+        assert back.shape == (4,)
+        np.testing.assert_array_equal(back[2:], [7, 8])
+
+    def test_at_2d(self, tmp_path: Path) -> None:
+        lg = _make_level_group(tmp_path)
+        create_object_attributes_array(
+            lg, "vecs", dtype="float32", num_channels=3,
+        )
+        write_object_attributes(
+            lg, "vecs", np.zeros((2, 3), dtype=np.float32),
+        )
+        write_object_attributes(
+            lg, "vecs", np.ones((1, 3), dtype=np.float32),
+            mode="append", at=4,
+        )
+        back = read_object_attributes(lg, "vecs")
+        assert back.shape == (5, 3)
+        assert np.isnan(back[2:4]).all()      # float default sentinel
+        np.testing.assert_array_equal(back[4], [1, 1, 1])
+
+    def test_repeating_the_same_at_is_idempotent(
+        self, tmp_path: Path,
+    ) -> None:
+        """The point of ``at``: a retried flush lands on the same rows."""
+        lg = _make_level_group(tmp_path)
+        create_object_attributes_array(lg, "labels", dtype="int32")
+        write_object_attributes(
+            lg, "labels", np.array([1, 2], dtype=np.int32),
+        )
+        for _ in range(3):
+            write_object_attributes(
+                lg, "labels", np.array([5, 6], dtype=np.int32),
+                mode="append", at=2,
+            )
+        np.testing.assert_array_equal(
+            read_object_attributes(lg, "labels"), [1, 2, 5, 6],
+        )
+
+    def test_at_with_replace_raises(self, tmp_path: Path) -> None:
+        lg = _make_level_group(tmp_path)
+        create_object_attributes_array(lg, "x", dtype="int32")
+        try:
+            write_object_attributes(
+                lg, "x", np.array([1], dtype=np.int32), at=0,
+            )
+            assert False, "Should raise"
+        except ArrayError:
+            pass
+
+    def test_negative_at_raises(self, tmp_path: Path) -> None:
+        lg = _make_level_group(tmp_path)
+        create_object_attributes_array(lg, "x", dtype="int32")
+        try:
+            write_object_attributes(
+                lg, "x", np.array([1], dtype=np.int32),
+                mode="append", at=-1,
+            )
+            assert False, "Should raise"
+        except ArrayError:
+            pass
+
+
+# ===================================================================
+# read_links(include_intra=..., select=...)
+# ===================================================================
+
+class TestReadLinksSelection:
+    """Skipping the intra array, and materialising only chosen rows."""
+
+    #: One intra record and two crossing ones.  Segment order is
+    #: "+1.0.0" < "0.0.+1" < "0.0.0", so the intra record sorts LAST —
+    #: see ``test_read_order_is_offsets_segment_then_cell``.
+    LINKS = [
+        (((0, 0, 0), 4), ((0, 0, 1), 0)),   # segment "0.0.+1"
+        (((0, 0, 0), 2), ((1, 0, 0), 1)),   # segment "+1.0.0"
+        (((1, 0, 0), 7), ((1, 0, 0), 8)),   # segment "0.0.0"  (intra)
+    ]
+
+    def test_include_intra_false_drops_the_intra_array(
+        self, tmp_path: Path,
+    ) -> None:
+        lg = _make_level_group(tmp_path)
+        write_links(lg, self.LINKS, sid_ndim=3)
+
+        assert len(read_links(lg)) == 3
+        crossing = read_links(lg, include_intra=False)
+        assert crossing == [self.LINKS[1], self.LINKS[0]]
+
+    def test_select_indexes_the_returned_population(
+        self, tmp_path: Path,
+    ) -> None:
+        """``select=[i]`` names the same record as ``read_links(...)[i]``."""
+        lg = _make_level_group(tmp_path)
+        write_links(lg, self.LINKS, sid_ndim=3)
+
+        every = read_links(lg)
+        for i in range(len(every)):
+            assert read_links(lg, select=[i]) == [every[i]]
+
+        crossing = read_links(lg, include_intra=False)
+        for i in range(len(crossing)):
+            assert read_links(
+                lg, include_intra=False, select=[i],
+            ) == [crossing[i]]
+
+    def test_select_spanning_cells(self, tmp_path: Path) -> None:
+        # Several records in one cell plus one in another, so the running
+        # row count has to carry across the cell boundary.
+        lg = _make_level_group(tmp_path)
+        links = [
+            (((0, 0, 0), i), ((1, 0, 0), i + 10)) for i in range(5)
+        ] + [(((0, 0, 0), 1), ((0, 0, 1), 2))]
+        write_links(lg, links, sid_ndim=3)
+
+        every = read_links(lg)
+        picks = [0, 2, 5]
+        assert read_links(lg, select=picks) == [every[i] for i in picks]
+
+    def test_select_empty_returns_nothing(self, tmp_path: Path) -> None:
+        lg = _make_level_group(tmp_path)
+        write_links(lg, self.LINKS, sid_ndim=3)
+        assert read_links(lg, select=[]) == []
+
+    def test_select_out_of_range_is_ignored(self, tmp_path: Path) -> None:
+        lg = _make_level_group(tmp_path)
+        write_links(lg, self.LINKS, sid_ndim=3)
+        every = read_links(lg)
+        assert read_links(lg, select=[1, 999]) == [every[1]]
+
+    def test_unsorted_select_raises(self, tmp_path: Path) -> None:
+        lg = _make_level_group(tmp_path)
+        write_links(lg, self.LINKS, sid_ndim=3)
+        try:
+            read_links(lg, select=[2, 0])
+            assert False, "Should raise"
+        except ArrayError:
+            pass
+
+
+# ===================================================================
+# read_chunk_vertex_buffer / chunk_vertex_count
+# ===================================================================
+
+class TestChunkVertexBuffer:
+    """The whole buffer, and its length, without going through fragment 0."""
+
+    def test_buffer_is_every_row_not_fragment_zero(
+        self, tmp_path: Path,
+    ) -> None:
+        """The case ``read_fragment(lg, cc, 0)`` gets wrong."""
+        lg = _make_level_group(tmp_path)
+        create_vertices_array(lg)
+        a = np.array([[0, 0, 0], [1, 1, 1]], dtype=np.float32)
+        b = np.array([[2, 2, 2]], dtype=np.float32)
+        write_chunk_vertices(lg, (0, 0, 0), [a, b])
+
+        buf = read_chunk_vertex_buffer(lg, (0, 0, 0), ndim=3)
+        assert buf.shape == (3, 3)
+        np.testing.assert_array_equal(buf, np.concatenate([a, b]))
+        # Fragment 0 is only the first object's rows.
+        assert read_fragment(
+            lg, (0, 0, 0), 0, dtype=np.float32, ndim=3,
+        ).shape == (2, 3)
+
+    def test_buffer_reads_the_declared_dtype(self, tmp_path: Path) -> None:
+        """Not an assumed float32 — the cell is a bare buffer with no header."""
+        lg = _make_level_group(tmp_path)
+        create_vertices_array(lg)
+        # Restamp the declared element type, as create_vertices_array does
+        # for a store that asks for one (the fixture already made the array).
+        lg.write_array_meta(VERTICES, {
+            "zv_array": "vertices", "dtype": "float64", "encoding": "raw",
+        })
+        pts = np.array([[1.5, 2.5, 3.5]], dtype=np.float64)
+        write_chunk_vertices(lg, (0, 0, 0), [pts], dtype=np.float64)
+
+        buf = read_chunk_vertex_buffer(lg, (0, 0, 0))
+        assert buf.dtype == np.float64
+        np.testing.assert_array_equal(buf, pts)
+
+    def test_unwritten_chunk_is_empty_not_an_error(
+        self, tmp_path: Path,
+    ) -> None:
+        """A chunk nobody wrote holds no rows; that is an answer, not a failure."""
+        lg = _make_level_group(tmp_path)
+        create_vertices_array(lg)
+        buf = read_chunk_vertex_buffer(lg, (99, 99, 99), ndim=3)
+        assert buf.shape == (0, 3)
+
+    def test_buffer_default_when_the_array_is_absent(
+        self, tmp_path: Path,
+    ) -> None:
+        lg = _make_level_group(tmp_path)   # no create_vertices_array
+        del lg.zarr_group[VERTICES]
+        assert read_chunk_vertex_buffer(
+            lg, (0, 0, 0), default=None,
+        ) is None
+
+    def test_count_matches_the_buffer(self, tmp_path: Path) -> None:
+        lg = _make_level_group(tmp_path)
+        create_vertices_array(lg)
+        write_chunk_vertices(lg, (0, 0, 0), [
+            np.zeros((2, 3), dtype=np.float32),
+            np.ones((3, 3), dtype=np.float32),
+        ])
+        assert chunk_vertex_count(lg, (0, 0, 0)) == 5
+        assert read_chunk_vertex_buffer(lg, (0, 0, 0)).shape[0] == 5
+
+    def test_count_spans_explicit_fragments(self, tmp_path: Path) -> None:
+        """An explicit fragment referencing a high row sets the extent."""
+        lg = _make_level_group(tmp_path)
+        create_vertices_array(lg)
+        write_chunk_vertices(lg, (0, 0, 0), [
+            np.zeros((4, 3), dtype=np.float32),
+        ])
+        write_chunk_fragments(
+            lg, (0, 0, 0), [np.array([3, 1], dtype=np.int64)],
+            target="vertex", mode="append",
+        )
+        # Still 4: the twin references rows the range already covers.
+        assert chunk_vertex_count(lg, (0, 0, 0)) == 4
+
+    def test_count_on_missing_chunk(self, tmp_path: Path) -> None:
+        lg = _make_level_group(tmp_path)
+        create_vertices_array(lg)
+        assert chunk_vertex_count(lg, (99, 99, 99)) == 0
+
+# ===================================================================
 # R3: write_links / write_link_attributes append
 # ===================================================================
 
@@ -1514,6 +1818,115 @@ class TestReadFragmentDefault:
             read_chunk_link_fragment(
                 lg, (0, 0, 0), 5, link_width=2,
             )
+            assert False, "Should raise"
+        except ArrayError:
+            pass
+
+
+# ===================================================================
+# read_chunk_vertex_rows -- the concatenation, with and without the
+# whole-buffer shortcut
+# ===================================================================
+
+class TestChunkVertexRows:
+    """Whatever route it takes, the answer must equal
+    ``np.concatenate(read_chunk_vertices(...))`` exactly."""
+
+    @staticmethod
+    def _expected(lg, cc, **kw):
+        groups = read_chunk_vertices(lg, cc, **kw)
+        return (np.concatenate(groups, axis=0) if groups
+                else np.zeros((0, 3), dtype=np.float32))
+
+    def test_matches_concatenated_fragments_when_they_tile(
+        self, tmp_path: Path,
+    ) -> None:
+        lg = _make_level_group(tmp_path)
+        create_vertices_array(lg)
+        g0 = np.array([[0, 0, 0], [1, 1, 1]], dtype=np.float32)
+        g1 = np.array([[10, 10, 10]], dtype=np.float32)
+        g2 = np.array([[20, 20, 20], [21, 21, 21]], dtype=np.float32)
+        write_chunk_vertices(lg, (0, 0, 0), [g0, g1, g2])
+
+        rows = read_chunk_vertex_rows(lg, (0, 0, 0), dtype=np.float32, ndim=3)
+        np.testing.assert_array_equal(
+            rows, self._expected(lg, (0, 0, 0), dtype=np.float32, ndim=3),
+        )
+        np.testing.assert_array_equal(rows, np.concatenate([g0, g1, g2]))
+
+    def test_empty_fragments_do_not_disturb_the_order(
+        self, tmp_path: Path,
+    ) -> None:
+        lg = _make_level_group(tmp_path)
+        create_vertices_array(lg)
+        g0 = np.array([[1, 2, 3]], dtype=np.float32)
+        g_empty = np.zeros((0, 3), dtype=np.float32)
+        g2 = np.array([[7, 8, 9]], dtype=np.float32)
+        write_chunk_vertices(lg, (0, 0, 0), [g0, g_empty, g2])
+
+        rows = read_chunk_vertex_rows(lg, (0, 0, 0), dtype=np.float32, ndim=3)
+        np.testing.assert_array_equal(rows, np.array([[1, 2, 3], [7, 8, 9]],
+                                                     dtype=np.float32))
+
+    def test_explicit_fragments_take_the_gather_path(
+        self, tmp_path: Path,
+    ) -> None:
+        """Rows referenced twice, and rows referenced not at all — the
+        shortcut must not fire, and the answer must still be the
+        fragments' concatenation rather than the buffer."""
+        lg = _make_level_group(tmp_path)
+        create_vertices_array(lg)
+        buf = np.arange(15, dtype=np.float32).reshape(5, 3)
+        write_chunk_vertices(lg, (0, 0, 0), [buf])
+        write_chunk_fragments(lg, (0, 0, 0), [
+            np.array([4, 0], dtype=np.int64),
+            np.array([2], dtype=np.int64),
+        ])
+
+        rows = read_chunk_vertex_rows(lg, (0, 0, 0), dtype=np.float32, ndim=3)
+        np.testing.assert_array_equal(rows, buf[[4, 0, 2]])
+        np.testing.assert_array_equal(
+            rows, self._expected(lg, (0, 0, 0), dtype=np.float32, ndim=3),
+        )
+
+    def test_rows_no_fragment_references_are_dropped(
+        self, tmp_path: Path,
+    ) -> None:
+        """The difference from ``read_chunk_vertex_buffer``: a range that
+        stops short of the buffer must not pull the tail in with it."""
+        lg = _make_level_group(tmp_path)
+        create_vertices_array(lg)
+        buf = np.arange(15, dtype=np.float32).reshape(5, 3)
+        write_chunk_vertices(lg, (0, 0, 0), [buf])
+        write_chunk_fragments(lg, (0, 0, 0), [(0, 3)])
+
+        rows = read_chunk_vertex_rows(lg, (0, 0, 0), dtype=np.float32, ndim=3)
+        assert rows.shape == (3, 3)
+        np.testing.assert_array_equal(rows, buf[:3])
+
+    def test_empty_chunk_yields_no_rows(self, tmp_path: Path) -> None:
+        lg = _make_level_group(tmp_path)
+        create_vertices_array(lg)
+        write_chunk_vertices(lg, (0, 0, 0), [])
+
+        rows = read_chunk_vertex_rows(lg, (0, 0, 0), dtype=np.float32, ndim=3)
+        assert rows.shape == (0, 3)
+
+    def test_two_dimensional_vertices(self, tmp_path: Path) -> None:
+        lg = _make_level_group(tmp_path, ndim=2)
+        create_vertices_array(lg, dtype="float64")
+        g0 = np.array([[10.0, 20.0], [30.0, 40.0]], dtype=np.float64)
+        g1 = np.array([[50.0, 60.0]], dtype=np.float64)
+        write_chunk_vertices(lg, (0, 0), [g0, g1], dtype=np.float64)
+
+        rows = read_chunk_vertex_rows(lg, (0, 0), dtype=np.float64, ndim=2)
+        np.testing.assert_array_equal(rows, np.concatenate([g0, g1]))
+
+    def test_missing_chunk_raises(self, tmp_path: Path) -> None:
+        lg = _make_level_group(tmp_path)
+        create_vertices_array(lg)
+        try:
+            read_chunk_vertex_rows(lg, (3, 3, 3), dtype=np.float32, ndim=3)
             assert False, "Should raise"
         except ArrayError:
             pass

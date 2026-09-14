@@ -27,7 +27,7 @@
   consolidated metadata will be slow to open on object stores.
 
 **Error**
-: A fatal issue that indicates the store does not conform to the ZVF spec
+: A fatal issue that indicates the store does not conform to the Zarr Vectors specification
   at the declared conformance level. Example: a `bin_shape` value that
   does not evenly divide `chunk_shape`.
 
@@ -35,7 +35,7 @@
 
 ## Introduction
 
-`zarr-vectors-py` ships a multi-level validator that checks ZVF stores for
+`zarr-vectors-py` ships a multi-level validator that checks Zarr Vectors stores for
 correctness and conformance. Validation is organised into five progressively
 deeper levels. Shallow levels (1–2) are fast and check structural and
 metadata properties. Deeper levels (3–5) are more expensive because they

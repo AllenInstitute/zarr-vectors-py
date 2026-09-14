@@ -1,16 +1,21 @@
 # Point clouds
 
-Point clouds are the simplest ZVF geometry type: a collection of spatial
+Point clouds are the simplest Zarr Vectors geometry type: a collection of spatial
 positions with optional per-vertex scalar or vector attributes. They arise
 in synchrotron absorption imaging (HiP-CT, micro-CT), single-molecule
 localisation microscopy (STORM, PALM, MINFLUX), spatial transcriptomics
 (Visium HD, Xenium, MERFISH), and lidar scanning.
 
 This tutorial covers writing, reading, spatial querying, attribute handling,
-ingesting from external formats, and building multi-resolution pyramids.
-All examples on this page use only the core `zarr-vectors` API. Format
-converters for LAS/PLY/CSV/XYZ live in the companion package
-**`zarr-vectors-tools`**.
+and building multi-resolution pyramids. Everything here is on the supported
+`zarr_vectors.api` surface — re-exported from the top-level package, so
+`zv.create` and `zv.open` below are `api` objects — apart from two places that
+deliberately reach into `zarr_vectors.building`, the other supported surface,
+for physical detail the api does not carry. Format converters for
+LAS/PLY/CSV/XYZ live in the companion package **`zarr-vectors-tools`**.
+
+The page is one continuous session — later blocks reuse the stores earlier
+blocks create.
 
 ---
 
@@ -18,192 +23,288 @@ converters for LAS/PLY/CSV/XYZ live in the companion package
 
 ### Minimal write
 
+A store starts as a `Schema`: where the data lives in space, what the axes
+mean, and roughly how much of it there is. Chunk and bin shapes are not
+arguments — they are derived from `Layout`, which says how finely to cut the
+volume up.
+
 ```python
 import numpy as np
-from zarr_vectors.types.points import write_points
+import zarr_vectors as zv
+
+ds = zv.create("scan_min.zarrvectors", schema=zv.Schema(
+    bounds=((0.0, 0.0, 0.0), (1000.0, 1000.0, 1000.0)),
+    axes=(zv.Axis("x", unit="micrometer"),
+          zv.Axis("y", unit="micrometer"),
+          zv.Axis("z", unit="micrometer")),
+    kind="point_cloud",
+    expected=zv.SizeHints(n_vertices=100_000),
+    layout=zv.Layout(cells=5),          # ~5 chunks per axis
+))
 
 rng = np.random.default_rng(42)
-
-# 100 000 points in a 1 000³ µm volume
 positions = rng.uniform(0, 1000, (100_000, 3)).astype(np.float32)
 
-write_points(
-    "scan.zarrvectors",
-    positions,
-    chunk_shape=(200.0, 200.0, 200.0),   # one chunk file per 200³ µm
-    bin_shape=(50.0, 50.0, 50.0),        # spatial index at 50³ µm
-)
+print(ds.add_points(positions))
+print(ds.kinds, ds.ndim, ds.format_version)
+print(ds.level(0).scale, ds.level(0).resolution)
+print(ds.level(0).grid, ds.level(0).grid.shape)
+print(ds.level(0).vertex_count)
 ```
 
-After writing, the store summary is:
+```text
+{'vertex_count': 100000, 'chunk_count': 125, 'object_count': 0, 'group_count': 0, 'bins_per_chunk': (4, 4, 4)}
+('point_cloud',) 3 (0, 9, 0)
+(200.0, 200.0, 200.0) (50.0, 50.0, 50.0)
+Grid(5x5x5 cells of (200.0, 200.0, 200.0)) (5, 5, 5)
+100000
+```
 
+`Level.scale` is the chunk shape — the I/O unit, one file per occupied cell —
+and `Level.resolution` is the bin shape, the spatial index unit inside it. Five
+cells per axis across 1 000 µm gives 200 µm chunks, and the default four
+subcells per axis gives 50 µm bins, which is where `bins_per_chunk: (4, 4, 4)`
+comes from. Counting does not read anything: `Level.vertex_count` answers from
+metadata.
+
+A fresh store holds only what has been written:
+
+```python
+import os
+print(sorted(os.listdir("scan_min.zarrvectors")))
+print(sorted(os.listdir("scan_min.zarrvectors/0")))
 ```
-geometry_type:  point_cloud
-spatial_dims:   3
-chunk_shape:    [200.0, 200.0, 200.0]
-bin_shape:      [50.0, 50.0, 50.0]
-0:   100000 vertices, 125 chunks
+
+```text
+['0', 'zarr.json']
+['vertex_fragments', 'vertices', 'zarr.json']
 ```
+
+`zarr.json` is the Zarr v3 group document; store-level fields live under its
+`attributes.zarr_vectors` and the per-level transforms under
+`attributes.multiscales`.
 
 ### Write with per-vertex attributes
 
-Any number of named float or integer attribute arrays can be attached.
-The arrays must have the same length as `positions` (one value per vertex):
+Any number of named float or integer attribute arrays can be attached. Each
+array has one entry per vertex — the same length as `positions` — and a vector
+attribute keeps its trailing width:
 
 ```python
 rng = np.random.default_rng(42)
 n = 100_000
-positions   = rng.uniform(0, 1000, (n, 3)).astype(np.float32)
-intensity   = rng.uniform(0, 1, n).astype(np.float32)          # absorption
-label       = rng.integers(0, 8, n).astype(np.int32)           # class label
-rgb         = rng.integers(0, 256, (n, 3)).astype(np.uint8)    # colour
-confidence  = rng.uniform(0.5, 1, n).astype(np.float32)
+positions  = rng.uniform(0, 1000, (n, 3)).astype(np.float32)
+intensity  = rng.uniform(0, 1, n).astype(np.float32)         # absorption
+label      = rng.integers(0, 8, n).astype(np.int32)          # class label
+rgb        = rng.integers(0, 256, (n, 3)).astype(np.uint8)   # colour
+confidence = rng.uniform(0.5, 1, n).astype(np.float32)
 
-write_points(
-    "scan.zarrvectors",
-    positions,
-    chunk_shape=(200.0, 200.0, 200.0),
-    bin_shape=(50.0, 50.0, 50.0),
+ds = zv.create("scan.zarrvectors", schema=zv.Schema(
+    bounds=((0.0, 0.0, 0.0), (1000.0, 1000.0, 1000.0)),
+    axes=(zv.Axis("x", unit="micrometer"),
+          zv.Axis("y", unit="micrometer"),
+          zv.Axis("z", unit="micrometer")),
+    kind="point_cloud",
     vertex_attributes={
-        "intensity":  intensity,
-        "label":      label,
-        "color":      rgb,        # vector attribute: shape (N, 3)
-        "confidence": confidence,
+        "intensity":  zv.AttributeSpec(dtype="float32", unit="absorbance"),
+        "label":      zv.AttributeSpec(dtype="int32", categorical=True),
+        "color":      zv.AttributeSpec(dtype="uint8", channels=3),
+        "confidence": zv.AttributeSpec(dtype="float32"),
     },
-)
+    expected=zv.SizeHints(n_vertices=n),
+    layout=zv.Layout(cells=5),
+))
+print(ds.add_points(positions, attributes={
+    "intensity": intensity, "label": label,
+    "color": rgb, "confidence": confidence,
+}))
+print(ds.level(0).attribute_names("vertex"))
+print(sorted(os.listdir("scan.zarrvectors/0/vertex_attributes")))
 ```
 
-`write_points` still accepts `attributes=` as a deprecated alias for
-`vertex_attributes=`; it emits a `DeprecationWarning`. Passing both
-raises `TypeError`.
+```text
+{'vertex_count': 100000, 'chunk_count': 125, 'object_count': 0, 'group_count': 0, 'bins_per_chunk': (4, 4, 4)}
+('color', 'confidence', 'intensity', 'label')
+['color', 'confidence', 'intensity', 'label', 'zarr.json']
+```
 
-There are no `coordinate_system` or `axis_units` arguments — those
-concepts do not exist anywhere in this package.
+The `Schema` *declares* the attributes — dtype, channel width, whether a label
+is categorical, what a value is measured in — and sizes their arrays; the values
+themselves are always passed to the write call, as `attributes=`. Declarations
+are documentation and layout input, not validation: nothing checks a written
+array against its spec.
 
-### Choosing `chunk_shape` and `bin_shape`
+Each name becomes one child array under `vertex_attributes/`, on the same chunk
+grid as `vertices/`, with rows aligned 1:1 with it.
 
-A practical starting point: `chunk_shape` should be large enough that
-each chunk contains ~10 000–100 000 vertices; `bin_shape` should be
-roughly `chunk_shape / 4` per axis.
+### Axes and units
+
+`Axis` carries the axis name and the unit it is measured in, and they are
+written as OME-NGFF axes so other tooling can read them:
 
 ```python
-# Estimate expected vertices per chunk
-total_vertices    = 10_000_000
-volume            = 4000 ** 3        # µm³
-chunk_volume      = 500 ** 3         # µm³ with chunk_shape = 500
-expected_per_chunk = total_vertices * chunk_volume / volume
-# ≈ 7 812 — within the target range
-
-write_points(
-    "large_scan.zarrvectors",
-    positions_10M,
-    chunk_shape=(500.0, 500.0, 500.0),
-    bin_shape=(125.0, 125.0, 125.0),   # 4×4×4 = 64 bins/chunk
-)
+import json
+meta = json.load(open("scan.zarrvectors/zarr.json"))
+print(sorted(meta["attributes"]))
+print(meta["attributes"]["multiscales"][0]["axes"])
 ```
+
+```text
+['multiscales', 'zarr_vectors']
+[{'name': 'x', 'type': 'space', 'unit': 'micrometer'}, {'name': 'y', 'type': 'space', 'unit': 'micrometer'}, {'name': 'z', 'type': 'space', 'unit': 'micrometer'}]
+```
+
+There is no coordinate-reference-system argument on `Schema`: axis names and
+units are as much as the schema says about what the coordinates mean.
+
+### Choosing the grid
+
+A practical starting point: chunks large enough that each holds roughly
+10 000–100 000 vertices, and the default four bins per chunk axis. `cells` is
+the data-shaped spelling — cut the volume into about this many pieces per axis:
+
+```python
+total_vertices = 10_000_000
+bounds_extent  = 4000.0                 # µm per axis
+target_cells   = 8                      # -> 500 µm chunks
+print(bounds_extent / target_cells, total_vertices / target_cells ** 3)
+```
+
+```text
+500.0 19531.25
+```
+
+When the grid is fixed from outside — a pipeline whose chunks must line up with
+an image volume's — `cell_size` sets it directly, and `subcells` sets the
+number of bins per chunk axis:
+
+```python
+fixed = zv.create("fixed.zarrvectors", schema=zv.Schema(
+    bounds=((0.0, 0.0, 0.0), (1000.0, 1000.0, 1000.0)),
+    kind="point_cloud",
+    layout=zv.Layout(cell_size=(250.0, 250.0, 250.0), subcells=5),
+))
+print(fixed.level(0).scale, fixed.level(0).resolution)
+```
+
+```text
+(250.0, 250.0, 250.0) (50.0, 50.0, 50.0)
+```
+
+See [Choosing a layout](../../how_to/choose_chunk_and_bin.md)
+for the reasoning behind a particular size.
 
 ---
 
 ## Reading a point cloud
 
-### Read all data
+### Read everything
 
 ```python
-from zarr_vectors.types.points import read_points
+ds = zv.open("scan.zarrvectors")
 
-result = read_points("scan.zarrvectors")
+r = ds.read()
+print(r)
+print(r.vertex_count, r.positions.shape, r.positions.dtype)
+print(r.attributes.names())
+print(r.attributes["intensity"].shape, r.attributes["label"].dtype,
+      r.attributes["color"].shape)
+print(r.attributes_read, r.complete, r.errors)
+```
 
-print(result["vertex_count"])                     # 100000
-print(result["positions"].shape)                  # (100000, 3)
-print(result["attributes"]["intensity"].shape)    # (100000,)
-print(result["attributes"]["label"].dtype)        # int32
-print(result["attributes"]["color"].shape)        # (100000, 3)
+```text
+ReadResult(kind='point_cloud', vertices=100000, attributes=['color', 'confidence', 'intensity', 'label'])
+100000 (100000, 3) float32
+('color', 'confidence', 'intensity', 'label')
+(100000,) int32 (100000, 3)
+True True ()
+```
+
+A whole-store read brings the attributes with it, and vector attributes keep
+their `(N, C)` shape. `attributes_read` is not decoration: an empty
+`r.attributes` with `attributes_read == False` means *nobody looked*, not
+*there are none* — it comes back `False` on narrowed reads whose reader could
+not carry the attributes.
+
+### Reading less
+
+`select()` builds a `Query` and reads nothing; `count()` and `read()` are the
+terminals that touch the store. Naming attributes narrows what is loaded:
+
+```python
+lean = ds.select(attributes=["intensity"]).read()
+print(lean.attributes.names(), lean.attributes_read)
+print(lean.vertex_count)
+```
+
+```text
+('intensity',) True
+100000
 ```
 
 ### Read a specific level
 
-If the store has a multi-resolution pyramid, pass `level=N` to read a
-coarser representation:
-
-```python
-coarse = read_points("scan.zarrvectors", level=1)
-print(coarse["vertex_count"])     # fewer vertices — spatially coarsened
-print(coarse["level"])            # 1
-```
-
-### Reading attributes
-
-**Attributes are opt-in.** `read_points` loads *no* attribute data unless
-you name what you want: the returned `vertex_attributes` dict is empty by
-default. Name them with `attribute_names` (not `attributes`):
-
-```python
-result = read_points("scan.zarrvectors")
-print(result["vertex_attributes"])      # {} — nothing loaded
-
-result = read_points(
-    "scan.zarrvectors",
-    attribute_names=["intensity"],      # only load intensity
-)
-print(sorted(result["vertex_attributes"]))   # ['intensity']
-assert "label" not in result["vertex_attributes"]
-```
-
-The result key is `vertex_attributes`, not `attributes`. `read_points`
-returns exactly three keys:
-
-```python
-result = read_points("scan.zarrvectors", attribute_names=["intensity", "color"])
-print(sorted(result))                              # ['positions', 'vertex_attributes', 'vertex_count']
-print(result["positions"].shape)                   # (N, 3)
-print(result["vertex_attributes"]["color"].shape)  # (N, 3) — shape preserved
-```
-
-Vector attributes keep their `(N, C)` shape through `read_points`. (The
-lazy API flattens them — see
-[Lazy loading](../multiscale/lazy_loading.md).)
+If the store has a multi-resolution pyramid, `level=` (or the `Level` handle)
+reads a coarser representation — see [Multi-resolution
+pyramids](#multi-resolution-pyramids) below, which builds one into this store.
 
 ---
 
 ## Spatial bounding-box queries
 
-ZVF queries target individual bins — not full chunks — so the amount of
-data loaded is proportional to the query volume, not the chunk volume.
+Zarr Vectors queries target individual bins — not full chunks — so for a point cloud the
+box is vertex-exact: the count is the true number of points inside it, not the
+contents of the chunks it overlaps.
 
 ```python
-lo = np.array([100.0, 100.0, 100.0])
-hi = np.array([200.0, 200.0, 200.0])
-
-result = read_points(
-    "scan.zarrvectors",
-    bbox=(lo, hi),
-)
-print(result["vertex_count"])   # ≈ 100 (100³/1000³ × 100 000)
-print(result["positions"].min(axis=0))  # all >= lo
-print(result["positions"].max(axis=0))  # all <= hi
+q = ds.select(bbox=((100.0, 100.0, 100.0), (200.0, 200.0, 200.0)))
+print(q.explain())
+print(q.count())
+r = q.read()
+print(r)
+print(r.positions.min(axis=0))
+print(r.positions.max(axis=0))
+print(q.cells())
 ```
 
-The query is exact: only vertices within the half-open interval
-`[lo, hi)` per axis are returned.
+```text
+point_cloud read: level 0, bbox [100.0, 100.0, 100.0]..[200.0, 200.0, 200.0]
+  via read_points(attribute_names, bbox, level)
+109
+ReadResult(kind='point_cloud', vertices=109, attributes=['color', 'confidence', 'intensity', 'label'])
+[100.439674 100.72887  100.454704]
+[199.90297 198.85411 197.56297]
+CellSet(8 cell(s))
+```
 
-### Combining bbox and level
+`explain()` names the reader that will run and the arguments it will get, and
+`cells()` reads nothing — eight cells, because a 100–200 µm box straddles the
+200 µm chunk boundary on every axis.
 
-A coarser level with bbox is the key pattern for overview-first rendering:
-load a low-resolution overview of the full volume, then switch to the
-finer level only for the region of interest.
+A radius selection and a row limit narrow the same way:
 
 ```python
-# Overview: coarse level, full volume
-overview = read_points("scan.zarrvectors", level=2)
+qn = ds.select(near=((500.0, 500.0, 500.0), 50.0))
+print(qn.explain())
+print(qn.count())
+print(round(float(np.linalg.norm(qn.read().positions - 500.0, axis=1).max()), 3))
 
-# Detail: full resolution, small region
-detail = read_points(
-    "scan.zarrvectors",
-    level=0,
-    bbox=(np.array([400., 400., 400.]),
-          np.array([600., 600., 600.])),
-)
+lim = ds.select(bbox=((0.0, 0.0, 0.0), (500.0, 500.0, 500.0))).limit(10).read()
+print(lim.vertex_count, lim.truncated, lim.complete)
 ```
+
+```text
+point_cloud read: level 0, within 50.0 of [500.0, 500.0, 500.0]
+  via read_points(attribute_names, bbox, level) then filtered in memory
+59
+49.895
+10 True False
+```
+
+The sphere really is enforced — the farthest point is inside 50 µm — but
+`explain()` is honest that it costs a bounding-box read plus an in-memory
+filter. `limit()` sets `truncated`, and `complete` goes `False` to say the
+result is not the whole answer.
 
 ---
 
@@ -212,36 +313,138 @@ detail = read_points(
 ### Building a pyramid
 
 ```python
-from zarr_vectors.multiresolution.coarsen import build_pyramid
-
-build_pyramid(
-    "scan.zarrvectors",
-    factors=[(2.0, 1.00), (4.0, 1.00)],
+ds = zv.open("scan.zarrvectors", mode="r+")
+print(zv.coarsen_methods())
+rep = ds.build_pyramid(
+    factors=[(2.0, 1.0), (2.0, 1.0)],
+    chunk_scale_factors=[2, 2],
+    method="per_object",
 )
+print(rep["levels_created"], [s["vertex_count"] for s in rep["level_specs"]])
+
+ds = zv.open("scan.zarrvectors")
+print(ds.levels)
+for i in ds.levels:
+    lv = ds.level(i)
+    print(i, lv.vertex_count, lv.scale, lv.resolution, lv.attribute_names("vertex"))
+print(sorted(ds.capabilities))
 ```
 
-Bin aggregation is fixed: source vertices collapse to their centroid.
-There is no aggregation-mode parameter.
-
-After building, the resolution summary is:
-
+```text
+('per_object',)
+2 [1000, 125]
+(0, 1, 2)
+0 100000 (200.0, 200.0, 200.0) (50.0, 50.0, 50.0) ('color', 'confidence', 'intensity', 'label')
+1 1000 (400.0, 400.0, 400.0) (100.0, 100.0, 100.0) ()
+2 125 (800.0, 800.0, 800.0) (200.0, 200.0, 200.0) ()
+['multiscale_links', 'shared_fragments']
 ```
-0:  100000 vertices  (bin_ratio 1×1×1)
-1:  12890 vertices   (bin_ratio 2×2×2)
-2:  1613 vertices    (bin_ratio 4×4×4)
-```
 
-### Anisotropic pyramids
+Each entry in `factors` is a `(coarsen_factor, sparsity_factor)` pair applied to
+the level below, so they compound: `[(2.0, 1.0), (2.0, 1.0)]` bins at 2× and 4×
+the root bin. Either factor at `1.0` opts out — sparsity drops whole objects,
+which does nothing to a point cloud written without object ids. Vertices within
+a bin collapse to their centroid; `zv.coarsen_methods()` lists the installed
+coarseners, and `"per_object"` is the one in core.
 
-For data with anisotropic resolution (e.g. 4×4×25 nm voxels), use an
-anisotropic `bin_ratio` that coarsens proportionally in each axis:
+Pass `chunk_scale_factors=` alongside `factors=`, or every level inherits the
+root chunk shape and `resolution(scale=)` has nothing to tell the levels apart
+by. Re-open the dataset after building: the handle that built the pyramid keeps
+stale level metadata. Note that per-vertex attributes are **not** carried into a
+coarsened level — `attribute_names("vertex")` is empty above level 0.
+
+A viewer usually wants a level by physical size rather than by index, which is
+what `resolution(scale=)` is for:
 
 ```python
-# Anisotropic: coarsen z 2× less than x,y (data is 6× coarser in z already)
-build_pyramid(
-    "aniso.zarrvectors",
-    factors=[(2.0, 1.00), (4.0, 1.00)],
-)
+print(ds.resolution(scale=400.0).index, ds.resolution(scale=800.0).index)
+print(ds.read(level=1).vertex_count)
+print(ds.level(1).read())
+```
+
+```text
+1 2
+1000
+ReadResult(kind='point_cloud', vertices=1000)
+```
+
+There is no supported call for adding or rebuilding a *single* level:
+`zarr_vectors.multiresolution.coarsen.coarsen_level` and
+`zarr_vectors.ops.refresh.rebuild_pyramid_from_level` both reach past the
+contract into internal modules, and using either is a gap to report rather than
+a settled spelling. `Dataset.build_pyramid` covers the whole-pyramid case,
+which is the common one.
+
+### Overview first, then detail
+
+Overview-first rendering is a whole read of a coarse level, then a bounding-box
+read at level 0 for the region of interest:
+
+```python
+overview = ds.read(level=2)
+detail = ds.select(
+    bbox=((400.0, 400.0, 400.0), (600.0, 600.0, 600.0)),
+    level=0,
+).read()
+print(overview.vertex_count, detail.vertex_count)
+```
+
+```text
+125 765
+```
+
+Do **not** put the box on the coarse level instead. Bounding-box queries against
+coarsened levels currently under-report, and they under-report silently:
+
+```python
+box = ((400.0, 400.0, 400.0), (600.0, 600.0, 600.0))
+lo, hi = np.array(box[0]), np.array(box[1])
+for lvl in ds.levels:
+    queried = ds.select(bbox=box, level=lvl).count()
+    whole = ds.read(level=lvl).positions
+    in_box = int((((whole >= lo) & (whole <= hi)).all(axis=1)).sum())
+    print(lvl, queried, in_box)
+```
+
+```text
+0 765 765
+1 0 8
+2 0 1
+```
+
+Level 0 agrees exactly; the coarse levels return nothing while genuinely
+holding vertices in the box. Read a coarse level whole and filter in memory.
+
+### Anisotropic data
+
+For data with anisotropic sampling (4×4×25 nm voxels, say), the anisotropy
+belongs in the layout — `cells` takes one count per axis — and in
+`chunk_scale_factors`, whose entries may be per-axis tuples. The coarsen factor
+itself is a single number, so binning coarsens isotropically:
+
+```python
+aniso = zv.create("aniso.zarrvectors", schema=zv.Schema(
+    bounds=((0.0, 0.0, 0.0), (1000.0, 1000.0, 1000.0)),
+    kind="point_cloud",
+    expected=zv.SizeHints(n_vertices=50_000),
+    layout=zv.Layout(cells=(8, 8, 2)),      # coarse in z, fine in x and y
+))
+rng = np.random.default_rng(7)
+aniso.add_points(rng.uniform(0, 1000, (50_000, 3)).astype(np.float32))
+print(aniso.level(0).scale, aniso.level(0).resolution)
+
+aniso = zv.open("aniso.zarrvectors", mode="r+")
+aniso.build_pyramid(factors=[(2.0, 1.0)], chunk_scale_factors=[(2, 2, 1)])
+
+aniso = zv.open("aniso.zarrvectors")
+for i in aniso.levels:
+    print(i, aniso.level(i).vertex_count, aniso.level(i).scale, aniso.level(i).resolution)
+```
+
+```text
+(125.0, 125.0, 500.0) (31.25, 31.25, 125.0)
+0 50000 (125.0, 125.0, 500.0) (31.25, 31.25, 125.0)
+1 1024 (250.0, 250.0, 500.0) (62.5, 62.5, 250.0)
 ```
 
 ---
@@ -255,50 +458,101 @@ CLI) live in the companion package **`zarr-vectors-tools`**.
 
 ## Validation
 
+Validation levels 1–5 check progressively deeper properties of the store. Call
+the module function with a filesystem path rather than `Dataset.validate()`,
+which hands the validator a `file://` URL and reports `FAIL` on a perfectly
+good local store:
+
 ```python
 from zarr_vectors.validate import validate
 
 result = validate("scan.zarrvectors", level=5)
 print(result.summary())
-# Level 5 validation: PASS
-#   42 passed, 0 warnings, 0 errors
+print(result.ok, len(result.passed), len(result.warnings), len(result.errors))
 ```
+
+```text
+Level 5 validation: PASS
+  40 passed, 1 warnings, 0 errors
+  WARN:  Point cloud but links array exists
+True 40 1 0
+```
+
+That warning is `build_pyramid`'s doing — it writes the cross-level links array
+into the point-cloud store. A point cloud that has never been coarsened has no
+`links/` at all. Note that `zarr_vectors.validate` is *undecided*: stable in
+practice, but its result objects carry no compatibility promise. See
+[Validation](../io/validation_and_repair.md) for what each level checks.
 
 ---
 
 ## Common pitfalls
 
-**`bin_shape` does not divide `chunk_shape`.**
-The writer raises `ValueError` immediately. Check that
-`chunk_shape[d] / bin_shape[d]` is an integer for every axis.
+**`add_points` is a one-shot write, not an append.**
+A second call re-derives the grid from its own batch and overwrites what was
+there; a batch that lands inside the first batch's extent silently replaces it.
+Assemble the full array first, or write each batch to its own store.
 
-```python
-# This will raise ValueError:
-write_points("bad.zarrvectors", positions,
-             chunk_shape=(200., 200., 200.),
-             bin_shape=(60., 60., 60.))   # 200/60 = 3.33... ✗
+```pycon
+>>> ds2.add_points(first_1000_points)      # 1 000 points
+>>> ds2.add_points(another_500_points)     # 500 more, same region
+>>> ds2.read().vertex_count                # not 1 500
+500
 ```
 
-**Writing float64 positions.**
-ZVF stores positions as float32 by default. If your coordinates require
-float64 precision (sub-nanometre accuracy at kilometre scale), pass
-`dtype=np.float64` to preserve precision:
+**Bin shape not dividing chunk shape.**
+On this surface it cannot happen: `Layout` derives the bin shape *by dividing*
+the chunk shape into `subcells` per axis, so any `subcells` divides exactly
+(`subcells=3` over a 200 µm chunk gives 66.667 µm bins, which is correct, not a
+rounding bug). Code that sets `bin_shape` by hand through
+`zarr_vectors.building.write_points` is on its own — the writer does not check
+— so check it yourself:
 
-```python
-write_points("precise.zarrvectors", positions_f64,
-             chunk_shape=(200., 200., 200.),
-             dtype=np.float64)
+```pycon
+>>> from zarr_vectors import building
+>>> building.validate_bin_shape_divides_chunk((200.0, 200.0, 200.0), (60.0, 60.0, 60.0))
+MetadataError: chunk_shape[0]=200.0 is not an integer multiple of bin_shape[0]=60.0 (ratio=3.333333)
 ```
 
-Be aware that float64 doubles storage size and reduces Blosc compression
-ratio.
+**float64 positions.**
+`Schema(position_dtype="float64")` is recorded on the schema, but `add_points`
+writes float32 today, so coordinates that need sub-nanometre precision at
+kilometre scale come back rounded. Until the api carries the declaration
+through, `building.write_points(..., dtype="float64")` is the way to actually
+store float64 — verify with `ds.read().positions.dtype` rather than assuming.
+Be aware that float64 doubles storage size and reduces Blosc compression ratio.
 
-**Attribute array has wrong length.**
-The write function checks that each attribute array has the same length as
-`positions`. If you have a mismatch, check whether your data pipeline
-dropped or duplicated rows.
+**Attribute array of the wrong length.**
+An attribute array shorter than `positions` fails during binning, with an index
+error that names neither the attribute nor the writer:
 
-**Reading a large store without bbox.**
-`read_points` without `bbox` loads all vertices into memory. For stores
-with > 50M vertices this may exhaust RAM. Use a bbox query or the lazy
-API (see [Lazy loading](../multiscale/lazy_loading.md)).
+```pycon
+>>> ds.add_points(positions_100, attributes={"intensity": intensity_99})
+IndexError: index 99 is out of bounds for axis 0 with size 99
+```
+
+If you see that, check whether your data pipeline dropped or duplicated rows.
+
+**Reading a large store without a bbox.**
+`ds.read()` loads every vertex into memory. For stores with tens of millions of
+vertices, either take a bounding box, cap the result with `.limit(n)`, or walk
+the query's cells and read one at a time:
+
+```python
+big = zv.open("scan.zarrvectors")
+q = big.select(bbox=((0.0, 0.0, 0.0), (400.0, 400.0, 400.0)))
+cells = q.cells()
+print(cells, len(cells))
+print(sum(big.select(cells=[c]).read().vertex_count for c in cells), q.count())
+```
+
+```text
+CellSet(27 cell(s)) 27
+21537 6465
+```
+
+A per-cell read returns whole chunks, so it sees more vertices than the exact
+box does — filter each part as it arrives. (`Query.iter_cells()` is the
+generator form of that loop and raises `NotImplementedError` for now: the
+readers under it materialise the whole result, so a generator would use the
+same peak memory while implying it does not.)

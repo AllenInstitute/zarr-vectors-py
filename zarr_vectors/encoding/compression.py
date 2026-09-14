@@ -21,7 +21,8 @@ _BYTES_SERIALIZER: dict[str, Any] = {"name": "bytes"}
 # zarr 3.2.1's default compressor for numeric arrays, matching
 # ``default_compressors_v3`` in zarr.core.array — a Zstd codec at level 0
 # with checksum disabled.  Kept as a module-level constant so the value is
-# trivial to inspect from tests and the benchmark notebook.
+# trivial to inspect from tests and from the 07_compression benchmark
+# notebook (zarr-vectors-tools, benchmarks/internals/).
 ZARR_V3_DEFAULT_ZSTD_CODEC: dict[str, Any] = {
     "name": "zstd",
     "configuration": {"level": 0, "checksum": False},

@@ -18,6 +18,7 @@ from __future__ import annotations
 import copy
 import json
 from dataclasses import dataclass, field
+from collections.abc import Sequence
 from typing import Any, TypedDict
 
 import numpy as np
@@ -557,10 +558,21 @@ class LevelMetadata:
     Attributes:
         level: Integer level index (0 = full resolution).
         vertex_count: Total vertices at this level.
-        arrays_present: List of array names present at this level.
+        arrays_present: FAMILY names present at this level -- ``"vertices"``,
+            ``"vertex_attributes"``, ``"links"``, ``"object_index"`` -- never
+            ``"<family>/<name>"``.  Readers gate on the family, so a per-name
+            entry advertises nothing.  Hand-maintaining this list is how it
+            drifts (``create_store`` long declared ``[vertices]`` while also
+            creating ``vertex_fragments``); prefer
+            :func:`zarr_vectors.building.refresh_arrays_present`, which
+            derives it from what is actually on disk.
         bin_shape: Supervoxel edge lengths at this level (None for level 0,
             which inherits base_bin_shape from root).
-        bin_ratio: Integer fold-change per axis relative to level 0.
+        bin_ratio: Fold-change per axis relative to level 0.  Float,
+            not int: a coarsen factor may be fractional, and this is
+            what becomes the NGFF ``scale``.  ``compute_bin_ratio``
+            keeps its integer contract for callers that want a whole
+            fold.
             ``(1,1,1)`` for level 0, ``(2,2,2)`` for 2× coarser bins, etc.
         object_sparsity: Fraction of objects retained at this level (0,1].
         coarsening_method: How this level was generated.
@@ -583,7 +595,7 @@ class LevelMetadata:
     vertex_count: int
     arrays_present: list[str]
     bin_shape: tuple[float, ...] | None = None
-    bin_ratio: tuple[int, ...] | None = None
+    bin_ratio: tuple[float, ...] | None = None
     chunk_shape: tuple[float, ...] | None = None
     """Per-level physical chunk size override.  ``None`` means the level
     inherits :attr:`RootMetadata.chunk_shape`.  When set, each axis must
@@ -612,6 +624,35 @@ class LevelMetadata:
     """True when per-chunk fragments represent metavertices that
     may be referenced by multiple objects' manifests (the shared-
     metavertex case)."""
+    fragments_tile: bool = False
+    """True when EVERY chunk in this level has a vertex fragment index
+    that tiles its buffer — ``ChunkFragmentIndex.tiles(n_rows)`` holds for
+    all of them.
+
+    Under that condition the concatenation of a chunk's fragments *is*
+    its vertex buffer, so a bulk read — no bbox, no object or group
+    filter, no attribute filter — can return the buffer without reading
+    ``vertex_fragments`` at all.  Measured: 19.0 ms -> 14.3 ms on a
+    10^6-point / 125-chunk level, byte-identical result.  The saving is
+    the per-chunk object reads and decompressions the index costs, not
+    the index decode itself, which is why no reader-side cleverness can
+    reach it.
+
+    Unlike every other field here, this is a claim about what has *not*
+    happened since — that nothing has retired a row.  It is therefore set
+    only by a bulk writer that lays each chunk out bin by bin and writes
+    nothing else, stamped after those writes; and it is cleared by
+    :meth:`Group.write_bytes` on any later write to ``vertices`` or
+    ``vertex_fragments``, the chokepoint every such write passes through.
+    Readers additionally re-verify it on the first chunk they read, and
+    ``validate_consistency`` checks it against the store.
+
+    A stale True is a wrong answer, not a crash: rows no fragment
+    references come back, and per-vertex attribute columns desync from
+    the positions they describe.  Hence the three independent guards.
+    Absent (the default) means "unknown", which is what every store
+    written before this field says, and costs only the read it would
+    otherwise have saved."""
 
     def to_dict(self) -> dict[str, Any]:
         """Serialise to a JSON-compatible dict."""
@@ -642,6 +683,8 @@ class LevelMetadata:
             d["inherited_num_objects"] = int(self.inherited_num_objects)
         if self.shared_fragments:
             d["shared_fragments"] = True
+        if self.fragments_tile:
+            d["fragments_tile"] = True
         return {"zarr_vectors_level": d}
 
     @classmethod
@@ -676,7 +719,7 @@ class LevelMetadata:
             vertex_count=lv["vertex_count"],
             arrays_present=lv["arrays_present"],
             bin_shape=tuple(bs) if bs else None,
-            bin_ratio=tuple(int(x) for x in br) if br else None,
+            bin_ratio=tuple(float(x) for x in br) if br else None,
             chunk_shape=tuple(float(x) for x in cs) if cs else None,
             object_sparsity=lv.get("object_sparsity", 1.0),
             coarsening_method=lv.get("coarsening_method", "none"),
@@ -687,6 +730,7 @@ class LevelMetadata:
             preserves_object_ids=bool(lv.get("preserves_object_ids", False)),
             inherited_num_objects=lv.get("inherited_num_objects"),
             shared_fragments=bool(lv.get("shared_fragments", False)),
+            fragments_tile=bool(lv.get("fragments_tile", False)),
         )
 
     def validate(self) -> None:
@@ -780,6 +824,122 @@ class LevelMetadata:
                     f"inherited_num_objects must be >= 0, got "
                     f"{self.inherited_num_objects}"
                 )
+
+
+    @classmethod
+    def from_parent(
+        cls,
+        root_meta: "RootMetadata",
+        parent_meta: "LevelMetadata | None",
+        *,
+        level: int,
+        vertex_count: int,
+        arrays_present: list[str],
+        bin_scale_from_parent: float | Sequence[float] = 1.0,
+        chunk_scale_from_parent: int | Sequence[int] = 1,
+        object_sparsity: float = 1.0,
+        coarsening_method: str | None = None,
+        preserves_object_ids: bool = False,
+        inherited_num_objects: int | None = None,
+        shared_fragments: bool = False,
+        parent_level: int | None = None,
+    ) -> "LevelMetadata":
+        """Build a coarser level's metadata from the level below it.
+
+        This block is hand-written at twenty-odd sites across core and its
+        consumers, and the copies have already diverged: one computed
+        ``bin_shape`` against the ROOT instead of the parent, so every level
+        of that pyramid got the same bin.  The arithmetic is small and the
+        frames are easy to mix up (see the module comment above), which is
+        exactly the shape of thing that belongs in one place.
+
+        Both scale arguments are **parent-relative**, matching
+        ``coarsen_level``'s keywords; ``bin_ratio`` is derived
+        level-0-relative because that is what becomes the NGFF ``scale``,
+        and ``chunk_shape`` is omitted when it equals the root's, matching
+        the on-disk convention.
+
+        A factor of ``1.0`` is a true no-op, so a coarsener that does not
+        bin at all -- a skeleton pruner keeps the root bin at every level --
+        is expressed by leaving the defaults alone rather than being
+        assumed away.
+
+        Args:
+            parent_meta: The level below.  ``None`` when the parent is
+                level 0, which carries no bin_shape of its own.
+            bin_scale_from_parent: Bin factor against the PARENT's bin.
+            chunk_scale_from_parent: Chunk factor against the PARENT's
+                chunk grid.  Positive integers only (nested grids).
+
+        Raises:
+            MetadataError: If a factor is non-positive, or the resulting
+                level fails its own cross-level validation.
+        """
+        parent_bin = get_level_bin_shape(root_meta, parent_meta)
+        parent_chunk = get_level_chunk_shape(root_meta, parent_meta)
+        ndim = len(parent_bin)
+
+        def _per_axis(value: Any, what: str) -> tuple[float, ...]:
+            seq = (
+                tuple(float(v) for v in value)
+                if isinstance(value, (tuple, list))
+                else (float(value),) * ndim
+            )
+            if len(seq) != ndim:
+                raise MetadataError(
+                    f"{what} has {len(seq)} axes, level has {ndim}"
+                )
+            if any(v <= 0 for v in seq):
+                raise MetadataError(f"{what} must be positive, got {seq}")
+            return seq
+
+        bin_f = _per_axis(bin_scale_from_parent, "bin_scale_from_parent")
+        chunk_f = _per_axis(chunk_scale_from_parent, "chunk_scale_from_parent")
+        for axis, f in enumerate(chunk_f):
+            if abs(f - round(f)) > 1e-9:
+                raise MetadataError(
+                    f"chunk_scale_from_parent axis {axis} = {f} is not an "
+                    f"integer; chunk grids nest"
+                )
+
+        bin_shape = tuple(b * f for b, f in zip(parent_bin, bin_f))
+        chunk_shape = tuple(c * f for c, f in zip(parent_chunk, chunk_f))
+
+        root_bin = tuple(float(b) for b in root_meta.effective_bin_shape)
+        bin_ratio = tuple(
+            (float(t) / float(r)) if r else 1.0
+            for t, r in zip(bin_shape, root_bin)
+        )
+
+        # The on-disk convention: a level that matches root omits the field
+        # rather than restating it.
+        root_chunk = tuple(float(c) for c in root_meta.chunk_shape)
+        chunk_override: tuple[float, ...] | None = (
+            None
+            if all(abs(a - b) < 1e-9 for a, b in zip(chunk_shape, root_chunk))
+            else chunk_shape
+        )
+
+        meta = cls(
+            level=level,
+            vertex_count=int(vertex_count),
+            arrays_present=list(arrays_present),
+            bin_shape=bin_shape,
+            bin_ratio=bin_ratio,
+            chunk_shape=chunk_override,
+            object_sparsity=object_sparsity,
+            coarsening_method=coarsening_method,
+            parent_level=(
+                parent_level if parent_level is not None
+                else (parent_meta.level if parent_meta is not None else 0)
+            ),
+            preserves_object_ids=preserves_object_ids,
+            inherited_num_objects=inherited_num_objects,
+            shared_fragments=shared_fragments,
+        )
+        meta.validate()
+        validate_level_chunk_shape_against_root(root_meta, meta)
+        return meta
 
 
 def _to_python_scalar(v: Any) -> Any:
@@ -1029,17 +1189,26 @@ def get_level_chunk_shape(
     return root_meta.chunk_shape
 
 
-def chunk_scale_factor(
+def chunk_scale_from_root(
     root_meta: RootMetadata,
     level_meta: LevelMetadata | None,
 ) -> tuple[int, ...]:
-    """Return the per-axis integer multiple of root ``chunk_shape``.
+    """Return the per-axis integer multiple of ROOT ``chunk_shape``.
 
     For a level whose ``chunk_shape`` is ``r_i × root_chunk_shape[i]``
     along axis ``i``, returns ``(r_0, r_1, ..., r_{ndim-1})``.  A level
     that inherits root returns all-ones.  Raises :class:`MetadataError`
     when the per-level chunk_shape isn't an integer multiple of root
     along some axis (nesting violation).
+
+    **Root-relative**, and named so.  ``coarsen_level``'s
+    ``chunk_scale_factor=`` keyword is *parent*-relative — it multiplies
+    the SOURCE level's chunk_shape — so on a pyramid built with a repeated
+    factor the two quantities diverge (``[2, 2]`` gives parent-factors
+    2 and 2, but root-scales 2 and 4).  While both were called
+    ``chunk_scale_factor`` nothing at the call site distinguished them,
+    and reading one as the other compounds silently.  The old name remains
+    as a deprecated alias.
     """
     eff = get_level_chunk_shape(root_meta, level_meta)
     root_cs = root_meta.chunk_shape
@@ -1066,6 +1235,144 @@ def chunk_scale_factor(
     return tuple(ratios)
 
 
+def chunk_scale_factor(
+    root_meta: RootMetadata,
+    level_meta: LevelMetadata | None,
+) -> tuple[int, ...]:
+    """Deprecated alias for :func:`chunk_scale_from_root`."""
+    import warnings
+
+    warnings.warn(
+        "metadata.chunk_scale_factor() is renamed chunk_scale_from_root(). "
+        "It is ROOT-relative, whereas coarsen_level(chunk_scale_factor=) is "
+        "PARENT-relative; the shared name hid that they are different "
+        "quantities on any pyramid with more than one coarser level.",
+        DeprecationWarning,
+        stacklevel=2,
+    )
+    return chunk_scale_from_root(root_meta, level_meta)
+
+
+# ---------------------------------------------------------------------------
+# Three reference frames, and how to move between them
+# ---------------------------------------------------------------------------
+#
+# A pyramid level carries four quantities that all look like "a factor" and
+# are measured against three different things:
+#
+#   bin_shape            ABSOLUTE  -- edge lengths, in world units.
+#   chunk_shape          ABSOLUTE  -- edge lengths, in world units.
+#   bin_ratio            vs LEVEL 0 -- what becomes the NGFF ``scale``.
+#   coarsen_factor=      vs PARENT  -- what ``coarsen_level`` multiplies the
+#                                     SOURCE level's bin by.
+#   chunk_scale_factor=  vs PARENT  -- likewise for the chunk grid.
+#
+# Nothing in a name or a type distinguishes them, and reading one as another
+# compounds silently.  Two real bugs came from exactly that: a pyramid
+# refresh recovered ``coarsen_factor`` from the level-0-relative
+# ``bin_ratio`` and squared it (levels came back at 2x, 8x, 64x instead of
+# 2x, 4x, 8x), and a coarsener multiplied the ROOT bin instead of the
+# parent's so every level got the same bin.
+#
+# The helpers below are the supported way to move between the frames.
+# ``chunk_scale_from_root`` is the root-relative chunk counterpart and is
+# named for its frame for the same reason.
+
+
+def get_level_bin_shape(
+    root_meta: RootMetadata,
+    level_meta: LevelMetadata | None,
+) -> tuple[float, ...]:
+    """This level's ABSOLUTE bin shape.
+
+    The bin counterpart of :func:`get_level_chunk_shape`, resolved in the
+    order the store actually records things:
+
+    1. ``level_meta.bin_shape`` when set -- the authoritative absolute value;
+    2. else ``root.effective_bin_shape * level_meta.bin_ratio``, because a
+       level round-tripped through a store that had no NGFF translation
+       keeps its ratio but loses its shape;
+    3. else the root's effective bin (level 0, or a level that does not bin).
+
+    ``bin_shape`` is preferred over ``bin_ratio`` deliberately: the ratio is
+    the level-0-relative view and reconstructing an absolute from it is one
+    multiplication further from the source of truth.
+    """
+    if level_meta is not None and level_meta.bin_shape:
+        return tuple(float(b) for b in level_meta.bin_shape)
+    base = tuple(float(b) for b in root_meta.effective_bin_shape)
+    if level_meta is not None and level_meta.bin_ratio:
+        if len(level_meta.bin_ratio) != len(base):
+            raise MetadataError(
+                f"bin_ratio has {len(level_meta.bin_ratio)} dims, root bin "
+                f"has {len(base)}"
+            )
+        return tuple(b * float(r) for b, r in zip(base, level_meta.bin_ratio))
+    return base
+
+
+def level_factor(
+    root_meta: RootMetadata,
+    level_meta: LevelMetadata,
+    parent_meta: LevelMetadata | None,
+) -> tuple[float, ...]:
+    """The PARENT-relative bin factor -- what ``coarsen_factor`` means.
+
+    ``bin_ratio`` is level-0-relative and ``bin_shape`` is absolute, so
+    neither is the number ``coarsen_level`` wants.  This is that number.
+
+    ``parent_meta`` is ``None`` for a level whose parent is level 0.
+
+    Raises:
+        MetadataError: If the per-axis factors are not uniform.  The
+            caller reduces this to a scalar (``coarsen_level`` takes one),
+            so letting axis 0 speak for the rest would silently discard
+            the others.
+    """
+    child = get_level_bin_shape(root_meta, level_meta)
+    parent = get_level_bin_shape(root_meta, parent_meta)
+    factors = tuple(
+        (float(c) / float(p)) if p else 1.0 for c, p in zip(child, parent)
+    )
+    if factors and any(abs(f - factors[0]) > 1e-9 for f in factors):
+        raise MetadataError(
+            f"per-axis bin factors {factors} are not uniform; a scalar "
+            f"coarsen_factor cannot express this level. Pass the per-axis "
+            f"bin_shape explicitly instead."
+        )
+    return factors
+
+
+def level_chunk_scale(
+    root_meta: RootMetadata,
+    level_meta: LevelMetadata,
+    parent_meta: LevelMetadata | None,
+) -> tuple[int, ...]:
+    """The PARENT-relative chunk factor -- what ``chunk_scale_factor`` means.
+
+    The chunk counterpart of :func:`level_factor`.  Contrast
+    :func:`chunk_scale_from_root`, which answers the level-0-relative
+    question and is what ``LevelMetadata`` records.
+    """
+    child = get_level_chunk_shape(root_meta, level_meta)
+    parent = get_level_chunk_shape(root_meta, parent_meta)
+    out: list[int] = []
+    for axis, (c, p) in enumerate(zip(child, parent)):
+        if p <= 0:
+            raise MetadataError(
+                f"parent chunk_shape axis {axis} = {p}; must be > 0"
+            )
+        ratio_f = float(c) / float(p)
+        ratio_i = int(round(ratio_f))
+        if ratio_i < 1 or abs(ratio_f - ratio_i) > 1e-9:
+            raise MetadataError(
+                f"chunk_shape axis {axis} = {c} is not a positive integer "
+                f"multiple of the parent's {p} (ratio {ratio_f})"
+            )
+        out.append(ratio_i)
+    return tuple(out)
+
+
 def validate_level_chunk_shape_against_root(
     root_meta: RootMetadata,
     level_meta: LevelMetadata,
@@ -1080,16 +1387,27 @@ def validate_level_chunk_shape_against_root(
        so bins still tile chunks cleanly at the level's resolution.
 
     Self-consistency (positivity, rank match against root) is checked
-    independently by :meth:`LevelMetadata.validate`.  Both this helper
-    and that method are no-ops when ``level_meta.chunk_shape is None``.
+    independently by :meth:`LevelMetadata.validate`.
+
+    Both this helper and that method are no-ops when
+    ``level_meta.chunk_shape is None``.
+
+    The no-op is deliberate and must stay.  Extending the divisibility
+    check to levels that INHERIT root's ``chunk_shape`` looks like it
+    would close a gap -- a coarse level takes its ``bin_shape`` from the
+    coarsen factor while keeping root's grid -- but it rejects the normal
+    case: a coarse level's bin is routinely LARGER than the chunk it sits
+    in (bin 200 in a chunk of 100), and "bins tile chunks" is only an
+    invariant while bins are the finer of the two.
     """
     if level_meta.chunk_shape is None:
         return
+    effective_chunk = level_meta.chunk_shape
     # Triggers the nesting check.
-    _ratios = chunk_scale_factor(root_meta, level_meta)
+    _ratios = chunk_scale_from_root(root_meta, level_meta)
     del _ratios
 
-    # Per-level bin_shape must still divide the per-level chunk_shape.
+    # Per-level bin_shape must still divide the effective chunk_shape.
     bin_shape: tuple[float, ...] | None
     if level_meta.bin_shape is not None:
         bin_shape = level_meta.bin_shape
@@ -1099,12 +1417,25 @@ def validate_level_chunk_shape_against_root(
         bin_shape = None
     if bin_shape is None:
         return
-    for axis, (cs, bs) in enumerate(zip(level_meta.chunk_shape, bin_shape)):
+    for axis, (cs, bs) in enumerate(zip(effective_chunk, bin_shape)):
         if bs <= 0:
             raise MetadataError(
                 f"Level {level_meta.level} bin_shape axis {axis} = {bs}; "
                 "must be > 0"
             )
+        if float(bs) > float(cs):
+            # A coarse level's bin routinely exceeds the chunk it sits in
+            # (bin 240 in a chunk of 120 -- one bin spanning two chunks is
+            # exactly what coarsening produces).  "Bins tile chunks" is an
+            # invariant only while bins are the FINER of the two; above
+            # that the meaningful question is whether the bin is a whole
+            # multiple of the chunk, which the grid does not require.
+            #
+            # This is why the helper had never been called from a write
+            # path: run as written it rejects levels core's own coarsener
+            # produces.  Checking only the bin <= chunk case is what makes
+            # it safe to enforce.
+            continue
         ratio_f = float(cs) / float(bs)
         ratio_i = int(round(ratio_f))
         if ratio_i < 1 or abs(ratio_f - ratio_i) > 1e-9:

@@ -3,7 +3,7 @@
 ## Terms
 
 **Reference fixture**
-: A small, pre-written ZVF store committed to the repository under
+: A small, pre-written Zarr Vectors store committed to the repository under
   `tests/fixtures/`. Reference fixtures are the ground truth for
   compliance testing: any conforming reader must produce correct output
   when reading them.
@@ -28,8 +28,8 @@
 ## Introduction
 
 The compliance test suite serves two purposes. First, it ensures that
-`zarr-vectors-py` correctly reads ZVF stores written by any conforming
-implementation. Second, it documents the ZVF format in executable form:
+`zarr-vectors-py` correctly reads Zarr Vectors stores written by any conforming
+implementation. Second, it documents the Zarr Vectors format in executable form:
 the reference fixtures are concrete examples of valid stores that
 contributors can inspect.
 
@@ -47,7 +47,7 @@ add new functionality must include new tests.
 tests/
 ├── fixtures/                       ← reference stores (committed to repo)
 │   ├── point_cloud_3d/
-│   │   ├── store.zarrvectors/      ← reference ZVF store (small)
+│   │   ├── store.zarrvectors/      ← reference Zarr Vectors store (small)
 │   │   └── expected.npz           ← golden outputs
 │   ├── streamline_3d_multiscale/
 │   │   ├── store.zarrvectors/

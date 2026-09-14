@@ -425,3 +425,88 @@ def test_links_group_is_a_group_not_an_array() -> None:
     assert _is_per_chunk_array(f"{links_group_path(-1)}/0.0.+1") is True
     assert _is_per_chunk_array("link_attributes/w/0") is False
     assert _is_per_chunk_array("link_attributes/w/0/0.0.+1") is True
+
+
+class TestIntraCellDtypeIsHonoured:
+    """``read_links`` must decode each cell at the dtype its array declares.
+
+    ``write_chunk_links`` stamps the payload dtype onto the offsets array and
+    ``iter_link_cells`` honours it, but ``read_links`` /
+    ``read_links_for_tuple`` used to decode every cell at a hard-coded int64.
+    An int32-declared array — which is what BRIDGE stamps for its per-chunk
+    node graph via ``create_node_graph_array`` — then yields a quarter of the
+    rows on an even element count and raises ``cannot reshape array of size N``
+    on an odd one.
+    """
+
+    @staticmethod
+    def _int32_intra_store(n_edges: int) -> tuple[str, np.ndarray]:
+        """Store whose intra links array is declared (and written) int32."""
+        from zarr_vectors.core.arrays import (
+            create_links_array,
+            create_vertices_array,
+            write_chunk_links,
+            write_chunk_vertices,
+        )
+        from zarr_vectors.core.store import create_store
+
+        path = os.path.join(tempfile.mkdtemp(), "s.zarrvectors")
+        root = create_store(
+            path, bounds=([0.0, 0.0, 0.0], [64.0, 64.0, 64.0]),
+            chunk_shape=(32.0, 32.0, 32.0), geometry_types=["point_cloud"],
+        )
+        lg = get_resolution_level(root, 0)
+
+        n_verts = n_edges + 1
+        pos = np.stack([
+            np.linspace(0.0, 30.0, n_verts),
+            np.zeros(n_verts), np.zeros(n_verts),
+        ], axis=1).astype(np.float32)
+        create_vertices_array(lg, dtype="float32")
+        write_chunk_vertices(lg, (0, 0, 0), [pos], dtype=np.float32)
+
+        edges = np.stack([
+            np.arange(n_edges, dtype=np.int32),
+            np.arange(1, n_edges + 1, dtype=np.int32),
+        ], axis=1)
+        create_links_array(lg, 2, dtype="int32", delta=0, sid_ndim=3)
+        write_chunk_links(lg, (0, 0, 0), [edges], dtype=np.int32)
+        return path, edges
+
+    @pytest.mark.parametrize("n_edges", [43, 44])
+    def test_odd_and_even_edge_counts_round_trip(self, n_edges: int) -> None:
+        # 43 is the case that RAISED pre-fix; 44 is the one that silently
+        # returned a quarter of the rows.
+        path, edges = self._int32_intra_store(n_edges)
+        lg = get_resolution_level(open_store(path), 0)
+
+        records = read_links(lg, delta=0)
+        assert len(records) == n_edges, (
+            f"expected {n_edges} records, got {len(records)}"
+        )
+        got = np.asarray([[va, vb] for (_ca, va), (_cb, vb) in records], dtype=np.int32)
+        assert np.array_equal(got, edges)
+
+    def test_agrees_with_iter_link_cells(self) -> None:
+        # iter_link_cells always honoured the stamp; the two readers must not
+        # disagree about the same bytes.
+        from zarr_vectors.core.arrays import iter_link_cells
+
+        path, edges = self._int32_intra_store(43)
+        lg = get_resolution_level(open_store(path), 0)
+
+        via_cells = np.concatenate(
+            [np.asarray(g) for _seg, _off, _src, groups in iter_link_cells(lg, 0)
+             for g in groups],
+            axis=0,
+        )
+        via_read = np.asarray(
+            [[va, vb] for (_ca, va), (_cb, vb) in read_links(lg, delta=0)],
+        )
+        assert via_cells.shape == via_read.shape == edges.shape
+        assert np.array_equal(via_cells, via_read)
+
+    def test_int64_cells_are_unaffected(self) -> None:
+        # The fallback must stay int64 for arrays written before the stamp.
+        lg = get_resolution_level(open_store(_graph_spanning_two_chunks(5)), 0)
+        assert len(read_links(lg, delta=0)) == 5

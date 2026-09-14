@@ -3,7 +3,7 @@
 ## Terms
 
 **Rechunking**
-: The process of rewriting an existing ZVF store with a different
+: The process of rewriting an existing Zarr Vectors store with a different
   `chunk_shape` (and optionally a different `bin_shape`). Rechunking
   produces a new store; the original is not modified in-place unless
   explicitly requested.
@@ -50,7 +50,7 @@ is poorly matched to the actual query access pattern.
 
 Rechunking is also necessary when importing data from a different format
 (e.g. TRK or LAS) that has its own chunking scheme, and when building a
-ZVF store that will be served from cloud storage where chunk size
+Zarr Vectors store that will be served from cloud storage where chunk size
 requirements differ from those for local access.
 
 ---

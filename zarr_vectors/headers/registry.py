@@ -13,7 +13,8 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
-from zarr_vectors.core.store import FsGroup, open_store
+from zarr_vectors.core.group import Group
+from zarr_vectors.core.store import open_store
 
 
 class HeaderRegistry:
@@ -21,16 +22,22 @@ class HeaderRegistry:
 
     Args:
         store_path_or_root: Either a filesystem path (str/Path) to the
-            store, or an already-open :class:`FsGroup` root handle.
+            store, or an already-open :class:`Group` root handle.
+
+    The handle check is against ``Group``, not ``FsGroup``.  ``FsGroup``
+    is returned only when the backing store happens to be a
+    ``LocalStore``, so testing for it meant a cloud-backed root fell
+    through to ``open_store(str(root))`` -- which stringifies a Group and
+    then tries to open the result as a path.
     """
 
-    def __init__(self, store_path_or_root: str | Path | FsGroup) -> None:
-        if isinstance(store_path_or_root, FsGroup):
+    def __init__(self, store_path_or_root: str | Path | Group) -> None:
+        if isinstance(store_path_or_root, Group):
             self._root = store_path_or_root
         else:
             self._root = open_store(str(store_path_or_root), mode="r+")
 
-    def _headers_group(self, create: bool = False) -> FsGroup:
+    def _headers_group(self, create: bool = False) -> Group:
         """Get or create the /headers/ group."""
         if create:
             return self._root.require_group("headers")
@@ -107,9 +114,10 @@ class HeaderRegistry:
         if format_name not in hg:
             raise KeyError(f"No header stored for format '{format_name}'")
 
-        import shutil
-        fmt_path = hg.path / format_name
-        shutil.rmtree(fmt_path)
+        # delete_subtree, not shutil.rmtree: ``hg.path`` raises for any
+        # store that is not local, so removing a header worked on disk
+        # and nowhere else.
+        hg.delete_subtree(format_name)
 
     def __repr__(self) -> str:
         fmts = self.available_formats
