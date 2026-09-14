@@ -29,13 +29,7 @@ from zarr_vectors.api.level import Level
 from zarr_vectors.api.result import ReadResult
 from zarr_vectors.api.schema import Layout, Schema, SchemaConflict, StorageOptions
 from zarr_vectors.api.select import Query
-from zarr_vectors.constants import (
-    GEOM_GRAPH,
-    GEOM_LINE,
-    GEOM_MESH,
-    GEOM_POINT_CLOUD,
-    GEOM_POLYLINE,
-)
+from zarr_vectors.constants import GEOM_POLYLINE
 from zarr_vectors.exceptions import MetadataError, StoreError, ZVError
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
@@ -56,12 +50,10 @@ class FormatError(ZVError):
     """The store's on-disk format is not one this code can serve."""
 
 
-def _parse_version(text: str) -> tuple[int, ...]:
-    parts: list[int] = []
-    for chunk in str(text).split("."):
-        digits = "".join(c for c in chunk if c.isdigit())
-        parts.append(int(digits) if digits else 0)
-    return tuple(parts or (0,))
+# One parser for the whole package.  There were two — this and the one in
+# ``_api_version`` — for a syntax that has to mean the same thing in both.
+from zarr_vectors._api_version import parse_version as _parse_version
+from zarr_vectors._api_version import satisfies as _satisfies
 
 
 class Dataset:
@@ -152,7 +144,15 @@ class Dataset:
         return tuple(getattr(self._root_meta, "geometry_types", None) or ())
 
     def kind_of(self, level: int = 0) -> str:
-        """The geometry type a read at ``level`` should be decoded as."""
+        """The geometry type a read at ``level`` should be decoded as.
+
+        ``level`` is accepted and currently ignored: geometry type is a
+        store-wide declaration, and a pyramid's coarser levels hold the
+        same kind as level 0.  It stays in the signature because a
+        composite store's levels could differ, and a caller should not
+        have to change their call when that lands.
+        """
+        del level  # see above
         kinds = self.kinds
         if not kinds:
             raise MetadataError(
@@ -299,7 +299,12 @@ class Dataset:
         layout: Layout | None = None,
         on_out_of_bounds: Literal["raise", "ignore", "expand"] = "raise",
     ) -> dict[str, Any]:
-        """Write line segments, as an ``(M, 2, D)`` array."""
+        """Write line segments, as an ``(M, 2, D)`` array.
+
+        ``write_lines`` takes no ``groups``; a line store's objects are
+        its lines and the writer has no grouping array.  Write the
+        groupings through :mod:`zarr_vectors.building` if you need them.
+        """
         from zarr_vectors.types.lines import write_lines
 
         return self._write(
@@ -315,6 +320,7 @@ class Dataset:
         faces: npt.ArrayLike,
         *,
         attributes: Mapping[str, npt.ArrayLike] | None = None,
+        object_attributes: Mapping[str, npt.ArrayLike] | None = None,
         object_ids: npt.ArrayLike | None = None,
         layout: Layout | None = None,
         on_out_of_bounds: Literal["raise", "ignore", "expand"] = "raise",
@@ -325,6 +331,7 @@ class Dataset:
         return self._write(
             write_mesh, vertices, faces,
             vertex_attributes=dict(attributes or {}) or None,
+            object_attributes=dict(object_attributes or {}) or None,
             object_ids=object_ids,
             layout=layout, out_of_bounds=on_out_of_bounds,
         )
@@ -336,6 +343,7 @@ class Dataset:
         *,
         attributes: Mapping[str, npt.ArrayLike] | None = None,
         edge_attributes: Mapping[str, npt.ArrayLike] | None = None,
+        object_attributes: Mapping[str, npt.ArrayLike] | None = None,
         object_ids: npt.ArrayLike | None = None,
         tree: bool = False,
         layout: Layout | None = None,
@@ -352,6 +360,7 @@ class Dataset:
             write_graph, positions, edges,
             vertex_attributes=dict(attributes or {}) or None,
             link_attributes=dict(edge_attributes or {}) or None,
+            object_attributes=dict(object_attributes or {}) or None,
             object_ids=object_ids, kind="skeleton" if tree else "graph",
             layout=layout, out_of_bounds=on_out_of_bounds,
         )
@@ -592,8 +601,16 @@ async def aopen(source: Any, *, storage: StorageOptions | None = None) -> Datase
     """
     from zarr_vectors.core.aio import open_store_async
 
-    group = await open_store_async(source)
-    return Dataset(group, storage=storage or StorageOptions())
+    storage = storage or StorageOptions()
+    # Forwarded, like ``open`` does.  Accepting ``storage`` and then not
+    # using it meant a forced backend and any credentials were silently
+    # dropped on exactly the path a browser host has to take.
+    group = await open_store_async(
+        source,
+        backend=storage.resolve_backend(str(source)),
+        storage_options=dict(storage.options) or None,
+    )
+    return Dataset(group, storage=storage)
 
 
 def require_format(dataset: Dataset, spec: str) -> None:
@@ -609,28 +626,14 @@ def require_format(dataset: Dataset, spec: str) -> None:
     a sentence.
     """
     found = dataset.format_version
-    for clause in (c.strip() for c in spec.split(",") if c.strip()):
-        for op in (">=", "<=", "==", ">", "<"):
-            if clause.startswith(op):
-                want = _parse_version(clause[len(op):])
-                width = max(len(found), len(want))
-                lhs = found + (0,) * (width - len(found))
-                rhs = want + (0,) * (width - len(want))
-                ok = {
-                    ">=": lhs >= rhs, "<=": lhs <= rhs, "==": lhs == rhs,
-                    ">": lhs > rhs, "<": lhs < rhs,
-                }[op]
-                if not ok:
-                    raise FormatError(
-                        f"{dataset.url} is on-disk format "
-                        f"{'.'.join(map(str, found))}, which does not satisfy "
-                        f"{spec!r}. There is no backward-compatible reader: an "
-                        f"older store must be rewritten from source, and a newer "
-                        f"one needs a newer zarr-vectors."
-                    )
-                break
-        else:
-            raise ValueError(f"cannot parse version clause {clause!r} in {spec!r}")
+    if _satisfies(found, spec) is not None:
+        raise FormatError(
+            f"{dataset.url} is on-disk format "
+            f"{'.'.join(map(str, found))}, which does not satisfy "
+            f"{spec!r}. There is no backward-compatible reader: an "
+            f"older store must be rewritten from source, and a newer "
+            f"one needs a newer zarr-vectors."
+        )
 
 
 # Which ``_write`` kwarg carries which attribute scope.
@@ -719,7 +722,3 @@ def _kind_of_url(url: str) -> str:
     except Exception:
         return "local"
 
-
-# Kinds this module knows how to create stores for, exported so callers
-# can validate a Schema.kind without importing constants.
-KINDS = (GEOM_POINT_CLOUD, GEOM_LINE, GEOM_POLYLINE, GEOM_MESH, GEOM_GRAPH)

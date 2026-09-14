@@ -105,11 +105,11 @@ from zarr_vectors.typing import (
 )
 
 if TYPE_CHECKING:
-    from zarr_vectors.core.store import ReadSource
+    from zarr_vectors.core.store import ReadSource, WriteTarget
 
 
 def write_polylines(
-    store_path: str,
+    store_path: WriteTarget,
     polylines: list[npt.NDArray[np.floating]],
     *,
     chunk_shape: ChunkShape,
@@ -175,13 +175,9 @@ def write_polylines(
     # the polyline writer itself splits at chunk boundaries only — see
     # the call to ``split_polyline_at_boundaries`` below.
 
-    root = _create_or_open_store(
-        store_path,
-        backend=backend,
-        bounds=bounds_list,
-        chunk_shape=tuple(chunk_shape),
-        ndim=ndim,
-    )
+    # Checked before anything is created.  It used to be rejected after
+    # ``_create_or_open_store``, which left an empty store on disk for a
+    # call that was never going to succeed.
     # OOB policy for polyline vertices.  "ignore" is rejected — dropping
     # vertices would break the per-polyline ordering and connectivity.
     if out_of_bounds == "ignore":
@@ -190,6 +186,13 @@ def write_polylines(
             "polyline connectivity depends on vertex ordering. Use "
             "'raise' (default) or 'expand'."
         )
+    root = _create_or_open_store(
+        store_path,
+        backend=backend,
+        bounds=bounds_list,
+        chunk_shape=tuple(chunk_shape),
+        ndim=ndim,
+    )
     _apply_out_of_bounds_policy(root, all_pts, policy=out_of_bounds)
 
     root_meta = _ensure_root_metadata_for_write(
@@ -636,7 +639,7 @@ def _read_polylines(
         try:
             filter_bin = lm.chunk_attribute_values.index(fvalue)
         except ValueError:
-            return _empty_polyline_result()
+            return _empty_polyline_result(ndim)
 
     # An explicitly-named object/group subset lets us read only those
     # objects' manifests and the chunks they reference, instead of the
@@ -660,7 +663,7 @@ def _read_polylines(
             meta = level_group.read_array_meta("object_index")
             object_ids = list(range(meta["num_objects"]))
         except Exception:
-            return _empty_polyline_result()
+            return _empty_polyline_result(ndim)
 
     # If bbox, find which chunks are relevant
     target_chunks: set[ChunkCoords] | None = None
@@ -950,6 +953,7 @@ def _read_polylines(
         "polylines": result_polylines,
         "object_ids": result_object_ids,
         "vertex_attributes": attrs_out,
+        "ndim": ndim,
         "polyline_count": len(result_polylines),
         "vertex_count": total_verts,
     }
@@ -977,11 +981,14 @@ def _read_manifest_run(
     return out
 
 
-def _empty_polyline_result() -> dict[str, Any]:
+def _empty_polyline_result(ndim: int = 3) -> dict[str, Any]:
     return {
         "polylines": [],
         "object_ids": [],
         "vertex_attributes": {},
+        # Carried so an empty result still knows how wide the store is;
+        # the adapter cannot infer it from no data.
+        "ndim": int(ndim),
         "polyline_count": 0,
         "vertex_count": 0,
     }

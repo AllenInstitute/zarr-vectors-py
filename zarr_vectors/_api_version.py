@@ -3,10 +3,12 @@
 Three versions are in play and only one of them is expressible in a
 dependency pin:
 
-* the **package** version (``__version__``) — setuptools-scm, currently
-  ``0.2.1.devN``;
-* the **on-disk format** version (``FORMAT_VERSION``, 0.9.0) — already
-  negotiable via :func:`zarr_vectors.api.require_format`;
+* the **package** version (``__version__``) — derived from the git tag by
+  setuptools-scm, so it moves with every commit and should never be
+  asserted against;
+* the **on-disk format** version (:data:`zarr_vectors.constants
+  .FORMAT_VERSION`) — already negotiable via
+  :func:`zarr_vectors.api.require_format`;
 * the **API surface** version, this module — which moved when ``api`` and
   ``building`` were introduced without the package version moving at all.
 
@@ -52,12 +54,56 @@ FEATURES: frozenset[str] = frozenset({
 })
 
 
-def _parse(text: str) -> tuple[int, ...]:
+def parse_version(text: str) -> tuple[int, ...]:
+    """A dotted version string as a comparable tuple.
+
+    Tolerant on purpose: anything non-numeric in a component is dropped,
+    so ``"0.2.1.dev66"`` and ``"0.9.0"`` both compare.
+    """
     out: list[int] = []
-    for part in text.strip().split("."):
+    for part in str(text).strip().split("."):
         digits = "".join(c for c in part if c.isdigit())
         out.append(int(digits) if digits else 0)
-    return tuple(out)
+    return tuple(out) or (0,)
+
+
+# Backwards-compatible private alias.
+_parse = parse_version
+
+
+def satisfies(found: tuple[int, ...], spec: str) -> str | None:
+    """``None`` if ``found`` satisfies every clause of ``spec``, else the
+    first clause it fails.
+
+    ``spec`` is a comma-separated list of ``>=`` / ``>`` / ``<=`` / ``<``
+    / ``==`` clauses, e.g. ``">=0.9,<0.11"``.  One definition, because
+    there were two -- here and in ``api.dataset.require_format`` -- and
+    two parsers for one syntax is one parser too many.
+
+    Raises:
+        ValueError: If a clause cannot be parsed.
+    """
+    for clause in (c.strip() for c in spec.split(",") if c.strip()):
+        for op in (">=", "<=", "==", ">", "<"):
+            if not clause.startswith(op):
+                continue
+            want = parse_version(clause[len(op):])
+            width = max(len(found), len(want))
+            lhs = found + (0,) * (width - len(found))
+            rhs = want + (0,) * (width - len(want))
+            ok = {
+                ">=": lhs >= rhs, "<=": lhs <= rhs, "==": lhs == rhs,
+                ">": lhs > rhs, "<": lhs < rhs,
+            }[op]
+            if not ok:
+                return clause
+            break
+        else:
+            raise ValueError(
+                f"cannot parse version clause {clause!r} in {spec!r}; "
+                f"expected one of >=, >, <=, <, == followed by a version"
+            )
+    return None
 
 
 def require_api(spec: str = "", *, features: object = ()) -> None:
@@ -88,25 +134,11 @@ def require_api(spec: str = "", *, features: object = ()) -> None:
         )
 
     found = __api_version__
-    for clause in (c.strip() for c in spec.split(",") if c.strip()):
-        for op in (">=", "<=", "==", ">", "<"):
-            if not clause.startswith(op):
-                continue
-            want = _parse(clause[len(op):])
-            width = max(len(found), len(want))
-            lhs = found + (0,) * (width - len(found))
-            rhs = want + (0,) * (width - len(want))
-            if not {
-                ">=": lhs >= rhs, "<=": lhs <= rhs, "==": lhs == rhs,
-                ">": lhs > rhs, "<": lhs < rhs,
-            }[op]:
-                raise ImportError(
-                    f"zarr-vectors API surface is "
-                    f"{'.'.join(map(str, found))}, which does not satisfy "
-                    f"{spec!r}. Note this is NOT the package version — "
-                    f"the two move independently, which is why a pin on "
-                    f"the package cannot express this."
-                )
-            break
-        else:
-            raise ValueError(f"unparsable clause {clause!r} in spec {spec!r}")
+    if spec and satisfies(found, spec) is not None:
+        raise ImportError(
+            f"zarr-vectors API surface is "
+            f"{'.'.join(map(str, found))}, which does not satisfy "
+            f"{spec!r}. Note this is NOT the package version — "
+            f"the two move independently, which is why a pin on "
+            f"the package cannot express this."
+        )

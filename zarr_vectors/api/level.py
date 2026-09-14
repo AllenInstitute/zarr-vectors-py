@@ -37,7 +37,7 @@ from zarr_vectors.constants import (
     OBJECT_ATTRIBUTES,
     VERTEX_ATTRIBUTES,
 )
-from zarr_vectors.exceptions import ZVError
+from zarr_vectors.exceptions import ArrayError, StoreError, ZVError
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
     from zarr_vectors.api.dataset import Dataset
@@ -76,6 +76,14 @@ _READERS: dict[str, tuple[str, str, tuple[str, ...], str]] = {
         ("bbox", "object_ids", "group_ids", "chunks", "attribute_filter"),
         "from_polylines",
     ),
+    # ``object_ids`` stays listed for mesh/graph/skeleton even though
+    # those readers raise NotImplementedError for it.  Dropping it does
+    # NOT help: ``to_reader_kwargs`` silently discards a term the reader
+    # cannot express, and ``_post_filter`` has nothing to filter on
+    # (neither reader returns per-vertex object ids), so the read would
+    # come back as the whole level with the caller believing they had
+    # scoped it.  Raising is the right answer; ``_check_supported``
+    # below just raises it with a message about what the CALLER typed.
     GEOM_MESH: (
         "zarr_vectors.types.meshes", "read_mesh",
         ("bbox", "object_ids", "chunks", "attribute_filter"),
@@ -320,6 +328,28 @@ class Level:
 
         return getattr(importlib.import_module(module_name), func_name), supports, adapter
 
+    def _check_supported(self, selection: Selection) -> None:
+        """Refuse a selection term this geometry's reader cannot honour.
+
+        ``read_mesh`` and ``read_graph`` raise for ``object_ids=``, which
+        is right -- silently handing back the whole level is the worst
+        outcome -- but their message names a parameter of a function the
+        caller never called.  Say it in the caller's own terms instead.
+        """
+        if selection.objects is None and selection.groups is None:
+            return
+        if self.kind not in (GEOM_MESH, GEOM_GRAPH, GEOM_SKELETON):
+            return
+        term = "objects=" if selection.objects is not None else "groups="
+        raise ZVError(
+            f"select({term}...) is not supported for {self.kind!r}: the "
+            f"reader behind it cannot scope a read by object, and applying "
+            f"the filter afterwards is impossible because the result "
+            f"carries no per-vertex object ids. Read the level and filter "
+            f"the arrays yourself, or use level.objects[...] on a geometry "
+            f"that supports it (point clouds, polylines, lines)."
+        )
+
     def _reader_kwargs(self, selection: Selection, supports: Sequence[str]) -> dict[str, Any]:
         """Selection terms this reader can express, with ``"all"`` resolved.
 
@@ -377,6 +407,7 @@ class Level:
         care — or it raises the genuine error, unobscured.  The cost is
         having done the work twice on the rare read that needs it.
         """
+        self._check_supported(selection)
         reader, supports, adapter = self._reader()
         kwargs = self._reader_kwargs(selection, supports)
         group = self._dataset._group
@@ -392,7 +423,21 @@ class Level:
                 strict=True,
                 label=reader.__name__,
             )
-        except Exception:
+        except (ArrayError, StoreError, ZVError, KeyError, ValueError) as e:
+            # Narrowed from a bare ``except Exception``.  The fallback is
+            # sound -- it is the identical computation without the
+            # batching -- but catching everything meant an engine bug and
+            # a genuine store failure were indistinguishable, each costing
+            # the read twice and neither ever being seen.  A
+            # NotImplementedError or a KeyboardInterrupt now propagates.
+            import warnings
+
+            warnings.warn(
+                f"batched read failed ({type(e).__name__}: {e}); falling "
+                f"back to the direct reader. The answer is the same; the "
+                f"read is slower, and this is worth reporting.",
+                RuntimeWarning, stacklevel=2,
+            )
             raw = reader(group, **kwargs)
         return self._finish(raw, adapter, selection)
 
@@ -405,6 +450,7 @@ class Level:
         """
         from zarr_vectors.core.aio import read_async
 
+        self._check_supported(selection)
         reader, supports, adapter = self._reader()
         kwargs = self._reader_kwargs(selection, supports)
         raw = await read_async(reader, self._dataset._group, **kwargs)

@@ -108,11 +108,11 @@ from zarr_vectors.typing import (
 )
 
 if TYPE_CHECKING:
-    from zarr_vectors.core.store import ReadSource
+    from zarr_vectors.core.store import ReadSource, WriteTarget
 
 
 def write_points(
-    store_path: str,
+    store_path: WriteTarget,
     positions: npt.NDArray[np.floating],
     *,
     chunk_shape: ChunkShape | None = None,

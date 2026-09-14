@@ -75,7 +75,15 @@ CrossChunkLink: TypeAlias = tuple[
     tuple[ChunkCoords, int],  # (chunk_A_coords, local_vertex_index_A)
     tuple[ChunkCoords, int],  # (chunk_B_coords, local_vertex_index_B)
 ]
-"""A link (edge/face vertex pair) between vertices in different spatial chunks."""
+"""One link record as a pair of ``(chunk_coords, local_vertex_index)``.
+
+Named for the pre-0.9 layout, where cross-chunk links were their own
+family.  Since 0.9.0 connectivity is one family and a record whose
+endpoints share a chunk is simply one whose relative offset is zero, so
+this shape describes *any* 2-endpoint link -- ``write_links`` accepts it
+for both.  Kept under the old name because it is the spelling every
+caller already uses.
+"""
 
 # ---------------------------------------------------------------------------
 # Convention / metadata string types

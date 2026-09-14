@@ -134,19 +134,33 @@ def replace_truncated(result: ReadResult, value: bool) -> ReadResult:
     )
 
 
-def _join_segments(part: Any) -> npt.NDArray[Any]:
+def _join_segments(part: Any, ndim: int = 3) -> npt.NDArray[Any]:
     """One part's vertices as a single ``(N, D)`` array.
 
     ``read_polylines`` yields each polyline as a list of per-chunk
     segments; other readers yield a plain array.  Both are accepted so
     the adapter does not have to care which reader it came from.
+
+    ``ndim`` is only reached for an empty part, where there is no data to
+    infer a width from.  It used to be hard-coded to 3, so an empty read
+    of a 2-D store reported ``result.ndim == 3``.
     """
     if isinstance(part, (list, tuple)):
         segments = [np.asarray(s) for s in part if len(s)]
         if not segments:
-            return np.zeros((0, 3), dtype=np.float32)
+            return np.zeros((0, ndim), dtype=np.float32)
         return np.concatenate(segments, axis=0)
     return np.asarray(part)
+
+
+def _infer_ndim(polylines: Sequence[Any]) -> int:
+    """Coordinate width from the first segment that has one, else 0."""
+    for part in polylines:
+        for segment in (part if isinstance(part, (list, tuple)) else [part]):
+            arr = np.asarray(segment)
+            if arr.ndim == 2 and arr.shape[1]:
+                return int(arr.shape[1])
+    return 0
 
 
 def _slices_from_lengths(lengths: Sequence[int]) -> tuple[slice, ...]:
@@ -421,11 +435,16 @@ class ReadResult:
         at a boundary.
         """
         raw_polylines = list(raw.get("polylines") or [])
-        arrays = [_join_segments(p) for p in raw_polylines]
+        # Width from the data where there is any; from the store's own
+        # dimensionality otherwise, which the reader reports even on an
+        # empty result.  Hard-coding 3 made every empty read of a 2-D
+        # store claim three dimensions.
+        ndim = int(raw.get("ndim") or 0) or _infer_ndim(raw_polylines) or 3
+        arrays = [_join_segments(p, ndim) for p in raw_polylines]
         if arrays:
             positions = np.concatenate(arrays, axis=0)
         else:
-            positions = np.zeros((0, 3), dtype=np.float32)
+            positions = np.zeros((0, ndim), dtype=np.float32)
         part_objects = raw.get("object_ids")
         return cls(
             kind=kind,

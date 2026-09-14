@@ -154,8 +154,10 @@ per-array dtype duplication.
 CAP_PRESERVED_OBJECT_IDS: str = "preserved_object_ids"
 """At least one resolution level was written with ID-preserving
 sparsification (``preserves_object_ids=True`` on the level metadata).
-Dropped objects appear as empty manifest slots and zero
-``present_mask`` bytes; ``parent_level`` carries semantic weight."""
+A dropped object keeps its id as an empty manifest slot, so ids stay
+stable across levels, and ``parent_level`` carries semantic weight.
+(Pre-0.8.1 this also meant a zeroed ``present_mask`` byte; that sidecar
+is gone -- presence is the manifest being empty.)"""
 
 CAP_SHARED_FRAGMENTS: str = "shared_fragments"
 """At least one resolution level stores per-chunk fragments that may

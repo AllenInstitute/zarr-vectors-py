@@ -158,7 +158,12 @@ __all__ = [
 ]
 
 # Retired from ``__all__`` but still importable for one release:
-#   Group, FsGroup, create_store, open_store, rebind, detect_scheme,
-#   RechunkSpec, rechunk, rechunk_by_attribute, ZVWriter
-# Get the first eight from ``zarr_vectors.building``; ``ZVWriter`` is
-# deprecated outright (see its own warning for what replaces each method).
+#   Group, create_store, open_store, RechunkSpec, rechunk,
+#   rechunk_by_attribute  -> all re-exported by ``zarr_vectors.building``
+#   FsGroup, rebind, detect_scheme                 -> NOT in building; they
+#       are local-store and backend-plumbing details with no supported
+#       spelling.  Reach for ``open_store`` / ``create_store`` instead.
+#   ZVWriter -> deprecated outright (see its own warning for what
+#       replaces each method).
+# The previous note here said "get the first eight from building", which
+# was wrong for three of them.

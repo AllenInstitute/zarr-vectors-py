@@ -30,6 +30,12 @@ if TYPE_CHECKING:
     # :mod:`zarr_vectors.core.aio`.
     ReadSource = StoreLike | Group
 
+    # What every ``write_*`` entry point accepts.  Annotated ``str`` for
+    # a long time, which was never true: the same path through
+    # ``_create_or_open_store`` takes a Path, a pre-built Store and an
+    # already-open Group, and consumers pass all three.
+    WriteTarget = StoreLike | Group
+
 from zarr_vectors.constants import (
     DEFAULT_AXES_NAMES,
     DEFAULT_BOUNDS_SIDE,

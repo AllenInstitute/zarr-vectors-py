@@ -95,11 +95,11 @@ from zarr_vectors.typing import (
 )
 
 if TYPE_CHECKING:
-    from zarr_vectors.core.store import ReadSource
+    from zarr_vectors.core.store import ReadSource, WriteTarget
 
 
 def write_mesh(
-    store_path: str,
+    store_path: WriteTarget,
     vertices: npt.NDArray[np.floating],
     faces: npt.NDArray[np.integer],
     *,
@@ -158,13 +158,9 @@ def write_mesh(
     else:
         bounds_list = (list(bounds[0]), list(bounds[1]))
 
-    root = _create_or_open_store(
-        store_path,
-        backend=backend,
-        bounds=bounds_list,
-        chunk_shape=tuple(chunk_shape),
-        ndim=ndim,
-    )
+    # Checked before anything is created.  It used to be rejected after
+    # ``_create_or_open_store``, which left an empty store on disk for a
+    # call that was never going to succeed.
     # OOB policy for mesh vertices.  "ignore" filters vertices but does
     # NOT rewrite ``faces`` to drop references to filtered vertices —
     # call set_bounds(..., force=True) afterwards for a fully consistent
@@ -176,6 +172,13 @@ def write_mesh(
             "Use 'raise' (default) or 'expand', or pre-filter vertices "
             "and remap faces upstream."
         )
+    root = _create_or_open_store(
+        store_path,
+        backend=backend,
+        bounds=bounds_list,
+        chunk_shape=tuple(chunk_shape),
+        ndim=ndim,
+    )
     vertices, _ = _apply_out_of_bounds_policy(
         root, vertices, policy=out_of_bounds,
     )

@@ -101,7 +101,7 @@ from zarr_vectors.typing import (
 )
 
 if TYPE_CHECKING:
-    from zarr_vectors.core.store import ReadSource
+    from zarr_vectors.core.store import ReadSource, WriteTarget
 
 
 # ===================================================================
@@ -109,7 +109,7 @@ if TYPE_CHECKING:
 # ===================================================================
 
 def write_graph(
-    store_path: str,
+    store_path: WriteTarget,
     positions: npt.NDArray[np.floating],
     edges: npt.NDArray[np.integer],
     *,
@@ -246,6 +246,15 @@ def write_graph(
     else:
         bounds_list = (list(bounds[0]), list(bounds[1]))
 
+    # Checked before anything is created.  It used to be rejected after
+    # ``_create_or_open_store``, which left an empty store on disk for a
+    # call that was never going to succeed.
+    if out_of_bounds == "ignore":
+        raise ArrayError(
+            "out_of_bounds='ignore' is not supported for write_graph: "
+            "edges reference node indices and would be left dangling. "
+            "Use 'raise' (default) or 'expand'."
+        )
     root = _create_or_open_store(
         store_path,
         backend=backend,
@@ -253,12 +262,6 @@ def write_graph(
         chunk_shape=tuple(chunk_shape),
         ndim=ndim,
     )
-    if out_of_bounds == "ignore":
-        raise ArrayError(
-            "out_of_bounds='ignore' is not supported for write_graph: "
-            "edges reference node indices and would be left dangling. "
-            "Use 'raise' (default) or 'expand'."
-        )
     _apply_out_of_bounds_policy(root, positions, policy=out_of_bounds)
 
     root_meta = _ensure_root_metadata_for_write(

@@ -23,6 +23,8 @@ from typing import TYPE_CHECKING, Any
 import numpy as np
 import numpy.typing as npt
 
+from zarr_vectors.exceptions import ArrayError, StoreError
+
 if TYPE_CHECKING:  # pragma: no cover - typing only
     from zarr_vectors.api.level import Level
     from zarr_vectors.api.result import ReadResult
@@ -120,7 +122,12 @@ class ObjectCatalog:
             return np.arange(len(self), dtype=np.int64)
         try:
             return np.flatnonzero(self.present_mask()).astype(np.int64)
-        except Exception:
+        except (ArrayError, StoreError):
+            # A level with no object index has no presence to report, and
+            # every slot is as present as any other.  Narrowed from a bare
+            # ``except Exception``, which answered this for a genuine
+            # decode failure too -- returning every id as present is a
+            # plausible-looking wrong answer, which is the worst kind.
             return np.arange(len(self), dtype=np.int64)
 
     def present_mask(self) -> npt.NDArray[Any]:
@@ -151,7 +158,11 @@ class ObjectCatalog:
             return False
         try:
             return bool(self.present_mask()[oid])
-        except Exception:
+        except (ArrayError, StoreError):
+            # No object index: the id is in range, so it is as present as
+            # any other.  ``except Exception: return True`` also answered
+            # True for a corrupt index, which is a membership test that
+            # cannot fail and therefore cannot be trusted.
             return True
 
     def __repr__(self) -> str:
