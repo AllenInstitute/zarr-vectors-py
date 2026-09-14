@@ -9,8 +9,21 @@ everywhere in the package.
 # Format version
 # ---------------------------------------------------------------------------
 
-FORMAT_VERSION: str = "0.9.0"
+FORMAT_VERSION: str = "0.9.1"
 """Current ZV specification version.
+
+0.9.1: optional, backward-compatible ``attribute_specs`` block on the
+root (absent ⇒ the prior behaviour, so 0.9.0 stores read unchanged).
+It records what a store declares its attributes to be, by scope —
+``{"vertex": {"intensity": {"dtype": "float32", "unit": "microvolt"}},
+"object": {...}, "link": {...}}`` — so a
+:class:`zarr_vectors.api.schema.Schema` round-trips through
+``Schema.from_store`` and ``open_or_create`` can report a store that is
+missing an attribute the caller declared.  A declaration is not a
+promise the array exists; the array appears when data is written.
+``unit`` and ``description`` are additionally stamped onto the
+attribute array's own metadata block when it is written.  No migration:
+an undeclared store is simply undeclared.
 
 0.9.0: single-array layout for every per-spatial-chunk array.  Each
 logical array — ``vertices``, ``vertex_fragments``, ``link_fragments``,

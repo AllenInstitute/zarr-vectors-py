@@ -370,6 +370,9 @@ class Dataset:
         effective = layout or schema.layout
         resolved = effective.resolve(schema, store_kind=self._store_kind())
         kwargs = {k: v for k, v in kwargs.items() if v is not None}
+        # Checked BEFORE the write: a declaration the data contradicts is
+        # worth catching while the store is still as it was.
+        _check_declared(schema, kwargs)
         self._meta = None  # geometry_types and bounds may change
         self._levels.clear()
         report: dict[str, Any] = writer(
@@ -380,6 +383,7 @@ class Dataset:
             compressor=resolved.compressor,
             **kwargs,
         )
+        _stamp_declared(self, schema, kwargs)
         return report
 
     def _store_kind(self) -> str:
@@ -526,6 +530,7 @@ def create(
         vertex_dtype=schema.position_dtype,
         axes=cast("Any", [a.to_ngff() for a in schema.axes]) if schema.axes else None,
         geometry_types=[schema.kind] if schema.kind else None,
+        attribute_specs=schema.to_root_block() or None,
         backend=storage.resolve_backend(str(target)),
         storage_options=dict(storage.options) or None,
     )
@@ -626,6 +631,84 @@ def require_format(dataset: Dataset, spec: str) -> None:
                 break
         else:
             raise ValueError(f"cannot parse version clause {clause!r} in {spec!r}")
+
+
+# Which ``_write`` kwarg carries which attribute scope.
+_SCOPE_KWARGS: dict[str, str] = {
+    "vertex_attributes": "vertex",
+    "object_attributes": "object",
+    "link_attributes": "link",
+}
+
+
+def _check_declared(schema: Schema, kwargs: Mapping[str, Any]) -> None:
+    """Reject data that contradicts what the store says it holds.
+
+    ``AttributeSpec.dtype`` and ``channels`` used to be inert -- a store
+    could declare ``float32`` and be handed ``float64``, and nothing
+    anywhere noticed.  A declaration that is never checked is decoration.
+
+    Only *declared* attributes are checked; passing an undeclared one is
+    how a store is extended, and is fine.
+    """
+    for kwarg, scope in _SCOPE_KWARGS.items():
+        supplied = kwargs.get(kwarg) or {}
+        for name, value in supplied.items():
+            spec = schema.spec_for(name, scope)
+            if spec is None:
+                continue
+            arr = np.asarray(
+                value[0] if isinstance(value, list) and value else value
+            )
+            if arr.dtype != np.dtype(spec.dtype):
+                raise SchemaConflict(
+                    f"{scope} attribute {name!r} is declared "
+                    f"{spec.dtype!r} but was given {arr.dtype!r}. Pass the "
+                    f"declared dtype, or change the declaration."
+                )
+            channels = int(arr.shape[-1]) if arr.ndim > 1 else 1
+            if channels != int(spec.channels):
+                raise SchemaConflict(
+                    f"{scope} attribute {name!r} is declared with "
+                    f"{spec.channels} channel(s) but was given {channels}."
+                )
+
+
+def _stamp_declared(
+    dataset: Dataset, schema: Schema, kwargs: Mapping[str, Any],
+) -> None:
+    """Record ``unit`` / ``description`` on the arrays just written.
+
+    The writers know the dtype and the channel names -- they have the real
+    array -- so only what the *declaration* adds is stamped here, and only
+    for attributes that were actually written.  Merged onto the array's
+    own metadata block, which is where a reader already looks, so this
+    needs no format change and no reader is obliged to care.
+
+    Best-effort by design: failing to annotate an array that was written
+    correctly must not turn a successful write into an error.
+    """
+    families = {
+        "vertex": "vertex_attributes",
+        "object": "object_attributes",
+        "link": "link_attributes",
+    }
+    for kwarg, scope in _SCOPE_KWARGS.items():
+        supplied = kwargs.get(kwarg) or {}
+        for name in supplied:
+            spec = schema.spec_for(name, scope)
+            if spec is None:
+                continue
+            extra = spec.array_metadata()
+            if not extra:
+                continue
+            try:
+                level = dataset.level(0).store
+                path = f"{families[scope]}/{name}"
+                if level.standalone_array_exists(path) or level.array_exists(path):
+                    level.write_array_meta(path, extra)
+            except Exception:  # noqa: BLE001 - annotation, never fatal
+                continue
 
 
 def _kind_of_url(url: str) -> str:

@@ -93,6 +93,15 @@ class AttributeSpec:
 
     ``channels`` is the trailing width: 1 for a scalar per vertex, 3 for
     an RGB colour, and so on.
+
+    Declaring one is load-bearing.  ``dtype`` and ``channels`` are checked
+    against the array a writer is actually handed, so a store cannot
+    quietly disagree with what it says it holds; ``unit`` and
+    ``description`` are written onto the attribute array itself, so the
+    store can say what its ``intensity`` is measured in; and the whole
+    declaration is recorded on the root, so :meth:`Schema.from_store`
+    reads it back and :func:`~zarr_vectors.api.dataset.open_or_create`
+    can tell you a store is missing something you declared.
     """
 
     dtype: str = "float32"
@@ -100,6 +109,47 @@ class AttributeSpec:
     categorical: bool = False
     unit: str | None = None
     description: str | None = None
+
+    def to_dict(self) -> dict[str, Any]:
+        """JSON-ready form.  Defaults are omitted, so the common
+        declaration costs one key."""
+        out: dict[str, Any] = {"dtype": self.dtype}
+        if self.channels != 1:
+            out["channels"] = int(self.channels)
+        if self.categorical:
+            out["categorical"] = True
+        if self.unit:
+            out["unit"] = self.unit
+        if self.description:
+            out["description"] = self.description
+        return out
+
+    @classmethod
+    def from_dict(cls, d: Mapping[str, Any]) -> AttributeSpec:
+        return cls(
+            dtype=str(d.get("dtype", "float32")),
+            channels=int(d.get("channels", 1) or 1),
+            categorical=bool(d.get("categorical", False)),
+            unit=d.get("unit"),
+            description=d.get("description"),
+        )
+
+    def array_metadata(self) -> dict[str, Any]:
+        """The fields that belong on the attribute array itself.
+
+        ``dtype`` and ``channel_names`` are the writer's to stamp -- it
+        knows the real array -- so this carries only what the declaration
+        adds.  Empty when nothing was declared beyond the type, which is
+        why a caller can check it before paying for a write.
+        """
+        out: dict[str, Any] = {}
+        if self.unit:
+            out["unit"] = self.unit
+        if self.description:
+            out["description"] = self.description
+        if self.categorical:
+            out["declared_categorical"] = True
+        return out
 
 
 @dataclass(frozen=True, slots=True)
@@ -255,19 +305,22 @@ class StorageOptions:
 class Schema:
     """What the data is.  No storage term appears here.
 
-    ``profile`` stands in for the three convention strings
-    (``links_convention``, ``object_index_convention``,
-    ``cross_chunk_strategy``) that callers are currently expected to set
-    and that the type writers lazily fill in anyway.  Naming the *use*
-    rather than the encoding means a store stays correct when the
-    encoding changes.
+    The three attribute maps are declarations, and they are recorded:
+    :meth:`to_root_block` writes them onto the store and
+    :meth:`from_store` reads them back, so a schema round-trips and
+    :func:`~zarr_vectors.api.dataset.open_or_create` can report a store
+    that is missing one.
+
+    (A ``profile`` field used to sit here, standing in for the three
+    convention strings.  Nothing read it, and the type writers fill those
+    in from the geometry anyway, so it named a concept that did not
+    exist.  It was removed rather than left looking like a promise.)
     """
 
     ndim: int = 3
     bounds: tuple[Sequence[float], Sequence[float]] | None = None
     axes: tuple[Axis, ...] | None = None
     kind: str = GEOM_POINT_CLOUD
-    profile: str = "auto"
     position_dtype: str = "float32"
     vertex_attributes: Mapping[str, AttributeSpec] = field(default_factory=dict)
     object_attributes: Mapping[str, AttributeSpec] = field(default_factory=dict)
@@ -294,6 +347,30 @@ class Schema:
     ) -> Schema:
         return replace(self, bounds=(tuple(lo), tuple(hi)))
 
+    def to_root_block(self) -> dict[str, dict[str, Any]]:
+        """The declaration, in the shape the root attrs record it.
+
+        Scopes with nothing declared are omitted entirely, so a schema
+        that declares no attributes writes no key.
+        """
+        scopes = {
+            "vertex": self.vertex_attributes,
+            "object": self.object_attributes,
+            "link": self.link_attributes,
+        }
+        return {
+            scope: {n: spec.to_dict() for n, spec in named.items()}
+            for scope, named in scopes.items() if named
+        }
+
+    def spec_for(self, name: str, scope: str = "vertex") -> AttributeSpec | None:
+        """The declaration for one attribute, or ``None`` if undeclared."""
+        return {
+            "vertex": self.vertex_attributes,
+            "object": self.object_attributes,
+            "link": self.link_attributes,
+        }[scope].get(name)
+
     @classmethod
     def from_store(
         cls, root_meta: RootMetadata, level_meta: LevelMetadata | None = None,
@@ -319,11 +396,22 @@ class Schema:
             if len(ratios) == 1:
                 subcells = ratios.pop()
         kinds = list(getattr(root_meta, "geometry_types", None) or [])
+        declared = getattr(root_meta, "attribute_specs", None) or {}
+
+        def _scope(name: str) -> dict[str, AttributeSpec]:
+            return {
+                n: AttributeSpec.from_dict(spec)
+                for n, spec in (declared.get(name) or {}).items()
+            }
+
         return cls(
             # sid_ndim, not spatial_index_dims: the latter is the axes list.
             ndim=int(getattr(root_meta, "sid_ndim", 3) or 3),
             bounds=(tuple(bounds[0]), tuple(bounds[1])) if bounds else None,
             kind=kinds[0] if kinds else GEOM_POINT_CLOUD,
+            vertex_attributes=_scope("vertex"),
+            object_attributes=_scope("object"),
+            link_attributes=_scope("link"),
             layout=Layout(
                 cell_size=tuple(chunk_shape) if chunk_shape else None,
                 subcells=subcells,
@@ -340,6 +428,11 @@ class Schema:
         out: list[str] = []
         if self.ndim != other.ndim:
             out.append(f"ndim: {self.ndim} != {other.ndim}")
+        # ``kind`` pins how a store is decoded, so opening a point cloud
+        # with a mesh schema is a conflict, not a detail.  Only compared
+        # when the store declares one: a freshly warmed store has none.
+        if self.kind and other.kind and self.kind != other.kind:
+            out.append(f"kind: {self.kind} != {other.kind}")
         if self.bounds and other.bounds:
             for i, (a, b) in enumerate(zip(self.bounds, other.bounds)):
                 if [float(v) for v in a] != [float(v) for v in b]:
@@ -349,4 +442,21 @@ class Schema:
         if mine is not None and theirs is not None:
             if [float(v) for v in mine] != [float(v) for v in theirs]:
                 out.append(f"cell size: {list(mine)} != {list(theirs)}")
+        # Declared attributes.  Only what BOTH sides mention is compared,
+        # and only where they disagree: declaring an attribute the store
+        # does not yet carry is how you extend one, not a conflict.  An
+        # undeclared store (nothing recorded, or written before 0.9.1)
+        # reports nothing here rather than every name as missing.
+        for scope in ("vertex", "object", "link"):
+            ours = getattr(self, f"{scope}_attributes") or {}
+            yours = getattr(other, f"{scope}_attributes") or {}
+            if not yours:
+                continue
+            for name in sorted(set(ours) & set(yours)):
+                a, b = ours[name], yours[name]
+                if a.to_dict() != b.to_dict():
+                    out.append(
+                        f"{scope} attribute {name!r}: "
+                        f"{a.to_dict()} != {b.to_dict()}"
+                    )
         return out

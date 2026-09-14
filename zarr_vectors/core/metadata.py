@@ -282,6 +282,16 @@ class RootMetadata:
     """Optional capability tokens this store uses.  See
     :mod:`zarr_vectors.constants` for the canonical token names
     (``CAP_*``).  Empty list by default."""
+    attribute_specs: dict[str, dict[str, Any]] | None = None
+    """What the store declares its attributes to be, by scope.
+
+    ``{"vertex": {"intensity": {"dtype": "float32", "unit": "microvolt"}},
+    "object": {...}, "link": {...}}``.  Optional and additive (0.9.1):
+    absent means undeclared, which is every store written before it and
+    every store whose writer never said.  A declaration is not a promise
+    that the array exists -- it appears when data is written -- but it is
+    what lets :meth:`zarr_vectors.api.schema.Schema.from_store` round-trip
+    and ``open_or_create`` report a store missing something declared."""
 
     def validate(self) -> None:
         """Validate this metadata object.
@@ -450,6 +460,12 @@ class RootMetadata:
             d["zarr_vectors"]["base_bin_shape"] = list(self.base_bin_shape)
         if self.format_capabilities:
             d["zarr_vectors"]["format_capabilities"] = list(self.format_capabilities)
+        if self.attribute_specs:
+            d["zarr_vectors"]["attribute_specs"] = {
+                scope: {n: dict(spec) for n, spec in named.items()}
+                for scope, named in self.attribute_specs.items()
+                if named
+            }
         return d
 
     @classmethod
@@ -521,6 +537,13 @@ class RootMetadata:
             reduction_factor=zv.get("reduction_factor", DEFAULT_REDUCTION_FACTOR),
             base_bin_shape=tuple(bbs) if bbs else None,
             format_capabilities=list(caps),
+            attribute_specs=(
+                {
+                    scope: {n: dict(spec) for n, spec in named.items()}
+                    for scope, named in specs.items()
+                }
+                if (specs := zv.get("attribute_specs")) else None
+            ),
         )
 
     def is_complete(self) -> bool:

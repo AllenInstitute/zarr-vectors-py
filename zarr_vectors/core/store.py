@@ -312,6 +312,7 @@ def create_store(
     reduction_factor: int | None = None,
     base_bin_shape: tuple[float, ...] | None = None,
     format_capabilities: list[str] | None = None,
+    attribute_specs: dict[str, dict[str, Any]] | None = None,
     backend: str | None = None,
     storage_options: dict[str, Any] | None = None,
     **backend_kwargs: Any,
@@ -382,6 +383,11 @@ def create_store(
             omitted, defaults to ``chunk_shape`` (one bin per chunk).
         format_capabilities: Optional capability tokens to stamp on
             the root.  See :mod:`zarr_vectors.constants` ``CAP_*``.
+        attribute_specs: What the store declares its attributes to be,
+            by scope -- ``{"vertex": {name: {...}}, "object": ..., 
+            "link": ...}``.  Optional and additive; a reader that does
+            not know about it is unaffected.  Declaring an attribute does
+            not create it.
         backend: Force a particular backend (``"local"`` / ``"icechunk"``).
         **backend_kwargs: Forwarded to the backend constructor.
 
@@ -456,6 +462,7 @@ def create_store(
         reduction_factor=reduction_factor,
         base_bin_shape=base_bin_shape,
         format_capabilities=format_capabilities,
+        attribute_specs=attribute_specs,
     )
 
     # 0/ + empty vertices pair — the "warm" payload.
@@ -535,6 +542,7 @@ def _write_root_attrs(
     reduction_factor: int | None = None,
     base_bin_shape: tuple[float, ...] | None = None,
     format_capabilities: list[str] | None = None,
+    attribute_specs: dict[str, dict[str, Any]] | None = None,
 ) -> None:
     """Write the ``zarr_vectors`` root-attrs block plus the eager NGFF
     ``multiscales`` block (axes only — ``datasets`` are filled in by
@@ -571,6 +579,15 @@ def _write_root_attrs(
         zv["reduction_factor"] = int(reduction_factor)
     if base_bin_shape is not None:
         zv["base_bin_shape"] = list(base_bin_shape)
+    if attribute_specs:
+        # Only non-empty scopes, so a store that declares nothing carries
+        # no key at all rather than three empty dicts.
+        declared = {
+            scope: dict(named)
+            for scope, named in attribute_specs.items() if named
+        }
+        if declared:
+            zv["attribute_specs"] = declared
 
     # Eager NGFF ``multiscales`` block — axes are the canonical axis
     # store from 0.5.0 on.  We seed datasets with level 0 only; the
