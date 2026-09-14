@@ -24,6 +24,7 @@ import numpy as np
 from zarr_vectors.api.result import Attributes, ReadResult
 from zarr_vectors.api.select import Query, Selection
 from zarr_vectors.constants import (
+    FRAGMENT_ATTRIBUTES,
     GEOM_GRAPH,
     GEOM_LINE,
     GEOM_MESH,
@@ -31,6 +32,10 @@ from zarr_vectors.constants import (
     GEOM_POLYLINE,
     GEOM_SKELETON,
     GEOM_STREAMLINE,
+    GROUP_ATTRIBUTES,
+    LINK_ATTRIBUTES,
+    OBJECT_ATTRIBUTES,
+    VERTEX_ATTRIBUTES,
 )
 from zarr_vectors.exceptions import ZVError
 
@@ -89,12 +94,20 @@ _READERS: dict[str, tuple[str, str, tuple[str, ...], str]] = {
 }
 
 # Attribute families, by the group each lives under in a level.
+#
+# Spelled with the constants, not with string literals.  ``"group"``
+# pointed at ``groupings_attributes``, which is not a path this format has
+# -- the family is ``group_attributes``, which is what
+# ``write_groupings_attributes`` creates and what the README promises
+# ``attribute_names("group")`` will find.  It silently answered ``()`` for
+# every store, and a literal is exactly the kind of thing that drifts
+# without anything noticing.
 _ATTR_GROUPS: dict[str, str] = {
-    "vertex": "vertex_attributes",
-    "fragment": "fragment_attributes",
-    "object": "object_attributes",
-    "group": "groupings_attributes",
-    "link": "link_attributes",
+    "vertex": VERTEX_ATTRIBUTES,
+    "fragment": FRAGMENT_ATTRIBUTES,
+    "object": OBJECT_ATTRIBUTES,
+    "group": GROUP_ATTRIBUTES,
+    "link": LINK_ATTRIBUTES,
 }
 
 
