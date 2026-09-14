@@ -940,14 +940,20 @@ def _write_cross_level_edges(
     # anchor uses that level's scale as ``r_src``.  ``directed=True``:
     # fine→coarse parenthood is data, not an undirected pair.
     fine_lg = get_resolution_level(root_group, fine_level)
-    write_links(
-        fine_lg,
-        [[f, c] for f, c in zip(fine_eps, coarse_eps)],
-        sid_ndim,
-        delta=delta,
-        link_width=2,
-        directed=True,
-    )
+    # One batch for the family. Unbatched, each cell write is a
+    # read-modify-write of the array's whole presence manifest, so
+    # writing C cells costs O(C^2) -- the same bug already fixed for
+    # this module's vertex writes and for shard_store, and the reason
+    # the comment on step 6 records 207 s for 32k cells.
+    with fine_lg.batched_writes():
+        write_links(
+            fine_lg,
+            [[f, c] for f, c in zip(fine_eps, coarse_eps)],
+            sid_ndim,
+            delta=delta,
+            link_width=2,
+            directed=True,
+        )
 
     if storage == XLEVEL_EXPLICIT:
         # Mirror at the coarse level under -delta: the coarse endpoint
@@ -955,14 +961,15 @@ def _write_cross_level_edges(
         # by hand — write_links re-derives the offsets from the coarse
         # grid, which is what the fine-side split cannot speak to.
         coarse_lg = get_resolution_level(root_group, fine_level + delta)
-        write_links(
-            coarse_lg,
-            [[c, f] for f, c in zip(fine_eps, coarse_eps)],
-            sid_ndim,
-            delta=-delta,
-            link_width=2,
-            directed=True,
-        )
+        with coarse_lg.batched_writes():
+            write_links(
+                coarse_lg,
+                [[c, f] for f, c in zip(fine_eps, coarse_eps)],
+                sid_ndim,
+                delta=-delta,
+                link_width=2,
+                directed=True,
+            )
 
 
 # ===================================================================
