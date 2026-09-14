@@ -351,14 +351,20 @@ class ReadResult:
 
     @classmethod
     def from_lines(cls, raw: Mapping[str, Any], *, kind: str) -> ReadResult:
-        """``{endpoints, line_count}`` — the only reader with no
-        attribute key at all on any path.
+        """``{endpoints, vertex_attributes, line_count}``.
 
         ``endpoints`` is ``(M, 2, D)``.  Flattening it to ``(2M, D)`` with
         one two-vertex part per line loses nothing (:attr:`endpoints`
         reverses it exactly) and gains the shared shape.  The synthesised
         ``edges`` makes the connectivity explicit, which the tuple form
         left implicit in the axis layout.
+
+        ``vertex_attributes`` holds two rows per line in the same order,
+        so it lines up with ``positions`` as flattened here.  A dict that
+        is present but empty means the reader looked and the store had
+        none; a dict that is *absent* means the read predates
+        ``read_lines`` returning them, and ``attributes_read`` keeps the
+        two apart rather than reporting "none" for both.
         """
         endpoints = np.asarray(raw["endpoints"])
         n_lines = int(endpoints.shape[0])
@@ -373,7 +379,8 @@ class ReadResult:
             positions=positions,
             parts=_slices_from_lengths([2] * n_lines),
             edges=edges,
-            attributes_read=False,
+            attributes=Attributes(raw.get("vertex_attributes") or {}),
+            attributes_read="vertex_attributes" in raw,
         )
 
     @classmethod

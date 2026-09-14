@@ -24,18 +24,21 @@ from zarr_vectors.constants import (
     GEOM_LINE,
     LINKS_IMPLICIT_SEQUENTIAL,
     OBJIDX_STANDARD,
+    VERTEX_ATTRIBUTES,
     VERTEX_FRAGMENTS,
     VERTICES,
 )
 from zarr_vectors.constants import OBJECT_INDEX
 from zarr_vectors.core.arrays import (
     stamp_fragments_tile,
+    attribute_layout,
     create_attribute_array,
     create_object_attributes_array,
     create_object_index_array,
     create_vertices_array,
     list_chunk_keys,
     read_all_object_manifests,
+    read_chunk_attributes,
     read_chunk_vertices,
     read_object_attributes,
     read_fragment,
@@ -200,6 +203,25 @@ def write_lines(
             )
         line_attr_bins, attr_bin_values = assign_attribute_bins(src_values)
 
+    # Per-endpoint attributes are ``(N, 2)`` or ``(N, 2, C)`` -- two
+    # values per line, one per endpoint -- and follow their endpoint into
+    # whichever fragment it lands in.  Validated here, before anything is
+    # created on disk, so a wrong shape is not reported after a store
+    # exists.  These used to be accepted and then silently dropped: the
+    # writer imported ``create_attribute_array`` and
+    # ``write_chunk_attributes`` and called neither.
+    vertex_attr_arrays: dict[str, npt.NDArray] = {}
+    if attributes:
+        for _name, _data in attributes.items():
+            _arr = np.asarray(_data)
+            if _arr.ndim < 2 or _arr.shape[:2] != (n_lines, 2):
+                raise ArrayError(
+                    f"vertex_attributes[{_name!r}] must be (N, 2) or "
+                    f"(N, 2, C) with N=n_lines={n_lines} -- one value per "
+                    f"endpoint; got shape {_arr.shape}"
+                )
+            vertex_attr_arrays[_name] = _arr
+
     effective_bin = bin_shape if bin_shape is not None else chunk_shape
     bins_per_chunk = tuple(
         int(round(cs / bs)) for cs, bs in zip(chunk_shape, effective_bin)
@@ -239,6 +261,8 @@ def write_lines(
     axes = root_meta.spatial_index_dims
 
     arrays_present = [VERTICES, "object_index"]
+    if vertex_attr_arrays:
+        arrays_present.append(VERTEX_ATTRIBUTES)
     level_chunk_dims: list[str] | None = None
     if chunk_by_attribute is not None:
         level_chunk_dims = compute_chunk_dim_names(
@@ -275,7 +299,12 @@ def write_lines(
     cb_tuples = [tuple(row) for row in chunk_b_ints.tolist()]
     same_chunk = np.all(chunk_a_ints == chunk_b_ints, axis=1).tolist()
 
-    chunk_groups: dict[ChunkCoords, list[tuple[int, npt.NDArray]]] = {}
+    # ``(line_index, vertices, endpoint_indices)`` -- the third element
+    # says which of the line's two endpoints this fragment holds, so the
+    # attribute rows can follow the same split as the vertices.
+    chunk_groups: dict[
+        ChunkCoords, list[tuple[int, npt.NDArray, tuple[int, ...]]]
+    ] = {}
     object_manifests: dict[int, ObjectManifest] = {}
     cross_links: list[CrossChunkLink] = []
 
@@ -287,17 +316,17 @@ def write_lines(
         if same_chunk[i]:
             bucket = chunk_groups.setdefault(ca, [])
             fragment_idx = len(bucket)
-            bucket.append((i, endpoints[i]))  # (N=2, D)
+            bucket.append((i, endpoints[i], (0, 1)))  # (N=2, D)
             object_manifests[i] = [(ca, fragment_idx)]
         else:
             cb = cb_tuples[i]
             bucket_a = chunk_groups.setdefault(ca, [])
             fragment_idx_a = len(bucket_a)
-            bucket_a.append((i, endpoints[i, 0:1]))  # (1, D)
+            bucket_a.append((i, endpoints[i, 0:1], (0,)))  # (1, D)
 
             bucket_b = chunk_groups.setdefault(cb, [])
             fragment_idx_b = len(bucket_b)
-            bucket_b.append((i, endpoints[i, 1:2]))  # (1, D)
+            bucket_b.append((i, endpoints[i, 1:2], (1,)))  # (1, D)
 
             object_manifests[i] = [(ca, fragment_idx_a), (cb, fragment_idx_b)]
             # Link endpoints are chunk-local vertex indices, not
@@ -334,12 +363,29 @@ def write_lines(
         if line_attributes:
             for name in line_attributes:
                 create_object_attributes_array(level_group, name)
+        for name, arr in vertex_attr_arrays.items():
+            create_attribute_array(
+                level_group, name, dtype=str(arr.dtype),
+                channel_names=(
+                    [f"ch{c}" for c in range(arr.shape[2])]
+                    if arr.ndim == 3 else None
+                ),
+            )
 
         for chunk_coords, groups_list in sorted(chunk_groups.items()):
             vert_arrays = [g[1] for g in groups_list]
             write_chunk_vertices(
                 level_group, chunk_coords, vert_arrays, dtype=np_dtype,
             )
+            # Attribute rows follow their endpoints: a line split at a
+            # chunk boundary contributes one row to each side, in the same
+            # fragment order as the vertices written just above.
+            for name, arr in vertex_attr_arrays.items():
+                write_chunk_attributes(
+                    level_group, name, chunk_coords,
+                    [arr[i][list(eps)] for i, _verts, eps in groups_list],
+                    dtype=arr.dtype,
+                )
 
         write_object_index(level_group, object_manifests, sid_ndim=idx_ndim)
 
@@ -403,6 +449,10 @@ def read_lines(
             f"{prefix}/{VERTICES}",
             f"{prefix}/{VERTEX_FRAGMENTS}",
             f"{prefix}/{OBJECT_INDEX}",
+            # Probed even on a store that has none: a speculative miss
+            # caches as absent, which is the answer the reader wants, and
+            # leaving it out meant a warm block still paid one lookup.
+            f"{prefix}/{VERTEX_ATTRIBUTES}",
         ])
         return _read_lines(
             root,
@@ -438,6 +488,27 @@ def _read_lines(
     except Exception:
         pass
 
+    # Per-endpoint attributes, if the store carries any.  Read here,
+    # alongside the vertices, because they have to follow the SAME
+    # per-object assembly the endpoints below do -- the facade's
+    # level-ordered gather cannot be aligned to it, and for a multi-chunk
+    # store would silently pair each value with the wrong endpoint.
+    attr_layouts: dict[str, tuple[np.dtype, int]] = {}
+    try:
+        _attr_names = sorted(level_group[VERTEX_ATTRIBUTES].children())
+    except Exception:
+        _attr_names = []
+    if _attr_names:
+        # One gather for the whole family rather than a lookup per name.
+        level_group.prime_nodes(
+            [f"{VERTEX_ATTRIBUTES}/{_n}" for _n in _attr_names],
+        )
+    for _name in _attr_names:
+        try:
+            attr_layouts[_name] = attribute_layout(level_group, _name)
+        except Exception:
+            continue
+
     # Resolve attribute_filter → leading-bin index (per-object lines:
     # all of an object's chunks share the same leading coord).
     filter_bin: int | None = None
@@ -469,6 +540,7 @@ def _read_lines(
         except ValueError:
             return {
                 "endpoints": np.zeros((0, 2, ndim), dtype=dtype),
+                "vertex_attributes": {},
                 "line_count": 0,
             }
 
@@ -508,6 +580,10 @@ def _read_lines(
         (VERTICES, _chunk_key_strs),
         (VERTEX_FRAGMENTS, _chunk_key_strs),
         (OBJECT_INDEX, ["data", "offsets"]),
+        *(
+            (f"{VERTEX_ATTRIBUTES}/{_n}", _chunk_key_strs)
+            for _n in attr_layouts
+        ),
     ]
     _batched_reads_cm = level_group.batched_reads(_prefetch_plan)
     _batched_reads_cm.__enter__()
@@ -519,6 +595,11 @@ def _read_lines(
         # indexes into the per-object output list, not the global oid
         # (which can be sparse).
         oid_outputs: list[list[npt.NDArray | None]] = []
+        # One parallel slot table per attribute, filled from the same
+        # dispatch so a value can never be paired with another endpoint.
+        attr_outputs: dict[str, list[list[npt.NDArray | None]]] = {
+            name: [] for name in attr_layouts
+        }
         oid_for_output: list[int] = []
         chunk_dispatch: dict[ChunkCoords, list[tuple[int, int, int]]] = {}
         for oid in object_ids:
@@ -529,6 +610,8 @@ def _read_lines(
                 continue
             slot = len(oid_outputs)
             oid_outputs.append([None] * len(manifest))
+            for _slots in attr_outputs.values():
+                _slots.append([None] * len(manifest))
             oid_for_output.append(oid)
             for mi, (cc, fragment_index) in enumerate(manifest):
                 chunk_dispatch.setdefault(cc, []).append((slot, mi, fragment_index))
@@ -541,12 +624,26 @@ def _read_lines(
                 )
             except ArrayError:
                 continue
+            attr_groups: dict[str, list[npt.NDArray]] = {}
+            for _name, (_adt, _ancols) in attr_layouts.items():
+                try:
+                    attr_groups[_name] = read_chunk_attributes(
+                        level_group, _name, cc, dtype=_adt, ncols=_ancols,
+                    )
+                except ArrayError:
+                    continue
             for slot, mi, fragment_index in entries:
                 if 0 <= fragment_index < len(groups):
                     oid_outputs[slot][mi] = groups[fragment_index]
+                for _name, _rows in attr_groups.items():
+                    if 0 <= fragment_index < len(_rows):
+                        attr_outputs[_name][slot][mi] = _rows[fragment_index]
 
         result_endpoints: list[npt.NDArray] = []
-        for slot_groups in oid_outputs:
+        result_attrs: dict[str, list[npt.NDArray]] = {
+            name: [] for name in attr_layouts
+        }
+        for slot, slot_groups in enumerate(oid_outputs):
             if any(g is None for g in slot_groups):
                 continue
             all_verts = np.concatenate(slot_groups, axis=0)
@@ -554,12 +651,27 @@ def _read_lines(
                 continue
             ep = np.stack([all_verts[0], all_verts[-1]], axis=0)
             result_endpoints.append(ep)
+            # Same first/last reduction as the endpoints, over the same
+            # manifest order, so row 2k belongs to endpoint 0 of line k
+            # and row 2k+1 to endpoint 1 -- the order ``endpoints`` is
+            # flattened in.
+            for _name in attr_layouts:
+                parts = attr_outputs[_name][slot]
+                if any(q is None for q in parts):
+                    continue
+                rows = np.concatenate(parts, axis=0)
+                if len(rows) < 2:
+                    continue
+                result_attrs[_name].append(
+                    np.stack([rows[0], rows[-1]], axis=0)
+                )
     finally:
         _batched_reads_cm.__exit__(None, None, None)
 
     if not result_endpoints:
         return {
             "endpoints": np.zeros((0, 2, ndim), dtype=dtype),
+            "vertex_attributes": {},
             "line_count": 0,
         }
 
@@ -579,8 +691,20 @@ def _read_lines(
         )
         mask = in_a | in_b
         endpoints_out = endpoints_out[mask]
+        # Two attribute rows per line, so the per-line mask repeats.
+        keep_mask = np.repeat(mask, 2)
+
+    # An attribute is returned only when every emitted line contributed a
+    # row.  A short column cannot be aligned to ``endpoints``, and a
+    # silently misaligned one is worse than an absent one.
+    attrs_out: dict[str, npt.NDArray] = {}
+    for _name, _parts in result_attrs.items():
+        if _parts and len(_parts) == len(result_endpoints):
+            _col = np.concatenate(_parts, axis=0)
+            attrs_out[_name] = _col[keep_mask] if bbox is not None else _col
 
     return {
         "endpoints": endpoints_out,
+        "vertex_attributes": attrs_out,
         "line_count": len(endpoints_out),
     }

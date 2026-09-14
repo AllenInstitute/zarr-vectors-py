@@ -133,6 +133,143 @@ class TestLinesAttributes:
         result = read_lines(store)
         assert result["line_count"] == 2
 
+    def test_per_endpoint_attributes_round_trip(self, tmp_path: Path) -> None:
+        """``vertex_attributes`` were accepted and then silently dropped.
+
+        ``write_lines`` imported ``create_attribute_array`` and
+        ``write_chunk_attributes`` and called neither, so two values per
+        line went in and nothing came back out -- with no warning and no
+        ``vertex_attributes/`` directory on disk.
+        """
+        endpoints = np.array([
+            [[10, 10, 10], [20, 20, 20]],
+            [[30, 30, 30], [40, 40, 40]],
+        ], dtype=np.float32)
+        width = np.array([[1.0, 2.0], [3.0, 4.0]], dtype=np.float32)
+        colour = np.arange(2 * 2 * 3, dtype=np.float32).reshape(2, 2, 3)
+        store = str(tmp_path / "vattrs.zarrvectors")
+
+        write_lines(
+            store, endpoints,
+            chunk_shape=(100.0, 100.0, 100.0),
+            vertex_attributes={"width": width, "colour": colour},
+        )
+        result = read_lines(store)
+
+        # One row per endpoint, in the order ``endpoints`` flattens.
+        np.testing.assert_allclose(
+            result["vertex_attributes"]["width"], width.reshape(-1),
+        )
+        np.testing.assert_allclose(
+            result["vertex_attributes"]["colour"], colour.reshape(-1, 3),
+        )
+
+    def test_attributes_follow_a_line_split_across_chunks(
+        self, tmp_path: Path,
+    ) -> None:
+        """A split line puts one endpoint in each chunk; so must its rows.
+
+        The two endpoints become single-vertex fragments in different
+        chunks, so an attribute column assembled level-by-level rather
+        than per object would pair each value with the wrong endpoint --
+        and, because the counts still match, would do it silently.
+        """
+        endpoints = np.array([
+            [[10, 10, 10], [310, 10, 10]],
+            [[320, 20, 20], [20, 20, 20]],
+        ], dtype=np.float32)
+        width = np.array([[1.0, 2.0], [3.0, 4.0]], dtype=np.float32)
+        store = str(tmp_path / "split.zarrvectors")
+
+        summary = write_lines(
+            store, endpoints,
+            chunk_shape=(200.0, 200.0, 200.0),
+            vertex_attributes={"width": width},
+        )
+        assert summary["cross_chunk_count"] == 2
+
+        result = read_lines(store)
+        np.testing.assert_allclose(result["endpoints"], endpoints)
+        np.testing.assert_allclose(
+            result["vertex_attributes"]["width"], width.reshape(-1),
+        )
+
+    def test_attributes_survive_a_bbox_filter(self, tmp_path: Path) -> None:
+        """The bbox drops whole lines, so it must drop two rows per line."""
+        endpoints = np.array([
+            [[10, 10, 10], [20, 20, 20]],
+            [[80, 80, 80], [90, 90, 90]],
+        ], dtype=np.float32)
+        width = np.array([[1.0, 2.0], [3.0, 4.0]], dtype=np.float32)
+        store = str(tmp_path / "bbox.zarrvectors")
+
+        write_lines(
+            store, endpoints,
+            chunk_shape=(100.0, 100.0, 100.0),
+            vertex_attributes={"width": width},
+        )
+        result = read_lines(
+            store, bbox=(np.array([0, 0, 0]), np.array([25, 25, 25])),
+        )
+        assert result["line_count"] == 1
+        np.testing.assert_allclose(
+            result["vertex_attributes"]["width"], [1.0, 2.0],
+        )
+
+    def test_per_endpoint_attributes_reach_the_api(self, tmp_path: Path) -> None:
+        """The data surface sees them, and knows it looked.
+
+        ``ReadResult.attributes_read`` has to be True even when the store
+        carries none, or a caller cannot tell "no attributes" from "not
+        attempted" -- which is the distinction the flag exists for.
+        """
+        import zarr_vectors as zv
+
+        endpoints = np.array([
+            [[10, 10, 10], [310, 10, 10]],
+        ], dtype=np.float32)
+        width = np.array([[1.0, 2.0]], dtype=np.float32)
+        store = str(tmp_path / "api.zarrvectors")
+        write_lines(
+            store, endpoints,
+            chunk_shape=(200.0, 200.0, 200.0),
+            vertex_attributes={"width": width},
+        )
+
+        level = zv.open(store).level(0)
+        assert level.attribute_names("vertex") == ("width",)
+
+        result = level.read()
+        assert result.attributes_read is True
+        np.testing.assert_allclose(result.attributes["width"], [1.0, 2.0])
+        np.testing.assert_allclose(
+            result.positions, endpoints.reshape(-1, 3),
+        )
+
+        bare = str(tmp_path / "bare.zarrvectors")
+        write_lines(bare, endpoints, chunk_shape=(200.0, 200.0, 200.0))
+        empty = zv.open(bare).level(0).read()
+        assert empty.attributes_read is True
+        assert empty.attributes.names() == ()
+
+    def test_wrong_per_endpoint_shape_is_rejected(self, tmp_path: Path) -> None:
+        """Rejected before the store exists, not after."""
+        endpoints = np.array([
+            [[10, 10, 10], [20, 20, 20]],
+        ], dtype=np.float32)
+        store = tmp_path / "wrong.zarrvectors"
+        try:
+            write_lines(
+                str(store), endpoints,
+                chunk_shape=(100.0, 100.0, 100.0),
+                # One value per line, not one per endpoint.
+                vertex_attributes={"width": np.array([1.0], dtype=np.float32)},
+            )
+            assert False, "expected ArrayError"
+        except ArrayError as e:
+            assert "(N, 2)" in str(e)
+        assert not store.exists()
+
 
 class TestLinesEdgeCases:
 
