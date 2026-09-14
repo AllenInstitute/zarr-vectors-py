@@ -364,11 +364,27 @@ def _per_object_coarsen(
     n_metavertices = int(inverse.max()) + 1 if inverse.size > 0 else 0
 
     # --- Step 3 (continued): centroid per bin --------------------------
-    meta_positions = np.zeros((n_metavertices, ndim), dtype=np.float32)
-    bin_counts = np.zeros(n_metavertices, dtype=np.int64)
-    np.add.at(meta_positions, inverse, all_pos)
-    np.add.at(bin_counts, inverse, 1)
-    meta_positions /= bin_counts[:, None]
+    # Sum each bin's member positions, then divide by its population.
+    #
+    # ``np.bincount``, not ``np.add.at``: the latter is numpy's
+    # unbuffered scatter-add and takes the slow path on every element,
+    # which at a million source vertices is a million of them. bincount
+    # is the same reduction expressed as a histogram with weights, and
+    # runs in C. The accumulation is in float64 so a densely populated
+    # bin does not lose precision to float32 before the divide.
+    bin_counts = np.bincount(inverse, minlength=n_metavertices).astype(
+        np.int64, copy=False,
+    )
+    meta_positions = np.empty((n_metavertices, ndim), dtype=np.float32)
+    for _axis in range(ndim):
+        meta_positions[:, _axis] = (
+            np.bincount(
+                inverse,
+                weights=all_pos[:, _axis].astype(np.float64, copy=False),
+                minlength=n_metavertices,
+            )
+            / np.maximum(bin_counts, 1)
+        )
 
     # --- Step 4: chunk-assign metavertices ------------------------------
     chunk_assignments = assign_chunks(meta_positions, chunk_shape)

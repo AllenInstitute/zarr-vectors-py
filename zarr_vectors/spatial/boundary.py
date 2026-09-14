@@ -625,6 +625,21 @@ def partition_records_by_offset(
             f"{len(scale_src)}/{len(scale_trg)} != sid_ndim {sid_ndim}"
         )
     buckets: dict[tuple[str, ChunkCoords], list[tuple[list[int], int, int]]] = {}
+    # Three per-call memos. Each of these is a pure function of something
+    # a record repeats constantly: the chunk it is anchored from, the
+    # permutation that placed it, and the neighbour offsets that decide
+    # which array it lands in. A level has far fewer distinct chunks than
+    # records, only ``L!`` permutations, and a handful of neighbour
+    # patterns -- but formatting the offsets alone built a string per
+    # record, which profiling put at a tenth of a pyramid build.
+    #
+    # Deliberately plain dicts scoped to this call, not ``lru_cache``:
+    # measured, a module-level cache was *slower*, because an eviction
+    # policy and a lock cost more than the arithmetic they were avoiding
+    # once the key space exceeded the cache.
+    anchors: dict[ChunkCoords, ChunkCoords] = {}
+    perms: dict[tuple[int, ...], int] = {}
+    segments: dict[tuple[ChunkCoords, ...], str] = {}
     for input_idx, rec in enumerate(records):
         rec = list(rec)
         if len(rec) != link_width:
@@ -642,14 +657,25 @@ def partition_records_by_offset(
             rec, directed=directed, store=store, cross_level=cross_level,
         ):
             src_chunk = tuple(int(x) for x in rec[sigma[0]][0])
-            anchor = anchor_chunk(src_chunk, scale_src, scale_trg)
+            anchor = anchors.get(src_chunk)
+            if anchor is None:
+                anchor = anchor_chunk(src_chunk, scale_src, scale_trg)
+                anchors[src_chunk] = anchor
             offsets = tuple(
                 tuple(int(c) - int(a) for c, a in zip(rec[j][0], anchor))
                 for j in sigma[1:]
             )
             vi_in_src = [int(rec[j][1]) for j in sigma]
-            perm_idx = _lehmer_encode(sigma)
-            buckets.setdefault((format_offsets(offsets), src_chunk), []).append(
+            sigma_key = tuple(sigma)
+            perm_idx = perms.get(sigma_key)
+            if perm_idx is None:
+                perm_idx = _lehmer_encode(sigma)
+                perms[sigma_key] = perm_idx
+            segment = segments.get(offsets)
+            if segment is None:
+                segment = format_offsets(offsets)
+                segments[offsets] = segment
+            buckets.setdefault((segment, src_chunk), []).append(
                 (vi_in_src, perm_idx, input_idx)
             )
     return buckets
