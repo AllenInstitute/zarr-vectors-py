@@ -55,6 +55,11 @@ _ALLOWED_UNCOVERED = frozenset({
     # Removed from core entirely; the remaining references are prose in
     # migration notes, and one consumer not yet moved to read_links.
     "read_cross_chunk_links",
+    # The pre-promotion private spelling of expand_manifest_blocks, which
+    # IS exported here.  core.arrays keeps the alias deliberately so a
+    # consumer is not broken by a rename that gains them nothing; the one
+    # importer has simply not moved its import line yet.
+    "_expand_blocks",
     # Editing belongs to the api surface: ``Dataset.editing()`` returns an
     # EditPlan that wraps both VertexRef constructors, and its ``.session``
     # is the documented escape hatch for the rest.  The one importer is the
