@@ -49,7 +49,7 @@ from zarr_vectors.core.arrays import (
     read_chunk_vertex_rows,
     read_fragment,
     read_group_object_ids,
-    read_object_manifest,
+    read_object_manifests,
     resolve_chunk_keys,
     stamp_fragments_tile,
     write_chunk_attributes,
@@ -422,28 +422,41 @@ def write_points(
                     combined_assignments[(int(ab), *spatial_cc)] = global_indices[mask]
 
             for chunk_coords, global_indices in sorted(combined_assignments.items()):
-                chunk_positions = positions[global_indices]
+                # One fragment per object, ordered by object id. Built by
+                # sorting the chunk's vertices by owner and splitting at
+                # the boundaries -- NOT by masking the chunk once per
+                # object, which reads every vertex once per object and so
+                # costs objects x vertices for the chunk. On 500k objects
+                # sharing a cell that was 633s; this is the same linear
+                # argsort-and-split ``write_mesh`` already uses.
+                #
+                # The sort is stable, so vertices keep their input order
+                # within an object, which is the order the mask produced.
                 chunk_obj_ids = object_ids[global_indices]
-                unique_objs = np.unique(chunk_obj_ids)
                 vert_groups: list[npt.NDArray] = []
                 attr_groups_per_name: dict[str, list[npt.NDArray]] = {}
                 if attributes:
                     for attr_name in attributes:
                         attr_groups_per_name[attr_name] = []
 
-                fragment_idx = 0
-                for obj_id in unique_objs:
-                    mask = chunk_obj_ids == obj_id
-                    vert_groups.append(chunk_positions[mask])
-                    oid = int(obj_id)
-                    if oid not in object_manifests:
-                        object_manifests[oid] = []
-                    object_manifests[oid].append((chunk_coords, fragment_idx))
-                    if attributes:
-                        obj_global = global_indices[mask]
-                        for attr_name, attr_data in attributes.items():
-                            attr_groups_per_name[attr_name].append(attr_data[obj_global])
-                    fragment_idx += 1
+                if len(global_indices):
+                    order = np.argsort(chunk_obj_ids, kind="stable")
+                    ordered_global = global_indices[order]
+                    unique_objs, first_at = np.unique(
+                        chunk_obj_ids[order], return_index=True,
+                    )
+                    split_at = first_at[1:]
+                    vert_groups = list(
+                        np.split(positions[ordered_global], split_at)
+                    )
+                    for fragment_idx, obj_id in enumerate(unique_objs):
+                        object_manifests.setdefault(int(obj_id), []).append(
+                            (chunk_coords, fragment_idx),
+                        )
+                    for attr_name, attr_data in (attributes or {}).items():
+                        attr_groups_per_name[attr_name] = list(
+                            np.split(attr_data[ordered_global], split_at)
+                        )
 
                 write_chunk_vertices(level_group, chunk_coords, vert_groups, dtype=np_dtype)
                 if attributes:
@@ -677,10 +690,23 @@ def _read_points(
             for name in (attribute_names or ())
         }
 
+        # Every manifest in one coordinate selection, not one read per
+        # id. Each singular read decodes a whole 16,384-row bucket, so
+        # 10,000 ids cost 38s against a 200k-object store while the
+        # plural read answers the same set in 0.08s -- slower than simply
+        # reading the entire level.
+        try:
+            manifests_by_oid = read_object_manifests(
+                level_group, ids=[int(o) for o in object_ids],
+            )
+        except ArrayError:
+            manifests_by_oid = {}
+
         for oid in object_ids:
-            try:
-                manifest = read_object_manifest(level_group, oid)
-            except ArrayError:
+            # Absent means out of range or no such object -- the same ids
+            # the singular read raised on.
+            manifest = manifests_by_oid.get(int(oid))
+            if manifest is None:
                 continue
 
             # Optionally restrict the manifest to listed chunks.

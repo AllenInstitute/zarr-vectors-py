@@ -471,25 +471,39 @@ def write_graph(
             chunk_positions = positions[global_indices]
             chunk_obj_ids = object_ids[global_indices]
 
-            unique_objs = np.unique(chunk_obj_ids)
+            # One fragment per object, ordered by object id -- built by
+            # splitting the chunk at the owner boundaries rather than
+            # masking it once per object, which costs objects x vertices
+            # for the chunk (500k objects in one cell: 633s).
+            #
+            # ``chunk_assignments`` was already stably sorted by owner
+            # above, so this sort is the identity today; it is kept
+            # because ``build_vertex_chunk_mapping`` numbers vertices in
+            # exactly this order, and a split that silently disagreed
+            # with it would mis-point every edge in a multi-object chunk
+            # rather than fail.
             vert_groups: list[npt.NDArray] = []
             attr_groups: dict[str, list[npt.NDArray]] = {}
             if node_attributes:
                 for name in node_attributes:
                     attr_groups[name] = []
 
-            for obj_id in unique_objs:
-                mask = chunk_obj_ids == obj_id
-                vert_groups.append(chunk_positions[mask])
-                oid = int(obj_id)
-                if oid not in object_manifests:
-                    object_manifests[oid] = []
-                object_manifests[oid].append((chunk_coords, len(vert_groups) - 1))
-
-                if node_attributes:
-                    obj_global = global_indices[mask]
-                    for name, data in node_attributes.items():
-                        attr_groups[name].append(data[obj_global])
+            if len(global_indices):
+                order = np.argsort(chunk_obj_ids, kind="stable")
+                ordered_global = global_indices[order]
+                unique_objs, first_at = np.unique(
+                    chunk_obj_ids[order], return_index=True,
+                )
+                split_at = first_at[1:]
+                vert_groups = list(np.split(chunk_positions[order], split_at))
+                for fragment_idx, obj_id in enumerate(unique_objs):
+                    object_manifests.setdefault(int(obj_id), []).append(
+                        (chunk_coords, fragment_idx),
+                    )
+                for name, data in (node_attributes or {}).items():
+                    attr_groups[name] = list(
+                        np.split(data[ordered_global], split_at)
+                    )
 
             write_chunk_vertices(level_group, chunk_coords, vert_groups, dtype=np_dtype)
 
