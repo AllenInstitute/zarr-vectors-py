@@ -199,14 +199,16 @@ class ZVLevel:
     @property
     def present_oids(self) -> np.ndarray:
         """Sorted array of OIDs present at this level."""
-        from zarr_vectors.core.arrays import read_all_object_manifests
+        # Which slots are occupied, not what is in them. The mask reads
+        # that off the stored bytes; decoding every manifest built each
+        # object's chunk references only to ask whether there were any.
+        from zarr_vectors.core.arrays import object_present_mask
         try:
-            manifests = read_all_object_manifests(self._group)
+            return np.flatnonzero(object_present_mask(self._group)).astype(
+                np.int64,
+            )
         except Exception:
             return np.zeros(0, dtype=np.int64)
-        return np.asarray(
-            [i for i, m in enumerate(manifests) if m], dtype=np.int64,
-        )
 
     def read_attribute_chunk(self, value: Any) -> list[npt.NDArray]:
         """Read all fragments for chunks whose attribute equals ``value``.

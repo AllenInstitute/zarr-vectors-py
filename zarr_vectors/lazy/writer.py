@@ -35,11 +35,12 @@ from zarr.core.sync import sync
 
 from zarr_vectors.core.arrays import (
     list_chunk_keys,
+    object_count,
+    patch_object_manifests,
     read_all_object_manifests,
     read_chunk_vertices,
     write_chunk_attributes,
     write_chunk_vertices,
-    write_object_index,
 )
 from zarr_vectors.exceptions import ArrayError
 from zarr_vectors.spatial.boundary import chunk_local_to_global_offsets
@@ -530,17 +531,20 @@ class ZVWriter:
 
     def _current_num_objects(self) -> int:
         """Inspect existing object_index for total count."""
+        # The slot count is stamped on the index; decoding every
+        # manifest to take len() of the list read the whole level to
+        # learn a number already written down.
         try:
-            manifests = read_all_object_manifests(self._group)
+            n_existing = object_count(self._group)
         except Exception:
             return 0
         existing_pending = self._pending_manifests
         if existing_pending:
             return max(
-                len(manifests),
+                n_existing,
                 max(existing_pending.keys()) + 1,
             )
-        return len(manifests)
+        return n_existing
 
     # ---------------- lifecycle -----------------------------------------
 
@@ -591,18 +595,19 @@ class ZVWriter:
     def _merge_and_write_object_index(self, sid_ndim: int) -> None:
         """Merge ``self._pending_manifests`` into the main ``object_index/``.
 
-        Reads the current index (if any), applies last-write-wins
-        on staged OIDs, and rewrites the index in one call.
+        Writes the staged OIDs over whatever those slots held, leaving
+        every other row alone. Reading the whole index in order to write
+        it back merged cost the object count on every flush, and an
+        append-style writer flushes often; last-write-wins on the staged
+        ids is the same outcome either way.
         """
-        try:
-            existing = read_all_object_manifests(self._group)
-        except Exception:
-            existing = []
-        merged: dict[int, ObjectManifest] = {
-            oid: m for oid, m in enumerate(existing)
-        }
-        merged.update(self._pending_manifests)
-        write_object_index(self._group, merged, sid_ndim=sid_ndim)
+        if not self._pending_manifests:
+            return
+        patch_object_manifests(
+            self._group,
+            {int(oid): list(m) for oid, m in self._pending_manifests.items()},
+            sid_ndim,
+        )
 
     def _bump_level_vertex_count(self) -> None:
         """Recompute the level's vertex_count from on-disk data."""
