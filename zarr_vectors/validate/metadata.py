@@ -6,12 +6,20 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 from zarr_vectors.constants import (
-    CROSS_CHUNK_DEDUP, CROSS_CHUNK_BOTH, CROSS_CHUNK_EXPLICIT,
-    LINKS_EXPLICIT, LINKS_IMPLICIT_BRANCHES, LINKS_IMPLICIT_SEQUENTIAL,
-    OBJIDX_IDENTITY, OBJIDX_STANDARD,
+    CROSS_CHUNK_BOTH,
+    CROSS_CHUNK_DEDUP,
+    CROSS_CHUNK_EXPLICIT,
+    LINKS_EXPLICIT,
+    LINKS_IMPLICIT_BRANCHES,
+    LINKS_IMPLICIT_SEQUENTIAL,
+    OBJIDX_IDENTITY,
+    OBJIDX_STANDARD,
 )
 from zarr_vectors.core.store import (
-    open_store, read_root_metadata, get_resolution_level, list_resolution_levels,
+    get_resolution_level,
+    list_resolution_levels,
+    open_store,
+    read_root_metadata,
 )
 from zarr_vectors.validate.structure import ValidationResult
 
@@ -58,7 +66,10 @@ def validate_metadata(store_path: str | Path | Group) -> ValidationResult:
     if meta.bounds:
         bmin, bmax = meta.bounds
         if len(bmin) != sid_ndim or len(bmax) != sid_ndim:
-            result.add_error(f"Bounds dim mismatch: min={len(bmin)}, max={len(bmax)}, expected {sid_ndim}")
+            result.add_error(
+                f"Bounds dim mismatch: min={len(bmin)}, "
+                f"max={len(bmax)}, expected {sid_ndim}"
+            )
         else:
             result.add_pass("Bounds dimensionality matches SID")
 

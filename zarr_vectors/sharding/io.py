@@ -48,9 +48,9 @@ read-locality benefit without a custom mapping.
 
 from __future__ import annotations
 
-import json
+from collections.abc import Sequence
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Sequence
+from typing import TYPE_CHECKING, Any
 
 from zarr_vectors.core.group import _parse_chunk_coords
 from zarr_vectors.core.store import (
@@ -58,6 +58,9 @@ from zarr_vectors.core.store import (
     list_resolution_levels,
     open_store,
 )
+
+if TYPE_CHECKING:  # pragma: no cover - typing only
+    from zarr_vectors.core.group import Group
 
 
 # ===================================================================

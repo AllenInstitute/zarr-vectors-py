@@ -35,8 +35,9 @@ import json
 import sys
 import warnings
 from collections import defaultdict
+from collections.abc import Iterable
 from concurrent.futures import ThreadPoolExecutor
-from typing import Any, Iterable
+from typing import Any
 
 import numpy as np
 import zarr

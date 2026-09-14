@@ -19,18 +19,18 @@ import numpy as np
 import numpy.typing as npt
 
 from zarr_vectors.constants import (
-    RESOLUTION_PREFIX,
     CROSS_CHUNK_EXPLICIT,
+    DEFAULT_OOB_POLICY,
     GEOM_LINE,
     LINKS_IMPLICIT_SEQUENTIAL,
+    OBJECT_INDEX,
     OBJIDX_STANDARD,
+    RESOLUTION_PREFIX,
     VERTEX_ATTRIBUTES,
     VERTEX_FRAGMENTS,
     VERTICES,
 )
-from zarr_vectors.constants import OBJECT_INDEX
 from zarr_vectors.core.arrays import (
-    stamp_fragments_tile,
     attribute_layout,
     create_attribute_array,
     create_object_attributes_array,
@@ -40,8 +40,7 @@ from zarr_vectors.core.arrays import (
     read_all_object_manifests,
     read_chunk_attributes,
     read_chunk_vertices,
-    read_object_attributes,
-    read_fragment,
+    stamp_fragments_tile,
     write_chunk_attributes,
     write_chunk_vertices,
     write_links,
@@ -52,8 +51,7 @@ from zarr_vectors.core.attr_chunking import (
     assign_attribute_bins,
     compute_chunk_dim_names,
 )
-from zarr_vectors.constants import DEFAULT_OOB_POLICY
-from zarr_vectors.core.metadata import LevelMetadata, RootMetadata
+from zarr_vectors.core.metadata import LevelMetadata
 from zarr_vectors.core.store import (
     FsGroup,
     _apply_out_of_bounds_policy,
@@ -61,7 +59,6 @@ from zarr_vectors.core.store import (
     _ensure_root_metadata_for_write,
     _finalize_write,
     create_resolution_level,
-    create_store,
     get_resolution_level,
     open_store,
     read_level_metadata,
@@ -69,10 +66,7 @@ from zarr_vectors.core.store import (
 )
 from zarr_vectors.exceptions import ArrayError
 from zarr_vectors.spatial.chunking import (
-    assign_chunks,
     compute_bounds,
-    compute_chunk_coords,
-    bin_to_chunk,
 )
 from zarr_vectors.typing import (
     BinShape,
@@ -81,7 +75,6 @@ from zarr_vectors.typing import (
     ChunkShape,
     CrossChunkLink,
     ObjectManifest,
-    FragmentRef,
 )
 
 if TYPE_CHECKING:
@@ -222,10 +215,9 @@ def write_lines(
                 )
             vertex_attr_arrays[_name] = _arr
 
-    effective_bin = bin_shape if bin_shape is not None else chunk_shape
-    bins_per_chunk = tuple(
-        int(round(cs / bs)) for cs, bs in zip(chunk_shape, effective_bin)
-    )
+    # No bins_per_chunk here: write_lines splits at chunk boundaries
+    # only.  ``bin_shape`` still reaches the store as base_bin_shape,
+    # for readers and for later coarsening.
 
     all_pts = endpoints.reshape(-1, ndim)
     if bounds is None:

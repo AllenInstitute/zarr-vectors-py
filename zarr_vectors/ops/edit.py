@@ -22,7 +22,8 @@ objects, refresh policy) are documented in the approved plan at
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Any, Iterable, Literal
+from collections.abc import Iterable
+from typing import TYPE_CHECKING, Any, Literal
 
 import numpy as np
 import numpy.typing as npt
@@ -956,7 +957,6 @@ class EditSession:
             return self._report
 
         # 1. Apply dirty chunks via batched_writes for parallelism.
-        from zarr_vectors.core.store import commit, get_resolution_level
         from zarr_vectors.core.arrays import (
             create_links_array,
             finalize_links,
@@ -964,6 +964,7 @@ class EditSession:
             write_chunk_links,
             write_chunk_vertices,
         )
+        from zarr_vectors.core.store import commit, get_resolution_level
 
         # Link families whose cells this flush rewrote.  Per-cell writes
         # don't maintain the family-wide counts, so each needs one

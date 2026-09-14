@@ -45,7 +45,7 @@ class ValidationResult:
     def add_error(self, msg: str) -> None:
         self.errors.append(msg)
 
-    def merge(self, other: "ValidationResult") -> None:
+    def merge(self, other: ValidationResult) -> None:
         self.passed.extend(other.passed)
         self.warnings.extend(other.warnings)
         self.errors.extend(other.errors)
@@ -54,7 +54,8 @@ class ValidationResult:
         status = "PASS" if self.ok else "FAIL"
         parts = [
             f"Level {self.level} validation: {status}",
-            f"  {len(self.passed)} passed, {len(self.warnings)} warnings, {len(self.errors)} errors",
+            f"  {len(self.passed)} passed, "
+            f"{len(self.warnings)} warnings, {len(self.errors)} errors",
         ]
         for e in self.errors:
             parts.append(f"  ERROR: {e}")

@@ -15,15 +15,14 @@ if TYPE_CHECKING:
     from zarr.storage import StoreLike
 
 from zarr_vectors.core.group import Group
+from zarr_vectors.core.metadata import RootMetadata
 from zarr_vectors.core.store import (
-    FsGroup,
     list_resolution_levels,
     open_store,
-    read_root_metadata,
     read_level_metadata,
+    read_root_metadata,
     rebind,
 )
-from zarr_vectors.core.metadata import RootMetadata, LevelMetadata
 from zarr_vectors.lazy.level import ZVLevel
 
 

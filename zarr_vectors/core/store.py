@@ -12,8 +12,8 @@ by the :class:`Group` abstraction in :mod:`zarr_vectors.core.group`.
 from __future__ import annotations
 
 import os
-from pathlib import Path
 from collections.abc import Sequence
+from pathlib import Path
 from typing import TYPE_CHECKING, Any
 from urllib.parse import unquote, urlparse
 
@@ -22,6 +22,11 @@ from zarr.storage import LocalStore
 
 if TYPE_CHECKING:
     from zarr.storage import StoreLike
+
+    # Imported here as well as at runtime below: a type checker reads this
+    # block top-down and has not reached the runtime import yet, so the
+    # aliases underneath would otherwise name something undefined.
+    from zarr_vectors.core.group import Group
 
     # What every ``read_*`` entry point accepts: a URL/path string, a
     # pre-built ``zarr.abc.store.Store``, or an already-open Group.  The
@@ -39,14 +44,13 @@ if TYPE_CHECKING:
 from zarr_vectors.constants import (
     DEFAULT_AXES_NAMES,
     DEFAULT_BOUNDS_SIDE,
-    DEFAULT_OOB_POLICY,
     FORMAT_VERSION,  # noqa: F401  (re-exported for callers)
     PARAMETRIC_GROUP,
     RESOLUTION_PREFIX,
     VALID_OOB_POLICIES,
     VERTICES,
 )
-from zarr_vectors.core.group import Group, _BackendShim
+from zarr_vectors.core.group import Group
 from zarr_vectors.core.metadata import (
     LevelMetadata,
     NgffAxis,
@@ -56,7 +60,6 @@ from zarr_vectors.core.metadata import (
     serialise_parametric_types,
 )
 from zarr_vectors.exceptions import MetadataError, StoreError
-
 
 # ===================================================================
 # Path / URL → Zarr store
@@ -390,7 +393,7 @@ def create_store(
         format_capabilities: Optional capability tokens to stamp on
             the root.  See :mod:`zarr_vectors.constants` ``CAP_*``.
         attribute_specs: What the store declares its attributes to be,
-            by scope -- ``{"vertex": {name: {...}}, "object": ..., 
+            by scope -- ``{"vertex": {name: {...}}, "object": ...,
             "link": ...}``.  Optional and additive; a reader that does
             not know about it is unaffected.  Declaring an attribute does
             not create it.

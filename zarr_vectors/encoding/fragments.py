@@ -40,8 +40,8 @@ goes through a one-time prefix-popcount cache built lazily on first call.
 from __future__ import annotations
 
 import struct
+from collections.abc import Sequence
 from dataclasses import dataclass, field
-from typing import Sequence
 
 import numpy as np
 import numpy.typing as npt
@@ -440,7 +440,7 @@ def decode_fragments(raw: bytes) -> ChunkFragmentIndex:
     bitmap_padded = _bitmap_padded_length(f)
     if len(raw) < offset + bitmap_padded:
         raise ArrayError(
-            f"Fragment-index blob truncated in bitmap region",
+            "Fragment-index blob truncated in bitmap region",
         )
     # Copy out the unpadded portion as our canonical bitmap.  Copying
     # is cheap (≤ ceil(F/8) bytes) and avoids retaining the whole input
@@ -453,7 +453,7 @@ def decode_fragments(raw: bytes) -> ChunkFragmentIndex:
     range_table_bytes = r * 16
     if len(raw) < offset + range_table_bytes:
         raise ArrayError(
-            f"Fragment-index blob truncated in range table",
+            "Fragment-index blob truncated in range table",
         )
     range_table = np.frombuffer(
         raw, dtype=np.int64, count=r * 2, offset=offset,
@@ -464,7 +464,7 @@ def decode_fragments(raw: bytes) -> ChunkFragmentIndex:
     csr_offsets_bytes = (e + 1) * 4
     if len(raw) < offset + csr_offsets_bytes:
         raise ArrayError(
-            f"Fragment-index blob truncated in CSR offsets",
+            "Fragment-index blob truncated in CSR offsets",
         )
     csr_offsets = np.frombuffer(
         raw, dtype=np.uint32, count=e + 1, offset=offset,
@@ -475,7 +475,7 @@ def decode_fragments(raw: bytes) -> ChunkFragmentIndex:
     csr_indices_bytes = t * 8
     if len(raw) < offset + csr_indices_bytes:
         raise ArrayError(
-            f"Fragment-index blob truncated in CSR indices",
+            "Fragment-index blob truncated in CSR indices",
         )
     csr_indices = np.frombuffer(
         raw, dtype=np.int64, count=t, offset=offset,

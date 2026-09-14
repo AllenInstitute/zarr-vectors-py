@@ -48,7 +48,6 @@ from zarr_vectors.ops.links import (
 )
 from zarr_vectors.ops.merge import allocate_oid, merge_edit_reports
 from zarr_vectors.ops.refresh import rebuild_pyramid_from_level
-from zarr_vectors.ops.vacuum import vacuum
 from zarr_vectors.ops.refs import (
     AttributeRef,
     FragmentRef,
@@ -56,6 +55,7 @@ from zarr_vectors.ops.refs import (
     ObjectRef,
     VertexRef,
 )
+from zarr_vectors.ops.vacuum import vacuum
 
 __all__ = [
     "AttributeRef",

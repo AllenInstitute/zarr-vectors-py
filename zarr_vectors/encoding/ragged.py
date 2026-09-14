@@ -17,7 +17,6 @@ import numpy.typing as npt
 
 from zarr_vectors.exceptions import ArrayError
 
-
 # ---------------------------------------------------------------------------
 # Ragged float encoding (vertex positions, float/int attributes)
 # ---------------------------------------------------------------------------

@@ -25,8 +25,8 @@ import numpy as np
 import numpy.typing as npt
 
 from zarr_vectors.constants import (
-    RESOLUTION_PREFIX,
     CROSS_CHUNK_EXPLICIT,
+    DEFAULT_OOB_POLICY,
     FRAGMENT_ATTRIBUTES,
     GEOM_GRAPH,
     GEOM_SKELETON,
@@ -34,24 +34,22 @@ from zarr_vectors.constants import (
     LINKS_EXPLICIT,
     LINKS_IMPLICIT_BRANCHES,
     OBJIDX_STANDARD,
+    RESOLUTION_PREFIX,
     VERTEX_FRAGMENTS,
     VERTICES,
 )
 from zarr_vectors.core.arrays import (
-    stamp_fragments_tile,
     create_attribute_array,
     create_fragment_attribute_array,
     create_links_array,
     create_object_attributes_array,
     create_object_index_array,
     create_vertices_array,
-    list_chunk_keys,
     list_link_offsets,
-    resolve_chunk_keys,
-    read_all_object_manifests,
     read_chunk_vertices,
     read_links,
-    read_object_vertices,
+    resolve_chunk_keys,
+    stamp_fragments_tile,
     write_chunk_attributes,
     write_chunk_fragment_attributes,
     write_chunk_vertices,
@@ -64,10 +62,8 @@ from zarr_vectors.core.attr_chunking import (
     assign_attribute_bins,
     compute_chunk_dim_names,
 )
-from zarr_vectors.constants import DEFAULT_OOB_POLICY
 from zarr_vectors.core.metadata import (
     LevelMetadata,
-    RootMetadata,
     get_level_chunk_shape,
 )
 from zarr_vectors.core.paths import links_group_path
@@ -78,7 +74,6 @@ from zarr_vectors.core.store import (
     _ensure_root_metadata_for_write,
     _finalize_write,
     create_resolution_level,
-    create_store,
     get_resolution_level,
     open_store,
     read_level_metadata,
@@ -87,10 +82,8 @@ from zarr_vectors.core.store import (
 from zarr_vectors.exceptions import ArrayError
 from zarr_vectors.spatial.boundary import build_vertex_chunk_mapping
 from zarr_vectors.spatial.chunking import (
-    assign_bins,
     assign_chunks,
     compute_bounds,
-    group_bins_by_chunk,
 )
 from zarr_vectors.typing import (
     BinShape,

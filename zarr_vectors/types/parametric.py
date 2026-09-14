@@ -24,26 +24,18 @@ from typing import TYPE_CHECKING, Any
 import numpy as np
 import numpy.typing as npt
 
-from zarr_vectors.constants import PARAMETRIC_GROUP
 from zarr_vectors.core.metadata import (
     DEFAULT_PARAMETRIC_TYPES,
-    PARAMETRIC_LINE,
-    PARAMETRIC_PLANE,
-    PARAMETRIC_SPHERE,
     ParametricTypeDef,
-    deserialise_parametric_types,
-    serialise_parametric_types,
 )
 from zarr_vectors.core.store import (
-    FsGroup,
     create_store,
     get_parametric_group,
     open_store,
-    read_root_metadata,
-    write_parametric_types,
     read_parametric_types,
+    write_parametric_types,
 )
-from zarr_vectors.exceptions import ArrayError, MetadataError
+from zarr_vectors.exceptions import ArrayError
 
 if TYPE_CHECKING:
     from zarr_vectors.core.store import ReadSource

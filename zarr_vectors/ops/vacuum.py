@@ -32,8 +32,6 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
-import numpy as np
-
 from zarr_vectors.constants import OBJECT_ATTRIBUTES
 from zarr_vectors.exceptions import EditError
 from zarr_vectors.ops.change_set import VacuumReport

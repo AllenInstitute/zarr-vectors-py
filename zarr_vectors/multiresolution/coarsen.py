@@ -29,10 +29,10 @@ from zarr_vectors.constants import (
     DEFAULT_CROSS_LEVEL_DEPTH,
     DEFAULT_CROSS_LEVEL_STORAGE,
     OBJECT_ATTRIBUTES,
+    VALID_XLEVEL_STORAGE,
     VERTICES,
     XLEVEL_EXPLICIT,
     XLEVEL_NONE,
-    VALID_XLEVEL_STORAGE,
 )
 from zarr_vectors.core.arrays import (
     create_object_attributes_array,
@@ -65,6 +65,9 @@ from zarr_vectors.multiresolution.object_selection import apply_sparsity
 from zarr_vectors.spatial.boundary import build_vertex_chunk_mapping
 from zarr_vectors.spatial.chunking import assign_chunks
 from zarr_vectors.typing import ChunkCoords
+
+if TYPE_CHECKING:  # pragma: no cover - typing only
+    from zarr_vectors.core.group import Group
 
 
 # ===================================================================
@@ -284,7 +287,6 @@ def _per_object_coarsen(
         keep_oids = sorted(int(o) for o in kept)
     else:
         keep_oids = list(range(n_src_objects))
-    keep_set = set(keep_oids)
 
     # --- Step 2-3: build (source vertex → bin → metavertex) map ---------
     # Per-object ordered source-vertex positions (with their global index

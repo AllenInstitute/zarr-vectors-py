@@ -32,7 +32,6 @@ from zarr_vectors.core.metadata import (
     LevelMetadata,
     RootMetadata,
     compute_bin_ratio,
-    compute_bin_shape,
     validate_bin_shape_divides_chunk,
 )
 from zarr_vectors.core.store import (
@@ -43,7 +42,7 @@ from zarr_vectors.core.store import (
 )
 from zarr_vectors.exceptions import StoreError
 from zarr_vectors.spatial.chunking import assign_bins
-from zarr_vectors.typing import BinShape, ChunkCoords
+from zarr_vectors.typing import BinShape
 
 
 def rebin_level(

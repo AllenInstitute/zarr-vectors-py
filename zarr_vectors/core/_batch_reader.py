@@ -32,7 +32,6 @@ import asyncio
 import os
 from typing import Any, NamedTuple
 
-import numpy as np
 import zarr
 from numcodecs.vlen import VLenBytes
 from zarr.core.array_spec import ArraySpec
@@ -43,6 +42,8 @@ from zarr.core.sync import sync
 # not reintroduce the import cycle this module otherwise avoids.
 from zarr_vectors.core._vlen import (
     cell_region as _vlen_cell_region,
+)
+from zarr_vectors.core._vlen import (
     region_to_bytes as _vlen_region_to_bytes,
 )
 

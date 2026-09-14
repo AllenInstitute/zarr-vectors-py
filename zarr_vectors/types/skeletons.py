@@ -30,8 +30,9 @@ the single-level primitives the reduce and the reader build on.
 from __future__ import annotations
 
 from collections import defaultdict
+from collections.abc import Sequence
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Sequence
+from typing import TYPE_CHECKING, Any
 
 import numpy as np
 import numpy.typing as npt
@@ -50,8 +51,8 @@ from zarr_vectors.core.arrays import (
     create_vertices_array,
     read_chunk_link_fragment,
     read_fragment,
-    read_object_manifest,
     read_object_attributes,
+    read_object_manifest,
     read_vertex_fragment_index,
     write_chunk_attributes,
     write_chunk_fragment_attributes,
@@ -71,7 +72,6 @@ from zarr_vectors.core.store import (
     read_root_metadata,
 )
 from zarr_vectors.exceptions import ArrayError
-from zarr_vectors.types.graphs import _extract_branch_links, _reorder_tree
 from zarr_vectors.typing import ChunkCoords
 
 if TYPE_CHECKING:

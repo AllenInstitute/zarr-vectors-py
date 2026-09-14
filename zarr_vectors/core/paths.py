@@ -33,7 +33,7 @@ delta and offset conventions have exactly one definition each.
 
 from __future__ import annotations
 
-from typing import Sequence
+from collections.abc import Sequence
 
 from zarr_vectors.constants import (
     LINK_ATTRIBUTES,

@@ -42,12 +42,12 @@ def rebuild_pyramid_from_level(
     """
     from zarr_vectors.core.metadata import compute_bin_ratio
     from zarr_vectors.core.store import (
+        commit,
         list_resolution_levels,
         read_level_metadata,
         read_root_metadata,
         remove_resolution_level,
         session_for,
-        commit,
     )
     from zarr_vectors.multiresolution.coarsen import coarsen_level
 

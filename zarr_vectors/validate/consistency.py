@@ -9,11 +9,16 @@ import numpy as np
 
 from zarr_vectors.core.arrays import (
     chunk_fragments_tile,
+    list_chunk_keys,
+    read_all_object_manifests,
     read_chunk_vertex_buffer,
-    list_chunk_keys, read_all_object_manifests, read_chunk_vertices,
+    read_chunk_vertices,
 )
 from zarr_vectors.core.store import (
-    get_resolution_level, list_resolution_levels, open_store, read_root_metadata,
+    get_resolution_level,
+    list_resolution_levels,
+    open_store,
+    read_root_metadata,
 )
 from zarr_vectors.typing import ChunkCoords
 from zarr_vectors.validate.structure import ValidationResult
@@ -218,7 +223,11 @@ def validate_consistency(store_path: str | Path | Group) -> ValidationResult:
                     if cc not in chunk_fragment_counts:
                         result.add_error(f"{prefix}: obj {oid} refs non-existent chunk {cc}")
                     elif fragment_index >= chunk_fragment_counts[cc]:
-                        result.add_error(f"{prefix}: obj {oid} refs fragment_idx={fragment_index} >= {chunk_fragment_counts[cc]}")
+                        result.add_error(
+                            f"{prefix}: obj {oid} refs "
+                            f"fragment_idx={fragment_index} >= "
+                            f"{chunk_fragment_counts[cc]}"
+                        )
             result.add_pass(f"{prefix}: object_index validated ({len(manifests)} objects)")
         except Exception:
             pass

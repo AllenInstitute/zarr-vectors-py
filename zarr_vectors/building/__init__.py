@@ -38,28 +38,28 @@ from __future__ import annotations
 # --- array names and layout sentinels --------------------------------
 from zarr_vectors.constants import (
     CAP_FRAGMENT_INDEX,
-    COARSEN_PER_OBJECT,
-    DEFAULT_CROSS_LEVEL_DEPTH,
-    DEFAULT_CROSS_LEVEL_STORAGE,
-    FRAGMENT_ATTRIBUTES,
-    GROUP_ATTRIBUTES,
-    LINKS_IMPLICIT_BRANCHES,
-    LINKS_IMPLICIT_SEQUENTIAL,
-    XLEVEL_EXPLICIT,
-    XLEVEL_NONE,
     CAP_MULTISCALE_LINKS,
     CAP_PRESERVED_OBJECT_IDS,
     CAP_SHARED_FRAGMENTS,
+    COARSEN_PER_OBJECT,
+    DEFAULT_CROSS_LEVEL_DEPTH,
+    DEFAULT_CROSS_LEVEL_STORAGE,
     FORMAT_VERSION,
+    FRAGMENT_ATTRIBUTES,
+    GROUP_ATTRIBUTES,
     GROUPS,
     LINK_ATTRIBUTES,
     LINK_FRAGMENTS,
     LINKS,
+    LINKS_IMPLICIT_BRANCHES,
+    LINKS_IMPLICIT_SEQUENTIAL,
     OBJECT_ATTRIBUTES,
     OBJECT_INDEX,
     VERTEX_ATTRIBUTES,
     VERTEX_FRAGMENTS,
     VERTICES,
+    XLEVEL_EXPLICIT,
+    XLEVEL_NONE,
 )
 from zarr_vectors.core.arrays import (
     OBJECT_INDEX_LAYOUT_V1,
@@ -122,15 +122,14 @@ from zarr_vectors.core.arrays import (
     write_chunk_vertices,
     write_groupings,
     write_groupings_attributes,
-    write_link_attributes,
     write_link_attribute_cells,
+    write_link_attributes,
     write_link_cells,
     write_links,
     write_object_attributes,
     write_object_index,
 )
 from zarr_vectors.core.group import Group
-from zarr_vectors.exceptions import StoreError
 from zarr_vectors.core.metadata import (
     LevelMetadata,
     RootMetadata,
@@ -139,9 +138,9 @@ from zarr_vectors.core.metadata import (
     compute_bin_ratio,
     compute_bin_shape,
     get_level_bin_shape,
+    get_level_chunk_shape,
     level_chunk_scale,
     level_factor,
-    get_level_chunk_shape,
     validate_bin_shape_divides_chunk,
     validate_level_chunk_shape_against_root,
 )
@@ -181,10 +180,12 @@ from zarr_vectors.encoding.fragments import (
     decode_object_manifest_blocks,
     encode_object_manifest_blocks,
 )
+from zarr_vectors.exceptions import StoreError
 from zarr_vectors.multiresolution.registry import (
     register_coarsen_strategy,
     register_selection_strategy,
 )
+
 # Re-layout, alongside the sharding verbs it sits next to.  Retired from
 # ``zarr_vectors.__all__`` (it describes where bytes live, not what the
 # data is), so this is where a tool gets it.  Note it REWRITES the chunk
@@ -239,7 +240,6 @@ from zarr_vectors.types.skeletons import (
     write_skeleton_chunk,
     write_skeleton_cross_chunk_links,
 )
-
 
 #: The subset of :class:`Group`'s methods this module promises.
 #:

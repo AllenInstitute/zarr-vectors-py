@@ -26,8 +26,12 @@ Convention contract:
 | ``links_convention`` | add / edit / remove behaviour |
 |---|---|
 | ``"explicit"`` | every link is a stored row; all edits work uniformly |
-| ``"implicit_sequential"`` | no rows stored; all link edits raise (caller must promote the store via ``materialise_object_links_explicit``) |
-| ``"implicit_sequential_with_branches"`` | branch-override rows only; add/edit/remove operate on the stored branch entries; structural removal of an implicit edge raises |
+| ``"implicit_sequential"`` | no rows stored; all link edits raise
+  (caller must promote the store via
+  ``materialise_object_links_explicit``) |
+| ``"implicit_sequential_with_branches"`` | branch-override rows only;
+  add/edit/remove operate on the stored branch entries; structural
+  removal of an implicit edge raises |
 
 Atomic semantics for links are weaker than for vertices: links don't
 carry OID identity directly.  Under ``atomic=True`` an edit appends a
@@ -37,6 +41,7 @@ row is overwritten.  Object manifests are unaffected by link edits.
 
 from __future__ import annotations
 
+from collections.abc import Iterable
 from typing import TYPE_CHECKING
 
 import numpy as np
@@ -642,9 +647,9 @@ def reorder_vertices_implicit(
     root,
     level: int,
     *,
-    object_ids: "Iterable[int] | None" = None,
+    object_ids: Iterable[int] | None = None,
     flip_convention: bool = False,
-    dtype: "np.dtype | str" = np.float32,
+    dtype: np.dtype | str = np.float32,
 ) -> dict:
     """Inverse of :func:`materialise_object_links_explicit`.
 
@@ -699,7 +704,6 @@ def reorder_vertices_implicit(
     import warnings
 
     from zarr_vectors.core.arrays import (
-        finalize_links,
         list_link_offsets,
         read_all_object_manifests,
         read_chunk_link_attributes,
@@ -711,9 +715,7 @@ def reorder_vertices_implicit(
         write_chunk_fragment_attributes,
         write_chunk_links,
         write_chunk_vertices,
-        write_link_attribute_cells,
         write_link_attributes,
-        write_link_cells,
         write_links,
         write_object_index,
     )
@@ -721,16 +723,17 @@ def reorder_vertices_implicit(
     from zarr_vectors.core.paths import links_group_path
     from zarr_vectors.core.store import get_resolution_level
 
-    _empty_report = lambda: {
-        "objects_processed": 0,
-        "objects_skipped_non_tree": 0,
-        "skipped_oids": [],
-        "branch_overrides_written": 0,
-        "cross_chunk_branch_overrides_written": 0,
-        "chunks_repermuted": 0,
-        "fragments_split": 0,
-        "convention_flipped": False,
-    }
+    def _empty_report() -> dict:
+        return {
+            "objects_processed": 0,
+            "objects_skipped_non_tree": 0,
+            "skipped_oids": [],
+            "branch_overrides_written": 0,
+            "cross_chunk_branch_overrides_written": 0,
+            "chunks_repermuted": 0,
+            "fragments_split": 0,
+            "convention_flipped": False,
+        }
 
     meta = RootMetadata.from_dict(root.attrs.to_dict())
     sid_ndim = meta.sid_ndim
@@ -1026,7 +1029,8 @@ def reorder_vertices_implicit(
 
     # Per-chunk branch-override accumulators.
     intra_branch_rows: dict = {cc: [] for cc in chunks_to_rewrite}
-    new_cross_branches: list = []  # list of ((parent_cc, parent_new_local), (child_cc, child_new_local))
+    # ((parent_cc, parent_new_local), (child_cc, child_new_local))
+    new_cross_branches: list = []
 
     n_intra_branches = 0
     n_cross_branches = 0
@@ -1208,7 +1212,10 @@ def reorder_vertices_implicit(
                 continue
             arr = np.stack(kept, axis=0) if kept[0].ndim > 0 else np.asarray(kept)
             group0 = arr
-            group_rest = [np.empty((0,) + arr.shape[1:], dtype=arr.dtype) for _ in range(n_frags - 1)]
+            group_rest = [
+                np.empty((0,) + arr.shape[1:], dtype=arr.dtype)
+                for _ in range(n_frags - 1)
+            ]
             from zarr_vectors.core.arrays import write_chunk_link_attributes
             write_chunk_link_attributes(
                 level_group, fname, cc, [group0, *group_rest],

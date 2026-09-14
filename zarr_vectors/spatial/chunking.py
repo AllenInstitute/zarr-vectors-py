@@ -9,7 +9,7 @@ of vertices in one pass using ``np.floor`` and structured-array
 from __future__ import annotations
 
 import itertools
-from typing import Iterable
+from collections.abc import Iterable
 
 import numpy as np
 import numpy.typing as npt
@@ -415,7 +415,7 @@ def fragment_index_to_bin(
         local[d] = remaining % bins_per_chunk[d]
         remaining //= bins_per_chunk[d]
     return tuple(
-        l + c * bpc for l, c, bpc in zip(local, chunk_coords, bins_per_chunk)
+        lo + c * bpc for lo, c, bpc in zip(local, chunk_coords, bins_per_chunk)
     )
 
 

@@ -25,7 +25,7 @@ group in batches, holding only O(fragments) in memory:
 from __future__ import annotations
 
 import warnings
-from typing import Sequence
+from collections.abc import Sequence
 
 import numpy as np
 from zarr.codecs import VLenBytesCodec
@@ -243,7 +243,7 @@ class ObjectIndexAppender:
             self._level_group, self._length_attr, full, mode="replace",
         )
 
-    def __enter__(self) -> "ObjectIndexAppender":
+    def __enter__(self) -> ObjectIndexAppender:
         return self
 
     def __exit__(self, exc_type, exc_val, exc_tb) -> None:

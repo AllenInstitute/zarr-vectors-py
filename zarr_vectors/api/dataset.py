@@ -25,6 +25,11 @@ from typing import TYPE_CHECKING, Any, Literal, cast
 import numpy as np
 import numpy.typing as npt
 
+# One parser for the whole package.  There were two -- this and the one
+# in ``_api_version`` -- for a syntax that has to mean the same thing in
+# both.
+from zarr_vectors._api_version import parse_version as _parse_version
+from zarr_vectors._api_version import satisfies as _satisfies
 from zarr_vectors.api.level import Level
 from zarr_vectors.api.result import ReadResult
 from zarr_vectors.api.schema import Layout, Schema, SchemaConflict, StorageOptions
@@ -48,12 +53,6 @@ __all__ = [
 
 class FormatError(ZVError):
     """The store's on-disk format is not one this code can serve."""
-
-
-# One parser for the whole package.  There were two — this and the one in
-# ``_api_version`` — for a syntax that has to mean the same thing in both.
-from zarr_vectors._api_version import parse_version as _parse_version
-from zarr_vectors._api_version import satisfies as _satisfies
 
 
 class Dataset:

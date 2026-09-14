@@ -13,12 +13,9 @@ import numpy as np
 import numpy.typing as npt
 
 from zarr_vectors.core.arrays import (
-    list_chunk_keys,
     read_all_object_manifests,
     read_chunk_attributes,
     read_chunk_vertices,
-    read_object_vertices,
-    read_fragment,
 )
 from zarr_vectors.core.store import FsGroup
 from zarr_vectors.typing import ChunkCoords

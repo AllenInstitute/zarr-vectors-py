@@ -9,16 +9,14 @@ and split ordered polylines at chunk boundaries.
 from __future__ import annotations
 
 import math
-from typing import Sequence
+from collections.abc import Sequence
 
 import numpy as np
 import numpy.typing as npt
 
 from zarr_vectors.core.paths import format_offsets
 from zarr_vectors.exceptions import ChunkingError
-from zarr_vectors.spatial.chunking import compute_chunk_coords
 from zarr_vectors.typing import ChunkCoords, ChunkShape, CrossChunkLink
-
 
 # ===================================================================
 # Polyline / streamline splitting
@@ -300,7 +298,7 @@ def partition_faces(
             is a list of ``L`` tuples ``(chunk_coords, local_vertex_index)``
             — one per face vertex.
     """
-    f_count, l = faces.shape
+    f_count, lo = faces.shape
 
     # Get chunk index for every vertex of every face
     face_chunks = vertex_chunks[faces]  # (F, L)
@@ -752,8 +750,8 @@ def chunk_local_to_global_offsets(
 
     for cc in chunk_keys:
         # Derive total vertex count from the vertices/<key> blob size.
-        from zarr_vectors.core.arrays import _chunk_key  # local: tight loop
         from zarr_vectors.constants import VERTICES
+        from zarr_vectors.core.arrays import _chunk_key  # local: tight loop
         try:
             raw = level_group.read_bytes(VERTICES, _chunk_key(cc))
             count = len(raw) // row_size if row_size else 0

@@ -15,13 +15,29 @@ convention validation, and parametric type registries.
 
 from __future__ import annotations
 
-import copy
-import json
-from dataclasses import dataclass, field
 from collections.abc import Sequence
+from dataclasses import dataclass, field
 from typing import Any, TypedDict
 
 import numpy as np
+
+from zarr_vectors.constants import (
+    CROSS_CHUNK_EXPLICIT,
+    DEFAULT_CROSS_LEVEL_DEPTH,
+    DEFAULT_CROSS_LEVEL_STORAGE,
+    DEFAULT_REDUCTION_FACTOR,
+    ENCODING_RAW,
+    FORMAT_VERSION,
+    LINKS_IMPLICIT_SEQUENTIAL,
+    OBJIDX_STANDARD,
+    VALID_CROSS_CHUNK_STRATEGIES,
+    VALID_ENCODINGS,
+    VALID_GEOMETRY_TYPES,
+    VALID_LINKS_CONVENTIONS,
+    VALID_OBJIDX_CONVENTIONS,
+    VALID_XLEVEL_STORAGE,
+)
+from zarr_vectors.exceptions import ConventionError, MetadataError
 
 
 class NgffAxis(TypedDict, total=False):
@@ -42,26 +58,6 @@ class NgffAxis(TypedDict, total=False):
     name: str
     type: str
     unit: str
-
-from zarr_vectors.constants import (
-    DEFAULT_COARSENING_METHOD,
-    DEFAULT_CROSS_LEVEL_DEPTH,
-    DEFAULT_CROSS_LEVEL_STORAGE,
-    DEFAULT_REDUCTION_FACTOR,
-    FORMAT_VERSION,
-    LINKS_IMPLICIT_SEQUENTIAL,
-    OBJIDX_STANDARD,
-    CROSS_CHUNK_EXPLICIT,
-    VALID_CROSS_CHUNK_STRATEGIES,
-    VALID_GEOMETRY_TYPES,
-    VALID_LINKS_CONVENTIONS,
-    VALID_OBJIDX_CONVENTIONS,
-    VALID_XLEVEL_STORAGE,
-    VALID_ENCODINGS,
-    ENCODING_RAW,
-)
-from zarr_vectors.exceptions import ConventionError, MetadataError
-
 
 # ===================================================================
 # Axes / CRS helpers (OME-Zarr RFC 4/5)
@@ -852,8 +848,8 @@ class LevelMetadata:
     @classmethod
     def from_parent(
         cls,
-        root_meta: "RootMetadata",
-        parent_meta: "LevelMetadata | None",
+        root_meta: RootMetadata,
+        parent_meta: LevelMetadata | None,
         *,
         level: int,
         vertex_count: int,
@@ -866,7 +862,7 @@ class LevelMetadata:
         inherited_num_objects: int | None = None,
         shared_fragments: bool = False,
         parent_level: int | None = None,
-    ) -> "LevelMetadata":
+    ) -> LevelMetadata:
         """Build a coarser level's metadata from the level below it.
 
         This block is hand-written at twenty-odd sites across core and its

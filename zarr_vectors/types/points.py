@@ -21,20 +21,20 @@ import numpy.typing as npt
 
 from zarr_vectors.constants import (
     CROSS_CHUNK_EXPLICIT,
-    RESOLUTION_PREFIX,
+    DEFAULT_OOB_POLICY,
     FRAGMENT_ATTRIBUTES,
     GEOM_POINT_CLOUD,
     LINKS_IMPLICIT_SEQUENTIAL,
-    OBJIDX_IDENTITY,
     OBJIDX_STANDARD,
+    RESOLUTION_PREFIX,
     VERTEX_ATTRIBUTES,
     VERTEX_FRAGMENTS,
     VERTICES,
 )
 from zarr_vectors.core.arrays import (
     chunk_fragments_tile as _chunk_tiles,
-    read_chunk_vertex_buffer,
-    stamp_fragments_tile,
+)
+from zarr_vectors.core.arrays import (
     create_attribute_array,
     create_fragment_attribute_array,
     create_groupings_array,
@@ -43,18 +43,15 @@ from zarr_vectors.core.arrays import (
     create_object_index_array,
     create_vertices_array,
     list_chunk_keys,
-    resolve_chunk_keys,
-    read_all_groupings,
-    read_all_object_manifests,
     read_attribute_fragment,
     read_chunk_attributes,
+    read_chunk_vertex_buffer,
     read_chunk_vertex_rows,
-    read_group_object_ids,
-    read_groupings_attributes,
-    read_object_attributes,
-    read_object_manifest,
-    read_object_vertices,
     read_fragment,
+    read_group_object_ids,
+    read_object_manifest,
+    resolve_chunk_keys,
+    stamp_fragments_tile,
     write_chunk_attributes,
     write_chunk_fragment_attributes,
     write_chunk_vertices,
@@ -67,15 +64,8 @@ from zarr_vectors.core.attr_chunking import (
     assign_attribute_bins,
     compute_chunk_dim_names,
 )
-from zarr_vectors.encoding.categorical import (
-    DICTIONARY_ENCODING,
-    decode_categorical,
-    encode_categorical,
-)
-from zarr_vectors.constants import DEFAULT_OOB_POLICY
 from zarr_vectors.core.metadata import (
     LevelMetadata,
-    RootMetadata,
     get_level_chunk_shape,
 )
 from zarr_vectors.core.store import (
@@ -85,11 +75,15 @@ from zarr_vectors.core.store import (
     _ensure_root_metadata_for_write,
     _finalize_write,
     create_resolution_level,
-    create_store,
     get_resolution_level,
     open_store,
-    read_root_metadata,
     read_level_metadata,
+    read_root_metadata,
+)
+from zarr_vectors.encoding.categorical import (
+    DICTIONARY_ENCODING,
+    decode_categorical,
+    encode_categorical,
 )
 from zarr_vectors.exceptions import ArrayError
 from zarr_vectors.spatial.chunking import (
@@ -104,7 +98,6 @@ from zarr_vectors.typing import (
     ChunkCoords,
     ChunkShape,
     ObjectManifest,
-    FragmentRef,
 )
 
 if TYPE_CHECKING:
@@ -481,7 +474,9 @@ def write_points(
                     vert_groups_bin[fragment_idx] = positions[global_indices]
                     if attributes:
                         for attr_name, attr_data in attributes.items():
-                            attr_groups_per_name_bin[attr_name][fragment_idx] = attr_data[global_indices]
+                            attr_groups_per_name_bin[attr_name][
+                                fragment_idx
+                            ] = attr_data[global_indices]
 
                 write_chunk_vertices(level_group, chunk_coords, vert_groups_bin, dtype=np_dtype)
                 if attributes:
@@ -760,7 +755,10 @@ def _read_points(
 
         result: dict[str, Any] = {
             "positions": positions_out,
-            "object_ids": np.concatenate(all_obj_labels) if all_obj_labels else np.array([], dtype=np.int64),
+            "object_ids": (
+                np.concatenate(all_obj_labels) if all_obj_labels
+                else np.array([], dtype=np.int64)
+            ),
             "vertex_attributes": attrs_out,
             "vertex_count": len(positions_out),
         }
@@ -861,9 +859,9 @@ def _read_points(
         if bbox is not None and has_bins:
             # Bin-level targeting: only decode matching fragments
             from zarr_vectors.spatial.chunking import (
-                bins_intersecting_bbox,
                 bin_to_chunk,
                 bin_to_fragment_index,
+                bins_intersecting_bbox,
             )
             target_bins = bins_intersecting_bbox(
                 np.asarray(bbox[0]), np.asarray(bbox[1]),
@@ -985,7 +983,10 @@ def _read_points(
                                 dtype=attr_dtype, ncols=attr_ncols,
                             )
                             for fragment_index in fragment_indices:
-                                if fragment_index < len(attr_groups) and len(attr_groups[fragment_index]) > 0:
+                                if (
+                                    fragment_index < len(attr_groups)
+                                    and len(attr_groups[fragment_index]) > 0
+                                ):
                                     attr_parts.append(attr_groups[fragment_index])
                         except ArrayError:
                             continue

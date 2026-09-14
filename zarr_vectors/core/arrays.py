@@ -36,6 +36,12 @@ from zarr_vectors.constants import (
     VERTEX_FRAGMENTS,
     VERTICES,
 )
+
+# Group, not FsGroup: FsGroup is a no-op subclass that create_store and
+# open_store return only when the backing store happens to be a
+# LocalStore, so annotating these functions with it was already wrong for
+# every cloud-backed store. Annotation-only change; nothing moves.
+from zarr_vectors.core.group import _LEVEL_META_KEY, Group
 from zarr_vectors.core.paths import (
     format_delta,
     format_offsets,
@@ -48,11 +54,6 @@ from zarr_vectors.core.paths import (
     parse_delta,
     parse_offsets,
 )
-# Group, not FsGroup: FsGroup is a no-op subclass that create_store and
-# open_store return only when the backing store happens to be a
-# LocalStore, so annotating these functions with it was already wrong for
-# every cloud-backed store. Annotation-only change; nothing moves.
-from zarr_vectors.core.group import _LEVEL_META_KEY, Group
 from zarr_vectors.core.store import FsGroup  # noqa: F401  (re-exported for callers)
 from zarr_vectors.encoding.fragments import (
     ChunkFragmentIndex,
@@ -4484,7 +4485,7 @@ def object_count(level_group: Group) -> int:
     return int(meta.get("num_objects", 0) or 0)
 
 
-def object_present_mask(level_group: Group) -> "npt.NDArray[np.bool_]":
+def object_present_mask(level_group: Group) -> npt.NDArray[np.bool_]:
     """Per-slot mask of which objects this level actually holds.
 
     ``True`` where the slot has a non-empty manifest.  Reads the manifests

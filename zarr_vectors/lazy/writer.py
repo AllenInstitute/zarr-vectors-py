@@ -27,7 +27,7 @@ loudly and not protected at runtime.
 from __future__ import annotations
 
 import asyncio
-from typing import Any, TYPE_CHECKING
+from typing import TYPE_CHECKING
 
 import numpy as np
 import numpy.typing as npt
@@ -41,7 +41,6 @@ from zarr_vectors.core.arrays import (
     write_chunk_vertices,
     write_object_index,
 )
-from zarr_vectors.core.metadata import LevelMetadata, RootMetadata
 from zarr_vectors.exceptions import ArrayError
 from zarr_vectors.spatial.boundary import chunk_local_to_global_offsets
 from zarr_vectors.spatial.chunking import assign_chunks
@@ -310,7 +309,6 @@ class ZVWriter:
         # We read each chunk's links via `read_chunk_links` to discover
         # the size, then slice and write.
         from zarr_vectors.core.arrays import (
-            count_link_groups,
             read_chunk_links,
         )
 

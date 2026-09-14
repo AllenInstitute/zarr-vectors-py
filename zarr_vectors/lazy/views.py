@@ -11,21 +11,20 @@ polylines/streamlines.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
-from typing import Any, Callable
+from dataclasses import dataclass
+from typing import Any
 
 import numpy as np
 import numpy.typing as npt
 
 from zarr_vectors.core.arrays import (
-    list_chunk_keys,
     read_all_object_manifests,
     read_chunk_vertices,
-    read_object_vertices,
     read_fragment,
+    read_object_vertices,
 )
+from zarr_vectors.core.metadata import LevelMetadata, RootMetadata
 from zarr_vectors.core.store import FsGroup
-from zarr_vectors.core.metadata import RootMetadata, LevelMetadata
 from zarr_vectors.typing import BinCoords, ChunkCoords
 
 try:
@@ -149,7 +148,7 @@ class ZVView:
             bins_per_chunk = self._root_meta.bins_per_chunk
             if any(b > 1 for b in bins_per_chunk):
                 from zarr_vectors.spatial.chunking import (
-                    bins_intersecting_bbox, bin_to_chunk, bin_to_fragment_index,
+                    bins_intersecting_bbox,
                 )
                 effective_bin = self._root_meta.effective_bin_shape
                 target_bins = set(bins_intersecting_bbox(
@@ -269,7 +268,10 @@ class ZVView:
                     continue
                 for fragment_index in fragment_indices:
                     try:
-                        fragment = read_fragment(self._group, cc, fragment_index, dtype=dtype, ndim=ndim)
+                        fragment = read_fragment(
+                            self._group, cc, fragment_index,
+                            dtype=dtype, ndim=ndim,
+                        )
                         if len(fragment) > 0:
                             all_positions.append(fragment)
                     except Exception:
