@@ -398,8 +398,15 @@ def _per_object_coarsen(
     if src_has_objects:
         create_object_index_array(level_group)
 
-    for cc, groups in sorted(per_chunk_groups.items()):
-        write_chunk_vertices(level_group, cc, groups, dtype=np.float32)
+    # One batch for the whole level. Unbatched, each cell write is a
+    # parse-insert-sort-rewrite of the array's presence manifest, so
+    # writing C cells costs O(C^2) -- 32,768 cells took 207s to write
+    # through this path and 262,144 did not finish in 25 minutes.
+    # Batched, the cells go out in one gather and presence is stamped
+    # once for the array.
+    with level_group.batched_writes():
+        for cc, groups in sorted(per_chunk_groups.items()):
+            write_chunk_vertices(level_group, cc, groups, dtype=np.float32)
 
     # --- Step 7: emit per-object manifests ------------------------------
     # We need to map each source vertex back to its metavertex_index.

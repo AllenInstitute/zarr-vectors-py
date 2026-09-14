@@ -252,9 +252,13 @@ def shard_store(
             # we can rebuild after replacing the node at this path.  The
             # presence manifest and origin are managed by the create /
             # write calls below, so drop them from the carried-over attrs.
+            # The reads go out in one gather: they are the whole array,
+            # and one round-trip per cell is exactly what sharding is
+            # being asked to fix.
             chunk_payloads: dict[str, bytes] = {}
-            for k in chunk_keys:
-                chunk_payloads[k] = level.read_bytes(array_name, k)
+            with level.batched_reads([(array_name, list(chunk_keys))]):
+                for k in chunk_keys:
+                    chunk_payloads[k] = level.read_bytes(array_name, k)
             preserved_attrs = dict(level.read_array_meta(array_name))
             preserved_attrs.pop("nonempty_chunks", None)
             preserved_attrs.pop("chunk_grid_origin", None)
@@ -262,7 +266,10 @@ def shard_store(
             # Drop the prior array before re-creating at this path.
             del level.zarr_group[array_name]
 
-            # Allocate the native-sharded vlen-bytes array.
+            # Allocate the native-sharded vlen-bytes array.  Deliberately
+            # outside the write batch below: this call writes the array's
+            # own ``zarr.json``, and the batch's deferred-metadata path
+            # is for *group* nodes.
             level.create_sharded_chunk_array(
                 array_name,
                 grid_shape=grid_shape,
@@ -271,14 +278,24 @@ def shard_store(
                 attributes=preserved_attrs,
             )
 
-            # Write each chunk into its grid-coord cell.
-            for k, data in chunk_payloads.items():
-                if not data:
-                    continue
-                level.write_bytes(array_name, k, data)
+            n_packed = len(chunk_payloads)
+            # Write every cell in one batch. Unbatched, each write_bytes
+            # is a read-modify-write of the whole shard the cell lands in
+            # plus a parse-insert-sort-rewrite of the array's presence
+            # manifest -- ~60ms per cell measured, so packing 13,824
+            # cells did not finish in 15 minutes and a million cells
+            # would take the better part of a day. Batched, the cells
+            # land in one ``set_coordinate_selection`` (zarr writes each
+            # shard once) and presence is stamped once for the array.
+            with level.batched_writes():
+                for k in chunk_keys:
+                    data = chunk_payloads.pop(k)
+                    if not data:
+                        continue
+                    level.write_bytes(array_name, k, data)
 
             arrays_sharded += 1
-            chunks_packed += len(chunk_payloads)
+            chunks_packed += n_packed
 
     return {
         "arrays_sharded": arrays_sharded,
