@@ -355,9 +355,15 @@ def _per_object_coarsen(
     bin_keys = np.ascontiguousarray(bin_coords).view(
         np.dtype((np.void, bin_coords.dtype.itemsize * bin_coords.shape[1]))
     ).ravel()
-    _, inverse = np.unique(bin_keys, return_inverse=True)
+    unique_keys, inverse = np.unique(bin_keys, return_inverse=True)
     inverse = inverse.astype(np.int64, copy=False)
     n_metavertices = int(inverse.max()) + 1 if inverse.size > 0 else 0
+    # bin_coords and the view over it are one int64 per axis per source
+    # vertex -- twice all_pos -- and were held to the end of the function
+    # purely so the cross-level step could recompute this np.unique on
+    # them. It is the same answer, so pass it and let the source-sized
+    # arrays go now.
+    del bin_coords, bin_keys
 
     # --- Step 3 (continued): centroid per bin --------------------------
     # Sum each bin's member positions, then divide by its population.
@@ -386,15 +392,21 @@ def _per_object_coarsen(
     chunk_assignments = assign_chunks(meta_positions, chunk_shape)
 
     # --- Step 5: per-chunk fragment layout (one fragment per metavertex) ------------
-    metavertex_to_ref: dict[int, tuple[ChunkCoords, int]] = {}
     per_chunk_groups: dict[ChunkCoords, list[np.ndarray]] = {}
-    for cc, indices in sorted(chunk_assignments.items()):
+    # Where each metavertex ended up, as two dense arrays rather than a
+    # dict with one tuple-valued entry per metavertex: at a million of
+    # them that dict was ~150 MB of interpreter objects to express a map
+    # from range(M).
+    mv_chunk_slot = np.full(n_metavertices, -1, dtype=np.int64)
+    mv_fragment_idx = np.full(n_metavertices, -1, dtype=np.int64)
+    chunk_slots: list[ChunkCoords] = []
+    for slot, (cc, indices) in enumerate(sorted(chunk_assignments.items())):
         # ``indices`` are metavertex indices that fell in this chunk.
-        for fragment_idx, mv_idx in enumerate(indices.tolist()):
-            metavertex_to_ref[int(mv_idx)] = (cc, fragment_idx)
-            per_chunk_groups.setdefault(cc, []).append(
-                meta_positions[mv_idx:mv_idx + 1]
-            )
+        idx = np.asarray(indices, dtype=np.int64)
+        chunk_slots.append(cc)
+        mv_chunk_slot[idx] = slot
+        mv_fragment_idx[idx] = np.arange(idx.size, dtype=np.int64)
+        per_chunk_groups[cc] = list(np.split(meta_positions[idx], idx.size))
 
     # --- Step 6: write per-chunk fragments --------------------------
     arrays_present = [VERTICES, "object_index"] if src_has_objects else [VERTICES]
@@ -445,17 +457,20 @@ def _per_object_coarsen(
             cursor += 0
             new_manifests[oid] = []
             continue
-        mv_seq = inverse[cursor:cursor + n].tolist()
+        mv_seq = inverse[cursor:cursor + n]
         cursor += n
-        # Deduplicate consecutive duplicates while preserving order.
-        manifest: list[tuple[ChunkCoords, int]] = []
-        prev = -1
-        for mv_idx in mv_seq:
-            if mv_idx == prev:
-                continue
-            prev = mv_idx
-            manifest.append(metavertex_to_ref[int(mv_idx)])
-        new_manifests[oid] = manifest
+        # Drop consecutive duplicates, preserving order -- vectorised,
+        # because this runs once per source vertex across the level.
+        if mv_seq.size > 1:
+            keep = np.concatenate(([True], mv_seq[1:] != mv_seq[:-1]))
+            mv_seq = mv_seq[keep]
+        new_manifests[oid] = [
+            (chunk_slots[slot], int(frag))
+            for slot, frag in zip(
+                mv_chunk_slot[mv_seq].tolist(),
+                mv_fragment_idx[mv_seq].tolist(),
+            )
+        ]
 
     # --- Step 9: emit object_index (gap-fill for dropped OIDs) ----------
     if src_has_objects:
@@ -509,7 +524,7 @@ def _per_object_coarsen(
             source_level=source_level,
             ndim=ndim,
             bin_shape_arr=bin_shape_arr,
-            bin_keys=bin_keys,
+            unique_keys=unique_keys,
             coarse_chunk_assignments_mv=chunk_assignments,
             storage=cross_level_storage,
         )
@@ -533,7 +548,7 @@ def _emit_inline_cross_level_links(
     source_level: int,
     ndim: int,
     bin_shape_arr: npt.NDArray[np.float64],
-    bin_keys: npt.NDArray,
+    unique_keys: npt.NDArray,
     coarse_chunk_assignments_mv: dict[ChunkCoords, npt.NDArray[np.int64]],
     storage: str,
 ) -> None:
@@ -557,10 +572,10 @@ def _emit_inline_cross_level_links(
     this after the ``create_resolution_level`` for ``source_level + 1``
     (step 6 of :func:`_per_object_coarsen`).
     """
-    # Metavertex ids are positions in this sorted key array -- which is
-    # what lets the per-vertex lookup below be a searchsorted instead of
+    # ``unique_keys`` arrives from the caller, which already computed it
+    # binning the source. Metavertex ids are positions in it, which is
+    # what lets the per-vertex lookup below be a searchsorted rather than
     # a dict with one bytes key per metavertex.
-    unique_keys = np.unique(bin_keys)
 
     # mv_idx → chunk-major-flat coarse index.
     coarse_chunk_assignments, n_coarse = _reconstruct_chunk_assignments(
