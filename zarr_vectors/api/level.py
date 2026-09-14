@@ -528,15 +528,24 @@ class Level:
             )
             grid = target.grid
             cell = np.asarray(grid.cell_shape, dtype=np.float64)
-            # grid.origin is None for a store with no negative-coord
-            # offset -- the same fallback Grid.cell_of applies.
-            origin = np.asarray(
-                grid.origin if grid.origin is not None else [0.0] * len(cell),
-                dtype=np.float64,
-            )
-            wanted = {tuple(int(c) for c in ref.coords) for ref in selection.cells}
+            if cell.size != result.positions.shape[1]:
+                raise ZVError(
+                    f"level {target.index} declares no cell size, so a "
+                    f"cells= selection cannot be resolved against it"
+                )
+            wanted = {
+                tuple(int(c) for c in getattr(ref, "coords", ref))
+                for ref in selection.cells
+            }
+            # Absolute, matching ref.coords and the keys on disk.  There is
+            # no origin term because ``assign_chunks`` has none either; the
+            # subtraction that used to be here made this the one place that
+            # disagreed with every reference it was comparing against, and
+            # it also crashed outright on a level with no declared bounds,
+            # where ``grid.origin`` is ``()`` rather than the ``None`` the
+            # old guard tested for.
             idx = np.floor(
-                (np.asarray(result.positions, dtype=np.float64) - origin) / cell
+                np.asarray(result.positions, dtype=np.float64) / cell
             ).astype(np.int64)
             keep &= np.array(
                 [tuple(row) in wanted for row in idx], dtype=bool

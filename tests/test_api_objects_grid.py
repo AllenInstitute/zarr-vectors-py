@@ -50,6 +50,25 @@ def cloud(tmp_path):
     return path
 
 
+@pytest.fixture
+def offset_cloud(tmp_path):
+    """A store whose bounds are nowhere near zero.
+
+    Every other grid fixture starts at ``[0, 0, 0]``, where a
+    bounds-relative frame and an absolute one are indistinguishable.  That
+    is exactly why the frame bug survived: nothing in the suite could see
+    it.  Bounds land at about (1050, 2050) with a 200-wide cell, so the
+    grid is anchored at cell (5, 5, 5).
+    """
+    rng = np.random.default_rng(23)
+    path = tmp_path / "offset.zarrvectors"
+    write_points(
+        path, rng.uniform(1050, 2050, size=(2000, 3)).astype(np.float32),
+        chunk_shape=(200.0, 200.0, 200.0), bin_shape=(50.0, 50.0, 50.0),
+    )
+    return path
+
+
 def _level_group(path):
     return get_resolution_level(open_store(str(path)), 0)
 
@@ -211,3 +230,83 @@ class TestCellSelection:
         plan = level.select(cells=cells).plan()
         assert plan.expand == ()
         assert {c.key for c in plan.cells} == set(cells.keys())
+
+
+class TestGridSpeaksTheStoresFrame:
+    """Cells are addressed the way the store writes them, or not at all.
+
+    ``cells_in`` was absolute and ``cell_of`` / ``holds`` / ``__iter__``
+    were bounds-relative.  A reference is handed straight to the readers'
+    ``chunks=`` term and to the engine's cell requests, both of which are
+    absolute -- so the relative half was simply wrong, and invisible on
+    any store whose bounds began at zero.
+    """
+
+    def test_cell_of_names_a_key_the_store_actually_has(self, offset_cloud):
+        from zarr_vectors.building import list_chunk_keys
+
+        level = zv.open(offset_cloud).level(0)
+        real = set(list_chunk_keys(level.store))
+        grid = level.grid
+        for point in level.read().positions[:20]:
+            assert grid.cell_of(point).coords in real
+
+    def test_selecting_the_cell_a_point_is_in_finds_that_point(
+        self, offset_cloud,
+    ):
+        """The reported failure: this read zero vertices."""
+        level = zv.open(offset_cloud).level(0)
+        point = level.read().positions[0]
+        got = level.select(cells=[level.grid.cell_of(point)]).read()
+        assert got.vertex_count > 0
+
+    def test_cell_of_agrees_with_cells_in(self, offset_cloud):
+        level = zv.open(offset_cloud).level(0)
+        grid = level.grid
+        point = level.read().positions[0]
+        assert grid.cell_of(point) in grid.cells_in((point, point))
+
+    def test_the_post_filter_uses_the_same_frame(self, offset_cloud):
+        """``cells_split=False`` forces the in-memory path.
+
+        It re-implemented ``cell_of`` vectorised, with the same origin
+        subtraction -- so it disagreed with the references it was
+        comparing against.
+        """
+        level = zv.open(offset_cloud).level(0)
+        ref = level.grid.cell_of(level.read().positions[0])
+        assert (
+            level.select(cells=[ref], cells_split=False).read().vertex_count
+            == level.select(cells=[ref]).read().vertex_count
+            > 0
+        )
+
+    def test_holds_accepts_the_cells_the_grid_names(self, offset_cloud):
+        level = zv.open(offset_cloud).level(0)
+        grid = level.grid
+        assert grid.holds(grid.cell_of(level.read().positions[0]))
+        # ...and still rejects one outside the allocation.
+        assert not grid.holds(zv.CellRef((999, 0, 0)))
+
+    def test_anchor_is_the_cell_the_lower_corner_falls_in(self, offset_cloud):
+        level = zv.open(offset_cloud).level(0)
+        origin, _shape = level.store.chunk_grid_bounds("vertices")
+        assert level.grid.anchor == tuple(origin or (0, 0, 0))
+
+    def test_iterating_yields_absolute_references(self, offset_cloud):
+        level = zv.open(offset_cloud).level(0)
+        grid = level.grid
+        anchor = grid.anchor
+        seen = list(grid)
+        assert len(seen) == grid.cells
+        assert all(grid.holds(ref) for ref in seen)
+        assert min(seen).coords == anchor
+
+    def test_a_degenerate_grid_has_a_zero_anchor_and_no_cells(self):
+        """``Level.grid`` builds this when the store declares no bounds.
+
+        ``origin`` is ``()`` there, which the old post-filter's
+        ``is not None`` guard did not catch -- it broadcast-crashed.
+        """
+        assert zv.Grid(shape=(), cell_shape=(100.0,) * 3).anchor == (0, 0, 0)
+        assert list(zv.Grid(shape=(), cell_shape=())) == []

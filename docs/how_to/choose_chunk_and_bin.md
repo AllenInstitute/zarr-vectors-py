@@ -553,9 +553,10 @@ level = zv.open("scan.zarrvectors").level(0)
 grid = level.grid
 xyz = level.read().positions
 
-ijk = np.floor(
-    (xyz - np.asarray(grid.origin)) / np.asarray(grid.cell_shape)
-).astype(int)
+# Cells are addressed absolutely -- the same map the writer used -- so
+# there is no origin to subtract.  `grid.anchor` is the cell the lower
+# corner falls in, if you want to know where the allocation starts.
+ijk = np.floor(xyz / np.asarray(grid.cell_shape)).astype(int)
 _, counts = np.unique(ijk, axis=0, return_counts=True)
 
 print(grid, f"{len(counts)}/{grid.cells} occupied")
