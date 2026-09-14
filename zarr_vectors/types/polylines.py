@@ -28,6 +28,7 @@ from zarr_vectors.constants import (
     LINKS_IMPLICIT_SEQUENTIAL,
     OBJECT_INDEX,
     OBJIDX_STANDARD,
+    VERTEX_ATTRIBUTES,
     VERTEX_FRAGMENTS,
     VERTICES,
 )
@@ -45,6 +46,8 @@ from zarr_vectors.core.arrays import (
     read_all_groupings,
     read_all_object_manifests,
     read_object_manifest,
+    attribute_layout,
+    read_chunk_attributes,
     read_chunk_vertices,
     read_group_object_ids,
     read_object_attributes,
@@ -82,7 +85,7 @@ from zarr_vectors.core.store import (
     read_level_metadata,
     read_root_metadata,
 )
-from zarr_vectors.exceptions import ArrayError
+from zarr_vectors.exceptions import ArrayError, StoreError
 from zarr_vectors.spatial.boundary import (
     cross_chunk_links_for_segments,
     split_polyline_at_boundaries,
@@ -680,8 +683,29 @@ def _read_polylines(
         )
 
     result_polylines: list[list[npt.NDArray]] = []
+    # One entry per emitted polyline, mirroring ``result_polylines``:
+    # ``{name: [rows_per_fragment, ...]}``.
+    result_attrs: list[dict[str, list[npt.NDArray | None]]] = []
     result_object_ids: list[int] = []
     total_verts = 0
+
+    # Every per-vertex attribute the level carries.  Unlike read_points,
+    # this reader has no ``attribute_names`` term for a caller to narrow
+    # with, so it reads what is there -- the same choice read_lines makes.
+    attr_layouts: dict[str, tuple[np.dtype, int]] = {}
+    try:
+        _attr_names = sorted(level_group[VERTEX_ATTRIBUTES].children())
+    except Exception:
+        _attr_names = []
+    if _attr_names:
+        level_group.prime_nodes(
+            [f"{VERTEX_ATTRIBUTES}/{_n}" for _n in _attr_names],
+        )
+    for _name in _attr_names:
+        try:
+            attr_layouts[_name] = attribute_layout(level_group, _name)
+        except Exception:
+            continue
 
     # Choose between a selective read (an explicit object/group subset —
     # read only those objects' manifests and the chunks they reference,
@@ -780,6 +804,60 @@ def _read_polylines(
                 return groups[fragment_idx]
             return None
 
+        # Per-vertex attributes, decoded once per chunk like the vertices
+        # above.  This reader returned none at all, so the facade fell back
+        # to a level-ordered gather -- which it then had to refuse for any
+        # narrowed read, because a level-ordered column cannot be aligned
+        # to a by-object assembly.  Read here and the two orders are the
+        # same order by construction.
+        attr_cache: dict[tuple[str, ChunkCoords], list[npt.NDArray]] = {}
+
+        def _read_attr_fragment(
+            name: str, cc: ChunkCoords, fragment_idx: int,
+        ) -> npt.NDArray | None:
+            key = (name, cc)
+            if key not in attr_cache:
+                a_dtype, a_ncols = attr_layouts[name]
+                try:
+                    attr_cache[key] = read_chunk_attributes(
+                        level_group, name, cc, dtype=a_dtype, ncols=a_ncols,
+                    )
+                except (ArrayError, StoreError):
+                    attr_cache[key] = []
+            rows = attr_cache[key]
+            if 0 <= fragment_idx < len(rows):
+                return rows[fragment_idx]
+            return None
+
+        def _read_run(
+            entries: list[FragmentRef],
+        ) -> tuple[list[npt.NDArray], dict[str, list[npt.NDArray | None]]]:
+            """One emitted polyline's fragments, with its attribute rows.
+
+            Kept in lockstep deliberately: a fragment that fails to read
+            is skipped, and skipping it in one list but not the other is
+            exactly how a column ends up describing the wrong vertices.
+            A fragment whose attribute rows are missing or the wrong
+            length records ``None``, which drops that column rather than
+            misaligning it.
+            """
+            frags: list[npt.NDArray] = []
+            attrs: dict[str, list[npt.NDArray | None]] = {
+                name: [] for name in attr_layouts
+            }
+            for cc, fragment_index in entries:
+                fragment = _read_fragment(cc, fragment_index)
+                if fragment is None:
+                    continue
+                frags.append(fragment)
+                for name in attr_layouts:
+                    rows = _read_attr_fragment(name, cc, fragment_index)
+                    attrs[name].append(
+                        None if rows is None or len(rows) != len(fragment)
+                        else rows
+                    )
+            return frags, attrs
+
         for oid in object_ids:
             # ------------------------------------------------------------------
             # Segment-level crop mode (chunks=).
@@ -804,22 +882,18 @@ def _read_polylines(
                         run.append((cc, fragment_idx))
                     else:
                         if run:
-                            fragment_list = [
-                                fragment for fragment in (_read_fragment(cc, fragment_index) for cc, fragment_index in run)
-                                if fragment is not None
-                            ]
+                            fragment_list, attr_list = _read_run(run)
                             if fragment_list:
                                 result_polylines.append(fragment_list)
+                                result_attrs.append(attr_list)
                                 result_object_ids.append(oid)
                                 total_verts += sum(len(fragment) for fragment in fragment_list)
                             run = []
                 if run:
-                    fragment_list = [
-                        fragment for fragment in (_read_fragment(cc, fragment_index) for cc, fragment_index in run)
-                        if fragment is not None
-                    ]
+                    fragment_list, attr_list = _read_run(run)
                     if fragment_list:
                         result_polylines.append(fragment_list)
+                        result_attrs.append(attr_list)
                         result_object_ids.append(oid)
                         total_verts += sum(len(fragment) for fragment in fragment_list)
                 continue
@@ -832,15 +906,9 @@ def _read_polylines(
                 ]
                 if not matching:
                     continue
-                fragment_list = [
-                    fragment for fragment in (_read_fragment(cc, fragment_index) for cc, fragment_index in matching)
-                    if fragment is not None
-                ]
+                fragment_list, attr_list = _read_run(matching)
             else:
-                fragment_list = [
-                    fragment for fragment in (_read_fragment(cc, fragment_index) for cc, fragment_index in obj_manifest)
-                    if fragment is not None
-                ]
+                fragment_list, attr_list = _read_run(obj_manifest)
 
             if not fragment_list:
                 continue
@@ -855,14 +923,33 @@ def _read_polylines(
                     continue
 
             result_polylines.append(fragment_list)
+            result_attrs.append(attr_list)
             result_object_ids.append(oid)
             total_verts += sum(len(fragment) for fragment in fragment_list)
     finally:
         _batched_reads_cm.__exit__(None, None, None)
 
+    # A column is returned only when every fragment of every emitted
+    # polyline supplied its rows, so it lines up with ``polylines``
+    # flattened in the same order.  Anything short is dropped rather than
+    # misaligned.
+    attrs_out: dict[str, npt.NDArray] = {}
+    for _name in attr_layouts:
+        parts: list[npt.NDArray] = []
+        complete = bool(result_attrs)
+        for per_poly in result_attrs:
+            rows = per_poly.get(_name) or []
+            if not rows or any(r is None for r in rows):
+                complete = False
+                break
+            parts.extend(rows)
+        if complete and parts:
+            attrs_out[_name] = np.concatenate(parts, axis=0)
+
     return {
         "polylines": result_polylines,
         "object_ids": result_object_ids,
+        "vertex_attributes": attrs_out,
         "polyline_count": len(result_polylines),
         "vertex_count": total_verts,
     }
@@ -894,6 +981,7 @@ def _empty_polyline_result() -> dict[str, Any]:
     return {
         "polylines": [],
         "object_ids": [],
+        "vertex_attributes": {},
         "polyline_count": 0,
         "vertex_count": 0,
     }

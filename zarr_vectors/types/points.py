@@ -46,6 +46,7 @@ from zarr_vectors.core.arrays import (
     resolve_chunk_keys,
     read_all_groupings,
     read_all_object_manifests,
+    read_attribute_fragment,
     read_chunk_attributes,
     read_chunk_vertex_rows,
     read_group_object_ids,
@@ -557,8 +558,10 @@ def read_points(
         chunks: Optional whitelist of chunk coordinate tuples; only data
             in those chunks is returned. ``chunks=[]`` yields an empty
             result; ``chunks=None`` (default) applies no chunk filter.
-        attribute_names: Optional list of attribute names to read.
-            If None, reads all available attributes.
+        attribute_names: Attributes to read.  ``None`` reads **none** --
+            the parameter names what to fetch, it does not mean "all".
+            ``Level.read()`` resolves ``attributes="all"`` into an
+            explicit list before calling this.
 
     Returns:
         Dict with keys:
@@ -664,7 +667,20 @@ def _read_points(
     if object_ids is not None:
         all_positions: list[npt.NDArray] = []
         all_obj_labels: list[npt.NDArray] = []
-        all_attrs: dict[str, list[npt.NDArray]] = {}
+        # Per-vertex attributes, gathered fragment by fragment alongside
+        # the positions.  This path used to return ``{}`` unconditionally
+        # -- not because a store has none, but because nothing here looked
+        # -- which made ``level.objects[7]`` and every ``select(objects=)``
+        # unable to carry attributes for any geometry.  The facade cannot
+        # repair it afterwards either: its gather is level-ordered, and a
+        # by-object reading cannot be aligned to that.
+        all_attrs: dict[str, list[npt.NDArray]] = {
+            name: [] for name in (attribute_names or ())
+        }
+        attr_layouts = {
+            name: _read_attribute_meta(level_group, name)
+            for name in (attribute_names or ())
+        }
 
         for oid in object_ids:
             try:
@@ -693,6 +709,19 @@ def _read_points(
                     continue
                 all_positions.append(fragment)
                 all_obj_labels.append(np.full(n_pts, oid, dtype=np.int64))
+                # Same fragment, same order, so the rows line up with the
+                # positions appended just above without any further
+                # bookkeeping.  A fragment whose attribute rows are
+                # missing or the wrong length drops the whole column
+                # rather than misaligning it -- see below.
+                for name, (a_dtype, a_ncols, _enc) in attr_layouts.items():
+                    rows = read_attribute_fragment(
+                        level_group, name, chunk_coords, fragment_index,
+                        dtype=a_dtype, ncols=a_ncols, default=None,
+                    )
+                    all_attrs[name].append(
+                        None if rows is None or len(rows) != n_pts else rows
+                    )
 
         if not all_positions:
             return _empty_result(ndim)
@@ -700,6 +729,7 @@ def _read_points(
         positions_out = np.concatenate(all_positions, axis=0)
 
         # Apply bbox filter if needed
+        mask = None
         if bbox is not None:
             mask = np.all(
                 (positions_out >= bbox[0]) & (positions_out <= bbox[1]),
@@ -710,10 +740,28 @@ def _read_points(
                 np.concatenate(all_obj_labels)[mask]
             ]
 
+        attrs_out: dict[str, npt.NDArray] = {}
+        for name, parts in all_attrs.items():
+            # A column is returned only when every fragment supplied its
+            # rows.  A short column cannot be aligned to ``positions``,
+            # and a silently misaligned one is worse than an absent one.
+            if not parts or any(part is None for part in parts):
+                continue
+            column = np.concatenate(parts, axis=0)
+            if mask is not None:
+                column = column[mask]
+            _dtype, _ncols, encoding = attr_layouts[name]
+            if encoding is not None:
+                column = decode_categorical(
+                    column, encoding["categories"],
+                    fill_value=encoding.get("_FillValue"),
+                )
+            attrs_out[name] = column
+
         result: dict[str, Any] = {
             "positions": positions_out,
             "object_ids": np.concatenate(all_obj_labels) if all_obj_labels else np.array([], dtype=np.int64),
-            "vertex_attributes": {},
+            "vertex_attributes": attrs_out,
             "vertex_count": len(positions_out),
         }
         return result

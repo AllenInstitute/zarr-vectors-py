@@ -207,10 +207,29 @@ class ReadResult:
     attributes_read: bool = True
     """Whether attributes were even attempted.
 
-    ``read_points``' object-id path returns ``vertex_attributes={}``
-    unconditionally: the attributes are not absent, they were never
-    looked at.  A caller that cannot distinguish those two will conclude
-    a store has no attributes when it has plenty.
+    ``False`` means the reader did not look, so an empty
+    :attr:`attributes` says nothing about the store.  A caller that cannot
+    tell those apart will conclude a store has none when it has plenty.
+
+    Where they are available today, by geometry and query shape:
+
+    ========  =====  ====  =======  =====
+    kind      whole  bbox  objects  limit
+    ========  =====  ====  =======  =====
+    points    yes    yes   yes      yes
+    polyline  yes    yes   yes      yes
+    line      yes    yes   yes      yes
+    mesh      yes    no    n/a      yes
+    graph     yes    no    n/a      yes
+    ========  =====  ====  =======  =====
+
+    ``mesh`` and ``graph`` lose them on a narrowed read because their
+    readers return no attributes at all and the facade's fallback gather
+    is level-ordered, which cannot be aligned to a cut-down result.
+    ``objects=`` is ``n/a`` for those two: the readers raise
+    ``NotImplementedError`` for it rather than silently ignoring it.
+    Closing the two gaps needs the resolver phase, which plans the
+    attribute reads alongside everything else.
     """
 
     truncated: bool = False
@@ -333,20 +352,21 @@ class ReadResult:
         """``{positions, vertex_attributes, vertex_count}``, plus
         ``object_ids`` on the object-id path.
 
-        That path returns ``vertex_attributes={}`` unconditionally
-        (``points.py:653``) — not because there are none, but because it
-        never reads them.  ``attributes_read`` records the difference.
+        Both of ``read_points``' paths now run the same attribute gather,
+        so both report ``attributes_read``.  The object-id path used to
+        return ``vertex_attributes={}`` unconditionally — not because
+        there were none, but because it never looked — which is why this
+        adapter had to special-case it.
         """
         positions = np.asarray(raw["positions"])
         object_ids = raw.get("object_ids")
-        by_object = object_ids is not None
         return cls(
             kind=kind,
             positions=positions,
             parts=(slice(0, len(positions)),) if len(positions) else (),
             object_ids=None if object_ids is None else np.asarray(object_ids),
             attributes=Attributes(raw.get("vertex_attributes") or {}),
-            attributes_read=not by_object,
+            attributes_read="vertex_attributes" in raw,
         )
 
     @classmethod
@@ -415,7 +435,11 @@ class ReadResult:
                 None if part_objects is None or len(part_objects) == 0
                 else np.asarray(part_objects)
             ),
-            attributes_read=False,
+            # Flattened in the same order as ``positions`` above --
+            # fragment by fragment, polyline by polyline -- which is what
+            # ``read_polylines`` gathers them in.
+            attributes=Attributes(raw.get("vertex_attributes") or {}),
+            attributes_read="vertex_attributes" in raw,
         )
 
     @classmethod
