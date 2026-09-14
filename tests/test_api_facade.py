@@ -375,6 +375,25 @@ class TestNoSelfDeprecation:
         assert zv.open(tmp_path / "s.zarrvectors").level(0).read().edges.shape == (2, 2)
 
 
+class TestLevelIsOptional:
+    """``level=None`` is the documented "not specified" sentinel."""
+
+    def test_dataset_select_accepts_the_unset_sentinel(self, points_store):
+        """``Selection.level`` defaults to None so level 0 stays requestable.
+
+        ``Dataset.select`` coerced with ``int()``, so the one spelling the
+        API tells callers to use raised TypeError -- on a feature
+        ``_api_version.FEATURES`` advertises as
+        ``selection-level-optional``.
+        """
+        ds = zv.open(points_store)
+        assert (
+            ds.select(level=None).read().vertex_count
+            == ds.select().read().vertex_count
+            == ds.select(level=0).read().vertex_count
+        )
+
+
 class TestDeferredCapabilities:
     """The facade must not advertise what it cannot do."""
 

@@ -226,7 +226,14 @@ class Dataset:
     # ---------------- reading ----------------
 
     def select(self, **kw: Any) -> Query:
-        return self.level(int(kw.get("level", 0))).select(**kw)
+        # ``level=None`` is the documented "not specified" sentinel -- it is
+        # what lets level 0 be requested explicitly, which is why
+        # ``Selection.level`` defaults to None rather than 0 and why
+        # FEATURES advertises ``selection-level-optional``.  Coercing it
+        # with ``int()`` raised TypeError on the one spelling the API tells
+        # callers to use.
+        level = kw.get("level")
+        return self.level(0 if level is None else int(level)).select(**kw)
 
     def read(self, **kw: Any) -> ReadResult:
         return self.select(**kw).read()
