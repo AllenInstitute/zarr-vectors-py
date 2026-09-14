@@ -652,11 +652,21 @@ def reorder_vertices_implicit(
     deterministic DFS pre-order, and physically reorders each chunk's
     vertices so the object's spine becomes a contiguous run of
     chunk-local indices in DFS order.  Edges along the spine then
-    collapse under the ``implicit_sequential_with_branches`` baseline
-    (``parent[i] = i-1`` over the reader's chunk-sorted concatenation);
-    only true branch overrides remain, in ``links/0/<offsets>/<chunk>`` —
-    the all-zero offsets cell for a within-chunk override, a non-zero one
-    for an override whose endpoints straddle chunks.
+    collapse under the ``implicit_sequential_with_branches`` baseline;
+    only the ones the baseline cannot imply remain, in
+    ``links/0/<offsets>/<chunk>`` — the all-zero offsets cell for a
+    within-chunk override, a non-zero one for an override whose endpoints
+    straddle chunks.
+
+    The baseline is ``parent[i] = i-1`` over the reader's chunk-sorted
+    concatenation **within a fragment**, and it stops at every fragment
+    start: the row before one belongs to a different object or a
+    different chunk.  So a spine edge whose child opens a fragment is
+    written out even though the two vertices are adjacent in read order.
+    This used to be skipped, on the reading that the chain ran unbroken
+    across the whole level — which cannot be true of a level holding more
+    than one object, and which silently dropped the boundary edges of a
+    path spanning several chunks.
 
     Objects whose link graph is not a tree (cycles, multi-parent,
     disconnected within their manifest) are skipped with a
@@ -1021,6 +1031,16 @@ def reorder_vertices_implicit(
     n_intra_branches = 0
     n_cross_branches = 0
 
+    # New-local index of each fragment's first vertex, per chunk.  The
+    # implicit chain is suspended there: the row before a fragment start
+    # belongs to another object or another chunk, so a reader cannot take
+    # it for the parent, and an edge landing on one has to be recorded
+    # even when the two vertices happen to be adjacent in read order.
+    fragment_start_locals: dict = {
+        cc: {int(ns) for (ns, nc, _ofi) in groups if nc > 0}
+        for cc, groups in chunk_new_groups.items()
+    }
+
     for oid, qd in qualifying.items():
         dfs_order = qd["dfs_order"]
         dfs_parent = qd["dfs_parent"]
@@ -1031,7 +1051,11 @@ def reorder_vertices_implicit(
                 continue
             v_global = _new_global(v)
             p_global = _new_global(p)
-            if p_global == v_global - 1:
+            v_cc_check, _ = v
+            starts_fragment = (
+                _new_local(v) in fragment_start_locals.get(v_cc_check, ())
+            )
+            if p_global == v_global - 1 and not starts_fragment:
                 continue  # implicit baseline handles it
             # Emit override
             v_cc, _ = v
