@@ -138,6 +138,10 @@ class Group:
     # Consumed by :meth:`write_bytes` and the batched flush in
     # :mod:`zarr_vectors.core._batch_writer`.
     _active_codecs: list[dict[str, Any]] | None = None
+    # Rows written into each ``vertices`` cell this session, keyed by
+    # chunk key.  Written by ``write_chunk_vertices``, consumed by
+    # ``stamp_fragments_tile``; see :meth:`note_vertex_rows`.
+    _vertex_rows_written: dict[str, int] | None = None
     # Explicit grid config for per-chunk-array creation, overriding what
     # ``arrays._derive_native_config`` would read off the store's
     # metadata.  Set by
@@ -192,6 +196,7 @@ class Group:
         self._node_cache_readonly = False
         self._listing_cache = None
         self._tiling_claim_settled = False
+        self._vertex_rows_written = None
 
     @classmethod
     def _from_zarr(
@@ -881,6 +886,34 @@ class Group:
         if cache is not None:
             cache[key] = listing
         return listing
+
+    def note_vertex_rows(self, chunk_key: str, n_rows: int) -> None:
+        """Record how many vertex rows a cell was just given.
+
+        :func:`~zarr_vectors.core.arrays.stamp_fragments_tile` has to
+        know each cell's row count to check the fragment index against
+        it, and it used to get that by re-reading every ``vertices``
+        cell it had just written -- measured at 1.00x the bytes written,
+        so a bulk write downloaded its own output in full before
+        returning.  The writer already knows the number, so it says so.
+
+        Only a hint: a key with no recorded count is read back as
+        before, which is what keeps the stamp correct for a level whose
+        cells this session did not write.
+        """
+        if self._vertex_rows_written is None:
+            self._vertex_rows_written = {}
+        self._vertex_rows_written[chunk_key] = int(n_rows)
+
+    def take_vertex_rows(self) -> dict[str, int]:
+        """Consume and clear the recorded counts.
+
+        Cleared on read so a later stamp cannot trust a count from
+        before an intervening edit.
+        """
+        recorded = self._vertex_rows_written or {}
+        self._vertex_rows_written = None
+        return recorded
 
     def list_chunks(self, array_name: str) -> list[str]:
         """The dotted chunk keys this array holds data for, sorted."""

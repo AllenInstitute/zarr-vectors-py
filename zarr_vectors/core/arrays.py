@@ -92,6 +92,27 @@ OBJECT_INDEX_LAYOUT_V1 = "vlen_manifests_v1"
 # the read amplification ceiling (~16K manifest blobs per fetch).
 OBJECT_INDEX_MANIFEST_BUCKET = 16_384
 
+#: Largest ``object_index/manifests`` array the writers will allocate.
+#:
+#: An object id is the **row index** of its manifest, so the index is as
+#: long as the largest id plus one, not as long as the number of objects.
+#: One object with id 20,000,000 therefore allocates twenty million rows
+#: (measured: 20s to write, and every whole-index operation --
+#: ``num_objects``, ``ids()``, ``object_present_mask``,
+#: ``read_all_object_manifests`` -- then scales with that, not with the
+#: one object present).  Segmentation-style 64-bit ids do not fit at all.
+#:
+#: 2**26 rows is far past any dense id space a real dataset carries and
+#: well short of the sizes that turn a write into a hang, so crossing it
+#: means the ids are addresses from somewhere else rather than a dense
+#: sequence.  Refusing is better than the silent alternative: today the
+#: symptom is a store that takes minutes to write and gigabytes to open.
+OBJECT_INDEX_MAX_ROWS = 1 << 26
+
+#: Emit a sparsity warning once an index is this long and this empty.
+_OBJECT_INDEX_SPARSE_FLOOR = 1 << 20
+_OBJECT_INDEX_SPARSE_RATIO = 64
+
 # One object manifest naming no fragments.  ``encode_object_manifest_blocks``
 # emits a bare block count for an empty list, so this is the same four bytes
 # whatever ``sid_ndim`` the store uses — which is what lets an append pad a
@@ -565,6 +586,8 @@ def open_write_session(
     else:
         ss = tuple(int(x) for x in shard_shape)
 
+    _warn_on_cell_count(grid_shape, sharded=ss is not None)
+
     stack = ExitStack()
     with stack:
         stack.enter_context(level_group.batched_writes(compressor=compressor))
@@ -572,6 +595,46 @@ def open_write_session(
             level_group.native_sharded_arrays(ss, grid_shape, origin=origin)
         )
         yield
+
+
+#: Cell count above which a level's chunk_shape is worth questioning.
+#:
+#: An unsharded cell is one object in the store, and the per-cell cost of
+#: writing one is fixed -- it does not shrink because the cell is nearly
+#: empty.  Past this many cells the layout, not the data, is what a write
+#: is spending its time on.
+_CELL_COUNT_WARN = 100_000
+
+
+def _warn_on_cell_count(grid_shape: tuple[int, ...], *, sharded: bool) -> None:
+    """Say so when a chunk_shape allocates an unworkable number of cells.
+
+    The automatic :class:`~zarr_vectors.api.schema.Layout` already targets
+    a cell size rather than a cell count, but a caller-supplied
+    ``chunk_shape`` gets no such check, and the failure mode is silent:
+    the write simply takes a very long time and leaves a directory tree
+    with one file per cell.
+    """
+    total = 1
+    for s in grid_shape:
+        total *= int(s)
+    if total <= _CELL_COUNT_WARN:
+        return
+    remedy = (
+        "Consider a coarser chunk_shape"
+        if sharded else
+        "Consider a coarser chunk_shape, or shard_store() to pack cells "
+        "into shard objects"
+    )
+    warnings.warn(
+        f"This chunk_shape allocates a {'x'.join(str(s) for s in grid_shape)} "
+        f"grid = {total:,} cells"
+        f"{'' if sharded else ', each a separate object in the store'}. "
+        f"The per-cell cost of a write is fixed, so it is the cell count "
+        f"rather than the vertex count that sets the time. {remedy}.",
+        RuntimeWarning,
+        stacklevel=4,
+    )
 
 
 def _is_per_chunk_array(name: str) -> bool:
@@ -1249,11 +1312,11 @@ def write_chunk_vertices(
     )
 
     # Express each group as a contiguous (start_row, count) fragment.
+    cumulative = 0
     if len(groups) == 0:
         fragments: list[tuple[int, int]] = []
     else:
         per_group_counts = [int(np.asarray(g).shape[0]) for g in groups]
-        cumulative = 0
         fragments = []
         for n in per_group_counts:
             fragments.append((cumulative, n))
@@ -1262,6 +1325,10 @@ def write_chunk_vertices(
         VERTEX_FRAGMENTS, key, encode_fragments(fragments),
         record_presence=record_presence,
     )
+    # Tell the level how many rows this cell now holds, so the tiling
+    # stamp can check the fragment index against it without reading the
+    # buffer back.  See :meth:`Group.note_vertex_rows`.
+    level_group.note_vertex_rows(key, cumulative)
     return vertex_byte_offsets
 
 
@@ -1634,6 +1701,43 @@ def write_chunk_link_attributes(
     level_group.write_bytes(full_name, key, raw_bytes)
 
 
+def _check_object_index_size(size: int, n_present: int) -> None:
+    """Refuse an object index that the ids have made absurdly long.
+
+    Object ids index the manifests array directly, so the id space --
+    not the object count -- sets its length.  See
+    :data:`OBJECT_INDEX_MAX_ROWS`.
+
+    Raises:
+        ArrayError: When the largest id would allocate more than
+            :data:`OBJECT_INDEX_MAX_ROWS` rows.
+    """
+    if size > OBJECT_INDEX_MAX_ROWS:
+        raise ArrayError(
+            f"Object ids index the object index directly, so writing an id "
+            f"of {size - 1} allocates {size:,} manifest rows for "
+            f"{n_present:,} object(s) -- past the "
+            f"{OBJECT_INDEX_MAX_ROWS:,}-row ceiling. Ids that large are "
+            f"usually addresses from elsewhere (segmentation labels, "
+            f"hashes). Remap them to a dense 0..n-1 range and keep the "
+            f"originals as an object attribute."
+        )
+    if (
+        size >= _OBJECT_INDEX_SPARSE_FLOOR
+        and n_present
+        and size > n_present * _OBJECT_INDEX_SPARSE_RATIO
+    ):
+        warnings.warn(
+            f"Object index allocates {size:,} manifest rows for "
+            f"{n_present:,} object(s): {100 * (1 - n_present / size):.1f}% of "
+            f"it is empty padding, and every whole-index read pays for it. "
+            f"Ids are row indices, so a dense 0..n-1 id space is what keeps "
+            f"the index proportional to the data.",
+            RuntimeWarning,
+            stacklevel=3,
+        )
+
+
 def write_object_index(
     level_group: Group,
     manifests: dict[int, ObjectManifest],
@@ -1663,6 +1767,7 @@ def write_object_index(
         size = int(total_objects)
     else:
         size = max(manifests.keys()) + 1
+    _check_object_index_size(size, len(manifests))
     # Build a dense list, filling gaps with empty manifests
     manifest_list: list[list[tuple[tuple[int, ...], int]]] = []
     for oid in range(size):
@@ -1703,6 +1808,101 @@ def write_object_index(
         "num_present": sum(1 for blob in manifest_blobs if blob != _empty_manifest),
         "sid_ndim": sid_ndim,
         "layout": OBJECT_INDEX_LAYOUT_V1,
+    })
+
+
+def patch_object_manifests(
+    level_group: Group,
+    updates: dict[int, ObjectManifest],
+    sid_ndim: int,
+) -> None:
+    """Replace named rows of ``object_index/manifests``, leaving the rest.
+
+    :func:`write_object_index` rewrites every row, so changing one
+    object's manifest costs the whole index: on a 400,000-object store a
+    single ``edit_vertex`` spent 3.3s and 414 MB doing it, and both
+    figures grow with the object count rather than with the edit.  This
+    touches only the zarr chunks the named rows fall in.
+
+    ``num_present`` is adjusted by the difference between the rows being
+    replaced and the rows replacing them, so it stays exact without a
+    full decode.  The array grows when an id runs past the end, padded
+    with empty manifests exactly as a full rewrite would.
+
+    Args:
+        level_group: Resolution level group.
+        updates: ``{object_id: [(chunk_coords, fragment_index), ...]}``
+            for the objects whose manifests changed.  An empty list
+            blanks that object, which is how a removal is recorded.
+        sid_ndim: Number of spatial index dimensions.
+    """
+    if not updates:
+        return
+
+    oi_group = level_group.zarr_group.require_group(OBJECT_INDEX)
+    if "manifests" not in oi_group:
+        # Nothing to patch into -- this is the first index for the level.
+        write_object_index(level_group, dict(updates), sid_ndim)
+        return
+
+    meta = level_group.read_array_meta(OBJECT_INDEX)
+    empty_blob = encode_object_manifest_blocks([], sid_ndim=sid_ndim)
+    arr = oi_group["manifests"]
+    n0 = int(arr.shape[0])
+    highest = max(int(o) for o in updates)
+    size = max(n0, highest + 1)
+    _check_object_index_size(size, len(updates))
+
+    rows = sorted(int(o) for o in updates)
+    blobs = {
+        oid: encode_object_manifest_blocks(
+            [
+                (tuple(int(c) for c in cc), int(fi))
+                for cc, fi in (updates[oid] or [])
+            ],
+            sid_ndim=sid_ndim,
+        )
+        for oid in rows
+    }
+
+    # What those rows held before, so num_present moves by the delta
+    # rather than being recounted over the whole index.
+    existing_rows = [o for o in rows if o < n0]
+    previous = dict(zip(
+        existing_rows,
+        level_group.read_vlen_elements(
+            f"{OBJECT_INDEX}/manifests", existing_rows,
+        ),
+    )) if existing_rows else {}
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", UnstableSpecificationWarning)
+        if size > n0:
+            arr.resize((size,))
+            pad = [o for o in range(n0, size) if o not in blobs]
+            if pad:
+                pad_values = np.empty(len(pad), dtype=object)
+                pad_values[:] = [empty_blob] * len(pad)
+                arr.set_coordinate_selection(
+                    (np.asarray(pad, dtype=np.intp),), pad_values,
+                )
+        values = np.empty(len(rows), dtype=object)
+        values[:] = [blobs[o] for o in rows]
+        arr.set_coordinate_selection(
+            (np.asarray(rows, dtype=np.intp),), values,
+        )
+    level_group._invalidate_node(f"{OBJECT_INDEX}/manifests")
+
+    was_present = sum(
+        1 for o in rows if previous.get(o, empty_blob) != empty_blob
+    )
+    now_present = sum(1 for o in rows if blobs[o] != empty_blob)
+    prior_present = int(meta.get("num_present", meta.get("num_objects", n0)))
+    level_group.write_array_meta(OBJECT_INDEX, {
+        **meta,
+        "num_objects": size,
+        "num_present": max(0, prior_present - was_present + now_present),
+        "sid_ndim": sid_ndim,
     })
 
 
@@ -3456,20 +3656,33 @@ def stamp_fragments_tile(level_group: Group, ndim: int) -> bool:
 
     dtype = vertices_dtype(level_group)
     key_strs = [_chunk_key(cc) for cc in keys]
+    # Row counts the writer recorded as it encoded each cell. Where one
+    # is present the buffer need not be fetched to be measured, which is
+    # the difference between a bulk write that reads its own output back
+    # in full (measured: 1.00x the bytes written) and one that reads only
+    # the fragment indices -- 16 bytes per fragment. The check itself is
+    # unchanged: the index still comes from the store and is still
+    # verified against the row count rather than trusted.
+    recorded = level_group.take_vertex_rows()
+    unrecorded = [k for k in key_strs if k not in recorded]
     with _maybe_batched_reads(level_group, [
-        (VERTICES, key_strs),
+        (VERTICES, unrecorded),
         (VERTEX_FRAGMENTS, key_strs),
     ]):
         for cc in keys:
+            key = _chunk_key(cc)
             try:
                 fi = read_vertex_fragment_index(level_group, cc)
-                raw = level_group.read_bytes(VERTICES, _chunk_key(cc))
+                n_rows = recorded.get(key)
+                if n_rows is None:
+                    raw = level_group.read_bytes(VERTICES, key)
+                    row_bytes = dtype.itemsize * max(1, int(ndim))
+                    if row_bytes == 0 or len(raw) % row_bytes:
+                        return False
+                    n_rows = len(raw) // row_bytes
             except (ArrayError, StoreError):
                 return False
-            row_bytes = dtype.itemsize * max(1, int(ndim))
-            if row_bytes == 0 or len(raw) % row_bytes:
-                return False
-            if not fi.tiles(len(raw) // row_bytes):
+            if not fi.tiles(n_rows):
                 return False
 
     level = level_group.attrs.get(_LEVEL_META_KEY)
