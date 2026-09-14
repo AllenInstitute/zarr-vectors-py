@@ -38,7 +38,12 @@ from zarr_vectors.constants import (
     OBJECT_ATTRIBUTES,
     VERTEX_ATTRIBUTES,
 )
-from zarr_vectors.exceptions import ArrayError, StoreError, ZVError
+from zarr_vectors.exceptions import (
+    ArrayError,
+    MetadataError,
+    StoreError,
+    ZVError,
+)
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
     from zarr_vectors.api.dataset import Dataset
@@ -400,7 +405,142 @@ class Level:
             names = self.attribute_names("vertex")
             if names:
                 kwargs["attribute_names"] = list(names)
+        if "chunks" in supports and "chunks" not in kwargs:
+            prefix = self._cells_covering_limit(selection)
+            if prefix is not None:
+                kwargs["chunks"] = prefix
         return kwargs
+
+    def _cells_covering_limit(
+        self, selection: Selection,
+    ) -> list[tuple[int, ...]] | None:
+        """Enough leading cells to satisfy ``limit``, or ``None``.
+
+        A limit was applied only after the read, so ``select(limit=10)``
+        against five million points read all five million and then kept
+        ten -- 239 MB of peak memory for ten rows.  The reader emits
+        cells in sorted key order and the post-filter keeps the first
+        ``limit`` survivors, so the same rows come from a prefix of that
+        order.  Which prefix is decided by the fragment indices, walked
+        in order and stopped at the first cell that makes the total
+        enough -- index reads, not vertex reads.
+
+        ``None`` whenever anything else narrows the selection, since then
+        the surviving rows are not a prefix of the cells, and whenever
+        the indices cannot be read, which simply leaves the previous
+        read-everything behaviour in place.
+        """
+        limit = selection.limit
+        if (
+            limit is None
+            or selection.bbox is not None
+            or selection.near is not None
+            or selection.objects is not None
+            or selection.groups is not None
+            or selection.cells is not None
+            or selection.where is not None
+        ):
+            return None
+        if int(limit) <= 0:
+            return None
+        from zarr_vectors.core.arrays import (
+            _fragment_vertex_extent,
+            list_chunk_keys,
+            read_vertex_fragment_index,
+        )
+
+        target = (
+            self if selection.level in (None, self._index)
+            else self._dataset.level(selection.level)
+        )
+        level_group = target.store
+        try:
+            keys = list_chunk_keys(level_group)
+        except (ArrayError, StoreError, KeyError):
+            return None
+        if not keys:
+            return None
+        taken: list[tuple[int, ...]] = []
+        total = 0
+        for cc in keys:
+            taken.append(tuple(int(c) for c in cc))
+            try:
+                total += _fragment_vertex_extent(
+                    read_vertex_fragment_index(level_group, cc),
+                )
+            except (ArrayError, StoreError, KeyError):
+                return None
+            if total >= int(limit):
+                break
+        # Every cell was needed, so naming them narrows nothing.
+        return None if len(taken) == len(keys) else taken
+
+    def cells(
+        self, bbox: tuple[Sequence[float], Sequence[float]] | None = None,
+    ) -> Any:
+        """The cells this level actually holds, optionally within a box.
+
+        The counterpart to :meth:`Grid.cells_in`, which enumerates the
+        *allocation*: a grid is a pure value and cannot know what is in
+        the store, so a sparse level -- a specimen bounding box with data
+        in part of it -- answers ``cells_in`` with a reference per
+        allocated cell. Building a million of those takes about nine
+        seconds before any read happens, and all but a thousand of them
+        name nothing.
+
+        This asks the level instead, so the answer is proportional to the
+        data. It is the better argument to ``select(cells=...)`` whenever
+        the caller wants "what is here", and ``Grid.cells_in`` remains
+        the right one for "what could be here".
+        """
+        import numpy as _np
+
+        from zarr_vectors.api.grid import CellRef, CellSet
+        from zarr_vectors.core.arrays import list_chunk_keys, resolve_chunk_keys
+
+        level_group = self.store
+        if bbox is None:
+            coords = list_chunk_keys(level_group)
+        else:
+            coords = resolve_chunk_keys(
+                level_group,
+                tuple(self.scale),
+                bbox=(
+                    _np.asarray(bbox[0], dtype=_np.float64),
+                    _np.asarray(bbox[1], dtype=_np.float64),
+                ),
+            )
+        return CellSet(CellRef(tuple(int(c) for c in cc)) for cc in coords)
+
+    def _count_without_reading(self, selection: Selection) -> int | None:
+        """The vertex count, when it can be had from metadata alone.
+
+        ``None`` when the selection narrows anything, because then the
+        answer depends on the data and there is nothing stored that
+        knows it.  An unnarrowed count is the level's own
+        ``vertex_count``, which every writer stamps -- reading five
+        million points to count them cost 236 MB of peak memory to
+        return a number already on disk.
+        """
+        if (
+            selection.bbox is not None
+            or selection.near is not None
+            or selection.objects is not None
+            or selection.groups is not None
+            or selection.cells is not None
+            or selection.limit is not None
+            or selection.where is not None
+        ):
+            return None
+        target = (
+            self if selection.level in (None, self._index)
+            else self._dataset.level(selection.level)
+        )
+        try:
+            count = getattr(target._metadata(), "vertex_count", None)
+        except (ArrayError, StoreError, MetadataError, KeyError):
+            return None
+        return None if count is None else int(count)
 
     def plan(self, selection: Selection) -> Any:
         """The I/O this selection implies, before any of it is performed.

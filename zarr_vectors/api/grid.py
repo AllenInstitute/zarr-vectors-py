@@ -209,6 +209,14 @@ class Grid:
         The replacement for ``chunks=[(3, 1, 2), ...]``: the caller states
         a region and receives opaque references, rather than stating grid
         coordinates they had to derive themselves.
+
+        This is the **allocation**, not the occupancy: a grid is a value
+        and holds no store handle, so it answers what the declared grid
+        covers whether or not anything was written there.  On a sparse
+        store the two differ by orders of magnitude, and a reference per
+        allocated cell is a cost paid before any read.  Use
+        :meth:`zarr_vectors.api.level.Level.cells` for the cells a level
+        actually holds.
         """
         lo = np.asarray(bbox[0], dtype=np.float64)
         hi = np.asarray(bbox[1], dtype=np.float64)
@@ -219,6 +227,9 @@ class Grid:
 
     def __iter__(self) -> Iterator[CellRef]:
         """Every cell of the allocation, as absolute references.
+
+        The allocation, so this is ``prod(shape)`` references however
+        little of the grid holds data -- see :meth:`cells_in`.
 
         Yields nothing for a grid with no shape; it used to yield one
         bogus ``CellRef(())``, because ``itertools.product()`` over an

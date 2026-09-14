@@ -248,7 +248,15 @@ class Query:
         return await self._level._aexecute(self._selection)
 
     def count(self) -> int:
-        """How many vertices this query would return."""
+        """How many vertices this query would return.
+
+        An unnarrowed count comes from the level's stamped vertex count
+        without reading a chunk.  Anything narrowed has to be read,
+        because what survives a filter is a property of the data.
+        """
+        exact = self._level._count_without_reading(self._selection)
+        if exact is not None:
+            return exact
         return self.read().vertex_count
 
     def object_ids(self) -> npt.NDArray[Any]:
