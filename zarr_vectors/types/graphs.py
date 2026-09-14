@@ -334,11 +334,50 @@ def write_graph(
                 mask = chunk_bins == ab
                 prefixed_assignments[(int(ab),) + spatial_cc] = gi[mask]
         chunk_assignments = prefixed_assignments
+
+    # Group each chunk's vertices by object BEFORE the local-index mapping
+    # is built.  The write loop below emits one fragment per object per
+    # chunk, in ``np.unique`` order, and a link's chunk-local index is an
+    # offset into that concatenation -- so a mapping built from the
+    # unregrouped order numbers vertices differently from the way they are
+    # actually stored, and every edge in a chunk holding more than one
+    # object then points at the wrong vertex.  ``meshes.py`` already does
+    # this, for the same reason and with the same comment.
+    for _cc, _gi in list(chunk_assignments.items()):
+        _gi = np.asarray(_gi, dtype=np.int64)
+        if _gi.size > 1:
+            _gi = _gi[np.argsort(object_ids[_gi], kind="stable")]
+        chunk_assignments[_cc] = _gi
     chunk_list = sorted(chunk_assignments.keys())
 
     vertex_chunks, vertex_local, chunk_list = build_vertex_chunk_mapping(
         chunk_assignments, n_nodes, chunk_list
     )
+
+    # Read order: the row each vertex will occupy once a reader
+    # concatenates this level's chunks (``chunk_list`` order) and, within
+    # each chunk, its fragments.  The implicit-sequential convention is
+    # stated in that frame, so the store/skip decision below has to be
+    # made in it too.
+    _chunk_sizes = np.array(
+        [len(chunk_assignments[cc]) for cc in chunk_list], dtype=np.int64,
+    )
+    _chunk_start = np.zeros(len(chunk_list), dtype=np.int64)
+    if len(chunk_list) > 1:
+        _chunk_start[1:] = np.cumsum(_chunk_sizes[:-1])
+    read_idx = _chunk_start[vertex_chunks] + vertex_local
+
+    # A fragment's first vertex has no implicit predecessor: the row
+    # before it belongs to another object or another chunk, so a reader
+    # cannot assume it is the parent.
+    is_fragment_start = np.zeros(n_nodes, dtype=bool)
+    for _cc in chunk_list:
+        _gi = chunk_assignments[_cc]
+        if _gi.size == 0:
+            continue
+        _oids = object_ids[_gi]
+        _starts = np.concatenate(([True], _oids[1:] != _oids[:-1]))
+        is_fragment_start[_gi[_starts]] = True
 
     # Select the edges that need an explicit record, then hand them to
     # ``write_links`` in global ``(chunk, vertex)`` form and let it route
@@ -348,9 +387,25 @@ def write_graph(
     e_chunk = vertex_chunks[edges]                      # (M, 2)
     is_cross = e_chunk[:, 0] != e_chunk[:, 1]
     if is_tree:
-        # Depth-first order implies the non-branch parents, but only
-        # within a chunk: a boundary-crossing edge is always explicit.
-        store_mask = is_cross | _branch_mask(edges)
+        # Store exactly the edges the reader's implicit rule does not
+        # already give it.  That rule is ``parent[i] = i - 1`` over the
+        # concatenated read order, suspended at a fragment start -- so an
+        # edge is implied precisely when the child sits one row after its
+        # parent AND is not itself a fragment start.
+        #
+        # This replaces ``is_cross | _branch_mask(edges)``, which was
+        # stated in DFS-index space.  DFS order and read order diverge
+        # whenever a chunk sorts ahead of the one holding the root, and
+        # there the old rule dropped a real edge and let the root inherit
+        # the previous chunk's last vertex as its parent -- reading back
+        # an edge nobody ever wrote.
+        _child, _parent = edges[:, 0], edges[:, 1]
+        implied = (
+            (read_idx[_child] == read_idx[_parent] + 1)
+            & ~is_fragment_start[_child]
+        )
+        store_mask = ~implied
+        _check_one_root_per_object(edges, object_ids, n_nodes)
     else:
         store_mask = np.ones(n_edges, dtype=bool)
     store_rows = np.flatnonzero(store_mask)
@@ -684,6 +739,10 @@ def _read_graph(
         # edges) — all redundant.
         chunk_offsets: dict[ChunkCoords, int] = {}
         all_positions: list[npt.NDArray] = []
+        # Row index of each fragment's first vertex in the concatenation
+        # below.  That is where the implicit-sequential convention stops
+        # applying -- see the tree reconstruction further down.
+        fragment_starts: list[int] = []
         running = 0
         for chunk_coords in chunk_keys:
             chunk_offsets[chunk_coords] = running
@@ -694,6 +753,8 @@ def _read_graph(
             except ArrayError:
                 continue
             for fragment in groups:
+                if len(fragment):
+                    fragment_starts.append(running)
                 all_positions.append(fragment)
                 running += len(fragment)
 
@@ -727,8 +788,17 @@ def _read_graph(
         # For skeletons: reconstruct full edge set from implicit sequential + branch links
         if is_tree:
             total_nodes = len(positions_out)
-            # Start with implicit parents: parent[i] = i-1, parent[0] = -1
+            # Implicit parents: parent[i] = i-1 WITHIN a fragment.  At a
+            # fragment start there is no predecessor to inherit -- the row
+            # before it belongs to another object or another chunk -- so it
+            # starts parentless and is filled in only by an explicit
+            # record.  Without this a tree whose root did not land on row 0
+            # took the previous fragment's last vertex as its parent,
+            # returning an edge the writer never stored (and, for a root in
+            # a later chunk, one edge too many).
             parent_arr = np.arange(-1, total_nodes - 1, dtype=np.int64)
+            if fragment_starts:
+                parent_arr[np.asarray(fragment_starts, dtype=np.int64)] = -1
             # Vectorized branch-link override: one fancy-index per block.
             for edge_block in all_edges:
                 if len(edge_block) == 0:
@@ -896,14 +966,63 @@ def _reorder_tree(
     return new_positions, new_edges, new_node_attrs, edge_attributes, reorder_map
 
 
+def _check_one_root_per_object(
+    edges: npt.NDArray,
+    object_ids: npt.NDArray,
+    n_nodes: int,
+) -> None:
+    """Reject a skeleton whose object holds more than one tree.
+
+    ``implicit_sequential_with_branches`` stores a parent only where the
+    reader cannot imply one, and the reader implies ``parent[i] = i - 1``
+    everywhere except a fragment start.  A second root inside one object's
+    fragment is therefore inexpressible: it has no parent, yet it does
+    have a predecessor the reader will hand it, so it reads back joined to
+    the vertex before it -- an edge nobody wrote.
+
+    One rooted tree per object id is the fix, and it is the shape the
+    object model wants anyway.  Say so rather than silently inventing
+    connectivity; a forest that genuinely has no object structure can be
+    written with ``kind="graph"``, which stores every edge explicitly.
+    """
+    has_parent = np.zeros(n_nodes, dtype=bool)
+    if len(edges):
+        children = edges[:, 0].astype(np.int64, copy=False)
+        in_range = (children >= 0) & (children < n_nodes)
+        has_parent[children[in_range]] = True
+    roots = np.flatnonzero(~has_parent)
+    if roots.size <= 1:
+        return
+    root_oids = np.asarray(object_ids)[roots]
+    sorted_oids = np.sort(root_oids)
+    repeated = sorted_oids[1:][sorted_oids[1:] == sorted_oids[:-1]]
+    if repeated.size == 0:
+        return
+    offender = int(repeated[0])
+    n_roots = int(np.count_nonzero(root_oids == offender))
+    raise ArrayError(
+        f"kind='skeleton' stores one rooted tree per object, but object "
+        f"{offender} has {n_roots} roots (a forest). The "
+        f"implicit_sequential_with_branches convention records a parent "
+        f"only where the reader cannot imply one, so a second root in the "
+        f"same object reads back with the preceding vertex as its parent "
+        f"-- an edge that was never written. Give each tree its own "
+        f"object_ids entry, or write it with kind='graph'."
+    )
+
+
 def _branch_mask(edges: npt.NDArray) -> npt.NDArray[np.bool_]:
     """Rows of a tree edge list that depth-first order does not imply.
 
     ``edges`` is ``(M, 2)`` ``[child, parent]``.  In a depth-first
     ordered tree most edges have ``parent == child - 1``; the rest are
-    branch points and are the only ones needing an explicit intra-chunk
-    record.  The single definition of that predicate — the write path
-    selects records with it, :func:`_extract_branch_links` slices with it.
+    branch points.
+
+    NOT what :func:`write_graph` selects on any more.  DFS index and read
+    order are different numberings, and the store/skip decision has to be
+    made in read order -- see the ``is_tree`` branch there.  This remains
+    the predicate over DFS indices, which is what
+    :func:`_extract_branch_links` wants.
     """
     if len(edges) == 0:
         return np.zeros(0, dtype=bool)
