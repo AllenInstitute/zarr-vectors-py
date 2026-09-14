@@ -337,11 +337,15 @@ class Dataset:
         """Write a graph, or a skeleton when ``tree=True``."""
         from zarr_vectors.types.graphs import write_graph
 
+        # ``kind=``, not the ``is_tree=`` alias: that alias is deprecated
+        # and warns on every call, so the supported surface was emitting a
+        # DeprecationWarning about its own implementation on every
+        # ``add_graph``.
         return self._write(
             write_graph, positions, edges,
             vertex_attributes=dict(attributes or {}) or None,
             link_attributes=dict(edge_attributes or {}) or None,
-            object_ids=object_ids, is_tree=tree,
+            object_ids=object_ids, kind="skeleton" if tree else "graph",
             layout=layout, out_of_bounds=on_out_of_bounds,
         )
 
