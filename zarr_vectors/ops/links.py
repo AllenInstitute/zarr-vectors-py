@@ -705,12 +705,13 @@ def reorder_vertices_implicit(
 
     from zarr_vectors.core.arrays import (
         list_link_offsets,
-        read_all_object_manifests,
+        object_count,
         read_chunk_link_attributes,
         read_chunk_links,
         read_chunk_vertices,
         read_link_attributes,
         read_links,
+        read_object_manifests,
         read_vertex_fragment_index,
         write_chunk_fragment_attributes,
         write_chunk_links,
@@ -754,8 +755,10 @@ def reorder_vertices_implicit(
         )
 
     level_group = get_resolution_level(root, level)
-    all_manifests = read_all_object_manifests(level_group)
-    n_objects = len(all_manifests)
+    # The slot count is stamped on the index; reading every manifest to
+    # take its length decoded the whole level to learn a number already
+    # written down. Only the targeted objects' manifests are then read.
+    n_objects = object_count(level_group)
     if object_ids is None:
         target_oids = list(range(n_objects))
     else:
@@ -765,6 +768,7 @@ def reorder_vertices_implicit(
                 raise EditError(
                     f"object_id {o} out of range [0, {n_objects})"
                 )
+    all_manifests = read_object_manifests(level_group, ids=target_oids)
     if not target_oids:
         return _empty_report()
 
@@ -796,7 +800,7 @@ def reorder_vertices_implicit(
     oid_fragment_runs: dict = {}  # oid -> list of (cc, frag_idx, vkey_slice_start, vkey_slice_end)
 
     for oid in target_oids:
-        manifest = all_manifests[oid]
+        manifest = all_manifests.get(int(oid), [])
         vkey_list = []
         frag_runs = []
         for (cc, frag_idx) in manifest:

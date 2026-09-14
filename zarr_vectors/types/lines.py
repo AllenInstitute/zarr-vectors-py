@@ -37,9 +37,9 @@ from zarr_vectors.core.arrays import (
     create_object_index_array,
     create_vertices_array,
     list_chunk_keys,
-    read_all_object_manifests,
     read_chunk_attributes,
     read_chunk_vertices,
+    read_object_manifests,
     stamp_fragments_tile,
     write_chunk_attributes,
     write_chunk_vertices,
@@ -548,14 +548,18 @@ def _read_lines(
     # entries don't start with the matching bin.
     if filter_bin is not None:
         try:
-            manifests = read_all_object_manifests(level_group)
+            pruning = read_object_manifests(
+                level_group, ids=[int(o) for o in object_ids],
+            )
         except Exception:
-            manifests = []
+            pruning = {}
         kept: list[int] = []
         for oid in object_ids:
-            if oid < len(manifests) and manifests[oid]:
-                if all(cc and cc[0] == filter_bin for cc, _ in manifests[oid]):
-                    kept.append(oid)
+            manifest = pruning.get(int(oid))
+            if manifest and all(
+                cc and cc[0] == filter_bin for cc, _ in manifest
+            ):
+                kept.append(oid)
         object_ids = kept
 
     # Chunk-major read: decode each chunk's fragments *once*, then
@@ -583,7 +587,13 @@ def _read_lines(
     _batched_reads_cm = level_group.batched_reads(_prefetch_plan)
     _batched_reads_cm.__enter__()
     try:
-        manifests = read_all_object_manifests(level_group)
+        # The manifests of the objects asked for, not of every object in
+        # the level. A caller naming a hundred lines in a store holding a
+        # million should not decode a million manifests to find them;
+        # when the caller names them all, this is the same work as before.
+        manifest_by_oid = read_object_manifests(
+            level_group, ids=[int(o) for o in object_ids],
+        )
 
         # Build a per-chunk dispatch table: chunk → list of
         # (oid_local_idx, manifest_position, fragment_index).  ``oid_local_idx``
@@ -598,9 +608,9 @@ def _read_lines(
         oid_for_output: list[int] = []
         chunk_dispatch: dict[ChunkCoords, list[tuple[int, int, int]]] = {}
         for oid in object_ids:
-            if oid < 0 or oid >= len(manifests):
-                continue
-            manifest = manifests[oid]
+            # Absent covers negative, out-of-range and no-such-object --
+            # the cases the index bounds check used to catch.
+            manifest = manifest_by_oid.get(int(oid))
             if not manifest:
                 continue
             slot = len(oid_outputs)
