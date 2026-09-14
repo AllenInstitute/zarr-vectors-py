@@ -55,9 +55,15 @@ _DEFAULT_TARGET_OBJECT_BYTES = 16 << 20
 # cost of a slightly larger fragment index.
 _DEFAULT_SUBCELLS = 4
 
-# With no bounds and no hint there is nothing to divide, so one cell per
-# axis is the only honest answer: a single chunk holding everything.
+# With no size hint there is nothing to divide by, so one cell per axis
+# is the only honest answer: a single chunk holding everything.  Given a
+# hint, ``_cells_for`` picks a real count instead -- see there.
 _DEFAULT_CELLS = 1
+
+# What one cell should hold, when a hint lets us aim.  Matches
+# ``Grid.capacity``'s target, so a layout this module chooses is a layout
+# that object reports as fitting.
+_TARGET_CELL_BYTES = 64 << 20
 
 
 class SchemaConflict(MetadataError):
@@ -191,6 +197,24 @@ class Layout:
     this many pieces per axis" — and is what most callers should use.
     ``cell_size`` is the escape hatch for a grid fixed from outside, such
     as a pipeline whose chunks must line up with an image volume's.
+
+    What the defaults actually do:
+
+    ``cells="auto"``
+        Derived from :attr:`Schema.expected` — enough cells that each one
+        holds roughly 64 MB, the figure
+        :meth:`zarr_vectors.api.grid.Grid.capacity` judges against.  With
+        no hint it is **one cell per axis**: a single chunk holding
+        everything.  That is the honest answer when nothing is known, not
+        a good default — say ``cells=`` or fill in ``expected`` for
+        anything you intend to query spatially.
+    ``subcells="auto"``
+        Four per axis, so a bbox read touches about 1/64th of a 3-D chunk.
+    ``pack="auto"``
+        On for object stores, off for local ones.
+    ``compression="auto"``
+        ``zstd``, or ``$ZARR_VECTORS_COMPRESSION`` when set.  It used to
+        resolve to *no* compression, which is not what the word means.
     """
 
     cells: int | Sequence[int] | Literal["auto"] = "auto"
@@ -216,13 +240,15 @@ class Layout:
         ndim = len(lo)
         extent = [h - low for low, h in zip(lo, hi)]
 
-        chunk_shape = self._chunk_shape(extent, ndim)
+        chunk_shape = self._chunk_shape(extent, ndim, schema)
         bin_shape = self._bin_shape(chunk_shape)
         pack = store_kind != "local" if self.pack == "auto" else bool(self.pack)
         shard_shape = self._shard_shape(extent, chunk_shape, schema) if pack else None
-        compressor = None if self.compression == "auto" else self.compression
+        compressor = self.compression
         if self.compression == "auto":
-            compressor = os.environ.get("ZARR_VECTORS_COMPRESSION") or None
+            # "auto" resolved to *no* compression unless an environment
+            # variable said otherwise, which is not what the word means.
+            compressor = os.environ.get("ZARR_VECTORS_COMPRESSION") or "zstd"
         return ResolvedLayout(
             chunk_shape=chunk_shape,
             bin_shape=bin_shape,
@@ -231,7 +257,9 @@ class Layout:
             bounds=(lo, hi),
         )
 
-    def _chunk_shape(self, extent: list[float], ndim: int) -> tuple[float, ...]:
+    def _chunk_shape(
+        self, extent: list[float], ndim: int, schema: Schema,
+    ) -> tuple[float, ...]:
         if self.cell_size is not None:
             size = tuple(float(v) for v in self.cell_size)
             if len(size) != ndim:
@@ -239,7 +267,7 @@ class Layout:
                     f"Layout.cell_size has {len(size)} axes but the bounds have {ndim}."
                 )
             return size
-        cells = _DEFAULT_CELLS if self.cells == "auto" else self.cells
+        cells = self._cells_for(schema, ndim) if self.cells == "auto" else self.cells
         counts = (
             [int(cells)] * ndim if isinstance(cells, int)
             else [int(c) for c in cells]
@@ -251,6 +279,33 @@ class Layout:
         return tuple(
             (e / c if c > 0 else e) or 1.0 for e, c in zip(extent, counts)
         )
+
+    def _cells_for(self, schema: Schema, ndim: int) -> int:
+        """Cells per axis for ``cells="auto"``.
+
+        ``Schema.expected.n_vertices`` is the caller's own estimate of how
+        much data is coming, and it already sizes the shards; using it
+        here too means an untouched ``Layout`` produces a grid rather than
+        a single chunk holding the entire volume.  The target is
+        :data:`_TARGET_CELL_BYTES` per cell, which is the figure
+        :meth:`zarr_vectors.api.grid.Grid.capacity` judges against -- so
+        an automatic layout is one that object reports as fitting.
+
+        Falls back to one cell per axis with no hint.  That really is the
+        only honest answer then: there is nothing to divide by, and
+        guessing a grid for data of unknown size trades a known cost for
+        an unknown one.  A caller who does not know should say
+        ``cells=``; one who does should fill in ``expected``.
+        """
+        hint = schema.expected.n_vertices if schema.expected else None
+        if not hint or hint <= 0:
+            return _DEFAULT_CELLS
+        # bytes ≈ n_vertices * ndim * 4 (float32 positions), so the cell
+        # count that lands on the target is total_bytes / target.
+        total_bytes = float(hint) * max(1, ndim) * 4.0
+        target_cells = max(1.0, total_bytes / _TARGET_CELL_BYTES)
+        per_axis = int(math.ceil(target_cells ** (1.0 / max(1, ndim))))
+        return max(_DEFAULT_CELLS, per_axis)
 
     def _bin_shape(self, chunk_shape: tuple[float, ...]) -> tuple[float, ...]:
         # bin_shape must divide chunk_shape exactly, so this divides

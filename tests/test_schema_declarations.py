@@ -172,3 +172,71 @@ class TestOpenOrCreateCanSeeIt:
 def test_profile_is_gone():
     """It named a concept that did not exist and nothing read it."""
     assert not hasattr(zv.Schema(), "profile")
+
+
+class TestAutomaticLayout:
+    """``Layout()`` untouched should produce a store, not one giant chunk.
+
+    ``cells="auto"`` resolved to a single cell per axis while the class
+    docstring promised "a caller who never touches Layout gets a sensible
+    store".  ``Schema.expected.n_vertices`` was right there -- it already
+    sized the shards -- and nothing consulted it for the grid.
+    """
+
+    def test_a_size_hint_produces_a_real_grid(self):
+        schema = _schema(
+            bounds=([0.0] * 3, [1000.0] * 3),
+            expected=zv.SizeHints(n_vertices=200_000_000),
+            layout=zv.Layout(),
+        )
+        resolved = schema.layout.resolve(schema)
+        grid = zv.Grid.plan(schema.bounds, cell_size=resolved.chunk_shape)
+        assert grid.cells > 1
+        # ...and the grid it picks is one Grid.capacity signs off on.
+        assert grid.capacity(n_vertices=200_000_000).fits
+
+    def test_more_data_means_more_cells(self):
+        def cells(n):
+            schema = _schema(
+                bounds=([0.0] * 3, [1000.0] * 3),
+                expected=zv.SizeHints(n_vertices=n), layout=zv.Layout(),
+            )
+            r = schema.layout.resolve(schema)
+            return zv.Grid.plan(schema.bounds, cell_size=r.chunk_shape).cells
+
+        assert cells(10_000_000) < cells(200_000_000) < cells(2_000_000_000)
+
+    def test_no_hint_still_means_one_cell_per_axis(self):
+        """The honest answer when there is nothing to divide by.
+
+        Pinned deliberately: guessing a grid for data of unknown size
+        trades a known cost for an unknown one.
+        """
+        schema = _schema(bounds=([0.0] * 3, [1000.0] * 3), layout=zv.Layout())
+        resolved = schema.layout.resolve(schema)
+        assert resolved.chunk_shape == (1000.0, 1000.0, 1000.0)
+
+    def test_an_explicit_cells_still_wins(self):
+        schema = _schema(
+            bounds=([0.0] * 3, [1000.0] * 3),
+            expected=zv.SizeHints(n_vertices=2_000_000_000),
+            layout=zv.Layout(cells=4),
+        )
+        assert schema.layout.resolve(schema).chunk_shape == (250.0,) * 3
+
+    def test_automatic_compression_means_compression(self, monkeypatch):
+        """"auto" resolved to *no* compression, which is not what it says."""
+        monkeypatch.delenv("ZARR_VECTORS_COMPRESSION", raising=False)
+        schema = _schema(bounds=([0.0] * 3, [1000.0] * 3), layout=zv.Layout())
+        assert schema.layout.resolve(schema).compressor == "zstd"
+
+    def test_the_environment_variable_still_wins(self, monkeypatch):
+        monkeypatch.setenv("ZARR_VECTORS_COMPRESSION", "blosc")
+        schema = _schema(bounds=([0.0] * 3, [1000.0] * 3), layout=zv.Layout())
+        assert schema.layout.resolve(schema).compressor == "blosc"
+
+    def test_explicitly_asking_for_none_is_honoured(self):
+        schema = _schema(
+            bounds=([0.0] * 3, [1000.0] * 3), layout=zv.Layout(compression=None),
+        )
+        assert schema.layout.resolve(schema).compressor is None

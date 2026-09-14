@@ -67,11 +67,18 @@ parameters the storage layer needs. Every field has a working `"auto"`.
 
 | Field | What it says | Default |
 |-------|--------------|---------|
-| `cells` | How many cells per axis to cut the volume into | `"auto"` → 1, the whole volume in one cell |
+| `cells` | How many cells per axis to cut the volume into | `"auto"` → from `Schema.expected`, else 1 |
 | `cell_size` | The cell size in coordinate units, when the grid is fixed from outside | `None` |
 | `subcells` | How many bins per axis inside each cell | `"auto"` → 4 |
 | `pack` | Whether to pack cells into shards | `"auto"` → on for object stores, off for local |
-| `compression` | Compressor name | `"auto"` → `$ZARR_VECTORS_COMPRESSION`, else none |
+| `compression` | Compressor name | `"auto"` → `$ZARR_VECTORS_COMPRESSION`, else `zstd` |
+
+`cells="auto"` divides by `Schema.expected.n_vertices` — the estimate that
+already sizes the shards — aiming for about 64 MB per cell, which is the
+figure `Grid.capacity` judges against. With **no** hint it falls back to one
+cell per axis: a single chunk holding everything. That is the honest answer
+when there is nothing to divide by, not a good grid, so fill in `expected`
+or say `cells=` for anything you intend to query spatially.
 
 `Layout.resolve(schema)` computes `chunk_shape`, `bin_shape`, `shard_shape`
 and `compressor` from those, and it is the only place in the package where
