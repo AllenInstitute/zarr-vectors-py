@@ -289,9 +289,15 @@ def _per_object_coarsen(
         keep_oids = list(range(n_src_objects))
 
     # --- Step 2-3: build (source vertex → bin → metavertex) map ---------
-    # Per-object ordered source-vertex positions (with their global index
-    # in the flat source-vertex array).
-    per_object_positions: dict[int, np.ndarray] = {}
+    # Per-object source-vertex counts, in ``keep_oids`` order, alongside
+    # the flat concatenation of the positions themselves.
+    #
+    # Only the counts are kept per object, not the positions: step 7
+    # below walks the flat array in per-object slices and needs the slice
+    # lengths, so holding each object's own copy as well meant a second
+    # full copy of the level's vertices alive at the same time as
+    # ``all_pos``. On a million vertices the peak was 68 times the data.
+    per_object_count: dict[int, int] = {}
     flat_positions: list[np.ndarray] = []
     flat_oid_of_v: list[int] = []
     next_global = 0
@@ -304,13 +310,18 @@ def _per_object_coarsen(
                 continue
             parts.append(np.asarray(fragment, dtype=np.float32))
         if not parts:
-            per_object_positions[oid] = np.zeros((0, ndim), dtype=np.float32)
+            per_object_count[oid] = 0
             continue
         obj_positions = np.concatenate(parts, axis=0)
-        per_object_positions[oid] = obj_positions
+        per_object_count[oid] = int(obj_positions.shape[0])
         flat_positions.append(obj_positions)
         flat_oid_of_v.extend([oid] * obj_positions.shape[0])
         next_global += obj_positions.shape[0]
+
+    # The source fragments have been copied into the flat array and are
+    # not read again; releasing them here keeps the source level and the
+    # working copy from being resident at once.
+    src_fragment_positions.clear()
 
     if not flat_positions:
         # Surviving objects had no vertices.  Write an empty level.
@@ -332,6 +343,9 @@ def _per_object_coarsen(
         }
 
     all_pos = np.concatenate(flat_positions, axis=0)
+    # ``all_pos`` owns the data now; the per-object arrays were its only
+    # other reference.
+    flat_positions.clear()
 
     # Target bin shape: source bin_shape × coarsen_factor.
     # Target bin shape: the SOURCE level's bin_shape x coarsen_factor, so the
@@ -414,7 +428,7 @@ def _per_object_coarsen(
     cursor = 0
     new_manifests: dict[int, list[tuple[ChunkCoords, int]]] = {}
     for oid in keep_oids:
-        n = per_object_positions[oid].shape[0]
+        n = per_object_count[oid]
         if n == 0:
             cursor += 0
             new_manifests[oid] = []

@@ -691,11 +691,17 @@ def build_vertex_chunk_mapping(
     vertex_chunks = np.full(n_vertices, -1, dtype=np.int64)
     vertex_local_indices = np.full(n_vertices, -1, dtype=np.int64)
 
+    # Scatter per chunk rather than per vertex: the inner loop ran once
+    # for every vertex in the level, on the write path of every graph and
+    # mesh. A chunk's vertices are numbered 0..n-1 in the order they are
+    # stored, which is an arange, and their destinations are the chunk's
+    # own index array -- both expressible as one scatter each.
     for coord, global_indices in chunk_assignments.items():
-        chunk_idx = coord_to_idx[coord]
-        for local_idx, global_idx in enumerate(global_indices):
-            vertex_chunks[global_idx] = chunk_idx
-            vertex_local_indices[global_idx] = local_idx
+        gi = np.asarray(global_indices, dtype=np.int64)
+        if gi.size == 0:
+            continue
+        vertex_chunks[gi] = coord_to_idx[coord]
+        vertex_local_indices[gi] = np.arange(gi.size, dtype=np.int64)
 
     if np.any(vertex_chunks == -1):
         missing = int(np.sum(vertex_chunks == -1))
