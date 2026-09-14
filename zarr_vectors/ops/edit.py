@@ -122,7 +122,13 @@ class EditSession:
         # Per-level pending manifest ops, keyed by (level, oid).
         self._manifest_ops: dict[tuple[int, int], ManifestOp] = {}
         # Per-level manifest cache (lazy, populated on first lookup).
-        self._all_manifests: dict[int, list[ObjectManifest]] = {}
+        self._all_manifests: dict[
+            int, tuple[npt.NDArray[np.int64], list[ObjectManifest]]
+        ] = {}
+        # object id -> row, per level. Built with the manifests, because
+        # the two are only the same when a level stores its objects
+        # densely from zero.
+        self._id_rows: dict[int, dict[int, int]] = {}
         # Per-level next-available OID (atomic mode appends new OIDs here).
         self._next_oid: dict[int, int] = {}
         # Fragment → OIDs inverted index (lazy, built on first lookup
@@ -711,32 +717,51 @@ class EditSession:
     # Manifest / OID bookkeeping
     # ------------------------------------------------------------------
 
-    def _all_manifests_for(self, level: int) -> list[ObjectManifest]:
+    def _all_manifests_for(
+        self, level: int,
+    ) -> tuple[npt.NDArray[np.int64], list[ObjectManifest]]:
+        """``(ids, manifests)`` for a level, read once per session.
+
+        The ids are returned rather than implied: the manifest list is
+        in row order, and an object id equals its row only while the
+        level numbers its objects densely from zero.
+        """
         if level in self._all_manifests:
             return self._all_manifests[level]
-        from zarr_vectors.core.arrays import read_all_object_manifests
+        from zarr_vectors.core.arrays import read_object_manifest_rows
         from zarr_vectors.core.store import get_resolution_level
         level_group = get_resolution_level(self.root, level)
         try:
-            manifests = read_all_object_manifests(level_group)
+            ids, manifests = read_object_manifest_rows(level_group)
         except Exception:
-            manifests = []
-        self._all_manifests[level] = manifests
-        self._next_oid[level] = len(manifests)
-        return manifests
+            ids, manifests = np.zeros(0, dtype=np.int64), []
+        self._all_manifests[level] = (ids, manifests)
+        # The next free id, not the next free row: allocating at the row
+        # count would collide with any id at or above it.
+        self._next_oid[level] = (
+            int(ids.max()) + 1 if ids.size else 0
+        )
+        self._id_rows[level] = {int(o): r for r, o in enumerate(ids.tolist())}
+        return ids, manifests
+
+    def _row_of(self, level: int, oid: int) -> int | None:
+        """Row holding ``oid`` at ``level``, or ``None`` if absent."""
+        self._all_manifests_for(level)
+        return self._id_rows.get(level, {}).get(int(oid))
 
     def _get_manifest(self, level: int, oid: int) -> ObjectManifest:
         # Honour any pending in-session edit for this OID first.
         pending = self._manifest_ops.get((level, oid))
         if pending is not None and pending.new_manifest is not None:
             return list(pending.new_manifest)
-        manifests = self._all_manifests_for(level)
-        if oid < 0 or oid >= len(manifests):
+        _ids, manifests = self._all_manifests_for(level)
+        row = self._row_of(level, oid)
+        if row is None:
             raise EditError(
-                f"object_id {oid} out of range at level {level} "
-                f"(have {len(manifests)} OIDs)"
+                f"object_id {oid} is not at level {level} "
+                f"(have {len(manifests)} object(s))"
             )
-        return list(manifests[oid])
+        return list(manifests[row])
 
     def _oids_referencing(
         self,
@@ -791,8 +816,8 @@ class EditSession:
         if marker in index:
             return index
         index[marker] = []  # sentinel — must not collide with real keys
-        manifests = self._all_manifests_for(level)
-        for oid, manifest in enumerate(manifests):
+        ids, manifests = self._all_manifests_for(level)
+        for oid, manifest in zip(ids.tolist(), manifests):
             for cc, fi in manifest:
                 key = (level, tuple(int(c) for c in cc), int(fi))
                 index.setdefault(key, []).append(oid)
@@ -890,10 +915,9 @@ class EditSession:
             if pending is not None and pending.new_manifest is not None:
                 old_mani = list(pending.new_manifest)
             else:
-                manifests = self._all_manifests_for(level)
-                old_mani = (
-                    list(manifests[oid]) if 0 <= oid < len(manifests) else []
-                )
+                _ids, manifests = self._all_manifests_for(level)
+                row = self._row_of(level, oid)
+                old_mani = [] if row is None else list(manifests[row])
             self._manifest_ops[(level, oid)] = ManifestOp(
                 level=level, object_id=oid,
                 new_manifest=new_mani, new_oid=None,

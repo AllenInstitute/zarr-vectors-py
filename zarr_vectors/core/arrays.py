@@ -87,6 +87,31 @@ _UNSET: Any = object()
 # of single-chunk ``data`` + ``offsets`` byte blobs.
 OBJECT_INDEX_LAYOUT_V1 = "vlen_manifests_v1"
 
+#: Layout in which object ids are *stored* rather than implied by row
+#: position.
+#:
+#: Under V1 an object id IS its row index, so the array is as long as the
+#: largest id plus one and an id of twenty million allocates twenty
+#: million rows for one object.  Segmentation-style 64-bit ids do not fit
+#: at all, which is why ``types/skeletons.py`` -- whose ids are segment
+#: ids -- has to hand-roll a sorted attribute column and binary-search it.
+#:
+#: Under V2 the ids live in a sibling ``object_ids`` array, one entry per
+#: row, and rows are dense.  Ids may be arbitrary, sparse, and huge.
+#:
+#: Both layouts read through one code path, because **a V1 store is
+#: simply one whose id table is the identity** -- so there is no format
+#: cut here and 0.9.x stores keep reading unchanged.
+OBJECT_INDEX_LAYOUT_V2 = "vlen_manifests_v2"
+
+#: Name of the row-to-id array under ``object_index/``.
+OBJECT_IDS_ARRAY = "object_ids"
+
+#: Set on ``object_index`` when the stored ids ascend, which lets a
+#: lookup binary-search them directly instead of sorting first.  Bulk
+#: writers emit ids in order, so this is the common case.
+OBJECT_IDS_SORTED_ATTR = "object_ids_sorted"
+
 # Objects per zarr chunk of ``object_index/manifests``.  A single-object
 # read fetches only the chunk containing the requested oid, so this sets
 # the read amplification ceiling (~16K manifest blobs per fetch).
@@ -1763,15 +1788,22 @@ def write_object_index(
     if not manifests and total_objects is None:
         return
 
+    # Rows are dense and the ids are stored alongside them, so an id may
+    # be arbitrary, sparse or 64-bit without allocating anything for the
+    # gaps. ``total_objects`` still widens the id space, which the
+    # id-preserving pyramid regime uses to keep dropped objects
+    # addressable -- those become present-but-empty rows exactly as
+    # before, just without the padding between them.
+    row_ids = sorted(int(o) for o in manifests)
     if total_objects is not None:
-        size = int(total_objects)
-    else:
-        size = max(manifests.keys()) + 1
-    _check_object_index_size(size, len(manifests))
-    # Build a dense list, filling gaps with empty manifests
-    manifest_list: list[list[tuple[tuple[int, ...], int]]] = []
-    for oid in range(size):
-        manifest_list.append(manifests.get(oid, []))
+        # Preserve the historical contract: a caller declaring a slot
+        # count means ids 0..total-1 all exist, empty or not.
+        declared = set(range(int(total_objects)))
+        row_ids = sorted(declared.union(row_ids))
+    _check_object_index_size(len(row_ids), len(manifests))
+    manifest_list: list[list[tuple[tuple[int, ...], int]]] = [
+        manifests.get(oid, []) for oid in row_ids
+    ]
 
     # v0.6 manifest-block encoding.  Each old (chunk, fragment_index) tuple
     # becomes one mode-0 (single fragment) block.  Range / explicit
@@ -1795,9 +1827,10 @@ def write_object_index(
     _empty_manifest = encode_object_manifest_blocks([], sid_ndim=sid_ndim)
 
     _write_object_index_manifests(level_group, manifest_blobs)
+    _write_object_id_table(level_group, row_ids)
     level_group.write_array_meta(OBJECT_INDEX, {
         "zv_array": "object_index",
-        "num_objects": size,
+        "num_objects": len(row_ids),
         # How many of those slots actually hold an object.  ``num_objects``
         # is the SLOT count: a sparsified pyramid level deliberately keeps
         # dropped objects as empty manifests so ids stay stable across
@@ -1807,8 +1840,23 @@ def write_object_index(
         # store, to answer a question the writer already knew.
         "num_present": sum(1 for blob in manifest_blobs if blob != _empty_manifest),
         "sid_ndim": sid_ndim,
-        "layout": OBJECT_INDEX_LAYOUT_V1,
+        "layout": OBJECT_INDEX_LAYOUT_V2,
+        OBJECT_IDS_SORTED_ATTR: True,
     })
+
+
+def _write_object_id_table(level_group: Group, row_ids: Sequence[int]) -> None:
+    """Write ``object_index/object_ids``: row → object id.
+
+    This is the tie that used to be positional only. The comment on
+    ``write_object_attributes``' ``at=`` -- "nothing on disk ties a row
+    to an object, so row i means object i by position alone" -- was the
+    statement of the problem; this array is the answer to it.
+    """
+    level_group.write_array(
+        f"{OBJECT_INDEX}/{OBJECT_IDS_ARRAY}",
+        np.asarray(list(row_ids), dtype=np.int64),
+    )
 
 
 def patch_object_manifests(
@@ -1849,11 +1897,8 @@ def patch_object_manifests(
     empty_blob = encode_object_manifest_blocks([], sid_ndim=sid_ndim)
     arr = oi_group["manifests"]
     n0 = int(arr.shape[0])
-    highest = max(int(o) for o in updates)
-    size = max(n0, highest + 1)
-    _check_object_index_size(size, len(updates))
 
-    rows = sorted(int(o) for o in updates)
+    ids = sorted(int(o) for o in updates)
     blobs = {
         oid: encode_object_manifest_blocks(
             [
@@ -1862,48 +1907,72 @@ def patch_object_manifests(
             ],
             sid_ndim=sid_ndim,
         )
-        for oid in rows
+        for oid in ids
     }
+
+    # Ids this level already holds keep their row; the rest are appended
+    # in id order. An id is not a row, so a new one extends the index by
+    # exactly one row however large the id is.
+    known, known_rows = object_rows_for_ids(level_group, ids)
+    row_of = dict(zip(known.tolist(), known_rows.tolist()))
+    fresh = [o for o in ids if o not in row_of]
+    size = n0 + len(fresh)
+    _check_object_index_size(size, size)
+    for offset, oid in enumerate(fresh):
+        row_of[oid] = n0 + offset
 
     # What those rows held before, so num_present moves by the delta
     # rather than being recounted over the whole index.
-    existing_rows = [o for o in rows if o < n0]
+    existing_rows = [row_of[o] for o in ids if o in known.tolist()]
     previous = dict(zip(
-        existing_rows,
+        [o for o in ids if row_of[o] < n0],
         level_group.read_vlen_elements(
-            f"{OBJECT_INDEX}/manifests", existing_rows,
+            f"{OBJECT_INDEX}/manifests", sorted(existing_rows),
         ),
     )) if existing_rows else {}
 
+    target_rows = [row_of[o] for o in ids]
     with warnings.catch_warnings():
         warnings.simplefilter("ignore", UnstableSpecificationWarning)
         if size > n0:
             arr.resize((size,))
-            pad = [o for o in range(n0, size) if o not in blobs]
-            if pad:
-                pad_values = np.empty(len(pad), dtype=object)
-                pad_values[:] = [empty_blob] * len(pad)
-                arr.set_coordinate_selection(
-                    (np.asarray(pad, dtype=np.intp),), pad_values,
-                )
-        values = np.empty(len(rows), dtype=object)
-        values[:] = [blobs[o] for o in rows]
+        values = np.empty(len(ids), dtype=object)
+        values[:] = [blobs[o] for o in ids]
         arr.set_coordinate_selection(
-            (np.asarray(rows, dtype=np.intp),), values,
+            (np.asarray(target_rows, dtype=np.intp),), values,
         )
     level_group._invalidate_node(f"{OBJECT_INDEX}/manifests")
 
+    if fresh:
+        table = read_object_id_table(level_group)
+        if table is None:
+            table = np.arange(n0, dtype=np.int64)
+        _write_object_id_table(
+            level_group,
+            np.concatenate([table, np.asarray(fresh, dtype=np.int64)]).tolist(),
+        )
+
     was_present = sum(
-        1 for o in rows if previous.get(o, empty_blob) != empty_blob
+        1 for o in ids if previous.get(o, empty_blob) != empty_blob
     )
-    now_present = sum(1 for o in rows if blobs[o] != empty_blob)
+    now_present = sum(1 for o in ids if blobs[o] != empty_blob)
     prior_present = int(meta.get("num_present", meta.get("num_objects", n0)))
-    level_group.write_array_meta(OBJECT_INDEX, {
+    new_meta = {
         **meta,
         "num_objects": size,
         "num_present": max(0, prior_present - was_present + now_present),
         "sid_ndim": sid_ndim,
-    })
+        "layout": OBJECT_INDEX_LAYOUT_V2,
+    }
+    if fresh:
+        # Appended ids need not ascend, so the cheap lookup no longer
+        # applies unless they happen to.
+        new_meta[OBJECT_IDS_SORTED_ATTR] = bool(
+            meta.get(OBJECT_IDS_SORTED_ATTR)
+            and (n0 == 0 or fresh[0] > int(read_object_id_table(level_group)[n0 - 1]))
+            and fresh == sorted(fresh)
+        )
+    level_group.write_array_meta(OBJECT_INDEX, new_meta)
 
 
 def _write_object_index_manifests(
@@ -4697,17 +4766,20 @@ def read_object_manifest(
     sid_ndim = meta["sid_ndim"]
     num_objects = meta["num_objects"]
 
-    if object_id < 0 or object_id >= num_objects:
+    _require_object_index_layout(meta)
+    found, rows = object_rows_for_ids(level_group, [object_id])
+    if found.size == 0:
         raise ArrayError(
-            f"Object ID {object_id} out of range [0, {num_objects})"
+            f"Object ID {object_id} is not in this level "
+            f"({num_objects} object(s))"
         )
-
-    _require_object_index_v1(meta)
     # Via the Group rather than the raw zarr node, so the read passes a
     # chokepoint the offline snapshot can serve (see Group.offline_reads).
     # Slice-then-extract, never scalar-index: see zarr_vectors.core._vlen.
     # This 1-D manifests array shares that rule with the N-D cell readers.
-    blob = level_group.read_vlen_element(f"{OBJECT_INDEX}/manifests", object_id)
+    blob = level_group.read_vlen_element(
+        f"{OBJECT_INDEX}/manifests", int(rows[0]),
+    )
     blocks = decode_object_manifest_blocks(blob, sid_ndim=sid_ndim)
     return expand_manifest_blocks(blocks)
 
@@ -4724,7 +4796,7 @@ def read_all_object_manifests(
     sid_ndim = meta["sid_ndim"]
     num_objects = int(meta.get("num_objects", 0))
 
-    _require_object_index_v1(meta)
+    _require_object_index_layout(meta)
     if num_objects == 0:
         return []
     # Via the Group rather than the raw zarr node, so the read passes a
@@ -4734,6 +4806,27 @@ def read_all_object_manifests(
         expand_manifest_blocks(decode_object_manifest_blocks(b, sid_ndim=sid_ndim))
         for b in blobs
     ]
+
+
+def read_object_manifest_rows(
+    level_group: Group,
+) -> tuple[npt.NDArray[np.int64], list[ObjectManifest]]:
+    """Every manifest in row order, paired with the id that owns it.
+
+    The honest replacement for enumerating
+    :func:`read_all_object_manifests`. That returns a list indexed by
+    *row*, and a caller writing ``for oid, manifest in enumerate(...)``
+    is reading the row as an id -- true only while the level stores its
+    objects densely from zero, and silently wrong otherwise.
+    """
+    manifests = read_all_object_manifests(level_group)
+    ids = object_ids_for_rows(level_group)
+    if ids.size != len(manifests):
+        # A table that disagrees with the rows it describes cannot be
+        # used to name them; fall back to positional, which is what the
+        # store meant before the table existed.
+        ids = np.arange(len(manifests), dtype=np.int64)
+    return ids, manifests
 
 
 def read_object_manifests(
@@ -4768,27 +4861,139 @@ def read_object_manifests(
     meta = level_group.read_array_meta(OBJECT_INDEX)
     sid_ndim = meta["sid_ndim"]
     num_objects = int(meta.get("num_objects", 0))
-    _require_object_index_v1(meta)
+    _require_object_index_layout(meta)
     if num_objects == 0:
         return {}
 
     path = f"{OBJECT_INDEX}/manifests"
     if ids is None:
         blobs = level_group.read_vlen_array(path)
-        wanted = list(range(len(blobs)))
+        wanted = object_ids_for_rows(level_group).tolist()
     else:
-        wanted = sorted({int(i) for i in ids if 0 <= int(i) < num_objects})
-        if not wanted:
+        found, rows = object_rows_for_ids(level_group, list(ids))
+        if found.size == 0:
             return {}
+        # Ascending rows so the coordinate selection touches each zarr
+        # chunk once; the result is keyed by id, so the order it was
+        # asked in does not matter.
+        order = np.argsort(rows, kind="stable")
+        wanted = found[order].tolist()
         # One coordinate selection, not one request per id: the plural
         # read is the whole point, and it goes through the Group so it
         # stays serveable from an offline snapshot like every other read.
-        blobs = level_group.read_vlen_elements(path, wanted)
+        blobs = level_group.read_vlen_elements(path, rows[order].tolist())
 
     return {
         oid: expand_manifest_blocks(decode_object_manifest_blocks(blob, sid_ndim=sid_ndim))
         for oid, blob in zip(wanted, blobs)
     }
+
+
+def read_object_id_table(level_group: Group) -> npt.NDArray[np.int64] | None:
+    """Row → object id, or ``None`` when rows *are* ids.
+
+    ``None`` is the V1 answer and means the identity mapping.  Callers
+    should branch on it rather than materialising ``arange(n)``, which
+    on a large level is the allocation the table exists to avoid.
+    """
+    try:
+        meta = level_group.read_array_meta(OBJECT_INDEX)
+    except Exception:
+        return None
+    if meta.get("layout") != OBJECT_INDEX_LAYOUT_V2:
+        return None
+    try:
+        table = level_group.read_array(f"{OBJECT_INDEX}/{OBJECT_IDS_ARRAY}")
+    except Exception:
+        return None
+    return np.asarray(table, dtype=np.int64)
+
+
+def _object_id_lookup(
+    level_group: Group,
+) -> tuple[npt.NDArray[np.int64], npt.NDArray[np.int64]] | None:
+    """``(sorted_ids, rows_for_sorted_ids)``, or ``None`` for identity.
+
+    Sorting is skipped when the writer stamped
+    :data:`OBJECT_IDS_SORTED_ATTR`, which bulk writers do because they
+    emit ids in order.
+    """
+    cache = level_group._object_id_lookup_cache
+    key = level_group._full_path(OBJECT_INDEX)
+    if cache is not None and key in cache:
+        return cache[key]
+    table = read_object_id_table(level_group)
+    if table is None:
+        result = None
+    else:
+        try:
+            meta = level_group.read_array_meta(OBJECT_INDEX)
+        except Exception:
+            meta = {}
+        if meta.get(OBJECT_IDS_SORTED_ATTR):
+            result = (table, np.arange(table.size, dtype=np.int64))
+        else:
+            order = np.argsort(table, kind="stable")
+            result = (table[order], order)
+    if cache is None:
+        cache = level_group._object_id_lookup_cache = {}
+    cache[key] = result
+    return result
+
+
+def object_rows_for_ids(
+    level_group: Group, ids: Sequence[int],
+) -> tuple[npt.NDArray[np.int64], npt.NDArray[np.int64]]:
+    """Resolve object ids to rows, dropping ids the level does not hold.
+
+    Returns ``(found_ids, rows)`` in the order given.  An id that is
+    absent is simply not returned, which is the same contract
+    :func:`read_object_manifests` already offers for an out-of-range id,
+    so a caller may pass a superset without pre-filtering.
+    """
+    wanted = np.asarray(list(ids), dtype=np.int64)
+    if wanted.size == 0:
+        return wanted, wanted
+    lookup = _object_id_lookup(level_group)
+    if lookup is None:
+        # Identity: the id is the row, bounded by the row count.
+        n_rows = object_row_count(level_group)
+        keep = (wanted >= 0) & (wanted < n_rows)
+        return wanted[keep], wanted[keep]
+    sorted_ids, rows = lookup
+    pos = np.searchsorted(sorted_ids, wanted)
+    np.clip(pos, 0, max(sorted_ids.size - 1, 0), out=pos)
+    hit = sorted_ids.size > 0
+    found = (sorted_ids[pos] == wanted) if hit else np.zeros_like(wanted, bool)
+    return wanted[found], rows[pos[found]]
+
+
+def object_ids_for_rows(
+    level_group: Group, rows: Sequence[int] | npt.NDArray[np.int64] | None = None,
+) -> npt.NDArray[np.int64]:
+    """The object ids at ``rows``, or every id in row order.
+
+    The inverse of :func:`object_rows_for_ids`, and what a caller
+    scanning manifests positionally needs in order to say which object
+    each row belongs to.
+    """
+    table = read_object_id_table(level_group)
+    if table is None:
+        n_rows = object_row_count(level_group)
+        return (
+            np.arange(n_rows, dtype=np.int64) if rows is None
+            else np.asarray(list(rows), dtype=np.int64)
+        )
+    return table if rows is None else table[np.asarray(list(rows), dtype=np.int64)]
+
+
+def object_row_count(level_group: Group) -> int:
+    """How many manifest rows this level holds."""
+    try:
+        meta = level_group.read_array_meta(OBJECT_INDEX)
+    except Exception:
+        return 0
+    return int(meta.get("num_objects", 0) or 0)
 
 
 def object_count(level_group: Group) -> int:
@@ -4815,7 +5020,7 @@ def object_present_mask(level_group: Group) -> npt.NDArray[np.bool_]:
     time this function took.
     """
     meta = level_group.read_array_meta(OBJECT_INDEX)
-    _require_object_index_v1(meta)
+    _require_object_index_layout(meta)
     if int(meta.get("num_objects", 0)) == 0:
         return np.zeros((0,), dtype=bool)
     blobs = level_group.read_vlen_array(f"{OBJECT_INDEX}/manifests")
@@ -4841,6 +5046,19 @@ def object_present_count(level_group: Group) -> int:
     if stamped is not None:
         return int(stamped)
     return int(object_present_mask(level_group).sum())
+
+
+def _require_object_index_layout(meta: dict[str, Any]) -> None:
+    """Raise unless ``object_index`` is a layout this build can read.
+
+    Both V1 and V2 are readable, and they share one code path: a V1
+    store is one whose id table is the identity.  Anything else is older
+    than this build supports.
+    """
+    layout = meta.get("layout")
+    if layout in (OBJECT_INDEX_LAYOUT_V1, OBJECT_INDEX_LAYOUT_V2):
+        return
+    _require_object_index_v1(meta)
 
 
 def _require_object_index_v1(meta: dict[str, Any]) -> None:

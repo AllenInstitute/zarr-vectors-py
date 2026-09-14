@@ -16,7 +16,7 @@ out so the public API stays stable for when they land later.
 
 OID compaction:
 
-1. Read every manifest at every level (via ``read_all_object_manifests``).
+1. Read every manifest at every level (via ``read_object_manifest_rows``).
 2. Identify OIDs with non-empty manifests; these are the "live" OIDs.
 3. Build a dense remap ``{old_oid: new_oid}`` so live OIDs occupy
    ``[0, n_live)`` in their original relative order.
@@ -74,9 +74,9 @@ def vacuum(
         return report
 
     from zarr_vectors.core.arrays import (
-        read_all_object_manifests,
         read_object_attribute_present_mask,
         read_object_attributes,
+        read_object_manifest_rows,
         write_object_attributes,
         write_object_index,
     )
@@ -93,14 +93,17 @@ def vacuum(
     for level in list_resolution_levels(root):
         level_group = get_resolution_level(root, level)
         try:
-            manifests = read_all_object_manifests(level_group)
+            ids, manifests = read_object_manifest_rows(level_group)
         except Exception:
             continue
         n = len(manifests)
         if n == 0:
             continue
 
-        live_oids = [oid for oid, m in enumerate(manifests) if m]
+        # The ids that still hold geometry. Enumerating gave rows, which
+        # are the same thing only while a level numbers its objects
+        # densely from zero.
+        live_oids = [int(o) for o, m in zip(ids.tolist(), manifests) if m]
         if len(live_oids) == n:
             # Already dense — no remap needed at this level.  We still
             # carry the identity through so downstream consumers can

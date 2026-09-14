@@ -243,7 +243,7 @@ def _ensure_object_attribute_array(
     except Exception:
         pass
 
-    manifests = session._all_manifests_for(target.level)
+    _ids, manifests = session._all_manifests_for(target.level)
     n_objects = len(manifests)
     if n_objects == 0:
         raise EditError(

@@ -113,8 +113,8 @@ def _read_level(src_group, ndim: int, link_width: int):
     from zarr_vectors.core.arrays import (
         iter_link_cells,
         list_chunk_keys,
-        read_all_object_manifests,
         read_chunk_vertices,
+        read_object_manifest_rows,
         read_vertex_fragment_index,
     )
     from zarr_vectors.exceptions import ArrayError
@@ -124,11 +124,11 @@ def _read_level(src_group, ndim: int, link_width: int):
     # write one -- in which case every vertex belongs to a single implicit
     # object 0 and each chunk contributes one fragment.
     try:
-        manifests = read_all_object_manifests(src_group)
+        ids, manifests = read_object_manifest_rows(src_group)
     except Exception:  # noqa: BLE001
-        manifests = []
+        ids, manifests = np.zeros(0, dtype=np.int64), []
     owner: dict[tuple, int] = {}
-    for oid, frags in enumerate(manifests):
+    for oid, frags in zip(ids.tolist(), manifests):
         for cc, f in frags:
             owner.setdefault((tuple(int(x) for x in cc), int(f)), oid)
     implicit = not owner

@@ -39,10 +39,10 @@ from zarr_vectors.core.arrays import (
     create_object_index_array,
     create_vertices_array,
     list_chunk_keys,
-    read_all_object_manifests,
     read_chunk_vertices,
     read_links,
     read_object_attributes,
+    read_object_manifest_rows,
     write_chunk_vertices,
     write_cross_level_links,
     write_object_attributes,
@@ -252,8 +252,13 @@ def _per_object_coarsen(
             src_fragment_positions[(cc, fragment_idx)] = fragment
 
     src_has_objects = "object_index" in src_group
+    src_ids: npt.NDArray[np.int64] | None = None
     if src_has_objects:
-        src_manifests = read_all_object_manifests(src_group)
+        # Ids alongside rows: ``keep_oids`` below indexes the manifest
+        # list, which is row order, and the object the coarse level must
+        # carry forward is named by the id at that row -- the same thing
+        # only while a level stores its objects densely from zero.
+        src_ids, src_manifests = read_object_manifest_rows(src_group)
     else:
         # No object_index — treat the level as one implicit object whose
         # manifest enumerates every fragment in chunk-major order.
@@ -451,11 +456,17 @@ def _per_object_coarsen(
     # Walk per-object slices of the flat ``inverse`` array.
     cursor = 0
     new_manifests: dict[int, list[tuple[ChunkCoords, int]]] = {}
+
+    def _id_of(row: int) -> int:
+        """The object id at a source row -- the row itself when the
+        source stored its objects densely from zero."""
+        return int(src_ids[row]) if src_ids is not None else int(row)
+
     for oid in keep_oids:
         n = per_object_count[oid]
         if n == 0:
             cursor += 0
-            new_manifests[oid] = []
+            new_manifests[_id_of(oid)] = []
             continue
         mv_seq = inverse[cursor:cursor + n]
         cursor += n
@@ -464,7 +475,7 @@ def _per_object_coarsen(
         if mv_seq.size > 1:
             keep = np.concatenate(([True], mv_seq[1:] != mv_seq[:-1]))
             mv_seq = mv_seq[keep]
-        new_manifests[oid] = [
+        new_manifests[_id_of(oid)] = [
             (chunk_slots[slot], int(frag))
             for slot, frag in zip(
                 mv_chunk_slot[mv_seq].tolist(),
@@ -472,11 +483,22 @@ def _per_object_coarsen(
             )
         ]
 
-    # --- Step 9: emit object_index (gap-fill for dropped OIDs) ----------
+    # --- Step 9: emit object_index (dropped OIDs stay addressable) ------
     if src_has_objects:
+        # Every source id gets a row, so a sparsified level keeps the
+        # ids it dropped addressable -- as empty manifests, exactly as
+        # the old slot padding did, but named rather than implied by
+        # position. ``total_objects`` is deliberately not passed: it
+        # declares the id space as range(n), which is only the source's
+        # id space when that source numbered its objects densely.
+        ids_for_index = (
+            src_ids.tolist() if src_ids is not None
+            else list(range(n_src_objects))
+        )
         write_object_index(
-            level_group, new_manifests, sid_ndim=ndim,
-            total_objects=n_src_objects,
+            level_group,
+            {int(oid): new_manifests.get(int(oid), []) for oid in ids_for_index},
+            sid_ndim=ndim,
         )
 
     # --- Step 10: per-object attributes with present_mask ---------------

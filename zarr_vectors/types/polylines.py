@@ -41,11 +41,11 @@ from zarr_vectors.core.arrays import (
     create_object_attributes_array,
     create_object_index_array,
     create_vertices_array,
-    read_all_object_manifests,
     read_chunk_attributes,
     read_chunk_vertices,
     read_fragment,
     read_group_object_ids,
+    read_object_manifest_rows,
     read_object_manifests,
     resolve_chunk_keys,
     stamp_fragments_tile,
@@ -765,9 +765,10 @@ def _read_polylines(
         # full read assemble exactly what the ``object_ids=`` subset read
         # does.
         try:
-            manifests = read_all_object_manifests(level_group)
+            _mids, manifests = read_object_manifest_rows(level_group)
+            by_id = {int(o): m for o, m in zip(_mids.tolist(), manifests)}
         except Exception:
-            manifests = []
+            manifests, by_id = [], {}
 
         needed_chunks: set[ChunkCoords] = set()
         for m in manifests:
@@ -791,9 +792,7 @@ def _read_polylines(
             # ``manifests`` was read above to derive the chunk set; the
             # per-object loop indexes into it — no per-iteration read.
             def _get_manifest(oid: int) -> ObjectManifest | None:
-                if 0 <= oid < len(manifests):
-                    return manifests[oid]
-                return None
+                return by_id.get(int(oid))
 
         # Decode each materialised chunk's fragments exactly once.  The
         # per-object dispatch then slices from this cache — O(K_per_chunk)

@@ -25,7 +25,7 @@ import pytest
 
 from zarr_vectors.constants import OBJECT_INDEX
 from zarr_vectors.core.arrays import (
-    OBJECT_INDEX_LAYOUT_V1,
+    OBJECT_INDEX_LAYOUT_V2,
     OBJECT_INDEX_MANIFEST_BUCKET,
     read_all_object_manifests,
     read_object_manifest,
@@ -64,11 +64,13 @@ def test_fresh_store_uses_vlen_layout(rng: np.random.Generator) -> None:
     )
     level = open_store(str(store), mode="r")["0"]
     meta = level.read_array_meta(OBJECT_INDEX)
-    assert meta.get("layout") == OBJECT_INDEX_LAYOUT_V1
+    assert meta.get("layout") == OBJECT_INDEX_LAYOUT_V2
 
     oi_grp = level.zarr_group[OBJECT_INDEX]
     children = set(oi_grp.array_keys())
     assert "manifests" in children
+    # The ids are stored, not implied by row position.
+    assert "object_ids" in children
     assert "data" not in children
     assert "offsets" not in children
 

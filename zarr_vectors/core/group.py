@@ -142,6 +142,11 @@ class Group:
     # chunk key.  Written by ``write_chunk_vertices``, consumed by
     # ``stamp_fragments_tile``; see :meth:`note_vertex_rows`.
     _vertex_rows_written: dict[str, int] | None = None
+    # object_index path -> (sorted ids, rows), built on first lookup.
+    # Resolving an id to a row otherwise re-reads and re-sorts the id
+    # table on every single-object read, which turns a point lookup into
+    # a whole-index read.
+    _object_id_lookup_cache: dict[str, Any] | None = None
     # Explicit grid config for per-chunk-array creation, overriding what
     # ``arrays._derive_native_config`` would read off the store's
     # metadata.  Set by
@@ -197,6 +202,7 @@ class Group:
         self._listing_cache = None
         self._tiling_claim_settled = False
         self._vertex_rows_written = None
+        self._object_id_lookup_cache = None
 
     @classmethod
     def _from_zarr(
@@ -1511,6 +1517,9 @@ class Group:
         """
         full = self._full_path(path)
         prefix = f"{full}/"
+        # The id table is a node like any other, so a write that
+        # replaces it must drop the lookup built from it.
+        self._object_id_lookup_cache = None
         for cache in (self._node_cache, self._listing_cache):
             if not cache:
                 continue

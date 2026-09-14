@@ -1602,17 +1602,17 @@ def _auto_materialise_to_explicit(
     """
     import warnings
 
-    from zarr_vectors.core.arrays import read_all_object_manifests
+    from zarr_vectors.core.arrays import read_object_manifest_rows
     from zarr_vectors.core.store import get_resolution_level
 
     level_group = get_resolution_level(session.root, level)
     try:
-        manifests = read_all_object_manifests(level_group)
+        ids, manifests = read_object_manifest_rows(level_group)
     except Exception:
-        manifests = []
+        ids, manifests = np.zeros(0, dtype=np.int64), []
     n_added = 0
     n_objects = 0
-    for oid, manifest in enumerate(manifests):
+    for oid, manifest in zip(ids.tolist(), manifests):
         if not manifest:
             continue
         n_objects += 1

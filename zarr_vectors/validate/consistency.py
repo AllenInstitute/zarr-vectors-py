@@ -10,9 +10,9 @@ import numpy as np
 from zarr_vectors.core.arrays import (
     chunk_fragments_tile,
     list_chunk_keys,
-    read_all_object_manifests,
     read_chunk_vertex_buffer,
     read_chunk_vertices,
+    read_object_manifest_rows,
 )
 from zarr_vectors.core.store import (
     get_resolution_level,
@@ -217,8 +217,8 @@ def validate_consistency(store_path: str | Path | Group) -> ValidationResult:
             pass
 
         try:
-            manifests = read_all_object_manifests(lg)
-            for oid, mf in enumerate(manifests):
+            ids, manifests = read_object_manifest_rows(lg)
+            for oid, mf in zip(ids.tolist(), manifests):
                 for cc, fragment_index in mf:
                     if cc not in chunk_fragment_counts:
                         result.add_error(f"{prefix}: obj {oid} refs non-existent chunk {cc}")

@@ -389,9 +389,12 @@ class ZVPolylineCollection:
         reconstructed polyline as an ``(N, D)`` numpy array.
         """
         manifests = self._ensure_manifests()
-        if object_id < 0 or object_id >= len(manifests):
+        from zarr_vectors.core.arrays import object_rows_for_ids
+        _found, _rows = object_rows_for_ids(self._group, [int(object_id)])
+        if _found.size == 0:
             raise IndexError(
-                f"Polyline {object_id} out of range [0, {len(manifests)})"
+                f"Polyline {object_id} is not in this level "
+                f"({len(manifests)} object(s))"
             )
         return _delayed_read_polyline(
             self._group, object_id, self._ndim,
