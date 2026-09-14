@@ -379,7 +379,11 @@ class Level:
     def plan(self, selection: Selection) -> Any:
         """The I/O this selection implies, before any of it is performed.
 
-        Pure metadata arithmetic — building a plan reads nothing.
+        Metadata arithmetic: the level's attrs and its presence manifest
+        are read so a narrowed plan can name the cells that actually
+        hold data, and no chunk is fetched.  Inside a
+        :meth:`~zarr_vectors.core.group.Group.cached_nodes` block those
+        reads are already paid for.
         """
         from zarr_vectors._engine.resolve import context_from_level, resolve
 
