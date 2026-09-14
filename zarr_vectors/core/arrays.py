@@ -2509,6 +2509,15 @@ def _pack_link_rows(
     writer and reader both consult.
     """
     width = link_width + (1 if has_perm else 0)
+    if isinstance(entries, np.ndarray):
+        # Already an (M, link_width) block from the array partitioner.
+        # It only reaches here when has_perm is False, which is exactly
+        # the cross-level case that partitioner serves.
+        if has_perm:
+            raise ArrayError(
+                "packed link rows cannot carry a permutation column"
+            )
+        return np.ascontiguousarray(entries, dtype=dtype)
     out = np.empty((len(entries), width), dtype=dtype)
     for r, (vi, perm_idx, _input_idx) in enumerate(entries):
         if has_perm:
@@ -2517,6 +2526,76 @@ def _pack_link_rows(
         else:
             out[r, :] = vi
     return out
+
+
+def write_cross_level_links(
+    level_group: Group,
+    src_chunks: npt.NDArray[np.int64],
+    src_vi: npt.NDArray[np.int64],
+    trg_chunks: npt.NDArray[np.int64],
+    trg_vi: npt.NDArray[np.int64],
+    sid_ndim: int,
+    *,
+    delta: int,
+    dtype: np.dtype | str = np.int64,
+    mode: Literal["replace", "append"] = "replace",
+) -> LinkPartition:
+    """:func:`write_links` for two-endpoint cross-level records, in array form.
+
+    The pyramid emits one record per fine vertex -- twice, under the
+    default explicit storage -- and the record-shaped path spends about
+    ten Python objects on each of them before any of it reaches the
+    store. The endpoints arrive as arrays and there is no reason to take
+    them apart: partitioning them is floor-divide, subtract, group by.
+
+    Only the family bookkeeping is shared, by re-entering
+    :func:`write_links` with the partition already built, so segment
+    policy, counts and family metadata keep exactly one implementation.
+
+    Args:
+        level_group: The level that owns the family.
+        src_chunks: ``(M, sid_ndim)`` chunk coords of endpoint 0.
+        src_vi: ``(M,)`` chunk-local vertex index of endpoint 0.
+        trg_chunks: ``(M, sid_ndim)`` chunk coords of endpoint 1.
+        trg_vi: ``(M,)`` chunk-local vertex index of endpoint 1.
+        sid_ndim: Spatial index dimensionality.
+        delta: Level delta; must be non-zero, since an intra-level record
+            is not what this path is for and would need the permutation
+            machinery it deliberately omits.
+        dtype: Row dtype.
+        mode: ``"replace"`` or ``"append"``, as :func:`write_links`.
+    """
+    from zarr_vectors.spatial.boundary import partition_arrays_by_offset
+
+    if delta == 0:
+        raise ArrayError(
+            "write_cross_level_links is for cross-level records; delta=0 "
+            "records need the placement and permutation handling in "
+            "write_links"
+        )
+    n_records = int(np.asarray(src_vi).shape[0])
+    if n_records == 0:
+        return LinkPartition(
+            cell_indices={}, num_links=0, num_physical_records=0, first_new=0,
+        )
+    scale_src, scale_trg = _link_scales(level_group, delta, sid_ndim)
+    buckets = partition_arrays_by_offset(
+        src_chunks, src_vi, trg_chunks, trg_vi,
+        scale_src=scale_src, scale_trg=scale_trg, sid_ndim=sid_ndim,
+    )
+    return write_links(
+        level_group,
+        [],
+        sid_ndim,
+        delta=delta,
+        link_width=2,
+        dtype=dtype,
+        mode=mode,
+        directed=True,
+        _prepartitioned=buckets,
+        _link_width=2,
+        _num_records=n_records,
+    )
 
 
 def write_links(
@@ -2530,6 +2609,9 @@ def write_links(
     mode: Literal["replace", "append"] = "replace",
     directed: bool = False,
     store: Literal["canonical", "duplicate"] = "canonical",
+    _prepartitioned: dict[tuple[str, ChunkCoords], Any] | None = None,
+    _link_width: int | None = None,
+    _num_records: int | None = None,
 ) -> LinkPartition:
     """Write whole link records into ``links/<delta>/<offsets>/``.
 
@@ -2603,7 +2685,7 @@ def write_links(
         raise ArrayError(
             f"store must be 'canonical' or 'duplicate', got {store!r}"
         )
-    if not links:
+    if not links and not _prepartitioned:
         # Honour the empty-input fast-exit; emit an empty partition so
         # callers don't crash on attribute reflection.  NOTE this means
         # an empty `links` does NOT clear anything — callers wanting that
@@ -2613,17 +2695,36 @@ def write_links(
         )
 
     dtype = np.dtype(dtype)
-    normalised, link_width = _normalise_link_records(
-        links, link_width, sid_ndim, delta,
-    )
+    if _prepartitioned is not None:
+        # Records already partitioned by the caller -- see
+        # ``write_cross_level_links``. Everything past this point is
+        # family bookkeeping that must not be duplicated, which is why
+        # the array path re-enters here rather than reimplementing it.
+        buckets = _prepartitioned
+        link_width = int(_link_width or link_width or 2)
+        n_records = int(_num_records or 0)
+    else:
+        normalised, link_width = _normalise_link_records(
+            links, link_width, sid_ndim, delta,
+        )
+        buckets = _partition_links(
+            level_group, normalised, link_width, sid_ndim,
+            delta=delta, directed=directed, store=store,
+        )
+        n_records = len(normalised)
     family = links_group_path(delta)
     fam_meta = level_group.read_array_meta(family) or {}
 
-    buckets = _partition_links(
-        level_group, normalised, link_width, sid_ndim,
-        delta=delta, directed=directed, store=store,
-    )
-    targeted: list[str] = sorted({seg for seg, _chunk in buckets})
+    # Grouped once. The write loop below used to rescan every bucket for
+    # each targeted segment, which is quadratic in the number of distinct
+    # offset segments.
+    by_segment: dict[str, list[tuple[ChunkCoords, Any]]] = {}
+    for (bucket_seg, src_chunk), entries in buckets.items():
+        # The array partitioner yields (rows, input_indices); only the
+        # rows are written, the indices ride out in the partition.
+        block = entries[0] if isinstance(entries, tuple) else entries
+        by_segment.setdefault(bucket_seg, []).append((src_chunk, block))
+    targeted: list[str] = sorted(by_segment)
     surviving = [
         seg for seg in list_link_offsets(level_group, delta)
         if seg not in targeted
@@ -2686,9 +2787,7 @@ def write_links(
         has_perm = links_has_perm(
             offsets, delta=delta, directed=directed, store=store,
         )
-        for (bucket_seg, src_chunk), entries in buckets.items():
-            if bucket_seg != seg:
-                continue
+        for src_chunk, entries in by_segment[seg]:
             rows = _pack_link_rows(
                 entries, has_perm=has_perm, link_width=link_width, dtype=dtype,
             )
@@ -2715,7 +2814,7 @@ def write_links(
         new_total = counted.num_links
         new_physical_total = counted.num_physical_records
     else:
-        new_total = existing_total + len(normalised)
+        new_total = existing_total + n_records
         new_physical_total = existing_physical + new_physical
 
     _stamp_link_family_meta(
@@ -2725,7 +2824,10 @@ def write_links(
     )
 
     return LinkPartition(
-        cell_indices={k: [idx for _, _, idx in v] for k, v in buckets.items()},
+        cell_indices={
+            k: (v[1] if isinstance(v, tuple) else [idx for _, _, idx in v])
+            for k, v in buckets.items()
+        },
         num_links=new_total,
         num_physical_records=new_physical_total,
         first_new=first_new,

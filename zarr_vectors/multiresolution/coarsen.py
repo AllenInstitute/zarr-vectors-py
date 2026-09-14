@@ -44,7 +44,7 @@ from zarr_vectors.core.arrays import (
     read_links,
     read_object_attributes,
     write_chunk_vertices,
-    write_links,
+    write_cross_level_links,
     write_object_attributes,
     write_object_index,
 )
@@ -927,14 +927,17 @@ def _write_cross_level_edges(
         coarse_chunk_assignments, n_coarse, sorted(coarse_chunk_assignments.keys()),
     )
 
-    fine_eps = [
-        (fine_chunk_list[int(fine_vchunks[i])], int(fine_vlocal[i]))
-        for i in fine_global.tolist()
-    ]
-    coarse_eps = [
-        (coarse_chunk_list[int(coarse_vchunks[i])], int(coarse_vlocal[i]))
-        for i in parent_valid.tolist()
-    ]
+    # Kept as arrays. build_vertex_chunk_mapping already returns the
+    # per-vertex chunk and local indices as int64 arrays, so taking them
+    # apart into a Python tuple per endpoint -- once per fine vertex, and
+    # again for the mirrored family -- only to have the partitioner put
+    # them back together was the dominant cost of a pyramid build.
+    fine_chunk_arr = np.asarray(fine_chunk_list, dtype=np.int64)
+    coarse_chunk_arr = np.asarray(coarse_chunk_list, dtype=np.int64)
+    fine_cc = fine_chunk_arr[fine_vchunks[fine_global]]
+    fine_vi = fine_vlocal[fine_global]
+    coarse_cc = coarse_chunk_arr[coarse_vchunks[parent_valid]]
+    coarse_vi = coarse_vlocal[parent_valid]
 
     # Endpoint 0 leads and stays at the owning level, so each call's
     # anchor uses that level's scale as ``r_src``.  ``directed=True``:
@@ -946,13 +949,9 @@ def _write_cross_level_edges(
     # this module's vertex writes and for shard_store, and the reason
     # the comment on step 6 records 207 s for 32k cells.
     with fine_lg.batched_writes():
-        write_links(
-            fine_lg,
-            [[f, c] for f, c in zip(fine_eps, coarse_eps)],
-            sid_ndim,
+        write_cross_level_links(
+            fine_lg, fine_cc, fine_vi, coarse_cc, coarse_vi, sid_ndim,
             delta=delta,
-            link_width=2,
-            directed=True,
         )
 
     if storage == XLEVEL_EXPLICIT:
@@ -962,13 +961,9 @@ def _write_cross_level_edges(
         # grid, which is what the fine-side split cannot speak to.
         coarse_lg = get_resolution_level(root_group, fine_level + delta)
         with coarse_lg.batched_writes():
-            write_links(
-                coarse_lg,
-                [[c, f] for f, c in zip(fine_eps, coarse_eps)],
-                sid_ndim,
+            write_cross_level_links(
+                coarse_lg, coarse_cc, coarse_vi, fine_cc, fine_vi, sid_ndim,
                 delta=-delta,
-                link_width=2,
-                directed=True,
             )
 
 

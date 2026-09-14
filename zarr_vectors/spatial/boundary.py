@@ -681,6 +681,106 @@ def partition_records_by_offset(
     return buckets
 
 
+def partition_arrays_by_offset(
+    src_chunks: npt.NDArray[np.int64],
+    src_vi: npt.NDArray[np.int64],
+    trg_chunks: npt.NDArray[np.int64],
+    trg_vi: npt.NDArray[np.int64],
+    *,
+    scale_src: Sequence[int],
+    scale_trg: Sequence[int],
+    sid_ndim: int,
+) -> dict[tuple[str, ChunkCoords], tuple[npt.NDArray[np.int64], npt.NDArray[np.int64]]]:
+    """:func:`partition_records_by_offset` for two-endpoint records held as arrays.
+
+    A sibling rather than a mode, because the tuple signature cannot
+    express the array form and the general function has to keep serving
+    the mesh and skeleton writers.
+
+    This covers exactly the shape a pyramid emits -- ``link_width=2``,
+    ``directed=True``, and a cross-level ``delta`` -- and that shape is
+    what makes it expressible as array work at all:
+    :func:`_cell_placements` returns the identity placement
+    unconditionally when ``cross_level`` is set, deciding it before it
+    looks at a record, and :func:`links_has_perm` is then False, so
+    there is one placement per record, a constant permutation index of
+    zero, and no permutation column. What is left is arithmetic:
+    floor-divide the anchor, subtract the offsets, group by the pair.
+
+    The general function spends about ten Python objects per record on
+    exactly this, and a pyramid emits one record per fine vertex --
+    twice, under the default explicit storage.
+
+    Args:
+        src_chunks: ``(M, sid_ndim)`` chunk coords of endpoint 0, the
+            one that leads and stays at the owning level.
+        src_vi: ``(M,)`` vertex index of endpoint 0, local to its chunk.
+        trg_chunks: ``(M, sid_ndim)`` chunk coords of endpoint 1.
+        trg_vi: ``(M,)`` vertex index of endpoint 1, local to its chunk.
+        scale_src: Source level's chunk scale, per axis.
+        scale_trg: Target level's chunk scale, per axis.
+        sid_ndim: Spatial index dimensionality.
+
+    Returns:
+        ``{(offsets_segment, source_chunk): (rows, input_indices)}``,
+        where ``rows`` is ``(M_k, 2)`` of ``[src_vi, trg_vi]`` and
+        ``input_indices`` says which input record each row came from.
+        Rows keep their input order within a bucket, which is what makes
+        the output byte-identical to the record-shaped function's.
+    """
+    src_chunks = np.asarray(src_chunks, dtype=np.int64)
+    trg_chunks = np.asarray(trg_chunks, dtype=np.int64)
+    src_vi = np.asarray(src_vi, dtype=np.int64)
+    trg_vi = np.asarray(trg_vi, dtype=np.int64)
+    n = int(src_vi.shape[0])
+    for name, arr in (("src_chunks", src_chunks), ("trg_chunks", trg_chunks)):
+        if arr.ndim != 2 or arr.shape[1] != sid_ndim:
+            raise ChunkingError(
+                f"partition_arrays_by_offset: {name} has shape "
+                f"{arr.shape}; expected (M, {sid_ndim})"
+            )
+    if not (src_chunks.shape[0] == trg_chunks.shape[0] == n == trg_vi.shape[0]):
+        raise ChunkingError(
+            "partition_arrays_by_offset: endpoint arrays disagree on length"
+        )
+    if n == 0:
+        return {}
+
+    # anchor = floor(c_src * r_src / r_trg), the same integer floor
+    # division ``anchor_chunk`` performs, which floors toward -inf and so
+    # is correct for negative coords. offset = c_trg - anchor.
+    rs = np.asarray(scale_src, dtype=np.int64)
+    rt = np.asarray(scale_trg, dtype=np.int64)
+    offsets = trg_chunks - ((src_chunks * rs) // rt)
+
+    # Group by (source chunk, offsets). lexsort is stable, so records
+    # keep their input order inside a group.
+    key = np.concatenate([src_chunks, offsets], axis=1)
+    order = np.lexsort(key.T[::-1])
+    key_sorted = key[order]
+    rows = np.stack([src_vi, trg_vi], axis=1)[order]
+
+    starts = np.flatnonzero(
+        np.concatenate((
+            [True], np.any(key_sorted[1:] != key_sorted[:-1], axis=1),
+        ))
+    )
+    ends = np.append(starts[1:], n)
+
+    out: dict[
+        tuple[str, ChunkCoords], tuple[npt.NDArray[np.int64], npt.NDArray[np.int64]]
+    ] = {}
+    for start, end in zip(starts.tolist(), ends.tolist()):
+        head = key_sorted[start]
+        src_chunk = tuple(int(x) for x in head[:sid_ndim])
+        offset = tuple(int(x) for x in head[sid_ndim:])
+        # One format_offsets per distinct group, not per record.
+        out[(format_offsets((offset,)), src_chunk)] = (
+            rows[start:end], order[start:end],
+        )
+    return out
+
+
 # ===================================================================
 # Vertex assignment helpers
 # ===================================================================
