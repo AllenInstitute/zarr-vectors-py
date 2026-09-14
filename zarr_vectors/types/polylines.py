@@ -46,7 +46,7 @@ from zarr_vectors.core.arrays import (
     read_chunk_vertices,
     read_fragment,
     read_group_object_ids,
-    read_object_manifest,
+    read_object_manifests,
     resolve_chunk_keys,
     stamp_fragments_tile,
     write_chunk_attributes,
@@ -83,7 +83,6 @@ from zarr_vectors.spatial.boundary import (
     split_polyline_at_boundaries,
 )
 from zarr_vectors.spatial.chunking import (
-    chunks_intersecting_bbox,
     compute_bounds,
 )
 from zarr_vectors.typing import (
@@ -661,12 +660,18 @@ def _read_polylines(
         except Exception:
             return _empty_polyline_result(ndim)
 
-    # If bbox, find which chunks are relevant
+    # If bbox, find which chunks are relevant.  Resolved against the
+    # level rather than enumerated from the grid: the box is a cartesian
+    # product with no clamp, so on a sparse store -- a specimen bounding
+    # box with data in part of it -- a whole-domain query materialised
+    # one tuple per *allocated* cell (a million of them for a thousand
+    # occupied) purely to test membership against manifests that can
+    # only name occupied ones.  The resolved set is the same set: a
+    # manifest never references a chunk the level does not hold.
     target_chunks: set[ChunkCoords] | None = None
     if bbox is not None:
-        target_chunks = set(chunks_intersecting_bbox(
-            np.asarray(bbox[0]), np.asarray(bbox[1]),
-            level_chunk_shape,
+        target_chunks = set(resolve_chunk_keys(
+            level_group, level_chunk_shape, bbox=bbox,
         ))
 
     # Explicit chunks whitelist switches read_polylines into segment-level
@@ -713,12 +718,19 @@ def _read_polylines(
     manifest_by_oid: dict[int, ObjectManifest] = {}
     if explicit_subset:
         needed_chunks: set[ChunkCoords] = set()
-        for oid in object_ids:
-            try:
-                m = read_object_manifest(level_group, oid)
-            except Exception:
-                continue  # missing/out-of-range oid — skip
-            manifest_by_oid[oid] = m
+        # One coordinate selection for the whole subset. Read one id at a
+        # time, each call decodes a full 16,384-row manifest bucket, and
+        # 10,000 ids cost 64s against a 50k-object store -- 75x the 0.85s
+        # it takes to read every polyline in it. Missing and
+        # out-of-range ids are simply absent from the result, which is
+        # what the per-id ``except: continue`` was for.
+        try:
+            manifest_by_oid = read_object_manifests(
+                level_group, ids=[int(o) for o in object_ids],
+            )
+        except Exception:
+            manifest_by_oid = {}
+        for m in manifest_by_oid.values():
             for cc, _fi in m:
                 needed_chunks.add(cc)
         # Only whitelist chunks are ever read from the cache in crop mode,
