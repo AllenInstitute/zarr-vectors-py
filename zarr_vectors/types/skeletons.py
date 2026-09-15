@@ -44,13 +44,17 @@ from zarr_vectors.constants import (
     VERTICES,
 )
 from zarr_vectors.core.arrays import (
+    _link_scales,
+    cell_endpoint_chunks,
     create_attribute_array,
     create_fragment_attribute_array,
     create_links_array,
     create_object_index_array,
     create_vertices_array,
+    list_link_offsets,
     read_chunk_link_fragment,
     read_fragment,
+    read_links_for_tuple,
     read_object_attributes,
     read_object_manifest,
     read_vertex_fragment_index,
@@ -62,6 +66,7 @@ from zarr_vectors.core.arrays import (
 )
 from zarr_vectors.core.metadata import LevelMetadata
 from zarr_vectors.core.multiscale import upsert_level_transform
+from zarr_vectors.core.paths import is_intra, parse_offsets
 from zarr_vectors.core.store import (
     _create_or_open_store,
     _ensure_root_metadata_for_write,
@@ -551,6 +556,52 @@ def read_skeleton_by_segment_id(
             b = _to_global(cc, int(par_cl))
             if a is not None and b is not None:
                 all_edges.append(np.array([[a, b]], dtype=np.int64))
+
+    # Cross-chunk links: the other population in this same links/0/
+    # family.  Unreachable through read_chunk_link_fragment above --
+    # link_fragments/ is keyed by chunk alone and only ever partitions
+    # the all-zero-offsets (intra) array, so it cannot index a crossing.
+    #
+    # Assumes store="canonical" (the skeleton writer's only policy):
+    # each record is filed in exactly one cell, so this cannot
+    # double-count.  A store="duplicate" family files one copy per
+    # incident chunk and would need deduping -- unreachable today since
+    # write_skeleton_cross_chunk_links hardcodes directed=True/canonical,
+    # but this is the line that would need to change if that ever does.
+    scale_src, scale_trg = _link_scales(level_group, 0, ndim)
+    cross_offsets = []
+    for seg in list_link_offsets(level_group, 0):
+        try:
+            offs = parse_offsets(seg, sid_ndim=ndim, link_width=2)
+        except ValueError:
+            # A segment that doesn't match this family's geometry is not
+            # ours to interpret; skip rather than mis-decode its rows.
+            continue
+        if not is_intra(offs):
+            cross_offsets.append(offs)
+    # DISTINCT chunks, not manifest entries: a crossing is filed once per
+    # source cell, not per fragment, so iterating entries would emit it
+    # once per fragment this object has in that chunk.
+    for cc in dict.fromkeys(cc for cc, _fidx in manifest):
+        for offs in cross_offsets:
+            # endpoint 0 is the source cell; endpoint k>0 is
+            # anchor(src) + o_k.  Anchor-projected, so this stays correct
+            # if the family ever spans levels with unequal chunk grids.
+            chunks = cell_endpoint_chunks(cc, offs, scale_src, scale_trg)
+            # directed=True, so the tuple is read as input order and
+            # endpoint 0 -- the parent -- selects the cell filed at `cc`.
+            for (cc_p, vi_p), (cc_c, vi_c) in read_links_for_tuple(
+                level_group, chunks, delta=0,
+            ):
+                # Storage leads with the parent (see
+                # write_skeleton_cross_chunk_links); the documented
+                # return convention here is [child, parent].  Swap.
+                child = _to_global(tuple(cc_c), int(vi_c))
+                parent = _to_global(tuple(cc_p), int(vi_p))
+                if child is not None and parent is not None:
+                    all_edges.append(
+                        np.array([[child, parent]], dtype=np.int64),
+                    )
 
     positions = np.concatenate(all_pos, axis=0) if all_pos else np.zeros((0, ndim), np.float32)
     offset = get_coordinate_offset(root, ndim)
