@@ -45,9 +45,10 @@ from zarr_vectors.core.arrays import (
     create_object_attributes_array,
     create_object_index_array,
     create_vertices_array,
+    link_endpoints_to_rows,
     list_link_offsets,
     read_chunk_vertices,
-    read_links,
+    read_link_arrays,
     resolve_chunk_keys,
     stamp_fragments_tile,
     write_chunk_attributes,
@@ -406,18 +407,13 @@ def write_graph(
         store_mask = np.ones(n_edges, dtype=bool)
     store_rows = np.flatnonzero(store_mask)
 
-    # Records stay in edge order, which ``partition_records_by_offset``
-    # preserves within each cell — that is what lets the per-edge
-    # attribute rows below be a plain ``[store_rows]`` slice.
-    link_records: list[list[tuple[ChunkCoords, int]]] = [
-        [(chunk_list[ca], la), (chunk_list[cb], lb)]
-        for ca, la, cb, lb in zip(
-            e_chunk[store_rows, 0].tolist(),
-            vertex_local[edges[store_rows, 0]].tolist(),
-            e_chunk[store_rows, 1].tolist(),
-            vertex_local[edges[store_rows, 1]].tolist(),
-        )
-    ]
+    # Records stay in edge order, which the partitioner preserves within
+    # each cell — that is what lets the per-edge attribute rows below be
+    # a plain ``[store_rows]`` slice.  Held as arrays -- ``(M, 2, D)``
+    # endpoint chunks and ``(M, 2)`` local indices -- rather than one
+    # list of tuples per edge.
+    link_chunks = np.asarray(chunk_list, dtype=np.int64)[e_chunk[store_rows]]
+    link_vi = vertex_local[edges[store_rows]]
 
     # Write vertices per chunk (one fragment per object per chunk)
     object_manifests: dict[int, ObjectManifest] = {}
@@ -534,8 +530,8 @@ def write_graph(
         # One write for every edge, intra and cross alike — sid_ndim is
         # widened when chunk keys carry an attribute-bin prefix.
         partition = write_links(
-            level_group, link_records, idx_ndim, delta=0,
-            link_width=link_width,
+            level_group, [], idx_ndim, delta=0,
+            link_width=link_width, _arrays=(link_chunks, link_vi),
         )
         # Backstop: `arrays_present` advertises the family, and the
         # per-cell editors in ops/ write into an array that must already
@@ -780,20 +776,13 @@ def _read_graph(
         # touching a chunk outside ``chunk_keys`` has no offset and is
         # dropped, which is what applies the bbox/chunks filter to edges.
         all_edges: list[npt.NDArray] = []
-        src_global: list[int] = []
-        dst_global: list[int] = []
-        for (chunk_a, vi_a), (chunk_b, vi_b) in read_links(level_group, delta=0):
-            oa = chunk_offsets.get(chunk_a)
-            ob = chunk_offsets.get(chunk_b)
-            if oa is None or ob is None:
-                continue
-            src_global.append(oa + int(vi_a))
-            dst_global.append(ob + int(vi_b))
-        if src_global:
-            all_edges.append(np.column_stack([
-                np.asarray(src_global, dtype=np.int64),
-                np.asarray(dst_global, dtype=np.int64),
-            ]))
+        # As arrays, not one tuple per edge: the remap is a gather.
+        edge_chunks, edge_vi = read_link_arrays(level_group, delta=0)
+        if edge_vi.shape[0] and edge_vi.shape[1] == 2:
+            rows = link_endpoints_to_rows(edge_chunks, edge_vi, chunk_offsets)
+            keep = (rows >= 0).all(axis=1)
+            if keep.any():
+                all_edges.append(np.ascontiguousarray(rows[keep]))
 
         # For skeletons: reconstruct full edge set from implicit sequential + branch links
         if is_tree:

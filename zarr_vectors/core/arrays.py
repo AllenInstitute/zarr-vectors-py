@@ -13,7 +13,7 @@ the store or encoding modules directly.
 from __future__ import annotations
 
 import warnings
-from collections.abc import Iterator, Sequence
+from collections.abc import Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import Any, Literal
@@ -59,8 +59,10 @@ from zarr_vectors.encoding.fragments import (
     ChunkFragmentIndex,
     decode_fragments,
     decode_object_manifest_blocks,
+    decode_object_manifests_many,
     encode_fragments,
     encode_object_manifest_blocks,
+    encode_object_manifests_many,
 )
 from zarr_vectors.encoding.ragged import (
     decode_ragged_blob,
@@ -494,6 +496,54 @@ def _ensure_array_dir(
     if level_group._pending_array_metas is not None:
         return
     level_group.require_group(array_name)
+
+
+def _ensure_chunk_arrays(
+    level_group: Group,
+    arrays: Sequence[tuple[str, dict[str, Any] | None]],
+) -> None:
+    """:func:`_ensure_array_dir` for several per-chunk arrays at once.
+
+    The grid is derived once and every array that has to be created is
+    created in one gather; an array that already holds the requested
+    layout is reused and only has its metadata applied, exactly as the
+    singular form does.  Names that are not per-chunk arrays fall
+    through to the singular form.
+    """
+    if not arrays:
+        return
+    explicit_cfg = level_group._native_sharded_config
+    cfg = explicit_cfg if explicit_cfg is not None else _derive_native_config(level_group)
+    to_create: list[tuple[str, dict[str, Any] | None]] = []
+    replace: set[str] = set()
+    for array_name, attributes in arrays:
+        if cfg is None or not _is_per_chunk_array(array_name):
+            _ensure_array_dir(level_group, array_name, attributes=attributes)
+            continue
+        if level_group.standalone_array_exists(array_name):
+            if explicit_cfg is None or _array_matches_layout(
+                level_group, array_name, explicit_cfg
+            ):
+                if attributes:
+                    level_group.write_array_meta(array_name, attributes)
+                continue
+            replace.add(array_name)
+        to_create.append((array_name, attributes))
+    if not to_create:
+        return
+    compressors = None
+    if level_group._active_codecs is not None:
+        from zarr_vectors.encoding.compression import codecs_for_create_array
+
+        compressors = codecs_for_create_array(level_group._active_codecs)
+    level_group.create_sharded_chunk_arrays(
+        to_create,
+        grid_shape=cfg["grid_shape"],
+        shard_shape=cfg["shard_shape"],
+        origin=cfg.get("origin"),
+        compressors=compressors,
+        replace=replace,
+    )
 
 
 def _array_matches_layout(
@@ -963,6 +1013,86 @@ def create_links_array(
     if (
         delta == 0
         and is_intra(offsets)
+        and not level_group.array_exists(LINK_FRAGMENTS)
+    ):
+        _ensure_array_dir(level_group, LINK_FRAGMENTS)
+        level_group.write_array_meta(LINK_FRAGMENTS, {
+            "zv_array": LINK_FRAGMENTS,
+            "encoding": "fragment_index_v1",
+        })
+
+
+def _create_links_arrays(
+    level_group: Group,
+    offsets_list: Sequence[Sequence[ChunkCoords]],
+    *,
+    link_width: int,
+    dtype: str,
+    delta: int,
+    sid_ndim: int,
+    directed: bool,
+    store: str,
+) -> None:
+    """:func:`create_links_array` for every offsets segment of one write.
+
+    Same checks, same metadata, one allocation: the family policy is
+    checked once, every array that does not yet exist is created in a
+    single gather (see :meth:`Group.create_sharded_chunk_arrays`), and
+    the family group and fragment sidecar are stamped once.
+    """
+    if not offsets_list:
+        return
+    family = links_group_path(delta)
+    existing_family = (
+        level_group.read_array_meta(family) or {}
+        if level_group.array_exists(family) else {}
+    )
+    if existing_family:
+        _check_link_family_policy(
+            existing_family, delta=delta, link_width=link_width,
+            sid_ndim=sid_ndim, directed=directed, store=store,
+            action="append to",
+        )
+    wanted: list[tuple[str, dict[str, Any]]] = []
+    seen: set[str] = set()
+    for offsets in offsets_list:
+        full_name = links_path(delta, offsets)
+        if full_name in seen:
+            continue
+        seen.add(full_name)
+        # A family that does not exist yet has no arrays under it, so
+        # the two store probes an existence check costs per segment are
+        # skipped for it: on a fresh family of 1,700 segments they were
+        # 2.5 s of the write.
+        if existing_family and _short_circuit_existing(level_group, full_name, True):
+            continue
+        wanted.append((full_name, {
+            "zv_array": "links",
+            "dtype": dtype,
+            "offsets": [list(int(c) for c in o) for o in offsets],
+            "has_perm": links_has_perm(
+                offsets, delta=delta, directed=directed, store=store,
+            ),
+            "link_width": link_width,
+            "level_delta": int(delta),
+        }))
+    if not wanted:
+        return
+    _ensure_chunk_arrays(level_group, wanted)
+    if not existing_family:
+        family_meta: dict[str, Any] = {
+            "zv_array": "links_family",
+            "level_delta": int(delta),
+            "link_width": int(link_width),
+            "directed": bool(directed),
+            "store": str(store),
+        }
+        if sid_ndim is not None:
+            family_meta["sid_ndim"] = int(sid_ndim)
+        level_group.write_array_meta(family, family_meta)
+    if (
+        delta == 0
+        and any(is_intra(o) for o in offsets_list)
         and not level_group.array_exists(LINK_FRAGMENTS)
     ):
         _ensure_array_dir(level_group, LINK_FRAGMENTS)
@@ -1810,15 +1940,7 @@ def write_object_index(
     # short-circuits are reserved for writers that know they produce
     # ranges or fragment-list shapes — to be plumbed through the
     # higher-level write APIs in a future change.
-    manifest_blobs: list[bytes] = []
-    for manifest in manifest_list:
-        blocks = [
-            (tuple(int(c) for c in chunk_coords), int(fragment_index))
-            for chunk_coords, fragment_index in manifest
-        ]
-        manifest_blobs.append(
-            encode_object_manifest_blocks(blocks, sid_ndim=sid_ndim)
-        )
+    manifest_blobs = encode_object_manifests_many(manifest_list, sid_ndim=sid_ndim)
 
     # What an absent object encodes to, from the encoder rather than from
     # a pinned literal -- a consumer had reverse-engineered this as
@@ -2579,12 +2701,12 @@ def _pack_link_rows(
     """
     width = link_width + (1 if has_perm else 0)
     if isinstance(entries, np.ndarray):
-        # Already an (M, link_width) block from the array partitioner.
-        # It only reaches here when has_perm is False, which is exactly
-        # the cross-level case that partitioner serves.
-        if has_perm:
+        # Already an (M, W) block from an array partitioner, with the
+        # perm column in place wherever the segment carries one.
+        if entries.ndim != 2 or entries.shape[1] != width:
             raise ArrayError(
-                "packed link rows cannot carry a permutation column"
+                f"packed link rows are {entries.shape[1] if entries.ndim == 2 else '?'} "
+                f"wide; this segment stores {width} columns"
             )
         return np.ascontiguousarray(entries, dtype=dtype)
     out = np.empty((len(entries), width), dtype=dtype)
@@ -2681,8 +2803,15 @@ def write_links(
     _prepartitioned: dict[tuple[str, ChunkCoords], Any] | None = None,
     _link_width: int | None = None,
     _num_records: int | None = None,
+    _arrays: tuple[npt.NDArray[np.integer], npt.NDArray[np.integer]] | None = None,
 ) -> LinkPartition:
     """Write whole link records into ``links/<delta>/<offsets>/``.
+
+    ``_arrays`` is the same input as ``links`` in array form --
+    ``(chunks, vi)`` of shapes ``(M, L, sid_ndim)`` and ``(M, L)`` -- for
+    a writer that holds its records that way already (the mesh and graph
+    writers do); it saves building and taking apart one Python list per
+    record.  Pass ``links=[]`` with it.
 
     The whole-family counterpart to :func:`write_chunk_links`: it takes
     records in *global* ``(chunk_coords, vertex_idx)`` form, decides where
@@ -2754,7 +2883,9 @@ def write_links(
         raise ArrayError(
             f"store must be 'canonical' or 'duplicate', got {store!r}"
         )
-    if not links and not _prepartitioned:
+    if _arrays is not None and int(np.asarray(_arrays[1]).shape[0]) == 0:
+        _arrays = None
+    if not links and not _prepartitioned and _arrays is None:
         # Honour the empty-input fast-exit; emit an empty partition so
         # callers don't crash on attribute reflection.  NOTE this means
         # an empty `links` does NOT clear anything — callers wanting that
@@ -2773,14 +2904,71 @@ def write_links(
         link_width = int(_link_width or link_width or 2)
         n_records = int(_num_records or 0)
     else:
-        normalised, link_width = _normalise_link_records(
-            links, link_width, sid_ndim, delta,
-        )
-        buckets = _partition_links(
-            level_group, normalised, link_width, sid_ndim,
-            delta=delta, directed=directed, store=store,
-        )
-        n_records = len(normalised)
+        chunks_arr: npt.NDArray[np.int64] | None = None
+        vi_arr: npt.NDArray[np.int64] | None = None
+        if _arrays is not None:
+            chunks_arr = np.asarray(_arrays[0], dtype=np.int64)
+            vi_arr = np.asarray(_arrays[1], dtype=np.int64)
+            if chunks_arr.ndim != 3 or vi_arr.ndim != 2 or chunks_arr.shape[:2] != vi_arr.shape:
+                raise ArrayError(
+                    f"links/{format_delta(delta)}: array records must be "
+                    f"(M, L, sid_ndim) chunks and (M, L) indices, got "
+                    f"{chunks_arr.shape} and {vi_arr.shape}"
+                )
+            if chunks_arr.shape[2] != sid_ndim:
+                raise ArrayError(
+                    f"chunk coords arity mismatch in links/"
+                    f"{format_delta(delta)}: sid_ndim={sid_ndim}, "
+                    f"got {chunks_arr.shape[2]}"
+                )
+            if link_width is None:
+                link_width = int(vi_arr.shape[1])
+            elif int(vi_arr.shape[1]) != link_width:
+                raise ArrayError(
+                    f"links/{format_delta(delta)}: record arity "
+                    f"{vi_arr.shape[1]} != link_width {link_width}"
+                )
+            n_records = int(vi_arr.shape[0])
+            if store == "duplicate":
+                # One record files under several cells there; that is the
+                # record partitioner's business.
+                normalised = [
+                    list(zip(map(tuple, cs), vs))
+                    for cs, vs in zip(chunks_arr.tolist(), vi_arr.tolist())
+                ]
+                chunks_arr = vi_arr = None
+        else:
+            from zarr_vectors.spatial.boundary import _MAX_ARRAY_LINK_WIDTH
+
+            normalised, link_width = _normalise_link_records(
+                links, link_width, sid_ndim, delta,
+            )
+            n_records = len(normalised)
+            if store == "canonical" and link_width <= _MAX_ARRAY_LINK_WIDTH:
+                # The record form is what callers hand over; the array
+                # partitioner is what decides where each lands, since it
+                # does the same arithmetic without a Python object per
+                # endpoint.
+                chunks_arr = np.array(
+                    [[c for c, _ in rec] for rec in normalised], dtype=np.int64,
+                ).reshape(n_records, link_width, sid_ndim)
+                vi_arr = np.array(
+                    [[v for _, v in rec] for rec in normalised], dtype=np.int64,
+                ).reshape(n_records, link_width)
+        if chunks_arr is not None and vi_arr is not None:
+            from zarr_vectors.spatial.boundary import partition_link_arrays
+
+            scale_src, scale_trg = _link_scales(level_group, delta, sid_ndim)
+            buckets = partition_link_arrays(
+                chunks_arr, vi_arr, link_width=link_width, sid_ndim=sid_ndim,
+                scale_src=scale_src, scale_trg=scale_trg,
+                directed=directed, cross_level=(delta != 0),
+            )
+        else:
+            buckets = _partition_links(
+                level_group, normalised, link_width, sid_ndim,
+                delta=delta, directed=directed, store=store,
+            )
     family = links_group_path(delta)
     fam_meta = level_group.read_array_meta(family) or {}
 
@@ -2846,16 +3034,40 @@ def write_links(
         first_new = existing_total
 
     new_physical = 0
+    segment_offsets = {
+        seg: parse_offsets(seg, sid_ndim=sid_ndim, link_width=link_width)
+        for seg in targeted
+    }
+    # Every targeted array in one allocation.  A mesh with random
+    # geometry fans out to hundreds of offsets segments, a graph to well
+    # over a thousand, and creating each through its own ``sync()`` cost
+    # tens of milliseconds a segment -- a third of a mesh write.
+    _create_links_arrays(
+        level_group, list(segment_offsets.values()),
+        link_width=link_width, dtype=str(dtype), delta=delta,
+        sid_ndim=sid_ndim, directed=directed, store=store,
+    )
     for seg in targeted:
-        offsets = parse_offsets(seg, sid_ndim=sid_ndim, link_width=link_width)
-        create_links_array(
-            level_group, link_width, dtype=str(dtype), delta=delta,
-            sid_ndim=sid_ndim, offsets=offsets, directed=directed,
-            store=store, exist_ok=True,
-        )
+        offsets = segment_offsets[seg]
         has_perm = links_has_perm(
             offsets, delta=delta, directed=directed, store=store,
         )
+        if mode == "replace" and not (delta == 0 and is_intra(offsets)):
+            # A fresh cross-offset array: every cell is one inline ragged
+            # blob of the rows it was handed, so the whole segment goes
+            # to the store as one batch of cells.  The per-cell writer
+            # below is the definition of that encoding
+            # (``encode_ragged_blob``, no sidecar) and stays the path for
+            # appends, which have to merge with what a cell already holds.
+            cells: list[tuple[str, bytes]] = []
+            for src_chunk, entries in by_segment[seg]:
+                rows = _pack_link_rows(
+                    entries, has_perm=has_perm, link_width=link_width, dtype=dtype,
+                )
+                new_physical += rows.shape[0]
+                cells.append((_chunk_key(src_chunk), encode_ragged_blob([rows], dtype)))
+            level_group.write_cells(links_path(delta, offsets), cells)
+            continue
         for src_chunk, entries in by_segment[seg]:
             rows = _pack_link_rows(
                 entries, has_perm=has_perm, link_width=link_width, dtype=dtype,
@@ -4908,10 +5120,22 @@ def read_all_object_manifests(
     # Via the Group rather than the raw zarr node, so the read passes a
     # chokepoint the offline snapshot can serve (see Group.offline_reads).
     blobs = level_group.read_vlen_array(f"{OBJECT_INDEX}/manifests")
-    return [
-        expand_manifest_blocks(decode_object_manifest_blocks(b, sid_ndim=sid_ndim))
-        for b in blobs
-    ]
+    return _decode_manifests(blobs, sid_ndim)
+
+
+def _decode_manifests(blobs: Sequence[bytes], sid_ndim: int) -> list[ObjectManifest]:
+    """Every blob's expanded manifest, decoded as one batch.
+
+    The uniform case -- every block a single fragment, which is what
+    every bulk writer produces -- comes back from the batch decoder
+    already in the expanded ``(chunk_coords, fragment_index)`` shape;
+    anything else is expanded blob by blob.
+    """
+    decoded, uniform = decode_object_manifests_many(blobs, sid_ndim=sid_ndim)
+    if uniform:
+        return decoded
+    return [expand_manifest_blocks(blocks) for blocks in decoded]
+
 
 
 #: Fragment-attribute column naming the object that owns each fragment.
@@ -5096,10 +5320,8 @@ def read_object_manifests(
         # stays serveable from an offline snapshot like every other read.
         blobs = level_group.read_vlen_elements(path, rows[order].tolist())
 
-    return {
-        oid: expand_manifest_blocks(decode_object_manifest_blocks(blob, sid_ndim=sid_ndim))
-        for oid, blob in zip(wanted, blobs)
-    }
+    return dict(zip(wanted, _decode_manifests(blobs, sid_ndim)))
+
 
 
 def read_object_id_table(level_group: Group) -> npt.NDArray[np.int64] | None:
@@ -5699,6 +5921,152 @@ def read_links(
                         placed_endpoints, perm_idx, link_width,
                     )))
     return out
+
+
+def read_link_arrays(
+    level_group: Group,
+    *,
+    delta: int = 0,
+    include_intra: bool = True,
+) -> tuple[npt.NDArray[np.int64], npt.NDArray[np.int64]]:
+    """Every link record under ``links/<delta>/`` as two arrays.
+
+    :func:`read_links` in array form: ``(chunks, vi)`` of shapes
+    ``(M, L, sid_ndim)`` and ``(M, L)``, one row per record in exactly
+    the order :func:`read_links` returns them -- offsets segments
+    sorted, cells sorted within each, rows in write order -- and with
+    the input endpoint order restored from ``perm_idx``.  So
+    ``read_links(...)[i]`` is ``tuple(zip(map(tuple, chunks[i]), vi[i]))``.
+
+    Offered because the per-record tuples are the cost of a large
+    family: half a million faces took 8 s to build as tuples and a
+    further 2 s to take apart again, for arithmetic -- a chunk offset
+    plus a local index -- that is one gather over these arrays.  A
+    ``store="duplicate"`` family returns each record once per copy,
+    like :func:`read_links`.
+
+    Returns empty ``(0, 0, 0)`` / ``(0, 0)`` arrays when the family is
+    absent or holds no rows.
+    """
+    from zarr_vectors.spatial.boundary import _lehmer_decode
+
+    empty = (np.empty((0, 0, 0), dtype=np.int64), np.empty((0, 0), dtype=np.int64))
+    family = links_group_path(delta)
+    if not level_group.array_exists(family):
+        return empty
+    fam_meta = level_group.read_array_meta(family) or {}
+    if "link_width" not in fam_meta or "sid_ndim" not in fam_meta:
+        return empty
+    link_width = int(fam_meta["link_width"])
+    sid_ndim = int(fam_meta["sid_ndim"])
+    directed = bool(fam_meta.get("directed", False))
+    store = str(fam_meta.get("store", "canonical"))
+    scale_src, scale_trg = _link_scales(level_group, delta, sid_ndim)
+
+    # inverse[p] gathers a placed row back into input order: the
+    # ``out[sigma[i]] = placed[i]`` of apply_perm_inverse, as one index.
+    inverse: npt.NDArray[np.int64] | None = None
+
+    chunk_parts: list[npt.NDArray[np.int64]] = []
+    vi_parts: list[npt.NDArray[np.int64]] = []
+    for seg in list_link_offsets(level_group, delta):
+        arr_name = f"{family}/{seg}"
+        try:
+            offsets = parse_offsets(
+                seg, sid_ndim=sid_ndim, link_width=link_width,
+            )
+        except ValueError as e:
+            raise ArrayError(
+                f"{arr_name}: offsets segment {seg!r} does not match the "
+                f"family's sid_ndim={sid_ndim} link_width={link_width}: {e}"
+            ) from e
+        if not include_intra and is_intra(offsets):
+            continue
+        arr_meta = level_group.read_array_meta(arr_name) or {}
+        has_perm = bool(arr_meta.get(
+            "has_perm",
+            links_has_perm(
+                offsets, delta=delta, directed=directed, store=store,
+            ),
+        ))
+        ncols = (1 + link_width) if has_perm else link_width
+        flat = delta == 0 and is_intra(offsets)
+        cell_dtype = np.dtype(arr_meta.get("dtype", "int64"))
+
+        cell_rows: list[npt.NDArray[np.int64]] = []
+        cell_chunks: list[tuple[ChunkCoords, ...]] = []
+        for cell_key in sorted(level_group.list_chunks(arr_name)):
+            blob = level_group.read_bytes(arr_name, cell_key)
+            if not blob:
+                continue
+            rows_arr = _link_cell_rows(
+                blob, ncols=ncols, flat=flat, dtype=cell_dtype,
+            )
+            if rows_arr.size == 0:
+                continue
+            cell_rows.append(rows_arr)
+            cell_chunks.append(cell_endpoint_chunks(
+                _parse_chunk_key(cell_key), offsets, scale_src, scale_trg,
+            ))
+        if not cell_rows:
+            continue
+        counts = np.fromiter((r.shape[0] for r in cell_rows), dtype=np.int64, count=len(cell_rows))
+        rows = np.concatenate(cell_rows, axis=0)
+        placed_chunks = np.repeat(
+            np.asarray(cell_chunks, dtype=np.int64).reshape(-1, link_width, sid_ndim),
+            counts, axis=0,
+        )
+        if has_perm:
+            if inverse is None:
+                import math
+
+                inverse = np.stack([
+                    np.argsort(_lehmer_decode(p, link_width))
+                    for p in range(math.factorial(link_width))
+                ]).astype(np.int64)
+            perm = rows[:, 0]
+            if perm.size and (int(perm.min()) < 0 or int(perm.max()) >= inverse.shape[0]):
+                raise ArrayError(
+                    f"{arr_name}: perm_idx out of range [0, {inverse.shape[0]})"
+                )
+            gather = inverse[perm]
+            rowsel = np.arange(rows.shape[0])[:, None]
+            vi_parts.append(rows[:, 1:1 + link_width][rowsel, gather])
+            chunk_parts.append(placed_chunks[rowsel, gather])
+        else:
+            vi_parts.append(np.ascontiguousarray(rows[:, :link_width]))
+            chunk_parts.append(placed_chunks)
+    if not vi_parts:
+        return empty
+    return (
+        np.concatenate(chunk_parts, axis=0),
+        np.concatenate(vi_parts, axis=0),
+    )
+
+
+def link_endpoints_to_rows(
+    chunks: npt.NDArray[np.int64],
+    vi: npt.NDArray[np.int64],
+    chunk_offsets: Mapping[ChunkCoords, int],
+) -> npt.NDArray[np.int64]:
+    """Global row of every endpoint: ``chunk_offsets[chunk] + vi``.
+
+    ``chunks`` and ``vi`` are what :func:`read_link_arrays` returns;
+    ``chunk_offsets`` is where each chunk's rows start in a reader's
+    concatenation.  An endpoint whose chunk the reader did not take is
+    ``-1``, which is how a bbox or cells filter reaches the records.
+    """
+    m, link_width, sid_ndim = chunks.shape
+    if m == 0:
+        return np.empty((0, link_width), dtype=np.int64)
+    flat = chunks.reshape(-1, sid_ndim)
+    unique, inverse = np.unique(flat, axis=0, return_inverse=True)
+    starts = np.fromiter(
+        (chunk_offsets.get(tuple(row), -1) for row in unique.tolist()),
+        dtype=np.int64, count=unique.shape[0],
+    )
+    base = starts[np.asarray(inverse).reshape(-1)].reshape(m, link_width)
+    return np.where(base >= 0, base + vi, -1)
 
 
 def _link_tuple_cell(

@@ -46,20 +46,40 @@ def encode_ragged_floats(
         return b"", np.empty(0, dtype=np.int64)
 
     dtype = np.dtype(dtype)
+
+    # Fast path: every group already an array of the target dtype and a
+    # common shape past the first axis -- what every writer hands over
+    # -- so the buffer is one concatenation and one ``tobytes``, and the
+    # offsets follow from the row counts.  A line store writes half a
+    # million one-row groups; serialising each on its own was a third of
+    # the write.  Anything else (a mixed-shape list, a group that needs
+    # casting) takes the per-group path below, byte for byte the same.
+    first = groups[0]
+    if (
+        isinstance(first, np.ndarray)
+        and first.dtype == dtype
+        and first.ndim >= 1
+        and all(
+            isinstance(g, np.ndarray)
+            and g.dtype == dtype
+            and g.shape[1:] == first.shape[1:]
+            for g in groups
+        )
+    ):
+        row_bytes = int(dtype.itemsize) * int(np.prod(first.shape[1:], dtype=np.int64))
+        counts = np.fromiter((g.shape[0] for g in groups), dtype=np.int64, count=len(groups))
+        offsets = np.empty(len(groups), dtype=np.int64)
+        offsets[0] = 0
+        np.cumsum(counts[:-1] * row_bytes, out=offsets[1:])
+        buffer = np.concatenate(groups, axis=0) if len(groups) > 1 else first
+        return np.ascontiguousarray(buffer).tobytes(), offsets
+
     parts: list[bytes] = []
-    offsets: list[int] = []
+    offsets_list: list[int] = []
     current_offset = 0
 
-    # Validate consistent column count
-    ndims: set[int] = set()
     for g in groups:
-        ndims.add(g.ndim)
-    if len(ndims) > 1:
-        # Allow mix of 1-D and 2-D only if 1-D groups are empty
-        pass  # we'll handle per-group below
-
-    for g in groups:
-        offsets.append(current_offset)
+        offsets_list.append(current_offset)
         arr = np.asarray(g, dtype=dtype)
         if arr.ndim == 0:
             arr = arr.reshape(0)
@@ -67,7 +87,7 @@ def encode_ragged_floats(
         parts.append(raw)
         current_offset += len(raw)
 
-    return b"".join(parts), np.array(offsets, dtype=np.int64)
+    return b"".join(parts), np.array(offsets_list, dtype=np.int64)
 
 
 def decode_ragged_floats(

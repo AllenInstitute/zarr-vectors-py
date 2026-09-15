@@ -31,15 +31,18 @@ from zarr_vectors.constants import (
     VERTICES,
 )
 from zarr_vectors.core.arrays import (
+    _chunk_key,
+    _reshape_vertex_buffer,
+    attribute_buffer,
     attribute_layout,
     create_attribute_array,
     create_object_attributes_array,
     create_object_index_array,
     create_vertices_array,
+    fragment_rows,
     list_chunk_keys,
-    read_chunk_attributes,
-    read_chunk_vertices,
     read_object_manifests,
+    read_vertex_fragment_index,
     stamp_fragments_tile,
     write_chunk_attributes,
     write_chunk_vertices,
@@ -64,7 +67,7 @@ from zarr_vectors.core.store import (
     read_level_metadata,
     read_root_metadata,
 )
-from zarr_vectors.exceptions import ArrayError
+from zarr_vectors.exceptions import ArrayError, StoreError
 from zarr_vectors.spatial.chunking import (
     compute_bounds,
 )
@@ -73,7 +76,6 @@ from zarr_vectors.typing import (
     BoundingBox,
     ChunkCoords,
     ChunkShape,
-    CrossChunkLink,
     ObjectManifest,
 )
 
@@ -301,7 +303,13 @@ def write_lines(
         ChunkCoords, list[tuple[int, npt.NDArray, tuple[int, ...]]]
     ] = {}
     object_manifests: dict[int, ObjectManifest] = {}
-    cross_links: list[CrossChunkLink] = []
+    # The boundary-crossing records, as the arrays ``write_links`` takes
+    # directly: one row per split line, its two endpoint chunks and their
+    # chunk-local vertex indices.
+    cross_a_chunk: list[ChunkCoords] = []
+    cross_b_chunk: list[ChunkCoords] = []
+    cross_a_vi: list[int] = []
+    cross_b_vi: list[int] = []
 
     # One Python pass over lines is unavoidable to preserve line-id-
     # ordered fragment_idx assignment, but each iteration is now just
@@ -331,7 +339,11 @@ def write_lines(
             # fragment's only vertex sits at chunk-local index k.
             # Hardcoding 0 here made every line in a chunk link to that
             # chunk's *first* vertex.
-            cross_links.append(((ca, fragment_idx_a), (cb, fragment_idx_b)))
+            cross_a_chunk.append(ca)
+            cross_b_chunk.append(cb)
+            cross_a_vi.append(fragment_idx_a)
+            cross_b_vi.append(fragment_idx_b)
+    cross_links = cross_a_vi
 
     idx_ndim = ndim + 1 if line_attr_bins is not None else ndim
     # Collapse all per-array zarr.json PUTs + per-chunk byte writes into
@@ -386,7 +398,23 @@ def write_lines(
 
         if cross_links:
             write_links(
-                level_group, cross_links, idx_ndim, delta=0, link_width=2,
+                level_group, [], idx_ndim, delta=0, link_width=2,
+                _arrays=(
+                    np.stack(
+                        [
+                            np.asarray(cross_a_chunk, dtype=np.int64),
+                            np.asarray(cross_b_chunk, dtype=np.int64),
+                        ],
+                        axis=1,
+                    ),
+                    np.stack(
+                        [
+                            np.asarray(cross_a_vi, dtype=np.int64),
+                            np.asarray(cross_b_vi, dtype=np.int64),
+                        ],
+                        axis=1,
+                    ),
+                ),
             )
 
         if line_attributes:
@@ -595,92 +623,168 @@ def _read_lines(
             level_group, ids=[int(o) for o in object_ids],
         )
 
-        # Build a per-chunk dispatch table: chunk → list of
-        # (oid_local_idx, manifest_position, fragment_index).  ``oid_local_idx``
-        # indexes into the per-object output list, not the global oid
-        # (which can be sparse).
-        oid_outputs: list[list[npt.NDArray | None]] = []
-        # One parallel slot table per attribute, filled from the same
-        # dispatch so a value can never be paired with another endpoint.
-        attr_outputs: dict[str, list[list[npt.NDArray | None]]] = {
-            name: [] for name in attr_layouts
-        }
-        oid_for_output: list[int] = []
-        chunk_dispatch: dict[ChunkCoords, list[tuple[int, int, int]]] = {}
+        # Build a per-chunk dispatch table: chunk → (slot, manifest_position,
+        # fragment_index) triples.  ``slot`` indexes the per-line output,
+        # not the global oid (which can be sparse).
+        #
+        # A line is its first and last vertex, so what each fragment
+        # contributes is at most two rows: the first row of a line's
+        # first fragment and the last row of its last.  The dispatch
+        # records which, and the per-chunk pass below gathers exactly
+        # those rows with array indexing.  Assembling every line's
+        # fragments and reducing each to two rows in Python cost 6 s of a
+        # 27 s read of a quarter-million lines.
+        slot_oids: list[int] = []
+        slot_lengths: list[int] = []
+        disp_chunk: list[ChunkCoords] = []
+        disp_slot: list[int] = []
+        disp_pos: list[int] = []
+        disp_frag: list[int] = []
         for oid in object_ids:
             # Absent covers negative, out-of-range and no-such-object --
             # the cases the index bounds check used to catch.
             manifest = manifest_by_oid.get(int(oid))
             if not manifest:
                 continue
-            slot = len(oid_outputs)
-            oid_outputs.append([None] * len(manifest))
-            for _slots in attr_outputs.values():
-                _slots.append([None] * len(manifest))
-            oid_for_output.append(oid)
+            slot = len(slot_oids)
+            slot_oids.append(oid)
+            slot_lengths.append(len(manifest))
             for mi, (cc, fragment_index) in enumerate(manifest):
-                chunk_dispatch.setdefault(cc, []).append((slot, mi, fragment_index))
+                disp_chunk.append(cc)
+                disp_slot.append(slot)
+                disp_pos.append(mi)
+                disp_frag.append(int(fragment_index))
 
-        # One read_chunk_vertices per chunk; copy slices into output slots.
-        for cc, entries in chunk_dispatch.items():
+        n_slots = len(slot_oids)
+        lengths = np.asarray(slot_lengths, dtype=np.int64)
+        d_slot = np.asarray(disp_slot, dtype=np.int64)
+        d_pos = np.asarray(disp_pos, dtype=np.int64)
+        d_frag = np.asarray(disp_frag, dtype=np.int64)
+        d_is_first = d_pos == 0
+        d_is_last = d_pos == (lengths[d_slot] - 1 if n_slots else d_pos)
+
+        # Per line: its first row, its last row, how many rows it holds,
+        # and how many of its fragments were served -- a line is emitted
+        # only when every fragment was, with at least two rows between
+        # them, exactly as before.
+        first_rows = np.zeros((n_slots, ndim), dtype=dtype)
+        last_rows = np.zeros((n_slots, ndim), dtype=dtype)
+        row_counts = np.zeros(n_slots, dtype=np.int64)
+        served = np.zeros(n_slots, dtype=np.int64)
+        attr_first: dict[str, npt.NDArray] = {}
+        attr_last: dict[str, npt.NDArray] = {}
+        attr_served: dict[str, npt.NDArray] = {}
+        attr_rows: dict[str, npt.NDArray] = {}
+        for _name, (_adt, _ancols) in attr_layouts.items():
+            shape = (n_slots,) if _ancols == 1 else (n_slots, _ancols)
+            attr_first[_name] = np.zeros(shape, dtype=_adt)
+            attr_last[_name] = np.zeros(shape, dtype=_adt)
+            attr_served[_name] = np.zeros(n_slots, dtype=np.int64)
+            attr_rows[_name] = np.zeros(n_slots, dtype=np.int64)
+
+        # Group the dispatch by chunk, once.
+        by_chunk: dict[ChunkCoords, list[int]] = {}
+        for i, cc in enumerate(disp_chunk):
+            by_chunk.setdefault(cc, []).append(i)
+
+        def _gather_ends(
+            full: npt.NDArray, fi, entries: npt.NDArray,
+            firsts: npt.NDArray, lasts: npt.NDArray,
+            counts: npt.NDArray, hits: npt.NDArray,
+        ) -> None:
+            """Scatter fragment ends of ``entries`` (dispatch rows) into the
+            per-line tables, for one chunk's buffer ``full``."""
+            frags = d_frag[entries]
+            valid = (frags >= 0) & (frags < fi.num_fragments)
+            entries = entries[valid]
+            frags = frags[valid]
+            if entries.size == 0:
+                return
+            table = fi.ranges()
+            if table is not None:
+                starts = table[frags, 0]
+                lens = table[frags, 1]
+                ends = starts + lens - 1
+                nonempty = lens > 0
+                slots = d_slot[entries]
+                counts += np.bincount(
+                    slots, weights=lens, minlength=n_slots,
+                ).astype(np.int64)
+                hits += np.bincount(slots, minlength=n_slots)
+                pick = nonempty & d_is_first[entries]
+                firsts[slots[pick]] = full[starts[pick]]
+                pick = nonempty & d_is_last[entries]
+                lasts[slots[pick]] = full[ends[pick]]
+                return
+            # Explicit fragments: gather row by row through the index.
+            for e, f in zip(entries.tolist(), frags.tolist()):
+                rows = fragment_rows(full, fi, f)
+                slot = int(d_slot[e])
+                counts[slot] += len(rows)
+                hits[slot] += 1
+                if len(rows) == 0:
+                    continue
+                if d_is_first[e]:
+                    firsts[slot] = rows[0]
+                if d_is_last[e]:
+                    lasts[slot] = rows[-1]
+
+        for cc, entry_list in by_chunk.items():
+            entries = np.asarray(entry_list, dtype=np.int64)
+            key = _chunk_key(cc)
             try:
-                groups = read_chunk_vertices(
-                    level_group, cc, dtype=dtype, ndim=ndim,
-                )
-            except ArrayError:
+                raw = level_group.read_bytes(VERTICES, key)
+                fi = read_vertex_fragment_index(level_group, cc)
+            except (ArrayError, StoreError):
                 continue
-            attr_groups: dict[str, list[npt.NDArray]] = {}
+            full = _reshape_vertex_buffer(raw, dtype, ndim)
+            _gather_ends(full, fi, entries, first_rows, last_rows, row_counts, served)
             for _name, (_adt, _ancols) in attr_layouts.items():
                 try:
-                    attr_groups[_name] = read_chunk_attributes(
-                        level_group, _name, cc, dtype=_adt, ncols=_ancols,
+                    buf = attribute_buffer(
+                        level_group.read_bytes(f"{VERTEX_ATTRIBUTES}/{_name}", key),
+                        fi, _adt, what=f"Attribute '{_name}' chunk {key}",
                     )
-                except ArrayError:
+                except (ArrayError, StoreError):
                     continue
-            for slot, mi, fragment_index in entries:
-                if 0 <= fragment_index < len(groups):
-                    oid_outputs[slot][mi] = groups[fragment_index]
-                for _name, _rows in attr_groups.items():
-                    if 0 <= fragment_index < len(_rows):
-                        attr_outputs[_name][slot][mi] = _rows[fragment_index]
-
-        result_endpoints: list[npt.NDArray] = []
-        result_attrs: dict[str, list[npt.NDArray]] = {
-            name: [] for name in attr_layouts
-        }
-        for slot, slot_groups in enumerate(oid_outputs):
-            if any(g is None for g in slot_groups):
-                continue
-            all_verts = np.concatenate(slot_groups, axis=0)
-            if len(all_verts) < 2:
-                continue
-            ep = np.stack([all_verts[0], all_verts[-1]], axis=0)
-            result_endpoints.append(ep)
-            # Same first/last reduction as the endpoints, over the same
-            # manifest order, so row 2k belongs to endpoint 0 of line k
-            # and row 2k+1 to endpoint 1 -- the order ``endpoints`` is
-            # flattened in.
-            for _name in attr_layouts:
-                parts = attr_outputs[_name][slot]
-                if any(q is None for q in parts):
+                # One row per vertex, ``ncols`` values each; a cell of any
+                # other width cannot be aligned and is skipped, which
+                # drops the column below rather than misaligning it.
+                if buf is None or buf.shape[0] != full.shape[0] or buf.shape[1] != _ancols:
                     continue
-                rows = np.concatenate(parts, axis=0)
-                if len(rows) < 2:
-                    continue
-                result_attrs[_name].append(
-                    np.stack([rows[0], rows[-1]], axis=0)
+                _gather_ends(
+                    buf[:, 0] if _ancols == 1 else buf, fi, entries,
+                    attr_first[_name], attr_last[_name],
+                    attr_rows[_name], attr_served[_name],
                 )
+
+        emitted = (served == lengths) & (row_counts >= 2)
+        endpoints_out = np.stack(
+            [first_rows[emitted], last_rows[emitted]], axis=1,
+        )  # (M, 2, D)
+        # Per attribute, the ``(2M, ...)`` column in endpoint order: row
+        # 2k is endpoint 0 of line k and row 2k+1 endpoint 1, the order
+        # ``endpoints`` flattens in.  Kept only when every emitted line
+        # contributed a complete pair, matching the endpoints' own rule.
+        attr_columns: dict[str, npt.NDArray] = {}
+        for _name in attr_layouts:
+            ok = (attr_served[_name][emitted] == lengths[emitted]) & (
+                attr_rows[_name][emitted] >= 2
+            )
+            if emitted.any() and bool(ok.all()):
+                pair = np.stack(
+                    [attr_first[_name][emitted], attr_last[_name][emitted]], axis=1,
+                )
+                attr_columns[_name] = pair.reshape(-1, *pair.shape[2:])
     finally:
         _batched_reads_cm.__exit__(None, None, None)
 
-    if not result_endpoints:
+    if endpoints_out.shape[0] == 0:
         return {
             "endpoints": np.zeros((0, 2, ndim), dtype=dtype),
             "vertex_attributes": {},
             "line_count": 0,
         }
-
-    endpoints_out = np.stack(result_endpoints, axis=0)  # (M, 2, D)
 
     # Apply bbox filter
     if bbox is not None:
@@ -703,10 +807,8 @@ def _read_lines(
     # row.  A short column cannot be aligned to ``endpoints``, and a
     # silently misaligned one is worse than an absent one.
     attrs_out: dict[str, npt.NDArray] = {}
-    for _name, _parts in result_attrs.items():
-        if _parts and len(_parts) == len(result_endpoints):
-            _col = np.concatenate(_parts, axis=0)
-            attrs_out[_name] = _col[keep_mask] if bbox is not None else _col
+    for _name, _col in attr_columns.items():
+        attrs_out[_name] = _col[keep_mask] if bbox is not None else _col
 
     return {
         "endpoints": endpoints_out,

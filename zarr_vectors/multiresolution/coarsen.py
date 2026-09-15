@@ -30,6 +30,7 @@ from zarr_vectors.constants import (
     DEFAULT_CROSS_LEVEL_STORAGE,
     OBJECT_ATTRIBUTES,
     VALID_XLEVEL_STORAGE,
+    VERTEX_FRAGMENTS,
     VERTICES,
     XLEVEL_EXPLICIT,
     XLEVEL_NONE,
@@ -38,11 +39,13 @@ from zarr_vectors.core.arrays import (
     create_object_attributes_array,
     create_object_index_array,
     create_vertices_array,
+    link_endpoints_to_rows,
     list_chunk_keys,
     read_chunk_vertices,
-    read_links,
+    read_link_arrays,
     read_object_attributes,
     read_object_manifest_rows,
+    vertices_dtype,
     write_chunk_vertices,
     write_cross_level_links,
     write_object_attributes,
@@ -242,14 +245,21 @@ def _per_object_coarsen(
 
     # --- Step 0: read source manifests + vertex positions ----------------
     # Read source vertex positions, indexed by (chunk_coords, fragment_idx).
+    # One prefetch for the level: read chunk by chunk, each read opened
+    # its own one-cell prefetch, and two thousand of those cost 14 s of
+    # a 45 s pyramid -- more than the coarsening itself.
     src_fragment_positions: dict[tuple[ChunkCoords, int], npt.NDArray] = {}
-    for cc in list_chunk_keys(src_group, VERTICES):
-        try:
-            fragments = read_chunk_vertices(src_group, cc, ndim=ndim)
-        except ArrayError:
-            continue
-        for fragment_idx, fragment in enumerate(fragments):
-            src_fragment_positions[(cc, fragment_idx)] = fragment
+    # The declared dtype once, not once per chunk: unasked, every read
+    # resolved the ``vertices`` node again to look it up.
+    src_dtype = vertices_dtype(src_group)
+    with _level_prefetch(src_group):
+        for cc in list_chunk_keys(src_group, VERTICES):
+            try:
+                fragments = read_chunk_vertices(src_group, cc, dtype=src_dtype, ndim=ndim)
+            except ArrayError:
+                continue
+            for fragment_idx, fragment in enumerate(fragments):
+                src_fragment_positions[(cc, fragment_idx)] = fragment
 
     src_has_objects = "object_index" in src_group
     src_ids: npt.NDArray[np.int64] | None = None
@@ -624,36 +634,37 @@ def _emit_inline_cross_level_links(
     key_dtype = np.dtype((
         np.void, int(bin_shape_arr.shape[0]) * np.dtype(np.int64).itemsize,
     ))
-    for cc in list_chunk_keys(src_group, VERTICES):
-        try:
-            fragments = read_chunk_vertices(
-                src_group, cc, dtype=np.float32, ndim=ndim,
-            )
-        except ArrayError:
-            continue
-        for fragment in fragments:
-            n_local = int(fragment.shape[0])
-            if n_local == 0:
+    with _level_prefetch(src_group):
+        for cc in list_chunk_keys(src_group, VERTICES):
+            try:
+                fragments = read_chunk_vertices(
+                    src_group, cc, dtype=np.float32, ndim=ndim,
+                )
+            except ArrayError:
                 continue
-            local_bins = np.floor(
-                np.asarray(fragment, dtype=np.float32) / bin_shape_arr,
-            ).astype(np.int64)
-            local_keys = np.ascontiguousarray(local_bins).view(key_dtype).ravel()
-            # One searchsorted per fragment, not one dict lookup per
-            # vertex. ``unique_keys`` is np.unique output and therefore
-            # sorted, so the position it returns IS the metavertex index.
-            # The old form allocated a bytes object per vertex, which was
-            # the hottest Python loop in the coarsener.
-            pos = np.searchsorted(unique_keys, local_keys)
-            np.clip(pos, 0, len(unique_keys) - 1, out=pos)
-            # A key the coarse level never produced has no parent; the
-            # caller relies on those staying -1.
-            hit = unique_keys[pos] == local_keys
-            if hit.any():
-                parent[cursor + np.flatnonzero(hit)] = mv_to_coarse_global[
-                    pos[hit]
-                ]
-            cursor += n_local
+            for fragment in fragments:
+                n_local = int(fragment.shape[0])
+                if n_local == 0:
+                    continue
+                local_bins = np.floor(
+                    np.asarray(fragment, dtype=np.float32) / bin_shape_arr,
+                ).astype(np.int64)
+                local_keys = np.ascontiguousarray(local_bins).view(key_dtype).ravel()
+                # One searchsorted per fragment, not one dict lookup per
+                # vertex. ``unique_keys`` is np.unique output and therefore
+                # sorted, so the position it returns IS the metavertex index.
+                # The old form allocated a bytes object per vertex, which was
+                # the hottest Python loop in the coarsener.
+                pos = np.searchsorted(unique_keys, local_keys)
+                np.clip(pos, 0, len(unique_keys) - 1, out=pos)
+                # A key the coarse level never produced has no parent; the
+                # caller relies on those staying -1.
+                hit = unique_keys[pos] == local_keys
+                if hit.any():
+                    parent[cursor + np.flatnonzero(hit)] = mv_to_coarse_global[
+                        pos[hit]
+                    ]
+                cursor += n_local
 
     _write_cross_level_edges(
         root,
@@ -738,6 +749,22 @@ def _stamp_root_cross_level(
     root_group.attrs.update({"zarr_vectors": zv})
 
 
+def _level_prefetch(level_group):
+    """One batched read of every ``vertices`` and ``vertex_fragments``
+    cell in the level, for a loop that would otherwise open one
+    single-cell prefetch per chunk.
+
+    A no-op inside an outer prefetch or an offline replay, like
+    :func:`~zarr_vectors.core.arrays._maybe_batched_reads`.
+    """
+    from zarr_vectors.core.arrays import _chunk_key, _maybe_batched_reads
+
+    keys = [_chunk_key(cc) for cc in list_chunk_keys(level_group, VERTICES)]
+    return _maybe_batched_reads(level_group, [
+        (VERTICES, keys), (VERTEX_FRAGMENTS, keys),
+    ])
+
+
 def _reconstruct_chunk_assignments(
     level_group, ndim: int,
 ) -> tuple[dict[ChunkCoords, npt.NDArray[np.int64]], int]:
@@ -794,17 +821,26 @@ def _decode_parent_from_plus_one(
     ``None`` when the family is absent or empty.
     """
     parent = np.full(n_fine, -1, dtype=np.int64)
-    found_any = False
 
     try:
-        records = read_links(fine_lg, delta=1)
+        chunks, vi = read_link_arrays(fine_lg, delta=1)
     except (ArrayError, KeyError):
-        records = []
-    for (cc_s, vi_s), (cc_t, vi_t) in records:
-        parent[int(fine_assn[cc_s][vi_s])] = int(coarse_assn[cc_t][vi_t])
-        found_any = True
-
-    return parent if found_any else None
+        return None
+    if vi.shape[0] == 0 or vi.shape[1] != 2:
+        return None
+    # Each level's assignment for a chunk is a contiguous range, so the
+    # global index of an endpoint is the range's start plus its local
+    # index -- one gather per side rather than two dict lookups and an
+    # int() per record.
+    fine_start = {cc: int(rows[0]) for cc, rows in fine_assn.items() if rows.size}
+    coarse_start = {cc: int(rows[0]) for cc, rows in coarse_assn.items() if rows.size}
+    fine_idx = link_endpoints_to_rows(chunks[:, :1], vi[:, :1], fine_start)[:, 0]
+    coarse_idx = link_endpoints_to_rows(chunks[:, 1:], vi[:, 1:], coarse_start)[:, 0]
+    valid = (fine_idx >= 0) & (coarse_idx >= 0)
+    if not valid.any():
+        return None
+    parent[fine_idx[valid]] = coarse_idx[valid]
+    return parent
 
 
 def _finalize_cross_level_for_store(

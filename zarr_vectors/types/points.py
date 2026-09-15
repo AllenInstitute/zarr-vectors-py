@@ -33,9 +33,9 @@ from zarr_vectors.constants import (
     VERTICES,
 )
 from zarr_vectors.core.arrays import (
-    chunk_fragments_tile as _chunk_tiles,
-)
-from zarr_vectors.core.arrays import (
+    _chunk_key,
+    _reshape_vertex_buffer,
+    attribute_buffer,
     create_attribute_array,
     create_fragment_attribute_array,
     create_groupings_array,
@@ -43,15 +43,18 @@ from zarr_vectors.core.arrays import (
     create_object_attributes_array,
     create_object_index_array,
     create_vertices_array,
+    fragment_rows,
     list_chunk_keys,
-    read_attribute_fragment,
+    read_chunk_attribute_rows,
     read_chunk_attributes,
     read_chunk_vertex_buffer,
     read_chunk_vertex_rows,
     read_fragment,
     read_group_object_ids,
     read_object_manifests,
+    read_vertex_fragment_index,
     resolve_chunk_keys,
+    shape_attribute_rows,
     stamp_fragments_tile,
     write_chunk_attributes,
     write_chunk_fragment_attributes,
@@ -60,6 +63,9 @@ from zarr_vectors.core.arrays import (
     write_groupings_attributes,
     write_object_attributes,
     write_object_index,
+)
+from zarr_vectors.core.arrays import (
+    chunk_fragments_tile as _chunk_tiles,
 )
 from zarr_vectors.core.attr_chunking import (
     assign_attribute_bins,
@@ -86,7 +92,7 @@ from zarr_vectors.encoding.categorical import (
     decode_categorical,
     encode_categorical,
 )
-from zarr_vectors.exceptions import ArrayError
+from zarr_vectors.exceptions import ArrayError, StoreError
 from zarr_vectors.spatial.chunking import (
     assign_bins,
     assign_chunks,
@@ -703,6 +709,20 @@ def _read_points(
         except ArrayError:
             manifests_by_oid = {}
 
+        # The wanted fragments, grouped by the chunk holding them.  Each
+        # chunk's vertex buffer, fragment index and attribute cells are
+        # then decoded once and every wanted fragment sliced from that
+        # one decode -- rather than once per (object, chunk, attribute),
+        # which re-read and re-decoded the same fragment index three
+        # times per fragment and cost 12 s of a 20 s read of 2,000
+        # objects.  The plan below also tells an offline replay, in one
+        # pass, every cell this read needs.
+        kept_oids: list[int] = []
+        per_object: list[list[npt.NDArray | None]] = []
+        per_object_attrs: dict[str, list[list[npt.NDArray | None]]] = {
+            name: [] for name in attr_layouts
+        }
+        by_chunk: dict[ChunkCoords, list[tuple[int, int, int]]] = {}
         for oid in object_ids:
             # Absent means out of range or no such object -- the same ids
             # the singular read raised on.
@@ -717,33 +737,76 @@ def _read_points(
                 ]
             if not manifest:
                 continue
+            slot = len(kept_oids)
+            kept_oids.append(oid)
+            per_object.append([None] * len(manifest))
+            for slots in per_object_attrs.values():
+                slots.append([None] * len(manifest))
+            for pos, (chunk_coords, fragment_index) in enumerate(manifest):
+                by_chunk.setdefault(chunk_coords, []).append(
+                    (slot, pos, int(fragment_index)),
+                )
 
-            for chunk_coords, fragment_index in manifest:
+        if not by_chunk:
+            return _empty_result(ndim)
+
+        key_strs = [_chunk_key(cc) for cc in by_chunk]
+        prefetch: list[tuple[str, list[str]]] = [
+            (VERTICES, key_strs), (VERTEX_FRAGMENTS, key_strs),
+        ]
+        prefetch += [
+            (f"{VERTEX_ATTRIBUTES}/{name}", key_strs) for name in attr_layouts
+        ]
+        with level_group.batched_reads(prefetch):
+            for chunk_coords, entries in by_chunk.items():
+                key = _chunk_key(chunk_coords)
                 try:
-                    fragment = read_fragment(
-                        level_group, chunk_coords, fragment_index,
-                        dtype=dtype, ndim=ndim,
-                    )
-                except ArrayError:
+                    raw = level_group.read_bytes(VERTICES, key)
+                    fi = read_vertex_fragment_index(level_group, chunk_coords)
+                except (ArrayError, StoreError):
                     continue
-                n_pts = len(fragment)
-                if n_pts == 0:
+                full = _reshape_vertex_buffer(raw, dtype, ndim)
+                attr_full: dict[str, npt.NDArray | None] = {}
+                for name, (a_dtype, _a_ncols, _enc) in attr_layouts.items():
+                    try:
+                        attr_full[name] = attribute_buffer(
+                            level_group.read_bytes(
+                                f"{VERTEX_ATTRIBUTES}/{name}", key,
+                            ),
+                            fi, a_dtype,
+                            what=f"Attribute '{name}' chunk {key}",
+                        )
+                    except (ArrayError, StoreError):
+                        attr_full[name] = None
+                for slot, pos, fragment_index in entries:
+                    if not 0 <= fragment_index < fi.num_fragments:
+                        continue
+                    rows = fragment_rows(full, fi, fragment_index)
+                    per_object[slot][pos] = rows
+                    n_pts = len(rows)
+                    # Same fragment, same order, so the attribute rows
+                    # line up with the positions without any further
+                    # bookkeeping.  A fragment whose attribute rows are
+                    # missing or the wrong length drops the whole column
+                    # rather than misaligning it -- see below.
+                    for name, (_a_dtype, a_ncols, _enc) in attr_layouts.items():
+                        buf = attr_full[name]
+                        if buf is None:
+                            continue
+                        a_rows = shape_attribute_rows(
+                            fragment_rows(buf, fi, fragment_index), a_ncols,
+                        )
+                        if len(a_rows) == n_pts:
+                            per_object_attrs[name][slot][pos] = a_rows
+
+        for slot, oid in enumerate(kept_oids):
+            for pos, rows in enumerate(per_object[slot]):
+                if rows is None or len(rows) == 0:
                     continue
-                all_positions.append(fragment)
-                all_obj_labels.append(np.full(n_pts, oid, dtype=np.int64))
-                # Same fragment, same order, so the rows line up with the
-                # positions appended just above without any further
-                # bookkeeping.  A fragment whose attribute rows are
-                # missing or the wrong length drops the whole column
-                # rather than misaligning it -- see below.
-                for name, (a_dtype, a_ncols, _enc) in attr_layouts.items():
-                    rows = read_attribute_fragment(
-                        level_group, name, chunk_coords, fragment_index,
-                        dtype=a_dtype, ncols=a_ncols, default=None,
-                    )
-                    all_attrs[name].append(
-                        None if rows is None or len(rows) != n_pts else rows
-                    )
+                all_positions.append(rows)
+                all_obj_labels.append(np.full(len(rows), oid, dtype=np.int64))
+                for name in attr_layouts:
+                    all_attrs[name].append(per_object_attrs[name][slot][pos])
 
         if not all_positions:
             return _empty_result(ndim)
@@ -878,7 +941,10 @@ def _read_points(
     # purely a perf optimisation — correctness is unaffected.
     chunk_key_strs = [".".join(str(c) for c in cc) for cc in chunk_keys]
     prefetch_plan: list[tuple[str, list[str]]] = [(VERTICES, chunk_key_strs)]
-    if not skip_fragments:
+    # The attribute reads below align their rows through the fragment
+    # index, so it is wanted whenever they are -- even on a level whose
+    # tiling claim lets the positions skip it.
+    if not skip_fragments or attribute_names:
         prefetch_plan.append((VERTEX_FRAGMENTS, chunk_key_strs))
     if attribute_names:
         for attr_name in attribute_names:
@@ -1057,6 +1123,19 @@ def _read_points(
                         if cc not in chunk_keys_set:
                             continue
                         try:
+                            if fragment_indices is None:
+                                # Whole chunk wanted -- the positions took
+                                # the buffer whole above, so the rows come
+                                # whole too.  Iterating the sentinel here
+                                # was a crash on any box that covered a
+                                # chunk entirely.
+                                rows = read_chunk_attribute_rows(
+                                    level_group, attr_name, cc,
+                                    dtype=attr_dtype, ncols=attr_ncols,
+                                )
+                                if len(rows) > 0:
+                                    attr_parts.append(rows)
+                                continue
                             attr_groups = read_chunk_attributes(
                                 level_group, attr_name, cc,
                                 dtype=attr_dtype, ncols=attr_ncols,
@@ -1070,16 +1149,20 @@ def _read_points(
                         except ArrayError:
                             continue
                 else:
+                    # Each chunk's rows whole, in the same order the
+                    # positions were taken: partitioning per fragment and
+                    # re-joining cost a 64-way split per chunk per
+                    # attribute for nothing.
                     for chunk_coords in chunk_keys:
                         try:
-                            attr_groups = read_chunk_attributes(
+                            rows = read_chunk_attribute_rows(
                                 level_group, attr_name, chunk_coords,
                                 dtype=attr_dtype, ncols=attr_ncols,
                             )
-                            for ag in attr_groups:
-                                attr_parts.append(ag)
                         except ArrayError:
                             continue
+                        if len(rows) > 0:
+                            attr_parts.append(rows)
                 if attr_parts:
                     attr_all = np.concatenate(attr_parts, axis=0)
                     if bbox is not None:

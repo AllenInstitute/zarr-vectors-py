@@ -162,7 +162,7 @@ async def _fetch_chunks(
     inside the event loop.
     """
     from zarr_vectors.core._batch_reader import (
-        _direct_read_many,
+        _direct_read_plan,
         _direct_spec,
         _gather_plan,
     )
@@ -192,18 +192,15 @@ async def _fetch_chunks(
         # given, so hand it the root and use root-relative paths as the
         # "names".
         tasks.append(_gather_plan(root, gathered))
-    for _array_path, spec, chunk_keys in direct:
-        tasks.append(asyncio.to_thread(_direct_read_many, spec, chunk_keys))
+    if direct:
+        # One job for every direct array together, so the files pool
+        # across arrays rather than per array.
+        tasks.append(asyncio.to_thread(_direct_read_plan, direct))
     results = await asyncio.gather(*tasks)
 
     out: dict[tuple[str, str], bytes] = {}
-    offset = 0
-    if gathered:
-        out.update(results[0])
-        offset = 1
-    for (array_path, _spec, _keys), cells in zip(direct, results[offset:]):
-        for chunk_key, data in cells:
-            out[(array_path, chunk_key)] = data
+    for part in results:
+        out.update(part)
     return out
 
 

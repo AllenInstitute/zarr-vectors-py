@@ -100,8 +100,25 @@ def assign_chunks(
     # Convert to structured array for np.unique
     result: dict[ChunkCoords, npt.NDArray[np.intp]] = {}
 
-    # Fast path for few dimensions: use tuple hashing
-    if ndim <= 4:
+    # Fast path: every row's coords packed into ONE int64 key, then a
+    # single argsort.  A lexsort over D int64 columns plus a row-wise
+    # diff was 0.44 s of a 3 s million-point write, run twice on the
+    # object path; the packed form sorts one column and finds the group
+    # boundaries with one diff.  Packing is exact whenever the coord
+    # ranges multiply to under 2**63, which is any grid a store can
+    # allocate; anything wider takes the lexsort path.
+    packed = _pack_coords(chunk_ints)
+    if packed is not None:
+        sort_idx = np.argsort(packed, kind="stable")
+        sorted_keys = packed[sort_idx]
+        boundaries = np.flatnonzero(sorted_keys[1:] != sorted_keys[:-1]) + 1
+        starts = np.concatenate(([0], boundaries))
+        # One tolist for every group's coords, not a tuple() per group
+        # over numpy scalars.
+        coords = chunk_ints[sort_idx[starts]].tolist()
+        for coord, grp in zip(coords, np.split(sort_idx, boundaries)):
+            result[tuple(coord)] = grp
+    elif ndim <= 4:
         # Build a dict by iterating unique rows — but avoid Python loops
         # over all N rows.  Instead, use lexsort + diff to find group
         # boundaries.
@@ -132,6 +149,20 @@ def assign_chunks(
             result[coord] = np.flatnonzero(mask)
 
     return result
+
+
+def _pack_coords(coords: npt.NDArray[np.int64]) -> npt.NDArray[np.int64] | None:
+    """``(N, D)`` integer coords as one int64 key per row, ordering rows
+    exactly as a lexicographic sort of the coords would.
+
+    ``None`` when the per-axis ranges are too wide to pack exactly.
+    """
+    lo = coords.min(axis=0)
+    span = (coords.max(axis=0) - lo + 1).astype(np.float64)
+    if float(np.prod(span)) >= 2.0 ** 62:
+        return None
+    strides = np.cumprod(np.concatenate(([1.0], span[::-1][:-1])))[::-1].astype(np.int64)
+    return (coords - lo) @ strides
 
 
 def compute_chunk_coords(
@@ -457,13 +488,28 @@ def group_bins_by_chunk(
         ``{chunk_coords: {fragment_index: global_vertex_indices}}``.
     """
     result: dict[ChunkCoords, dict[int, npt.NDArray[np.intp]]] = {}
+    if not bin_assignments:
+        return result
 
-    for bc, indices in bin_assignments.items():
-        cc = bin_to_chunk(bc, bins_per_chunk)
-        fragment_idx = bin_to_fragment_index(bc, cc, bins_per_chunk)
+    # Every bin's chunk and fragment index in one pass of array
+    # arithmetic, rather than two Python helpers per bin: a million
+    # points binned 4x4x4 have ~30k bins, and the per-bin form was a
+    # fifth of a second per write.  Same arithmetic as ``bin_to_chunk``
+    # (floor division toward -inf) and ``bin_to_fragment_index``
+    # (row-major linearisation of the local bin coords).
+    bins = np.asarray(list(bin_assignments.keys()), dtype=np.int64)
+    bpc = np.asarray(bins_per_chunk, dtype=np.int64)
+    chunks = np.floor_divide(bins, bpc)
+    local = bins - chunks * bpc
+    strides = np.cumprod(np.concatenate(([1], bpc[::-1][:-1])))[::-1]
+    fragment_indices = (local @ strides).tolist()
 
-        if cc not in result:
-            result[cc] = {}
-        result[cc][fragment_idx] = indices
+    for cc, fragment_idx, indices in zip(
+        map(tuple, chunks.tolist()), fragment_indices, bin_assignments.values(),
+    ):
+        bucket = result.get(cc)
+        if bucket is None:
+            bucket = result[cc] = {}
+        bucket[fragment_idx] = indices
 
     return result

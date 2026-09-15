@@ -33,6 +33,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import struct
 import sys
 import threading
 import uuid
@@ -258,13 +259,32 @@ def _direct_write_spec(
 
 
 def _encode_direct(spec: _DirectWriteSpec, data: bytes) -> bytes:
-    """One cell's payload as the bytes zarr would store for it."""
+    """One cell's payload as the bytes zarr would store for it.
+
+    Two routes to the same bytes.  When every BytesBytes codec is zstd
+    -- the default pipeline, and the only one a ``Layout`` resolves to
+    besides none -- the vlen frame is packed by hand (numcodecs'
+    VLenBytes layout for one item: item count, byte length, payload) and
+    handed straight to the numcodecs Zstd instance the zarr codec itself
+    delegates to.  That is byte-identical to the general route and about
+    twenty times cheaper per cell, which matters because a links family
+    is a hundred thousand cells of a few rows each and the encode was
+    half the flush.  Anything else takes the general route: a numpy
+    object cell through zarr's own ``_encode_sync`` chain.
+    """
+    codecs = spec.codecs
+    if all(type(codec).__name__ == "ZstdCodec" for codec in codecs):
+        framed: Any = struct.pack("<II", 1, len(data)) + data
+        for codec in codecs:
+            framed = codec._zstd_codec.encode(framed)
+        return bytes(framed)
+
     from zarr_vectors.core._batch_reader import _VLEN_BYTES
 
     obj = np.empty(1, dtype=object)
     obj[0] = data
     buffer = spec.spec.prototype.buffer.from_bytes(_VLEN_BYTES.encode(obj))
-    for codec in spec.codecs:
+    for codec in codecs:
         buffer = codec._encode_sync(buffer, spec.spec)
     return bytes(buffer.to_bytes())
 

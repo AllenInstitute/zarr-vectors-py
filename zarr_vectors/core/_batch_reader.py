@@ -417,21 +417,46 @@ def _direct_read_many(
     Keys this array cannot hold are omitted, exactly as
     :func:`_direct_read` omits them.
     """
-    addressed = [(k, _direct_path(spec, k)) for k in chunk_keys]
-    wanted = [(k, path) for k, path in addressed if path is not None]
+    cache = _direct_read_plan([("", spec, chunk_keys)])
+    return [(k, cache[("", k)]) for k in chunk_keys if ("", k) in cache]
+
+
+def _direct_read_plan(
+    entries: list[tuple[str, _DirectSpec, list[str]]],
+) -> dict[tuple[str, str], bytes]:
+    """Read and decode the cells of several arrays as one job.
+
+    ``entries`` is ``[(array_name, spec, chunk_keys), ...]``; the result
+    is keyed ``(array_name, chunk_key)``, with keys an array cannot hold
+    omitted.
+
+    The files are pooled across every array, not per array.  The
+    per-array form crossed the parallel threshold only for a wide array,
+    and a links family is the opposite shape -- a graph store fanned out
+    into 1,691 offsets arrays of ~70 cells each, every one below the
+    threshold, and read its 120,000 files one after another: 533 s, of
+    which the decode was seconds.  Pooled, the same read is bounded by
+    the disk rather than by the slowest ``open``.
+    """
+    wanted: list[tuple[str, _DirectSpec, str, str]] = []
+    for array_name, spec, chunk_keys in entries:
+        for chunk_key in chunk_keys:
+            path = _direct_path(spec, chunk_key)
+            if path is not None:
+                wanted.append((array_name, spec, chunk_key, path))
     if not wanted:
-        return []
+        return {}
     if len(wanted) >= _PARALLEL_READ_MIN:
         raws = list(
-            _read_pool().map(_read_file, [path for _, path in wanted])
+            _read_pool().map(_read_file, [w[3] for w in wanted])
         )
     else:
-        raws = [_read_file(path) for _, path in wanted]
-    out: list[tuple[str, bytes]] = []
-    for (chunk_key, _path), raw in zip(wanted, raws):
+        raws = [_read_file(w[3]) for w in wanted]
+    out: dict[tuple[str, str], bytes] = {}
+    for (array_name, spec, chunk_key, _path), raw in zip(wanted, raws):
         data = _decode_direct(spec, raw)
         if data is not None:
-            out.append((chunk_key, data))
+            out[(array_name, chunk_key)] = data
     return out
 
 
@@ -497,12 +522,11 @@ def flush_prefetch(
             sync(_gather_plan(zarr_group._async_group, gathered, nodes))
         )
 
-    for array_name, chunk_keys in plan:
-        spec = direct.get(array_name)
-        if spec is None:
-            continue
-        for chunk_key, data in _direct_read_many(spec, list(chunk_keys)):
-            cache[(array_name, chunk_key)] = data
+    cache.update(_direct_read_plan([
+        (array_name, direct[array_name], list(chunk_keys))
+        for array_name, chunk_keys in plan
+        if array_name in direct
+    ]))
     return cache
 
 

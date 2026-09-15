@@ -33,7 +33,7 @@ Public surface mirrors the legacy :class:`FsGroup` for back-compat:
 from __future__ import annotations
 
 import warnings
-from collections.abc import Iterator, Sequence
+from collections.abc import Iterable, Iterator, Sequence
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Literal
@@ -413,6 +413,54 @@ class Group:
         _vlen_set_cell(sharded_arr, index, bytes(data))
         if record_presence:
             _record_nonempty_chunk(sharded_arr, chunk_key, present=bool(data))
+
+    def write_cells(
+        self,
+        array_name: str,
+        cells: Iterable[tuple[str, bytes]],
+        *,
+        record_presence: bool = True,
+    ) -> int:
+        """:meth:`write_bytes` for many cells of one array.
+
+        The node is resolved and the grid read once for the whole batch;
+        each cell then costs its coordinate check and, inside a
+        :meth:`batched_writes` block, one append to the queue.  A links
+        family writes a hundred thousand cells of a few rows each, and
+        the per-call overhead of the singular form was most of that
+        write.  Returns how many cells were written.
+        """
+        if array_name in (_VERTICES_ARRAY, _VERTEX_FRAGMENTS_ARRAY):
+            self._clear_fragments_tile()
+        sharded_arr = self._sharded_chunk_array(array_name)
+        if sharded_arr is None:
+            raise StoreError(
+                f"Cannot write to {array_name!r} in "
+                f"{self._zarr.path or '<root>'}: no chunk array at that "
+                f"path. Per-chunk arrays must be allocated first (see "
+                f"arrays._ensure_array_dir / create_sharded_chunk_array)."
+            )
+        origin = _grid_origin(sharded_arr)
+        shape = sharded_arr.shape
+        pending = self._pending_writes
+        n = 0
+        for chunk_key, data in cells:
+            coords = _parse_chunk_coords(chunk_key)
+            if coords is None:
+                raise StoreError(
+                    f"Cannot write to array {array_name!r}: "
+                    f"chunk_key {chunk_key!r} is not a coord tuple"
+                )
+            index = _coord_to_index(coords, origin)
+            _check_coords_in_bounds(index, shape, array_name)
+            n += 1
+            if pending is not None:
+                pending.append((array_name, chunk_key, bytes(data), record_presence))
+                continue
+            _vlen_set_cell(sharded_arr, index, bytes(data))
+            if record_presence:
+                _record_nonempty_chunk(sharded_arr, chunk_key, present=bool(data))
+        return n
 
     @contextmanager
     def batched_reads(
@@ -1494,6 +1542,118 @@ class Group:
         # the ``zarr.json`` we have in hand.
         if self._node_cache is not None:
             self._node_cache[self._full_path(array_name)] = arr
+
+    def create_sharded_chunk_arrays(
+        self,
+        arrays: Sequence[tuple[str, dict[str, Any] | None]],
+        grid_shape: tuple[int, ...],
+        *,
+        shard_shape: tuple[int, ...] | None = None,
+        origin: tuple[int, ...] | None = None,
+        compressors: list[dict[str, Any]] | None = None,
+        replace: Sequence[str] | set[str] = (),
+    ) -> None:
+        """:meth:`create_sharded_chunk_array` for several arrays at once.
+
+        One ``zarr.json`` per array still has to be written, but they are
+        independent, so they go out in one gather rather than through a
+        blocking ``sync()`` each -- which is the difference between
+        allocating a links family of 1,700 offsets arrays in a second and
+        in a minute.
+
+        ``arrays`` is ``[(array_name, attributes), ...]``; ``replace``
+        names those whose existing node must be dropped first (the
+        caller has looked, so this does not look again).
+        """
+        import asyncio
+
+        from zarr.core.sync import sync
+
+        if not arrays:
+            return
+        ndim = len(grid_shape)
+        if shard_shape is not None and len(shard_shape) != ndim:
+            raise StoreError(
+                f"shard_shape rank {len(shard_shape)} != grid_shape "
+                f"rank {ndim}"
+            )
+        # Every parent group first, once each: the arrays are created by
+        # path below, and a node created under a group that does not
+        # exist has no hierarchy to be found in.
+        for parent_path in sorted({name.rpartition("/")[0] for name, _ in arrays}):
+            if parent_path:
+                self._zarr.require_group(parent_path)
+        for array_name in replace:
+            parent_path, _, leaf = array_name.rpartition("/")
+            parent = self._zarr[parent_path] if parent_path else self._zarr
+            if leaf in parent:
+                del parent[leaf]
+
+        base_kwargs: dict[str, Any] = {
+            "shape": grid_shape,
+            "chunks": (1,) * ndim,
+            "dtype": "bytes",
+            "serializer": VLenBytesCodec(),
+            "compressors": list(compressors) if compressors else [],
+        }
+        if shard_shape is not None:
+            base_kwargs["shards"] = tuple(shard_shape)
+        base_attrs: dict[str, Any] = {_NONEMPTY_CHUNKS_ATTR: []}
+        if origin is not None and any(int(o) != 0 for o in origin):
+            base_attrs[_CHUNK_GRID_ORIGIN_ATTR] = [int(o) for o in origin]
+
+        for array_name, _ in arrays:
+            self._invalidate_node(array_name)
+
+        # The first array goes through zarr, which settles everything
+        # about the layout -- codecs, dtype, chunk grid -- into one
+        # metadata object.  Every other array in the batch IS that
+        # metadata with its own attributes, so the rest are written as
+        # their ``zarr.json`` directly, all in one gather, and wrapped in
+        # handles without a round-trip: what zarr's ``create_array`` does
+        # per array is parse the same arguments, probe the store for an
+        # existing node, and write the same document, which for a links
+        # family of 1,700 arrays was twelve seconds.
+        import dataclasses
+
+        from zarr.core.array import AsyncArray
+        from zarr.core.buffer import default_buffer_prototype
+
+        first_name, first_attributes = arrays[0]
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", UnstableSpecificationWarning)
+            first = self._zarr.create_array(
+                first_name,
+                **base_kwargs,
+                attributes={**base_attrs, **_json_safe(first_attributes or {})},
+            )
+        handles: list[tuple[str, zarr.Array]] = [(first_name, first)]
+        rest = arrays[1:]
+        if rest:
+            template = first.metadata
+            prototype = default_buffer_prototype()
+            store = self._zarr.store
+            puts: list[tuple[str, Any]] = []
+            for array_name, attributes in rest:
+                meta = dataclasses.replace(
+                    template,
+                    attributes={**base_attrs, **_json_safe(attributes or {})},
+                )
+                store_path = self._zarr.store_path / array_name
+                key = f"{store_path.path}/zarr.json" if store_path.path else "zarr.json"
+                puts.append((key, meta.to_buffer_dict(prototype)["zarr.json"]))
+                handles.append((
+                    array_name,
+                    zarr.Array(AsyncArray(metadata=meta, store_path=store_path)),
+                ))
+
+            async def _put_all() -> None:
+                await asyncio.gather(*(store.set(key, buf) for key, buf in puts))
+
+            sync(_put_all())
+        if self._node_cache is not None:
+            for array_name, handle in handles:
+                self._node_cache[self._full_path(array_name)] = handle
 
     def _lookup_node(self, path: str) -> zarr.Array | zarr.Group | None:
         """Return the Zarr node at ``path``, or ``None`` if absent.

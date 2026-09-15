@@ -781,6 +781,186 @@ def partition_arrays_by_offset(
     return out
 
 
+#: Endpoint counts the array partitioner handles.  Its permutation
+#: tables are ``L**L`` and ``L!`` entries; past this a record-shaped
+#: family is exotic enough that the per-record path is the right one.
+_MAX_ARRAY_LINK_WIDTH = 6
+
+
+def _lehmer_table(link_width: int) -> tuple[npt.NDArray[np.int64], npt.NDArray[np.int64]]:
+    """``(code_of, radix)`` such that ``code_of[sigma @ radix]`` is
+    :func:`_lehmer_encode` of the permutation ``sigma``.
+
+    ``sigma @ radix`` is ``sigma`` read as a base-``L`` number, which is
+    injective over permutations, so a table of ``L**L`` entries answers
+    every one of them with a gather.
+    """
+    import itertools
+
+    L = link_width
+    radix = (L ** np.arange(L - 1, -1, -1)).astype(np.int64)
+    table = np.full(L ** L, -1, dtype=np.int64)
+    for perm in itertools.permutations(range(L)):
+        table[int(np.dot(perm, radix))] = _lehmer_encode(perm)
+    return table, radix
+
+
+def partition_link_arrays(
+    chunks: npt.NDArray[np.int64],
+    vi: npt.NDArray[np.int64],
+    *,
+    link_width: int,
+    sid_ndim: int,
+    scale_src: Sequence[int],
+    scale_trg: Sequence[int],
+    directed: bool = False,
+    cross_level: bool = False,
+) -> dict[tuple[str, ChunkCoords], tuple[npt.NDArray[np.int64], npt.NDArray[np.int64]]]:
+    """:func:`partition_records_by_offset` for records held as arrays,
+    under ``store="canonical"``.
+
+    The general function spends about ten Python objects per record --
+    a list, its endpoint tuples, a sort key, a placement -- and a mesh
+    emits one record per face: 13 s of a 74 s write for half a million
+    faces, before a byte reached the store.  Every step of it is array
+    arithmetic: the placement is an argsort of each record's endpoints,
+    the permutation index a table gather, the anchor a floor-divide,
+    the offsets a subtraction, and the bucket a group-by.
+
+    Placement follows :func:`_cell_placements` exactly:
+
+    - ``cross_level``, ``directed``, and intra-chunk records keep the
+      input endpoint order (identity, ``perm_idx`` 0);
+    - otherwise the endpoints are sorted by ``(chunk_coords, vi)``, and
+      the record files under the lexicographically-positive offset once.
+
+    ``store="duplicate"`` is not covered -- one record files under
+    several cells there, which is the record function's business.
+
+    Args:
+        chunks: ``(M, L, sid_ndim)`` chunk coords of every endpoint.
+        vi: ``(M, L)`` chunk-local vertex index of every endpoint.
+        link_width: ``L``.
+        sid_ndim: Spatial index dimensionality.
+        scale_src, scale_trg: As :func:`partition_records_by_offset`.
+        directed: Keep input endpoint order for every record.
+        cross_level: ``delta != 0``; endpoint 0 leads unconditionally.
+
+    Returns:
+        ``{(offsets_segment, source_chunk): (rows, input_indices)}``.
+        ``rows`` is the ``(M_k, W)`` block the cell stores -- the placed
+        vertex indices, led by the ``perm_idx`` column exactly when
+        :func:`~zarr_vectors.core.arrays.links_has_perm` says the segment
+        carries one -- and ``input_indices`` says which input record each
+        row came from.  Rows keep their input order within a bucket.
+    """
+    chunks = np.asarray(chunks, dtype=np.int64)
+    vi = np.asarray(vi, dtype=np.int64)
+    L = int(link_width)
+    if chunks.ndim != 3 or chunks.shape[1:] != (L, sid_ndim):
+        raise ChunkingError(
+            f"partition_link_arrays: chunks has shape {chunks.shape}; "
+            f"expected (M, {L}, {sid_ndim})"
+        )
+    if vi.shape != chunks.shape[:2]:
+        raise ChunkingError(
+            f"partition_link_arrays: vi has shape {vi.shape}; expected "
+            f"{chunks.shape[:2]}"
+        )
+    if len(scale_src) != sid_ndim or len(scale_trg) != sid_ndim:
+        raise ChunkingError(
+            f"partition_link_arrays: scale_src/scale_trg rank "
+            f"{len(scale_src)}/{len(scale_trg)} != sid_ndim {sid_ndim}"
+        )
+    if L > _MAX_ARRAY_LINK_WIDTH:
+        raise ChunkingError(
+            f"partition_link_arrays: link_width {L} exceeds "
+            f"{_MAX_ARRAY_LINK_WIDTH}; use partition_records_by_offset"
+        )
+    n = int(vi.shape[0])
+    if n == 0:
+        return {}
+
+    # --- placement: which input endpoint leads, and in what order -----
+    intra = np.all(chunks == chunks[:, :1, :], axis=(1, 2))
+    if cross_level or directed or L == 1:
+        sigma = np.broadcast_to(np.arange(L, dtype=np.int64), (n, L))
+    else:
+        # The canonical order of each record's endpoints, by
+        # (chunk_coords, vi): one lexsort over every endpoint of every
+        # record with the record as primary key, stable like the sorted()
+        # it replaces.  Intra-chunk records keep input order, as
+        # _cell_placements does.
+        rec = np.repeat(np.arange(n, dtype=np.int64), L)
+        keys = [vi.reshape(-1)]
+        flat_chunks = chunks.reshape(-1, sid_ndim)
+        keys += [flat_chunks[:, d] for d in range(sid_ndim - 1, -1, -1)]
+        keys.append(rec)
+        order = np.lexsort(keys)
+        sigma = order.reshape(n, L) - (np.arange(n, dtype=np.int64) * L)[:, None]
+        sigma = np.where(intra[:, None], np.arange(L, dtype=np.int64)[None, :], sigma)
+
+    rowsel = np.arange(n, dtype=np.int64)[:, None]
+    placed_chunks = chunks[rowsel, sigma]          # (n, L, D)
+    placed_vi = vi[rowsel, sigma]                  # (n, L)
+    if cross_level or directed or L == 1:
+        perm = np.zeros(n, dtype=np.int64)
+    else:
+        table, radix = _lehmer_table(L)
+        perm = table[sigma @ radix]
+
+    # --- anchor and offsets -------------------------------------------
+    rs = np.asarray(scale_src, dtype=np.int64)
+    rt = np.asarray(scale_trg, dtype=np.int64)
+    src = placed_chunks[:, 0, :]
+    anchor = (src * rs) // rt
+    offsets = placed_chunks[:, 1:, :] - anchor[:, None, :]   # (n, L-1, D)
+
+    # --- group by (source chunk, offsets) -----------------------------
+    key = np.concatenate([src, offsets.reshape(n, -1)], axis=1)
+    order = np.lexsort(key.T[::-1])
+    key_sorted = key[order]
+    starts = np.flatnonzero(
+        np.concatenate((
+            [True], np.any(key_sorted[1:] != key_sorted[:-1], axis=1),
+        ))
+    )
+    ends = np.append(starts[1:], n)
+
+    placed_vi = placed_vi[order]
+    perm = perm[order]
+    out: dict[
+        tuple[str, ChunkCoords], tuple[npt.NDArray[np.int64], npt.NDArray[np.int64]]
+    ] = {}
+    segments: dict[tuple[int, ...], tuple[str, bool]] = {}
+    # Every group's key as Python ints in one conversion; a line store
+    # has a bucket per cell, a hundred thousand of them, and converting
+    # each head element by element was most of this function.
+    heads = key_sorted[starts].tolist()
+    for head, start, end in zip(heads, starts.tolist(), ends.tolist()):
+        src_chunk = tuple(head[:sid_ndim])
+        flat_offsets = tuple(head[sid_ndim:])
+        seg = segments.get(flat_offsets)
+        if seg is None:
+            offset_tuples = tuple(
+                flat_offsets[k * sid_ndim:(k + 1) * sid_ndim] for k in range(L - 1)
+            )
+            is_intra = not any(flat_offsets)
+            # The perm column exists exactly where links_has_perm says:
+            # never intra, never cross-level or directed, else always.
+            has_perm = not (is_intra or cross_level or directed)
+            seg = (format_offsets(offset_tuples), has_perm)
+            segments[flat_offsets] = seg
+        segment, has_perm = seg
+        rows = placed_vi[start:end]
+        if has_perm:
+            rows = np.concatenate([perm[start:end, None], rows], axis=1)
+        out[(segment, src_chunk)] = (
+            np.ascontiguousarray(rows), order[start:end],
+        )
+    return out
+
+
 # ===================================================================
 # Vertex assignment helpers
 # ===================================================================
@@ -871,7 +1051,13 @@ def chunk_local_to_global_offsets(
     """
     # Imported lazily to avoid circular import with core.arrays which
     # depends on this module's other helpers.
-    from zarr_vectors.core.arrays import _infer_vert_ndim, list_chunk_keys
+    from zarr_vectors.constants import VERTICES
+    from zarr_vectors.core.arrays import (
+        _chunk_key,
+        _infer_vert_ndim,
+        _maybe_batched_reads,
+        list_chunk_keys,
+    )
 
     chunk_keys = list_chunk_keys(level_group)
     offsets: dict[ChunkCoords, int] = {}
@@ -886,17 +1072,20 @@ def chunk_local_to_global_offsets(
     ndim_meta = int(ndim) if ndim else _infer_vert_ndim(level_group)
     row_size = ndim_meta * itemsize
 
-    for cc in chunk_keys:
-        # Derive total vertex count from the vertices/<key> blob size.
-        from zarr_vectors.constants import VERTICES
-        from zarr_vectors.core.arrays import _chunk_key  # local: tight loop
-        try:
-            raw = level_group.read_bytes(VERTICES, _chunk_key(cc))
-            count = len(raw) // row_size if row_size else 0
-        except Exception:
-            count = 0
-        offsets[cc] = running
-        running += int(count)
+    # Every cell in one prefetch: sizing a level by reading its cells one
+    # at a time was 10 s of a 30 s pyramid, and this runs several times
+    # per build.
+    keys = [_chunk_key(cc) for cc in chunk_keys]
+    with _maybe_batched_reads(level_group, [(VERTICES, keys)]):
+        for cc, key in zip(chunk_keys, keys):
+            # Derive total vertex count from the vertices/<key> blob size.
+            try:
+                raw = level_group.read_bytes(VERTICES, key)
+                count = len(raw) // row_size if row_size else 0
+            except Exception:
+                count = 0
+            offsets[cc] = running
+            running += int(count)
     return offsets, chunk_keys, running
 
 

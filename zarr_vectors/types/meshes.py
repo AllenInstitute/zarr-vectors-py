@@ -39,9 +39,10 @@ from zarr_vectors.core.arrays import (
     create_object_attributes_array,
     create_object_index_array,
     create_vertices_array,
+    link_endpoints_to_rows,
     list_link_offsets,
     read_chunk_vertices,
-    read_links,
+    read_link_arrays,
     resolve_chunk_keys,
     stamp_fragments_tile,
     write_chunk_attributes,
@@ -288,14 +289,13 @@ def write_mesh(
     else:
         store_rows = np.arange(n_faces, dtype=np.int64)
 
-    # Records stay in face order, which ``partition_records_by_offset``
-    # preserves within each cell.
-    link_records: list[list[tuple[ChunkCoords, int]]] = [
-        [(chunk_list[ci], li) for ci, li in zip(row_chunks, row_locals)]
-        for row_chunks, row_locals in zip(
-            f_chunk[store_rows].tolist(), f_local[store_rows].tolist(),
-        )
-    ]
+    # Records stay in face order, which the partitioner preserves within
+    # each cell.  Held as arrays -- ``(F, L, D)`` endpoint chunks and
+    # ``(F, L)`` local indices -- rather than one list of tuples per
+    # face: building those and taking them apart again was 3 s of a
+    # half-million-face write before anything was partitioned.
+    link_chunks = np.asarray(chunk_list, dtype=np.int64)[f_chunk[store_rows]]
+    link_vi = f_local[store_rows]
 
     # Write vertices per chunk (one fragment per chunk for simplicity)
     object_manifests: dict[int, ObjectManifest] = {}
@@ -380,10 +380,10 @@ def write_mesh(
         # local_vertex_idx)`` endpoints, and ``write_links`` routes it to
         # the offsets array naming where those endpoints sit.  Winding is
         # recovered on read from ``perm_idx``, so the family is undirected.
-        if link_records:
+        if len(link_vi):
             write_links(
-                level_group, link_records, idx_ndim, delta=0,
-                link_width=link_width,
+                level_group, [], idx_ndim, delta=0,
+                link_width=link_width, _arrays=(link_chunks, link_vi),
             )
         # Backstop: `arrays_present` advertises the family, and the
         # per-cell editors in ops/ write into an array that must already
@@ -608,21 +608,13 @@ def _read_mesh(
         # face touching a chunk outside ``chunk_keys`` has no offset and is
         # dropped, which is what applies the bbox/chunks filter to faces.
         all_faces: list[npt.NDArray] = []
-        face_rows: list[list[int]] = []
-        for face in read_links(level_group, delta=0):
-            if len(face) != link_width:
-                continue  # not a face record (e.g. edge-arity, ignore)
-            vertex_ids: list[int] = []
-            for cc, local_idx in face:
-                offset = chunk_offsets.get(cc)
-                if offset is None:
-                    vertex_ids = []
-                    break
-                vertex_ids.append(offset + int(local_idx))
-            if len(vertex_ids) == link_width:
-                face_rows.append(vertex_ids)
-        if face_rows:
-            all_faces.append(np.asarray(face_rows, dtype=np.int64))
+        # As arrays, not one tuple per face: the remap is a gather.
+        face_chunks, face_vi = read_link_arrays(level_group, delta=0)
+        if face_vi.shape[0] and face_vi.shape[1] == link_width:
+            rows = link_endpoints_to_rows(face_chunks, face_vi, chunk_offsets)
+            keep = (rows >= 0).all(axis=1)
+            if keep.any():
+                all_faces.append(rows[keep])
 
         if all_faces:
             faces_out = np.concatenate(all_faces, axis=0)
