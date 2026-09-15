@@ -312,6 +312,21 @@ class ChunkFragmentIndex:
             and np.array_equal(ends[:-1], starts[1:])
         )
 
+    def ranges(self) -> npt.NDArray[np.int64] | None:
+        """The ``(F, 2)`` ``(start, count)`` table when *every* fragment
+        is a range, else ``None``.
+
+        The whole-index form of :meth:`range`.  A reader slicing every
+        fragment of a chunk -- 64 bins per chunk, a thousand chunks --
+        pays a bit test, a prefix lookup and two ``int()`` calls per
+        fragment through the per-fragment accessor; with this it walks
+        two lists.  ``None`` sends it to the general per-fragment path,
+        which stays the definition.
+        """
+        if self.num_explicit_fragments or self._range_table.shape[0] != self.num_fragments:
+            return None
+        return self._range_table
+
     def is_range(self, f: int) -> bool:
         """Return True if fragment ``f`` is a contiguous range.
 

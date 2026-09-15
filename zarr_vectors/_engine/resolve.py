@@ -51,6 +51,11 @@ __all__ = ["LevelContext", "resolve"]
 # Arrays every geometry read touches, in the order a reader touches them.
 _CORE_ARRAYS = (VERTICES, VERTEX_FRAGMENTS)
 
+# The row -> object id table under ``object_index/`` --
+# ``core.arrays.OBJECT_IDS_ARRAY``, spelled here so this module keeps
+# depending on constants alone.
+_OBJECT_IDS_TABLE = "object_ids"
+
 
 @dataclass(frozen=True, slots=True)
 class LevelContext:
@@ -95,12 +100,22 @@ class _Wanted:
     listings: tuple[str, ...] = field(default=())
 
 
-def _arrays_for(ctx: LevelContext, attributes: Sequence[str] | str) -> _Wanted:
+def _arrays_for(
+    ctx: LevelContext, attributes: Sequence[str] | str, *, by_object: bool = False,
+) -> _Wanted:
     """The arrays a read of this level touches.
 
     Attributes are included only when asked for.  ``read_points`` returns
     none unless named, so requesting every attribute array by default
     would fetch data the reader will then not even decode.
+
+    A read scoped by object does not take the manifests whole.  It wants
+    the rows of the ids it names, and those it discovers on the first
+    pass (see ``Group.read_vlen_elements``) and fetches by coordinate
+    selection -- the difference between reading 200 of 21 million
+    manifests and reading all of them.  What it does take whole is the
+    id table, which maps those ids to rows and is one integer per
+    object.
     """
     arrays = list(_CORE_ARRAYS)
     if attributes == "all":
@@ -112,7 +127,10 @@ def _arrays_for(ctx: LevelContext, attributes: Sequence[str] | str) -> _Wanted:
         ]
     whole = []
     if ctx.has_object_index:
-        whole.append(ctx.path(OBJECT_INDEX, "manifests"))
+        if by_object:
+            whole.append(ctx.path(OBJECT_INDEX, _OBJECT_IDS_TABLE))
+        else:
+            whole.append(ctx.path(OBJECT_INDEX, "manifests"))
     return _Wanted(arrays=tuple(arrays), whole_arrays=tuple(whole))
 
 
@@ -198,7 +216,14 @@ def resolve(selection: Any, ctx: LevelContext) -> ReadPlan:
         say so and the executor will fetch it — but every cell it does
         name is one the read is very likely to need.
     """
-    wanted = _arrays_for(ctx, getattr(selection, "attributes", "all"))
+    by_object = (
+        getattr(selection, "objects", None) is not None
+        or getattr(selection, "groups", None) is not None
+    )
+    wanted = _arrays_for(
+        ctx, getattr(selection, "attributes", "all"),
+        by_object=by_object and ctx.has_object_index,
+    )
     plan = ReadPlan.of(
         nodes=[ctx.prefix],
         arrays=wanted.whole_arrays,
@@ -235,6 +260,16 @@ def resolve(selection: Any, ctx: LevelContext) -> ReadPlan:
         cells = _cells_in_bbox(ctx, bbox) if bbox is not None else None
 
     if cells is None:
+        if by_object and ctx.has_object_index:
+            # Scoped by the manifests, not by the grid: which cells an
+            # object read touches is written in the object index, and the
+            # reader names them -- all of them, in one plan -- once it
+            # has read the manifests.  Fanning out here instead read the
+            # entire level to answer for one object: 3.8 s per
+            # ``level.objects[i]`` on a million-point store, the same as
+            # reading everything.  The nodes are still resolved, so the
+            # reader has its metadata and the fetcher its grid.
+            return plan.merge(ReadPlan.of(nodes=[ctx.path(a) for a in wanted.arrays]))
         # Nothing narrows the read, or the grid is not declared. Fan out
         # and take the whole level in one round-trip, which is what a
         # full read wants anyway.

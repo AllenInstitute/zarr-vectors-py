@@ -32,6 +32,8 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
+import numpy as np
+
 from zarr_vectors.constants import OBJECT_ATTRIBUTES
 from zarr_vectors.exceptions import EditError
 from zarr_vectors.ops.change_set import VacuumReport
@@ -56,12 +58,6 @@ def vacuum(
     :class:`NotImplementedError` so callers can pin the kwarg shape
     against the future API.
     """
-    if drop_empty_fragments:
-        raise NotImplementedError(
-            "vacuum(drop_empty_fragments=True): tombstone-fragment GC is "
-            "deferred to a future iteration; please run vacuum() with "
-            "drop_empty_fragments=False (the default) for now."
-        )
     if dedup_parallel_rows:
         raise NotImplementedError(
             "vacuum(dedup_parallel_rows=True): parallel-row dedup is "
@@ -90,6 +86,9 @@ def vacuum(
     meta = RootMetadata.from_dict(root.attrs.to_dict())
     sid_ndim = meta.sid_ndim
 
+    if drop_empty_fragments:
+        _report_unreferenced_fragments(root, report, dry_run=dry_run)
+
     for level in list_resolution_levels(root):
         level_group = get_resolution_level(root, level)
         try:
@@ -100,10 +99,15 @@ def vacuum(
         if n == 0:
             continue
 
-        # The ids that still hold geometry. Enumerating gave rows, which
-        # are the same thing only while a level numbers its objects
-        # densely from zero.
-        live_oids = [int(o) for o, m in zip(ids.tolist(), manifests) if m]
+        # The ids that still hold geometry, with the row each came from.
+        # Enumerating gave rows, which are the same thing only while a
+        # level numbers its objects densely from zero.
+        live = [
+            (int(o), row)
+            for row, (o, m) in enumerate(zip(ids.tolist(), manifests))
+            if m
+        ]
+        live_oids = [oid for oid, _row in live]
         if len(live_oids) == n:
             # Already dense — no remap needed at this level.  We still
             # carry the identity through so downstream consumers can
@@ -114,9 +118,9 @@ def vacuum(
 
         # Build the remap and the new dense manifest list.
         new_manifests: dict[int, list[tuple[tuple, int]]] = {}
-        for new_oid, old_oid in enumerate(live_oids):
+        for new_oid, (old_oid, row) in enumerate(live):
             report.oid_remap[int(old_oid)] = int(new_oid)
-            new_manifests[new_oid] = manifests[old_oid]
+            new_manifests[new_oid] = manifests[row]
 
         if dry_run:
             continue
@@ -140,10 +144,14 @@ def vacuum(
                     # Mis-sized array (e.g. partially written): skip
                     # rather than corrupt.
                     continue
-                new_arr = arr[live_oids]
+                # Attribute columns are row-indexed, so they compact by
+                # row -- the surviving ids name which objects those rows
+                # belong to, not where they sit.
+                live_rows = [row for _oid, row in live]
+                new_arr = arr[live_rows]
                 mask = read_object_attribute_present_mask(level_group, name)
                 if mask is not None and mask.shape[0] == n:
-                    new_mask = mask[live_oids]
+                    new_mask = mask[live_rows]
                 else:
                     new_mask = None
                 write_object_attributes(
@@ -159,3 +167,44 @@ def vacuum(
 # Silence unused-import warnings for type-only re-exports.
 _ = EditError
 __all__ = ["vacuum", "VacuumReport"]
+
+
+def _report_unreferenced_fragments(
+    root: Group,
+    report: VacuumReport,
+    *,
+    dry_run: bool,
+) -> None:
+    """Record fragments no object references, per level and chunk.
+
+    This pass was `NotImplementedError` for want of a reverse index: the
+    question "does anything reference this fragment" could only be
+    answered by decoding every manifest in the level. The
+    ``fragment_attributes/object_id`` column answers it directly, so the
+    pass builds the same inversion once and reports what it finds.
+
+    It reports rather than rewrites. Removing a fragment renumbers every
+    later fragment in its chunk, which invalidates every manifest entry
+    and every chunk-local link index pointing past it -- a rewrite of
+    the level, not a deletion. Naming the dead weight is the useful and
+    safe half; reclaiming it belongs with the rechunk path that already
+    rewrites levels wholesale.
+    """
+    from zarr_vectors.core.arrays import (
+        FRAGMENT_OWNER_NONE,
+        build_fragment_owner_column,
+    )
+    from zarr_vectors.core.store import get_resolution_level, list_resolution_levels
+
+    for level in list_resolution_levels(root):
+        level_group = get_resolution_level(root, level)
+        try:
+            owners = build_fragment_owner_column(level_group)
+        except Exception:
+            continue
+        for cc, column in sorted(owners.items()):
+            dead = np.flatnonzero(np.asarray(column) == FRAGMENT_OWNER_NONE)
+            if dead.size:
+                report.dropped_fragments_per_chunk[(level, cc)] = [
+                    int(i) for i in dead
+                ]

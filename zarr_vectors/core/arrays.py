@@ -3759,14 +3759,135 @@ def read_chunk_vertices(
     if fi.num_fragments == 0:
         return []
     full = _reshape_vertex_buffer(raw, dtype, ndim)
-    groups: list[npt.NDArray[np.floating]] = []
-    for f in range(fi.num_fragments):
-        if fi.is_range(f):
-            start, count = fi.range(f)
-            groups.append(full[start : start + count])
-        else:
-            groups.append(full[fi.indices(f)])
-    return groups
+    return _partition_rows(full, fi)
+
+
+def _partition_rows(
+    full: npt.NDArray, fi: ChunkFragmentIndex,
+) -> list[npt.NDArray]:
+    """``full`` cut into one array per fragment, in fragment order.
+
+    Range fragments are views; explicit ones are gathers.  When every
+    fragment is a range the two lists come off the range table whole
+    rather than through a per-fragment accessor -- see
+    :meth:`ChunkFragmentIndex.ranges`.
+    """
+    table = fi.ranges()
+    if table is not None:
+        return [
+            full[start : start + count]
+            for start, count in zip(table[:, 0].tolist(), table[:, 1].tolist())
+        ]
+    return [fragment_rows(full, fi, f) for f in range(fi.num_fragments)]
+
+
+def fragment_rows(
+    full: npt.NDArray, fi: ChunkFragmentIndex, f: int,
+) -> npt.NDArray:
+    """The rows of fragment ``f`` from a per-vertex buffer ``full``.
+
+    ``full`` is any array whose leading axis is the chunk's vertex rows
+    -- the ``(N, D)`` positions, or an attribute's ``(N, width)`` -- and
+    this is the one place the fragment-to-rows rule lives: a range
+    fragment is a contiguous slice, an explicit one a gather.
+    """
+    if fi.is_range(f):
+        start, count = fi.range(f)
+        return full[start : start + count]
+    return full[fi.indices(f)]
+
+
+def attribute_buffer(
+    raw: bytes,
+    fi: ChunkFragmentIndex,
+    dtype: np.dtype,
+    *,
+    what: str = "attribute",
+) -> npt.NDArray | None:
+    """One per-vertex attribute cell as its ``(n_vertices, width)`` buffer.
+
+    Per-vertex attributes are one row per underlying vertex, aligned 1:1
+    with the ``vertices`` buffer, so the row count is the fragment
+    index's vertex extent and the width falls out of the byte length.
+    ``None`` for a cell with no rows.
+
+    Raises:
+        ArrayError: If the bytes do not divide into that many rows.
+    """
+    itemsize = dtype.itemsize
+    total_elements = len(raw) // itemsize if itemsize else 0
+    n_vertices = _fragment_vertex_extent(fi)
+    if n_vertices <= 0 or total_elements == 0:
+        return None
+    if total_elements % n_vertices != 0:
+        raise ArrayError(
+            f"{what} has {total_elements} elements, not a multiple of its "
+            f"{n_vertices} vertices; per-vertex attributes must align 1:1 "
+            "with the vertices array."
+        )
+    return np.frombuffer(raw, dtype=dtype).reshape(n_vertices, total_elements // n_vertices)
+
+
+def shape_attribute_rows(rows: npt.NDArray, ncols: int) -> npt.NDArray:
+    """Rows from :func:`attribute_buffer`, in the shape a caller asked
+    for: flat for ``ncols == 1``, ``(N, ncols)`` otherwise -- the
+    historical ``decode_ragged_floats`` contract."""
+    flat = np.ascontiguousarray(rows).reshape(-1)
+    return flat if ncols == 1 else flat.reshape(-1, ncols)
+
+
+def read_chunk_attribute_rows(
+    level_group: Group,
+    attr_name: str,
+    chunk_coords: ChunkCoords,
+    dtype: np.dtype | str | None = None,
+    ncols: int | None = None,
+) -> npt.NDArray:
+    """Every fragment's attribute rows from one chunk, concatenated in
+    fragment order.
+
+    The attribute twin of :func:`read_chunk_vertex_rows`, and for the
+    same reason: a bulk reader that concatenates
+    :func:`read_chunk_attributes` pays for a 64-way partition it then
+    undoes, on every chunk, for every attribute.  When the fragments
+    tile the buffer -- the layout every bulk writer produces -- the
+    concatenation *is* the buffer and it is returned whole.  Anything
+    else falls back to partition-and-concatenate, so the rows are
+    exactly those the per-fragment reader would have returned, in the
+    same order.
+
+    Returns an empty array for a chunk with no fragments or no rows.
+    """
+    key = _chunk_key(chunk_coords)
+    full_name = f"{VERTEX_ATTRIBUTES}/{attr_name}"
+    dtype, ncols = _resolve_attribute_layout(level_group, full_name, dtype, ncols)
+
+    with _maybe_batched_reads(level_group, [
+        (full_name, [key]),
+        (VERTEX_FRAGMENTS, [key]),
+    ]):
+        try:
+            raw = level_group.read_bytes(full_name, key)
+        except Exception as e:
+            raise ArrayError(
+                f"Cannot read attribute '{attr_name}' chunk {key}: {e}"
+            ) from e
+        fi = read_vertex_fragment_index(level_group, chunk_coords)
+
+    empty = np.empty((0,) if ncols == 1 else (0, ncols), dtype=dtype)
+    if fi.num_fragments == 0:
+        return empty
+    full = attribute_buffer(
+        raw, fi, dtype, what=f"Attribute '{attr_name}' chunk {key}",
+    )
+    if full is None:
+        return empty
+    if fi.tiles(full.shape[0]):
+        return shape_attribute_rows(full, ncols)
+    parts = _partition_rows(full, fi)
+    return shape_attribute_rows(
+        np.concatenate(parts, axis=0) if parts else full[:0], ncols,
+    )
 
 
 def chunk_fragments_tile(
@@ -4437,30 +4558,15 @@ def read_chunk_attributes(
     # gathered group is finally flattened and re-shaped to honour the
     # caller's ``ncols`` (ncols=1 yields a flat 1-D array), matching the
     # historical decode_ragged_floats contract.
-    itemsize = dtype.itemsize
-    total_elements = len(raw) // itemsize if itemsize else 0
-    n_vertices = _fragment_vertex_extent(fi)
-    if n_vertices <= 0 or total_elements == 0:
+    full = attribute_buffer(
+        raw, fi, dtype, what=f"Attribute '{attr_name}' chunk {key}",
+    )
+    if full is None:
         empty = np.empty((0,) if ncols == 1 else (0, ncols), dtype=dtype)
         return [empty for _ in range(fi.num_fragments)]
-    if total_elements % n_vertices != 0:
-        raise ArrayError(
-            f"Attribute '{attr_name}' chunk {key} has {total_elements} "
-            f"elements, not a multiple of its {n_vertices} vertices; "
-            "per-vertex attributes must align 1:1 with the vertices array."
-        )
-    width = total_elements // n_vertices
-    full = np.frombuffer(raw, dtype=dtype).reshape(n_vertices, width)
-    groups: list[npt.NDArray] = []
-    for f in range(fi.num_fragments):
-        if fi.is_range(f):
-            start, count = fi.range(f)
-            rows = full[start : start + count]
-        else:
-            rows = full[fi.indices(f)]
-        flat = np.ascontiguousarray(rows).reshape(-1)
-        groups.append(flat if ncols == 1 else flat.reshape(-1, ncols))
-    return groups
+    return [
+        shape_attribute_rows(rows, ncols) for rows in _partition_rows(full, fi)
+    ]
 
 
 def read_attribute_fragment(
@@ -4806,6 +4912,113 @@ def read_all_object_manifests(
         expand_manifest_blocks(decode_object_manifest_blocks(b, sid_ndim=sid_ndim))
         for b in blobs
     ]
+
+
+#: Fragment-attribute column naming the object that owns each fragment.
+#:
+#: ``constants.FRAGMENT_ATTRIBUTES`` already reserves this: "including
+#: parent-IDs (e.g. an ``object_id`` fragment attribute carrying the OID
+#: that owns each fragment)".  Writing it makes "which objects reference
+#: this fragment" a single cell read rather than a decode of every
+#: manifest in the level.
+FRAGMENT_OWNER_ATTR = "object_id"
+
+#: Owner value meaning "more than one object references this fragment".
+#:
+#: Shared fragments are a declared capability (``CAP_SHARED_FRAGMENTS``),
+#: so one int64 cannot always name the owner.  It is deliberately not
+#: ``-1``, which already means "no parent" in the cross-level tables --
+#: reusing it would make an unowned fragment and a jointly-owned one
+#: indistinguishable.
+FRAGMENT_OWNER_SHARED = -2
+
+#: Owner value for a fragment no object references.
+FRAGMENT_OWNER_NONE = -1
+
+
+def build_fragment_owner_column(
+    level_group: Group,
+) -> dict[ChunkCoords, npt.NDArray[np.int64]]:
+    """The owning object id of every fragment, per chunk.
+
+    Derived from the manifests, which is the only place the relation is
+    recorded today.  Writing the result as a
+    ``fragment_attributes/object_id`` column is what turns the reverse
+    question into a read: without it, every caller that asks "which
+    objects reference this fragment" rebuilds this whole inversion in
+    memory, and four separate places in this package do exactly that.
+
+    A fragment named by more than one object is marked
+    :data:`FRAGMENT_OWNER_SHARED` rather than given one of its owners,
+    so a reader knows to consult the manifests instead of trusting a
+    half-truth.
+    """
+    ids, manifests = read_object_manifest_rows(level_group)
+    counts: dict[ChunkCoords, int] = {}
+    for manifest in manifests:
+        for cc, fi in manifest:
+            key = tuple(int(c) for c in cc)
+            counts[key] = max(counts.get(key, 0), int(fi) + 1)
+    owners = {
+        cc: np.full(n, FRAGMENT_OWNER_NONE, dtype=np.int64)
+        for cc, n in counts.items()
+    }
+    for oid, manifest in zip(ids.tolist(), manifests):
+        for cc, fi in manifest:
+            col = owners[tuple(int(c) for c in cc)]
+            current = int(col[int(fi)])
+            if current == FRAGMENT_OWNER_NONE:
+                col[int(fi)] = int(oid)
+            elif current != int(oid):
+                col[int(fi)] = FRAGMENT_OWNER_SHARED
+    return owners
+
+
+def write_fragment_owner_column(level_group: Group) -> int:
+    """Materialise :func:`build_fragment_owner_column` on the level.
+
+    Returns the number of fragments recorded.  Safe to re-run; it
+    rewrites whatever it finds.
+    """
+    owners = build_fragment_owner_column(level_group)
+    if not owners:
+        return 0
+    total = 0
+    create_fragment_attribute_array(
+        level_group, FRAGMENT_OWNER_ATTR, dtype="int64", exist_ok=True,
+    )
+    with level_group.batched_writes():
+        for cc, column in sorted(owners.items()):
+            write_chunk_fragment_attributes(
+                level_group, FRAGMENT_OWNER_ATTR, cc, column, dtype=np.int64,
+            )
+            total += int(column.size)
+    return total
+
+
+def read_fragment_owners(
+    level_group: Group,
+    chunk_coords: ChunkCoords,
+    fragment_index: int,
+) -> list[int] | None:
+    """Object ids referencing one fragment, or ``None`` if not recorded.
+
+    ``None`` means the level carries no owner column, or the fragment is
+    marked shared -- in both cases the caller must fall back to scanning
+    the manifests, which is what it did before this column existed.
+    """
+    try:
+        column = read_chunk_fragment_attributes(
+            level_group, FRAGMENT_OWNER_ATTR, chunk_coords, dtype=np.int64,
+        )
+    except Exception:
+        return None
+    if column is None or int(fragment_index) >= len(column):
+        return None
+    owner = int(np.asarray(column).reshape(-1)[int(fragment_index)])
+    if owner == FRAGMENT_OWNER_SHARED:
+        return None
+    return [] if owner == FRAGMENT_OWNER_NONE else [owner]
 
 
 def read_object_manifest_rows(

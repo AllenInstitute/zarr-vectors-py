@@ -70,6 +70,16 @@ _LEVEL_META_KEY = "zarr_vectors_level"
 # of them wrongly.
 _ABSENT = object()
 
+# Miss tags the offline session writes for a *planned* cell and for one
+# row of a standalone array.  ``_engine.plan.from_misses`` reads them
+# back (it keeps its own copies of the literals: importing it here would
+# be a cycle).  A planned cell is one a reader's prefetch plan named --
+# it is fetched exactly, with no fan-out to the rest of its array,
+# which is what lets an object read cost the object rather than the
+# level.  A bare ``(array, key)`` pair stays the discovery form.
+_MISS_CELL = "cell"
+_MISS_ROW = "row"
+
 
 class _OfflineSession:
     """The snapshot an offline read is served from, shared by a Group and
@@ -446,12 +456,25 @@ class Group:
             raise StoreError("batched_reads() does not support nesting")
         if self._offline is not None:
             # Under offline_reads (the async prime-and-replay path used by
-            # aio.read_async), the chunks this plan would prefetch are already in
-            # the session, and read_bytes serves them from there -- so the sync
-            # prefetch is redundant. It is also unavailable: flush_prefetch calls
-            # sync(), which under Pyodide needs WebAssembly stack switching
-            # (JSPI). Skip it; any genuine miss is recorded by the offline
-            # session and fetched by the next aio round.
+            # aio.read_async and the engine), the chunks this plan would
+            # prefetch are served from the session -- so the sync
+            # prefetch is redundant. It is also unavailable: flush_prefetch
+            # calls sync(), which under Pyodide needs WebAssembly stack
+            # switching (JSPI).
+            #
+            # What a plan IS good for offline is saying, all at once, what
+            # the snapshot still lacks.  Left to ``read_bytes`` the reader
+            # would surface one missing cell per round -- the first one it
+            # touched -- and a level with more cells than the round limit
+            # never converged.  So every planned cell the session cannot
+            # serve is recorded here as a *planned* miss, tagged so the
+            # next round fetches exactly those cells and does not fan out
+            # to every cell of their arrays, and the pass is abandoned
+            # immediately rather than decoding what it already knows it
+            # cannot finish.  Cells the snapshot has confirmed absent, or
+            # whose array is known to be a group or missing, are not
+            # misses: asking for those again would learn nothing.
+            self._record_planned_misses(plan)
             yield
             return
         from zarr_vectors.core._batch_reader import flush_prefetch
@@ -477,6 +500,41 @@ class Group:
             yield
         finally:
             self._prefetch_cache = None
+
+    def _record_planned_misses(self, plan: list[tuple[str, list[str]]]) -> None:
+        """Record every planned cell the offline session cannot serve.
+
+        See :meth:`batched_reads`.  Raises :class:`StoreError` once the
+        misses are recorded, which is the signal the replay loop acts
+        on; a plan the session fully covers returns normally.
+        """
+        offline = self._offline
+        if offline is None:
+            return
+        absent = getattr(offline, "absent", ())
+        chunks = offline.chunks
+        missing: list[tuple[str, str]] = []
+        unresolved: list[str] = []
+        for name, keys in plan:
+            full = self._full_path(name)
+            node = offline.nodes.get(full)
+            if node is _ABSENT or (node is not None and not isinstance(node, zarr.Array)):
+                # Not a chunk array: nothing there can ever be a cell.
+                continue
+            if node is None:
+                unresolved.append(full)
+            for key in keys:
+                cell = (full, key)
+                if cell not in chunks and cell not in absent:
+                    missing.append(cell)
+        if not missing:
+            return
+        offline.misses.update(unresolved)
+        offline.misses.update((_MISS_CELL, a, k) for a, k in missing)
+        raise StoreError(
+            f"Offline read: {len(missing)} planned cell(s) are not in the "
+            f"prefetched snapshot (first: {missing[0]!r})."
+        )
 
     @contextmanager
     def cached_nodes(self) -> Iterator[None]:
@@ -1266,12 +1324,41 @@ class Group:
         distinction is moot: the snapshot holds the array entire, and
         this just indexes into it.
         """
-        cached = self._offline_array(path)
-        if cached is not None:
-            return _vlen_region_to_bytes(cached[index:index + 1])
+        offline = self._offline_rows(path, [int(index)])
+        if offline is not None:
+            return offline[0]
         node = self._require_array_node(path)
         # Slice-then-extract, never scalar-index: see core._vlen.
         return _vlen_region_to_bytes(node[index:index + 1])
+
+    def _offline_rows(self, path: str, indices: Sequence[int]) -> list[bytes] | None:
+        """``indices`` of the vlen array at ``path`` from the offline
+        snapshot, or ``None`` when not offline.
+
+        Served from the whole array when the snapshot holds it, else from
+        the rows a fetch selected -- which is what keeps a by-id read of
+        twenty-one million manifests from reading twenty-one million
+        manifests.  A row the snapshot lacks records a *row* miss, so the
+        next round fetches exactly those rows by coordinate selection,
+        and then raises: same contract as :meth:`_offline_array`.
+        """
+        offline = self._offline
+        if offline is None:
+            return None
+        full = self._full_path(path)
+        whole = offline.arrays.get(full)
+        if whole is not None:
+            return [_vlen_region_to_bytes(whole[i:i + 1]) for i in indices]
+        held = getattr(offline, "rows", None)
+        known = held.get(full, {}) if held else {}
+        missing = [int(i) for i in indices if int(i) not in known]
+        if not missing:
+            return [bytes(known[int(i)]) for i in indices]
+        offline.misses.update((_MISS_ROW, full, i) for i in missing)
+        raise StoreError(
+            f"Offline read of {len(missing)} row(s) of {full!r}: not in the "
+            f"prefetched snapshot."
+        )
 
     def read_vlen_elements(self, path: str, indices: Sequence[int]) -> list[bytes]:
         """Read MANY elements of the vlen-bytes array at ``path``, at once.
@@ -1288,9 +1375,9 @@ class Group:
         """
         if not len(indices):
             return []
-        cached = self._offline_array(path)
-        if cached is not None:
-            return [_vlen_region_to_bytes(cached[i:i + 1]) for i in indices]
+        offline = self._offline_rows(path, indices)
+        if offline is not None:
+            return offline
         node = self._require_array_node(path)
         idx = np.asarray(indices, dtype=np.int64)
         try:

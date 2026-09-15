@@ -171,12 +171,16 @@ def _rows_in(
 class Level:
     """One resolution level of a :class:`~zarr_vectors.api.dataset.Dataset`."""
 
-    __slots__ = ("_dataset", "_index", "_meta")
+    __slots__ = ("_dataset", "_index", "_meta", "_attr_names")
 
     def __init__(self, dataset: Dataset, index: int) -> None:
         self._dataset = dataset
         self._index = int(index)
         self._meta: Any = None
+        # Per-family attribute names, listed once.  Lives and dies with
+        # this handle exactly as ``_meta`` does: the Dataset drops its
+        # Levels on every write it performs.
+        self._attr_names: dict[str, tuple[str, ...]] = {}
 
     # ---------------- identity ----------------
 
@@ -298,6 +302,18 @@ class Level:
                 f"unknown attribute family {kind!r}; expected one of "
                 f"{sorted(_ATTR_GROUPS)}"
             )
+        # Listed once per handle.  A listing reads every child's
+        # ``zarr.json``, and a read asked for it twice -- to plan, then to
+        # resolve ``attributes="all"`` -- so on a one-cell query the two
+        # listings were a third of the whole read.
+        cached = self._attr_names.get(kind)
+        if cached is not None:
+            return cached
+        names = self._list_attribute_names(kind)
+        self._attr_names[kind] = names
+        return names
+
+    def _list_attribute_names(self, kind: str) -> tuple[str, ...]:
         level_group = self.store
         try:
             family = level_group[_ATTR_GROUPS[kind]]
@@ -678,7 +694,7 @@ class Level:
 
         from zarr_vectors.core.arrays import (
             _maybe_batched_reads,
-            read_chunk_attributes,
+            read_chunk_attribute_rows,
         )
         from zarr_vectors.spatial.boundary import chunk_local_to_global_offsets
 
@@ -699,7 +715,7 @@ class Level:
             # is one round-trip per cell per attribute, and even locally
             # the fixed per-cell cost dominates: reading one attribute of
             # a 64-cell level took 0.96s against 0.04s for the positions.
-            from zarr_vectors.constants import VERTEX_ATTRIBUTES
+            from zarr_vectors.constants import VERTEX_ATTRIBUTES, VERTEX_FRAGMENTS
 
             key_strs = [
                 cc if isinstance(cc, str) else ".".join(str(int(c)) for c in cc)
@@ -708,15 +724,18 @@ class Level:
             plan = [
                 (f"{VERTEX_ATTRIBUTES}/{name}", key_strs) for name in wanted
             ]
+            plan.append((VERTEX_FRAGMENTS, key_strs))
             gathered: dict[str, Any] = {}
             with _maybe_batched_reads(level_group, plan):
                 for name in wanted:
-                    cols = [
-                        read_chunk_attributes(level_group, name, cc)
-                        for cc in chunk_keys
-                    ]
+                    # Each chunk's rows whole, not partitioned per
+                    # fragment and re-joined: see read_chunk_attribute_rows.
                     flat = [
-                        np.asarray(g) for per_chunk in cols for g in per_chunk
+                        rows for rows in (
+                            read_chunk_attribute_rows(level_group, name, cc)
+                            for cc in chunk_keys
+                        )
+                        if len(rows)
                     ]
                     if not flat:
                         continue

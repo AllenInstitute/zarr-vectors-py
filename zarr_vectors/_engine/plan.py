@@ -49,10 +49,15 @@ if TYPE_CHECKING:  # pragma: no cover - typing only
 
 # Miss tags used by ``_OfflineSession``.  A miss is either a bare ``str``
 # (a node path), a 2-tuple tagged with one of these (a whole array or a
-# listing), or an untagged 2-tuple of ``(array_path, chunk_key)`` (a
-# cell).  Kept here so the encoding lives in one place rather than being
-# re-derived at each inspection site.
+# listing), an untagged 2-tuple of ``(array_path, chunk_key)`` (a cell
+# discovered one read at a time), or a 3-tuple tagged ``"cell"`` (a cell
+# a reader's prefetch plan named) or ``"row"`` (one row of a standalone
+# array).  Kept here so the encoding lives in one place rather than
+# being re-derived at each inspection site; ``core.group`` writes the
+# 3-tuple forms and carries the same literals.
 _MISS_ARRAY = "array"
+_MISS_CELL = "cell"
+_MISS_ROW = "row"
 _MISS_LIST = "list"
 
 
@@ -218,6 +223,7 @@ class ReadPlan:
         """
         nodes: list[str] = []
         cells: list[CellRequest] = []
+        rows: list[RowRequest] = []
         arrays: list[str] = []
         listings: list[str] = []
         expand: list[str] = []
@@ -233,9 +239,22 @@ class ReadPlan:
                 else:
                     cells.append(CellRequest(tag, value))
                     expand.append(tag)
+            elif isinstance(miss, tuple) and len(miss) == 3:
+                tag, array, value = miss
+                if tag == _MISS_CELL:
+                    # A *planned* cell: the reader said exactly which
+                    # cells it wants, so they are fetched as named and the
+                    # array is resolved but not fanned out.  This is what
+                    # keeps an object read from scanning the level, and a
+                    # links family from being discovered one offsets
+                    # array per round.
+                    nodes.append(array)
+                    cells.append(CellRequest(array, value))
+                elif tag == _MISS_ROW:
+                    rows.append(RowRequest(array, (int(value),)))
         return cls.of(
-            nodes=nodes, cells=cells, arrays=arrays, listings=listings,
-            expand=expand,
+            nodes=nodes, cells=cells, rows=rows, arrays=arrays,
+            listings=listings, expand=expand,
         )
 
     # ---------------- algebra ----------------

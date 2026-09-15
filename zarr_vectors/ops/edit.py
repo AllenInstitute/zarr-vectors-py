@@ -777,9 +777,38 @@ class EditSession:
         consistent with pending-op state via surgical updates in
         :meth:`_stage_manifest`.
         """
-        index = self._build_fragment_owners(level)
         chunk_t = tuple(int(c) for c in chunk)
+        # Prefer the stored column when nothing in this session has
+        # touched the level's manifests. It answers in one cell read,
+        # where building the index decodes every manifest in the level
+        # -- which is what dominates a one-shot edit on a large store.
+        # Once an op is staged the on-disk answer is stale by
+        # definition, so the in-memory index takes over.
+        if self._fragment_owners is None and not any(
+            lvl == level for lvl, _oid in self._manifest_ops
+        ):
+            stored = self._stored_fragment_owners(level, chunk_t, int(fragment))
+            if stored is not None:
+                return stored
+        index = self._build_fragment_owners(level)
         return list(index.get((level, chunk_t, int(fragment)), ()))
+
+    def _stored_fragment_owners(
+        self, level: int, chunk: ChunkCoords, fragment: int,
+    ) -> list[int] | None:
+        """The owner column's answer, or ``None`` to fall back to a scan.
+
+        ``None`` covers a level with no column and a fragment marked as
+        shared between objects, which one integer cannot name.
+        """
+        from zarr_vectors.core.arrays import read_fragment_owners
+        from zarr_vectors.core.store import get_resolution_level
+
+        try:
+            level_group = get_resolution_level(self.root, level)
+            return read_fragment_owners(level_group, chunk, fragment)
+        except Exception:
+            return None
 
     def _fragment_owners_for(
         self,

@@ -475,6 +475,45 @@ def per_chunk_array_paths(level_group: Group) -> list[str]:
     return sorted(names)
 
 
+def build_fragment_owner_index(store_path, *, level: int | None = None) -> int:
+    """Record which object owns each fragment, as a readable column.
+
+    Writes ``fragment_attributes/object_id``, the slot the format
+    already reserves for it.  With the column in place "which objects
+    reference this fragment" is one cell read; without it, the only way
+    to answer is to decode every manifest in the level, which is what
+    an edit session does on its first lookup and what four other places
+    in this package each reinvent.
+
+    Offered as a maintenance verb rather than run by the writers,
+    because building it costs a full manifest scan and every consumer
+    falls back cleanly when it is absent.  Re-running it is safe; it
+    rewrites whatever it finds.
+
+    Args:
+        store_path: Store path, URL or open group.
+        level: Only this resolution level.  ``None`` does every level.
+
+    Returns:
+        How many fragments were recorded.
+    """
+    from zarr_vectors.core.arrays import write_fragment_owner_column
+    from zarr_vectors.core.store import (
+        get_resolution_level,
+        list_resolution_levels,
+        open_store,
+    )
+
+    root = open_store(store_path, mode="r+")
+    levels = (
+        list_resolution_levels(root) if level is None else [int(level)]
+    )
+    total = 0
+    for lvl in levels:
+        total += write_fragment_owner_column(get_resolution_level(root, lvl))
+    return total
+
+
 def rebuild_presence(
     level_group: Group,
     array_name: str | None = None,
@@ -644,6 +683,7 @@ __all__ = [
     "read_root_metadata",
     "read_skeleton_by_segment_id",
     "read_vertex_fragment_index",
+    "build_fragment_owner_index",
     "rebuild_presence",
     "rechunk",
     "rechunk_by_attribute",
