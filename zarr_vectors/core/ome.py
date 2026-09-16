@@ -71,7 +71,7 @@ __all__ = [
 #: Root-attribute key the block lives under.  Reserved by NGFF 0.5+.
 OME_ATTRS_KEY: str = "ome"
 
-OME_VERSION: str = "0.5"
+OME_VERSION: str = "0.6"
 """NGFF version stamped on the node.
 
 The one field here that cannot yet be got right.  RFC 8 is a proposal, so
