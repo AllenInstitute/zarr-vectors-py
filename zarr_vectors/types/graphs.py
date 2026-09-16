@@ -87,6 +87,7 @@ from zarr_vectors.spatial.chunking import (
     assign_chunks,
     compute_bounds,
 )
+from zarr_vectors.types.skeletons import get_coordinate_offset
 from zarr_vectors.typing import (
     BinShape,
     BoundingBox,
@@ -613,7 +614,10 @@ def read_graph(
 
     Returns:
         Dict with:
-        - ``positions``: ``(N, D)`` node positions
+        - ``positions``: ``(N, D)`` node positions, in world coordinates
+          (``stored + coordinate_offset``; identical to what
+          :func:`~zarr_vectors.types.skeletons.read_skeleton_by_segment_id`
+          returns for the same store)
         - ``edges``: ``(M, 2)`` edge list (remapped to output indices)
         - ``node_count``, ``edge_count``
     """
@@ -769,6 +773,18 @@ def _read_graph(
             return _empty_graph_result(ndim)
 
         positions_out = np.concatenate(all_positions, axis=0)
+        # World position = stored + coordinate_offset (see
+        # skeletons.py:COORDINATE_OFFSET_KEY) -- applied here, before the
+        # bbox filter below, so a caller's bbox is compared in the same
+        # world frame the returned positions are in.  Every real store
+        # `run_ingest` builds (its default `align=True` shifts storage to
+        # start at the origin and records the shift here) has a nonzero
+        # offset; every synthetic fixture built directly at the origin in
+        # this repo's own tests has always had a zero one, which is why
+        # this was missing for so long without a test catching it.
+        offset = get_coordinate_offset(root, ndim)
+        if positions_out.size and np.any(offset != 0):
+            positions_out = positions_out + offset.astype(positions_out.dtype)
 
         # Edges (delta=0; cross-pyramid-level edges live under delta != 0
         # and are not part of a single-level read).  One family, so intra

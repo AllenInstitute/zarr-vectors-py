@@ -286,6 +286,43 @@ class TestReadGraphOnDirectedSkeletonFamily:
             _directed_edge_endpoints(pos, edges)
 
 
+class TestReadGraphCoordinateOffset:
+    """World position = stored + coordinate_offset (see
+    skeletons.py's COORDINATE_OFFSET_KEY / get_coordinate_offset).
+    ``read_skeleton_by_segment_id`` applies this; ``read_graph`` silently
+    did not, so it returned the internal, chunk-aligned coordinate frame
+    instead of world coordinates on any store with a nonzero offset --
+    every store ``run_ingest`` builds by default (``align=True`` always
+    records one unless the source data happens to start exactly at the
+    world origin, which real datasets never do). Found by ingesting a
+    real, non-origin-aligned dataset and comparing the two readers.
+    """
+
+    def test_positions_are_world_coordinates(self, tmp_path: Path) -> None:
+        offset = (500.0, 300.0, 100.0)
+        root, lg = init_skeleton_store(
+            str(tmp_path / "sk.zv"),
+            chunk_shape=(100.0, 100.0, 100.0),
+            bounds=([0.0, 0.0, 0.0], [200.0, 200.0, 200.0]),
+            ndim=3,
+            attribute_dtypes={},
+            coordinate_offset=offset,
+        )
+        stored = np.array([[10, 10, 10], [20, 10, 10]], dtype=np.float32)
+        piece = {
+            "segment_id": 1,
+            "positions": stored,
+            "edges": np.array([[1, 0]], dtype=np.int64),
+        }
+        write_skeleton_chunk(lg, (0, 0, 0), [piece])
+
+        r = read_graph(str(tmp_path / "sk.zv"))
+        expected_world = stored + np.array(offset, dtype=np.float32)
+        # Not the raw stored coordinates -- the whole point of the bug.
+        assert not np.allclose(r["positions"], stored)
+        np.testing.assert_allclose(r["positions"], expected_world)
+
+
 class TestMultiObjectLinkIndices:
     """A chunk's vertices are stored object by object, and links index that.
 
