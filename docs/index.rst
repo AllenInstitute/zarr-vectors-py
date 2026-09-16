@@ -55,7 +55,7 @@ name at runtime, so nothing here has to be taken on trust.
 
 ----
 
-| `Link to the GitHub repository <https://github.com/BRIDGE-Neuroscience/zarr-vectors-py>`__
+| `Link to the GitHub repository <https://github.com/AllenInstitute/zarr-vectors-py>`__
 
 Where to start
 --------------

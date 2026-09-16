@@ -56,7 +56,7 @@ Installs all optional extras in a single command.
 To install from source with all development dependencies:
 
 ```bash
-git clone https://github.com/BRIDGE-Neuroscience/zarr-vectors-py.git
+git clone https://github.com/AllenInstitute/zarr-vectors-py.git
 cd zarr-vectors-py
 pip install -e ".[all]"
 pip install -r docs/requirements-docs.txt   # if building the docs locally

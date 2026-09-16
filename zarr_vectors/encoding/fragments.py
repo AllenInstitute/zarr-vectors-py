@@ -40,8 +40,9 @@ goes through a one-time prefix-popcount cache built lazily on first call.
 from __future__ import annotations
 
 import struct
+from collections.abc import Sequence
 from dataclasses import dataclass, field
-from typing import Sequence
+from typing import Any
 
 import numpy as np
 import numpy.typing as npt
@@ -158,6 +159,35 @@ def encode_fragments(
             0,                # num_fragments
             0,                # num_range_fragments
         )
+
+    if all(type(frag) is tuple for frag in fragments):
+        # Every fragment a ``(start, count)`` range -- what every bulk
+        # writer emits -- so the table is one array conversion, the
+        # bitmap all ones, and there is no CSR section.  A line store
+        # writes half a million such fragments; classifying each was
+        # a second of the write.
+        table = np.asarray(fragments, dtype=np.int64)
+        if table.ndim != 2 or table.shape[1] != 2:
+            raise ArrayError(
+                "Fragment tuples must have shape (start, count)",
+            )
+        if table.size and int(table[:, 1].min()) < 0:
+            raise ArrayError("Fragment count must be >= 0")
+        bitmap_len = _bitmap_padded_length(f)
+        bitmap = np.zeros(bitmap_len, dtype=np.uint8)
+        full, rem = divmod(f, 8)
+        bitmap[:full] = 0xFF
+        if rem:
+            bitmap[full] = (1 << rem) - 1
+        header = _HEADER_STRUCT.pack(
+            FRAGMENT_INDEX_MAGIC, FRAGMENT_INDEX_VERSION, 0, f, f,
+        )
+        return b"".join([
+            header,
+            bitmap.tobytes(),
+            np.ascontiguousarray(table).tobytes(),
+            np.zeros(1, dtype=np.uint32).tobytes(),   # explicit_offsets[0]
+        ])
 
     classified: list[tuple[bool, tuple[int, int] | np.ndarray]] = [
         _classify_fragment(frag, force_explicit=force_explicit)
@@ -312,6 +342,21 @@ class ChunkFragmentIndex:
             and np.array_equal(ends[:-1], starts[1:])
         )
 
+    def ranges(self) -> npt.NDArray[np.int64] | None:
+        """The ``(F, 2)`` ``(start, count)`` table when *every* fragment
+        is a range, else ``None``.
+
+        The whole-index form of :meth:`range`.  A reader slicing every
+        fragment of a chunk -- 64 bins per chunk, a thousand chunks --
+        pays a bit test, a prefix lookup and two ``int()`` calls per
+        fragment through the per-fragment accessor; with this it walks
+        two lists.  ``None`` sends it to the general per-fragment path,
+        which stays the definition.
+        """
+        if self.num_explicit_fragments or self._range_table.shape[0] != self.num_fragments:
+            return None
+        return self._range_table
+
     def is_range(self, f: int) -> bool:
         """Return True if fragment ``f`` is a contiguous range.
 
@@ -440,7 +485,7 @@ def decode_fragments(raw: bytes) -> ChunkFragmentIndex:
     bitmap_padded = _bitmap_padded_length(f)
     if len(raw) < offset + bitmap_padded:
         raise ArrayError(
-            f"Fragment-index blob truncated in bitmap region",
+            "Fragment-index blob truncated in bitmap region",
         )
     # Copy out the unpadded portion as our canonical bitmap.  Copying
     # is cheap (≤ ceil(F/8) bytes) and avoids retaining the whole input
@@ -453,7 +498,7 @@ def decode_fragments(raw: bytes) -> ChunkFragmentIndex:
     range_table_bytes = r * 16
     if len(raw) < offset + range_table_bytes:
         raise ArrayError(
-            f"Fragment-index blob truncated in range table",
+            "Fragment-index blob truncated in range table",
         )
     range_table = np.frombuffer(
         raw, dtype=np.int64, count=r * 2, offset=offset,
@@ -464,7 +509,7 @@ def decode_fragments(raw: bytes) -> ChunkFragmentIndex:
     csr_offsets_bytes = (e + 1) * 4
     if len(raw) < offset + csr_offsets_bytes:
         raise ArrayError(
-            f"Fragment-index blob truncated in CSR offsets",
+            "Fragment-index blob truncated in CSR offsets",
         )
     csr_offsets = np.frombuffer(
         raw, dtype=np.uint32, count=e + 1, offset=offset,
@@ -475,7 +520,7 @@ def decode_fragments(raw: bytes) -> ChunkFragmentIndex:
     csr_indices_bytes = t * 8
     if len(raw) < offset + csr_indices_bytes:
         raise ArrayError(
-            f"Fragment-index blob truncated in CSR indices",
+            "Fragment-index blob truncated in CSR indices",
         )
     csr_indices = np.frombuffer(
         raw, dtype=np.int64, count=t, offset=offset,
@@ -650,6 +695,130 @@ def encode_object_manifest_blocks(
         for c, f in blocks
     ]
     return struct.pack("<I", len(blocks)) + b"".join(block_bytes)
+
+
+def encode_object_manifests_many(
+    manifests: Sequence[Sequence[tuple[Sequence[int], Any]]],
+    sid_ndim: int,
+) -> list[bytes]:
+    """:func:`encode_object_manifest_blocks` over many manifests at once.
+
+    The inverse of :func:`decode_object_manifests_many`, for the same
+    layout: when every fragment reference is a plain index, every block
+    is a fixed-size mode-0 block and the whole batch is laid out with
+    numpy rather than packed field by field -- writing the index of a
+    coarsened level spent 3 s of a 45 s pyramid in the per-block packer.
+    Any other reference sends that manifest through the singular encoder.
+    """
+    n = len(manifests)
+    if n == 0:
+        return []
+    counts = np.fromiter((len(m) for m in manifests), dtype=np.int64, count=n)
+    total = int(counts.sum())
+    headers = [struct.pack("<I", int(c)) for c in counts.tolist()]
+    if total == 0:
+        return headers
+    flat = [block for m in manifests for block in m]
+    uniform = all(
+        isinstance(ref, (int, np.integer)) and not isinstance(ref, (bool, np.bool_))
+        for _c, ref in flat
+    )
+    if not uniform:
+        return [
+            encode_object_manifest_blocks(
+                [(tuple(int(c) for c in cc), ref) for cc, ref in m], sid_ndim=sid_ndim,
+            )
+            for m in manifests
+        ]
+    # Two list comprehensions and two array conversions: the conversion
+    # of a list of coordinate tuples is C-speed, where a generator of
+    # every coordinate was a Python step per number.
+    coords = np.array([cc for cc, _ref in flat], dtype=np.int64).reshape(total, sid_ndim)
+    indices = np.array([ref for _cc, ref in flat], dtype=np.int64).reshape(total)
+    if indices.size and int(indices.min()) < 0:
+        raise ArrayError(
+            f"fragment_index must be >= 0, got {int(indices.min())}",
+        )
+    block_size = sid_ndim * 8 + 1 + 8
+    blocks = np.empty((total, block_size), dtype=np.uint8)
+    blocks[:, : sid_ndim * 8] = (
+        coords.astype("<i8", copy=False).view(np.uint8).reshape(total, sid_ndim * 8)
+    )
+    blocks[:, sid_ndim * 8] = MANIFEST_MODE_SINGLE
+    blocks[:, sid_ndim * 8 + 1:] = (
+        indices.astype("<i8", copy=False).view(np.uint8).reshape(total, 8)
+    )
+    ends = np.cumsum(counts)
+    starts = ends - counts
+    return [
+        header + blocks[start:end].tobytes()
+        for header, start, end in zip(headers, starts.tolist(), ends.tolist())
+    ]
+
+
+def decode_object_manifests_many(
+    blobs: Sequence[bytes],
+    sid_ndim: int,
+) -> tuple[list[list[tuple[tuple[int, ...], Any]]], bool]:
+    """:func:`decode_object_manifest_blocks` over many blobs at once.
+
+    Returns ``(decoded, uniform)``.  ``decoded`` is one block list per
+    blob, exactly what the singular decoder would have produced for
+    each.  ``uniform`` is True when every block in every blob is a
+    mode-0 (single fragment) block, in which case each block is already
+    a ``(chunk_coords, fragment_index)`` pair and there is nothing left
+    to expand.
+
+    That is the layout every bulk writer produces, and it is parsed
+    here with numpy rather than one ``struct.unpack`` per field per
+    block: reading the manifests of a quarter-million lines spent 8 s
+    of a 27 s read decoding them one at a time.  A blob that is not
+    that shape sends the whole batch to the singular decoder, so the
+    two can never disagree.
+    """
+    n = len(blobs)
+    if n == 0:
+        return [], True
+    block_size = sid_ndim * 8 + 1 + 8
+    lengths = np.fromiter((len(b) for b in blobs), dtype=np.int64, count=n)
+
+    def _fallback() -> tuple[list[list[tuple[tuple[int, ...], Any]]], bool]:
+        return [decode_object_manifest_blocks(b, sid_ndim) for b in blobs], False
+
+    if int(lengths.min()) < 4 or np.any((lengths - 4) % block_size):
+        return _fallback()
+    expected = (lengths - 4) // block_size
+    buf = np.frombuffer(b"".join(blobs), dtype=np.uint8)
+    starts = np.empty(n, dtype=np.int64)
+    starts[0] = 0
+    np.cumsum(lengths[:-1], out=starts[1:])
+    counts = (
+        buf[starts[:, None] + np.arange(4)]
+        .copy().view("<u4").reshape(n).astype(np.int64)
+    )
+    if np.any(counts != expected):
+        return _fallback()
+    total = int(expected.sum())
+    if total == 0:
+        return [[] for _ in range(n)], True
+    blob_of_block = np.repeat(np.arange(n, dtype=np.int64), expected)
+    first_block = np.cumsum(expected) - expected
+    within = np.arange(total, dtype=np.int64) - first_block[blob_of_block]
+    block_starts = starts[blob_of_block] + 4 + within * block_size
+    if np.any(buf[block_starts + sid_ndim * 8] != MANIFEST_MODE_SINGLE):
+        return _fallback()
+    coords = (
+        buf[block_starts[:, None] + np.arange(sid_ndim * 8)]
+        .copy().view("<i8").reshape(total, sid_ndim)
+    )
+    indices = (
+        buf[block_starts[:, None] + (sid_ndim * 8 + 1) + np.arange(8)]
+        .copy().view("<i8").reshape(total)
+    )
+    out: list[list[tuple[tuple[int, ...], Any]]] = [[] for _ in range(n)]
+    for b, c, i in zip(blob_of_block.tolist(), coords.tolist(), indices.tolist()):
+        out[b].append((tuple(c), i))
+    return out, True
 
 
 def decode_object_manifest_blocks(

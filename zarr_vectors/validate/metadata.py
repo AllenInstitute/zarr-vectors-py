@@ -3,28 +3,40 @@
 from __future__ import annotations
 
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 from zarr_vectors.constants import (
-    CROSS_CHUNK_DEDUP, CROSS_CHUNK_BOTH, CROSS_CHUNK_EXPLICIT,
-    LINKS_EXPLICIT, LINKS_IMPLICIT_BRANCHES, LINKS_IMPLICIT_SEQUENTIAL,
-    OBJIDX_IDENTITY, OBJIDX_STANDARD,
+    CROSS_CHUNK_BOTH,
+    CROSS_CHUNK_DEDUP,
+    CROSS_CHUNK_EXPLICIT,
+    LINKS_EXPLICIT,
+    LINKS_IMPLICIT_BRANCHES,
+    LINKS_IMPLICIT_SEQUENTIAL,
+    OBJIDX_IDENTITY,
+    OBJIDX_STANDARD,
 )
 from zarr_vectors.core.store import (
-    open_store, read_root_metadata, get_resolution_level, list_resolution_levels,
+    get_resolution_level,
+    list_resolution_levels,
+    open_store,
+    read_root_metadata,
 )
 from zarr_vectors.validate.structure import ValidationResult
+
+if TYPE_CHECKING:  # pragma: no cover - typing only
+    from zarr_vectors.core.group import Group
 
 VALID_LINKS = {LINKS_EXPLICIT, LINKS_IMPLICIT_SEQUENTIAL, LINKS_IMPLICIT_BRANCHES}
 VALID_OBJIDX = {OBJIDX_STANDARD, OBJIDX_IDENTITY}
 VALID_CROSS = {CROSS_CHUNK_EXPLICIT, CROSS_CHUNK_DEDUP, CROSS_CHUNK_BOTH}
 
 
-def validate_metadata(store_path: str | Path) -> ValidationResult:
+def validate_metadata(store_path: str | Path | Group) -> ValidationResult:
     """Level 2: verify all metadata is well-formed."""
     result = ValidationResult(level=2)
 
     try:
-        root = open_store(str(store_path))
+        root = open_store(store_path)
     except Exception as e:
         result.add_error(f"Cannot open store: {e}")
         return result
@@ -54,7 +66,10 @@ def validate_metadata(store_path: str | Path) -> ValidationResult:
     if meta.bounds:
         bmin, bmax = meta.bounds
         if len(bmin) != sid_ndim or len(bmax) != sid_ndim:
-            result.add_error(f"Bounds dim mismatch: min={len(bmin)}, max={len(bmax)}, expected {sid_ndim}")
+            result.add_error(
+                f"Bounds dim mismatch: min={len(bmin)}, "
+                f"max={len(bmax)}, expected {sid_ndim}"
+            )
         else:
             result.add_pass("Bounds dimensionality matches SID")
 

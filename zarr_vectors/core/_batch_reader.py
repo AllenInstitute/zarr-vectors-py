@@ -30,9 +30,9 @@ from __future__ import annotations
 
 import asyncio
 import os
+import threading
 from typing import Any, NamedTuple
 
-import numpy as np
 import zarr
 from numcodecs.vlen import VLenBytes
 from zarr.core.array_spec import ArraySpec
@@ -43,6 +43,8 @@ from zarr.core.sync import sync
 # not reintroduce the import cycle this module otherwise avoids.
 from zarr_vectors.core._vlen import (
     cell_region as _vlen_cell_region,
+)
+from zarr_vectors.core._vlen import (
     region_to_bytes as _vlen_region_to_bytes,
 )
 
@@ -302,6 +304,49 @@ def _direct_spec(
     )
 
 
+def _direct_path(spec: _DirectSpec, chunk_key: str) -> str | None:
+    """Filesystem path of one cell, or ``None`` if this array cannot
+    hold that key (unparseable, wrong arity, off the grid)."""
+    coords = _parse_coords(chunk_key)
+    if coords is None or len(coords) != len(spec.shape):
+        return None
+    if spec.origin is not None:
+        coords = tuple(c - o for c, o in zip(coords, spec.origin))
+    if any(c < 0 or c >= s for c, s in zip(coords, spec.shape)):
+        return None
+    return spec.root + spec.separator + spec.separator.join(
+        str(c) for c in coords
+    )
+
+
+def _read_file(path: str) -> bytes | None:
+    """The bytes at ``path``, or ``None`` when nothing is stored there."""
+    try:
+        with open(path, "rb") as fh:
+            return fh.read()
+    except OSError:
+        return None
+
+
+def _decode_direct(spec: _DirectSpec, raw: bytes | None) -> bytes | None:
+    """Decode one cell's stored bytes.
+
+    ``raw is None`` means no stored object, which decodes to ``b""`` --
+    the fill value, and what the gather path caches for an unwritten
+    cell, so a plan naming one costs the same either way.
+    """
+    if raw is None:
+        return b""
+    buffer = spec.spec.prototype.buffer.from_bytes(raw)
+    for codec in reversed(spec.codecs):
+        buffer = codec._decode_sync(buffer, spec.spec)
+    decoded = _VLEN_BYTES.decode(buffer.as_numpy_array())
+    if decoded.size != 1:
+        return None
+    value = decoded.flat[0]
+    return b"" if value is None else bytes(value)
+
+
 def _direct_read(spec: _DirectSpec, chunk_key: str) -> bytes | None:
     """Read and decode one cell.
 
@@ -312,29 +357,107 @@ def _direct_read(spec: _DirectSpec, chunk_key: str) -> bytes | None:
     the grid), which the caller omits from the cache exactly as the
     gather does.
     """
-    coords = _parse_coords(chunk_key)
-    if coords is None or len(coords) != len(spec.shape):
+    path = _direct_path(spec, chunk_key)
+    if path is None:
         return None
-    if spec.origin is not None:
-        coords = tuple(c - o for c, o in zip(coords, spec.origin))
-    if any(c < 0 or c >= s for c, s in zip(coords, spec.shape)):
-        return None
-    path = spec.root + spec.separator + spec.separator.join(
-        str(c) for c in coords
-    )
-    try:
-        with open(path, "rb") as fh:
-            raw = fh.read()
-    except OSError:
-        return b""              # no stored object: the fill value
-    buffer = spec.spec.prototype.buffer.from_bytes(raw)
-    for codec in reversed(spec.codecs):
-        buffer = codec._decode_sync(buffer, spec.spec)
-    decoded = _VLEN_BYTES.decode(buffer.as_numpy_array())
-    if decoded.size != 1:
-        return None
-    value = decoded.flat[0]
-    return b"" if value is None else bytes(value)
+    return _decode_direct(spec, _read_file(path))
+
+
+#: Cells above which the direct path reads in parallel.
+#:
+#: The direct reader exists to skip zarr's async machinery per chunk,
+#: which is right for a handful of cells and wrong for thousands: one
+#: cell is one file, and opening them one after another serialises every
+#: batched read on a local store.
+#:
+#: How much that costs depends entirely on what an ``open`` costs, and
+#: that varies by two orders of magnitude on the same machine. Warm, it
+#: is around 40 microseconds and threads are pure overhead. Cold, or
+#: behind an on-access virus scanner, it was measured at 6.7 ms -- and
+#: rebuilding presence for 8,000 cells then spent 53 s of its 56 s
+#: inside ``open``, which threads cut to 11 s.
+#:
+#: So the threshold is set where the overhead is certainly repaid rather
+#: than where parallelism first helps: below it nothing changes, above
+#: it a slow store stops being read one file at a time. ``open`` and
+#: ``read`` release the GIL, so the threads genuinely overlap; decoding
+#: stays on the calling thread.
+_PARALLEL_READ_MIN = 256
+_PARALLEL_READ_WORKERS = min(16, (os.cpu_count() or 4) * 2)
+
+_READ_POOL: Any = None
+_READ_POOL_LOCK = threading.Lock()
+
+
+def _read_pool() -> Any:
+    """The shared reader pool, created on first use.
+
+    Shared rather than per-call: a pool costs a few milliseconds to
+    stand up, which at these sizes is a visible fraction of the read it
+    was meant to accelerate.
+    """
+    global _READ_POOL
+    if _READ_POOL is None:
+        with _READ_POOL_LOCK:
+            if _READ_POOL is None:
+                from concurrent.futures import ThreadPoolExecutor
+
+                _READ_POOL = ThreadPoolExecutor(
+                    max_workers=_PARALLEL_READ_WORKERS,
+                    thread_name_prefix="zv-read",
+                )
+    return _READ_POOL
+
+
+def _direct_read_many(
+    spec: _DirectSpec, chunk_keys: list[str],
+) -> list[tuple[str, bytes]]:
+    """Read and decode many cells of one array, in ``chunk_keys`` order.
+
+    Keys this array cannot hold are omitted, exactly as
+    :func:`_direct_read` omits them.
+    """
+    cache = _direct_read_plan([("", spec, chunk_keys)])
+    return [(k, cache[("", k)]) for k in chunk_keys if ("", k) in cache]
+
+
+def _direct_read_plan(
+    entries: list[tuple[str, _DirectSpec, list[str]]],
+) -> dict[tuple[str, str], bytes]:
+    """Read and decode the cells of several arrays as one job.
+
+    ``entries`` is ``[(array_name, spec, chunk_keys), ...]``; the result
+    is keyed ``(array_name, chunk_key)``, with keys an array cannot hold
+    omitted.
+
+    The files are pooled across every array, not per array.  The
+    per-array form crossed the parallel threshold only for a wide array,
+    and a links family is the opposite shape -- a graph store fanned out
+    into 1,691 offsets arrays of ~70 cells each, every one below the
+    threshold, and read its 120,000 files one after another: 533 s, of
+    which the decode was seconds.  Pooled, the same read is bounded by
+    the disk rather than by the slowest ``open``.
+    """
+    wanted: list[tuple[str, _DirectSpec, str, str]] = []
+    for array_name, spec, chunk_keys in entries:
+        for chunk_key in chunk_keys:
+            path = _direct_path(spec, chunk_key)
+            if path is not None:
+                wanted.append((array_name, spec, chunk_key, path))
+    if not wanted:
+        return {}
+    if len(wanted) >= _PARALLEL_READ_MIN:
+        raws = list(
+            _read_pool().map(_read_file, [w[3] for w in wanted])
+        )
+    else:
+        raws = [_read_file(w[3]) for w in wanted]
+    out: dict[tuple[str, str], bytes] = {}
+    for (array_name, spec, chunk_key, _path), raw in zip(wanted, raws):
+        data = _decode_direct(spec, raw)
+        if data is not None:
+            out[(array_name, chunk_key)] = data
+    return out
 
 
 def flush_prefetch(
@@ -399,14 +522,11 @@ def flush_prefetch(
             sync(_gather_plan(zarr_group._async_group, gathered, nodes))
         )
 
-    for array_name, chunk_keys in plan:
-        spec = direct.get(array_name)
-        if spec is None:
-            continue
-        for chunk_key in chunk_keys:
-            data = _direct_read(spec, chunk_key)
-            if data is not None:
-                cache[(array_name, chunk_key)] = data
+    cache.update(_direct_read_plan([
+        (array_name, direct[array_name], list(chunk_keys))
+        for array_name, chunk_keys in plan
+        if array_name in direct
+    ]))
     return cache
 
 

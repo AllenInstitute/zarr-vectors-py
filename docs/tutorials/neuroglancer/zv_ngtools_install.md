@@ -20,7 +20,7 @@ directly from GitHub.
 ## Install from GitHub
 
 ```bash
-pip install git+https://github.com/BRIDGE-Neuroscience/zv-ngtools.git
+pip install git+https://github.com/AllenInstitute/zv-ngtools.git
 ```
 
 This installs the `ngtools` package (the fork is still importable as
@@ -33,7 +33,7 @@ If you have not yet installed `zarr-vectors`, install both together:
 
 ```bash
 pip install "zarr-vectors[all]" \
-    git+https://github.com/BRIDGE-Neuroscience/zv-ngtools.git
+    git+https://github.com/AllenInstitute/zv-ngtools.git
 ```
 
 ### Development install
@@ -41,7 +41,7 @@ pip install "zarr-vectors[all]" \
 To contribute to `zv-ngtools` or run the examples:
 
 ```bash
-git clone https://github.com/BRIDGE-Neuroscience/zv-ngtools.git
+git clone https://github.com/AllenInstitute/zv-ngtools.git
 cd zv-ngtools
 pip install -e ".[dev]"
 ```
@@ -127,13 +127,13 @@ Because `zv-ngtools` is installed from GitHub, upgrades require
 re-running the install command:
 
 ```bash
-pip install --upgrade git+https://github.com/BRIDGE-Neuroscience/zv-ngtools.git
+pip install --upgrade git+https://github.com/AllenInstitute/zv-ngtools.git
 ```
 
 To pin a specific commit (for reproducibility):
 
 ```bash
-pip install "git+https://github.com/BRIDGE-Neuroscience/zv-ngtools.git@<commit_sha>"
+pip install "git+https://github.com/AllenInstitute/zv-ngtools.git@<commit_sha>"
 ```
 
 ---
@@ -173,5 +173,5 @@ print(list_datasources())
 ```
 
 If `zarr_vectors` is absent, the zv-ngtools fork was not installed correctly.
-Confirm with `pip show ngtools` that the source is the BRIDGE-Neuroscience
+Confirm with `pip show ngtools` that the source is the AllenInstitute
 fork (the installed version will show `Location: .../zv-ngtools`).

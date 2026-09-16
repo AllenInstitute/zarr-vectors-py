@@ -25,17 +25,16 @@ from typing import TYPE_CHECKING, Any, Literal, cast
 import numpy as np
 import numpy.typing as npt
 
+# One parser for the whole package.  There were two -- this and the one
+# in ``_api_version`` -- for a syntax that has to mean the same thing in
+# both.
+from zarr_vectors._api_version import parse_version as _parse_version
+from zarr_vectors._api_version import satisfies as _satisfies
 from zarr_vectors.api.level import Level
 from zarr_vectors.api.result import ReadResult
 from zarr_vectors.api.schema import Layout, Schema, SchemaConflict, StorageOptions
 from zarr_vectors.api.select import Query
-from zarr_vectors.constants import (
-    GEOM_GRAPH,
-    GEOM_LINE,
-    GEOM_MESH,
-    GEOM_POINT_CLOUD,
-    GEOM_POLYLINE,
-)
+from zarr_vectors.constants import GEOM_POLYLINE
 from zarr_vectors.exceptions import MetadataError, StoreError, ZVError
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
@@ -54,14 +53,6 @@ __all__ = [
 
 class FormatError(ZVError):
     """The store's on-disk format is not one this code can serve."""
-
-
-def _parse_version(text: str) -> tuple[int, ...]:
-    parts: list[int] = []
-    for chunk in str(text).split("."):
-        digits = "".join(c for c in chunk if c.isdigit())
-        parts.append(int(digits) if digits else 0)
-    return tuple(parts or (0,))
 
 
 class Dataset:
@@ -152,7 +143,15 @@ class Dataset:
         return tuple(getattr(self._root_meta, "geometry_types", None) or ())
 
     def kind_of(self, level: int = 0) -> str:
-        """The geometry type a read at ``level`` should be decoded as."""
+        """The geometry type a read at ``level`` should be decoded as.
+
+        ``level`` is accepted and currently ignored: geometry type is a
+        store-wide declaration, and a pyramid's coarser levels hold the
+        same kind as level 0.  It stays in the signature because a
+        composite store's levels could differ, and a caller should not
+        have to change their call when that lands.
+        """
+        del level  # see above
         kinds = self.kinds
         if not kinds:
             raise MetadataError(
@@ -226,7 +225,14 @@ class Dataset:
     # ---------------- reading ----------------
 
     def select(self, **kw: Any) -> Query:
-        return self.level(int(kw.get("level", 0))).select(**kw)
+        # ``level=None`` is the documented "not specified" sentinel -- it is
+        # what lets level 0 be requested explicitly, which is why
+        # ``Selection.level`` defaults to None rather than 0 and why
+        # FEATURES advertises ``selection-level-optional``.  Coercing it
+        # with ``int()`` raised TypeError on the one spelling the API tells
+        # callers to use.
+        level = kw.get("level")
+        return self.level(0 if level is None else int(level)).select(**kw)
 
     def read(self, **kw: Any) -> ReadResult:
         return self.select(**kw).read()
@@ -292,7 +298,12 @@ class Dataset:
         layout: Layout | None = None,
         on_out_of_bounds: Literal["raise", "ignore", "expand"] = "raise",
     ) -> dict[str, Any]:
-        """Write line segments, as an ``(M, 2, D)`` array."""
+        """Write line segments, as an ``(M, 2, D)`` array.
+
+        ``write_lines`` takes no ``groups``; a line store's objects are
+        its lines and the writer has no grouping array.  Write the
+        groupings through :mod:`zarr_vectors.building` if you need them.
+        """
         from zarr_vectors.types.lines import write_lines
 
         return self._write(
@@ -308,6 +319,7 @@ class Dataset:
         faces: npt.ArrayLike,
         *,
         attributes: Mapping[str, npt.ArrayLike] | None = None,
+        object_attributes: Mapping[str, npt.ArrayLike] | None = None,
         object_ids: npt.ArrayLike | None = None,
         layout: Layout | None = None,
         on_out_of_bounds: Literal["raise", "ignore", "expand"] = "raise",
@@ -318,6 +330,7 @@ class Dataset:
         return self._write(
             write_mesh, vertices, faces,
             vertex_attributes=dict(attributes or {}) or None,
+            object_attributes=dict(object_attributes or {}) or None,
             object_ids=object_ids,
             layout=layout, out_of_bounds=on_out_of_bounds,
         )
@@ -329,6 +342,7 @@ class Dataset:
         *,
         attributes: Mapping[str, npt.ArrayLike] | None = None,
         edge_attributes: Mapping[str, npt.ArrayLike] | None = None,
+        object_attributes: Mapping[str, npt.ArrayLike] | None = None,
         object_ids: npt.ArrayLike | None = None,
         tree: bool = False,
         layout: Layout | None = None,
@@ -337,11 +351,16 @@ class Dataset:
         """Write a graph, or a skeleton when ``tree=True``."""
         from zarr_vectors.types.graphs import write_graph
 
+        # ``kind=``, not the ``is_tree=`` alias: that alias is deprecated
+        # and warns on every call, so the supported surface was emitting a
+        # DeprecationWarning about its own implementation on every
+        # ``add_graph``.
         return self._write(
             write_graph, positions, edges,
             vertex_attributes=dict(attributes or {}) or None,
             link_attributes=dict(edge_attributes or {}) or None,
-            object_ids=object_ids, is_tree=tree,
+            object_attributes=dict(object_attributes or {}) or None,
+            object_ids=object_ids, kind="skeleton" if tree else "graph",
             layout=layout, out_of_bounds=on_out_of_bounds,
         )
 
@@ -359,6 +378,9 @@ class Dataset:
         effective = layout or schema.layout
         resolved = effective.resolve(schema, store_kind=self._store_kind())
         kwargs = {k: v for k, v in kwargs.items() if v is not None}
+        # Checked BEFORE the write: a declaration the data contradicts is
+        # worth catching while the store is still as it was.
+        _check_declared(schema, kwargs)
         self._meta = None  # geometry_types and bounds may change
         self._levels.clear()
         report: dict[str, Any] = writer(
@@ -369,6 +391,7 @@ class Dataset:
             compressor=resolved.compressor,
             **kwargs,
         )
+        _stamp_declared(self, schema, kwargs)
         return report
 
     def _store_kind(self) -> str:
@@ -411,7 +434,14 @@ class Dataset:
         """
         from zarr_vectors.multiresolution.coarsen import build_pyramid
 
-        out = build_pyramid(self.url, factors=list(factors), method=method, **kw)
+        # The handle, not ``self.url``.  ``Group.url`` is ``repr(store)``
+        # for anything that is not a LocalStore, so re-opening it failed
+        # outright on a memory- or object-backed dataset; and even for a
+        # URL it dropped this dataset's StorageOptions, so credentials and
+        # a forced backend were silently lost.  Passing the handle also
+        # means a dataset opened ``mode="r"`` can no longer write a
+        # pyramid -- the old path re-opened as ``"r+"`` and escalated.
+        out = build_pyramid(self._group, factors=list(factors), method=method, **kw)
         self._levels.clear()
         self._meta = None
         return out
@@ -419,7 +449,10 @@ class Dataset:
     def validate(self, *, level: int = 3) -> Any:
         from zarr_vectors.validate import validate as _validate
 
-        return _validate(self.url, level=level)
+        # Likewise.  This one was broken for LOCAL stores too: ``url`` is a
+        # ``file://`` URI and level 1 did a raw ``Path()`` on it, so every
+        # validation through this method failed at level 1 and returned.
+        return _validate(self._group, level=level)
 
     def commit(self, message: str = "zarr-vectors write") -> str | None:
         """Commit, for backends that have transactions.  ``None`` otherwise."""
@@ -505,6 +538,7 @@ def create(
         vertex_dtype=schema.position_dtype,
         axes=cast("Any", [a.to_ngff() for a in schema.axes]) if schema.axes else None,
         geometry_types=[schema.kind] if schema.kind else None,
+        attribute_specs=schema.to_root_block() or None,
         backend=storage.resolve_backend(str(target)),
         storage_options=dict(storage.options) or None,
     )
@@ -566,8 +600,16 @@ async def aopen(source: Any, *, storage: StorageOptions | None = None) -> Datase
     """
     from zarr_vectors.core.aio import open_store_async
 
-    group = await open_store_async(source)
-    return Dataset(group, storage=storage or StorageOptions())
+    storage = storage or StorageOptions()
+    # Forwarded, like ``open`` does.  Accepting ``storage`` and then not
+    # using it meant a forced backend and any credentials were silently
+    # dropped on exactly the path a browser host has to take.
+    group = await open_store_async(
+        source,
+        backend=storage.resolve_backend(str(source)),
+        storage_options=dict(storage.options) or None,
+    )
+    return Dataset(group, storage=storage)
 
 
 def require_format(dataset: Dataset, spec: str) -> None:
@@ -583,28 +625,92 @@ def require_format(dataset: Dataset, spec: str) -> None:
     a sentence.
     """
     found = dataset.format_version
-    for clause in (c.strip() for c in spec.split(",") if c.strip()):
-        for op in (">=", "<=", "==", ">", "<"):
-            if clause.startswith(op):
-                want = _parse_version(clause[len(op):])
-                width = max(len(found), len(want))
-                lhs = found + (0,) * (width - len(found))
-                rhs = want + (0,) * (width - len(want))
-                ok = {
-                    ">=": lhs >= rhs, "<=": lhs <= rhs, "==": lhs == rhs,
-                    ">": lhs > rhs, "<": lhs < rhs,
-                }[op]
-                if not ok:
-                    raise FormatError(
-                        f"{dataset.url} is on-disk format "
-                        f"{'.'.join(map(str, found))}, which does not satisfy "
-                        f"{spec!r}. There is no backward-compatible reader: an "
-                        f"older store must be rewritten from source, and a newer "
-                        f"one needs a newer zarr-vectors."
-                    )
-                break
-        else:
-            raise ValueError(f"cannot parse version clause {clause!r} in {spec!r}")
+    if _satisfies(found, spec) is not None:
+        raise FormatError(
+            f"{dataset.url} is on-disk format "
+            f"{'.'.join(map(str, found))}, which does not satisfy "
+            f"{spec!r}. There is no backward-compatible reader: an "
+            f"older store must be rewritten from source, and a newer "
+            f"one needs a newer zarr-vectors."
+        )
+
+
+# Which ``_write`` kwarg carries which attribute scope.
+_SCOPE_KWARGS: dict[str, str] = {
+    "vertex_attributes": "vertex",
+    "object_attributes": "object",
+    "link_attributes": "link",
+}
+
+
+def _check_declared(schema: Schema, kwargs: Mapping[str, Any]) -> None:
+    """Reject data that contradicts what the store says it holds.
+
+    ``AttributeSpec.dtype`` and ``channels`` used to be inert -- a store
+    could declare ``float32`` and be handed ``float64``, and nothing
+    anywhere noticed.  A declaration that is never checked is decoration.
+
+    Only *declared* attributes are checked; passing an undeclared one is
+    how a store is extended, and is fine.
+    """
+    for kwarg, scope in _SCOPE_KWARGS.items():
+        supplied = kwargs.get(kwarg) or {}
+        for name, value in supplied.items():
+            spec = schema.spec_for(name, scope)
+            if spec is None:
+                continue
+            arr = np.asarray(
+                value[0] if isinstance(value, list) and value else value
+            )
+            if arr.dtype != np.dtype(spec.dtype):
+                raise SchemaConflict(
+                    f"{scope} attribute {name!r} is declared "
+                    f"{spec.dtype!r} but was given {arr.dtype!r}. Pass the "
+                    f"declared dtype, or change the declaration."
+                )
+            channels = int(arr.shape[-1]) if arr.ndim > 1 else 1
+            if channels != int(spec.channels):
+                raise SchemaConflict(
+                    f"{scope} attribute {name!r} is declared with "
+                    f"{spec.channels} channel(s) but was given {channels}."
+                )
+
+
+def _stamp_declared(
+    dataset: Dataset, schema: Schema, kwargs: Mapping[str, Any],
+) -> None:
+    """Record ``unit`` / ``description`` on the arrays just written.
+
+    The writers know the dtype and the channel names -- they have the real
+    array -- so only what the *declaration* adds is stamped here, and only
+    for attributes that were actually written.  Merged onto the array's
+    own metadata block, which is where a reader already looks, so this
+    needs no format change and no reader is obliged to care.
+
+    Best-effort by design: failing to annotate an array that was written
+    correctly must not turn a successful write into an error.
+    """
+    families = {
+        "vertex": "vertex_attributes",
+        "object": "object_attributes",
+        "link": "link_attributes",
+    }
+    for kwarg, scope in _SCOPE_KWARGS.items():
+        supplied = kwargs.get(kwarg) or {}
+        for name in supplied:
+            spec = schema.spec_for(name, scope)
+            if spec is None:
+                continue
+            extra = spec.array_metadata()
+            if not extra:
+                continue
+            try:
+                level = dataset.level(0).store
+                path = f"{families[scope]}/{name}"
+                if level.standalone_array_exists(path) or level.array_exists(path):
+                    level.write_array_meta(path, extra)
+            except Exception:  # noqa: BLE001 - annotation, never fatal
+                continue
 
 
 def _kind_of_url(url: str) -> str:
@@ -615,7 +721,3 @@ def _kind_of_url(url: str) -> str:
     except Exception:
         return "local"
 
-
-# Kinds this module knows how to create stores for, exported so callers
-# can validate a Schema.kind without importing constants.
-KINDS = (GEOM_POINT_CLOUD, GEOM_LINE, GEOM_POLYLINE, GEOM_MESH, GEOM_GRAPH)

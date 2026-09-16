@@ -134,19 +134,33 @@ def replace_truncated(result: ReadResult, value: bool) -> ReadResult:
     )
 
 
-def _join_segments(part: Any) -> npt.NDArray[Any]:
+def _join_segments(part: Any, ndim: int = 3) -> npt.NDArray[Any]:
     """One part's vertices as a single ``(N, D)`` array.
 
     ``read_polylines`` yields each polyline as a list of per-chunk
     segments; other readers yield a plain array.  Both are accepted so
     the adapter does not have to care which reader it came from.
+
+    ``ndim`` is only reached for an empty part, where there is no data to
+    infer a width from.  It used to be hard-coded to 3, so an empty read
+    of a 2-D store reported ``result.ndim == 3``.
     """
     if isinstance(part, (list, tuple)):
         segments = [np.asarray(s) for s in part if len(s)]
         if not segments:
-            return np.zeros((0, 3), dtype=np.float32)
+            return np.zeros((0, ndim), dtype=np.float32)
         return np.concatenate(segments, axis=0)
     return np.asarray(part)
+
+
+def _infer_ndim(polylines: Sequence[Any]) -> int:
+    """Coordinate width from the first segment that has one, else 0."""
+    for part in polylines:
+        for segment in (part if isinstance(part, (list, tuple)) else [part]):
+            arr = np.asarray(segment)
+            if arr.ndim == 2 and arr.shape[1]:
+                return int(arr.shape[1])
+    return 0
 
 
 def _slices_from_lengths(lengths: Sequence[int]) -> tuple[slice, ...]:
@@ -207,10 +221,29 @@ class ReadResult:
     attributes_read: bool = True
     """Whether attributes were even attempted.
 
-    ``read_points``' object-id path returns ``vertex_attributes={}``
-    unconditionally: the attributes are not absent, they were never
-    looked at.  A caller that cannot distinguish those two will conclude
-    a store has no attributes when it has plenty.
+    ``False`` means the reader did not look, so an empty
+    :attr:`attributes` says nothing about the store.  A caller that cannot
+    tell those apart will conclude a store has none when it has plenty.
+
+    Where they are available today, by geometry and query shape:
+
+    ========  =====  ====  =======  =====
+    kind      whole  bbox  objects  limit
+    ========  =====  ====  =======  =====
+    points    yes    yes   yes      yes
+    polyline  yes    yes   yes      yes
+    line      yes    yes   yes      yes
+    mesh      yes    no    n/a      yes
+    graph     yes    no    n/a      yes
+    ========  =====  ====  =======  =====
+
+    ``mesh`` and ``graph`` lose them on a narrowed read because their
+    readers return no attributes at all and the facade's fallback gather
+    is level-ordered, which cannot be aligned to a cut-down result.
+    ``objects=`` is ``n/a`` for those two: the readers raise
+    ``NotImplementedError`` for it rather than silently ignoring it.
+    Closing the two gaps needs the resolver phase, which plans the
+    attribute reads alongside everything else.
     """
 
     truncated: bool = False
@@ -333,32 +366,39 @@ class ReadResult:
         """``{positions, vertex_attributes, vertex_count}``, plus
         ``object_ids`` on the object-id path.
 
-        That path returns ``vertex_attributes={}`` unconditionally
-        (``points.py:653``) — not because there are none, but because it
-        never reads them.  ``attributes_read`` records the difference.
+        Both of ``read_points``' paths now run the same attribute gather,
+        so both report ``attributes_read``.  The object-id path used to
+        return ``vertex_attributes={}`` unconditionally — not because
+        there were none, but because it never looked — which is why this
+        adapter had to special-case it.
         """
         positions = np.asarray(raw["positions"])
         object_ids = raw.get("object_ids")
-        by_object = object_ids is not None
         return cls(
             kind=kind,
             positions=positions,
             parts=(slice(0, len(positions)),) if len(positions) else (),
             object_ids=None if object_ids is None else np.asarray(object_ids),
             attributes=Attributes(raw.get("vertex_attributes") or {}),
-            attributes_read=not by_object,
+            attributes_read="vertex_attributes" in raw,
         )
 
     @classmethod
     def from_lines(cls, raw: Mapping[str, Any], *, kind: str) -> ReadResult:
-        """``{endpoints, line_count}`` — the only reader with no
-        attribute key at all on any path.
+        """``{endpoints, vertex_attributes, line_count}``.
 
         ``endpoints`` is ``(M, 2, D)``.  Flattening it to ``(2M, D)`` with
         one two-vertex part per line loses nothing (:attr:`endpoints`
         reverses it exactly) and gains the shared shape.  The synthesised
         ``edges`` makes the connectivity explicit, which the tuple form
         left implicit in the axis layout.
+
+        ``vertex_attributes`` holds two rows per line in the same order,
+        so it lines up with ``positions`` as flattened here.  A dict that
+        is present but empty means the reader looked and the store had
+        none; a dict that is *absent* means the read predates
+        ``read_lines`` returning them, and ``attributes_read`` keeps the
+        two apart rather than reporting "none" for both.
         """
         endpoints = np.asarray(raw["endpoints"])
         n_lines = int(endpoints.shape[0])
@@ -373,7 +413,8 @@ class ReadResult:
             positions=positions,
             parts=_slices_from_lengths([2] * n_lines),
             edges=edges,
-            attributes_read=False,
+            attributes=Attributes(raw.get("vertex_attributes") or {}),
+            attributes_read="vertex_attributes" in raw,
         )
 
     @classmethod
@@ -394,11 +435,16 @@ class ReadResult:
         at a boundary.
         """
         raw_polylines = list(raw.get("polylines") or [])
-        arrays = [_join_segments(p) for p in raw_polylines]
+        # Width from the data where there is any; from the store's own
+        # dimensionality otherwise, which the reader reports even on an
+        # empty result.  Hard-coding 3 made every empty read of a 2-D
+        # store claim three dimensions.
+        ndim = int(raw.get("ndim") or 0) or _infer_ndim(raw_polylines) or 3
+        arrays = [_join_segments(p, ndim) for p in raw_polylines]
         if arrays:
             positions = np.concatenate(arrays, axis=0)
         else:
-            positions = np.zeros((0, 3), dtype=np.float32)
+            positions = np.zeros((0, ndim), dtype=np.float32)
         part_objects = raw.get("object_ids")
         return cls(
             kind=kind,
@@ -408,7 +454,11 @@ class ReadResult:
                 None if part_objects is None or len(part_objects) == 0
                 else np.asarray(part_objects)
             ),
-            attributes_read=False,
+            # Flattened in the same order as ``positions`` above --
+            # fragment by fragment, polyline by polyline -- which is what
+            # ``read_polylines`` gathers them in.
+            attributes=Attributes(raw.get("vertex_attributes") or {}),
+            attributes_read="vertex_attributes" in raw,
         )
 
     @classmethod

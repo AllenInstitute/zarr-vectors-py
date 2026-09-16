@@ -15,6 +15,6 @@ Usage::
 """
 
 from zarr_vectors.lazy.store import ZVStore, open_zv
-from zarr_vectors.lazy.views import ZVView, ZVPolylineCollection
+from zarr_vectors.lazy.views import ZVPolylineCollection, ZVView
 
 __all__ = ["ZVStore", "ZVView", "ZVPolylineCollection", "open_zv"]

@@ -12,8 +12,8 @@ by the :class:`Group` abstraction in :mod:`zarr_vectors.core.group`.
 from __future__ import annotations
 
 import os
-from pathlib import Path
 from collections.abc import Sequence
+from pathlib import Path
 from typing import TYPE_CHECKING, Any
 from urllib.parse import unquote, urlparse
 
@@ -23,6 +23,11 @@ from zarr.storage import LocalStore
 if TYPE_CHECKING:
     from zarr.storage import StoreLike
 
+    # Imported here as well as at runtime below: a type checker reads this
+    # block top-down and has not reached the runtime import yet, so the
+    # aliases underneath would otherwise name something undefined.
+    from zarr_vectors.core.group import Group
+
     # What every ``read_*`` entry point accepts: a URL/path string, a
     # pre-built ``zarr.abc.store.Store``, or an already-open Group.  The
     # Group arm is what lets a caller hand in a handle whose caches are
@@ -30,17 +35,22 @@ if TYPE_CHECKING:
     # :mod:`zarr_vectors.core.aio`.
     ReadSource = StoreLike | Group
 
+    # What every ``write_*`` entry point accepts.  Annotated ``str`` for
+    # a long time, which was never true: the same path through
+    # ``_create_or_open_store`` takes a Path, a pre-built Store and an
+    # already-open Group, and consumers pass all three.
+    WriteTarget = StoreLike | Group
+
 from zarr_vectors.constants import (
     DEFAULT_AXES_NAMES,
     DEFAULT_BOUNDS_SIDE,
-    DEFAULT_OOB_POLICY,
     FORMAT_VERSION,  # noqa: F401  (re-exported for callers)
     PARAMETRIC_GROUP,
     RESOLUTION_PREFIX,
     VALID_OOB_POLICIES,
     VERTICES,
 )
-from zarr_vectors.core.group import Group, _BackendShim
+from zarr_vectors.core.group import Group
 from zarr_vectors.core.metadata import (
     LevelMetadata,
     NgffAxis,
@@ -50,7 +60,6 @@ from zarr_vectors.core.metadata import (
     serialise_parametric_types,
 )
 from zarr_vectors.exceptions import MetadataError, StoreError
-
 
 # ===================================================================
 # Path / URL → Zarr store
@@ -312,6 +321,8 @@ def create_store(
     reduction_factor: int | None = None,
     base_bin_shape: tuple[float, ...] | None = None,
     format_capabilities: list[str] | None = None,
+    attribute_specs: dict[str, dict[str, Any]] | None = None,
+    name: str | None = None,
     backend: str | None = None,
     storage_options: dict[str, Any] | None = None,
     **backend_kwargs: Any,
@@ -382,6 +393,16 @@ def create_store(
             omitted, defaults to ``chunk_shape`` (one bin per chunk).
         format_capabilities: Optional capability tokens to stamp on
             the root.  See :mod:`zarr_vectors.constants` ``CAP_*``.
+        attribute_specs: What the store declares its attributes to be,
+            by scope -- ``{"vertex": {name: {...}}, "object": ...,
+            "link": ...}``.  Optional and additive; a reader that does
+            not know about it is unaffected.  Declaring an attribute does
+            not create it.
+        name: Human-readable store name, recorded on the RFC 8 ``ome``
+            node so an OME collection can present it.  Defaults to the
+            store path's last segment with its extension stripped.  Not an
+            identifier: a collection referencing this store supplies its
+            own name for the node, which is what addresses it there.
         backend: Force a particular backend (``"local"`` / ``"icechunk"``).
         **backend_kwargs: Forwarded to the backend constructor.
 
@@ -456,6 +477,8 @@ def create_store(
         reduction_factor=reduction_factor,
         base_bin_shape=base_bin_shape,
         format_capabilities=format_capabilities,
+        attribute_specs=attribute_specs,
+        name=name,
     )
 
     # 0/ + empty vertices pair — the "warm" payload.
@@ -535,11 +558,19 @@ def _write_root_attrs(
     reduction_factor: int | None = None,
     base_bin_shape: tuple[float, ...] | None = None,
     format_capabilities: list[str] | None = None,
+    attribute_specs: dict[str, dict[str, Any]] | None = None,
+    name: str | None = None,
 ) -> None:
     """Write the ``zarr_vectors`` root-attrs block plus the eager NGFF
     ``multiscales`` block (axes only — ``datasets`` are filled in by
     :func:`zarr_vectors.core.multiscale.write_multiscale_metadata`
     when the pyramid is materialised).
+
+    Also writes the RFC 8 ``ome`` node (0.9.2+), which is what lets an OME
+    collection elsewhere name this store by path.  It is additive and
+    derived: nothing in this package reads it, and every field it carries
+    is a restatement of one of the two blocks above.  See
+    :mod:`zarr_vectors.core.ome`.
 
     Used by :func:`create_store` (initial) and helpers that update
     structural fields after create (e.g. :func:`set_bounds`).
@@ -571,6 +602,15 @@ def _write_root_attrs(
         zv["reduction_factor"] = int(reduction_factor)
     if base_bin_shape is not None:
         zv["base_bin_shape"] = list(base_bin_shape)
+    if attribute_specs:
+        # Only non-empty scopes, so a store that declares nothing carries
+        # no key at all rather than three empty dicts.
+        declared = {
+            scope: dict(named)
+            for scope, named in attribute_specs.items() if named
+        }
+        if declared:
+            zv["attribute_specs"] = declared
 
     # Eager NGFF ``multiscales`` block — axes are the canonical axis
     # store from 0.5.0 on.  We seed datasets with level 0 only; the
@@ -594,7 +634,28 @@ def _write_root_attrs(
     ms_entry["metadata"] = md
     multiscales = [ms_entry]
 
-    root.attrs.update({"zarr_vectors": zv, "multiscales": multiscales})
+    # RFC 8 node.  At create time no level group exists yet, so ``nodes``
+    # is empty for as long as it takes ``create_store`` to make level 0 --
+    # which then refreshes this block.  Every store that finished being
+    # created has at least one level.
+    from zarr_vectors.core.ome import (
+        OME_ATTRS_KEY,
+        build_root_node,
+        derive_store_name,
+        read_root_node,
+    )
+    ome_name = (
+        name
+        or (read_root_node(full_attrs) or {}).get("name")
+        or derive_store_name(root.url)
+    )
+    ome = build_root_node(
+        name=ome_name, axes=list(axes), levels=list_resolution_levels(root),
+    )
+
+    root.attrs.update({
+        "zarr_vectors": zv, "multiscales": multiscales, OME_ATTRS_KEY: ome,
+    })
 
 
 def _ensure_root_metadata_for_write(
@@ -940,6 +1001,7 @@ def open_store(
     *,
     backend: str | None = None,
     storage_options: dict[str, Any] | None = None,
+    require_zv: bool = True,
     **backend_kwargs: Any,
 ) -> Group:
     """Open an existing ZV store.
@@ -964,6 +1026,12 @@ def open_store(
             layer).  Callers that need to mutate must open with
             ``mode="r+"``.
         backend: Force a particular backend (auto-detect by default).
+        require_zv: When True (the default), a root with no
+            ``zarr_vectors`` attribute block raises :class:`StoreError`.
+            Pass False to get the handle anyway — for
+            :func:`zarr_vectors.validate.structure.validate_structure`,
+            whose job is to report that condition rather than be stopped
+            by it.
         **backend_kwargs: Forwarded to the backend constructor.
 
     Returns:
@@ -1032,6 +1100,12 @@ def open_store(
 
     attrs = root.attrs.to_dict()
     if "zarr_vectors" not in attrs:
+        if not require_zv:
+            # The one caller that passes False is the structural
+            # validator, whose job is to REPORT this rather than be
+            # stopped by it.  Raising here would mean the check exists in
+            # two places and the one written to describe it can never run.
+            return root
         raise StoreError(
             f"Not a valid ZV store: missing 'zarr_vectors' in root attrs "
             f"at {root.url}"
@@ -1325,6 +1399,11 @@ def create_resolution_level(
             else None
         )
         upsert_level_transform(root, level, scale=scale, translation=translation)
+
+    # Keep the RFC 8 node's level list in step with the level groups.
+    # Derived from disk rather than appended to, so it cannot drift.
+    from zarr_vectors.core.ome import refresh_root_node
+    refresh_root_node(root)
     return level_group
 
 
@@ -1675,6 +1754,9 @@ def remove_resolution_level(root: Group, level_index: int) -> None:
         raise StoreError(f"Resolution level {level_index} not found")
 
     root.delete_subtree(group_name)
+
+    from zarr_vectors.core.ome import refresh_root_node
+    refresh_root_node(root)
 
 
 def list_available_ratios(root: Group) -> list[tuple[int, ...]]:

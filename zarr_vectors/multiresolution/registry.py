@@ -32,7 +32,8 @@ Registered signatures
 
 from __future__ import annotations
 
-from typing import Any, Callable
+from collections.abc import Callable
+from typing import Any
 
 # Registered-callable signatures (documented above; kept loose so the tools
 # package isn't forced to import core typing internals).

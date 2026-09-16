@@ -40,7 +40,6 @@ from urllib.parse import unquote, urlparse
 
 from zarr_vectors.exceptions import StoreError
 
-
 _OpenMode = Literal["w", "r", "r+", "a"]
 
 

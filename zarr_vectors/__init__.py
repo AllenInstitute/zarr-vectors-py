@@ -28,6 +28,18 @@ except Exception:  # pragma: no cover - older/newer zarr without the class
 
 # The data-oriented API.  Prefer these: they describe the data, and they
 # are the surface that stays stable when the storage layer changes.
+# The builder surface, as an attribute of the package.  ``import
+# zarr_vectors as zv`` did not give you ``zv.building`` -- it had to be
+# imported by its full path -- while ``zv.FsGroup`` and ``zv.ZVWriter``
+# were right there, so the two names the split most wanted people to stop
+# using were the discoverable ones.
+from zarr_vectors import building  # noqa: F401
+from zarr_vectors._api_version import (  # noqa: F401
+    FEATURES,
+    __api_version__,
+    require_api,
+)
+from zarr_vectors._stability import stability  # noqa: F401
 from zarr_vectors.api import (
     Attributes,
     AttributeSpec,
@@ -59,19 +71,6 @@ from zarr_vectors.api import (
     open_or_create,
     require_format,
 )
-
-# The builder surface, as an attribute of the package.  ``import
-# zarr_vectors as zv`` did not give you ``zv.building`` -- it had to be
-# imported by its full path -- while ``zv.FsGroup`` and ``zv.ZVWriter``
-# were right there, so the two names the split most wanted people to stop
-# using were the discoverable ones.
-from zarr_vectors import building  # noqa: F401
-from zarr_vectors._api_version import (  # noqa: F401
-    FEATURES,
-    __api_version__,
-    require_api,
-)
-from zarr_vectors._stability import stability  # noqa: F401
 
 # The storage layer.  Kept importable from here for one release, but no
 # longer advertised in ``__all__``: a caller reaching for these is
@@ -158,7 +157,12 @@ __all__ = [
 ]
 
 # Retired from ``__all__`` but still importable for one release:
-#   Group, FsGroup, create_store, open_store, rebind, detect_scheme,
-#   RechunkSpec, rechunk, rechunk_by_attribute, ZVWriter
-# Get the first eight from ``zarr_vectors.building``; ``ZVWriter`` is
-# deprecated outright (see its own warning for what replaces each method).
+#   Group, create_store, open_store, RechunkSpec, rechunk,
+#   rechunk_by_attribute  -> all re-exported by ``zarr_vectors.building``
+#   FsGroup, rebind, detect_scheme                 -> NOT in building; they
+#       are local-store and backend-plumbing details with no supported
+#       spelling.  Reach for ``open_store`` / ``create_store`` instead.
+#   ZVWriter -> deprecated outright (see its own warning for what
+#       replaces each method).
+# The previous note here said "get the first eight from building", which
+# was wrong for three of them.

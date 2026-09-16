@@ -16,7 +16,7 @@ between objects, and per-object OIDs are preserved across levels.
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import numpy as np
 import numpy.typing as npt
@@ -29,22 +29,25 @@ from zarr_vectors.constants import (
     DEFAULT_CROSS_LEVEL_DEPTH,
     DEFAULT_CROSS_LEVEL_STORAGE,
     OBJECT_ATTRIBUTES,
+    VALID_XLEVEL_STORAGE,
+    VERTEX_FRAGMENTS,
     VERTICES,
     XLEVEL_EXPLICIT,
     XLEVEL_NONE,
-    VALID_XLEVEL_STORAGE,
 )
 from zarr_vectors.core.arrays import (
     create_object_attributes_array,
     create_object_index_array,
     create_vertices_array,
+    link_endpoints_to_rows,
     list_chunk_keys,
-    read_all_object_manifests,
     read_chunk_vertices,
-    read_links,
+    read_link_arrays,
     read_object_attributes,
+    read_object_manifest_rows,
+    vertices_dtype,
     write_chunk_vertices,
-    write_links,
+    write_cross_level_links,
     write_object_attributes,
     write_object_index,
 )
@@ -66,13 +69,16 @@ from zarr_vectors.spatial.boundary import build_vertex_chunk_mapping
 from zarr_vectors.spatial.chunking import assign_chunks
 from zarr_vectors.typing import ChunkCoords
 
+if TYPE_CHECKING:  # pragma: no cover - typing only
+    from zarr_vectors.core.group import Group
+
 
 # ===================================================================
 # Single-level coarsening
 # ===================================================================
 
 def coarsen_level(
-    store_path: str | Path,
+    store_path: str | Path | Group,
     source_level: int,
     target_level: int,
     *,
@@ -165,7 +171,7 @@ def coarsen_level(
 
 def _per_object_coarsen(
     *,
-    store_path: str | Path,
+    store_path: str | Path | Group,
     source_level: int,
     target_level: int,
     coarsen_factor: float,
@@ -184,7 +190,7 @@ def _per_object_coarsen(
     objects`` (`schema/zarr_vectors.linkml.yaml` schema captures the
     persistent metadata side).
     """
-    root = open_store(str(store_path), mode="r+")
+    root = open_store(store_path, mode="r+")
     root_meta = read_root_metadata(root)
     ndim = root_meta.sid_ndim
 
@@ -239,18 +245,30 @@ def _per_object_coarsen(
 
     # --- Step 0: read source manifests + vertex positions ----------------
     # Read source vertex positions, indexed by (chunk_coords, fragment_idx).
+    # One prefetch for the level: read chunk by chunk, each read opened
+    # its own one-cell prefetch, and two thousand of those cost 14 s of
+    # a 45 s pyramid -- more than the coarsening itself.
     src_fragment_positions: dict[tuple[ChunkCoords, int], npt.NDArray] = {}
-    for cc in list_chunk_keys(src_group, VERTICES):
-        try:
-            fragments = read_chunk_vertices(src_group, cc, ndim=ndim)
-        except ArrayError:
-            continue
-        for fragment_idx, fragment in enumerate(fragments):
-            src_fragment_positions[(cc, fragment_idx)] = fragment
+    # The declared dtype once, not once per chunk: unasked, every read
+    # resolved the ``vertices`` node again to look it up.
+    src_dtype = vertices_dtype(src_group)
+    with _level_prefetch(src_group):
+        for cc in list_chunk_keys(src_group, VERTICES):
+            try:
+                fragments = read_chunk_vertices(src_group, cc, dtype=src_dtype, ndim=ndim)
+            except ArrayError:
+                continue
+            for fragment_idx, fragment in enumerate(fragments):
+                src_fragment_positions[(cc, fragment_idx)] = fragment
 
     src_has_objects = "object_index" in src_group
+    src_ids: npt.NDArray[np.int64] | None = None
     if src_has_objects:
-        src_manifests = read_all_object_manifests(src_group)
+        # Ids alongside rows: ``keep_oids`` below indexes the manifest
+        # list, which is row order, and the object the coarse level must
+        # carry forward is named by the id at that row -- the same thing
+        # only while a level stores its objects densely from zero.
+        src_ids, src_manifests = read_object_manifest_rows(src_group)
     else:
         # No object_index — treat the level as one implicit object whose
         # manifest enumerates every fragment in chunk-major order.
@@ -284,15 +302,18 @@ def _per_object_coarsen(
         keep_oids = sorted(int(o) for o in kept)
     else:
         keep_oids = list(range(n_src_objects))
-    keep_set = set(keep_oids)
 
     # --- Step 2-3: build (source vertex → bin → metavertex) map ---------
-    # Per-object ordered source-vertex positions (with their global index
-    # in the flat source-vertex array).
-    per_object_positions: dict[int, np.ndarray] = {}
+    # Per-object source-vertex counts, in ``keep_oids`` order, alongside
+    # the flat concatenation of the positions themselves.
+    #
+    # Only the counts are kept per object, not the positions: step 7
+    # below walks the flat array in per-object slices and needs the slice
+    # lengths, so holding each object's own copy as well meant a second
+    # full copy of the level's vertices alive at the same time as
+    # ``all_pos``. On a million vertices the peak was 68 times the data.
+    per_object_count: dict[int, int] = {}
     flat_positions: list[np.ndarray] = []
-    flat_oid_of_v: list[int] = []
-    next_global = 0
     for oid in keep_oids:
         manifest = src_manifests[oid]
         parts: list[np.ndarray] = []
@@ -302,13 +323,16 @@ def _per_object_coarsen(
                 continue
             parts.append(np.asarray(fragment, dtype=np.float32))
         if not parts:
-            per_object_positions[oid] = np.zeros((0, ndim), dtype=np.float32)
+            per_object_count[oid] = 0
             continue
         obj_positions = np.concatenate(parts, axis=0)
-        per_object_positions[oid] = obj_positions
+        per_object_count[oid] = int(obj_positions.shape[0])
         flat_positions.append(obj_positions)
-        flat_oid_of_v.extend([oid] * obj_positions.shape[0])
-        next_global += obj_positions.shape[0]
+
+    # The source fragments have been copied into the flat array and are
+    # not read again; releasing them here keeps the source level and the
+    # working copy from being resident at once.
+    src_fragment_positions.clear()
 
     if not flat_positions:
         # Surviving objects had no vertices.  Write an empty level.
@@ -330,6 +354,9 @@ def _per_object_coarsen(
         }
 
     all_pos = np.concatenate(flat_positions, axis=0)
+    # ``all_pos`` owns the data now; the per-object arrays were its only
+    # other reference.
+    flat_positions.clear()
 
     # Target bin shape: source bin_shape × coarsen_factor.
     # Target bin shape: the SOURCE level's bin_shape x coarsen_factor, so the
@@ -343,30 +370,58 @@ def _per_object_coarsen(
     bin_keys = np.ascontiguousarray(bin_coords).view(
         np.dtype((np.void, bin_coords.dtype.itemsize * bin_coords.shape[1]))
     ).ravel()
-    _, inverse = np.unique(bin_keys, return_inverse=True)
+    unique_keys, inverse = np.unique(bin_keys, return_inverse=True)
     inverse = inverse.astype(np.int64, copy=False)
     n_metavertices = int(inverse.max()) + 1 if inverse.size > 0 else 0
+    # bin_coords and the view over it are one int64 per axis per source
+    # vertex -- twice all_pos -- and were held to the end of the function
+    # purely so the cross-level step could recompute this np.unique on
+    # them. It is the same answer, so pass it and let the source-sized
+    # arrays go now.
+    del bin_coords, bin_keys
 
     # --- Step 3 (continued): centroid per bin --------------------------
-    meta_positions = np.zeros((n_metavertices, ndim), dtype=np.float32)
-    bin_counts = np.zeros(n_metavertices, dtype=np.int64)
-    np.add.at(meta_positions, inverse, all_pos)
-    np.add.at(bin_counts, inverse, 1)
-    meta_positions /= bin_counts[:, None]
+    # Sum each bin's member positions, then divide by its population.
+    #
+    # ``np.bincount``, not ``np.add.at``: the latter is numpy's
+    # unbuffered scatter-add and takes the slow path on every element,
+    # which at a million source vertices is a million of them. bincount
+    # is the same reduction expressed as a histogram with weights, and
+    # runs in C. The accumulation is in float64 so a densely populated
+    # bin does not lose precision to float32 before the divide.
+    bin_counts = np.bincount(inverse, minlength=n_metavertices).astype(
+        np.int64, copy=False,
+    )
+    meta_positions = np.empty((n_metavertices, ndim), dtype=np.float32)
+    for _axis in range(ndim):
+        meta_positions[:, _axis] = (
+            np.bincount(
+                inverse,
+                weights=all_pos[:, _axis].astype(np.float64, copy=False),
+                minlength=n_metavertices,
+            )
+            / np.maximum(bin_counts, 1)
+        )
 
     # --- Step 4: chunk-assign metavertices ------------------------------
     chunk_assignments = assign_chunks(meta_positions, chunk_shape)
 
     # --- Step 5: per-chunk fragment layout (one fragment per metavertex) ------------
-    metavertex_to_ref: dict[int, tuple[ChunkCoords, int]] = {}
     per_chunk_groups: dict[ChunkCoords, list[np.ndarray]] = {}
-    for cc, indices in sorted(chunk_assignments.items()):
+    # Where each metavertex ended up, as two dense arrays rather than a
+    # dict with one tuple-valued entry per metavertex: at a million of
+    # them that dict was ~150 MB of interpreter objects to express a map
+    # from range(M).
+    mv_chunk_slot = np.full(n_metavertices, -1, dtype=np.int64)
+    mv_fragment_idx = np.full(n_metavertices, -1, dtype=np.int64)
+    chunk_slots: list[ChunkCoords] = []
+    for slot, (cc, indices) in enumerate(sorted(chunk_assignments.items())):
         # ``indices`` are metavertex indices that fell in this chunk.
-        for fragment_idx, mv_idx in enumerate(indices.tolist()):
-            metavertex_to_ref[int(mv_idx)] = (cc, fragment_idx)
-            per_chunk_groups.setdefault(cc, []).append(
-                meta_positions[mv_idx:mv_idx + 1]
-            )
+        idx = np.asarray(indices, dtype=np.int64)
+        chunk_slots.append(cc)
+        mv_chunk_slot[idx] = slot
+        mv_fragment_idx[idx] = np.arange(idx.size, dtype=np.int64)
+        per_chunk_groups[cc] = list(np.split(meta_positions[idx], idx.size))
 
     # --- Step 6: write per-chunk fragments --------------------------
     arrays_present = [VERTICES, "object_index"] if src_has_objects else [VERTICES]
@@ -396,37 +451,64 @@ def _per_object_coarsen(
     if src_has_objects:
         create_object_index_array(level_group)
 
-    for cc, groups in sorted(per_chunk_groups.items()):
-        write_chunk_vertices(level_group, cc, groups, dtype=np.float32)
+    # One batch for the whole level. Unbatched, each cell write is a
+    # parse-insert-sort-rewrite of the array's presence manifest, so
+    # writing C cells costs O(C^2) -- 32,768 cells took 207s to write
+    # through this path and 262,144 did not finish in 25 minutes.
+    # Batched, the cells go out in one gather and presence is stamped
+    # once for the array.
+    with level_group.batched_writes():
+        for cc, groups in sorted(per_chunk_groups.items()):
+            write_chunk_vertices(level_group, cc, groups, dtype=np.float32)
 
     # --- Step 7: emit per-object manifests ------------------------------
     # We need to map each source vertex back to its metavertex_index.
     # Walk per-object slices of the flat ``inverse`` array.
     cursor = 0
     new_manifests: dict[int, list[tuple[ChunkCoords, int]]] = {}
+
+    def _id_of(row: int) -> int:
+        """The object id at a source row -- the row itself when the
+        source stored its objects densely from zero."""
+        return int(src_ids[row]) if src_ids is not None else int(row)
+
     for oid in keep_oids:
-        n = per_object_positions[oid].shape[0]
+        n = per_object_count[oid]
         if n == 0:
             cursor += 0
-            new_manifests[oid] = []
+            new_manifests[_id_of(oid)] = []
             continue
-        mv_seq = inverse[cursor:cursor + n].tolist()
+        mv_seq = inverse[cursor:cursor + n]
         cursor += n
-        # Deduplicate consecutive duplicates while preserving order.
-        manifest: list[tuple[ChunkCoords, int]] = []
-        prev = -1
-        for mv_idx in mv_seq:
-            if mv_idx == prev:
-                continue
-            prev = mv_idx
-            manifest.append(metavertex_to_ref[int(mv_idx)])
-        new_manifests[oid] = manifest
+        # Drop consecutive duplicates, preserving order -- vectorised,
+        # because this runs once per source vertex across the level.
+        if mv_seq.size > 1:
+            keep = np.concatenate(([True], mv_seq[1:] != mv_seq[:-1]))
+            mv_seq = mv_seq[keep]
+        new_manifests[_id_of(oid)] = [
+            (chunk_slots[slot], int(frag))
+            for slot, frag in zip(
+                mv_chunk_slot[mv_seq].tolist(),
+                mv_fragment_idx[mv_seq].tolist(),
+            )
+        ]
 
-    # --- Step 9: emit object_index (gap-fill for dropped OIDs) ----------
+    # --- Step 9: emit object_index (dropped OIDs stay addressable) ------
     if src_has_objects:
+        # Every source id gets a row, so a sparsified level keeps the
+        # ids it dropped addressable -- as empty manifests, exactly as
+        # the old slot padding did, but named rather than implied by
+        # position. ``total_objects`` is deliberately not passed: it
+        # declares the id space as range(n), which is only the source's
+        # id space when that source numbered its objects densely.
+        ids_for_index = (
+            src_ids.tolist() if src_ids is not None
+            else list(range(n_src_objects))
+        )
         write_object_index(
-            level_group, new_manifests, sid_ndim=ndim,
-            total_objects=n_src_objects,
+            level_group,
+            {int(oid): new_manifests.get(int(oid), []) for oid in ids_for_index},
+            sid_ndim=ndim,
         )
 
     # --- Step 10: per-object attributes with present_mask ---------------
@@ -447,12 +529,14 @@ def _per_object_coarsen(
         # rows for survivors copied over.  Layout matches the source's
         # OID space (which already equals n_src_objects).
         out_data = np.zeros_like(src_data)
-        for oid in keep_oids:
-            if oid < len(src_data):
-                out_data[oid] = src_data[oid]
+        # One scatter each, rather than a Python iteration per surviving
+        # object over a column that is already an array.
+        keep_arr = np.asarray(keep_oids, dtype=np.int64)
+        keep_arr = keep_arr[keep_arr < len(src_data)]
+        if keep_arr.size:
+            out_data[keep_arr] = src_data[keep_arr]
         mask = np.zeros(n_src_objects, dtype=np.uint8)
-        for oid in keep_oids:
-            mask[oid] = 1
+        mask[np.asarray(keep_oids, dtype=np.int64)] = 1
         create_object_attributes_array(level_group, attr_name)
         write_object_attributes(level_group, attr_name, out_data, present_mask=mask)
 
@@ -472,7 +556,7 @@ def _per_object_coarsen(
             source_level=source_level,
             ndim=ndim,
             bin_shape_arr=bin_shape_arr,
-            bin_keys=bin_keys,
+            unique_keys=unique_keys,
             coarse_chunk_assignments_mv=chunk_assignments,
             storage=cross_level_storage,
         )
@@ -496,7 +580,7 @@ def _emit_inline_cross_level_links(
     source_level: int,
     ndim: int,
     bin_shape_arr: npt.NDArray[np.float64],
-    bin_keys: npt.NDArray,
+    unique_keys: npt.NDArray,
     coarse_chunk_assignments_mv: dict[ChunkCoords, npt.NDArray[np.int64]],
     storage: str,
 ) -> None:
@@ -520,22 +604,26 @@ def _emit_inline_cross_level_links(
     this after the ``create_resolution_level`` for ``source_level + 1``
     (step 6 of :func:`_per_object_coarsen`).
     """
-    # bin_key_bytes → mv_idx (bin-key-ordered, matches np.unique output).
-    unique_keys = np.unique(bin_keys)
-    bin_key_to_mv: dict[bytes, int] = {
-        bytes(k): i for i, k in enumerate(unique_keys)
-    }
+    # ``unique_keys`` arrives from the caller, which already computed it
+    # binning the source. Metavertex ids are positions in it, which is
+    # what lets the per-vertex lookup below be a searchsorted rather than
+    # a dict with one bytes key per metavertex.
 
     # mv_idx → chunk-major-flat coarse index.
     coarse_chunk_assignments, n_coarse = _reconstruct_chunk_assignments(
         level_group, ndim,
     )
-    mv_to_coarse_global: dict[int, int] = {}
+    # Dense map, so an array rather than a dict with one entry per
+    # metavertex: at a million metavertices the dict was ~150 MB of
+    # interpreter objects to express a permutation of range(M).
+    mv_to_coarse_global = np.full(len(unique_keys), -1, dtype=np.int64)
     for cc, mv_indices_for_chunk in sorted(coarse_chunk_assignments_mv.items()):
-        for local_vg, mv_idx in enumerate(mv_indices_for_chunk.tolist()):
-            mv_to_coarse_global[int(mv_idx)] = int(
-                coarse_chunk_assignments[cc][local_vg]
-            )
+        mv_idx_arr = np.asarray(mv_indices_for_chunk, dtype=np.int64)
+        if mv_idx_arr.size == 0:
+            continue
+        mv_to_coarse_global[mv_idx_arr] = np.asarray(
+            coarse_chunk_assignments[cc], dtype=np.int64,
+        )[: mv_idx_arr.size]
 
     # Build fine→coarse parent[] by re-walking source in chunk-major order.
     fine_chunk_assignments, n_fine = _reconstruct_chunk_assignments(
@@ -546,26 +634,37 @@ def _emit_inline_cross_level_links(
     key_dtype = np.dtype((
         np.void, int(bin_shape_arr.shape[0]) * np.dtype(np.int64).itemsize,
     ))
-    for cc in list_chunk_keys(src_group, VERTICES):
-        try:
-            fragments = read_chunk_vertices(
-                src_group, cc, dtype=np.float32, ndim=ndim,
-            )
-        except ArrayError:
-            continue
-        for fragment in fragments:
-            n_local = int(fragment.shape[0])
-            if n_local == 0:
+    with _level_prefetch(src_group):
+        for cc in list_chunk_keys(src_group, VERTICES):
+            try:
+                fragments = read_chunk_vertices(
+                    src_group, cc, dtype=np.float32, ndim=ndim,
+                )
+            except ArrayError:
                 continue
-            local_bins = np.floor(
-                np.asarray(fragment, dtype=np.float32) / bin_shape_arr,
-            ).astype(np.int64)
-            local_keys = np.ascontiguousarray(local_bins).view(key_dtype).ravel()
-            for j in range(n_local):
-                mv = bin_key_to_mv.get(bytes(local_keys[j]))
-                if mv is not None:
-                    parent[cursor + j] = mv_to_coarse_global[int(mv)]
-            cursor += n_local
+            for fragment in fragments:
+                n_local = int(fragment.shape[0])
+                if n_local == 0:
+                    continue
+                local_bins = np.floor(
+                    np.asarray(fragment, dtype=np.float32) / bin_shape_arr,
+                ).astype(np.int64)
+                local_keys = np.ascontiguousarray(local_bins).view(key_dtype).ravel()
+                # One searchsorted per fragment, not one dict lookup per
+                # vertex. ``unique_keys`` is np.unique output and therefore
+                # sorted, so the position it returns IS the metavertex index.
+                # The old form allocated a bytes object per vertex, which was
+                # the hottest Python loop in the coarsener.
+                pos = np.searchsorted(unique_keys, local_keys)
+                np.clip(pos, 0, len(unique_keys) - 1, out=pos)
+                # A key the coarse level never produced has no parent; the
+                # caller relies on those staying -1.
+                hit = unique_keys[pos] == local_keys
+                if hit.any():
+                    parent[cursor + np.flatnonzero(hit)] = mv_to_coarse_global[
+                        pos[hit]
+                    ]
+                cursor += n_local
 
     _write_cross_level_edges(
         root,
@@ -650,6 +749,22 @@ def _stamp_root_cross_level(
     root_group.attrs.update({"zarr_vectors": zv})
 
 
+def _level_prefetch(level_group):
+    """One batched read of every ``vertices`` and ``vertex_fragments``
+    cell in the level, for a loop that would otherwise open one
+    single-cell prefetch per chunk.
+
+    A no-op inside an outer prefetch or an offline replay, like
+    :func:`~zarr_vectors.core.arrays._maybe_batched_reads`.
+    """
+    from zarr_vectors.core.arrays import _chunk_key, _maybe_batched_reads
+
+    keys = [_chunk_key(cc) for cc in list_chunk_keys(level_group, VERTICES)]
+    return _maybe_batched_reads(level_group, [
+        (VERTICES, keys), (VERTEX_FRAGMENTS, keys),
+    ])
+
+
 def _reconstruct_chunk_assignments(
     level_group, ndim: int,
 ) -> tuple[dict[ChunkCoords, npt.NDArray[np.int64]], int]:
@@ -662,21 +777,29 @@ def _reconstruct_chunk_assignments(
     ``build_vertex_chunk_mapping`` for in-memory edge partitioning.
 
     Returns the assignments dict and the total vertex count.
+
+    Counts come from the size of each stored blob, not from decoding it.
+    The old form called ``read_chunk_vertices`` on every chunk purely to
+    sum ``fragment.shape[0]`` -- a full decode of the level's coordinate
+    data to learn how many rows it had. This runs twice per coarsen step
+    and once per level again in the finalize pass, so a pyramid paid for
+    several complete decodes it never looked at.
     """
-    chunk_keys = list_chunk_keys(level_group, VERTICES)
+    from zarr_vectors.spatial.boundary import chunk_local_to_global_offsets
+
+    offsets, chunk_keys, total = chunk_local_to_global_offsets(
+        level_group, ndim,
+    )
     assignments: dict[ChunkCoords, npt.NDArray[np.int64]] = {}
-    cursor = 0
-    for cc in chunk_keys:
-        try:
-            fragments = read_chunk_vertices(level_group, cc, ndim=ndim)
-        except ArrayError:
+    for i, cc in enumerate(chunk_keys):
+        start = offsets[cc]
+        end = offsets[chunk_keys[i + 1]] if i + 1 < len(chunk_keys) else total
+        if end <= start:
+            # An empty chunk contributes no vertices, and the old form
+            # skipped it rather than storing an empty range.
             continue
-        n = sum(int(fragment.shape[0]) for fragment in fragments)
-        if n == 0:
-            continue
-        assignments[cc] = np.arange(cursor, cursor + n, dtype=np.int64)
-        cursor += n
-    return assignments, cursor
+        assignments[cc] = np.arange(start, end, dtype=np.int64)
+    return assignments, total
 
 
 def _decode_parent_from_plus_one(
@@ -698,21 +821,30 @@ def _decode_parent_from_plus_one(
     ``None`` when the family is absent or empty.
     """
     parent = np.full(n_fine, -1, dtype=np.int64)
-    found_any = False
 
     try:
-        records = read_links(fine_lg, delta=1)
+        chunks, vi = read_link_arrays(fine_lg, delta=1)
     except (ArrayError, KeyError):
-        records = []
-    for (cc_s, vi_s), (cc_t, vi_t) in records:
-        parent[int(fine_assn[cc_s][vi_s])] = int(coarse_assn[cc_t][vi_t])
-        found_any = True
-
-    return parent if found_any else None
+        return None
+    if vi.shape[0] == 0 or vi.shape[1] != 2:
+        return None
+    # Each level's assignment for a chunk is a contiguous range, so the
+    # global index of an endpoint is the range's start plus its local
+    # index -- one gather per side rather than two dict lookups and an
+    # int() per record.
+    fine_start = {cc: int(rows[0]) for cc, rows in fine_assn.items() if rows.size}
+    coarse_start = {cc: int(rows[0]) for cc, rows in coarse_assn.items() if rows.size}
+    fine_idx = link_endpoints_to_rows(chunks[:, :1], vi[:, :1], fine_start)[:, 0]
+    coarse_idx = link_endpoints_to_rows(chunks[:, 1:], vi[:, 1:], coarse_start)[:, 0]
+    valid = (fine_idx >= 0) & (coarse_idx >= 0)
+    if not valid.any():
+        return None
+    parent[fine_idx[valid]] = coarse_idx[valid]
+    return parent
 
 
 def _finalize_cross_level_for_store(
-    store_path: str | Path,
+    store_path: str | Path | Group,
     *,
     cross_level_depth: int,
     cross_level_storage: str,
@@ -728,7 +860,7 @@ def _finalize_cross_level_for_store(
 
     ``cross_level_depth=-1`` means "walk all available level pairs".
     """
-    root = open_store(str(store_path), mode="r+")
+    root = open_store(store_path, mode="r+")
     _stamp_root_cross_level(
         root, depth=cross_level_depth, storage=cross_level_storage,
     )
@@ -868,27 +1000,32 @@ def _write_cross_level_edges(
         coarse_chunk_assignments, n_coarse, sorted(coarse_chunk_assignments.keys()),
     )
 
-    fine_eps = [
-        (fine_chunk_list[int(fine_vchunks[i])], int(fine_vlocal[i]))
-        for i in fine_global.tolist()
-    ]
-    coarse_eps = [
-        (coarse_chunk_list[int(coarse_vchunks[i])], int(coarse_vlocal[i]))
-        for i in parent_valid.tolist()
-    ]
+    # Kept as arrays. build_vertex_chunk_mapping already returns the
+    # per-vertex chunk and local indices as int64 arrays, so taking them
+    # apart into a Python tuple per endpoint -- once per fine vertex, and
+    # again for the mirrored family -- only to have the partitioner put
+    # them back together was the dominant cost of a pyramid build.
+    fine_chunk_arr = np.asarray(fine_chunk_list, dtype=np.int64)
+    coarse_chunk_arr = np.asarray(coarse_chunk_list, dtype=np.int64)
+    fine_cc = fine_chunk_arr[fine_vchunks[fine_global]]
+    fine_vi = fine_vlocal[fine_global]
+    coarse_cc = coarse_chunk_arr[coarse_vchunks[parent_valid]]
+    coarse_vi = coarse_vlocal[parent_valid]
 
     # Endpoint 0 leads and stays at the owning level, so each call's
     # anchor uses that level's scale as ``r_src``.  ``directed=True``:
     # fine→coarse parenthood is data, not an undirected pair.
     fine_lg = get_resolution_level(root_group, fine_level)
-    write_links(
-        fine_lg,
-        [[f, c] for f, c in zip(fine_eps, coarse_eps)],
-        sid_ndim,
-        delta=delta,
-        link_width=2,
-        directed=True,
-    )
+    # One batch for the family. Unbatched, each cell write is a
+    # read-modify-write of the array's whole presence manifest, so
+    # writing C cells costs O(C^2) -- the same bug already fixed for
+    # this module's vertex writes and for shard_store, and the reason
+    # the comment on step 6 records 207 s for 32k cells.
+    with fine_lg.batched_writes():
+        write_cross_level_links(
+            fine_lg, fine_cc, fine_vi, coarse_cc, coarse_vi, sid_ndim,
+            delta=delta,
+        )
 
     if storage == XLEVEL_EXPLICIT:
         # Mirror at the coarse level under -delta: the coarse endpoint
@@ -896,14 +1033,11 @@ def _write_cross_level_edges(
         # by hand — write_links re-derives the offsets from the coarse
         # grid, which is what the fine-side split cannot speak to.
         coarse_lg = get_resolution_level(root_group, fine_level + delta)
-        write_links(
-            coarse_lg,
-            [[c, f] for f, c in zip(fine_eps, coarse_eps)],
-            sid_ndim,
-            delta=-delta,
-            link_width=2,
-            directed=True,
-        )
+        with coarse_lg.batched_writes():
+            write_cross_level_links(
+                coarse_lg, coarse_cc, coarse_vi, fine_cc, fine_vi, sid_ndim,
+                delta=-delta,
+            )
 
 
 # ===================================================================
@@ -911,7 +1045,7 @@ def _write_cross_level_edges(
 # ===================================================================
 
 def build_pyramid(
-    store_path: str | Path,
+    store_path: str | Path | Group,
     *,
     factors: list[tuple[float, float]],
     chunk_scale_factors: list[int | tuple[int, ...]] | None = None,

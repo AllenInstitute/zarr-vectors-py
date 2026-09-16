@@ -251,6 +251,10 @@ per-cell readers and writers, and the finalisation pass.
 
 .. autofunction:: zarr_vectors.building.read_links_for_tuple
 
+.. autofunction:: zarr_vectors.building.read_link_arrays
+
+.. autofunction:: zarr_vectors.building.link_endpoints_to_rows
+
 .. autofunction:: zarr_vectors.building.read_link_attributes
 
 .. autofunction:: zarr_vectors.building.read_chunk_links

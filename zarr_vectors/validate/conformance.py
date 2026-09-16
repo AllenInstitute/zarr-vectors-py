@@ -3,19 +3,31 @@
 from __future__ import annotations
 
 from pathlib import Path
-
-import numpy as np
+from typing import TYPE_CHECKING
 
 from zarr_vectors.constants import (
-    GEOM_GRAPH, GEOM_LINE, GEOM_MESH, GEOM_POINT_CLOUD,
-    GEOM_POLYLINE, GEOM_SKELETON, GEOM_STREAMLINE,
-    LINKS_EXPLICIT, LINKS_IMPLICIT_BRANCHES, LINKS_IMPLICIT_SEQUENTIAL,
+    GEOM_GRAPH,
+    GEOM_LINE,
+    GEOM_MESH,
+    GEOM_POINT_CLOUD,
+    GEOM_POLYLINE,
+    GEOM_SKELETON,
+    GEOM_STREAMLINE,
+    LINKS_EXPLICIT,
+    LINKS_IMPLICIT_BRANCHES,
+    LINKS_IMPLICIT_SEQUENTIAL,
 )
 from zarr_vectors.core.arrays import list_chunk_keys, read_chunk_vertices
 from zarr_vectors.core.store import (
-    get_resolution_level, list_resolution_levels, open_store, read_root_metadata,
+    get_resolution_level,
+    list_resolution_levels,
+    open_store,
+    read_root_metadata,
 )
 from zarr_vectors.validate.structure import ValidationResult
+
+if TYPE_CHECKING:  # pragma: no cover - typing only
+    from zarr_vectors.core.group import Group
 
 GEOMETRY_LINK_REQ: dict[str, set[str]] = {
     GEOM_POINT_CLOUD: set(),
@@ -28,18 +40,17 @@ GEOMETRY_LINK_REQ: dict[str, set[str]] = {
 }
 
 
-def validate_conformance(store_path: str | Path) -> ValidationResult:
+def validate_conformance(store_path: str | Path | Group) -> ValidationResult:
     """Level 4: verify geometry-specific conformance."""
     result = ValidationResult(level=4)
 
     try:
-        root = open_store(str(store_path))
+        root = open_store(store_path)
         meta = read_root_metadata(root)
     except Exception as e:
         result.add_error(f"Cannot open store: {e}")
         return result
 
-    ndim = meta.sid_ndim
     geom_types = meta.geometry_types or []
     lc = meta.links_convention
 
@@ -120,12 +131,12 @@ def validate_conformance(store_path: str | Path) -> ValidationResult:
     return result
 
 
-def validate_multiresolution(store_path: str | Path) -> ValidationResult:
+def validate_multiresolution(store_path: str | Path | Group) -> ValidationResult:
     """Level 5: verify multi-resolution pyramid conformance."""
     result = ValidationResult(level=5)
 
     try:
-        root = open_store(str(store_path))
+        root = open_store(store_path)
         meta = read_root_metadata(root)
     except Exception as e:
         result.add_error(f"Cannot open store: {e}")
@@ -146,7 +157,6 @@ def validate_multiresolution(store_path: str | Path) -> ValidationResult:
 
     prev_count: int | None = None
     prev_ratio_product: int = 1
-    prev_object_count: int | None = None
     for li in levels:
         try:
             lg = get_resolution_level(root, li)
@@ -164,7 +174,10 @@ def validate_multiresolution(store_path: str | Path) -> ValidationResult:
                 if vc > prev_count:
                     result.add_error(f"resolution_{li}: {vc} > resolution_{li-1} ({prev_count})")
                 else:
-                    result.add_pass(f"resolution_{li}: {vc} verts ({prev_count/max(vc,1):.1f}x reduction)")
+                    result.add_pass(
+                        f"resolution_{li}: {vc} verts "
+                        f"({prev_count / max(vc, 1):.1f}x reduction)"
+                    )
             prev_count = vc
 
             # Check bin_ratio is non-decreasing (in volume) across levels

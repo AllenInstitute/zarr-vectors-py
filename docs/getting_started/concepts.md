@@ -157,7 +157,7 @@ print(ds.level(0).grid)
 
 ```text
 (200.0, 200.0, 200.0)
-Grid(5x5x5 cells of (200.0, 200.0, 200.0))
+Grid(6x6x6 cells of (200.0, 200.0, 200.0))
 ```
 
 When the grid is fixed from outside — a pipeline whose chunks must line up

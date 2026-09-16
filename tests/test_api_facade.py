@@ -319,6 +319,81 @@ class TestDatasetSurface:
         assert "filtered in memory" in text
 
 
+class TestNoSelfDeprecation:
+    """The supported surface must not warn about its own implementation."""
+
+    def test_add_graph_does_not_emit_a_deprecation_warning(self, tmp_path):
+        """``add_graph`` used to forward the deprecated ``is_tree=`` alias.
+
+        ``write_graph(is_tree=...)`` is deprecated in favour of ``kind=``,
+        and the facade passed it on every call -- so a caller who had done
+        nothing wrong, and who cannot reach ``kind=`` from the data API at
+        all, got a DeprecationWarning naming a parameter they never used.
+        """
+        import warnings
+
+        schema = Schema(
+            bounds=([0.0, 0.0, 0.0], [400.0, 400.0, 400.0]),
+            kind="graph",
+            layout=Layout(cell_size=[200.0, 200.0, 200.0]),
+        )
+        ds = zv.create(tmp_path / "g.zarrvectors", schema=schema)
+        positions = np.array(
+            [[10, 10, 10], [20, 20, 20], [30, 30, 30]], dtype=np.float32,
+        )
+        edges = np.array([[1, 0], [2, 1]], dtype=np.int64)
+
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            ds.add_graph(positions, edges)
+        assert not [
+            w for w in caught if issubclass(w.category, DeprecationWarning)
+        ], "add_graph warned about its own call into write_graph"
+
+    def test_add_graph_tree_still_writes_a_skeleton(self, tmp_path):
+        """...and the ``tree=`` flag still reaches the writer."""
+        import warnings
+
+        schema = Schema(
+            bounds=([0.0, 0.0, 0.0], [400.0, 400.0, 400.0]),
+            kind="skeleton",
+            layout=Layout(cell_size=[200.0, 200.0, 200.0]),
+        )
+        ds = zv.create(tmp_path / "s.zarrvectors", schema=schema)
+        positions = np.array(
+            [[10, 10, 10], [20, 20, 20], [30, 30, 30]], dtype=np.float32,
+        )
+        edges = np.array([[1, 0], [2, 1]], dtype=np.int64)
+
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            report = ds.add_graph(positions, edges, tree=True)
+        assert report["kind"] == "skeleton"
+        assert not [
+            w for w in caught if issubclass(w.category, DeprecationWarning)
+        ]
+        assert zv.open(tmp_path / "s.zarrvectors").level(0).read().edges.shape == (2, 2)
+
+
+class TestLevelIsOptional:
+    """``level=None`` is the documented "not specified" sentinel."""
+
+    def test_dataset_select_accepts_the_unset_sentinel(self, points_store):
+        """``Selection.level`` defaults to None so level 0 stays requestable.
+
+        ``Dataset.select`` coerced with ``int()``, so the one spelling the
+        API tells callers to use raised TypeError -- on a feature
+        ``_api_version.FEATURES`` advertises as
+        ``selection-level-optional``.
+        """
+        ds = zv.open(points_store)
+        assert (
+            ds.select(level=None).read().vertex_count
+            == ds.select().read().vertex_count
+            == ds.select(level=0).read().vertex_count
+        )
+
+
 class TestDeferredCapabilities:
     """The facade must not advertise what it cannot do."""
 

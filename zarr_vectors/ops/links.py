@@ -26,8 +26,12 @@ Convention contract:
 | ``links_convention`` | add / edit / remove behaviour |
 |---|---|
 | ``"explicit"`` | every link is a stored row; all edits work uniformly |
-| ``"implicit_sequential"`` | no rows stored; all link edits raise (caller must promote the store via ``materialise_object_links_explicit``) |
-| ``"implicit_sequential_with_branches"`` | branch-override rows only; add/edit/remove operate on the stored branch entries; structural removal of an implicit edge raises |
+| ``"implicit_sequential"`` | no rows stored; all link edits raise
+  (caller must promote the store via
+  ``materialise_object_links_explicit``) |
+| ``"implicit_sequential_with_branches"`` | branch-override rows only;
+  add/edit/remove operate on the stored branch entries; structural
+  removal of an implicit edge raises |
 
 Atomic semantics for links are weaker than for vertices: links don't
 carry OID identity directly.  Under ``atomic=True`` an edit appends a
@@ -37,6 +41,7 @@ row is overwritten.  Object manifests are unaffected by link edits.
 
 from __future__ import annotations
 
+from collections.abc import Iterable
 from typing import TYPE_CHECKING
 
 import numpy as np
@@ -642,9 +647,9 @@ def reorder_vertices_implicit(
     root,
     level: int,
     *,
-    object_ids: "Iterable[int] | None" = None,
+    object_ids: Iterable[int] | None = None,
     flip_convention: bool = False,
-    dtype: "np.dtype | str" = np.float32,
+    dtype: np.dtype | str = np.float32,
 ) -> dict:
     """Inverse of :func:`materialise_object_links_explicit`.
 
@@ -652,11 +657,21 @@ def reorder_vertices_implicit(
     deterministic DFS pre-order, and physically reorders each chunk's
     vertices so the object's spine becomes a contiguous run of
     chunk-local indices in DFS order.  Edges along the spine then
-    collapse under the ``implicit_sequential_with_branches`` baseline
-    (``parent[i] = i-1`` over the reader's chunk-sorted concatenation);
-    only true branch overrides remain, in ``links/0/<offsets>/<chunk>`` —
-    the all-zero offsets cell for a within-chunk override, a non-zero one
-    for an override whose endpoints straddle chunks.
+    collapse under the ``implicit_sequential_with_branches`` baseline;
+    only the ones the baseline cannot imply remain, in
+    ``links/0/<offsets>/<chunk>`` — the all-zero offsets cell for a
+    within-chunk override, a non-zero one for an override whose endpoints
+    straddle chunks.
+
+    The baseline is ``parent[i] = i-1`` over the reader's chunk-sorted
+    concatenation **within a fragment**, and it stops at every fragment
+    start: the row before one belongs to a different object or a
+    different chunk.  So a spine edge whose child opens a fragment is
+    written out even though the two vertices are adjacent in read order.
+    This used to be skipped, on the reading that the chain ran unbroken
+    across the whole level — which cannot be true of a level holding more
+    than one object, and which silently dropped the boundary edges of a
+    path spanning several chunks.
 
     Objects whose link graph is not a tree (cycles, multi-parent,
     disconnected within their manifest) are skipped with a
@@ -689,21 +704,19 @@ def reorder_vertices_implicit(
     import warnings
 
     from zarr_vectors.core.arrays import (
-        finalize_links,
         list_link_offsets,
-        read_all_object_manifests,
+        object_count,
         read_chunk_link_attributes,
         read_chunk_links,
         read_chunk_vertices,
         read_link_attributes,
         read_links,
+        read_object_manifests,
         read_vertex_fragment_index,
         write_chunk_fragment_attributes,
         write_chunk_links,
         write_chunk_vertices,
-        write_link_attribute_cells,
         write_link_attributes,
-        write_link_cells,
         write_links,
         write_object_index,
     )
@@ -711,16 +724,17 @@ def reorder_vertices_implicit(
     from zarr_vectors.core.paths import links_group_path
     from zarr_vectors.core.store import get_resolution_level
 
-    _empty_report = lambda: {
-        "objects_processed": 0,
-        "objects_skipped_non_tree": 0,
-        "skipped_oids": [],
-        "branch_overrides_written": 0,
-        "cross_chunk_branch_overrides_written": 0,
-        "chunks_repermuted": 0,
-        "fragments_split": 0,
-        "convention_flipped": False,
-    }
+    def _empty_report() -> dict:
+        return {
+            "objects_processed": 0,
+            "objects_skipped_non_tree": 0,
+            "skipped_oids": [],
+            "branch_overrides_written": 0,
+            "cross_chunk_branch_overrides_written": 0,
+            "chunks_repermuted": 0,
+            "fragments_split": 0,
+            "convention_flipped": False,
+        }
 
     meta = RootMetadata.from_dict(root.attrs.to_dict())
     sid_ndim = meta.sid_ndim
@@ -741,8 +755,10 @@ def reorder_vertices_implicit(
         )
 
     level_group = get_resolution_level(root, level)
-    all_manifests = read_all_object_manifests(level_group)
-    n_objects = len(all_manifests)
+    # The slot count is stamped on the index; reading every manifest to
+    # take its length decoded the whole level to learn a number already
+    # written down. Only the targeted objects' manifests are then read.
+    n_objects = object_count(level_group)
     if object_ids is None:
         target_oids = list(range(n_objects))
     else:
@@ -752,6 +768,7 @@ def reorder_vertices_implicit(
                 raise EditError(
                     f"object_id {o} out of range [0, {n_objects})"
                 )
+    all_manifests = read_object_manifests(level_group, ids=target_oids)
     if not target_oids:
         return _empty_report()
 
@@ -783,7 +800,7 @@ def reorder_vertices_implicit(
     oid_fragment_runs: dict = {}  # oid -> list of (cc, frag_idx, vkey_slice_start, vkey_slice_end)
 
     for oid in target_oids:
-        manifest = all_manifests[oid]
+        manifest = all_manifests.get(int(oid), [])
         vkey_list = []
         frag_runs = []
         for (cc, frag_idx) in manifest:
@@ -1016,10 +1033,21 @@ def reorder_vertices_implicit(
 
     # Per-chunk branch-override accumulators.
     intra_branch_rows: dict = {cc: [] for cc in chunks_to_rewrite}
-    new_cross_branches: list = []  # list of ((parent_cc, parent_new_local), (child_cc, child_new_local))
+    # ((parent_cc, parent_new_local), (child_cc, child_new_local))
+    new_cross_branches: list = []
 
     n_intra_branches = 0
     n_cross_branches = 0
+
+    # New-local index of each fragment's first vertex, per chunk.  The
+    # implicit chain is suspended there: the row before a fragment start
+    # belongs to another object or another chunk, so a reader cannot take
+    # it for the parent, and an edge landing on one has to be recorded
+    # even when the two vertices happen to be adjacent in read order.
+    fragment_start_locals: dict = {
+        cc: {int(ns) for (ns, nc, _ofi) in groups if nc > 0}
+        for cc, groups in chunk_new_groups.items()
+    }
 
     for oid, qd in qualifying.items():
         dfs_order = qd["dfs_order"]
@@ -1031,7 +1059,11 @@ def reorder_vertices_implicit(
                 continue
             v_global = _new_global(v)
             p_global = _new_global(p)
-            if p_global == v_global - 1:
+            v_cc_check, _ = v
+            starts_fragment = (
+                _new_local(v) in fragment_start_locals.get(v_cc_check, ())
+            )
+            if p_global == v_global - 1 and not starts_fragment:
                 continue  # implicit baseline handles it
             # Emit override
             v_cc, _ = v
@@ -1184,7 +1216,10 @@ def reorder_vertices_implicit(
                 continue
             arr = np.stack(kept, axis=0) if kept[0].ndim > 0 else np.asarray(kept)
             group0 = arr
-            group_rest = [np.empty((0,) + arr.shape[1:], dtype=arr.dtype) for _ in range(n_frags - 1)]
+            group_rest = [
+                np.empty((0,) + arr.shape[1:], dtype=arr.dtype)
+                for _ in range(n_frags - 1)
+            ]
             from zarr_vectors.core.arrays import write_chunk_link_attributes
             write_chunk_link_attributes(
                 level_group, fname, cc, [group0, *group_rest],
@@ -1567,17 +1602,17 @@ def _auto_materialise_to_explicit(
     """
     import warnings
 
-    from zarr_vectors.core.arrays import read_all_object_manifests
+    from zarr_vectors.core.arrays import read_object_manifest_rows
     from zarr_vectors.core.store import get_resolution_level
 
     level_group = get_resolution_level(session.root, level)
     try:
-        manifests = read_all_object_manifests(level_group)
+        ids, manifests = read_object_manifest_rows(level_group)
     except Exception:
-        manifests = []
+        ids, manifests = np.zeros(0, dtype=np.int64), []
     n_added = 0
     n_objects = 0
-    for oid, manifest in enumerate(manifests):
+    for oid, manifest in zip(ids.tolist(), manifests):
         if not manifest:
             continue
         n_objects += 1

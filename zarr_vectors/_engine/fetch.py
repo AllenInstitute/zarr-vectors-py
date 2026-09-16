@@ -143,6 +143,8 @@ async def _fetch_all(
     async_root: Any,
     plan: ReadPlan,
     caps: Capabilities,
+    *,
+    sync_root: Any = None,
 ) -> Snapshot:
     """Execute one whole plan against a live store.
 
@@ -155,7 +157,16 @@ async def _fetch_all(
     per round and a store with more chunks than the round limit never
     finishes.
 
+    The arrays behind ``plan.cells`` are resolved too.  Their metadata is
+    what lets a local store serve those cells directly (see
+    :func:`~zarr_vectors.core.aio._fetch_chunks`), and it costs one
+    ``zarr.json`` per array the reader was going to resolve anyway.
+
     The remaining four kinds are independent, so they go out together.
+
+    ``sync_root`` is the sync :class:`zarr.Group` at the store root when
+    the caller can tolerate a worker thread -- :class:`GroupFetcher`
+    passes it, :class:`AsyncFetcher` does not.
     """
     from zarr_vectors.core.aio import (
         _fetch_arrays,
@@ -165,7 +176,10 @@ async def _fetch_all(
         _resolve_nodes,
     )
 
-    nodes = await _resolve_nodes(async_root, set(plan.nodes) | set(plan.expand))
+    nodes = await _resolve_nodes(
+        async_root,
+        set(plan.nodes) | set(plan.expand) | {c.array for c in plan.cells},
+    )
 
     want_cells = {(c.array, c.key) for c in plan.cells}
     # Fan out only where the plan asked for it. Implying an array's whole
@@ -177,7 +191,7 @@ async def _fetch_all(
     )
 
     chunks, arrays, listings, rows = await asyncio.gather(
-        _fetch_chunks(async_root, nodes, want_cells),
+        _fetch_chunks(async_root, nodes, want_cells, sync_root=sync_root),
         _fetch_arrays(async_root, set(plan.arrays)),
         _fetch_listings(async_root, set(plan.listings)) if caps.can_list
         else _nothing({}),
@@ -245,7 +259,10 @@ class GroupFetcher:
             return Snapshot.empty()
         if not self.capabilities.can_gather:
             return self._fetch_serial(plan)
-        return sync(_fetch_all(self._async_root, plan, self.capabilities))
+        return sync(_fetch_all(
+            self._async_root, plan, self.capabilities,
+            sync_root=self._root._zarr,
+        ))
 
     def _fetch_serial(self, plan: ReadPlan) -> Snapshot:
         """Serial path for stores the gather pattern would misuse.
@@ -259,7 +276,7 @@ class GroupFetcher:
 
         zg = self._root._zarr
         nodes: dict[str, Any] = {}
-        for path in (*plan.nodes, *plan.expand):
+        for path in sorted({*plan.nodes, *plan.expand, *(c.array for c in plan.cells)}):
             try:
                 nodes[path] = zg[path]
             except KeyError:

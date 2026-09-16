@@ -47,9 +47,9 @@ print(zv.Grid.plan(bounds=((0., 0., 0.), (10_000., 10_000., 10_000.)),
 ```
 
 ```text
-Grid(20x20x20 cells of (500.0, 500.0, 500.0)) 8000
-20x20x20 = 8000 cells, ~0.8 MB/cell -- fits
-2x2x2 = 8 cells, ~750.0 MB/cell -- does not fit: ~750 MB per cell exceeds the 67 MB target; use more cells
+Grid(21x21x21 cells of (500.0, 500.0, 500.0)) 9261
+21x21x21 = 9261 cells, ~0.6 MB/cell -- fits
+3x3x3 = 27 cells, ~222.2 MB/cell -- does not fit: ~222 MB per cell exceeds the 67 MB target; use more cells
 ```
 
 `est_bytes_per_cell` counts coordinates only (`n_vertices / cells × ndim ×
@@ -280,9 +280,9 @@ print(zv.open("scan.zarrvectors").level(0).grid)
 ```
 
 ```text
-Grid(1x1x1 cells of (1000.0, 1000.0, 1000.0))
+Grid(2x2x2 cells of (1000.0, 1000.0, 1000.0))
 {'objects_rechunked': 200, 'bins_created': 1, 'total_vertices': 20000, 'rechunk_dims': ['spatial', 'x', 'y', 'z'], 'output_path': 'scan.zarrvectors'}
-Grid(4x4x4 cells of (250.0, 250.0, 250.0))
+Grid(5x5x5 cells of (250.0, 250.0, 250.0))
 ```
 
 This is the *least* memory-efficient route, and it is worth being explicit

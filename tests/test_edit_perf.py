@@ -32,11 +32,13 @@ def _build_index_from_scratch(
     """
     from zarr_vectors.ops.edit import _LEVEL_MARKER_CHUNK  # noqa: F401
 
-    disk_manifests = session._all_manifests_for(level)
+    disk_ids, disk_manifests = session._all_manifests_for(level)
     # Apply pending non-atomic ops over the disk state to get the
-    # per-OID "current" manifest.
+    # per-OID "current" manifest. Keyed by the id at each row, not by
+    # the row -- the two differ as soon as a level's ids are not a dense
+    # range from zero.
     per_oid: dict[int, list[tuple[tuple, int]]] = {
-        oid: list(m) for oid, m in enumerate(disk_manifests)
+        int(oid): list(m) for oid, m in zip(disk_ids.tolist(), disk_manifests)
     }
     for (lvl, oid), op in session._manifest_ops.items():
         if lvl != level:

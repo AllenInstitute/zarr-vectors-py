@@ -81,6 +81,56 @@ class TestNamedGroups:
         assert zv.open(path).groups.names() == ()
 
 
+class TestAttributeFamilies:
+    """``Level.attribute_names(kind)`` must name a family that exists."""
+
+    def test_group_attributes_are_found(self, tmp_path):
+        """The mapping pointed at a path this format does not have.
+
+        ``"group"`` resolved to ``groupings_attributes``; the family
+        ``write_groupings_attributes`` creates is ``group_attributes``.  So
+        the call answered ``()`` for every store ever written, while the
+        README promises it is accepted.
+        """
+        from zarr_vectors.types.points import write_points
+
+        path = tmp_path / "gattrs.zarrvectors"
+        write_points(
+            path,
+            np.array([[10, 10, 10], [300, 300, 300]], dtype=np.float32),
+            chunk_shape=(200.0, 200.0, 200.0),
+            bin_shape=(50.0, 50.0, 50.0),
+            object_ids=np.array([0, 1]),
+            groups={0: [0], 1: [1]},
+            group_attributes={
+                "region": np.array([1.0, 2.0], dtype=np.float32),
+            },
+        )
+        level = zv.open(path).level(0)
+        assert level.attribute_names("group") == ("region",)
+
+    def test_every_family_resolves_to_a_real_path(self, grouped):
+        """No family may name a path the constants do not define.
+
+        The bug was a string literal drifting from the format.  Pinning
+        the whole mapping against ``constants`` is what stops the next
+        one.
+        """
+        from zarr_vectors.api.level import _ATTR_GROUPS, attribute_families
+        from zarr_vectors import constants
+
+        defined = {
+            constants.VERTEX_ATTRIBUTES, constants.FRAGMENT_ATTRIBUTES,
+            constants.OBJECT_ATTRIBUTES, constants.GROUP_ATTRIBUTES,
+            constants.LINK_ATTRIBUTES,
+        }
+        assert set(_ATTR_GROUPS.values()) == defined
+        # ...and every one of them answers rather than raising.
+        level = zv.open(grouped).level(0)
+        for kind in attribute_families():
+            assert isinstance(level.attribute_names(kind), tuple)
+
+
 class TestUserMetadata:
     def test_round_trips(self, grouped):
         ds = zv.open(grouped, mode="r+")

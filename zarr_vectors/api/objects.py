@@ -23,6 +23,8 @@ from typing import TYPE_CHECKING, Any
 import numpy as np
 import numpy.typing as npt
 
+from zarr_vectors.exceptions import ArrayError, StoreError
+
 if TYPE_CHECKING:  # pragma: no cover - typing only
     from zarr_vectors.api.level import Level
     from zarr_vectors.api.result import ReadResult
@@ -94,7 +96,9 @@ class ObjectCatalog:
     def __getitem__(self, key: int | Sequence[int] | slice) -> ReadResult:
         """Read one object, or several, by id."""
         if isinstance(key, slice):
-            ids = list(range(*key.indices(len(self))))
+            # Slice the level's ids, not range(len) -- ids need not be
+            # contiguous, or start at zero, or be small.
+            ids = self.ids(present=False)[key].tolist()
         elif isinstance(key, (int, np.integer)):
             ids = [int(key)]
         else:
@@ -116,12 +120,26 @@ class ObjectCatalog:
         level reports every dropped id as present, and reading one gives
         ``vertex_count == 0`` — indistinguishable from an empty region.
         """
-        if not present:
-            return np.arange(len(self), dtype=np.int64)
+        from zarr_vectors.core.arrays import object_ids_for_rows
+
         try:
-            return np.flatnonzero(self.present_mask()).astype(np.int64)
-        except Exception:
-            return np.arange(len(self), dtype=np.int64)
+            all_ids = object_ids_for_rows(self._group())
+        except (ArrayError, StoreError):
+            all_ids = np.arange(len(self), dtype=np.int64)
+        if not present:
+            return all_ids
+        try:
+            # flatnonzero gives ROWS; the ids are what the caller asked
+            # for, and the two are only the same when the level stores
+            # its objects densely from zero.
+            return all_ids[np.flatnonzero(self.present_mask())]
+        except (ArrayError, StoreError):
+            # A level with no object index has no presence to report, and
+            # every slot is as present as any other.  Narrowed from a bare
+            # ``except Exception``, which answered this for a genuine
+            # decode failure too -- returning every id as present is a
+            # plausible-looking wrong answer, which is the worst kind.
+            return all_ids
 
     def present_mask(self) -> npt.NDArray[Any]:
         """Per-slot boolean: does this id hold any geometry?
@@ -146,12 +164,22 @@ class ObjectCatalog:
 
     def __contains__(self, object_id: int) -> bool:
         """Whether this id holds geometry — not merely whether it is in range."""
+        from zarr_vectors.core.arrays import object_rows_for_ids
+
         oid = int(object_id)
-        if not (0 <= oid < len(self)):
+        try:
+            found, rows = object_rows_for_ids(self._group(), [oid])
+        except (ArrayError, StoreError):
+            return 0 <= oid < len(self)
+        if found.size == 0:
             return False
         try:
-            return bool(self.present_mask()[oid])
-        except Exception:
+            return bool(self.present_mask()[int(rows[0])])
+        except (ArrayError, StoreError):
+            # No object index: the id is in range, so it is as present as
+            # any other.  ``except Exception: return True`` also answered
+            # True for a corrupt index, which is a membership test that
+            # cannot fail and therefore cannot be trusted.
             return True
 
     def __repr__(self) -> str:

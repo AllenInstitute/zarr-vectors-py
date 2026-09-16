@@ -55,13 +55,12 @@ def suggest_chunk_shape(
     """A chunk shape whose busiest cell holds about ``target_links_per_chunk``.
 
     Every level is inspected unless ``level`` names one. Chunk size is halved
-    per axis until the projected maximum falls under the target. The default of 8M links is just under the 8,993,990-face maximum of
+    per axis until the projected maximum falls under the target. The
+    default of 8M links is just under the 8,993,990-face maximum of
     a store measured to render acceptably, and an order of magnitude under the
     2**32-byte cell ceiling at which the vlen-bytes codec silently truncates.
     """
-    from zarr_vectors.core.store import open_store, read_root_metadata
-
-    from zarr_vectors.core.store import list_resolution_levels
+    from zarr_vectors.core.store import list_resolution_levels, open_store, read_root_metadata
 
     root = open_store(str(store_path), mode="r")
     meta = read_root_metadata(root)
@@ -72,7 +71,7 @@ def suggest_chunk_shape(
     # and sizing from level 0 alone would under-suggest.
     levels = ([level] if level is not None
               else sorted(list_resolution_levels(root)))
-    worst = max((_max_links_per_chunk(root, l) for l in levels), default=0.0)
+    worst = max((_max_links_per_chunk(root, lo) for lo in levels), default=0.0)
     for _ in range(8):
         if worst <= target_links_per_chunk:
             break
@@ -110,14 +109,14 @@ def _read_level(src_group, ndim: int, link_width: int):
     ``links`` is ``(N, link_width)``; an empty ``(0, link_width)`` array for a
     point cloud or for an object that happens to carry none.
     """
+    from zarr_vectors.constants import VERTICES
     from zarr_vectors.core.arrays import (
         iter_link_cells,
         list_chunk_keys,
-        read_all_object_manifests,
         read_chunk_vertices,
+        read_object_manifest_rows,
         read_vertex_fragment_index,
     )
-    from zarr_vectors.constants import VERTICES
     from zarr_vectors.exceptions import ArrayError
     from zarr_vectors.spatial.boundary import apply_perm_inverse
 
@@ -125,11 +124,11 @@ def _read_level(src_group, ndim: int, link_width: int):
     # write one -- in which case every vertex belongs to a single implicit
     # object 0 and each chunk contributes one fragment.
     try:
-        manifests = read_all_object_manifests(src_group)
+        ids, manifests = read_object_manifest_rows(src_group)
     except Exception:  # noqa: BLE001
-        manifests = []
+        ids, manifests = np.zeros(0, dtype=np.int64), []
     owner: dict[tuple, int] = {}
-    for oid, frags in enumerate(manifests):
+    for oid, frags in zip(ids.tolist(), manifests):
         for cc, f in frags:
             owner.setdefault((tuple(int(x) for x in cc), int(f)), oid)
     implicit = not owner
@@ -244,7 +243,7 @@ def _read_level(src_group, ndim: int, link_width: int):
         ll = links_of.get(o)
         out[o][1] = (np.concatenate(ll, axis=0) if ll
                      else np.zeros((0, link_width), np.int64))
-    return {o: (v, l) for o, (v, l) in out.items()}
+    return {o: (v, lo) for o, (v, lo) in out.items()}
 
 
 # ===================================================================
@@ -265,7 +264,7 @@ def _write_level(level_group, objects: dict, chunk_shape, ndim: int,
 
     cs = np.asarray(chunk_shape, np.float64)
     per_chunk: dict[tuple, list] = {}
-    for oid, (v, l) in sorted(objects.items()):
+    for oid, (v, lo) in sorted(objects.items()):
         if len(v) == 0:
             continue
         cc = np.floor(np.asarray(v, np.float64) / cs).astype(np.int64)
@@ -279,9 +278,9 @@ def _write_level(level_group, objects: dict, chunk_shape, ndim: int,
                 per_chunk.setdefault(key, []).append((oid, rows))
 
     local_of = {oid: np.full(len(v), -1, np.int64)
-                for oid, (v, l) in objects.items()}
+                for oid, (v, lo) in objects.items()}
     chunk_of = {oid: np.zeros((len(v), ndim), np.int64)
-                for oid, (v, l) in objects.items()}
+                for oid, (v, lo) in objects.items()}
     manifests: dict[int, list] = {}
 
     for cc in sorted(per_chunk):
@@ -298,12 +297,12 @@ def _write_level(level_group, objects: dict, chunk_shape, ndim: int,
     n_links = 0
     if has_links:
         pending: dict[tuple, list] = {}
-        for oid, (v, l) in sorted(objects.items()):
-            if len(l) == 0:
+        for oid, (v, lo) in sorted(objects.items()):
+            if len(lo) == 0:
                 continue
             loc, ch = local_of[oid], chunk_of[oid]
-            cor_c = [ch[l[:, k]] for k in range(link_width)]
-            cor_l = [loc[l[:, k]] for k in range(link_width)]
+            cor_c = [ch[lo[:, k]] for k in range(link_width)]
+            cor_l = [loc[lo[:, k]] for k in range(link_width)]
             base = cor_c[0]
             offs = [cor_c[k] - base for k in range(1, link_width)]
             sig = np.concatenate([base] + offs, axis=1)
@@ -420,7 +419,7 @@ def rechunk_spatial(
     meta = read_root_metadata(root)
     ndim = len(meta.chunk_shape)
     all_levels = sorted(list_resolution_levels(root))
-    todo = all_levels if levels is None else [l for l in all_levels if l in levels]
+    todo = all_levels if levels is None else [lo for lo in all_levels if lo in levels]
 
     if chunk_shape is None:
         chunk_shape = suggest_chunk_shape(
@@ -470,7 +469,11 @@ def rechunk_spatial(
                                   src_lm, "coarsening_method", None)}
         if lvl > 0:
             kw["parent_level"] = getattr(src_lm, "parent_level", lvl - 1)
-            bs = getattr(src_lm, "bin_shape", None)
+            # NOTE: derived from the ROOT bin and the level index, not
+            # from the source level's own bin_shape.  That is right for a
+            # pyramid built with a uniform factor of 2 and wrong for any
+            # other, but rechunking is not the place to change it -- see
+            # metadata.level_factor for the parent-relative quantity.
             kw["bin_shape"] = tuple(float(b) * (2 ** lvl) for b in base_bin)
             kw["preserves_object_ids"] = True
             kw["inherited_num_objects"] = n_obj_total

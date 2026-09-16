@@ -39,6 +39,11 @@ class CellRef:
     :meth:`Grid.cell_of` and passes them back, but never builds one from
     integers.  That is what keeps a change in how cells are addressed
     from being a downstream break.
+
+    When the escape hatch is taken: :attr:`coords` and :attr:`key` are
+    **absolute** chunk coordinates, identical to the keys on disk — which
+    is what lets a reference be handed straight to the readers' ``chunks=``
+    term and to the engine's cell requests.
     """
 
     coords: tuple[int, ...]
@@ -98,7 +103,14 @@ class Grid:
     """Physical size of one cell, in coordinate units."""
 
     origin: tuple[float, ...] = ()
-    """Coordinate of the grid's lower corner."""
+    """Coordinate of the grid's lower corner, in the data's own units.
+
+    Informational.  Cells are addressed **absolutely** — :meth:`cell_of`
+    is ``floor(point / cell_shape)``, the same map
+    :func:`~zarr_vectors.spatial.chunking.assign_chunks` uses to decide
+    where a vertex is written — so this is not a subtrahend.
+    :attr:`anchor` is the cell this corner falls in.
+    """
 
     @classmethod
     def plan(
@@ -114,6 +126,20 @@ class Grid:
         answer can change a decision.  A consumer that discovers after the
         fact that its chunk ids exceed the allocation has already written
         a store it must throw away.
+
+        The shape comes from
+        :func:`~zarr_vectors.spatial.chunking.grid_layout` — the function
+        the allocator itself calls — rather than from a restatement of it.
+        A restatement is what this used to be, and it was one plane short:
+        ``ceil((hi - lo) / size)`` counts cell-widths across the extent,
+        but bounds are inclusive, so a store spans
+        ``floor(hi/size) - floor(lo/size) + 1`` cells.
+
+        That makes ``target_cells=n`` produce ``n + 1`` cells per axis
+        when the upper bound lands exactly on a cell boundary: a vertex at
+        ``hi`` has to be storable, and it lands in cell ``floor(hi/size)``.
+        The extra plane is what the store really allocates; reporting
+        ``n`` is the failure this method exists to prevent.
         """
         lo = [float(v) for v in bounds[0]]
         hi = [float(v) for v in bounds[1]]
@@ -131,7 +157,9 @@ class Grid:
             )
         else:
             size = tuple(e or 1.0 for e in extent)
-        shape = tuple(max(1, math.ceil(e / s)) for e, s in zip(extent, size))
+        from zarr_vectors.spatial.chunking import grid_layout
+
+        _origin, shape = grid_layout((lo, hi), size)
         return cls(shape=shape, cell_shape=size, origin=tuple(lo))
 
     # ---------------- geometry ----------------
@@ -140,13 +168,40 @@ class Grid:
     def cells(self) -> int:
         return int(math.prod(self.shape)) if self.shape else 0
 
+    @property
+    def anchor(self) -> tuple[int, ...]:
+        """Absolute chunk coord of cell 0 — ``floor(origin / cell_shape)``.
+
+        The same value the store writes as an array's ``chunk_grid_origin``
+        attribute.  Derived rather than stored, so it cannot contradict
+        :attr:`origin`.
+        """
+        if not self.cell_shape:
+            return ()
+        origin = self.origin or (0.0,) * len(self.cell_shape)
+        return tuple(
+            int(math.floor(o / c)) for o, c in zip(origin, self.cell_shape)
+        )
+
     def cell_of(self, point: Sequence[float]) -> CellRef:
-        """Which cell a coordinate falls in."""
-        pos = np.asarray(point, dtype=np.float64)
-        origin = np.asarray(self.origin or [0.0] * len(self.cell_shape))
-        size = np.asarray(self.cell_shape, dtype=np.float64)
-        coords = np.floor((pos - origin) / size).astype(np.int64)
-        return CellRef(tuple(int(c) for c in coords))
+        """Which cell a coordinate falls in.
+
+        Absolute, as stored: ``floor(point / cell_shape)``.  It used to
+        subtract :attr:`origin`, which made it bounds-relative while
+        :meth:`cells_in` — and the chunk keys on disk, and the ``chunks=``
+        term a cell selection becomes — stayed absolute.  The two agreed
+        only for a store whose bounds began at zero; anywhere else
+        ``select(cells=[cell_of(p)])`` looked in a cell that does not hold
+        ``p``, and usually does not exist.
+        """
+        from zarr_vectors.spatial.chunking import compute_chunk_coords
+
+        # Delegated, not reimplemented: this is the single-vertex form of
+        # ``assign_chunks``, so cell_of cannot drift from how cells are
+        # written.
+        return CellRef(compute_chunk_coords(
+            np.asarray(point, dtype=np.float64), tuple(self.cell_shape),
+        ))
 
     def cells_in(self, bbox: tuple[Sequence[float], Sequence[float]]) -> CellSet:
         """Every cell a bounding box touches.
@@ -154,6 +209,14 @@ class Grid:
         The replacement for ``chunks=[(3, 1, 2), ...]``: the caller states
         a region and receives opaque references, rather than stating grid
         coordinates they had to derive themselves.
+
+        This is the **allocation**, not the occupancy: a grid is a value
+        and holds no store handle, so it answers what the declared grid
+        covers whether or not anything was written there.  On a sparse
+        store the two differ by orders of magnitude, and a reference per
+        allocated cell is a cost paid before any read.  Use
+        :meth:`zarr_vectors.api.level.Level.cells` for the cells a level
+        actually holds.
         """
         lo = np.asarray(bbox[0], dtype=np.float64)
         hi = np.asarray(bbox[1], dtype=np.float64)
@@ -163,10 +226,22 @@ class Grid:
         return CellSet(CellRef(tuple(int(c) for c in cc)) for cc in coords)
 
     def __iter__(self) -> Iterator[CellRef]:
+        """Every cell of the allocation, as absolute references.
+
+        The allocation, so this is ``prod(shape)`` references however
+        little of the grid holds data -- see :meth:`cells_in`.
+
+        Yields nothing for a grid with no shape; it used to yield one
+        bogus ``CellRef(())``, because ``itertools.product()`` over an
+        empty axis list produces a single empty tuple.
+        """
         import itertools
 
-        for coords in itertools.product(*(range(s) for s in self.shape)):
-            yield CellRef(coords)
+        if not self.shape:
+            return
+        anchor = self.anchor
+        for offsets in itertools.product(*(range(s) for s in self.shape)):
+            yield CellRef(tuple(a + o for a, o in zip(anchor, offsets)))
 
     # ---------------- capacity ----------------
 
@@ -200,10 +275,20 @@ class Grid:
         )
 
     def holds(self, ref: CellRef) -> bool:
-        """Whether ``ref`` is inside this grid's allocation."""
-        if len(ref.coords) != len(self.shape):
+        """Whether ``ref`` is inside this grid's allocation.
+
+        In the same absolute frame :meth:`cell_of` and :meth:`cells_in`
+        speak, so a reference either of them produced is tested against
+        the allocation it actually names.
+        """
+        coords = tuple(getattr(ref, "coords", ref))
+        anchor = self.anchor
+        if len(coords) != len(self.shape) or len(anchor) != len(self.shape):
             return False
-        return all(0 <= c < s for c, s in zip(ref.coords, self.shape))
+        return all(
+            a <= int(c) < a + s
+            for c, a, s in zip(coords, anchor, self.shape)
+        )
 
     def __repr__(self) -> str:
         shape = "x".join(str(s) for s in self.shape)

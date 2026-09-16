@@ -13,7 +13,8 @@ package imports to avoid an import cycle) can both import it directly.
 
 from __future__ import annotations
 
-from typing import Any, Sequence
+from collections.abc import Sequence
+from typing import Any
 
 import numpy as np
 

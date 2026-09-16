@@ -345,15 +345,37 @@ def test_constant_set_matches_schema_enum(schema, enum_name, members):
 # ===================================================================
 
 
-def test_format_version_is_0_9_0():
-    """The current ZV writer stamps 0.9.0; bump tests here when bumping."""
+def test_format_version_is_0_9_2():
+    """The current ZV writer stamps 0.9.2; bump tests here when bumping."""
     from zarr_vectors.constants import FORMAT_VERSION
 
-    assert FORMAT_VERSION == "0.9.0", (
+    assert FORMAT_VERSION == "0.9.2", (
         f"FORMAT_VERSION drifted to {FORMAT_VERSION!r}; if intentional "
         f"update this test and the version-cutoff check in "
         f"zarr_vectors.core.metadata.RootMetadata.validate()."
     )
+
+
+def test_the_0_9_x_additions_did_not_move_the_read_cutoff():
+    """0.9.1 and 0.9.2 are additive, so 0.9.0 stores must still read.
+
+    The hard break is at 0.9.0 -- the single-array layout.
+    ``attribute_specs`` (0.9.1) and the RFC 8 ``ome`` node (0.9.2) each
+    only add an optional root key.  Raising the cutoff alongside the
+    version would strand every 0.9.0 store for fields they are entitled
+    not to have.
+    """
+    from zarr_vectors.core.metadata import RootMetadata
+
+    axes = [{"name": n, "type": "space"} for n in "xyz"]
+    meta = RootMetadata(
+        spatial_index_dims=axes,
+        chunk_shape=(100.0, 100.0, 100.0),
+        bounds=([0.0] * 3, [100.0] * 3),
+        geometry_types=["point_cloud"],
+        zv_version="0.9.0",
+    )
+    meta.validate()  # must not raise
 
 
 @pytest.mark.parametrize(

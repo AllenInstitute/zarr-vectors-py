@@ -11,21 +11,20 @@ polylines/streamlines.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
-from typing import Any, Callable
+from dataclasses import dataclass
+from typing import Any
 
 import numpy as np
 import numpy.typing as npt
 
 from zarr_vectors.core.arrays import (
-    list_chunk_keys,
     read_all_object_manifests,
     read_chunk_vertices,
-    read_object_vertices,
     read_fragment,
+    read_object_vertices,
 )
+from zarr_vectors.core.metadata import LevelMetadata, RootMetadata
 from zarr_vectors.core.store import FsGroup
-from zarr_vectors.core.metadata import RootMetadata, LevelMetadata
 from zarr_vectors.typing import BinCoords, ChunkCoords
 
 try:
@@ -137,19 +136,30 @@ class ZVView:
 
         if bbox is not None:
             new_spec.bbox = (np.asarray(bbox[0]), np.asarray(bbox[1]))
-            # Compute target chunks from bbox
-            from zarr_vectors.spatial.chunking import chunks_intersecting_bbox
-            target = set(chunks_intersecting_bbox(
-                new_spec.bbox[0], new_spec.bbox[1],
-                self._root_meta.chunk_shape,
-            ))
-            new_spec.target_chunks = target
+            # Chunks the box touches, filtered from the ones this view
+            # already knows the level holds rather than enumerated from
+            # the declared grid. The product has no clamp, so on a sparse
+            # store -- a specimen bounding box with data in part of it --
+            # a wide box materialised one tuple per allocated cell to
+            # build a set used only for membership tests against chunks
+            # that exist. The keys are in hand, so this needs no I/O.
+            cs = np.asarray(self._root_meta.chunk_shape, dtype=np.float64)
+            lo_c = np.floor(new_spec.bbox[0] / cs).astype(np.int64)
+            hi_c = np.floor(new_spec.bbox[1] / cs).astype(np.int64)
+            nd = len(cs)
+            new_spec.target_chunks = {
+                cc for cc in self._all_chunk_keys
+                if all(
+                    int(lo_c[d]) <= int(v) <= int(hi_c[d])
+                    for d, v in enumerate(cc[-nd:])
+                )
+            }
 
             # If bins are available, compute bin-level targets
             bins_per_chunk = self._root_meta.bins_per_chunk
             if any(b > 1 for b in bins_per_chunk):
                 from zarr_vectors.spatial.chunking import (
-                    bins_intersecting_bbox, bin_to_chunk, bin_to_fragment_index,
+                    bins_intersecting_bbox,
                 )
                 effective_bin = self._root_meta.effective_bin_shape
                 target_bins = set(bins_intersecting_bbox(
@@ -269,7 +279,10 @@ class ZVView:
                     continue
                 for fragment_index in fragment_indices:
                     try:
-                        fragment = read_fragment(self._group, cc, fragment_index, dtype=dtype, ndim=ndim)
+                        fragment = read_fragment(
+                            self._group, cc, fragment_index,
+                            dtype=dtype, ndim=ndim,
+                        )
                         if len(fragment) > 0:
                             all_positions.append(fragment)
                     except Exception:
@@ -376,9 +389,12 @@ class ZVPolylineCollection:
         reconstructed polyline as an ``(N, D)`` numpy array.
         """
         manifests = self._ensure_manifests()
-        if object_id < 0 or object_id >= len(manifests):
+        from zarr_vectors.core.arrays import object_rows_for_ids
+        _found, _rows = object_rows_for_ids(self._group, [int(object_id)])
+        if _found.size == 0:
             raise IndexError(
-                f"Polyline {object_id} out of range [0, {len(manifests)})"
+                f"Polyline {object_id} is not in this level "
+                f"({len(manifests)} object(s))"
             )
         return _delayed_read_polyline(
             self._group, object_id, self._ndim,

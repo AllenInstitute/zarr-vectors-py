@@ -18,12 +18,11 @@ converters, pyramid builders, exporters. That code's job *is* the physical
 layout, so hiding the layout from it would hide the thing it works on. It gets
 the smaller, blunter surface instead, with the same promise attached.
 
-Four other modules are supported. Two have pages of their own —
-``zarr_vectors.constants`` (:doc:`constants`) and ``zarr_vectors.typing``
-(:doc:`typing`). Two do not: ``zarr_vectors.exceptions``, whose classes are
-named in the signatures that raise them, and ``zarr_vectors.headers``, which is
-promised but currently has no rendered page at all. That is a documentation gap,
-not a weaker promise.
+Four other modules are supported, three with pages of their own —
+``zarr_vectors.constants`` (:doc:`constants`), ``zarr_vectors.typing``
+(:doc:`typing`) and ``zarr_vectors.headers`` (:doc:`headers`). The fourth,
+``zarr_vectors.exceptions``, has none: its classes are named in the signatures
+that raise them, which is where you meet them.
 
 What is *not* here
 ------------------
@@ -81,6 +80,7 @@ Pages
    zarr_vectors
    constants
    typing
+   headers
    types
    validate
 

@@ -20,10 +20,12 @@ from collections.abc import Sequence
 from typing import TYPE_CHECKING, Any
 
 import numpy as np
+import numpy.typing as npt
 
 from zarr_vectors.api.result import Attributes, ReadResult
 from zarr_vectors.api.select import Query, Selection
 from zarr_vectors.constants import (
+    FRAGMENT_ATTRIBUTES,
     GEOM_GRAPH,
     GEOM_LINE,
     GEOM_MESH,
@@ -31,8 +33,17 @@ from zarr_vectors.constants import (
     GEOM_POLYLINE,
     GEOM_SKELETON,
     GEOM_STREAMLINE,
+    GROUP_ATTRIBUTES,
+    LINK_ATTRIBUTES,
+    OBJECT_ATTRIBUTES,
+    VERTEX_ATTRIBUTES,
 )
-from zarr_vectors.exceptions import ZVError
+from zarr_vectors.exceptions import (
+    ArrayError,
+    MetadataError,
+    StoreError,
+    ZVError,
+)
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
     from zarr_vectors.api.dataset import Dataset
@@ -71,6 +82,14 @@ _READERS: dict[str, tuple[str, str, tuple[str, ...], str]] = {
         ("bbox", "object_ids", "group_ids", "chunks", "attribute_filter"),
         "from_polylines",
     ),
+    # ``object_ids`` stays listed for mesh/graph/skeleton even though
+    # those readers raise NotImplementedError for it.  Dropping it does
+    # NOT help: ``to_reader_kwargs`` silently discards a term the reader
+    # cannot express, and ``_post_filter`` has nothing to filter on
+    # (neither reader returns per-vertex object ids), so the read would
+    # come back as the whole level with the caller believing they had
+    # scoped it.  Raising is the right answer; ``_check_supported``
+    # below just raises it with a message about what the CALLER typed.
     GEOM_MESH: (
         "zarr_vectors.types.meshes", "read_mesh",
         ("bbox", "object_ids", "chunks", "attribute_filter"),
@@ -89,12 +108,20 @@ _READERS: dict[str, tuple[str, str, tuple[str, ...], str]] = {
 }
 
 # Attribute families, by the group each lives under in a level.
+#
+# Spelled with the constants, not with string literals.  ``"group"``
+# pointed at ``groupings_attributes``, which is not a path this format has
+# -- the family is ``group_attributes``, which is what
+# ``write_groupings_attributes`` creates and what the README promises
+# ``attribute_names("group")`` will find.  It silently answered ``()`` for
+# every store, and a literal is exactly the kind of thing that drifts
+# without anything noticing.
 _ATTR_GROUPS: dict[str, str] = {
-    "vertex": "vertex_attributes",
-    "fragment": "fragment_attributes",
-    "object": "object_attributes",
-    "group": "groupings_attributes",
-    "link": "link_attributes",
+    "vertex": VERTEX_ATTRIBUTES,
+    "fragment": FRAGMENT_ATTRIBUTES,
+    "object": OBJECT_ATTRIBUTES,
+    "group": GROUP_ATTRIBUTES,
+    "link": LINK_ATTRIBUTES,
 }
 
 
@@ -116,15 +143,44 @@ def _narrows(selection: Selection) -> bool:
     ))
 
 
+def _rows_in(
+    rows: npt.NDArray[np.int64], wanted: set[tuple[int, ...]],
+) -> npt.NDArray[np.bool_]:
+    """Which of ``rows`` appear in ``wanted``, without a Python loop.
+
+    A cell post-filter asks this once per vertex, and asking it with
+    ``tuple(row) in wanted`` builds a Python tuple per vertex: 4.4s and
+    358 MB to keep one sixty-fourth of five million points.  Viewing each
+    row as a single structured scalar turns it into one ``np.isin``.
+    """
+    if not wanted:
+        return np.zeros(len(rows), dtype=bool)
+    width = rows.shape[1]
+    dt = np.dtype([(f"f{i}", np.int64) for i in range(width)])
+    want = np.asarray(sorted(wanted), dtype=np.int64)
+    if want.ndim != 2 or want.shape[1] != width:
+        # A ref of a different arity cannot match any row, and reshaping
+        # it to force a comparison would invent an answer.
+        return np.zeros(len(rows), dtype=bool)
+    return np.isin(
+        np.ascontiguousarray(rows).view(dt).ravel(),
+        np.ascontiguousarray(want).view(dt).ravel(),
+    )
+
+
 class Level:
     """One resolution level of a :class:`~zarr_vectors.api.dataset.Dataset`."""
 
-    __slots__ = ("_dataset", "_index", "_meta")
+    __slots__ = ("_dataset", "_index", "_meta", "_attr_names")
 
     def __init__(self, dataset: Dataset, index: int) -> None:
         self._dataset = dataset
         self._index = int(index)
         self._meta: Any = None
+        # Per-family attribute names, listed once.  Lives and dies with
+        # this handle exactly as ``_meta`` does: the Dataset drops its
+        # Levels on every write it performs.
+        self._attr_names: dict[str, tuple[str, ...]] = {}
 
     # ---------------- identity ----------------
 
@@ -246,6 +302,18 @@ class Level:
                 f"unknown attribute family {kind!r}; expected one of "
                 f"{sorted(_ATTR_GROUPS)}"
             )
+        # Listed once per handle.  A listing reads every child's
+        # ``zarr.json``, and a read asked for it twice -- to plan, then to
+        # resolve ``attributes="all"`` -- so on a one-cell query the two
+        # listings were a third of the whole read.
+        cached = self._attr_names.get(kind)
+        if cached is not None:
+            return cached
+        names = self._list_attribute_names(kind)
+        self._attr_names[kind] = names
+        return names
+
+    def _list_attribute_names(self, kind: str) -> tuple[str, ...]:
         level_group = self.store
         try:
             family = level_group[_ATTR_GROUPS[kind]]
@@ -307,6 +375,28 @@ class Level:
 
         return getattr(importlib.import_module(module_name), func_name), supports, adapter
 
+    def _check_supported(self, selection: Selection) -> None:
+        """Refuse a selection term this geometry's reader cannot honour.
+
+        ``read_mesh`` and ``read_graph`` raise for ``object_ids=``, which
+        is right -- silently handing back the whole level is the worst
+        outcome -- but their message names a parameter of a function the
+        caller never called.  Say it in the caller's own terms instead.
+        """
+        if selection.objects is None and selection.groups is None:
+            return
+        if self.kind not in (GEOM_MESH, GEOM_GRAPH, GEOM_SKELETON):
+            return
+        term = "objects=" if selection.objects is not None else "groups="
+        raise ZVError(
+            f"select({term}...) is not supported for {self.kind!r}: the "
+            f"reader behind it cannot scope a read by object, and applying "
+            f"the filter afterwards is impossible because the result "
+            f"carries no per-vertex object ids. Read the level and filter "
+            f"the arrays yourself, or use level.objects[...] on a geometry "
+            f"that supports it (point clouds, polylines, lines)."
+        )
+
     def _reader_kwargs(self, selection: Selection, supports: Sequence[str]) -> dict[str, Any]:
         """Selection terms this reader can express, with ``"all"`` resolved.
 
@@ -331,12 +421,151 @@ class Level:
             names = self.attribute_names("vertex")
             if names:
                 kwargs["attribute_names"] = list(names)
+        if "chunks" in supports and "chunks" not in kwargs:
+            prefix = self._cells_covering_limit(selection)
+            if prefix is not None:
+                kwargs["chunks"] = prefix
         return kwargs
+
+    def _cells_covering_limit(
+        self, selection: Selection,
+    ) -> list[tuple[int, ...]] | None:
+        """Enough leading cells to satisfy ``limit``, or ``None``.
+
+        A limit was applied only after the read, so ``select(limit=10)``
+        against five million points read all five million and then kept
+        ten -- 239 MB of peak memory for ten rows.  The reader emits
+        cells in sorted key order and the post-filter keeps the first
+        ``limit`` survivors, so the same rows come from a prefix of that
+        order.  Which prefix is decided by the fragment indices, walked
+        in order and stopped at the first cell that makes the total
+        enough -- index reads, not vertex reads.
+
+        ``None`` whenever anything else narrows the selection, since then
+        the surviving rows are not a prefix of the cells, and whenever
+        the indices cannot be read, which simply leaves the previous
+        read-everything behaviour in place.
+        """
+        limit = selection.limit
+        if (
+            limit is None
+            or selection.bbox is not None
+            or selection.near is not None
+            or selection.objects is not None
+            or selection.groups is not None
+            or selection.cells is not None
+            or selection.where is not None
+        ):
+            return None
+        if int(limit) <= 0:
+            return None
+        from zarr_vectors.core.arrays import (
+            _fragment_vertex_extent,
+            list_chunk_keys,
+            read_vertex_fragment_index,
+        )
+
+        target = (
+            self if selection.level in (None, self._index)
+            else self._dataset.level(selection.level)
+        )
+        level_group = target.store
+        try:
+            keys = list_chunk_keys(level_group)
+        except (ArrayError, StoreError, KeyError):
+            return None
+        if not keys:
+            return None
+        taken: list[tuple[int, ...]] = []
+        total = 0
+        for cc in keys:
+            taken.append(tuple(int(c) for c in cc))
+            try:
+                total += _fragment_vertex_extent(
+                    read_vertex_fragment_index(level_group, cc),
+                )
+            except (ArrayError, StoreError, KeyError):
+                return None
+            if total >= int(limit):
+                break
+        # Every cell was needed, so naming them narrows nothing.
+        return None if len(taken) == len(keys) else taken
+
+    def cells(
+        self, bbox: tuple[Sequence[float], Sequence[float]] | None = None,
+    ) -> Any:
+        """The cells this level actually holds, optionally within a box.
+
+        The counterpart to :meth:`Grid.cells_in`, which enumerates the
+        *allocation*: a grid is a pure value and cannot know what is in
+        the store, so a sparse level -- a specimen bounding box with data
+        in part of it -- answers ``cells_in`` with a reference per
+        allocated cell. Building a million of those takes about nine
+        seconds before any read happens, and all but a thousand of them
+        name nothing.
+
+        This asks the level instead, so the answer is proportional to the
+        data. It is the better argument to ``select(cells=...)`` whenever
+        the caller wants "what is here", and ``Grid.cells_in`` remains
+        the right one for "what could be here".
+        """
+        import numpy as _np
+
+        from zarr_vectors.api.grid import CellRef, CellSet
+        from zarr_vectors.core.arrays import list_chunk_keys, resolve_chunk_keys
+
+        level_group = self.store
+        if bbox is None:
+            coords = list_chunk_keys(level_group)
+        else:
+            coords = resolve_chunk_keys(
+                level_group,
+                tuple(self.scale),
+                bbox=(
+                    _np.asarray(bbox[0], dtype=_np.float64),
+                    _np.asarray(bbox[1], dtype=_np.float64),
+                ),
+            )
+        return CellSet(CellRef(tuple(int(c) for c in cc)) for cc in coords)
+
+    def _count_without_reading(self, selection: Selection) -> int | None:
+        """The vertex count, when it can be had from metadata alone.
+
+        ``None`` when the selection narrows anything, because then the
+        answer depends on the data and there is nothing stored that
+        knows it.  An unnarrowed count is the level's own
+        ``vertex_count``, which every writer stamps -- reading five
+        million points to count them cost 236 MB of peak memory to
+        return a number already on disk.
+        """
+        if (
+            selection.bbox is not None
+            or selection.near is not None
+            or selection.objects is not None
+            or selection.groups is not None
+            or selection.cells is not None
+            or selection.limit is not None
+            or selection.where is not None
+        ):
+            return None
+        target = (
+            self if selection.level in (None, self._index)
+            else self._dataset.level(selection.level)
+        )
+        try:
+            count = getattr(target._metadata(), "vertex_count", None)
+        except (ArrayError, StoreError, MetadataError, KeyError):
+            return None
+        return None if count is None else int(count)
 
     def plan(self, selection: Selection) -> Any:
         """The I/O this selection implies, before any of it is performed.
 
-        Pure metadata arithmetic — building a plan reads nothing.
+        Metadata arithmetic: the level's attrs and its presence manifest
+        are read so a narrowed plan can name the cells that actually
+        hold data, and no chunk is fetched.  Inside a
+        :meth:`~zarr_vectors.core.group.Group.cached_nodes` block those
+        reads are already paid for.
         """
         from zarr_vectors._engine.resolve import context_from_level, resolve
 
@@ -364,6 +593,7 @@ class Level:
         care — or it raises the genuine error, unobscured.  The cost is
         having done the work twice on the rare read that needs it.
         """
+        self._check_supported(selection)
         reader, supports, adapter = self._reader()
         kwargs = self._reader_kwargs(selection, supports)
         group = self._dataset._group
@@ -379,7 +609,21 @@ class Level:
                 strict=True,
                 label=reader.__name__,
             )
-        except Exception:
+        except (ArrayError, StoreError, ZVError, KeyError, ValueError) as e:
+            # Narrowed from a bare ``except Exception``.  The fallback is
+            # sound -- it is the identical computation without the
+            # batching -- but catching everything meant an engine bug and
+            # a genuine store failure were indistinguishable, each costing
+            # the read twice and neither ever being seen.  A
+            # NotImplementedError or a KeyboardInterrupt now propagates.
+            import warnings
+
+            warnings.warn(
+                f"batched read failed ({type(e).__name__}: {e}); falling "
+                f"back to the direct reader. The answer is the same; the "
+                f"read is slower, and this is worth reporting.",
+                RuntimeWarning, stacklevel=2,
+            )
             raw = reader(group, **kwargs)
         return self._finish(raw, adapter, selection)
 
@@ -392,6 +636,7 @@ class Level:
         """
         from zarr_vectors.core.aio import read_async
 
+        self._check_supported(selection)
         reader, supports, adapter = self._reader()
         kwargs = self._reader_kwargs(selection, supports)
         raw = await read_async(reader, self._dataset._group, **kwargs)
@@ -447,7 +692,10 @@ class Level:
 
         from dataclasses import replace as _replace
 
-        from zarr_vectors.core.arrays import read_chunk_attributes
+        from zarr_vectors.core.arrays import (
+            _maybe_batched_reads,
+            read_chunk_attribute_rows,
+        )
         from zarr_vectors.spatial.boundary import chunk_local_to_global_offsets
 
         try:
@@ -462,18 +710,38 @@ class Level:
                 # without knowing which vertices survived, and guessing
                 # would silently mis-pair values with positions.
                 return result
+            # One gather for every (attribute, cell) pair rather than a
+            # sequential read each. On an object store the unbatched form
+            # is one round-trip per cell per attribute, and even locally
+            # the fixed per-cell cost dominates: reading one attribute of
+            # a 64-cell level took 0.96s against 0.04s for the positions.
+            from zarr_vectors.constants import VERTEX_ATTRIBUTES, VERTEX_FRAGMENTS
+
+            key_strs = [
+                cc if isinstance(cc, str) else ".".join(str(int(c)) for c in cc)
+                for cc in chunk_keys
+            ]
+            plan = [
+                (f"{VERTEX_ATTRIBUTES}/{name}", key_strs) for name in wanted
+            ]
+            plan.append((VERTEX_FRAGMENTS, key_strs))
             gathered: dict[str, Any] = {}
-            for name in wanted:
-                cols = [
-                    read_chunk_attributes(level_group, name, cc)
-                    for cc in chunk_keys
-                ]
-                flat = [np.asarray(g) for per_chunk in cols for g in per_chunk]
-                if not flat:
-                    continue
-                col = np.concatenate(flat, axis=0)
-                if col.shape[0] == result.vertex_count:
-                    gathered[name] = col
+            with _maybe_batched_reads(level_group, plan):
+                for name in wanted:
+                    # Each chunk's rows whole, not partitioned per
+                    # fragment and re-joined: see read_chunk_attribute_rows.
+                    flat = [
+                        rows for rows in (
+                            read_chunk_attribute_rows(level_group, name, cc)
+                            for cc in chunk_keys
+                        )
+                        if len(rows)
+                    ]
+                    if not flat:
+                        continue
+                    col = np.concatenate(flat, axis=0)
+                    if col.shape[0] == result.vertex_count:
+                        gathered[name] = col
             if not gathered:
                 return result
             return _replace(
@@ -515,19 +783,26 @@ class Level:
             )
             grid = target.grid
             cell = np.asarray(grid.cell_shape, dtype=np.float64)
-            # grid.origin is None for a store with no negative-coord
-            # offset -- the same fallback Grid.cell_of applies.
-            origin = np.asarray(
-                grid.origin if grid.origin is not None else [0.0] * len(cell),
-                dtype=np.float64,
-            )
-            wanted = {tuple(int(c) for c in ref.coords) for ref in selection.cells}
+            if cell.size != result.positions.shape[1]:
+                raise ZVError(
+                    f"level {target.index} declares no cell size, so a "
+                    f"cells= selection cannot be resolved against it"
+                )
+            wanted = {
+                tuple(int(c) for c in getattr(ref, "coords", ref))
+                for ref in selection.cells
+            }
+            # Absolute, matching ref.coords and the keys on disk.  There is
+            # no origin term because ``assign_chunks`` has none either; the
+            # subtraction that used to be here made this the one place that
+            # disagreed with every reference it was comparing against, and
+            # it also crashed outright on a level with no declared bounds,
+            # where ``grid.origin`` is ``()`` rather than the ``None`` the
+            # old guard tested for.
             idx = np.floor(
-                (np.asarray(result.positions, dtype=np.float64) - origin) / cell
+                np.asarray(result.positions, dtype=np.float64) / cell
             ).astype(np.int64)
-            keep &= np.array(
-                [tuple(row) in wanted for row in idx], dtype=bool
-            )
+            keep &= _rows_in(idx, wanted)
         if selection.near is not None:
             centre, radius = selection.near
             offset = result.positions - np.asarray(centre, dtype=result.positions.dtype)

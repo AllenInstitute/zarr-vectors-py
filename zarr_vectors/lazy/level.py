@@ -3,17 +3,21 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
-from typing import Any
+from typing import TYPE_CHECKING, Any
+
+import numpy as np
+import numpy.typing as npt
 
 from zarr_vectors.constants import VERTEX_ATTRIBUTES
 from zarr_vectors.core.arrays import list_chunk_keys
 from zarr_vectors.core.metadata import LevelMetadata, RootMetadata
 from zarr_vectors.core.store import FsGroup
-from zarr_vectors.lazy.arrays import ZVAttributeCollection, ZVVertexCollection, ZVObjectIndex
+from zarr_vectors.lazy.arrays import ZVAttributeCollection, ZVObjectIndex, ZVVertexCollection
 from zarr_vectors.typing import ChunkCoords
 
-import numpy.typing as npt
-import numpy as np
+if TYPE_CHECKING:  # pragma: no cover - typing only
+    from zarr_vectors.lazy.views import ZVPolylineCollection, ZVView
+    from zarr_vectors.lazy.writer import ZVWriter
 
 
 class ZVLevel:
@@ -193,16 +197,18 @@ class ZVLevel:
         return bool(manifest)
 
     @property
-    def present_oids(self) -> "np.ndarray":
+    def present_oids(self) -> np.ndarray:
         """Sorted array of OIDs present at this level."""
-        from zarr_vectors.core.arrays import read_all_object_manifests
+        # Which slots are occupied, not what is in them. The mask reads
+        # that off the stored bytes; decoding every manifest built each
+        # object's chunk references only to ask whether there were any.
+        from zarr_vectors.core.arrays import object_present_mask
         try:
-            manifests = read_all_object_manifests(self._group)
+            return np.flatnonzero(object_present_mask(self._group)).astype(
+                np.int64,
+            )
         except Exception:
             return np.zeros(0, dtype=np.int64)
-        return np.asarray(
-            [i for i, m in enumerate(manifests) if m], dtype=np.int64,
-        )
 
     def read_attribute_chunk(self, value: Any) -> list[npt.NDArray]:
         """Read all fragments for chunks whose attribute equals ``value``.
@@ -294,7 +300,7 @@ class ZVLevel:
         bbox: tuple[npt.NDArray, npt.NDArray] | None = None,
         object_ids: list[int] | None = None,
         group_ids: list[int] | None = None,
-    ) -> "ZVView":
+    ) -> ZVView:
         """Apply filter constraints, returning a lazy filtered view.
 
         Filters can be chained: ``level.filter(group_ids=[0]).filter(bbox=roi)``.
@@ -307,7 +313,7 @@ class ZVLevel:
         Returns:
             A :class:`ZVView` with the specified constraints.
         """
-        from zarr_vectors.lazy.views import ZVView, FilterSpec
+        from zarr_vectors.lazy.views import FilterSpec, ZVView
         view = ZVView(
             self._group, self._root_meta, self._level_meta,
             self.chunk_keys, FilterSpec(),
@@ -320,7 +326,7 @@ class ZVLevel:
     # Mutation (write-back) handle
     # ---------------------------------------------------------------
 
-    def writer(self) -> "ZVWriter":
+    def writer(self) -> ZVWriter:
         """Return a :class:`ZVWriter` for mutating this level.
 
         Use as an async or sync context manager::
@@ -339,7 +345,7 @@ class ZVLevel:
     # ---------------------------------------------------------------
 
     @property
-    def polylines(self) -> "ZVPolylineCollection":
+    def polylines(self) -> ZVPolylineCollection:
         """Lazy polyline collection for streamline/polyline geometry.
 
         Each polyline is accessible by object ID::
@@ -374,7 +380,8 @@ class ZVLevel:
         Returns:
             Summary dict from the rechunk engine.
         """
-        from zarr_vectors.rechunk import rechunk as _rechunk, RechunkSpec
+        from zarr_vectors.rechunk import RechunkSpec
+        from zarr_vectors.rechunk import rechunk as _rechunk
         store_path = str(self._group.path.parent)
         spec = RechunkSpec(by=by, bins=bins, categorical=categorical)
         return _rechunk(store_path, spec, output=output)

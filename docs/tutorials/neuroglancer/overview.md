@@ -6,7 +6,7 @@ imaging, and synchrotron science. It natively understands several data
 formats (OME-Zarr image volumes, Neuroglancer precomputed, N5), but does
 not have native support for the Zarr Vectors.
 
-[`zv-ngtools`](https://github.com/BRIDGE-Neuroscience/zv-ngtools) bridges
+[`zv-ngtools`](https://github.com/AllenInstitute/zv-ngtools) bridges
 this gap. It is a fork of
 [`ngtools`](https://github.com/neuroscales/ngtools) — a collection of
 Neuroglancer utilities — extended with a `zarr_vectors` layer type that
@@ -196,7 +196,7 @@ viewer.add(
 
 Before working through the detailed tutorials:
 
-- [ ] `pip install git+https://github.com/BRIDGE-Neuroscience/zv-ngtools.git`
+- [ ] `pip install git+https://github.com/AllenInstitute/zv-ngtools.git`
 - [ ] A web browser that supports WebGL 2 (Chrome, Firefox, Edge)
 - [ ] A `.zarrvectors` store with at least a base level (level 0)
 

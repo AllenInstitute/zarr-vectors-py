@@ -48,9 +48,9 @@ read-locality benefit without a custom mapping.
 
 from __future__ import annotations
 
-import json
+from collections.abc import Sequence
 from pathlib import Path
-from typing import Any, Sequence
+from typing import TYPE_CHECKING, Any
 
 from zarr_vectors.core.group import _parse_chunk_coords
 from zarr_vectors.core.store import (
@@ -58,6 +58,9 @@ from zarr_vectors.core.store import (
     list_resolution_levels,
     open_store,
 )
+
+if TYPE_CHECKING:  # pragma: no cover - typing only
+    from zarr_vectors.core.group import Group
 
 
 # ===================================================================
@@ -165,7 +168,7 @@ def _normalise_shard_shape(
 
 
 def shard_store(
-    store_path: str | Path,
+    store_path: str | Path | Group,
     *,
     shard_shape: int | Sequence[int] = 8,
     arrays: list[str] | None = None,
@@ -196,9 +199,8 @@ def shard_store(
         Stats dict with ``arrays_sharded``, ``chunks_packed``,
         ``shard_shape``.
     """
-    store_path = Path(store_path) if isinstance(store_path, str) else store_path
 
-    root = open_store(str(store_path), mode="r+")
+    root = open_store(store_path, mode="r+")
 
     arrays_sharded = 0
     chunks_packed = 0
@@ -250,9 +252,13 @@ def shard_store(
             # we can rebuild after replacing the node at this path.  The
             # presence manifest and origin are managed by the create /
             # write calls below, so drop them from the carried-over attrs.
+            # The reads go out in one gather: they are the whole array,
+            # and one round-trip per cell is exactly what sharding is
+            # being asked to fix.
             chunk_payloads: dict[str, bytes] = {}
-            for k in chunk_keys:
-                chunk_payloads[k] = level.read_bytes(array_name, k)
+            with level.batched_reads([(array_name, list(chunk_keys))]):
+                for k in chunk_keys:
+                    chunk_payloads[k] = level.read_bytes(array_name, k)
             preserved_attrs = dict(level.read_array_meta(array_name))
             preserved_attrs.pop("nonempty_chunks", None)
             preserved_attrs.pop("chunk_grid_origin", None)
@@ -260,7 +266,10 @@ def shard_store(
             # Drop the prior array before re-creating at this path.
             del level.zarr_group[array_name]
 
-            # Allocate the native-sharded vlen-bytes array.
+            # Allocate the native-sharded vlen-bytes array.  Deliberately
+            # outside the write batch below: this call writes the array's
+            # own ``zarr.json``, and the batch's deferred-metadata path
+            # is for *group* nodes.
             level.create_sharded_chunk_array(
                 array_name,
                 grid_shape=grid_shape,
@@ -269,14 +278,24 @@ def shard_store(
                 attributes=preserved_attrs,
             )
 
-            # Write each chunk into its grid-coord cell.
-            for k, data in chunk_payloads.items():
-                if not data:
-                    continue
-                level.write_bytes(array_name, k, data)
+            n_packed = len(chunk_payloads)
+            # Write every cell in one batch. Unbatched, each write_bytes
+            # is a read-modify-write of the whole shard the cell lands in
+            # plus a parse-insert-sort-rewrite of the array's presence
+            # manifest -- ~60ms per cell measured, so packing 13,824
+            # cells did not finish in 15 minutes and a million cells
+            # would take the better part of a day. Batched, the cells
+            # land in one ``set_coordinate_selection`` (zarr writes each
+            # shard once) and presence is stamped once for the array.
+            with level.batched_writes():
+                for k in chunk_keys:
+                    data = chunk_payloads.pop(k)
+                    if not data:
+                        continue
+                    level.write_bytes(array_name, k, data)
 
             arrays_sharded += 1
-            chunks_packed += len(chunk_payloads)
+            chunks_packed += n_packed
 
     return {
         "arrays_sharded": arrays_sharded,
@@ -286,7 +305,7 @@ def shard_store(
 
 
 def unshard_store(
-    store_path: str | Path,
+    store_path: str | Path | Group,
     *,
     arrays: list[str] | None = None,
 ) -> dict[str, Any]:
@@ -301,8 +320,7 @@ def unshard_store(
     """
     import zarr
 
-    store_path = Path(store_path) if isinstance(store_path, str) else store_path
-    root = open_store(str(store_path), mode="r+")
+    root = open_store(store_path, mode="r+")
 
     arrays_unsharded = 0
     chunks_extracted = 0
@@ -356,7 +374,7 @@ def unshard_store(
 
 
 def reshard(
-    store_path: str | Path,
+    store_path: str | Path | Group,
     shard_shape: int | Sequence[int] | None,
     *,
     arrays: list[str] | None = None,
@@ -377,7 +395,7 @@ def reshard(
         ran.
     """
     if shard_shape is None:
-        if not is_sharded(str(store_path)):
+        if not is_sharded(store_path):
             return {"action": "noop", "message": "already unsharded"}
         result = unshard_store(store_path, arrays=arrays)
         return {"action": "unshard", **result}
@@ -391,10 +409,10 @@ def reshard(
 # ===================================================================
 
 
-def is_sharded(store_path: str | Path) -> bool:
+def is_sharded(store_path: str | Path | Group) -> bool:
     """True iff any array in the store uses the ``sharding_indexed`` codec."""
     try:
-        root = open_store(str(store_path))
+        root = open_store(store_path)
     except Exception:
         return False
     for level_idx in list_resolution_levels(root):
@@ -409,7 +427,7 @@ def is_sharded(store_path: str | Path) -> bool:
     return False
 
 
-def get_shard_info(store_path: str | Path) -> dict[str, Any]:
+def get_shard_info(store_path: str | Path | Group) -> dict[str, Any]:
     """Return a summary of the store's sharding state.
 
     The result has keys:
@@ -421,7 +439,7 @@ def get_shard_info(store_path: str | Path) -> dict[str, Any]:
     """
     import zarr
 
-    root = open_store(str(store_path))
+    root = open_store(store_path)
     arrays: list[dict[str, Any]] = []
     shard_count = 0
 

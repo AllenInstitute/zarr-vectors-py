@@ -14,10 +14,10 @@ for the single native-sharded mode; ``FLAT`` is the unsharded layout.
 
 from __future__ import annotations
 
-from enum import Enum
+from enum import StrEnum
 
 
-class ShardLayout(str, Enum):
+class ShardLayout(StrEnum):
     """Layout selector for back-compat with older shard APIs.
 
     ``FLAT`` keeps one storage object per Zarr Vectors chunk (no sharding).

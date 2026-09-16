@@ -135,6 +135,55 @@ class TestDegradation:
         assert plan.expand
         assert plan.cells == ()
 
+    def test_a_box_larger_than_the_level_walks_the_level(self):
+        # The box spans 1000 cells; the level holds two. Enumerating the
+        # box to intersect it would cost 1000 tuples to find 1 -- the
+        # scan has to run the other way round when the level is the
+        # smaller of the two.
+        ctx = LevelContext(
+            level=0, ndim=3, chunk_shape=CTX.chunk_shape,
+            known_cells=("0.0.0", "9.9.9"),
+        )
+        plan = resolve(
+            Selection(bbox=([0.0, 0.0, 0.0], [500.0, 500.0, 500.0])), ctx,
+        )
+        assert {c.key for c in plan.cells} == {"0.0.0"}
+
+    def test_a_binned_key_is_matched_on_its_spatial_tail(self):
+        # chunk_by_attribute prefixes every key with a bin axis, so a
+        # spatial box compared against the whole key matches nothing.
+        ctx = LevelContext(
+            level=0, ndim=3, chunk_shape=CTX.chunk_shape,
+            known_cells=("0.0.0.0", "3.0.0.0", "3.9.9.9"),
+        )
+        plan = resolve(
+            Selection(bbox=([0.0, 0.0, 0.0], [500.0, 500.0, 500.0])), ctx,
+        )
+        assert {c.key for c in plan.cells} == {"0.0.0.0", "3.0.0.0"}
+
+    def test_named_cells_the_level_does_not_hold_are_dropped(self):
+        # The caller's region is theirs and is not re-derived, but a cell
+        # the level is known not to hold fetches nothing, so asking for
+        # it only spends round-trips.
+        from zarr_vectors.api.grid import CellRef
+
+        ctx = LevelContext(
+            level=0, ndim=3, chunk_shape=CTX.chunk_shape, known_cells=("0.0.0",),
+        )
+        plan = resolve(
+            Selection(cells=[CellRef((0, 0, 0)), CellRef((7, 7, 7))]), ctx,
+        )
+        assert {c.key for c in plan.cells} == {"0.0.0"}
+
+    def test_named_cells_survive_when_occupancy_is_unknown(self):
+        from zarr_vectors.api.grid import CellRef
+
+        ctx = LevelContext(level=0, ndim=3, chunk_shape=CTX.chunk_shape)
+        plan = resolve(
+            Selection(cells=[CellRef((0, 0, 0)), CellRef((7, 7, 7))]), ctx,
+        )
+        assert {c.key for c in plan.cells} == {"0.0.0", "7.7.7"}
+
     def test_known_cells_prune_the_plan(self):
         # When the caller already knows which cells exist, asking for
         # empty ones is wasted round-trip budget.
@@ -224,3 +273,52 @@ def test_plan_costs_nothing_to_build(store):
 def test_explain_reports_the_plan(store):
     text = zv.open(store).select(bbox=([0.0, 0.0, 0.0], [100.0, 100.0, 100.0])).explain()
     assert "read_points" in text
+
+
+@pytest.fixture
+def sparse_store(tmp_path):
+    """1000 points in a grid that allocates 68,921 cells.
+
+    The shape a real sparse dataset has: a bounding box covering the
+    whole specimen, data in a thin part of it.
+    """
+    rng = np.random.default_rng(6)
+    path = tmp_path / "sparse.zarrvectors"
+    write_points(
+        path,
+        rng.uniform(0, 400, size=(1000, 3)).astype(np.float32),
+        chunk_shape=(10.0, 10.0, 10.0),
+        bounds=([0.0, 0.0, 0.0], [400.0, 400.0, 400.0]),
+    )
+    return path
+
+
+def test_a_bbox_plan_scales_with_occupancy_not_allocation(sparse_store):
+    # The grid allocates 41^3 = 68,921 cells and ~1000 hold data. Before
+    # the level's presence manifest reached the resolver, a whole-domain
+    # box planned one fetch per allocated cell per array -- 137,842 of
+    # them -- and the fetcher performed every one.
+    ds = zv.open(sparse_store)
+    level = ds.level(0)
+    occupied = len(level.store.list_chunks("vertices"))
+    plan = ds.select(bbox=ds.bounds).plan()
+
+    assert plan.expand == ()
+    # Two arrays (vertices, vertex_fragments) per occupied cell.
+    assert len(plan.cells) <= 2 * occupied
+    assert len(plan.cells) < 5000
+
+
+def test_a_sparse_whole_domain_read_returns_every_vertex(sparse_store):
+    # Narrowing to occupancy must not lose data: the pruned cells are
+    # empty ones, so the answer is unchanged.
+    ds = zv.open(sparse_store)
+    assert ds.select(bbox=ds.bounds).read().vertex_count == 1000
+
+
+def test_naming_every_grid_cell_still_only_fetches_the_full_ones(sparse_store):
+    ds = zv.open(sparse_store)
+    level = ds.level(0)
+    occupied = len(level.store.list_chunks("vertices"))
+    plan = level.select(cells=level.grid.cells_in(ds.bounds)).plan()
+    assert len(plan.cells) <= 2 * occupied

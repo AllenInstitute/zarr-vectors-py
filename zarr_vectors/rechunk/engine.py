@@ -19,9 +19,7 @@ from zarr_vectors.constants import VERTICES
 from zarr_vectors.core.arrays import (
     create_object_index_array,
     create_vertices_array,
-    list_chunk_keys,
     read_all_object_manifests,
-    read_chunk_vertices,
     read_object_vertices,
     write_chunk_vertices,
     write_object_index,
@@ -250,7 +248,6 @@ def rechunk(
         spatial_assignments = assign_chunks(all_pos, chunk_shape)
 
         # Build object-to-vertex mapping for this bin
-        obj_starts = np.cumsum([0] + bin_obj_boundaries[:-1])
 
         for spatial_cc, global_indices in sorted(spatial_assignments.items()):
             # Prefixed chunk key: (bin_idx, z, y, x)
@@ -264,7 +261,6 @@ def rechunk(
 
         # Build object manifests for this bin
         for local_idx, oid in enumerate(bin_objects):
-            start = int(obj_starts[local_idx])
             n_verts = bin_obj_boundaries[local_idx]
             if n_verts == 0:
                 continue

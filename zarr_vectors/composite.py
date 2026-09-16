@@ -22,7 +22,6 @@ Usage::
 
 from __future__ import annotations
 
-import json
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -36,18 +35,14 @@ from zarr_vectors.constants import (
     GEOM_POINT_CLOUD,
     GEOM_SKELETON,
     GEOM_STREAMLINE,
-    RESOLUTION_PREFIX,
     VERTICES,
 )
 from zarr_vectors.core.arrays import (
     _ensure_array_dir,
-    create_object_index_array,
     list_chunk_keys,
     read_chunk_vertices,
-    write_chunk_vertices,
-    write_object_index,
 )
-from zarr_vectors.core.metadata import LevelMetadata, RootMetadata
+from zarr_vectors.core.metadata import LevelMetadata
 from zarr_vectors.core.store import (
     FsGroup,
     _create_or_open_store,
@@ -58,7 +53,6 @@ from zarr_vectors.core.store import (
     read_root_metadata,
 )
 from zarr_vectors.spatial.chunking import assign_chunks, compute_bounds
-from zarr_vectors.typing import ChunkCoords, ObjectManifest
 
 if TYPE_CHECKING:
     from zarr_vectors.core.store import ReadSource

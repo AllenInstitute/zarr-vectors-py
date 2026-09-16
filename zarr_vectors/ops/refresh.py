@@ -7,12 +7,14 @@ every level *above* ``source_level``, reusing each level's existing
 post-refresh pyramid is byte-for-byte equivalent to a from-scratch
 ``build_pyramid`` call.
 
-Note: ``coarsen_level`` re-opens the store from a path/URL internally
-and spawns its own backend session.  When called inside an
-:class:`~zarr_vectors.ops.edit.EditSession` the caller must have
-already committed pending edits (otherwise the refresh will coarsen
-the *pre-edit* state).  :meth:`EditSession.flush` handles this by
-issuing a pre-refresh commit on icechunk-backed stores.
+Note: ``coarsen_level`` takes the handle it is given, so it sees
+whatever that handle has written.  It used to re-open the store from a
+URL and spawn its own backend session, which is why the caller had to
+commit first -- and why the refresh was unreachable on any store whose
+``Group.url`` is not an openable path.  :meth:`EditSession.flush` still
+issues a pre-refresh commit on icechunk-backed stores; it is now a
+checkpoint before the destructive level removal rather than a
+correctness requirement.
 """
 
 from __future__ import annotations
@@ -40,12 +42,12 @@ def rebuild_pyramid_from_level(
     """
     from zarr_vectors.core.metadata import compute_bin_ratio
     from zarr_vectors.core.store import (
+        commit,
         list_resolution_levels,
         read_level_metadata,
         read_root_metadata,
         remove_resolution_level,
         session_for,
-        commit,
     )
     from zarr_vectors.multiresolution.coarsen import coarsen_level
 
@@ -105,13 +107,13 @@ def rebuild_pyramid_from_level(
             "parent_level": lm.parent_level if lm.parent_level is not None else lv - 1,
         })
 
-    # Commit pending writes so coarsen_level (which re-opens the store)
-    # can see them.  No-op on non-transactional backends.
+    # Commit pending writes before dropping and rebuilding levels.  This
+    # is no longer needed for cross-handle visibility -- coarsen_level now
+    # works through the handle passed to it rather than re-opening the
+    # store from a URL -- but it remains a reasonable checkpoint before a
+    # destructive level removal.  No-op on non-transactional backends.
     if session_for(root) is not None:
         commit(root, "pre-refresh commit")
-
-    url = root.url
-
     summaries: list[dict[str, Any]] = []
     for entry in plan:
         lv = entry["level"]
@@ -119,7 +121,7 @@ def rebuild_pyramid_from_level(
         if session_for(root) is not None:
             commit(root, f"drop level {lv} for refresh")
         summary = coarsen_level(
-            url,
+            root,
             source_level=entry["parent_level"],
             target_level=lv,
             coarsen_factor=entry["coarsen_factor"],

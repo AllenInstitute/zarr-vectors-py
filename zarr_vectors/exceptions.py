@@ -89,7 +89,9 @@ class ConcurrentEditError(ZVError):
     """
 
 
-# Deprecated alias.  Kept for one release for code that imported the old
-# name; remove in 0.4.  Aliasing the class object means ``isinstance``
-# checks against either name keep working.
+# Deprecated alias for code that imported the old name.  Aliasing the
+# class object means ``isinstance`` checks against either name keep
+# working.  (This said "remove in 0.4" against a package that is on
+# 0.2.x and whose format is versioned separately -- a deadline that
+# could not arrive.  It goes when the next breaking release does.)
 ZVFError = ZVError

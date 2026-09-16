@@ -32,7 +32,6 @@ import numpy.typing as npt
 
 from zarr_vectors.constants import FRAGMENT_ATTRIBUTES, OBJECT_ATTRIBUTES
 from zarr_vectors.exceptions import EditError
-from zarr_vectors.typing import ChunkCoords
 from zarr_vectors.ops.refs import (
     AttributeRef,
     FragmentRef,
@@ -40,6 +39,7 @@ from zarr_vectors.ops.refs import (
     ObjectRef,
     VertexRef,
 )
+from zarr_vectors.typing import ChunkCoords
 
 if TYPE_CHECKING:
     from zarr_vectors.ops.edit import EditSession
@@ -243,7 +243,7 @@ def _ensure_object_attribute_array(
     except Exception:
         pass
 
-    manifests = session._all_manifests_for(target.level)
+    _ids, manifests = session._all_manifests_for(target.level)
     n_objects = len(manifests)
     if n_objects == 0:
         raise EditError(

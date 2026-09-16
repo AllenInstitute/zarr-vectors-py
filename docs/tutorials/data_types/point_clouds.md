@@ -54,9 +54,9 @@ print(ds.level(0).vertex_count)
 
 ```text
 {'vertex_count': 100000, 'chunk_count': 125, 'object_count': 0, 'group_count': 0, 'bins_per_chunk': (4, 4, 4)}
-('point_cloud',) 3 (0, 9, 0)
+('point_cloud',) 3 (0, 9, 1)
 (200.0, 200.0, 200.0) (50.0, 50.0, 50.0)
-Grid(5x5x5 cells of (200.0, 200.0, 200.0)) (5, 5, 5)
+Grid(6x6x6 cells of (200.0, 200.0, 200.0)) (6, 6, 6)
 100000
 ```
 
@@ -458,10 +458,9 @@ CLI) live in the companion package **`zarr-vectors-tools`**.
 
 ## Validation
 
-Validation levels 1–5 check progressively deeper properties of the store. Call
-the module function with a filesystem path rather than `Dataset.validate()`,
-which hands the validator a `file://` URL and reports `FAIL` on a perfectly
-good local store:
+Validation levels 1–5 check progressively deeper properties of the store. The
+module function takes a path, a URL or an open handle; `Dataset.validate()` is
+the same check reached from a dataset:
 
 ```python
 from zarr_vectors.validate import validate

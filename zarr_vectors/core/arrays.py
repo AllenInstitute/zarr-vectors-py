@@ -13,7 +13,7 @@ the store or encoding modules directly.
 from __future__ import annotations
 
 import warnings
-from collections.abc import Iterator, Sequence
+from collections.abc import Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import Any, Literal
@@ -36,6 +36,12 @@ from zarr_vectors.constants import (
     VERTEX_FRAGMENTS,
     VERTICES,
 )
+
+# Group, not FsGroup: FsGroup is a no-op subclass that create_store and
+# open_store return only when the backing store happens to be a
+# LocalStore, so annotating these functions with it was already wrong for
+# every cloud-backed store. Annotation-only change; nothing moves.
+from zarr_vectors.core.group import _LEVEL_META_KEY, Group
 from zarr_vectors.core.paths import (
     format_delta,
     format_offsets,
@@ -48,18 +54,15 @@ from zarr_vectors.core.paths import (
     parse_delta,
     parse_offsets,
 )
-# Group, not FsGroup: FsGroup is a no-op subclass that create_store and
-# open_store return only when the backing store happens to be a
-# LocalStore, so annotating these functions with it was already wrong for
-# every cloud-backed store. Annotation-only change; nothing moves.
-from zarr_vectors.core.group import _LEVEL_META_KEY, Group
 from zarr_vectors.core.store import FsGroup  # noqa: F401  (re-exported for callers)
 from zarr_vectors.encoding.fragments import (
     ChunkFragmentIndex,
     decode_fragments,
     decode_object_manifest_blocks,
+    decode_object_manifests_many,
     encode_fragments,
     encode_object_manifest_blocks,
+    encode_object_manifests_many,
 )
 from zarr_vectors.encoding.ragged import (
     decode_ragged_blob,
@@ -86,10 +89,56 @@ _UNSET: Any = object()
 # of single-chunk ``data`` + ``offsets`` byte blobs.
 OBJECT_INDEX_LAYOUT_V1 = "vlen_manifests_v1"
 
+#: Layout in which object ids are *stored* rather than implied by row
+#: position.
+#:
+#: Under V1 an object id IS its row index, so the array is as long as the
+#: largest id plus one and an id of twenty million allocates twenty
+#: million rows for one object.  Segmentation-style 64-bit ids do not fit
+#: at all, which is why ``types/skeletons.py`` -- whose ids are segment
+#: ids -- has to hand-roll a sorted attribute column and binary-search it.
+#:
+#: Under V2 the ids live in a sibling ``object_ids`` array, one entry per
+#: row, and rows are dense.  Ids may be arbitrary, sparse, and huge.
+#:
+#: Both layouts read through one code path, because **a V1 store is
+#: simply one whose id table is the identity** -- so there is no format
+#: cut here and 0.9.x stores keep reading unchanged.
+OBJECT_INDEX_LAYOUT_V2 = "vlen_manifests_v2"
+
+#: Name of the row-to-id array under ``object_index/``.
+OBJECT_IDS_ARRAY = "object_ids"
+
+#: Set on ``object_index`` when the stored ids ascend, which lets a
+#: lookup binary-search them directly instead of sorting first.  Bulk
+#: writers emit ids in order, so this is the common case.
+OBJECT_IDS_SORTED_ATTR = "object_ids_sorted"
+
 # Objects per zarr chunk of ``object_index/manifests``.  A single-object
 # read fetches only the chunk containing the requested oid, so this sets
 # the read amplification ceiling (~16K manifest blobs per fetch).
 OBJECT_INDEX_MANIFEST_BUCKET = 16_384
+
+#: Largest ``object_index/manifests`` array the writers will allocate.
+#:
+#: An object id is the **row index** of its manifest, so the index is as
+#: long as the largest id plus one, not as long as the number of objects.
+#: One object with id 20,000,000 therefore allocates twenty million rows
+#: (measured: 20s to write, and every whole-index operation --
+#: ``num_objects``, ``ids()``, ``object_present_mask``,
+#: ``read_all_object_manifests`` -- then scales with that, not with the
+#: one object present).  Segmentation-style 64-bit ids do not fit at all.
+#:
+#: 2**26 rows is far past any dense id space a real dataset carries and
+#: well short of the sizes that turn a write into a hang, so crossing it
+#: means the ids are addresses from somewhere else rather than a dense
+#: sequence.  Refusing is better than the silent alternative: today the
+#: symptom is a store that takes minutes to write and gigabytes to open.
+OBJECT_INDEX_MAX_ROWS = 1 << 26
+
+#: Emit a sparsity warning once an index is this long and this empty.
+_OBJECT_INDEX_SPARSE_FLOOR = 1 << 20
+_OBJECT_INDEX_SPARSE_RATIO = 64
 
 # One object manifest naming no fragments.  ``encode_object_manifest_blocks``
 # emits a bare block count for an empty list, so this is the same four bytes
@@ -449,6 +498,54 @@ def _ensure_array_dir(
     level_group.require_group(array_name)
 
 
+def _ensure_chunk_arrays(
+    level_group: Group,
+    arrays: Sequence[tuple[str, dict[str, Any] | None]],
+) -> None:
+    """:func:`_ensure_array_dir` for several per-chunk arrays at once.
+
+    The grid is derived once and every array that has to be created is
+    created in one gather; an array that already holds the requested
+    layout is reused and only has its metadata applied, exactly as the
+    singular form does.  Names that are not per-chunk arrays fall
+    through to the singular form.
+    """
+    if not arrays:
+        return
+    explicit_cfg = level_group._native_sharded_config
+    cfg = explicit_cfg if explicit_cfg is not None else _derive_native_config(level_group)
+    to_create: list[tuple[str, dict[str, Any] | None]] = []
+    replace: set[str] = set()
+    for array_name, attributes in arrays:
+        if cfg is None or not _is_per_chunk_array(array_name):
+            _ensure_array_dir(level_group, array_name, attributes=attributes)
+            continue
+        if level_group.standalone_array_exists(array_name):
+            if explicit_cfg is None or _array_matches_layout(
+                level_group, array_name, explicit_cfg
+            ):
+                if attributes:
+                    level_group.write_array_meta(array_name, attributes)
+                continue
+            replace.add(array_name)
+        to_create.append((array_name, attributes))
+    if not to_create:
+        return
+    compressors = None
+    if level_group._active_codecs is not None:
+        from zarr_vectors.encoding.compression import codecs_for_create_array
+
+        compressors = codecs_for_create_array(level_group._active_codecs)
+    level_group.create_sharded_chunk_arrays(
+        to_create,
+        grid_shape=cfg["grid_shape"],
+        shard_shape=cfg["shard_shape"],
+        origin=cfg.get("origin"),
+        compressors=compressors,
+        replace=replace,
+    )
+
+
 def _array_matches_layout(
     level_group: Group, array_name: str, cfg: dict[str, Any],
 ) -> bool:
@@ -494,15 +591,11 @@ def level_grid_layout(
     ``ceil(max_corner / chunk_shape)`` would also be one short whenever a
     point lands exactly on a chunk boundary — ``floor(..) + 1`` is exact.
     """
-    min_corner = np.asarray(bounds[0], dtype=np.float64)
-    max_corner = np.asarray(bounds[1], dtype=np.float64)
-    cs = np.asarray(chunk_shape, dtype=np.float64)
-    origin = tuple(int(np.floor(mn / c)) for mn, c in zip(min_corner, cs))
-    grid_shape = tuple(
-        max(1, int(np.floor(mx / c)) - o + 1)
-        for mx, c, o in zip(max_corner, cs, origin)
-    )
-    return origin, grid_shape
+    from zarr_vectors.spatial.chunking import grid_layout
+
+    # One definition, in the pure-numpy module, so the api's Grid can
+    # predict this allocation by calling it rather than by restating it.
+    return grid_layout((bounds[0], bounds[1]), chunk_shape)
 
 
 @contextmanager
@@ -568,6 +661,8 @@ def open_write_session(
     else:
         ss = tuple(int(x) for x in shard_shape)
 
+    _warn_on_cell_count(grid_shape, sharded=ss is not None)
+
     stack = ExitStack()
     with stack:
         stack.enter_context(level_group.batched_writes(compressor=compressor))
@@ -575,6 +670,46 @@ def open_write_session(
             level_group.native_sharded_arrays(ss, grid_shape, origin=origin)
         )
         yield
+
+
+#: Cell count above which a level's chunk_shape is worth questioning.
+#:
+#: An unsharded cell is one object in the store, and the per-cell cost of
+#: writing one is fixed -- it does not shrink because the cell is nearly
+#: empty.  Past this many cells the layout, not the data, is what a write
+#: is spending its time on.
+_CELL_COUNT_WARN = 100_000
+
+
+def _warn_on_cell_count(grid_shape: tuple[int, ...], *, sharded: bool) -> None:
+    """Say so when a chunk_shape allocates an unworkable number of cells.
+
+    The automatic :class:`~zarr_vectors.api.schema.Layout` already targets
+    a cell size rather than a cell count, but a caller-supplied
+    ``chunk_shape`` gets no such check, and the failure mode is silent:
+    the write simply takes a very long time and leaves a directory tree
+    with one file per cell.
+    """
+    total = 1
+    for s in grid_shape:
+        total *= int(s)
+    if total <= _CELL_COUNT_WARN:
+        return
+    remedy = (
+        "Consider a coarser chunk_shape"
+        if sharded else
+        "Consider a coarser chunk_shape, or shard_store() to pack cells "
+        "into shard objects"
+    )
+    warnings.warn(
+        f"This chunk_shape allocates a {'x'.join(str(s) for s in grid_shape)} "
+        f"grid = {total:,} cells"
+        f"{'' if sharded else ', each a separate object in the store'}. "
+        f"The per-cell cost of a write is fixed, so it is the cell count "
+        f"rather than the vertex count that sets the time. {remedy}.",
+        RuntimeWarning,
+        stacklevel=4,
+    )
 
 
 def _is_per_chunk_array(name: str) -> bool:
@@ -878,6 +1013,86 @@ def create_links_array(
     if (
         delta == 0
         and is_intra(offsets)
+        and not level_group.array_exists(LINK_FRAGMENTS)
+    ):
+        _ensure_array_dir(level_group, LINK_FRAGMENTS)
+        level_group.write_array_meta(LINK_FRAGMENTS, {
+            "zv_array": LINK_FRAGMENTS,
+            "encoding": "fragment_index_v1",
+        })
+
+
+def _create_links_arrays(
+    level_group: Group,
+    offsets_list: Sequence[Sequence[ChunkCoords]],
+    *,
+    link_width: int,
+    dtype: str,
+    delta: int,
+    sid_ndim: int,
+    directed: bool,
+    store: str,
+) -> None:
+    """:func:`create_links_array` for every offsets segment of one write.
+
+    Same checks, same metadata, one allocation: the family policy is
+    checked once, every array that does not yet exist is created in a
+    single gather (see :meth:`Group.create_sharded_chunk_arrays`), and
+    the family group and fragment sidecar are stamped once.
+    """
+    if not offsets_list:
+        return
+    family = links_group_path(delta)
+    existing_family = (
+        level_group.read_array_meta(family) or {}
+        if level_group.array_exists(family) else {}
+    )
+    if existing_family:
+        _check_link_family_policy(
+            existing_family, delta=delta, link_width=link_width,
+            sid_ndim=sid_ndim, directed=directed, store=store,
+            action="append to",
+        )
+    wanted: list[tuple[str, dict[str, Any]]] = []
+    seen: set[str] = set()
+    for offsets in offsets_list:
+        full_name = links_path(delta, offsets)
+        if full_name in seen:
+            continue
+        seen.add(full_name)
+        # A family that does not exist yet has no arrays under it, so
+        # the two store probes an existence check costs per segment are
+        # skipped for it: on a fresh family of 1,700 segments they were
+        # 2.5 s of the write.
+        if existing_family and _short_circuit_existing(level_group, full_name, True):
+            continue
+        wanted.append((full_name, {
+            "zv_array": "links",
+            "dtype": dtype,
+            "offsets": [list(int(c) for c in o) for o in offsets],
+            "has_perm": links_has_perm(
+                offsets, delta=delta, directed=directed, store=store,
+            ),
+            "link_width": link_width,
+            "level_delta": int(delta),
+        }))
+    if not wanted:
+        return
+    _ensure_chunk_arrays(level_group, wanted)
+    if not existing_family:
+        family_meta: dict[str, Any] = {
+            "zv_array": "links_family",
+            "level_delta": int(delta),
+            "link_width": int(link_width),
+            "directed": bool(directed),
+            "store": str(store),
+        }
+        if sid_ndim is not None:
+            family_meta["sid_ndim"] = int(sid_ndim)
+        level_group.write_array_meta(family, family_meta)
+    if (
+        delta == 0
+        and any(is_intra(o) for o in offsets_list)
         and not level_group.array_exists(LINK_FRAGMENTS)
     ):
         _ensure_array_dir(level_group, LINK_FRAGMENTS)
@@ -1252,11 +1467,11 @@ def write_chunk_vertices(
     )
 
     # Express each group as a contiguous (start_row, count) fragment.
+    cumulative = 0
     if len(groups) == 0:
         fragments: list[tuple[int, int]] = []
     else:
         per_group_counts = [int(np.asarray(g).shape[0]) for g in groups]
-        cumulative = 0
         fragments = []
         for n in per_group_counts:
             fragments.append((cumulative, n))
@@ -1265,6 +1480,10 @@ def write_chunk_vertices(
         VERTEX_FRAGMENTS, key, encode_fragments(fragments),
         record_presence=record_presence,
     )
+    # Tell the level how many rows this cell now holds, so the tiling
+    # stamp can check the fragment index against it without reading the
+    # buffer back.  See :meth:`Group.note_vertex_rows`.
+    level_group.note_vertex_rows(key, cumulative)
     return vertex_byte_offsets
 
 
@@ -1637,6 +1856,43 @@ def write_chunk_link_attributes(
     level_group.write_bytes(full_name, key, raw_bytes)
 
 
+def _check_object_index_size(size: int, n_present: int) -> None:
+    """Refuse an object index that the ids have made absurdly long.
+
+    Object ids index the manifests array directly, so the id space --
+    not the object count -- sets its length.  See
+    :data:`OBJECT_INDEX_MAX_ROWS`.
+
+    Raises:
+        ArrayError: When the largest id would allocate more than
+            :data:`OBJECT_INDEX_MAX_ROWS` rows.
+    """
+    if size > OBJECT_INDEX_MAX_ROWS:
+        raise ArrayError(
+            f"Object ids index the object index directly, so writing an id "
+            f"of {size - 1} allocates {size:,} manifest rows for "
+            f"{n_present:,} object(s) -- past the "
+            f"{OBJECT_INDEX_MAX_ROWS:,}-row ceiling. Ids that large are "
+            f"usually addresses from elsewhere (segmentation labels, "
+            f"hashes). Remap them to a dense 0..n-1 range and keep the "
+            f"originals as an object attribute."
+        )
+    if (
+        size >= _OBJECT_INDEX_SPARSE_FLOOR
+        and n_present
+        and size > n_present * _OBJECT_INDEX_SPARSE_RATIO
+    ):
+        warnings.warn(
+            f"Object index allocates {size:,} manifest rows for "
+            f"{n_present:,} object(s): {100 * (1 - n_present / size):.1f}% of "
+            f"it is empty padding, and every whole-index read pays for it. "
+            f"Ids are row indices, so a dense 0..n-1 id space is what keeps "
+            f"the index proportional to the data.",
+            RuntimeWarning,
+            stacklevel=3,
+        )
+
+
 def write_object_index(
     level_group: Group,
     manifests: dict[int, ObjectManifest],
@@ -1662,29 +1918,29 @@ def write_object_index(
     if not manifests and total_objects is None:
         return
 
+    # Rows are dense and the ids are stored alongside them, so an id may
+    # be arbitrary, sparse or 64-bit without allocating anything for the
+    # gaps. ``total_objects`` still widens the id space, which the
+    # id-preserving pyramid regime uses to keep dropped objects
+    # addressable -- those become present-but-empty rows exactly as
+    # before, just without the padding between them.
+    row_ids = sorted(int(o) for o in manifests)
     if total_objects is not None:
-        size = int(total_objects)
-    else:
-        size = max(manifests.keys()) + 1
-    # Build a dense list, filling gaps with empty manifests
-    manifest_list: list[list[tuple[tuple[int, ...], int]]] = []
-    for oid in range(size):
-        manifest_list.append(manifests.get(oid, []))
+        # Preserve the historical contract: a caller declaring a slot
+        # count means ids 0..total-1 all exist, empty or not.
+        declared = set(range(int(total_objects)))
+        row_ids = sorted(declared.union(row_ids))
+    _check_object_index_size(len(row_ids), len(manifests))
+    manifest_list: list[list[tuple[tuple[int, ...], int]]] = [
+        manifests.get(oid, []) for oid in row_ids
+    ]
 
     # v0.6 manifest-block encoding.  Each old (chunk, fragment_index) tuple
     # becomes one mode-0 (single fragment) block.  Range / explicit
     # short-circuits are reserved for writers that know they produce
     # ranges or fragment-list shapes — to be plumbed through the
     # higher-level write APIs in a future change.
-    manifest_blobs: list[bytes] = []
-    for manifest in manifest_list:
-        blocks = [
-            (tuple(int(c) for c in chunk_coords), int(fragment_index))
-            for chunk_coords, fragment_index in manifest
-        ]
-        manifest_blobs.append(
-            encode_object_manifest_blocks(blocks, sid_ndim=sid_ndim)
-        )
+    manifest_blobs = encode_object_manifests_many(manifest_list, sid_ndim=sid_ndim)
 
     # What an absent object encodes to, from the encoder rather than from
     # a pinned literal -- a consumer had reverse-engineered this as
@@ -1693,9 +1949,10 @@ def write_object_index(
     _empty_manifest = encode_object_manifest_blocks([], sid_ndim=sid_ndim)
 
     _write_object_index_manifests(level_group, manifest_blobs)
+    _write_object_id_table(level_group, row_ids)
     level_group.write_array_meta(OBJECT_INDEX, {
         "zv_array": "object_index",
-        "num_objects": size,
+        "num_objects": len(row_ids),
         # How many of those slots actually hold an object.  ``num_objects``
         # is the SLOT count: a sparsified pyramid level deliberately keeps
         # dropped objects as empty manifests so ids stay stable across
@@ -1705,8 +1962,139 @@ def write_object_index(
         # store, to answer a question the writer already knew.
         "num_present": sum(1 for blob in manifest_blobs if blob != _empty_manifest),
         "sid_ndim": sid_ndim,
-        "layout": OBJECT_INDEX_LAYOUT_V1,
+        "layout": OBJECT_INDEX_LAYOUT_V2,
+        OBJECT_IDS_SORTED_ATTR: True,
     })
+
+
+def _write_object_id_table(level_group: Group, row_ids: Sequence[int]) -> None:
+    """Write ``object_index/object_ids``: row → object id.
+
+    This is the tie that used to be positional only. The comment on
+    ``write_object_attributes``' ``at=`` -- "nothing on disk ties a row
+    to an object, so row i means object i by position alone" -- was the
+    statement of the problem; this array is the answer to it.
+    """
+    level_group.write_array(
+        f"{OBJECT_INDEX}/{OBJECT_IDS_ARRAY}",
+        np.asarray(list(row_ids), dtype=np.int64),
+    )
+
+
+def patch_object_manifests(
+    level_group: Group,
+    updates: dict[int, ObjectManifest],
+    sid_ndim: int,
+) -> None:
+    """Replace named rows of ``object_index/manifests``, leaving the rest.
+
+    :func:`write_object_index` rewrites every row, so changing one
+    object's manifest costs the whole index: on a 400,000-object store a
+    single ``edit_vertex`` spent 3.3s and 414 MB doing it, and both
+    figures grow with the object count rather than with the edit.  This
+    touches only the zarr chunks the named rows fall in.
+
+    ``num_present`` is adjusted by the difference between the rows being
+    replaced and the rows replacing them, so it stays exact without a
+    full decode.  The array grows when an id runs past the end, padded
+    with empty manifests exactly as a full rewrite would.
+
+    Args:
+        level_group: Resolution level group.
+        updates: ``{object_id: [(chunk_coords, fragment_index), ...]}``
+            for the objects whose manifests changed.  An empty list
+            blanks that object, which is how a removal is recorded.
+        sid_ndim: Number of spatial index dimensions.
+    """
+    if not updates:
+        return
+
+    oi_group = level_group.zarr_group.require_group(OBJECT_INDEX)
+    if "manifests" not in oi_group:
+        # Nothing to patch into -- this is the first index for the level.
+        write_object_index(level_group, dict(updates), sid_ndim)
+        return
+
+    meta = level_group.read_array_meta(OBJECT_INDEX)
+    empty_blob = encode_object_manifest_blocks([], sid_ndim=sid_ndim)
+    arr = oi_group["manifests"]
+    n0 = int(arr.shape[0])
+
+    ids = sorted(int(o) for o in updates)
+    blobs = {
+        oid: encode_object_manifest_blocks(
+            [
+                (tuple(int(c) for c in cc), int(fi))
+                for cc, fi in (updates[oid] or [])
+            ],
+            sid_ndim=sid_ndim,
+        )
+        for oid in ids
+    }
+
+    # Ids this level already holds keep their row; the rest are appended
+    # in id order. An id is not a row, so a new one extends the index by
+    # exactly one row however large the id is.
+    known, known_rows = object_rows_for_ids(level_group, ids)
+    row_of = dict(zip(known.tolist(), known_rows.tolist()))
+    fresh = [o for o in ids if o not in row_of]
+    size = n0 + len(fresh)
+    _check_object_index_size(size, size)
+    for offset, oid in enumerate(fresh):
+        row_of[oid] = n0 + offset
+
+    # What those rows held before, so num_present moves by the delta
+    # rather than being recounted over the whole index.
+    existing_rows = [row_of[o] for o in ids if o in known.tolist()]
+    previous = dict(zip(
+        [o for o in ids if row_of[o] < n0],
+        level_group.read_vlen_elements(
+            f"{OBJECT_INDEX}/manifests", sorted(existing_rows),
+        ),
+    )) if existing_rows else {}
+
+    target_rows = [row_of[o] for o in ids]
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", UnstableSpecificationWarning)
+        if size > n0:
+            arr.resize((size,))
+        values = np.empty(len(ids), dtype=object)
+        values[:] = [blobs[o] for o in ids]
+        arr.set_coordinate_selection(
+            (np.asarray(target_rows, dtype=np.intp),), values,
+        )
+    level_group._invalidate_node(f"{OBJECT_INDEX}/manifests")
+
+    if fresh:
+        table = read_object_id_table(level_group)
+        if table is None:
+            table = np.arange(n0, dtype=np.int64)
+        _write_object_id_table(
+            level_group,
+            np.concatenate([table, np.asarray(fresh, dtype=np.int64)]).tolist(),
+        )
+
+    was_present = sum(
+        1 for o in ids if previous.get(o, empty_blob) != empty_blob
+    )
+    now_present = sum(1 for o in ids if blobs[o] != empty_blob)
+    prior_present = int(meta.get("num_present", meta.get("num_objects", n0)))
+    new_meta = {
+        **meta,
+        "num_objects": size,
+        "num_present": max(0, prior_present - was_present + now_present),
+        "sid_ndim": sid_ndim,
+        "layout": OBJECT_INDEX_LAYOUT_V2,
+    }
+    if fresh:
+        # Appended ids need not ascend, so the cheap lookup no longer
+        # applies unless they happen to.
+        new_meta[OBJECT_IDS_SORTED_ATTR] = bool(
+            meta.get(OBJECT_IDS_SORTED_ATTR)
+            and (n0 == 0 or fresh[0] > int(read_object_id_table(level_group)[n0 - 1]))
+            and fresh == sorted(fresh)
+        )
+    level_group.write_array_meta(OBJECT_INDEX, new_meta)
 
 
 def _write_object_index_manifests(
@@ -2312,6 +2700,15 @@ def _pack_link_rows(
     writer and reader both consult.
     """
     width = link_width + (1 if has_perm else 0)
+    if isinstance(entries, np.ndarray):
+        # Already an (M, W) block from an array partitioner, with the
+        # perm column in place wherever the segment carries one.
+        if entries.ndim != 2 or entries.shape[1] != width:
+            raise ArrayError(
+                f"packed link rows are {entries.shape[1] if entries.ndim == 2 else '?'} "
+                f"wide; this segment stores {width} columns"
+            )
+        return np.ascontiguousarray(entries, dtype=dtype)
     out = np.empty((len(entries), width), dtype=dtype)
     for r, (vi, perm_idx, _input_idx) in enumerate(entries):
         if has_perm:
@@ -2320,6 +2717,76 @@ def _pack_link_rows(
         else:
             out[r, :] = vi
     return out
+
+
+def write_cross_level_links(
+    level_group: Group,
+    src_chunks: npt.NDArray[np.int64],
+    src_vi: npt.NDArray[np.int64],
+    trg_chunks: npt.NDArray[np.int64],
+    trg_vi: npt.NDArray[np.int64],
+    sid_ndim: int,
+    *,
+    delta: int,
+    dtype: np.dtype | str = np.int64,
+    mode: Literal["replace", "append"] = "replace",
+) -> LinkPartition:
+    """:func:`write_links` for two-endpoint cross-level records, in array form.
+
+    The pyramid emits one record per fine vertex -- twice, under the
+    default explicit storage -- and the record-shaped path spends about
+    ten Python objects on each of them before any of it reaches the
+    store. The endpoints arrive as arrays and there is no reason to take
+    them apart: partitioning them is floor-divide, subtract, group by.
+
+    Only the family bookkeeping is shared, by re-entering
+    :func:`write_links` with the partition already built, so segment
+    policy, counts and family metadata keep exactly one implementation.
+
+    Args:
+        level_group: The level that owns the family.
+        src_chunks: ``(M, sid_ndim)`` chunk coords of endpoint 0.
+        src_vi: ``(M,)`` chunk-local vertex index of endpoint 0.
+        trg_chunks: ``(M, sid_ndim)`` chunk coords of endpoint 1.
+        trg_vi: ``(M,)`` chunk-local vertex index of endpoint 1.
+        sid_ndim: Spatial index dimensionality.
+        delta: Level delta; must be non-zero, since an intra-level record
+            is not what this path is for and would need the permutation
+            machinery it deliberately omits.
+        dtype: Row dtype.
+        mode: ``"replace"`` or ``"append"``, as :func:`write_links`.
+    """
+    from zarr_vectors.spatial.boundary import partition_arrays_by_offset
+
+    if delta == 0:
+        raise ArrayError(
+            "write_cross_level_links is for cross-level records; delta=0 "
+            "records need the placement and permutation handling in "
+            "write_links"
+        )
+    n_records = int(np.asarray(src_vi).shape[0])
+    if n_records == 0:
+        return LinkPartition(
+            cell_indices={}, num_links=0, num_physical_records=0, first_new=0,
+        )
+    scale_src, scale_trg = _link_scales(level_group, delta, sid_ndim)
+    buckets = partition_arrays_by_offset(
+        src_chunks, src_vi, trg_chunks, trg_vi,
+        scale_src=scale_src, scale_trg=scale_trg, sid_ndim=sid_ndim,
+    )
+    return write_links(
+        level_group,
+        [],
+        sid_ndim,
+        delta=delta,
+        link_width=2,
+        dtype=dtype,
+        mode=mode,
+        directed=True,
+        _prepartitioned=buckets,
+        _link_width=2,
+        _num_records=n_records,
+    )
 
 
 def write_links(
@@ -2333,8 +2800,18 @@ def write_links(
     mode: Literal["replace", "append"] = "replace",
     directed: bool = False,
     store: Literal["canonical", "duplicate"] = "canonical",
+    _prepartitioned: dict[tuple[str, ChunkCoords], Any] | None = None,
+    _link_width: int | None = None,
+    _num_records: int | None = None,
+    _arrays: tuple[npt.NDArray[np.integer], npt.NDArray[np.integer]] | None = None,
 ) -> LinkPartition:
     """Write whole link records into ``links/<delta>/<offsets>/``.
+
+    ``_arrays`` is the same input as ``links`` in array form --
+    ``(chunks, vi)`` of shapes ``(M, L, sid_ndim)`` and ``(M, L)`` -- for
+    a writer that holds its records that way already (the mesh and graph
+    writers do); it saves building and taking apart one Python list per
+    record.  Pass ``links=[]`` with it.
 
     The whole-family counterpart to :func:`write_chunk_links`: it takes
     records in *global* ``(chunk_coords, vertex_idx)`` form, decides where
@@ -2406,7 +2883,9 @@ def write_links(
         raise ArrayError(
             f"store must be 'canonical' or 'duplicate', got {store!r}"
         )
-    if not links:
+    if _arrays is not None and int(np.asarray(_arrays[1]).shape[0]) == 0:
+        _arrays = None
+    if not links and not _prepartitioned and _arrays is None:
         # Honour the empty-input fast-exit; emit an empty partition so
         # callers don't crash on attribute reflection.  NOTE this means
         # an empty `links` does NOT clear anything — callers wanting that
@@ -2416,17 +2895,93 @@ def write_links(
         )
 
     dtype = np.dtype(dtype)
-    normalised, link_width = _normalise_link_records(
-        links, link_width, sid_ndim, delta,
-    )
+    if _prepartitioned is not None:
+        # Records already partitioned by the caller -- see
+        # ``write_cross_level_links``. Everything past this point is
+        # family bookkeeping that must not be duplicated, which is why
+        # the array path re-enters here rather than reimplementing it.
+        buckets = _prepartitioned
+        link_width = int(_link_width or link_width or 2)
+        n_records = int(_num_records or 0)
+    else:
+        chunks_arr: npt.NDArray[np.int64] | None = None
+        vi_arr: npt.NDArray[np.int64] | None = None
+        if _arrays is not None:
+            chunks_arr = np.asarray(_arrays[0], dtype=np.int64)
+            vi_arr = np.asarray(_arrays[1], dtype=np.int64)
+            if chunks_arr.ndim != 3 or vi_arr.ndim != 2 or chunks_arr.shape[:2] != vi_arr.shape:
+                raise ArrayError(
+                    f"links/{format_delta(delta)}: array records must be "
+                    f"(M, L, sid_ndim) chunks and (M, L) indices, got "
+                    f"{chunks_arr.shape} and {vi_arr.shape}"
+                )
+            if chunks_arr.shape[2] != sid_ndim:
+                raise ArrayError(
+                    f"chunk coords arity mismatch in links/"
+                    f"{format_delta(delta)}: sid_ndim={sid_ndim}, "
+                    f"got {chunks_arr.shape[2]}"
+                )
+            if link_width is None:
+                link_width = int(vi_arr.shape[1])
+            elif int(vi_arr.shape[1]) != link_width:
+                raise ArrayError(
+                    f"links/{format_delta(delta)}: record arity "
+                    f"{vi_arr.shape[1]} != link_width {link_width}"
+                )
+            n_records = int(vi_arr.shape[0])
+            if store == "duplicate":
+                # One record files under several cells there; that is the
+                # record partitioner's business.
+                normalised = [
+                    list(zip(map(tuple, cs), vs))
+                    for cs, vs in zip(chunks_arr.tolist(), vi_arr.tolist())
+                ]
+                chunks_arr = vi_arr = None
+        else:
+            from zarr_vectors.spatial.boundary import _MAX_ARRAY_LINK_WIDTH
+
+            normalised, link_width = _normalise_link_records(
+                links, link_width, sid_ndim, delta,
+            )
+            n_records = len(normalised)
+            if store == "canonical" and link_width <= _MAX_ARRAY_LINK_WIDTH:
+                # The record form is what callers hand over; the array
+                # partitioner is what decides where each lands, since it
+                # does the same arithmetic without a Python object per
+                # endpoint.
+                chunks_arr = np.array(
+                    [[c for c, _ in rec] for rec in normalised], dtype=np.int64,
+                ).reshape(n_records, link_width, sid_ndim)
+                vi_arr = np.array(
+                    [[v for _, v in rec] for rec in normalised], dtype=np.int64,
+                ).reshape(n_records, link_width)
+        if chunks_arr is not None and vi_arr is not None:
+            from zarr_vectors.spatial.boundary import partition_link_arrays
+
+            scale_src, scale_trg = _link_scales(level_group, delta, sid_ndim)
+            buckets = partition_link_arrays(
+                chunks_arr, vi_arr, link_width=link_width, sid_ndim=sid_ndim,
+                scale_src=scale_src, scale_trg=scale_trg,
+                directed=directed, cross_level=(delta != 0),
+            )
+        else:
+            buckets = _partition_links(
+                level_group, normalised, link_width, sid_ndim,
+                delta=delta, directed=directed, store=store,
+            )
     family = links_group_path(delta)
     fam_meta = level_group.read_array_meta(family) or {}
 
-    buckets = _partition_links(
-        level_group, normalised, link_width, sid_ndim,
-        delta=delta, directed=directed, store=store,
-    )
-    targeted: list[str] = sorted({seg for seg, _chunk in buckets})
+    # Grouped once. The write loop below used to rescan every bucket for
+    # each targeted segment, which is quadratic in the number of distinct
+    # offset segments.
+    by_segment: dict[str, list[tuple[ChunkCoords, Any]]] = {}
+    for (bucket_seg, src_chunk), entries in buckets.items():
+        # The array partitioner yields (rows, input_indices); only the
+        # rows are written, the indices ride out in the partition.
+        block = entries[0] if isinstance(entries, tuple) else entries
+        by_segment.setdefault(bucket_seg, []).append((src_chunk, block))
+    targeted: list[str] = sorted(by_segment)
     surviving = [
         seg for seg in list_link_offsets(level_group, delta)
         if seg not in targeted
@@ -2479,19 +3034,41 @@ def write_links(
         first_new = existing_total
 
     new_physical = 0
+    segment_offsets = {
+        seg: parse_offsets(seg, sid_ndim=sid_ndim, link_width=link_width)
+        for seg in targeted
+    }
+    # Every targeted array in one allocation.  A mesh with random
+    # geometry fans out to hundreds of offsets segments, a graph to well
+    # over a thousand, and creating each through its own ``sync()`` cost
+    # tens of milliseconds a segment -- a third of a mesh write.
+    _create_links_arrays(
+        level_group, list(segment_offsets.values()),
+        link_width=link_width, dtype=str(dtype), delta=delta,
+        sid_ndim=sid_ndim, directed=directed, store=store,
+    )
     for seg in targeted:
-        offsets = parse_offsets(seg, sid_ndim=sid_ndim, link_width=link_width)
-        create_links_array(
-            level_group, link_width, dtype=str(dtype), delta=delta,
-            sid_ndim=sid_ndim, offsets=offsets, directed=directed,
-            store=store, exist_ok=True,
-        )
+        offsets = segment_offsets[seg]
         has_perm = links_has_perm(
             offsets, delta=delta, directed=directed, store=store,
         )
-        for (bucket_seg, src_chunk), entries in buckets.items():
-            if bucket_seg != seg:
-                continue
+        if mode == "replace" and not (delta == 0 and is_intra(offsets)):
+            # A fresh cross-offset array: every cell is one inline ragged
+            # blob of the rows it was handed, so the whole segment goes
+            # to the store as one batch of cells.  The per-cell writer
+            # below is the definition of that encoding
+            # (``encode_ragged_blob``, no sidecar) and stays the path for
+            # appends, which have to merge with what a cell already holds.
+            cells: list[tuple[str, bytes]] = []
+            for src_chunk, entries in by_segment[seg]:
+                rows = _pack_link_rows(
+                    entries, has_perm=has_perm, link_width=link_width, dtype=dtype,
+                )
+                new_physical += rows.shape[0]
+                cells.append((_chunk_key(src_chunk), encode_ragged_blob([rows], dtype)))
+            level_group.write_cells(links_path(delta, offsets), cells)
+            continue
+        for src_chunk, entries in by_segment[seg]:
             rows = _pack_link_rows(
                 entries, has_perm=has_perm, link_width=link_width, dtype=dtype,
             )
@@ -2518,7 +3095,7 @@ def write_links(
         new_total = counted.num_links
         new_physical_total = counted.num_physical_records
     else:
-        new_total = existing_total + len(normalised)
+        new_total = existing_total + n_records
         new_physical_total = existing_physical + new_physical
 
     _stamp_link_family_meta(
@@ -2528,7 +3105,10 @@ def write_links(
     )
 
     return LinkPartition(
-        cell_indices={k: [idx for _, _, idx in v] for k, v in buckets.items()},
+        cell_indices={
+            k: (v[1] if isinstance(v, tuple) else [idx for _, _, idx in v])
+            for k, v in buckets.items()
+        },
         num_links=new_total,
         num_physical_records=new_physical_total,
         first_new=first_new,
@@ -3391,14 +3971,135 @@ def read_chunk_vertices(
     if fi.num_fragments == 0:
         return []
     full = _reshape_vertex_buffer(raw, dtype, ndim)
-    groups: list[npt.NDArray[np.floating]] = []
-    for f in range(fi.num_fragments):
-        if fi.is_range(f):
-            start, count = fi.range(f)
-            groups.append(full[start : start + count])
-        else:
-            groups.append(full[fi.indices(f)])
-    return groups
+    return _partition_rows(full, fi)
+
+
+def _partition_rows(
+    full: npt.NDArray, fi: ChunkFragmentIndex,
+) -> list[npt.NDArray]:
+    """``full`` cut into one array per fragment, in fragment order.
+
+    Range fragments are views; explicit ones are gathers.  When every
+    fragment is a range the two lists come off the range table whole
+    rather than through a per-fragment accessor -- see
+    :meth:`ChunkFragmentIndex.ranges`.
+    """
+    table = fi.ranges()
+    if table is not None:
+        return [
+            full[start : start + count]
+            for start, count in zip(table[:, 0].tolist(), table[:, 1].tolist())
+        ]
+    return [fragment_rows(full, fi, f) for f in range(fi.num_fragments)]
+
+
+def fragment_rows(
+    full: npt.NDArray, fi: ChunkFragmentIndex, f: int,
+) -> npt.NDArray:
+    """The rows of fragment ``f`` from a per-vertex buffer ``full``.
+
+    ``full`` is any array whose leading axis is the chunk's vertex rows
+    -- the ``(N, D)`` positions, or an attribute's ``(N, width)`` -- and
+    this is the one place the fragment-to-rows rule lives: a range
+    fragment is a contiguous slice, an explicit one a gather.
+    """
+    if fi.is_range(f):
+        start, count = fi.range(f)
+        return full[start : start + count]
+    return full[fi.indices(f)]
+
+
+def attribute_buffer(
+    raw: bytes,
+    fi: ChunkFragmentIndex,
+    dtype: np.dtype,
+    *,
+    what: str = "attribute",
+) -> npt.NDArray | None:
+    """One per-vertex attribute cell as its ``(n_vertices, width)`` buffer.
+
+    Per-vertex attributes are one row per underlying vertex, aligned 1:1
+    with the ``vertices`` buffer, so the row count is the fragment
+    index's vertex extent and the width falls out of the byte length.
+    ``None`` for a cell with no rows.
+
+    Raises:
+        ArrayError: If the bytes do not divide into that many rows.
+    """
+    itemsize = dtype.itemsize
+    total_elements = len(raw) // itemsize if itemsize else 0
+    n_vertices = _fragment_vertex_extent(fi)
+    if n_vertices <= 0 or total_elements == 0:
+        return None
+    if total_elements % n_vertices != 0:
+        raise ArrayError(
+            f"{what} has {total_elements} elements, not a multiple of its "
+            f"{n_vertices} vertices; per-vertex attributes must align 1:1 "
+            "with the vertices array."
+        )
+    return np.frombuffer(raw, dtype=dtype).reshape(n_vertices, total_elements // n_vertices)
+
+
+def shape_attribute_rows(rows: npt.NDArray, ncols: int) -> npt.NDArray:
+    """Rows from :func:`attribute_buffer`, in the shape a caller asked
+    for: flat for ``ncols == 1``, ``(N, ncols)`` otherwise -- the
+    historical ``decode_ragged_floats`` contract."""
+    flat = np.ascontiguousarray(rows).reshape(-1)
+    return flat if ncols == 1 else flat.reshape(-1, ncols)
+
+
+def read_chunk_attribute_rows(
+    level_group: Group,
+    attr_name: str,
+    chunk_coords: ChunkCoords,
+    dtype: np.dtype | str | None = None,
+    ncols: int | None = None,
+) -> npt.NDArray:
+    """Every fragment's attribute rows from one chunk, concatenated in
+    fragment order.
+
+    The attribute twin of :func:`read_chunk_vertex_rows`, and for the
+    same reason: a bulk reader that concatenates
+    :func:`read_chunk_attributes` pays for a 64-way partition it then
+    undoes, on every chunk, for every attribute.  When the fragments
+    tile the buffer -- the layout every bulk writer produces -- the
+    concatenation *is* the buffer and it is returned whole.  Anything
+    else falls back to partition-and-concatenate, so the rows are
+    exactly those the per-fragment reader would have returned, in the
+    same order.
+
+    Returns an empty array for a chunk with no fragments or no rows.
+    """
+    key = _chunk_key(chunk_coords)
+    full_name = f"{VERTEX_ATTRIBUTES}/{attr_name}"
+    dtype, ncols = _resolve_attribute_layout(level_group, full_name, dtype, ncols)
+
+    with _maybe_batched_reads(level_group, [
+        (full_name, [key]),
+        (VERTEX_FRAGMENTS, [key]),
+    ]):
+        try:
+            raw = level_group.read_bytes(full_name, key)
+        except Exception as e:
+            raise ArrayError(
+                f"Cannot read attribute '{attr_name}' chunk {key}: {e}"
+            ) from e
+        fi = read_vertex_fragment_index(level_group, chunk_coords)
+
+    empty = np.empty((0,) if ncols == 1 else (0, ncols), dtype=dtype)
+    if fi.num_fragments == 0:
+        return empty
+    full = attribute_buffer(
+        raw, fi, dtype, what=f"Attribute '{attr_name}' chunk {key}",
+    )
+    if full is None:
+        return empty
+    if fi.tiles(full.shape[0]):
+        return shape_attribute_rows(full, ncols)
+    parts = _partition_rows(full, fi)
+    return shape_attribute_rows(
+        np.concatenate(parts, axis=0) if parts else full[:0], ncols,
+    )
 
 
 def chunk_fragments_tile(
@@ -3459,20 +4160,33 @@ def stamp_fragments_tile(level_group: Group, ndim: int) -> bool:
 
     dtype = vertices_dtype(level_group)
     key_strs = [_chunk_key(cc) for cc in keys]
+    # Row counts the writer recorded as it encoded each cell. Where one
+    # is present the buffer need not be fetched to be measured, which is
+    # the difference between a bulk write that reads its own output back
+    # in full (measured: 1.00x the bytes written) and one that reads only
+    # the fragment indices -- 16 bytes per fragment. The check itself is
+    # unchanged: the index still comes from the store and is still
+    # verified against the row count rather than trusted.
+    recorded = level_group.take_vertex_rows()
+    unrecorded = [k for k in key_strs if k not in recorded]
     with _maybe_batched_reads(level_group, [
-        (VERTICES, key_strs),
+        (VERTICES, unrecorded),
         (VERTEX_FRAGMENTS, key_strs),
     ]):
         for cc in keys:
+            key = _chunk_key(cc)
             try:
                 fi = read_vertex_fragment_index(level_group, cc)
-                raw = level_group.read_bytes(VERTICES, _chunk_key(cc))
+                n_rows = recorded.get(key)
+                if n_rows is None:
+                    raw = level_group.read_bytes(VERTICES, key)
+                    row_bytes = dtype.itemsize * max(1, int(ndim))
+                    if row_bytes == 0 or len(raw) % row_bytes:
+                        return False
+                    n_rows = len(raw) // row_bytes
             except (ArrayError, StoreError):
                 return False
-            row_bytes = dtype.itemsize * max(1, int(ndim))
-            if row_bytes == 0 or len(raw) % row_bytes:
-                return False
-            if not fi.tiles(len(raw) // row_bytes):
+            if not fi.tiles(n_rows):
                 return False
 
     level = level_group.attrs.get(_LEVEL_META_KEY)
@@ -4056,30 +4770,15 @@ def read_chunk_attributes(
     # gathered group is finally flattened and re-shaped to honour the
     # caller's ``ncols`` (ncols=1 yields a flat 1-D array), matching the
     # historical decode_ragged_floats contract.
-    itemsize = dtype.itemsize
-    total_elements = len(raw) // itemsize if itemsize else 0
-    n_vertices = _fragment_vertex_extent(fi)
-    if n_vertices <= 0 or total_elements == 0:
+    full = attribute_buffer(
+        raw, fi, dtype, what=f"Attribute '{attr_name}' chunk {key}",
+    )
+    if full is None:
         empty = np.empty((0,) if ncols == 1 else (0, ncols), dtype=dtype)
         return [empty for _ in range(fi.num_fragments)]
-    if total_elements % n_vertices != 0:
-        raise ArrayError(
-            f"Attribute '{attr_name}' chunk {key} has {total_elements} "
-            f"elements, not a multiple of its {n_vertices} vertices; "
-            "per-vertex attributes must align 1:1 with the vertices array."
-        )
-    width = total_elements // n_vertices
-    full = np.frombuffer(raw, dtype=dtype).reshape(n_vertices, width)
-    groups: list[npt.NDArray] = []
-    for f in range(fi.num_fragments):
-        if fi.is_range(f):
-            start, count = fi.range(f)
-            rows = full[start : start + count]
-        else:
-            rows = full[fi.indices(f)]
-        flat = np.ascontiguousarray(rows).reshape(-1)
-        groups.append(flat if ncols == 1 else flat.reshape(-1, ncols))
-    return groups
+    return [
+        shape_attribute_rows(rows, ncols) for rows in _partition_rows(full, fi)
+    ]
 
 
 def read_attribute_fragment(
@@ -4385,17 +5084,20 @@ def read_object_manifest(
     sid_ndim = meta["sid_ndim"]
     num_objects = meta["num_objects"]
 
-    if object_id < 0 or object_id >= num_objects:
+    _require_object_index_layout(meta)
+    found, rows = object_rows_for_ids(level_group, [object_id])
+    if found.size == 0:
         raise ArrayError(
-            f"Object ID {object_id} out of range [0, {num_objects})"
+            f"Object ID {object_id} is not in this level "
+            f"({num_objects} object(s))"
         )
-
-    _require_object_index_v1(meta)
     # Via the Group rather than the raw zarr node, so the read passes a
     # chokepoint the offline snapshot can serve (see Group.offline_reads).
     # Slice-then-extract, never scalar-index: see zarr_vectors.core._vlen.
     # This 1-D manifests array shares that rule with the N-D cell readers.
-    blob = level_group.read_vlen_element(f"{OBJECT_INDEX}/manifests", object_id)
+    blob = level_group.read_vlen_element(
+        f"{OBJECT_INDEX}/manifests", int(rows[0]),
+    )
     blocks = decode_object_manifest_blocks(blob, sid_ndim=sid_ndim)
     return expand_manifest_blocks(blocks)
 
@@ -4412,16 +5114,156 @@ def read_all_object_manifests(
     sid_ndim = meta["sid_ndim"]
     num_objects = int(meta.get("num_objects", 0))
 
-    _require_object_index_v1(meta)
+    _require_object_index_layout(meta)
     if num_objects == 0:
         return []
     # Via the Group rather than the raw zarr node, so the read passes a
     # chokepoint the offline snapshot can serve (see Group.offline_reads).
     blobs = level_group.read_vlen_array(f"{OBJECT_INDEX}/manifests")
-    return [
-        expand_manifest_blocks(decode_object_manifest_blocks(b, sid_ndim=sid_ndim))
-        for b in blobs
-    ]
+    return _decode_manifests(blobs, sid_ndim)
+
+
+def _decode_manifests(blobs: Sequence[bytes], sid_ndim: int) -> list[ObjectManifest]:
+    """Every blob's expanded manifest, decoded as one batch.
+
+    The uniform case -- every block a single fragment, which is what
+    every bulk writer produces -- comes back from the batch decoder
+    already in the expanded ``(chunk_coords, fragment_index)`` shape;
+    anything else is expanded blob by blob.
+    """
+    decoded, uniform = decode_object_manifests_many(blobs, sid_ndim=sid_ndim)
+    if uniform:
+        return decoded
+    return [expand_manifest_blocks(blocks) for blocks in decoded]
+
+
+
+#: Fragment-attribute column naming the object that owns each fragment.
+#:
+#: ``constants.FRAGMENT_ATTRIBUTES`` already reserves this: "including
+#: parent-IDs (e.g. an ``object_id`` fragment attribute carrying the OID
+#: that owns each fragment)".  Writing it makes "which objects reference
+#: this fragment" a single cell read rather than a decode of every
+#: manifest in the level.
+FRAGMENT_OWNER_ATTR = "object_id"
+
+#: Owner value meaning "more than one object references this fragment".
+#:
+#: Shared fragments are a declared capability (``CAP_SHARED_FRAGMENTS``),
+#: so one int64 cannot always name the owner.  It is deliberately not
+#: ``-1``, which already means "no parent" in the cross-level tables --
+#: reusing it would make an unowned fragment and a jointly-owned one
+#: indistinguishable.
+FRAGMENT_OWNER_SHARED = -2
+
+#: Owner value for a fragment no object references.
+FRAGMENT_OWNER_NONE = -1
+
+
+def build_fragment_owner_column(
+    level_group: Group,
+) -> dict[ChunkCoords, npt.NDArray[np.int64]]:
+    """The owning object id of every fragment, per chunk.
+
+    Derived from the manifests, which is the only place the relation is
+    recorded today.  Writing the result as a
+    ``fragment_attributes/object_id`` column is what turns the reverse
+    question into a read: without it, every caller that asks "which
+    objects reference this fragment" rebuilds this whole inversion in
+    memory, and four separate places in this package do exactly that.
+
+    A fragment named by more than one object is marked
+    :data:`FRAGMENT_OWNER_SHARED` rather than given one of its owners,
+    so a reader knows to consult the manifests instead of trusting a
+    half-truth.
+    """
+    ids, manifests = read_object_manifest_rows(level_group)
+    counts: dict[ChunkCoords, int] = {}
+    for manifest in manifests:
+        for cc, fi in manifest:
+            key = tuple(int(c) for c in cc)
+            counts[key] = max(counts.get(key, 0), int(fi) + 1)
+    owners = {
+        cc: np.full(n, FRAGMENT_OWNER_NONE, dtype=np.int64)
+        for cc, n in counts.items()
+    }
+    for oid, manifest in zip(ids.tolist(), manifests):
+        for cc, fi in manifest:
+            col = owners[tuple(int(c) for c in cc)]
+            current = int(col[int(fi)])
+            if current == FRAGMENT_OWNER_NONE:
+                col[int(fi)] = int(oid)
+            elif current != int(oid):
+                col[int(fi)] = FRAGMENT_OWNER_SHARED
+    return owners
+
+
+def write_fragment_owner_column(level_group: Group) -> int:
+    """Materialise :func:`build_fragment_owner_column` on the level.
+
+    Returns the number of fragments recorded.  Safe to re-run; it
+    rewrites whatever it finds.
+    """
+    owners = build_fragment_owner_column(level_group)
+    if not owners:
+        return 0
+    total = 0
+    create_fragment_attribute_array(
+        level_group, FRAGMENT_OWNER_ATTR, dtype="int64", exist_ok=True,
+    )
+    with level_group.batched_writes():
+        for cc, column in sorted(owners.items()):
+            write_chunk_fragment_attributes(
+                level_group, FRAGMENT_OWNER_ATTR, cc, column, dtype=np.int64,
+            )
+            total += int(column.size)
+    return total
+
+
+def read_fragment_owners(
+    level_group: Group,
+    chunk_coords: ChunkCoords,
+    fragment_index: int,
+) -> list[int] | None:
+    """Object ids referencing one fragment, or ``None`` if not recorded.
+
+    ``None`` means the level carries no owner column, or the fragment is
+    marked shared -- in both cases the caller must fall back to scanning
+    the manifests, which is what it did before this column existed.
+    """
+    try:
+        column = read_chunk_fragment_attributes(
+            level_group, FRAGMENT_OWNER_ATTR, chunk_coords, dtype=np.int64,
+        )
+    except Exception:
+        return None
+    if column is None or int(fragment_index) >= len(column):
+        return None
+    owner = int(np.asarray(column).reshape(-1)[int(fragment_index)])
+    if owner == FRAGMENT_OWNER_SHARED:
+        return None
+    return [] if owner == FRAGMENT_OWNER_NONE else [owner]
+
+
+def read_object_manifest_rows(
+    level_group: Group,
+) -> tuple[npt.NDArray[np.int64], list[ObjectManifest]]:
+    """Every manifest in row order, paired with the id that owns it.
+
+    The honest replacement for enumerating
+    :func:`read_all_object_manifests`. That returns a list indexed by
+    *row*, and a caller writing ``for oid, manifest in enumerate(...)``
+    is reading the row as an id -- true only while the level stores its
+    objects densely from zero, and silently wrong otherwise.
+    """
+    manifests = read_all_object_manifests(level_group)
+    ids = object_ids_for_rows(level_group)
+    if ids.size != len(manifests):
+        # A table that disagrees with the rows it describes cannot be
+        # used to name them; fall back to positional, which is what the
+        # store meant before the table existed.
+        ids = np.arange(len(manifests), dtype=np.int64)
+    return ids, manifests
 
 
 def read_object_manifests(
@@ -4456,27 +5298,137 @@ def read_object_manifests(
     meta = level_group.read_array_meta(OBJECT_INDEX)
     sid_ndim = meta["sid_ndim"]
     num_objects = int(meta.get("num_objects", 0))
-    _require_object_index_v1(meta)
+    _require_object_index_layout(meta)
     if num_objects == 0:
         return {}
 
     path = f"{OBJECT_INDEX}/manifests"
     if ids is None:
         blobs = level_group.read_vlen_array(path)
-        wanted = list(range(len(blobs)))
+        wanted = object_ids_for_rows(level_group).tolist()
     else:
-        wanted = sorted({int(i) for i in ids if 0 <= int(i) < num_objects})
-        if not wanted:
+        found, rows = object_rows_for_ids(level_group, list(ids))
+        if found.size == 0:
             return {}
+        # Ascending rows so the coordinate selection touches each zarr
+        # chunk once; the result is keyed by id, so the order it was
+        # asked in does not matter.
+        order = np.argsort(rows, kind="stable")
+        wanted = found[order].tolist()
         # One coordinate selection, not one request per id: the plural
         # read is the whole point, and it goes through the Group so it
         # stays serveable from an offline snapshot like every other read.
-        blobs = level_group.read_vlen_elements(path, wanted)
+        blobs = level_group.read_vlen_elements(path, rows[order].tolist())
 
-    return {
-        oid: expand_manifest_blocks(decode_object_manifest_blocks(blob, sid_ndim=sid_ndim))
-        for oid, blob in zip(wanted, blobs)
-    }
+    return dict(zip(wanted, _decode_manifests(blobs, sid_ndim)))
+
+
+
+def read_object_id_table(level_group: Group) -> npt.NDArray[np.int64] | None:
+    """Row → object id, or ``None`` when rows *are* ids.
+
+    ``None`` is the V1 answer and means the identity mapping.  Callers
+    should branch on it rather than materialising ``arange(n)``, which
+    on a large level is the allocation the table exists to avoid.
+    """
+    try:
+        meta = level_group.read_array_meta(OBJECT_INDEX)
+    except Exception:
+        return None
+    if meta.get("layout") != OBJECT_INDEX_LAYOUT_V2:
+        return None
+    try:
+        table = level_group.read_array(f"{OBJECT_INDEX}/{OBJECT_IDS_ARRAY}")
+    except Exception:
+        return None
+    return np.asarray(table, dtype=np.int64)
+
+
+def _object_id_lookup(
+    level_group: Group,
+) -> tuple[npt.NDArray[np.int64], npt.NDArray[np.int64]] | None:
+    """``(sorted_ids, rows_for_sorted_ids)``, or ``None`` for identity.
+
+    Sorting is skipped when the writer stamped
+    :data:`OBJECT_IDS_SORTED_ATTR`, which bulk writers do because they
+    emit ids in order.
+    """
+    cache = level_group._object_id_lookup_cache
+    key = level_group._full_path(OBJECT_INDEX)
+    if cache is not None and key in cache:
+        return cache[key]
+    table = read_object_id_table(level_group)
+    if table is None:
+        result = None
+    else:
+        try:
+            meta = level_group.read_array_meta(OBJECT_INDEX)
+        except Exception:
+            meta = {}
+        if meta.get(OBJECT_IDS_SORTED_ATTR):
+            result = (table, np.arange(table.size, dtype=np.int64))
+        else:
+            order = np.argsort(table, kind="stable")
+            result = (table[order], order)
+    if cache is None:
+        cache = level_group._object_id_lookup_cache = {}
+    cache[key] = result
+    return result
+
+
+def object_rows_for_ids(
+    level_group: Group, ids: Sequence[int],
+) -> tuple[npt.NDArray[np.int64], npt.NDArray[np.int64]]:
+    """Resolve object ids to rows, dropping ids the level does not hold.
+
+    Returns ``(found_ids, rows)`` in the order given.  An id that is
+    absent is simply not returned, which is the same contract
+    :func:`read_object_manifests` already offers for an out-of-range id,
+    so a caller may pass a superset without pre-filtering.
+    """
+    wanted = np.asarray(list(ids), dtype=np.int64)
+    if wanted.size == 0:
+        return wanted, wanted
+    lookup = _object_id_lookup(level_group)
+    if lookup is None:
+        # Identity: the id is the row, bounded by the row count.
+        n_rows = object_row_count(level_group)
+        keep = (wanted >= 0) & (wanted < n_rows)
+        return wanted[keep], wanted[keep]
+    sorted_ids, rows = lookup
+    pos = np.searchsorted(sorted_ids, wanted)
+    np.clip(pos, 0, max(sorted_ids.size - 1, 0), out=pos)
+    hit = sorted_ids.size > 0
+    found = (sorted_ids[pos] == wanted) if hit else np.zeros_like(wanted, bool)
+    return wanted[found], rows[pos[found]]
+
+
+def object_ids_for_rows(
+    level_group: Group, rows: Sequence[int] | npt.NDArray[np.int64] | None = None,
+) -> npt.NDArray[np.int64]:
+    """The object ids at ``rows``, or every id in row order.
+
+    The inverse of :func:`object_rows_for_ids`, and what a caller
+    scanning manifests positionally needs in order to say which object
+    each row belongs to.
+    """
+    table = read_object_id_table(level_group)
+    if table is None:
+        n_rows = object_row_count(level_group)
+        return (
+            np.arange(n_rows, dtype=np.int64) if rows is None
+            else np.asarray(list(rows), dtype=np.int64)
+        )
+    return table if rows is None else table[np.asarray(list(rows), dtype=np.int64)]
+
+
+def object_row_count(level_group: Group) -> int:
+    """How many manifest rows this level holds."""
+    try:
+        meta = level_group.read_array_meta(OBJECT_INDEX)
+    except Exception:
+        return 0
+    return int(meta.get("num_objects", 0) or 0)
 
 
 def object_count(level_group: Group) -> int:
@@ -4488,15 +5440,30 @@ def object_count(level_group: Group) -> int:
     return int(meta.get("num_objects", 0) or 0)
 
 
-def object_present_mask(level_group: Group) -> "npt.NDArray[np.bool_]":
+def object_present_mask(level_group: Group) -> npt.NDArray[np.bool_]:
     """Per-slot mask of which objects this level actually holds.
 
-    ``True`` where the slot has a non-empty manifest.  Reads the manifests
-    when it must; there is no cheaper exact answer, which is why
-    :func:`object_present_count` exists for the count alone.
+    ``True`` where the slot has a non-empty manifest.
+
+    Answered from the stored bytes rather than from decoded manifests.
+    A manifest encodes as a block count followed by its blocks, so an
+    empty one is exactly the four zero bytes of a zero count and the
+    question "is this slot occupied" is a byte comparison.  Decoding
+    first -- building every chunk-coordinate tuple of every object in
+    the level -- answered the same question and then threw the answer
+    away: on a 400,000-object store the decode was about 80% of the
+    time this function took.
     """
-    manifests = read_all_object_manifests(level_group)
-    return np.array([bool(m) for m in manifests], dtype=bool)
+    meta = level_group.read_array_meta(OBJECT_INDEX)
+    _require_object_index_layout(meta)
+    if int(meta.get("num_objects", 0)) == 0:
+        return np.zeros((0,), dtype=bool)
+    blobs = level_group.read_vlen_array(f"{OBJECT_INDEX}/manifests")
+    # A never-written row reads back empty, which is absent too.
+    return np.array(
+        [bool(b) and bytes(b) != _EMPTY_MANIFEST_BLOB for b in blobs],
+        dtype=bool,
+    )
 
 
 def object_present_count(level_group: Group) -> int:
@@ -4514,6 +5481,19 @@ def object_present_count(level_group: Group) -> int:
     if stamped is not None:
         return int(stamped)
     return int(object_present_mask(level_group).sum())
+
+
+def _require_object_index_layout(meta: dict[str, Any]) -> None:
+    """Raise unless ``object_index`` is a layout this build can read.
+
+    Both V1 and V2 are readable, and they share one code path: a V1
+    store is one whose id table is the identity.  Anything else is older
+    than this build supports.
+    """
+    layout = meta.get("layout")
+    if layout in (OBJECT_INDEX_LAYOUT_V1, OBJECT_INDEX_LAYOUT_V2):
+        return
+    _require_object_index_v1(meta)
 
 
 def _require_object_index_v1(meta: dict[str, Any]) -> None:
@@ -4941,6 +5921,152 @@ def read_links(
                         placed_endpoints, perm_idx, link_width,
                     )))
     return out
+
+
+def read_link_arrays(
+    level_group: Group,
+    *,
+    delta: int = 0,
+    include_intra: bool = True,
+) -> tuple[npt.NDArray[np.int64], npt.NDArray[np.int64]]:
+    """Every link record under ``links/<delta>/`` as two arrays.
+
+    :func:`read_links` in array form: ``(chunks, vi)`` of shapes
+    ``(M, L, sid_ndim)`` and ``(M, L)``, one row per record in exactly
+    the order :func:`read_links` returns them -- offsets segments
+    sorted, cells sorted within each, rows in write order -- and with
+    the input endpoint order restored from ``perm_idx``.  So
+    ``read_links(...)[i]`` is ``tuple(zip(map(tuple, chunks[i]), vi[i]))``.
+
+    Offered because the per-record tuples are the cost of a large
+    family: half a million faces took 8 s to build as tuples and a
+    further 2 s to take apart again, for arithmetic -- a chunk offset
+    plus a local index -- that is one gather over these arrays.  A
+    ``store="duplicate"`` family returns each record once per copy,
+    like :func:`read_links`.
+
+    Returns empty ``(0, 0, 0)`` / ``(0, 0)`` arrays when the family is
+    absent or holds no rows.
+    """
+    from zarr_vectors.spatial.boundary import _lehmer_decode
+
+    empty = (np.empty((0, 0, 0), dtype=np.int64), np.empty((0, 0), dtype=np.int64))
+    family = links_group_path(delta)
+    if not level_group.array_exists(family):
+        return empty
+    fam_meta = level_group.read_array_meta(family) or {}
+    if "link_width" not in fam_meta or "sid_ndim" not in fam_meta:
+        return empty
+    link_width = int(fam_meta["link_width"])
+    sid_ndim = int(fam_meta["sid_ndim"])
+    directed = bool(fam_meta.get("directed", False))
+    store = str(fam_meta.get("store", "canonical"))
+    scale_src, scale_trg = _link_scales(level_group, delta, sid_ndim)
+
+    # inverse[p] gathers a placed row back into input order: the
+    # ``out[sigma[i]] = placed[i]`` of apply_perm_inverse, as one index.
+    inverse: npt.NDArray[np.int64] | None = None
+
+    chunk_parts: list[npt.NDArray[np.int64]] = []
+    vi_parts: list[npt.NDArray[np.int64]] = []
+    for seg in list_link_offsets(level_group, delta):
+        arr_name = f"{family}/{seg}"
+        try:
+            offsets = parse_offsets(
+                seg, sid_ndim=sid_ndim, link_width=link_width,
+            )
+        except ValueError as e:
+            raise ArrayError(
+                f"{arr_name}: offsets segment {seg!r} does not match the "
+                f"family's sid_ndim={sid_ndim} link_width={link_width}: {e}"
+            ) from e
+        if not include_intra and is_intra(offsets):
+            continue
+        arr_meta = level_group.read_array_meta(arr_name) or {}
+        has_perm = bool(arr_meta.get(
+            "has_perm",
+            links_has_perm(
+                offsets, delta=delta, directed=directed, store=store,
+            ),
+        ))
+        ncols = (1 + link_width) if has_perm else link_width
+        flat = delta == 0 and is_intra(offsets)
+        cell_dtype = np.dtype(arr_meta.get("dtype", "int64"))
+
+        cell_rows: list[npt.NDArray[np.int64]] = []
+        cell_chunks: list[tuple[ChunkCoords, ...]] = []
+        for cell_key in sorted(level_group.list_chunks(arr_name)):
+            blob = level_group.read_bytes(arr_name, cell_key)
+            if not blob:
+                continue
+            rows_arr = _link_cell_rows(
+                blob, ncols=ncols, flat=flat, dtype=cell_dtype,
+            )
+            if rows_arr.size == 0:
+                continue
+            cell_rows.append(rows_arr)
+            cell_chunks.append(cell_endpoint_chunks(
+                _parse_chunk_key(cell_key), offsets, scale_src, scale_trg,
+            ))
+        if not cell_rows:
+            continue
+        counts = np.fromiter((r.shape[0] for r in cell_rows), dtype=np.int64, count=len(cell_rows))
+        rows = np.concatenate(cell_rows, axis=0)
+        placed_chunks = np.repeat(
+            np.asarray(cell_chunks, dtype=np.int64).reshape(-1, link_width, sid_ndim),
+            counts, axis=0,
+        )
+        if has_perm:
+            if inverse is None:
+                import math
+
+                inverse = np.stack([
+                    np.argsort(_lehmer_decode(p, link_width))
+                    for p in range(math.factorial(link_width))
+                ]).astype(np.int64)
+            perm = rows[:, 0]
+            if perm.size and (int(perm.min()) < 0 or int(perm.max()) >= inverse.shape[0]):
+                raise ArrayError(
+                    f"{arr_name}: perm_idx out of range [0, {inverse.shape[0]})"
+                )
+            gather = inverse[perm]
+            rowsel = np.arange(rows.shape[0])[:, None]
+            vi_parts.append(rows[:, 1:1 + link_width][rowsel, gather])
+            chunk_parts.append(placed_chunks[rowsel, gather])
+        else:
+            vi_parts.append(np.ascontiguousarray(rows[:, :link_width]))
+            chunk_parts.append(placed_chunks)
+    if not vi_parts:
+        return empty
+    return (
+        np.concatenate(chunk_parts, axis=0),
+        np.concatenate(vi_parts, axis=0),
+    )
+
+
+def link_endpoints_to_rows(
+    chunks: npt.NDArray[np.int64],
+    vi: npt.NDArray[np.int64],
+    chunk_offsets: Mapping[ChunkCoords, int],
+) -> npt.NDArray[np.int64]:
+    """Global row of every endpoint: ``chunk_offsets[chunk] + vi``.
+
+    ``chunks`` and ``vi`` are what :func:`read_link_arrays` returns;
+    ``chunk_offsets`` is where each chunk's rows start in a reader's
+    concatenation.  An endpoint whose chunk the reader did not take is
+    ``-1``, which is how a bbox or cells filter reaches the records.
+    """
+    m, link_width, sid_ndim = chunks.shape
+    if m == 0:
+        return np.empty((0, link_width), dtype=np.int64)
+    flat = chunks.reshape(-1, sid_ndim)
+    unique, inverse = np.unique(flat, axis=0, return_inverse=True)
+    starts = np.fromiter(
+        (chunk_offsets.get(tuple(row), -1) for row in unique.tolist()),
+        dtype=np.int64, count=unique.shape[0],
+    )
+    base = starts[np.asarray(inverse).reshape(-1)].reshape(m, link_width)
+    return np.where(base >= 0, base + vi, -1)
 
 
 def _link_tuple_cell(

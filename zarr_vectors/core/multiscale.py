@@ -21,15 +21,13 @@ from __future__ import annotations
 
 from typing import Any
 
-from zarr_vectors.core.metadata import LevelMetadata
+from zarr_vectors.constants import RESOLUTION_PREFIX
 from zarr_vectors.core.store import (
     FsGroup,
     list_resolution_levels,
     read_level_metadata,
     read_root_metadata,
 )
-from zarr_vectors.constants import RESOLUTION_PREFIX
-from zarr_vectors.exceptions import MetadataError
 
 
 def upsert_level_transform(

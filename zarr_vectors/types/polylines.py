@@ -20,19 +20,20 @@ import numpy as np
 import numpy.typing as npt
 
 from zarr_vectors.constants import (
-    RESOLUTION_PREFIX,
     CROSS_CHUNK_EXPLICIT,
+    DEFAULT_OOB_POLICY,
     FRAGMENT_ATTRIBUTES,
-    GEOM_POLYLINE,
     GEOM_STREAMLINE,
     LINKS_IMPLICIT_SEQUENTIAL,
     OBJECT_INDEX,
     OBJIDX_STANDARD,
+    RESOLUTION_PREFIX,
+    VERTEX_ATTRIBUTES,
     VERTEX_FRAGMENTS,
     VERTICES,
 )
 from zarr_vectors.core.arrays import (
-    stamp_fragments_tile,
+    attribute_layout,
     create_attribute_array,
     create_fragment_attribute_array,
     create_groupings_array,
@@ -40,16 +41,14 @@ from zarr_vectors.core.arrays import (
     create_object_attributes_array,
     create_object_index_array,
     create_vertices_array,
-    list_chunk_keys,
-    resolve_chunk_keys,
-    read_all_groupings,
-    read_all_object_manifests,
-    read_object_manifest,
+    read_chunk_attributes,
     read_chunk_vertices,
-    read_group_object_ids,
-    read_object_attributes,
-    read_object_vertices,
     read_fragment,
+    read_group_object_ids,
+    read_object_manifest_rows,
+    read_object_manifests,
+    resolve_chunk_keys,
+    stamp_fragments_tile,
     write_chunk_attributes,
     write_chunk_fragment_attributes,
     write_chunk_vertices,
@@ -63,10 +62,8 @@ from zarr_vectors.core.attr_chunking import (
     assign_attribute_bins,
     compute_chunk_dim_names,
 )
-from zarr_vectors.constants import DEFAULT_OOB_POLICY
 from zarr_vectors.core.metadata import (
     LevelMetadata,
-    RootMetadata,
     get_level_chunk_shape,
 )
 from zarr_vectors.core.store import (
@@ -76,19 +73,16 @@ from zarr_vectors.core.store import (
     _ensure_root_metadata_for_write,
     _finalize_write,
     create_resolution_level,
-    create_store,
     get_resolution_level,
     open_store,
     read_level_metadata,
     read_root_metadata,
 )
-from zarr_vectors.exceptions import ArrayError
+from zarr_vectors.exceptions import ArrayError, StoreError
 from zarr_vectors.spatial.boundary import (
-    cross_chunk_links_for_segments,
     split_polyline_at_boundaries,
 )
 from zarr_vectors.spatial.chunking import (
-    chunks_intersecting_bbox,
     compute_bounds,
 )
 from zarr_vectors.typing import (
@@ -97,16 +91,16 @@ from zarr_vectors.typing import (
     ChunkCoords,
     ChunkShape,
     CrossChunkLink,
-    ObjectManifest,
     FragmentRef,
+    ObjectManifest,
 )
 
 if TYPE_CHECKING:
-    from zarr_vectors.core.store import ReadSource
+    from zarr_vectors.core.store import ReadSource, WriteTarget
 
 
 def write_polylines(
-    store_path: str,
+    store_path: WriteTarget,
     polylines: list[npt.NDArray[np.floating]],
     *,
     chunk_shape: ChunkShape,
@@ -172,13 +166,9 @@ def write_polylines(
     # the polyline writer itself splits at chunk boundaries only — see
     # the call to ``split_polyline_at_boundaries`` below.
 
-    root = _create_or_open_store(
-        store_path,
-        backend=backend,
-        bounds=bounds_list,
-        chunk_shape=tuple(chunk_shape),
-        ndim=ndim,
-    )
+    # Checked before anything is created.  It used to be rejected after
+    # ``_create_or_open_store``, which left an empty store on disk for a
+    # call that was never going to succeed.
     # OOB policy for polyline vertices.  "ignore" is rejected — dropping
     # vertices would break the per-polyline ordering and connectivity.
     if out_of_bounds == "ignore":
@@ -187,6 +177,13 @@ def write_polylines(
             "polyline connectivity depends on vertex ordering. Use "
             "'raise' (default) or 'expand'."
         )
+    root = _create_or_open_store(
+        store_path,
+        backend=backend,
+        bounds=bounds_list,
+        chunk_shape=tuple(chunk_shape),
+        ndim=ndim,
+    )
     _apply_out_of_bounds_policy(root, all_pts, policy=out_of_bounds)
 
     root_meta = _ensure_root_metadata_for_write(
@@ -555,6 +552,10 @@ def read_polylines(
             f"{prefix}/{VERTICES}",
             f"{prefix}/{VERTEX_FRAGMENTS}",
             f"{prefix}/{OBJECT_INDEX}",
+            # Probed even on a store that has none: a speculative miss
+            # caches as absent, which is the answer the reader wants, and
+            # leaving it out meant a warm block still paid one lookup.
+            f"{prefix}/{VERTEX_ATTRIBUTES}",
         ])
         return _read_polylines(
             root,
@@ -633,7 +634,7 @@ def _read_polylines(
         try:
             filter_bin = lm.chunk_attribute_values.index(fvalue)
         except ValueError:
-            return _empty_polyline_result()
+            return _empty_polyline_result(ndim)
 
     # An explicitly-named object/group subset lets us read only those
     # objects' manifests and the chunks they reference, instead of the
@@ -657,14 +658,20 @@ def _read_polylines(
             meta = level_group.read_array_meta("object_index")
             object_ids = list(range(meta["num_objects"]))
         except Exception:
-            return _empty_polyline_result()
+            return _empty_polyline_result(ndim)
 
-    # If bbox, find which chunks are relevant
+    # If bbox, find which chunks are relevant.  Resolved against the
+    # level rather than enumerated from the grid: the box is a cartesian
+    # product with no clamp, so on a sparse store -- a specimen bounding
+    # box with data in part of it -- a whole-domain query materialised
+    # one tuple per *allocated* cell (a million of them for a thousand
+    # occupied) purely to test membership against manifests that can
+    # only name occupied ones.  The resolved set is the same set: a
+    # manifest never references a chunk the level does not hold.
     target_chunks: set[ChunkCoords] | None = None
     if bbox is not None:
-        target_chunks = set(chunks_intersecting_bbox(
-            np.asarray(bbox[0]), np.asarray(bbox[1]),
-            level_chunk_shape,
+        target_chunks = set(resolve_chunk_keys(
+            level_group, level_chunk_shape, bbox=bbox,
         ))
 
     # Explicit chunks whitelist switches read_polylines into segment-level
@@ -680,8 +687,29 @@ def _read_polylines(
         )
 
     result_polylines: list[list[npt.NDArray]] = []
+    # One entry per emitted polyline, mirroring ``result_polylines``:
+    # ``{name: [rows_per_fragment, ...]}``.
+    result_attrs: list[dict[str, list[npt.NDArray | None]]] = []
     result_object_ids: list[int] = []
     total_verts = 0
+
+    # Every per-vertex attribute the level carries.  Unlike read_points,
+    # this reader has no ``attribute_names`` term for a caller to narrow
+    # with, so it reads what is there -- the same choice read_lines makes.
+    attr_layouts: dict[str, tuple[np.dtype, int]] = {}
+    try:
+        _attr_names = sorted(level_group[VERTEX_ATTRIBUTES].children())
+    except Exception:
+        _attr_names = []
+    if _attr_names:
+        level_group.prime_nodes(
+            [f"{VERTEX_ATTRIBUTES}/{_n}" for _n in _attr_names],
+        )
+    for _name in _attr_names:
+        try:
+            attr_layouts[_name] = attribute_layout(level_group, _name)
+        except Exception:
+            continue
 
     # Choose between a selective read (an explicit object/group subset —
     # read only those objects' manifests and the chunks they reference,
@@ -690,12 +718,19 @@ def _read_polylines(
     manifest_by_oid: dict[int, ObjectManifest] = {}
     if explicit_subset:
         needed_chunks: set[ChunkCoords] = set()
-        for oid in object_ids:
-            try:
-                m = read_object_manifest(level_group, oid)
-            except Exception:
-                continue  # missing/out-of-range oid — skip
-            manifest_by_oid[oid] = m
+        # One coordinate selection for the whole subset. Read one id at a
+        # time, each call decodes a full 16,384-row manifest bucket, and
+        # 10,000 ids cost 64s against a 50k-object store -- 75x the 0.85s
+        # it takes to read every polyline in it. Missing and
+        # out-of-range ids are simply absent from the result, which is
+        # what the per-id ``except: continue`` was for.
+        try:
+            manifest_by_oid = read_object_manifests(
+                level_group, ids=[int(o) for o in object_ids],
+            )
+        except Exception:
+            manifest_by_oid = {}
+        for m in manifest_by_oid.values():
             for cc, _fi in m:
                 needed_chunks.add(cc)
         # Only whitelist chunks are ever read from the cache in crop mode,
@@ -730,9 +765,10 @@ def _read_polylines(
         # full read assemble exactly what the ``object_ids=`` subset read
         # does.
         try:
-            manifests = read_all_object_manifests(level_group)
+            _mids, manifests = read_object_manifest_rows(level_group)
+            by_id = {int(o): m for o, m in zip(_mids.tolist(), manifests)}
         except Exception:
-            manifests = []
+            manifests, by_id = [], {}
 
         needed_chunks: set[ChunkCoords] = set()
         for m in manifests:
@@ -756,9 +792,7 @@ def _read_polylines(
             # ``manifests`` was read above to derive the chunk set; the
             # per-object loop indexes into it — no per-iteration read.
             def _get_manifest(oid: int) -> ObjectManifest | None:
-                if 0 <= oid < len(manifests):
-                    return manifests[oid]
-                return None
+                return by_id.get(int(oid))
 
         # Decode each materialised chunk's fragments exactly once.  The
         # per-object dispatch then slices from this cache — O(K_per_chunk)
@@ -779,6 +813,60 @@ def _read_polylines(
             if 0 <= fragment_idx < len(groups):
                 return groups[fragment_idx]
             return None
+
+        # Per-vertex attributes, decoded once per chunk like the vertices
+        # above.  This reader returned none at all, so the facade fell back
+        # to a level-ordered gather -- which it then had to refuse for any
+        # narrowed read, because a level-ordered column cannot be aligned
+        # to a by-object assembly.  Read here and the two orders are the
+        # same order by construction.
+        attr_cache: dict[tuple[str, ChunkCoords], list[npt.NDArray]] = {}
+
+        def _read_attr_fragment(
+            name: str, cc: ChunkCoords, fragment_idx: int,
+        ) -> npt.NDArray | None:
+            key = (name, cc)
+            if key not in attr_cache:
+                a_dtype, a_ncols = attr_layouts[name]
+                try:
+                    attr_cache[key] = read_chunk_attributes(
+                        level_group, name, cc, dtype=a_dtype, ncols=a_ncols,
+                    )
+                except (ArrayError, StoreError):
+                    attr_cache[key] = []
+            rows = attr_cache[key]
+            if 0 <= fragment_idx < len(rows):
+                return rows[fragment_idx]
+            return None
+
+        def _read_run(
+            entries: list[FragmentRef],
+        ) -> tuple[list[npt.NDArray], dict[str, list[npt.NDArray | None]]]:
+            """One emitted polyline's fragments, with its attribute rows.
+
+            Kept in lockstep deliberately: a fragment that fails to read
+            is skipped, and skipping it in one list but not the other is
+            exactly how a column ends up describing the wrong vertices.
+            A fragment whose attribute rows are missing or the wrong
+            length records ``None``, which drops that column rather than
+            misaligning it.
+            """
+            frags: list[npt.NDArray] = []
+            attrs: dict[str, list[npt.NDArray | None]] = {
+                name: [] for name in attr_layouts
+            }
+            for cc, fragment_index in entries:
+                fragment = _read_fragment(cc, fragment_index)
+                if fragment is None:
+                    continue
+                frags.append(fragment)
+                for name in attr_layouts:
+                    rows = _read_attr_fragment(name, cc, fragment_index)
+                    attrs[name].append(
+                        None if rows is None or len(rows) != len(fragment)
+                        else rows
+                    )
+            return frags, attrs
 
         for oid in object_ids:
             # ------------------------------------------------------------------
@@ -804,22 +892,18 @@ def _read_polylines(
                         run.append((cc, fragment_idx))
                     else:
                         if run:
-                            fragment_list = [
-                                fragment for fragment in (_read_fragment(cc, fragment_index) for cc, fragment_index in run)
-                                if fragment is not None
-                            ]
+                            fragment_list, attr_list = _read_run(run)
                             if fragment_list:
                                 result_polylines.append(fragment_list)
+                                result_attrs.append(attr_list)
                                 result_object_ids.append(oid)
                                 total_verts += sum(len(fragment) for fragment in fragment_list)
                             run = []
                 if run:
-                    fragment_list = [
-                        fragment for fragment in (_read_fragment(cc, fragment_index) for cc, fragment_index in run)
-                        if fragment is not None
-                    ]
+                    fragment_list, attr_list = _read_run(run)
                     if fragment_list:
                         result_polylines.append(fragment_list)
+                        result_attrs.append(attr_list)
                         result_object_ids.append(oid)
                         total_verts += sum(len(fragment) for fragment in fragment_list)
                 continue
@@ -832,15 +916,9 @@ def _read_polylines(
                 ]
                 if not matching:
                     continue
-                fragment_list = [
-                    fragment for fragment in (_read_fragment(cc, fragment_index) for cc, fragment_index in matching)
-                    if fragment is not None
-                ]
+                fragment_list, attr_list = _read_run(matching)
             else:
-                fragment_list = [
-                    fragment for fragment in (_read_fragment(cc, fragment_index) for cc, fragment_index in obj_manifest)
-                    if fragment is not None
-                ]
+                fragment_list, attr_list = _read_run(obj_manifest)
 
             if not fragment_list:
                 continue
@@ -855,14 +933,34 @@ def _read_polylines(
                     continue
 
             result_polylines.append(fragment_list)
+            result_attrs.append(attr_list)
             result_object_ids.append(oid)
             total_verts += sum(len(fragment) for fragment in fragment_list)
     finally:
         _batched_reads_cm.__exit__(None, None, None)
 
+    # A column is returned only when every fragment of every emitted
+    # polyline supplied its rows, so it lines up with ``polylines``
+    # flattened in the same order.  Anything short is dropped rather than
+    # misaligned.
+    attrs_out: dict[str, npt.NDArray] = {}
+    for _name in attr_layouts:
+        parts: list[npt.NDArray] = []
+        complete = bool(result_attrs)
+        for per_poly in result_attrs:
+            rows = per_poly.get(_name) or []
+            if not rows or any(r is None for r in rows):
+                complete = False
+                break
+            parts.extend(rows)
+        if complete and parts:
+            attrs_out[_name] = np.concatenate(parts, axis=0)
+
     return {
         "polylines": result_polylines,
         "object_ids": result_object_ids,
+        "vertex_attributes": attrs_out,
+        "ndim": ndim,
         "polyline_count": len(result_polylines),
         "vertex_count": total_verts,
     }
@@ -890,10 +988,14 @@ def _read_manifest_run(
     return out
 
 
-def _empty_polyline_result() -> dict[str, Any]:
+def _empty_polyline_result(ndim: int = 3) -> dict[str, Any]:
     return {
         "polylines": [],
         "object_ids": [],
+        "vertex_attributes": {},
+        # Carried so an empty result still knows how wide the store is;
+        # the adapter cannot infer it from no data.
+        "ndim": int(ndim),
         "polyline_count": 0,
         "vertex_count": 0,
     }

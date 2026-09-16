@@ -91,13 +91,46 @@ class TestCompactOids:
 
 class TestDeferredPasses:
 
-    def test_drop_empty_fragments_raises(
+    def test_drop_empty_fragments_reports_rather_than_raising(
         self, baseline: tuple[str, np.ndarray],
     ) -> None:
+        """The pass was deferred for want of a reverse index.
+
+        With the fragment-owner column it can answer "does anything
+        reference this fragment", so it reports the dead ones. It does
+        not remove them: dropping a fragment renumbers every later one
+        in its chunk, which invalidates every manifest entry and every
+        chunk-local link index pointing past it.
+        """
         path, _ = baseline
         root = open_store(path, mode="r+")
-        with pytest.raises(NotImplementedError):
-            vacuum(root, drop_empty_fragments=True)
+        report = vacuum(root, drop_empty_fragments=True)
+        # Every fragment of a freshly written store has an owner.
+        assert report.dropped_fragments_per_chunk == {}
+
+    def test_drop_empty_fragments_finds_an_unreferenced_fragment(
+        self, baseline: tuple[str, np.ndarray],
+    ) -> None:
+        from zarr_vectors.core.arrays import (
+            patch_object_manifests,
+            read_object_manifest_rows,
+        )
+        from zarr_vectors.core.store import get_resolution_level
+
+        path, _ = baseline
+        root = open_store(path, mode="r+")
+        level = get_resolution_level(root, 0)
+        ids, manifests = read_object_manifest_rows(level)
+        # Orphan one object's fragments by blanking its manifest.
+        victim = next(
+            int(o) for o, m in zip(ids.tolist(), manifests) if m
+        )
+        patch_object_manifests(level, {victim: []}, 3)
+
+        report = vacuum(open_store(path, mode="r+"), drop_empty_fragments=True)
+        assert report.dropped_fragments_per_chunk, (
+            "an orphaned fragment should be reported"
+        )
 
     def test_dedup_parallel_rows_raises(
         self, baseline: tuple[str, np.ndarray],

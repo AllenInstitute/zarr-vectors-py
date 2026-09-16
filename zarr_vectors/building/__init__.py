@@ -35,31 +35,34 @@ because a name used from ``core`` is a name nobody knows is load-bearing.
 
 from __future__ import annotations
 
+from pathlib import Path
+from typing import Any
+
 # --- array names and layout sentinels --------------------------------
 from zarr_vectors.constants import (
     CAP_FRAGMENT_INDEX,
-    COARSEN_PER_OBJECT,
-    DEFAULT_CROSS_LEVEL_DEPTH,
-    DEFAULT_CROSS_LEVEL_STORAGE,
-    FRAGMENT_ATTRIBUTES,
-    GROUP_ATTRIBUTES,
-    LINKS_IMPLICIT_BRANCHES,
-    LINKS_IMPLICIT_SEQUENTIAL,
-    XLEVEL_EXPLICIT,
-    XLEVEL_NONE,
     CAP_MULTISCALE_LINKS,
     CAP_PRESERVED_OBJECT_IDS,
     CAP_SHARED_FRAGMENTS,
+    COARSEN_PER_OBJECT,
+    DEFAULT_CROSS_LEVEL_DEPTH,
+    DEFAULT_CROSS_LEVEL_STORAGE,
     FORMAT_VERSION,
+    FRAGMENT_ATTRIBUTES,
+    GROUP_ATTRIBUTES,
     GROUPS,
     LINK_ATTRIBUTES,
     LINK_FRAGMENTS,
     LINKS,
+    LINKS_IMPLICIT_BRANCHES,
+    LINKS_IMPLICIT_SEQUENTIAL,
     OBJECT_ATTRIBUTES,
     OBJECT_INDEX,
     VERTEX_ATTRIBUTES,
     VERTEX_FRAGMENTS,
     VERTICES,
+    XLEVEL_EXPLICIT,
+    XLEVEL_NONE,
 )
 from zarr_vectors.core.arrays import (
     OBJECT_INDEX_LAYOUT_V1,
@@ -83,6 +86,7 @@ from zarr_vectors.core.arrays import (
     finalize_links,
     iter_link_cells,
     level_grid_layout,
+    link_endpoints_to_rows,
     link_family_policy,
     links_has_perm,
     list_chunk_keys,
@@ -105,6 +109,7 @@ from zarr_vectors.core.arrays import (
     read_fragment,
     read_group_object_ids,
     read_groupings_attributes,
+    read_link_arrays,
     read_link_attributes,
     read_links,
     read_links_for_tuple,
@@ -122,15 +127,14 @@ from zarr_vectors.core.arrays import (
     write_chunk_vertices,
     write_groupings,
     write_groupings_attributes,
-    write_link_attributes,
     write_link_attribute_cells,
+    write_link_attributes,
     write_link_cells,
     write_links,
     write_object_attributes,
     write_object_index,
 )
 from zarr_vectors.core.group import Group
-from zarr_vectors.exceptions import StoreError
 from zarr_vectors.core.metadata import (
     LevelMetadata,
     RootMetadata,
@@ -139,9 +143,9 @@ from zarr_vectors.core.metadata import (
     compute_bin_ratio,
     compute_bin_shape,
     get_level_bin_shape,
+    get_level_chunk_shape,
     level_chunk_scale,
     level_factor,
-    get_level_chunk_shape,
     validate_bin_shape_divides_chunk,
     validate_level_chunk_shape_against_root,
 )
@@ -181,10 +185,12 @@ from zarr_vectors.encoding.fragments import (
     decode_object_manifest_blocks,
     encode_object_manifest_blocks,
 )
+from zarr_vectors.exceptions import StoreError
 from zarr_vectors.multiresolution.registry import (
     register_coarsen_strategy,
     register_selection_strategy,
 )
+
 # Re-layout, alongside the sharding verbs it sits next to.  Retired from
 # ``zarr_vectors.__all__`` (it describes where bytes live, not what the
 # data is), so this is where a tool gets it.  Note it REWRITES the chunk
@@ -239,7 +245,6 @@ from zarr_vectors.types.skeletons import (
     write_skeleton_chunk,
     write_skeleton_cross_chunk_links,
 )
-
 
 #: The subset of :class:`Group`'s methods this module promises.
 #:
@@ -309,6 +314,42 @@ def refresh_arrays_present(level_group: Group) -> list[str]:
     ordered = sorted(families)
     update_level_metadata(level_group, arrays_present=ordered)
     return ordered
+
+
+def stamp_ome_node(
+    store: str | Path | Group,
+    *,
+    name: str | None = None,
+) -> dict[str, Any]:
+    """Add (or refresh) the RFC 8 ``ome`` node on an existing store.
+
+    What makes a store nameable by an OME *collection*: a resolver
+    following ``{"type": "zarr", "path": "./x.zarrvectors"}`` fetches the
+    root ``zarr.json`` and looks for a legal node under ``ome``.  Stores
+    written before 0.9.2 carry none, and stores written since carry one
+    already -- calling this on either leaves a correct block, so it is
+    safe to run over a whole directory of stores.
+
+    Metadata-only, and the one upgrade in this format's history that can
+    be applied in place.  Every prior version bump moved bytes, so the
+    migration story was "rewrite from source"; this one only adds a root
+    attribute, so a store is brought up to date without its data being
+    read, let alone rewritten.
+
+    Args:
+        store: Store path, URL, or an open root group.  A path or URL is
+            opened ``mode="r+"``.
+        name: Store name for the node.  ``None`` keeps the name already
+            recorded, and otherwise derives one from the store URL.
+
+    Returns:
+        The ``ome`` block as written.
+    """
+    from zarr_vectors.core.group import Group as _Group
+    from zarr_vectors.core.ome import refresh_root_node
+
+    root = store if isinstance(store, _Group) else open_store(store, mode="r+")
+    return refresh_root_node(root, name=name)
 
 
 def array_is_sharded(level_group: Group, array_name: str) -> bool:
@@ -475,6 +516,45 @@ def per_chunk_array_paths(level_group: Group) -> list[str]:
     return sorted(names)
 
 
+def build_fragment_owner_index(store_path, *, level: int | None = None) -> int:
+    """Record which object owns each fragment, as a readable column.
+
+    Writes ``fragment_attributes/object_id``, the slot the format
+    already reserves for it.  With the column in place "which objects
+    reference this fragment" is one cell read; without it, the only way
+    to answer is to decode every manifest in the level, which is what
+    an edit session does on its first lookup and what four other places
+    in this package each reinvent.
+
+    Offered as a maintenance verb rather than run by the writers,
+    because building it costs a full manifest scan and every consumer
+    falls back cleanly when it is absent.  Re-running it is safe; it
+    rewrites whatever it finds.
+
+    Args:
+        store_path: Store path, URL or open group.
+        level: Only this resolution level.  ``None`` does every level.
+
+    Returns:
+        How many fragments were recorded.
+    """
+    from zarr_vectors.core.arrays import write_fragment_owner_column
+    from zarr_vectors.core.store import (
+        get_resolution_level,
+        list_resolution_levels,
+        open_store,
+    )
+
+    root = open_store(store_path, mode="r+")
+    levels = (
+        list_resolution_levels(root) if level is None else [int(level)]
+    )
+    total = 0
+    for lvl in levels:
+        total += write_fragment_owner_column(get_resolution_level(root, lvl))
+    return total
+
+
 def rebuild_presence(
     level_group: Group,
     array_name: str | None = None,
@@ -603,6 +683,7 @@ __all__ = [
     "link_attributes_group_path",
     "link_attributes_path",
     "link_endpoint_scales",
+    "link_endpoints_to_rows",
     "link_family_policy",
     "links_group_path",
     "links_has_perm",
@@ -633,6 +714,7 @@ __all__ = [
     "read_group_object_ids",
     "read_groupings_attributes",
     "read_level_metadata",
+    "read_link_arrays",
     "read_link_attributes",
     "read_links",
     "read_links_for_tuple",
@@ -644,10 +726,12 @@ __all__ = [
     "read_root_metadata",
     "read_skeleton_by_segment_id",
     "read_vertex_fragment_index",
+    "build_fragment_owner_index",
     "rebuild_presence",
     "rechunk",
     "rechunk_by_attribute",
     "refresh_arrays_present",
+    "stamp_ome_node",
     "register_coarsen_strategy",
     "register_selection_strategy",
     "remove_resolution_level",

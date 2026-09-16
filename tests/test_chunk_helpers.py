@@ -95,3 +95,39 @@ def test_offsets_empty_store_safe(tmp_path):
     _, keys, total = chunk_local_to_global_offsets(lvl)
     assert total == 5
     assert len(keys) == 1
+
+
+def test_offsets_are_right_on_a_2d_store(tmp_path):
+    """The row width is the store's, not an assumed three.
+
+    ``chunk_local_to_global_offsets`` divides each blob's byte length by
+    ``ndim * itemsize`` to get its row count, and ``ndim`` used to be
+    hardcoded to 3.  On a 2D store that divides by 12 where it should
+    divide by 8, so every count -- and so every offset, and so every
+    global vertex index derived from one -- came out two thirds of the
+    truth.  Nothing raised; the numbers were simply wrong.
+    """
+    store = tmp_path / "flat.zv"
+    positions = np.array(
+        [[1.0, 1.0], [2.0, 2.0], [3.0, 3.0], [11.0, 11.0], [12.0, 12.0]],
+        dtype=np.float32,
+    )
+    write_points(store, positions, chunk_shape=(10.0, 10.0))
+
+    level = get_resolution_level(open_store(store), 0)
+    offsets, chunk_keys, total = chunk_local_to_global_offsets(level)
+
+    assert total == len(positions)
+    # Offsets partition [0, total) in chunk order, with no gaps.
+    assert sorted(offsets.values()) == [0, 3]
+    assert offsets[chunk_keys[0]] == 0
+
+
+def test_offsets_accept_an_explicit_row_width(tmp_path):
+    store = tmp_path / "explicit.zv"
+    positions = np.array([[1.0, 1.0], [2.0, 2.0]], dtype=np.float32)
+    write_points(store, positions, chunk_shape=(10.0, 10.0))
+
+    level = get_resolution_level(open_store(store), 0)
+    _offsets, _keys, total = chunk_local_to_global_offsets(level, 2)
+    assert total == 2

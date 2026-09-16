@@ -264,6 +264,7 @@ classes:
       - reduction_factor
       - base_bin_shape
       - format_capabilities
+      - attribute_specs
 
   LevelMetadata:
     description: >
@@ -573,6 +574,20 @@ slots:
     description: Optional 0.3+ feature tokens advertised by this store.
     range: FormatCapability
     multivalued: true
+  attribute_specs:
+    description: >
+      What the store declares its attributes to be, keyed by scope
+      (``vertex`` / ``object`` / ``link``) and then by attribute name.
+      Each entry carries ``dtype`` and optionally ``channels``,
+      ``categorical``, ``unit`` and ``description``.  Optional and
+      backward-compatible from 0.9.1: absent means undeclared, which is
+      every store written before it.  A declaration is not a promise the
+      array exists -- the array appears when data is written -- but it is
+      what lets a Schema round-trip and what ``open_or_create`` compares
+      against.  ``unit`` and ``description`` are additionally stamped on
+      the attribute array's own metadata block.
+    range: string
+    inlined: true
 
   # -- LevelMetadata -----------------------------------------------------
 

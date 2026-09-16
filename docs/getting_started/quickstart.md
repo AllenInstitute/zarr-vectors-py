@@ -96,7 +96,7 @@ print(ds.level(0).scale, ds.level(0).resolution)
 ```text
 Dataset('file:///.../scan.zarrvectors', point_cloud, levels=[0])
 (array([0., 0., 0.]), array([1000., 1000., 1000.]))
-('point_cloud',) 3 (0, 9, 0)
+('point_cloud',) 3 (0, 9, 1)
 (200.0, 200.0, 200.0) (50.0, 50.0, 50.0)
 ```
 
@@ -129,8 +129,8 @@ print(grid.shape, grid.cell_shape)
 ```
 
 ```text
-Grid(5x5x5 cells of (200.0, 200.0, 200.0))
-(5, 5, 5) (200.0, 200.0, 200.0)
+Grid(6x6x6 cells of (200.0, 200.0, 200.0))
+(6, 6, 6) (200.0, 200.0, 200.0)
 ```
 
 Storage geometry is no longer accepted anywhere on this surface:
@@ -692,10 +692,9 @@ Level 5 validation: PASS
 (That warning appears because `build_pyramid` wrote a links array into the
 point-cloud store; a freshly written point cloud has none.)
 
-Use the module function rather than `Dataset.validate()`: the method hands the
-dataset's `file://` URL to a path-based validator and reports `FAIL` on a
-perfectly good local store. Note also that `zarr_vectors.validate` is one of
-the `undecided` modules above. See
+`Dataset.validate(level=...)` is the same check reached from an open dataset —
+it passes its own handle, so it works on any backend. Note that
+`zarr_vectors.validate` is one of the `undecided` modules above. See
 [Validation](../tutorials/io/validation_and_repair.md) for what each level
 checks.
 
@@ -715,7 +714,7 @@ print(sorted(ds.capabilities), ds.supports("nonempty_chunks"))
 
 ```text
 (1, 0)
-(0, 9, 0)
+(0, 9, 1)
 ['multiscale_links', 'shared_fragments'] False
 ```
 
@@ -729,7 +728,7 @@ version numbers by hand:
 ```pycon
 >>> zv.require_format(ds, ">=0.9")     # returns None
 >>> zv.require_format(ds, ">=1.0")
-FormatError: file:///.../scan.zarrvectors is on-disk format 0.9.0, which does not satisfy '>=1.0'. There is no backward-compatible reader: an older store must be rewritten from source, and a newer one needs a newer zarr-vectors.
+FormatError: file:///.../scan.zarrvectors is on-disk format 0.9.1, which does not satisfy '>=1.0'. There is no backward-compatible reader: an older store must be rewritten from source, and a newer one needs a newer zarr-vectors.
 >>> zv.require_api(">=1.0", features=["surfaces", "query-cells"])   # returns None
 >>> zv.require_api(features=["streaming-reads"])
 ImportError: zarr-vectors 1.0 does not provide: streaming-reads. Known features: coarsen-strategy-options, presence-rebuild, query-cells, selection-level-optional, sharded-presence-guard, surfaces, vertex-attributes-on-read.

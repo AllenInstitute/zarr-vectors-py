@@ -153,5 +153,5 @@ When adding a new spec page:
 
 For questions about whether a change requires an RFC, or to discuss a
 potential contribution before writing a full RFC, open a
-[GitHub Discussion](https://github.com/BRIDGE-Neuroscience/zarr-vectors-py/discussions)
+[GitHub Discussion](https://github.com/AllenInstitute/zarr-vectors-py/discussions)
 in the "Ideas" or "Q&A" category.

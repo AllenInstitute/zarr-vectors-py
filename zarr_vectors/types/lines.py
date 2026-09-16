@@ -19,26 +19,31 @@ import numpy as np
 import numpy.typing as npt
 
 from zarr_vectors.constants import (
-    RESOLUTION_PREFIX,
     CROSS_CHUNK_EXPLICIT,
+    DEFAULT_OOB_POLICY,
     GEOM_LINE,
     LINKS_IMPLICIT_SEQUENTIAL,
+    OBJECT_INDEX,
     OBJIDX_STANDARD,
+    RESOLUTION_PREFIX,
+    VERTEX_ATTRIBUTES,
     VERTEX_FRAGMENTS,
     VERTICES,
 )
-from zarr_vectors.constants import OBJECT_INDEX
 from zarr_vectors.core.arrays import (
-    stamp_fragments_tile,
+    _chunk_key,
+    _reshape_vertex_buffer,
+    attribute_buffer,
+    attribute_layout,
     create_attribute_array,
     create_object_attributes_array,
     create_object_index_array,
     create_vertices_array,
+    fragment_rows,
     list_chunk_keys,
-    read_all_object_manifests,
-    read_chunk_vertices,
-    read_object_attributes,
-    read_fragment,
+    read_object_manifests,
+    read_vertex_fragment_index,
+    stamp_fragments_tile,
     write_chunk_attributes,
     write_chunk_vertices,
     write_links,
@@ -49,8 +54,7 @@ from zarr_vectors.core.attr_chunking import (
     assign_attribute_bins,
     compute_chunk_dim_names,
 )
-from zarr_vectors.constants import DEFAULT_OOB_POLICY
-from zarr_vectors.core.metadata import LevelMetadata, RootMetadata
+from zarr_vectors.core.metadata import LevelMetadata
 from zarr_vectors.core.store import (
     FsGroup,
     _apply_out_of_bounds_policy,
@@ -58,35 +62,29 @@ from zarr_vectors.core.store import (
     _ensure_root_metadata_for_write,
     _finalize_write,
     create_resolution_level,
-    create_store,
     get_resolution_level,
     open_store,
     read_level_metadata,
     read_root_metadata,
 )
-from zarr_vectors.exceptions import ArrayError
+from zarr_vectors.exceptions import ArrayError, StoreError
 from zarr_vectors.spatial.chunking import (
-    assign_chunks,
     compute_bounds,
-    compute_chunk_coords,
-    bin_to_chunk,
 )
 from zarr_vectors.typing import (
     BinShape,
     BoundingBox,
     ChunkCoords,
     ChunkShape,
-    CrossChunkLink,
     ObjectManifest,
-    FragmentRef,
 )
 
 if TYPE_CHECKING:
-    from zarr_vectors.core.store import ReadSource
+    from zarr_vectors.core.store import ReadSource, WriteTarget
 
 
 def write_lines(
-    store_path: str,
+    store_path: WriteTarget,
     endpoints: npt.NDArray[np.floating],
     *,
     chunk_shape: ChunkShape,
@@ -200,10 +198,28 @@ def write_lines(
             )
         line_attr_bins, attr_bin_values = assign_attribute_bins(src_values)
 
-    effective_bin = bin_shape if bin_shape is not None else chunk_shape
-    bins_per_chunk = tuple(
-        int(round(cs / bs)) for cs, bs in zip(chunk_shape, effective_bin)
-    )
+    # Per-endpoint attributes are ``(N, 2)`` or ``(N, 2, C)`` -- two
+    # values per line, one per endpoint -- and follow their endpoint into
+    # whichever fragment it lands in.  Validated here, before anything is
+    # created on disk, so a wrong shape is not reported after a store
+    # exists.  These used to be accepted and then silently dropped: the
+    # writer imported ``create_attribute_array`` and
+    # ``write_chunk_attributes`` and called neither.
+    vertex_attr_arrays: dict[str, npt.NDArray] = {}
+    if attributes:
+        for _name, _data in attributes.items():
+            _arr = np.asarray(_data)
+            if _arr.ndim < 2 or _arr.shape[:2] != (n_lines, 2):
+                raise ArrayError(
+                    f"vertex_attributes[{_name!r}] must be (N, 2) or "
+                    f"(N, 2, C) with N=n_lines={n_lines} -- one value per "
+                    f"endpoint; got shape {_arr.shape}"
+                )
+            vertex_attr_arrays[_name] = _arr
+
+    # No bins_per_chunk here: write_lines splits at chunk boundaries
+    # only.  ``bin_shape`` still reaches the store as base_bin_shape,
+    # for readers and for later coarsening.
 
     all_pts = endpoints.reshape(-1, ndim)
     if bounds is None:
@@ -212,6 +228,15 @@ def write_lines(
     else:
         bounds_list = (list(bounds[0]), list(bounds[1]))
 
+    # Checked before anything is created.  It used to be rejected after
+    # ``_create_or_open_store``, which left an empty store on disk for a
+    # call that was never going to succeed.
+    if out_of_bounds == "ignore":
+        raise ArrayError(
+            "out_of_bounds='ignore' is not supported for write_lines: "
+            "endpoint pairing depends on full line presence. Use 'raise' "
+            "(default) or 'expand'."
+        )
     root = _create_or_open_store(
         store_path,
         backend=backend,
@@ -219,12 +244,6 @@ def write_lines(
         chunk_shape=tuple(chunk_shape),
         ndim=ndim,
     )
-    if out_of_bounds == "ignore":
-        raise ArrayError(
-            "out_of_bounds='ignore' is not supported for write_lines: "
-            "endpoint pairing depends on full line presence. Use 'raise' "
-            "(default) or 'expand'."
-        )
     _apply_out_of_bounds_policy(root, all_pts, policy=out_of_bounds)
 
     root_meta = _ensure_root_metadata_for_write(
@@ -239,6 +258,8 @@ def write_lines(
     axes = root_meta.spatial_index_dims
 
     arrays_present = [VERTICES, "object_index"]
+    if vertex_attr_arrays:
+        arrays_present.append(VERTEX_ATTRIBUTES)
     level_chunk_dims: list[str] | None = None
     if chunk_by_attribute is not None:
         level_chunk_dims = compute_chunk_dim_names(
@@ -275,9 +296,20 @@ def write_lines(
     cb_tuples = [tuple(row) for row in chunk_b_ints.tolist()]
     same_chunk = np.all(chunk_a_ints == chunk_b_ints, axis=1).tolist()
 
-    chunk_groups: dict[ChunkCoords, list[tuple[int, npt.NDArray]]] = {}
+    # ``(line_index, vertices, endpoint_indices)`` -- the third element
+    # says which of the line's two endpoints this fragment holds, so the
+    # attribute rows can follow the same split as the vertices.
+    chunk_groups: dict[
+        ChunkCoords, list[tuple[int, npt.NDArray, tuple[int, ...]]]
+    ] = {}
     object_manifests: dict[int, ObjectManifest] = {}
-    cross_links: list[CrossChunkLink] = []
+    # The boundary-crossing records, as the arrays ``write_links`` takes
+    # directly: one row per split line, its two endpoint chunks and their
+    # chunk-local vertex indices.
+    cross_a_chunk: list[ChunkCoords] = []
+    cross_b_chunk: list[ChunkCoords] = []
+    cross_a_vi: list[int] = []
+    cross_b_vi: list[int] = []
 
     # One Python pass over lines is unavoidable to preserve line-id-
     # ordered fragment_idx assignment, but each iteration is now just
@@ -287,17 +319,17 @@ def write_lines(
         if same_chunk[i]:
             bucket = chunk_groups.setdefault(ca, [])
             fragment_idx = len(bucket)
-            bucket.append((i, endpoints[i]))  # (N=2, D)
+            bucket.append((i, endpoints[i], (0, 1)))  # (N=2, D)
             object_manifests[i] = [(ca, fragment_idx)]
         else:
             cb = cb_tuples[i]
             bucket_a = chunk_groups.setdefault(ca, [])
             fragment_idx_a = len(bucket_a)
-            bucket_a.append((i, endpoints[i, 0:1]))  # (1, D)
+            bucket_a.append((i, endpoints[i, 0:1], (0,)))  # (1, D)
 
             bucket_b = chunk_groups.setdefault(cb, [])
             fragment_idx_b = len(bucket_b)
-            bucket_b.append((i, endpoints[i, 1:2]))  # (1, D)
+            bucket_b.append((i, endpoints[i, 1:2], (1,)))  # (1, D)
 
             object_manifests[i] = [(ca, fragment_idx_a), (cb, fragment_idx_b)]
             # Link endpoints are chunk-local vertex indices, not
@@ -307,7 +339,11 @@ def write_lines(
             # fragment's only vertex sits at chunk-local index k.
             # Hardcoding 0 here made every line in a chunk link to that
             # chunk's *first* vertex.
-            cross_links.append(((ca, fragment_idx_a), (cb, fragment_idx_b)))
+            cross_a_chunk.append(ca)
+            cross_b_chunk.append(cb)
+            cross_a_vi.append(fragment_idx_a)
+            cross_b_vi.append(fragment_idx_b)
+    cross_links = cross_a_vi
 
     idx_ndim = ndim + 1 if line_attr_bins is not None else ndim
     # Collapse all per-array zarr.json PUTs + per-chunk byte writes into
@@ -334,18 +370,51 @@ def write_lines(
         if line_attributes:
             for name in line_attributes:
                 create_object_attributes_array(level_group, name)
+        for name, arr in vertex_attr_arrays.items():
+            create_attribute_array(
+                level_group, name, dtype=str(arr.dtype),
+                channel_names=(
+                    [f"ch{c}" for c in range(arr.shape[2])]
+                    if arr.ndim == 3 else None
+                ),
+            )
 
         for chunk_coords, groups_list in sorted(chunk_groups.items()):
             vert_arrays = [g[1] for g in groups_list]
             write_chunk_vertices(
                 level_group, chunk_coords, vert_arrays, dtype=np_dtype,
             )
+            # Attribute rows follow their endpoints: a line split at a
+            # chunk boundary contributes one row to each side, in the same
+            # fragment order as the vertices written just above.
+            for name, arr in vertex_attr_arrays.items():
+                write_chunk_attributes(
+                    level_group, name, chunk_coords,
+                    [arr[i][list(eps)] for i, _verts, eps in groups_list],
+                    dtype=arr.dtype,
+                )
 
         write_object_index(level_group, object_manifests, sid_ndim=idx_ndim)
 
         if cross_links:
             write_links(
-                level_group, cross_links, idx_ndim, delta=0, link_width=2,
+                level_group, [], idx_ndim, delta=0, link_width=2,
+                _arrays=(
+                    np.stack(
+                        [
+                            np.asarray(cross_a_chunk, dtype=np.int64),
+                            np.asarray(cross_b_chunk, dtype=np.int64),
+                        ],
+                        axis=1,
+                    ),
+                    np.stack(
+                        [
+                            np.asarray(cross_a_vi, dtype=np.int64),
+                            np.asarray(cross_b_vi, dtype=np.int64),
+                        ],
+                        axis=1,
+                    ),
+                ),
             )
 
         if line_attributes:
@@ -403,6 +472,10 @@ def read_lines(
             f"{prefix}/{VERTICES}",
             f"{prefix}/{VERTEX_FRAGMENTS}",
             f"{prefix}/{OBJECT_INDEX}",
+            # Probed even on a store that has none: a speculative miss
+            # caches as absent, which is the answer the reader wants, and
+            # leaving it out meant a warm block still paid one lookup.
+            f"{prefix}/{VERTEX_ATTRIBUTES}",
         ])
         return _read_lines(
             root,
@@ -438,6 +511,27 @@ def _read_lines(
     except Exception:
         pass
 
+    # Per-endpoint attributes, if the store carries any.  Read here,
+    # alongside the vertices, because they have to follow the SAME
+    # per-object assembly the endpoints below do -- the facade's
+    # level-ordered gather cannot be aligned to it, and for a multi-chunk
+    # store would silently pair each value with the wrong endpoint.
+    attr_layouts: dict[str, tuple[np.dtype, int]] = {}
+    try:
+        _attr_names = sorted(level_group[VERTEX_ATTRIBUTES].children())
+    except Exception:
+        _attr_names = []
+    if _attr_names:
+        # One gather for the whole family rather than a lookup per name.
+        level_group.prime_nodes(
+            [f"{VERTEX_ATTRIBUTES}/{_n}" for _n in _attr_names],
+        )
+    for _name in _attr_names:
+        try:
+            attr_layouts[_name] = attribute_layout(level_group, _name)
+        except Exception:
+            continue
+
     # Resolve attribute_filter → leading-bin index (per-object lines:
     # all of an object's chunks share the same leading coord).
     filter_bin: int | None = None
@@ -469,6 +563,7 @@ def _read_lines(
         except ValueError:
             return {
                 "endpoints": np.zeros((0, 2, ndim), dtype=dtype),
+                "vertex_attributes": {},
                 "line_count": 0,
             }
 
@@ -481,14 +576,18 @@ def _read_lines(
     # entries don't start with the matching bin.
     if filter_bin is not None:
         try:
-            manifests = read_all_object_manifests(level_group)
+            pruning = read_object_manifests(
+                level_group, ids=[int(o) for o in object_ids],
+            )
         except Exception:
-            manifests = []
+            pruning = {}
         kept: list[int] = []
         for oid in object_ids:
-            if oid < len(manifests) and manifests[oid]:
-                if all(cc and cc[0] == filter_bin for cc, _ in manifests[oid]):
-                    kept.append(oid)
+            manifest = pruning.get(int(oid))
+            if manifest and all(
+                cc and cc[0] == filter_bin for cc, _ in manifest
+            ):
+                kept.append(oid)
         object_ids = kept
 
     # Chunk-major read: decode each chunk's fragments *once*, then
@@ -508,62 +607,184 @@ def _read_lines(
         (VERTICES, _chunk_key_strs),
         (VERTEX_FRAGMENTS, _chunk_key_strs),
         (OBJECT_INDEX, ["data", "offsets"]),
+        *(
+            (f"{VERTEX_ATTRIBUTES}/{_n}", _chunk_key_strs)
+            for _n in attr_layouts
+        ),
     ]
     _batched_reads_cm = level_group.batched_reads(_prefetch_plan)
     _batched_reads_cm.__enter__()
     try:
-        manifests = read_all_object_manifests(level_group)
+        # The manifests of the objects asked for, not of every object in
+        # the level. A caller naming a hundred lines in a store holding a
+        # million should not decode a million manifests to find them;
+        # when the caller names them all, this is the same work as before.
+        manifest_by_oid = read_object_manifests(
+            level_group, ids=[int(o) for o in object_ids],
+        )
 
-        # Build a per-chunk dispatch table: chunk → list of
-        # (oid_local_idx, manifest_position, fragment_index).  ``oid_local_idx``
-        # indexes into the per-object output list, not the global oid
-        # (which can be sparse).
-        oid_outputs: list[list[npt.NDArray | None]] = []
-        oid_for_output: list[int] = []
-        chunk_dispatch: dict[ChunkCoords, list[tuple[int, int, int]]] = {}
+        # Build a per-chunk dispatch table: chunk → (slot, manifest_position,
+        # fragment_index) triples.  ``slot`` indexes the per-line output,
+        # not the global oid (which can be sparse).
+        #
+        # A line is its first and last vertex, so what each fragment
+        # contributes is at most two rows: the first row of a line's
+        # first fragment and the last row of its last.  The dispatch
+        # records which, and the per-chunk pass below gathers exactly
+        # those rows with array indexing.  Assembling every line's
+        # fragments and reducing each to two rows in Python cost 6 s of a
+        # 27 s read of a quarter-million lines.
+        slot_oids: list[int] = []
+        slot_lengths: list[int] = []
+        disp_chunk: list[ChunkCoords] = []
+        disp_slot: list[int] = []
+        disp_pos: list[int] = []
+        disp_frag: list[int] = []
         for oid in object_ids:
-            if oid < 0 or oid >= len(manifests):
-                continue
-            manifest = manifests[oid]
+            # Absent covers negative, out-of-range and no-such-object --
+            # the cases the index bounds check used to catch.
+            manifest = manifest_by_oid.get(int(oid))
             if not manifest:
                 continue
-            slot = len(oid_outputs)
-            oid_outputs.append([None] * len(manifest))
-            oid_for_output.append(oid)
+            slot = len(slot_oids)
+            slot_oids.append(oid)
+            slot_lengths.append(len(manifest))
             for mi, (cc, fragment_index) in enumerate(manifest):
-                chunk_dispatch.setdefault(cc, []).append((slot, mi, fragment_index))
+                disp_chunk.append(cc)
+                disp_slot.append(slot)
+                disp_pos.append(mi)
+                disp_frag.append(int(fragment_index))
 
-        # One read_chunk_vertices per chunk; copy slices into output slots.
-        for cc, entries in chunk_dispatch.items():
+        n_slots = len(slot_oids)
+        lengths = np.asarray(slot_lengths, dtype=np.int64)
+        d_slot = np.asarray(disp_slot, dtype=np.int64)
+        d_pos = np.asarray(disp_pos, dtype=np.int64)
+        d_frag = np.asarray(disp_frag, dtype=np.int64)
+        d_is_first = d_pos == 0
+        d_is_last = d_pos == (lengths[d_slot] - 1 if n_slots else d_pos)
+
+        # Per line: its first row, its last row, how many rows it holds,
+        # and how many of its fragments were served -- a line is emitted
+        # only when every fragment was, with at least two rows between
+        # them, exactly as before.
+        first_rows = np.zeros((n_slots, ndim), dtype=dtype)
+        last_rows = np.zeros((n_slots, ndim), dtype=dtype)
+        row_counts = np.zeros(n_slots, dtype=np.int64)
+        served = np.zeros(n_slots, dtype=np.int64)
+        attr_first: dict[str, npt.NDArray] = {}
+        attr_last: dict[str, npt.NDArray] = {}
+        attr_served: dict[str, npt.NDArray] = {}
+        attr_rows: dict[str, npt.NDArray] = {}
+        for _name, (_adt, _ancols) in attr_layouts.items():
+            shape = (n_slots,) if _ancols == 1 else (n_slots, _ancols)
+            attr_first[_name] = np.zeros(shape, dtype=_adt)
+            attr_last[_name] = np.zeros(shape, dtype=_adt)
+            attr_served[_name] = np.zeros(n_slots, dtype=np.int64)
+            attr_rows[_name] = np.zeros(n_slots, dtype=np.int64)
+
+        # Group the dispatch by chunk, once.
+        by_chunk: dict[ChunkCoords, list[int]] = {}
+        for i, cc in enumerate(disp_chunk):
+            by_chunk.setdefault(cc, []).append(i)
+
+        def _gather_ends(
+            full: npt.NDArray, fi, entries: npt.NDArray,
+            firsts: npt.NDArray, lasts: npt.NDArray,
+            counts: npt.NDArray, hits: npt.NDArray,
+        ) -> None:
+            """Scatter fragment ends of ``entries`` (dispatch rows) into the
+            per-line tables, for one chunk's buffer ``full``."""
+            frags = d_frag[entries]
+            valid = (frags >= 0) & (frags < fi.num_fragments)
+            entries = entries[valid]
+            frags = frags[valid]
+            if entries.size == 0:
+                return
+            table = fi.ranges()
+            if table is not None:
+                starts = table[frags, 0]
+                lens = table[frags, 1]
+                ends = starts + lens - 1
+                nonempty = lens > 0
+                slots = d_slot[entries]
+                counts += np.bincount(
+                    slots, weights=lens, minlength=n_slots,
+                ).astype(np.int64)
+                hits += np.bincount(slots, minlength=n_slots)
+                pick = nonempty & d_is_first[entries]
+                firsts[slots[pick]] = full[starts[pick]]
+                pick = nonempty & d_is_last[entries]
+                lasts[slots[pick]] = full[ends[pick]]
+                return
+            # Explicit fragments: gather row by row through the index.
+            for e, f in zip(entries.tolist(), frags.tolist()):
+                rows = fragment_rows(full, fi, f)
+                slot = int(d_slot[e])
+                counts[slot] += len(rows)
+                hits[slot] += 1
+                if len(rows) == 0:
+                    continue
+                if d_is_first[e]:
+                    firsts[slot] = rows[0]
+                if d_is_last[e]:
+                    lasts[slot] = rows[-1]
+
+        for cc, entry_list in by_chunk.items():
+            entries = np.asarray(entry_list, dtype=np.int64)
+            key = _chunk_key(cc)
             try:
-                groups = read_chunk_vertices(
-                    level_group, cc, dtype=dtype, ndim=ndim,
+                raw = level_group.read_bytes(VERTICES, key)
+                fi = read_vertex_fragment_index(level_group, cc)
+            except (ArrayError, StoreError):
+                continue
+            full = _reshape_vertex_buffer(raw, dtype, ndim)
+            _gather_ends(full, fi, entries, first_rows, last_rows, row_counts, served)
+            for _name, (_adt, _ancols) in attr_layouts.items():
+                try:
+                    buf = attribute_buffer(
+                        level_group.read_bytes(f"{VERTEX_ATTRIBUTES}/{_name}", key),
+                        fi, _adt, what=f"Attribute '{_name}' chunk {key}",
+                    )
+                except (ArrayError, StoreError):
+                    continue
+                # One row per vertex, ``ncols`` values each; a cell of any
+                # other width cannot be aligned and is skipped, which
+                # drops the column below rather than misaligning it.
+                if buf is None or buf.shape[0] != full.shape[0] or buf.shape[1] != _ancols:
+                    continue
+                _gather_ends(
+                    buf[:, 0] if _ancols == 1 else buf, fi, entries,
+                    attr_first[_name], attr_last[_name],
+                    attr_rows[_name], attr_served[_name],
                 )
-            except ArrayError:
-                continue
-            for slot, mi, fragment_index in entries:
-                if 0 <= fragment_index < len(groups):
-                    oid_outputs[slot][mi] = groups[fragment_index]
 
-        result_endpoints: list[npt.NDArray] = []
-        for slot_groups in oid_outputs:
-            if any(g is None for g in slot_groups):
-                continue
-            all_verts = np.concatenate(slot_groups, axis=0)
-            if len(all_verts) < 2:
-                continue
-            ep = np.stack([all_verts[0], all_verts[-1]], axis=0)
-            result_endpoints.append(ep)
+        emitted = (served == lengths) & (row_counts >= 2)
+        endpoints_out = np.stack(
+            [first_rows[emitted], last_rows[emitted]], axis=1,
+        )  # (M, 2, D)
+        # Per attribute, the ``(2M, ...)`` column in endpoint order: row
+        # 2k is endpoint 0 of line k and row 2k+1 endpoint 1, the order
+        # ``endpoints`` flattens in.  Kept only when every emitted line
+        # contributed a complete pair, matching the endpoints' own rule.
+        attr_columns: dict[str, npt.NDArray] = {}
+        for _name in attr_layouts:
+            ok = (attr_served[_name][emitted] == lengths[emitted]) & (
+                attr_rows[_name][emitted] >= 2
+            )
+            if emitted.any() and bool(ok.all()):
+                pair = np.stack(
+                    [attr_first[_name][emitted], attr_last[_name][emitted]], axis=1,
+                )
+                attr_columns[_name] = pair.reshape(-1, *pair.shape[2:])
     finally:
         _batched_reads_cm.__exit__(None, None, None)
 
-    if not result_endpoints:
+    if endpoints_out.shape[0] == 0:
         return {
             "endpoints": np.zeros((0, 2, ndim), dtype=dtype),
+            "vertex_attributes": {},
             "line_count": 0,
         }
-
-    endpoints_out = np.stack(result_endpoints, axis=0)  # (M, 2, D)
 
     # Apply bbox filter
     if bbox is not None:
@@ -579,8 +800,18 @@ def _read_lines(
         )
         mask = in_a | in_b
         endpoints_out = endpoints_out[mask]
+        # Two attribute rows per line, so the per-line mask repeats.
+        keep_mask = np.repeat(mask, 2)
+
+    # An attribute is returned only when every emitted line contributed a
+    # row.  A short column cannot be aligned to ``endpoints``, and a
+    # silently misaligned one is worse than an absent one.
+    attrs_out: dict[str, npt.NDArray] = {}
+    for _name, _col in attr_columns.items():
+        attrs_out[_name] = _col[keep_mask] if bbox is not None else _col
 
     return {
         "endpoints": endpoints_out,
+        "vertex_attributes": attrs_out,
         "line_count": len(endpoints_out),
     }

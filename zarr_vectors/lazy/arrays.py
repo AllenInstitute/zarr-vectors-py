@@ -13,12 +13,9 @@ import numpy as np
 import numpy.typing as npt
 
 from zarr_vectors.core.arrays import (
-    list_chunk_keys,
     read_all_object_manifests,
     read_chunk_attributes,
     read_chunk_vertices,
-    read_object_vertices,
-    read_fragment,
 )
 from zarr_vectors.core.store import FsGroup
 from zarr_vectors.typing import ChunkCoords
@@ -236,6 +233,16 @@ class ZVObjectIndex:
         self._group = level_group
         self._manifests: list | None = None
 
+    def _row_of(self, object_id: int) -> int | None:
+        """Row holding ``object_id``, or ``None`` if the level lacks it."""
+        from zarr_vectors.core.arrays import object_rows_for_ids
+
+        try:
+            found, rows = object_rows_for_ids(self._group, [int(object_id)])
+        except Exception:
+            return None
+        return int(rows[0]) if found.size else None
+
     def _ensure_loaded(self) -> list:
         if self._manifests is None:
             try:
@@ -261,9 +268,13 @@ class ZVObjectIndex:
             List of ``(chunk_coords, fragment_index)`` tuples.
         """
         manifests = self._ensure_loaded()
-        if object_id < 0 or object_id >= len(manifests):
-            raise IndexError(f"Object ID {object_id} out of range [0, {len(manifests)})")
-        return manifests[object_id]
+        row = self._row_of(object_id)
+        if row is None:
+            raise IndexError(
+                f"Object ID {object_id} is not in this level "
+                f"({len(manifests)} object(s))"
+            )
+        return manifests[row]
 
     def __len__(self) -> int:
         return self.object_count

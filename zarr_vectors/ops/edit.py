@@ -22,7 +22,8 @@ objects, refresh policy) are documented in the approved plan at
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Any, Iterable, Literal
+from collections.abc import Iterable
+from typing import TYPE_CHECKING, Any, Literal
 
 import numpy as np
 import numpy.typing as npt
@@ -121,7 +122,13 @@ class EditSession:
         # Per-level pending manifest ops, keyed by (level, oid).
         self._manifest_ops: dict[tuple[int, int], ManifestOp] = {}
         # Per-level manifest cache (lazy, populated on first lookup).
-        self._all_manifests: dict[int, list[ObjectManifest]] = {}
+        self._all_manifests: dict[
+            int, tuple[npt.NDArray[np.int64], list[ObjectManifest]]
+        ] = {}
+        # object id -> row, per level. Built with the manifests, because
+        # the two are only the same when a level stores its objects
+        # densely from zero.
+        self._id_rows: dict[int, dict[int, int]] = {}
         # Per-level next-available OID (atomic mode appends new OIDs here).
         self._next_oid: dict[int, int] = {}
         # Fragment → OIDs inverted index (lazy, built on first lookup
@@ -710,32 +717,51 @@ class EditSession:
     # Manifest / OID bookkeeping
     # ------------------------------------------------------------------
 
-    def _all_manifests_for(self, level: int) -> list[ObjectManifest]:
+    def _all_manifests_for(
+        self, level: int,
+    ) -> tuple[npt.NDArray[np.int64], list[ObjectManifest]]:
+        """``(ids, manifests)`` for a level, read once per session.
+
+        The ids are returned rather than implied: the manifest list is
+        in row order, and an object id equals its row only while the
+        level numbers its objects densely from zero.
+        """
         if level in self._all_manifests:
             return self._all_manifests[level]
-        from zarr_vectors.core.arrays import read_all_object_manifests
+        from zarr_vectors.core.arrays import read_object_manifest_rows
         from zarr_vectors.core.store import get_resolution_level
         level_group = get_resolution_level(self.root, level)
         try:
-            manifests = read_all_object_manifests(level_group)
+            ids, manifests = read_object_manifest_rows(level_group)
         except Exception:
-            manifests = []
-        self._all_manifests[level] = manifests
-        self._next_oid[level] = len(manifests)
-        return manifests
+            ids, manifests = np.zeros(0, dtype=np.int64), []
+        self._all_manifests[level] = (ids, manifests)
+        # The next free id, not the next free row: allocating at the row
+        # count would collide with any id at or above it.
+        self._next_oid[level] = (
+            int(ids.max()) + 1 if ids.size else 0
+        )
+        self._id_rows[level] = {int(o): r for r, o in enumerate(ids.tolist())}
+        return ids, manifests
+
+    def _row_of(self, level: int, oid: int) -> int | None:
+        """Row holding ``oid`` at ``level``, or ``None`` if absent."""
+        self._all_manifests_for(level)
+        return self._id_rows.get(level, {}).get(int(oid))
 
     def _get_manifest(self, level: int, oid: int) -> ObjectManifest:
         # Honour any pending in-session edit for this OID first.
         pending = self._manifest_ops.get((level, oid))
         if pending is not None and pending.new_manifest is not None:
             return list(pending.new_manifest)
-        manifests = self._all_manifests_for(level)
-        if oid < 0 or oid >= len(manifests):
+        _ids, manifests = self._all_manifests_for(level)
+        row = self._row_of(level, oid)
+        if row is None:
             raise EditError(
-                f"object_id {oid} out of range at level {level} "
-                f"(have {len(manifests)} OIDs)"
+                f"object_id {oid} is not at level {level} "
+                f"(have {len(manifests)} object(s))"
             )
-        return list(manifests[oid])
+        return list(manifests[row])
 
     def _oids_referencing(
         self,
@@ -751,9 +777,38 @@ class EditSession:
         consistent with pending-op state via surgical updates in
         :meth:`_stage_manifest`.
         """
-        index = self._build_fragment_owners(level)
         chunk_t = tuple(int(c) for c in chunk)
+        # Prefer the stored column when nothing in this session has
+        # touched the level's manifests. It answers in one cell read,
+        # where building the index decodes every manifest in the level
+        # -- which is what dominates a one-shot edit on a large store.
+        # Once an op is staged the on-disk answer is stale by
+        # definition, so the in-memory index takes over.
+        if self._fragment_owners is None and not any(
+            lvl == level for lvl, _oid in self._manifest_ops
+        ):
+            stored = self._stored_fragment_owners(level, chunk_t, int(fragment))
+            if stored is not None:
+                return stored
+        index = self._build_fragment_owners(level)
         return list(index.get((level, chunk_t, int(fragment)), ()))
+
+    def _stored_fragment_owners(
+        self, level: int, chunk: ChunkCoords, fragment: int,
+    ) -> list[int] | None:
+        """The owner column's answer, or ``None`` to fall back to a scan.
+
+        ``None`` covers a level with no column and a fragment marked as
+        shared between objects, which one integer cannot name.
+        """
+        from zarr_vectors.core.arrays import read_fragment_owners
+        from zarr_vectors.core.store import get_resolution_level
+
+        try:
+            level_group = get_resolution_level(self.root, level)
+            return read_fragment_owners(level_group, chunk, fragment)
+        except Exception:
+            return None
 
     def _fragment_owners_for(
         self,
@@ -790,8 +845,8 @@ class EditSession:
         if marker in index:
             return index
         index[marker] = []  # sentinel — must not collide with real keys
-        manifests = self._all_manifests_for(level)
-        for oid, manifest in enumerate(manifests):
+        ids, manifests = self._all_manifests_for(level)
+        for oid, manifest in zip(ids.tolist(), manifests):
             for cc, fi in manifest:
                 key = (level, tuple(int(c) for c in cc), int(fi))
                 index.setdefault(key, []).append(oid)
@@ -889,10 +944,9 @@ class EditSession:
             if pending is not None and pending.new_manifest is not None:
                 old_mani = list(pending.new_manifest)
             else:
-                manifests = self._all_manifests_for(level)
-                old_mani = (
-                    list(manifests[oid]) if 0 <= oid < len(manifests) else []
-                )
+                _ids, manifests = self._all_manifests_for(level)
+                row = self._row_of(level, oid)
+                old_mani = [] if row is None else list(manifests[row])
             self._manifest_ops[(level, oid)] = ManifestOp(
                 level=level, object_id=oid,
                 new_manifest=new_mani, new_oid=None,
@@ -956,7 +1010,6 @@ class EditSession:
             return self._report
 
         # 1. Apply dirty chunks via batched_writes for parallelism.
-        from zarr_vectors.core.store import commit, get_resolution_level
         from zarr_vectors.core.arrays import (
             create_links_array,
             finalize_links,
@@ -964,6 +1017,7 @@ class EditSession:
             write_chunk_links,
             write_chunk_vertices,
         )
+        from zarr_vectors.core.store import commit, get_resolution_level
 
         # Link families whose cells this flush rewrote.  Per-cell writes
         # don't maintain the family-wide counts, so each needs one
@@ -1040,7 +1094,7 @@ class EditSession:
     def _flush_manifest_ops(self) -> None:
         if not self._manifest_ops:
             return
-        from zarr_vectors.core.arrays import write_object_index
+        from zarr_vectors.core.arrays import patch_object_manifests
         from zarr_vectors.core.metadata import RootMetadata
         from zarr_vectors.core.store import get_resolution_level
 
@@ -1055,20 +1109,15 @@ class EditSession:
 
         for level, ops in by_level.items():
             level_group = get_resolution_level(self.root, level)
-            # Start from disk state then apply ops.
-            manifests = list(self._all_manifests_for(level))
-            max_oid = len(manifests) - 1
+            # Only the rows this flush actually changed. Rebuilding the
+            # whole index instead made a single-vertex edit cost the
+            # object count: 3.3s and 414 MB on a 400,000-object store,
+            # for one changed row.
+            updates: dict[int, list[tuple[ChunkCoords, int]]] = {}
             for op in ops:
                 oid = op.new_oid if op.new_oid is not None else op.object_id
-                if oid > max_oid:
-                    manifests.extend([] for _ in range(oid - max_oid))
-                    max_oid = oid
-                manifests[oid] = list(op.new_manifest or [])
-            manifest_dict = {i: m for i, m in enumerate(manifests)}
-            write_object_index(
-                level_group, manifest_dict, sid_ndim,
-                total_objects=len(manifests),
-            )
+                updates[int(oid)] = list(op.new_manifest or [])
+            patch_object_manifests(level_group, updates, sid_ndim)
 
     def _refresh_now(self, source_level: int) -> None:
         from zarr_vectors.ops.refresh import rebuild_pyramid_from_level

@@ -15,13 +15,29 @@ convention validation, and parametric type registries.
 
 from __future__ import annotations
 
-import copy
-import json
-from dataclasses import dataclass, field
 from collections.abc import Sequence
+from dataclasses import dataclass, field
 from typing import Any, TypedDict
 
 import numpy as np
+
+from zarr_vectors.constants import (
+    CROSS_CHUNK_EXPLICIT,
+    DEFAULT_CROSS_LEVEL_DEPTH,
+    DEFAULT_CROSS_LEVEL_STORAGE,
+    DEFAULT_REDUCTION_FACTOR,
+    ENCODING_RAW,
+    FORMAT_VERSION,
+    LINKS_IMPLICIT_SEQUENTIAL,
+    OBJIDX_STANDARD,
+    VALID_CROSS_CHUNK_STRATEGIES,
+    VALID_ENCODINGS,
+    VALID_GEOMETRY_TYPES,
+    VALID_LINKS_CONVENTIONS,
+    VALID_OBJIDX_CONVENTIONS,
+    VALID_XLEVEL_STORAGE,
+)
+from zarr_vectors.exceptions import ConventionError, MetadataError
 
 
 class NgffAxis(TypedDict, total=False):
@@ -42,26 +58,6 @@ class NgffAxis(TypedDict, total=False):
     name: str
     type: str
     unit: str
-
-from zarr_vectors.constants import (
-    DEFAULT_COARSENING_METHOD,
-    DEFAULT_CROSS_LEVEL_DEPTH,
-    DEFAULT_CROSS_LEVEL_STORAGE,
-    DEFAULT_REDUCTION_FACTOR,
-    FORMAT_VERSION,
-    LINKS_IMPLICIT_SEQUENTIAL,
-    OBJIDX_STANDARD,
-    CROSS_CHUNK_EXPLICIT,
-    VALID_CROSS_CHUNK_STRATEGIES,
-    VALID_GEOMETRY_TYPES,
-    VALID_LINKS_CONVENTIONS,
-    VALID_OBJIDX_CONVENTIONS,
-    VALID_XLEVEL_STORAGE,
-    VALID_ENCODINGS,
-    ENCODING_RAW,
-)
-from zarr_vectors.exceptions import ConventionError, MetadataError
-
 
 # ===================================================================
 # Axes / CRS helpers (OME-Zarr RFC 4/5)
@@ -282,6 +278,16 @@ class RootMetadata:
     """Optional capability tokens this store uses.  See
     :mod:`zarr_vectors.constants` for the canonical token names
     (``CAP_*``).  Empty list by default."""
+    attribute_specs: dict[str, dict[str, Any]] | None = None
+    """What the store declares its attributes to be, by scope.
+
+    ``{"vertex": {"intensity": {"dtype": "float32", "unit": "microvolt"}},
+    "object": {...}, "link": {...}}``.  Optional and additive (0.9.1):
+    absent means undeclared, which is every store written before it and
+    every store whose writer never said.  A declaration is not a promise
+    that the array exists -- it appears when data is written -- but it is
+    what lets :meth:`zarr_vectors.api.schema.Schema.from_store` round-trip
+    and ``open_or_create`` report a store missing something declared."""
 
     def validate(self) -> None:
         """Validate this metadata object.
@@ -450,6 +456,12 @@ class RootMetadata:
             d["zarr_vectors"]["base_bin_shape"] = list(self.base_bin_shape)
         if self.format_capabilities:
             d["zarr_vectors"]["format_capabilities"] = list(self.format_capabilities)
+        if self.attribute_specs:
+            d["zarr_vectors"]["attribute_specs"] = {
+                scope: {n: dict(spec) for n, spec in named.items()}
+                for scope, named in self.attribute_specs.items()
+                if named
+            }
         return d
 
     @classmethod
@@ -521,6 +533,13 @@ class RootMetadata:
             reduction_factor=zv.get("reduction_factor", DEFAULT_REDUCTION_FACTOR),
             base_bin_shape=tuple(bbs) if bbs else None,
             format_capabilities=list(caps),
+            attribute_specs=(
+                {
+                    scope: {n: dict(spec) for n, spec in named.items()}
+                    for scope, named in specs.items()
+                }
+                if (specs := zv.get("attribute_specs")) else None
+            ),
         )
 
     def is_complete(self) -> bool:
@@ -829,8 +848,8 @@ class LevelMetadata:
     @classmethod
     def from_parent(
         cls,
-        root_meta: "RootMetadata",
-        parent_meta: "LevelMetadata | None",
+        root_meta: RootMetadata,
+        parent_meta: LevelMetadata | None,
         *,
         level: int,
         vertex_count: int,
@@ -843,7 +862,7 @@ class LevelMetadata:
         inherited_num_objects: int | None = None,
         shared_fragments: bool = False,
         parent_level: int | None = None,
-    ) -> "LevelMetadata":
+    ) -> LevelMetadata:
         """Build a coarser level's metadata from the level below it.
 
         This block is hand-written at twenty-odd sites across core and its

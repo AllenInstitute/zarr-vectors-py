@@ -33,7 +33,7 @@ Public surface mirrors the legacy :class:`FsGroup` for back-compat:
 from __future__ import annotations
 
 import warnings
-from collections.abc import Iterator, Sequence
+from collections.abc import Iterable, Iterator, Sequence
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Literal
@@ -69,6 +69,16 @@ _LEVEL_META_KEY = "zarr_vectors_level"
 # False) from a hole in the prefetch plan, and would have to answer one
 # of them wrongly.
 _ABSENT = object()
+
+# Miss tags the offline session writes for a *planned* cell and for one
+# row of a standalone array.  ``_engine.plan.from_misses`` reads them
+# back (it keeps its own copies of the literals: importing it here would
+# be a cycle).  A planned cell is one a reader's prefetch plan named --
+# it is fetched exactly, with no fan-out to the rest of its array,
+# which is what lets an object read cost the object rather than the
+# level.  A bare ``(array, key)`` pair stays the discovery form.
+_MISS_CELL = "cell"
+_MISS_ROW = "row"
 
 
 class _OfflineSession:
@@ -138,6 +148,15 @@ class Group:
     # Consumed by :meth:`write_bytes` and the batched flush in
     # :mod:`zarr_vectors.core._batch_writer`.
     _active_codecs: list[dict[str, Any]] | None = None
+    # Rows written into each ``vertices`` cell this session, keyed by
+    # chunk key.  Written by ``write_chunk_vertices``, consumed by
+    # ``stamp_fragments_tile``; see :meth:`note_vertex_rows`.
+    _vertex_rows_written: dict[str, int] | None = None
+    # object_index path -> (sorted ids, rows), built on first lookup.
+    # Resolving an id to a row otherwise re-reads and re-sorts the id
+    # table on every single-object read, which turns a point lookup into
+    # a whole-index read.
+    _object_id_lookup_cache: dict[str, Any] | None = None
     # Explicit grid config for per-chunk-array creation, overriding what
     # ``arrays._derive_native_config`` would read off the store's
     # metadata.  Set by
@@ -192,6 +211,8 @@ class Group:
         self._node_cache_readonly = False
         self._listing_cache = None
         self._tiling_claim_settled = False
+        self._vertex_rows_written = None
+        self._object_id_lookup_cache = None
 
     @classmethod
     def _from_zarr(
@@ -393,6 +414,54 @@ class Group:
         if record_presence:
             _record_nonempty_chunk(sharded_arr, chunk_key, present=bool(data))
 
+    def write_cells(
+        self,
+        array_name: str,
+        cells: Iterable[tuple[str, bytes]],
+        *,
+        record_presence: bool = True,
+    ) -> int:
+        """:meth:`write_bytes` for many cells of one array.
+
+        The node is resolved and the grid read once for the whole batch;
+        each cell then costs its coordinate check and, inside a
+        :meth:`batched_writes` block, one append to the queue.  A links
+        family writes a hundred thousand cells of a few rows each, and
+        the per-call overhead of the singular form was most of that
+        write.  Returns how many cells were written.
+        """
+        if array_name in (_VERTICES_ARRAY, _VERTEX_FRAGMENTS_ARRAY):
+            self._clear_fragments_tile()
+        sharded_arr = self._sharded_chunk_array(array_name)
+        if sharded_arr is None:
+            raise StoreError(
+                f"Cannot write to {array_name!r} in "
+                f"{self._zarr.path or '<root>'}: no chunk array at that "
+                f"path. Per-chunk arrays must be allocated first (see "
+                f"arrays._ensure_array_dir / create_sharded_chunk_array)."
+            )
+        origin = _grid_origin(sharded_arr)
+        shape = sharded_arr.shape
+        pending = self._pending_writes
+        n = 0
+        for chunk_key, data in cells:
+            coords = _parse_chunk_coords(chunk_key)
+            if coords is None:
+                raise StoreError(
+                    f"Cannot write to array {array_name!r}: "
+                    f"chunk_key {chunk_key!r} is not a coord tuple"
+                )
+            index = _coord_to_index(coords, origin)
+            _check_coords_in_bounds(index, shape, array_name)
+            n += 1
+            if pending is not None:
+                pending.append((array_name, chunk_key, bytes(data), record_presence))
+                continue
+            _vlen_set_cell(sharded_arr, index, bytes(data))
+            if record_presence:
+                _record_nonempty_chunk(sharded_arr, chunk_key, present=bool(data))
+        return n
+
     @contextmanager
     def batched_reads(
         self,
@@ -435,12 +504,25 @@ class Group:
             raise StoreError("batched_reads() does not support nesting")
         if self._offline is not None:
             # Under offline_reads (the async prime-and-replay path used by
-            # aio.read_async), the chunks this plan would prefetch are already in
-            # the session, and read_bytes serves them from there -- so the sync
-            # prefetch is redundant. It is also unavailable: flush_prefetch calls
-            # sync(), which under Pyodide needs WebAssembly stack switching
-            # (JSPI). Skip it; any genuine miss is recorded by the offline
-            # session and fetched by the next aio round.
+            # aio.read_async and the engine), the chunks this plan would
+            # prefetch are served from the session -- so the sync
+            # prefetch is redundant. It is also unavailable: flush_prefetch
+            # calls sync(), which under Pyodide needs WebAssembly stack
+            # switching (JSPI).
+            #
+            # What a plan IS good for offline is saying, all at once, what
+            # the snapshot still lacks.  Left to ``read_bytes`` the reader
+            # would surface one missing cell per round -- the first one it
+            # touched -- and a level with more cells than the round limit
+            # never converged.  So every planned cell the session cannot
+            # serve is recorded here as a *planned* miss, tagged so the
+            # next round fetches exactly those cells and does not fan out
+            # to every cell of their arrays, and the pass is abandoned
+            # immediately rather than decoding what it already knows it
+            # cannot finish.  Cells the snapshot has confirmed absent, or
+            # whose array is known to be a group or missing, are not
+            # misses: asking for those again would learn nothing.
+            self._record_planned_misses(plan)
             yield
             return
         from zarr_vectors.core._batch_reader import flush_prefetch
@@ -466,6 +548,41 @@ class Group:
             yield
         finally:
             self._prefetch_cache = None
+
+    def _record_planned_misses(self, plan: list[tuple[str, list[str]]]) -> None:
+        """Record every planned cell the offline session cannot serve.
+
+        See :meth:`batched_reads`.  Raises :class:`StoreError` once the
+        misses are recorded, which is the signal the replay loop acts
+        on; a plan the session fully covers returns normally.
+        """
+        offline = self._offline
+        if offline is None:
+            return
+        absent = getattr(offline, "absent", ())
+        chunks = offline.chunks
+        missing: list[tuple[str, str]] = []
+        unresolved: list[str] = []
+        for name, keys in plan:
+            full = self._full_path(name)
+            node = offline.nodes.get(full)
+            if node is _ABSENT or (node is not None and not isinstance(node, zarr.Array)):
+                # Not a chunk array: nothing there can ever be a cell.
+                continue
+            if node is None:
+                unresolved.append(full)
+            for key in keys:
+                cell = (full, key)
+                if cell not in chunks and cell not in absent:
+                    missing.append(cell)
+        if not missing:
+            return
+        offline.misses.update(unresolved)
+        offline.misses.update((_MISS_CELL, a, k) for a, k in missing)
+        raise StoreError(
+            f"Offline read: {len(missing)} planned cell(s) are not in the "
+            f"prefetched snapshot (first: {missing[0]!r})."
+        )
 
     @contextmanager
     def cached_nodes(self) -> Iterator[None]:
@@ -882,6 +999,34 @@ class Group:
             cache[key] = listing
         return listing
 
+    def note_vertex_rows(self, chunk_key: str, n_rows: int) -> None:
+        """Record how many vertex rows a cell was just given.
+
+        :func:`~zarr_vectors.core.arrays.stamp_fragments_tile` has to
+        know each cell's row count to check the fragment index against
+        it, and it used to get that by re-reading every ``vertices``
+        cell it had just written -- measured at 1.00x the bytes written,
+        so a bulk write downloaded its own output in full before
+        returning.  The writer already knows the number, so it says so.
+
+        Only a hint: a key with no recorded count is read back as
+        before, which is what keeps the stamp correct for a level whose
+        cells this session did not write.
+        """
+        if self._vertex_rows_written is None:
+            self._vertex_rows_written = {}
+        self._vertex_rows_written[chunk_key] = int(n_rows)
+
+    def take_vertex_rows(self) -> dict[str, int]:
+        """Consume and clear the recorded counts.
+
+        Cleared on read so a later stamp cannot trust a count from
+        before an intervening edit.
+        """
+        recorded = self._vertex_rows_written or {}
+        self._vertex_rows_written = None
+        return recorded
+
     def list_chunks(self, array_name: str) -> list[str]:
         """The dotted chunk keys this array holds data for, sorted."""
         return self._chunk_listing(array_name).keys
@@ -1227,12 +1372,41 @@ class Group:
         distinction is moot: the snapshot holds the array entire, and
         this just indexes into it.
         """
-        cached = self._offline_array(path)
-        if cached is not None:
-            return _vlen_region_to_bytes(cached[index:index + 1])
+        offline = self._offline_rows(path, [int(index)])
+        if offline is not None:
+            return offline[0]
         node = self._require_array_node(path)
         # Slice-then-extract, never scalar-index: see core._vlen.
         return _vlen_region_to_bytes(node[index:index + 1])
+
+    def _offline_rows(self, path: str, indices: Sequence[int]) -> list[bytes] | None:
+        """``indices`` of the vlen array at ``path`` from the offline
+        snapshot, or ``None`` when not offline.
+
+        Served from the whole array when the snapshot holds it, else from
+        the rows a fetch selected -- which is what keeps a by-id read of
+        twenty-one million manifests from reading twenty-one million
+        manifests.  A row the snapshot lacks records a *row* miss, so the
+        next round fetches exactly those rows by coordinate selection,
+        and then raises: same contract as :meth:`_offline_array`.
+        """
+        offline = self._offline
+        if offline is None:
+            return None
+        full = self._full_path(path)
+        whole = offline.arrays.get(full)
+        if whole is not None:
+            return [_vlen_region_to_bytes(whole[i:i + 1]) for i in indices]
+        held = getattr(offline, "rows", None)
+        known = held.get(full, {}) if held else {}
+        missing = [int(i) for i in indices if int(i) not in known]
+        if not missing:
+            return [bytes(known[int(i)]) for i in indices]
+        offline.misses.update((_MISS_ROW, full, i) for i in missing)
+        raise StoreError(
+            f"Offline read of {len(missing)} row(s) of {full!r}: not in the "
+            f"prefetched snapshot."
+        )
 
     def read_vlen_elements(self, path: str, indices: Sequence[int]) -> list[bytes]:
         """Read MANY elements of the vlen-bytes array at ``path``, at once.
@@ -1249,9 +1423,9 @@ class Group:
         """
         if not len(indices):
             return []
-        cached = self._offline_array(path)
-        if cached is not None:
-            return [_vlen_region_to_bytes(cached[i:i + 1]) for i in indices]
+        offline = self._offline_rows(path, indices)
+        if offline is not None:
+            return offline
         node = self._require_array_node(path)
         idx = np.asarray(indices, dtype=np.int64)
         try:
@@ -1369,6 +1543,118 @@ class Group:
         if self._node_cache is not None:
             self._node_cache[self._full_path(array_name)] = arr
 
+    def create_sharded_chunk_arrays(
+        self,
+        arrays: Sequence[tuple[str, dict[str, Any] | None]],
+        grid_shape: tuple[int, ...],
+        *,
+        shard_shape: tuple[int, ...] | None = None,
+        origin: tuple[int, ...] | None = None,
+        compressors: list[dict[str, Any]] | None = None,
+        replace: Sequence[str] | set[str] = (),
+    ) -> None:
+        """:meth:`create_sharded_chunk_array` for several arrays at once.
+
+        One ``zarr.json`` per array still has to be written, but they are
+        independent, so they go out in one gather rather than through a
+        blocking ``sync()`` each -- which is the difference between
+        allocating a links family of 1,700 offsets arrays in a second and
+        in a minute.
+
+        ``arrays`` is ``[(array_name, attributes), ...]``; ``replace``
+        names those whose existing node must be dropped first (the
+        caller has looked, so this does not look again).
+        """
+        import asyncio
+
+        from zarr.core.sync import sync
+
+        if not arrays:
+            return
+        ndim = len(grid_shape)
+        if shard_shape is not None and len(shard_shape) != ndim:
+            raise StoreError(
+                f"shard_shape rank {len(shard_shape)} != grid_shape "
+                f"rank {ndim}"
+            )
+        # Every parent group first, once each: the arrays are created by
+        # path below, and a node created under a group that does not
+        # exist has no hierarchy to be found in.
+        for parent_path in sorted({name.rpartition("/")[0] for name, _ in arrays}):
+            if parent_path:
+                self._zarr.require_group(parent_path)
+        for array_name in replace:
+            parent_path, _, leaf = array_name.rpartition("/")
+            parent = self._zarr[parent_path] if parent_path else self._zarr
+            if leaf in parent:
+                del parent[leaf]
+
+        base_kwargs: dict[str, Any] = {
+            "shape": grid_shape,
+            "chunks": (1,) * ndim,
+            "dtype": "bytes",
+            "serializer": VLenBytesCodec(),
+            "compressors": list(compressors) if compressors else [],
+        }
+        if shard_shape is not None:
+            base_kwargs["shards"] = tuple(shard_shape)
+        base_attrs: dict[str, Any] = {_NONEMPTY_CHUNKS_ATTR: []}
+        if origin is not None and any(int(o) != 0 for o in origin):
+            base_attrs[_CHUNK_GRID_ORIGIN_ATTR] = [int(o) for o in origin]
+
+        for array_name, _ in arrays:
+            self._invalidate_node(array_name)
+
+        # The first array goes through zarr, which settles everything
+        # about the layout -- codecs, dtype, chunk grid -- into one
+        # metadata object.  Every other array in the batch IS that
+        # metadata with its own attributes, so the rest are written as
+        # their ``zarr.json`` directly, all in one gather, and wrapped in
+        # handles without a round-trip: what zarr's ``create_array`` does
+        # per array is parse the same arguments, probe the store for an
+        # existing node, and write the same document, which for a links
+        # family of 1,700 arrays was twelve seconds.
+        import dataclasses
+
+        from zarr.core.array import AsyncArray
+        from zarr.core.buffer import default_buffer_prototype
+
+        first_name, first_attributes = arrays[0]
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", UnstableSpecificationWarning)
+            first = self._zarr.create_array(
+                first_name,
+                **base_kwargs,
+                attributes={**base_attrs, **_json_safe(first_attributes or {})},
+            )
+        handles: list[tuple[str, zarr.Array]] = [(first_name, first)]
+        rest = arrays[1:]
+        if rest:
+            template = first.metadata
+            prototype = default_buffer_prototype()
+            store = self._zarr.store
+            puts: list[tuple[str, Any]] = []
+            for array_name, attributes in rest:
+                meta = dataclasses.replace(
+                    template,
+                    attributes={**base_attrs, **_json_safe(attributes or {})},
+                )
+                store_path = self._zarr.store_path / array_name
+                key = f"{store_path.path}/zarr.json" if store_path.path else "zarr.json"
+                puts.append((key, meta.to_buffer_dict(prototype)["zarr.json"]))
+                handles.append((
+                    array_name,
+                    zarr.Array(AsyncArray(metadata=meta, store_path=store_path)),
+                ))
+
+            async def _put_all() -> None:
+                await asyncio.gather(*(store.set(key, buf) for key, buf in puts))
+
+            sync(_put_all())
+        if self._node_cache is not None:
+            for array_name, handle in handles:
+                self._node_cache[self._full_path(array_name)] = handle
+
     def _lookup_node(self, path: str) -> zarr.Array | zarr.Group | None:
         """Return the Zarr node at ``path``, or ``None`` if absent.
 
@@ -1478,6 +1764,9 @@ class Group:
         """
         full = self._full_path(path)
         prefix = f"{full}/"
+        # The id table is a node like any other, so a write that
+        # replaces it must drop the lookup built from it.
+        self._object_id_lookup_cache = None
         for cache in (self._node_cache, self._listing_cache):
             if not cache:
                 continue

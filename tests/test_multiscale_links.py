@@ -473,3 +473,80 @@ def test_build_pyramid_implicit_only_plus(tmp_path: Path) -> None:
         f"implicit mode must still materialize +1 at the finer level; "
         f"saw deltas {sorted(all_deltas)}"
     )
+
+
+# ===================================================================
+# Array-native cross-level partitioning
+# ===================================================================
+
+
+def test_array_partition_matches_the_record_partition():
+    """The array path is an optimisation, so it must agree exactly.
+
+    Same endpoints through both partitioners: same buckets, same rows,
+    same order within each bucket. Order matters as much as content --
+    a cell is a concatenation, so two partitioners that agree on
+    membership but not on sequence write different bytes.
+    """
+    import numpy as np
+
+    from zarr_vectors.spatial.boundary import (
+        partition_arrays_by_offset,
+        partition_records_by_offset,
+    )
+
+    rng = np.random.default_rng(17)
+    n = 400
+    src_cc = rng.integers(0, 4, (n, 3)).astype(np.int64)
+    trg_cc = rng.integers(0, 4, (n, 3)).astype(np.int64)
+    src_vi = rng.integers(0, 50, n).astype(np.int64)
+    trg_vi = rng.integers(0, 50, n).astype(np.int64)
+    scales = (1, 1, 1)
+
+    records = [
+        [(tuple(int(c) for c in src_cc[i]), int(src_vi[i])),
+         (tuple(int(c) for c in trg_cc[i]), int(trg_vi[i]))]
+        for i in range(n)
+    ]
+    expected = partition_records_by_offset(
+        records, 2, 3, scale_src=scales, scale_trg=scales,
+        directed=True, store="canonical", cross_level=True,
+    )
+    got = partition_arrays_by_offset(
+        src_cc, src_vi, trg_cc, trg_vi,
+        scale_src=scales, scale_trg=scales, sid_ndim=3,
+    )
+
+    assert set(got) == set(expected)
+    # More than one segment, or the group-by is untested.
+    assert len({seg for seg, _ in got}) > 1
+    for key, (rows, input_idx) in got.items():
+        want = expected[key]
+        assert rows.tolist() == [vi for vi, _perm, _idx in want]
+        assert input_idx.tolist() == [idx for _vi, _perm, idx in want]
+
+
+def test_array_partition_anchors_across_differing_grids():
+    """Anchoring must floor toward -inf, including for negative coords."""
+    import numpy as np
+
+    from zarr_vectors.spatial.boundary import (
+        anchor_chunk,
+        partition_arrays_by_offset,
+    )
+
+    src_cc = np.array([[-3, 1, 0], [-1, -1, -1], [5, 2, 7]], dtype=np.int64)
+    trg_cc = np.array([[-2, 0, 0], [0, 0, 0], [2, 1, 3]], dtype=np.int64)
+    vi = np.array([0, 1, 2], dtype=np.int64)
+    got = partition_arrays_by_offset(
+        src_cc, vi, trg_cc, vi,
+        scale_src=(1, 1, 1), scale_trg=(2, 2, 2), sid_ndim=3,
+    )
+    for i in range(3):
+        anchor = anchor_chunk(
+            tuple(int(c) for c in src_cc[i]), (1, 1, 1), (2, 2, 2),
+        )
+        offset = tuple(int(t) - int(a) for t, a in zip(trg_cc[i], anchor))
+        from zarr_vectors.core.paths import format_offsets
+        assert (format_offsets((offset,)),
+                tuple(int(c) for c in src_cc[i])) in got

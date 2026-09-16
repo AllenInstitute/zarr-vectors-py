@@ -101,25 +101,25 @@ from zarr_vectors.validate import (
 )
 ```
 
-### `validate()` takes a path, not a URL
+### `validate()` takes a path, a URL, or an open handle
 
-L1 walks the store as a filesystem tree, so `store_path` must be a
-filesystem path. A `file://` URL is *not* accepted — it is treated as a
-relative directory name and fails the very first check:
+All five levels ask the *store*, so any of the three works and they reach
+the same verdict:
 
 ```pycon
 >>> validate("scan.zarrvectors", level=1).ok
 True
->>> print(validate("file:///data/scan.zarrvectors", level=1).summary())
-Level 1 validation: FAIL
-  0 passed, 0 warnings, 1 errors
-  ERROR: Store path does not exist: file:/data/scan.zarrvectors
+>>> validate("file:///data/scan.zarrvectors", level=1).ok
+True
+>>> validate(zv.open("scan.zarrvectors").store, level=1).ok
+True
 ```
 
-This is worth knowing because `Dataset.url` is always a URL — a locally
-opened dataset reports `file:///…` — so `Dataset.validate(level=...)`,
-which forwards that URL, fails in exactly that way on a perfectly good
-local store. Pass the path yourself until that is fixed.
+The handle form is what `Dataset.validate(level=...)` uses, which is why
+it works on a memory- or object-backed dataset as well as a local one.
+L1 used to walk the store as a filesystem tree, so it accepted only a
+path — and `Dataset.url` is always a URL, so validating through the
+dataset failed at the very first check on a perfectly good local store.
 
 ---
 

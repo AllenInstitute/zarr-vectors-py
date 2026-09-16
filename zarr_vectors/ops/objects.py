@@ -285,7 +285,6 @@ def _split_object_at_link_impl(
         LINKS_IMPLICIT_SEQUENTIAL,
     )
     from zarr_vectors.core.metadata import RootMetadata
-    from zarr_vectors.ops.fragments import partition_fragment_rows
 
     meta = RootMetadata.from_dict(session.root.attrs.to_dict())
     conv = meta.links_convention or LINKS_EXPLICIT

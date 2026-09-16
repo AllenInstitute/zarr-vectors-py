@@ -141,6 +141,8 @@ async def _fetch_chunks(
     root: zarr.AsyncGroup,
     nodes: dict[str, Any],
     keys: set[tuple[str, str]],
+    *,
+    sync_root: zarr.Group | None = None,
 ) -> dict[tuple[str, str], bytes]:
     """Fetch ``(array_path, chunk_key)`` cells concurrently.
 
@@ -148,8 +150,22 @@ async def _fetch_chunks(
     is already pure async and already knows the vlen-bytes cell layout
     and the ``chunk_grid_origin`` translation — the same code the sync
     batched-read path fans out with.
+
+    ``sync_root`` opts in to the local-filesystem direct reader for the
+    arrays it recognises (see ``_batch_reader._direct_spec``): those
+    cells are read with plain ``open()`` on a worker thread instead of
+    one ``AsyncArray.getitem`` per cell, which on a local store was the
+    read -- 3.8 s of a 4.6 s million-point read went to scheduling I/O
+    that had already finished.  Pyodide passes nothing here and keeps
+    the pure-async path.  The direct reader only serves arrays whose
+    node is already resolved, so it never issues a blocking lookup from
+    inside the event loop.
     """
-    from zarr_vectors.core._batch_reader import _gather_plan
+    from zarr_vectors.core._batch_reader import (
+        _direct_read_plan,
+        _direct_spec,
+        _gather_plan,
+    )
 
     if not keys:
         return {}
@@ -158,9 +174,34 @@ async def _fetch_chunks(
     for array_path, chunk_key in sorted(keys):
         by_array.setdefault(array_path, []).append(chunk_key)
 
-    # _gather_plan resolves array names against the group it is given, so
-    # hand it the root and use root-relative paths as the "names".
-    return await _gather_plan(root, list(by_array.items()))
+    direct: list[tuple[str, Any, list[str]]] = []
+    gathered: list[tuple[str, list[str]]] = []
+    for array_path, chunk_keys in by_array.items():
+        spec = None
+        node = nodes.get(array_path)
+        if sync_root is not None and isinstance(node, zarr.Array):
+            spec = _direct_spec(sync_root, array_path, node)
+        if spec is None:
+            gathered.append((array_path, chunk_keys))
+        else:
+            direct.append((array_path, spec, chunk_keys))
+
+    tasks: list[Any] = []
+    if gathered:
+        # _gather_plan resolves array names against the group it is
+        # given, so hand it the root and use root-relative paths as the
+        # "names".
+        tasks.append(_gather_plan(root, gathered))
+    if direct:
+        # One job for every direct array together, so the files pool
+        # across arrays rather than per array.
+        tasks.append(asyncio.to_thread(_direct_read_plan, direct))
+    results = await asyncio.gather(*tasks)
+
+    out: dict[tuple[str, str], bytes] = {}
+    for part in results:
+        out.update(part)
+    return out
 
 
 def _implied_chunks(nodes: dict[str, Any]) -> set[tuple[str, str]]:
