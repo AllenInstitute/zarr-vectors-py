@@ -345,24 +345,25 @@ def test_constant_set_matches_schema_enum(schema, enum_name, members):
 # ===================================================================
 
 
-def test_format_version_is_0_9_1():
-    """The current ZV writer stamps 0.9.1; bump tests here when bumping."""
+def test_format_version_is_0_9_2():
+    """The current ZV writer stamps 0.9.2; bump tests here when bumping."""
     from zarr_vectors.constants import FORMAT_VERSION
 
-    assert FORMAT_VERSION == "0.9.1", (
+    assert FORMAT_VERSION == "0.9.2", (
         f"FORMAT_VERSION drifted to {FORMAT_VERSION!r}; if intentional "
         f"update this test and the version-cutoff check in "
         f"zarr_vectors.core.metadata.RootMetadata.validate()."
     )
 
 
-def test_the_0_9_1_addition_did_not_move_the_read_cutoff():
-    """0.9.1 is additive, so 0.9.0 stores must still read.
+def test_the_0_9_x_additions_did_not_move_the_read_cutoff():
+    """0.9.1 and 0.9.2 are additive, so 0.9.0 stores must still read.
 
-    The hard break is at 0.9.0 -- the single-array layout -- and
-    ``attribute_specs`` only adds an optional root key.  Raising the
-    cutoff alongside the version would strand every 0.9.0 store for a
-    field they are entitled not to have.
+    The hard break is at 0.9.0 -- the single-array layout.
+    ``attribute_specs`` (0.9.1) and the RFC 8 ``ome`` node (0.9.2) each
+    only add an optional root key.  Raising the cutoff alongside the
+    version would strand every 0.9.0 store for fields they are entitled
+    not to have.
     """
     from zarr_vectors.core.metadata import RootMetadata
 

@@ -35,6 +35,9 @@ because a name used from ``core`` is a name nobody knows is load-bearing.
 
 from __future__ import annotations
 
+from pathlib import Path
+from typing import Any
+
 # --- array names and layout sentinels --------------------------------
 from zarr_vectors.constants import (
     CAP_FRAGMENT_INDEX,
@@ -311,6 +314,42 @@ def refresh_arrays_present(level_group: Group) -> list[str]:
     ordered = sorted(families)
     update_level_metadata(level_group, arrays_present=ordered)
     return ordered
+
+
+def stamp_ome_node(
+    store: str | Path | Group,
+    *,
+    name: str | None = None,
+) -> dict[str, Any]:
+    """Add (or refresh) the RFC 8 ``ome`` node on an existing store.
+
+    What makes a store nameable by an OME *collection*: a resolver
+    following ``{"type": "zarr", "path": "./x.zarrvectors"}`` fetches the
+    root ``zarr.json`` and looks for a legal node under ``ome``.  Stores
+    written before 0.9.2 carry none, and stores written since carry one
+    already -- calling this on either leaves a correct block, so it is
+    safe to run over a whole directory of stores.
+
+    Metadata-only, and the one upgrade in this format's history that can
+    be applied in place.  Every prior version bump moved bytes, so the
+    migration story was "rewrite from source"; this one only adds a root
+    attribute, so a store is brought up to date without its data being
+    read, let alone rewritten.
+
+    Args:
+        store: Store path, URL, or an open root group.  A path or URL is
+            opened ``mode="r+"``.
+        name: Store name for the node.  ``None`` keeps the name already
+            recorded, and otherwise derives one from the store URL.
+
+    Returns:
+        The ``ome`` block as written.
+    """
+    from zarr_vectors.core.group import Group as _Group
+    from zarr_vectors.core.ome import refresh_root_node
+
+    root = store if isinstance(store, _Group) else open_store(store, mode="r+")
+    return refresh_root_node(root, name=name)
 
 
 def array_is_sharded(level_group: Group, array_name: str) -> bool:
@@ -692,6 +731,7 @@ __all__ = [
     "rechunk",
     "rechunk_by_attribute",
     "refresh_arrays_present",
+    "stamp_ome_node",
     "register_coarsen_strategy",
     "register_selection_strategy",
     "remove_resolution_level",

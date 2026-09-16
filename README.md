@@ -100,7 +100,10 @@ dataset.zarrvectors/
 │                                           attributes.zarr_vectors (zv_version, bounds, chunk_shape,
 │                                           base_bin_shape, geometry_types, conventions, optional crs
 │                                           and attribute_specs); per-level scale/translation under
-│                                           attributes.multiscales (OME-NGFF 0.4).
+│                                           attributes.multiscales (OME-NGFF 0.4).  attributes.ome
+│                                           carries an OME-Zarr RFC 8 node so a collection elsewhere
+│                                           can name this store by path — additive, and read by
+│                                           nothing here (see zarr_vectors/core/ome.py).
 ├── 0/                            [always]  Full resolution.  Levels are bare integers, no prefix.
 │   ├── zarr.json                 [always]  Level metadata under attributes.zarr_vectors_level
 │   │                                       (vertex_count, object_sparsity, coarsening_method,

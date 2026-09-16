@@ -103,6 +103,22 @@ def validate_structure(store_path: str | Path | Group) -> ValidationResult:
             "root attributes)"
         )
 
+    # A warning, not an error: the block is additive (0.9.2), so a store
+    # without one is valid and fully readable.  What it cannot do is be
+    # resolved by an OME collection that names it by path -- a failure
+    # that otherwise surfaces in someone else's resolver, with nothing
+    # here to point at.
+    from zarr_vectors.core.ome import OME_ATTRS_KEY
+    if OME_ATTRS_KEY in root.attrs:
+        result.add_pass("RFC 8 'ome' node found")
+    else:
+        result.add_warning(
+            "No RFC 8 'ome' node in the root attributes; the store is valid "
+            "but cannot be resolved as a member of an OME collection. "
+            "Run zarr_vectors.building.stamp_ome_node(store) to add one "
+            "(metadata-only, no data is rewritten)."
+        )
+
     # Resolution levels are bare integer group names (``0``, ``1``, ...)
     # under the 0.4.1+ layout; anything else at the root is some other
     # entity (``parametric``, ``headers``).

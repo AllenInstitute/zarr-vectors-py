@@ -9,8 +9,31 @@ everywhere in the package.
 # Format version
 # ---------------------------------------------------------------------------
 
-FORMAT_VERSION: str = "0.9.1"
+FORMAT_VERSION: str = "0.9.2"
 """Current ZV specification version.
+
+0.9.2: optional, backward-compatible ``ome`` block on the root (absent ⇒
+the prior behaviour, so 0.9.0 and 0.9.1 stores read unchanged).  It is an
+OME-Zarr RFC 8 **node** — ``version``, ``type: "collection"``, ``name``,
+one ``zv:level`` leaf per resolution level, and a ``scene`` declaring the
+``world`` coordinate system with the store's axes and units.  That is
+what an OME *collection* elsewhere needs in order to name this store by
+path: a resolver following ``{"type": "zarr", "path": "./x.zarrvectors"}``
+fetches the root ``zarr.json`` and looks for a legal node under ``ome``,
+and before 0.9.2 there was none.  Declaring ``world`` is what makes the
+membership useful rather than merely legal — a viewer can place the store
+beside an image pyramid.
+
+Additive in the strict sense: nothing moved, nothing was removed, and no
+reader in this package or downstream consults the block.  Every field in
+it restates one already carried by ``zarr_vectors`` or ``multiscales``,
+which remain the source of truth.  Re-seating the format *on* RFC 8 —
+dropping the repurposed ``coordinateTransformations``, minting node types
+for the arrays, collapsing the attribute discriminators — is the separate
+0.10.0 change; this block is forward-compatible with it.  Because it only
+adds, an existing store can be brought up to it in place, without
+rewriting data: :func:`zarr_vectors.building.stamp_ome_node`.  See
+:mod:`zarr_vectors.core.ome`.
 
 0.9.1: optional, backward-compatible ``attribute_specs`` block on the
 root (absent ⇒ the prior behaviour, so 0.9.0 stores read unchanged).

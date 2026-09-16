@@ -322,6 +322,7 @@ def create_store(
     base_bin_shape: tuple[float, ...] | None = None,
     format_capabilities: list[str] | None = None,
     attribute_specs: dict[str, dict[str, Any]] | None = None,
+    name: str | None = None,
     backend: str | None = None,
     storage_options: dict[str, Any] | None = None,
     **backend_kwargs: Any,
@@ -397,6 +398,11 @@ def create_store(
             "link": ...}``.  Optional and additive; a reader that does
             not know about it is unaffected.  Declaring an attribute does
             not create it.
+        name: Human-readable store name, recorded on the RFC 8 ``ome``
+            node so an OME collection can present it.  Defaults to the
+            store path's last segment with its extension stripped.  Not an
+            identifier: a collection referencing this store supplies its
+            own name for the node, which is what addresses it there.
         backend: Force a particular backend (``"local"`` / ``"icechunk"``).
         **backend_kwargs: Forwarded to the backend constructor.
 
@@ -472,6 +478,7 @@ def create_store(
         base_bin_shape=base_bin_shape,
         format_capabilities=format_capabilities,
         attribute_specs=attribute_specs,
+        name=name,
     )
 
     # 0/ + empty vertices pair — the "warm" payload.
@@ -552,11 +559,18 @@ def _write_root_attrs(
     base_bin_shape: tuple[float, ...] | None = None,
     format_capabilities: list[str] | None = None,
     attribute_specs: dict[str, dict[str, Any]] | None = None,
+    name: str | None = None,
 ) -> None:
     """Write the ``zarr_vectors`` root-attrs block plus the eager NGFF
     ``multiscales`` block (axes only — ``datasets`` are filled in by
     :func:`zarr_vectors.core.multiscale.write_multiscale_metadata`
     when the pyramid is materialised).
+
+    Also writes the RFC 8 ``ome`` node (0.9.2+), which is what lets an OME
+    collection elsewhere name this store by path.  It is additive and
+    derived: nothing in this package reads it, and every field it carries
+    is a restatement of one of the two blocks above.  See
+    :mod:`zarr_vectors.core.ome`.
 
     Used by :func:`create_store` (initial) and helpers that update
     structural fields after create (e.g. :func:`set_bounds`).
@@ -620,7 +634,28 @@ def _write_root_attrs(
     ms_entry["metadata"] = md
     multiscales = [ms_entry]
 
-    root.attrs.update({"zarr_vectors": zv, "multiscales": multiscales})
+    # RFC 8 node.  At create time no level group exists yet, so ``nodes``
+    # is empty for as long as it takes ``create_store`` to make level 0 --
+    # which then refreshes this block.  Every store that finished being
+    # created has at least one level.
+    from zarr_vectors.core.ome import (
+        OME_ATTRS_KEY,
+        build_root_node,
+        derive_store_name,
+        read_root_node,
+    )
+    ome_name = (
+        name
+        or (read_root_node(full_attrs) or {}).get("name")
+        or derive_store_name(root.url)
+    )
+    ome = build_root_node(
+        name=ome_name, axes=list(axes), levels=list_resolution_levels(root),
+    )
+
+    root.attrs.update({
+        "zarr_vectors": zv, "multiscales": multiscales, OME_ATTRS_KEY: ome,
+    })
 
 
 def _ensure_root_metadata_for_write(
@@ -1364,6 +1399,11 @@ def create_resolution_level(
             else None
         )
         upsert_level_transform(root, level, scale=scale, translation=translation)
+
+    # Keep the RFC 8 node's level list in step with the level groups.
+    # Derived from disk rather than appended to, so it cannot drift.
+    from zarr_vectors.core.ome import refresh_root_node
+    refresh_root_node(root)
     return level_group
 
 
@@ -1714,6 +1754,9 @@ def remove_resolution_level(root: Group, level_index: int) -> None:
         raise StoreError(f"Resolution level {level_index} not found")
 
     root.delete_subtree(group_name)
+
+    from zarr_vectors.core.ome import refresh_root_node
+    refresh_root_node(root)
 
 
 def list_available_ratios(root: Group) -> list[tuple[int, ...]]:
