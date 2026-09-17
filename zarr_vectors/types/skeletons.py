@@ -51,6 +51,7 @@ from zarr_vectors.core.arrays import (
     create_links_array,
     create_object_index_array,
     create_vertices_array,
+    list_chunk_keys,
     list_link_offsets,
     read_chunk_link_fragment,
     read_fragment,
@@ -73,6 +74,7 @@ from zarr_vectors.core.store import (
     _finalize_write,
     create_resolution_level,
     get_resolution_level,
+    update_level_metadata,
     open_store,
     read_root_metadata,
 )
@@ -453,7 +455,39 @@ def write_skeleton_cross_chunk_links(
     )
 
 
+def _count_level_vertices(level_group) -> int:
+    """Sum every populated chunk's true vertex extent for ``level_group``.
+
+    Cheap: reads only the small ``vertex_fragments/<chunk>`` fragment-index
+    blob per chunk (``ChunkFragmentIndex.vertex_extent``), never the
+    ``vertices`` float payload itself.
+    """
+    total = 0
+    for cc in list_chunk_keys(level_group, VERTICES):
+        total += int(read_vertex_fragment_index(level_group, cc).vertex_extent)
+    return total
+
+
 def finalize_skeleton_store(root) -> None:
+    # Level 0's `vertex_count` is written as a 0 placeholder at
+    # `init_skeleton_store` time -- before a single chunk exists to count --
+    # because the streaming writer only learns real totals from what
+    # workers actually wrote, decentralized across many chunks.  Nothing
+    # patched that placeholder afterward (unlike a coarsened level, which
+    # `coarsen_skeleton_level` stamps with a real count from its own
+    # bookkeeping), so every level-0 skeleton store reported a vertex_count
+    # of 0 downstream -- readers cannot price the level, and any consumer
+    # that treats an unknown cost as unaffordable (rightly) will never pick
+    # level 0 over a coarser one that DOES report a count. Patch it here,
+    # once, from what is actually on disk.
+    try:
+        level0 = get_resolution_level(root, 0)
+        update_level_metadata(level0, vertex_count=_count_level_vertices(level0))
+    except Exception:
+        # A bookkeeping patch must never block the commit that actually
+        # matters; worst case this leaves the prior (0) placeholder, the
+        # behaviour before this fix existed.
+        pass
     # No ``fragments_tile`` stamp here, deliberately.  This finalises a
     # DECENTRALISED write -- many workers, each owning some chunks -- so
     # the layout is exactly the one whose tiling nothing can vouch for
