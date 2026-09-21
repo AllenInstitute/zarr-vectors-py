@@ -5,7 +5,10 @@ dependency pin:
 
 * the **package** version (``__version__``) — derived from the git tag by
   setuptools-scm, so it moves with every commit and should never be
-  asserted against;
+  asserted against. Each *release* tag is held equal to the format
+  version below, enforced by the release workflow, so the number on PyPI
+  names the format it ships; a build between releases carries a ``.devN``
+  of the next one, which is why a pin still cannot express anything;
 * the **on-disk format** version (:data:`zarr_vectors.constants
   .FORMAT_VERSION`) — already negotiable via
   :func:`zarr_vectors.api.require_format`;

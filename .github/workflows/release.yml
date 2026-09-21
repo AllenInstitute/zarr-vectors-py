@@ -148,6 +148,27 @@ jobs:
             exit 1
           fi
 
+      - name: Verify the release version matches FORMAT_VERSION
+        run: |
+          set -euo pipefail
+          # The package version and the on-disk format version are kept in
+          # lockstep deliberately.  They drift the moment nothing checks,
+          # which is how the release tags ended up far behind
+          # FORMAT_VERSION in the first place, so refuse a release whose
+          # tag does not name the format version it actually ships.
+          FORMAT="$(sed -nE 's/^FORMAT_VERSION[^=]*=[[:space:]]*"([^"]+)".*/\1/p' zarr_vectors/constants.py | head -n1)"
+          EXPECTED="${{ steps.bump.outputs.new_version }}"
+          if [ -z "${FORMAT}" ]; then
+            echo "::error::Could not read FORMAT_VERSION from zarr_vectors/constants.py" >&2
+            exit 1
+          fi
+          echo "FORMAT_VERSION: ${FORMAT}"
+          echo "Releasing:      ${EXPECTED}"
+          if [ "${FORMAT}" != "${EXPECTED}" ]; then
+            echo "::error::Releasing ${EXPECTED} but FORMAT_VERSION is ${FORMAT}. Update zarr_vectors/constants.py, or release ${FORMAT} instead." >&2
+            exit 1
+          fi
+
       - name: Push tag
         if: inputs.dry-run != 'true'
         # Deferred until the build + version check have passed so a failed
