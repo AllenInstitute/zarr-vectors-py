@@ -46,6 +46,7 @@ from zarr_vectors.core.arrays import (
     create_object_index_array,
     create_vertices_array,
     link_endpoints_to_rows,
+    link_family_policy,
     list_link_offsets,
     read_chunk_vertices,
     read_link_arrays,
@@ -86,6 +87,7 @@ from zarr_vectors.spatial.chunking import (
     assign_chunks,
     compute_bounds,
 )
+from zarr_vectors.types.skeletons import get_coordinate_offset
 from zarr_vectors.typing import (
     BinShape,
     BoundingBox,
@@ -612,7 +614,10 @@ def read_graph(
 
     Returns:
         Dict with:
-        - ``positions``: ``(N, D)`` node positions
+        - ``positions``: ``(N, D)`` node positions, in world coordinates
+          (``stored + coordinate_offset``; identical to what
+          :func:`~zarr_vectors.types.skeletons.read_skeleton_by_segment_id`
+          returns for the same store)
         - ``edges``: ``(M, 2)`` edge list (remapped to output indices)
         - ``node_count``, ``edge_count``
     """
@@ -768,6 +773,18 @@ def _read_graph(
             return _empty_graph_result(ndim)
 
         positions_out = np.concatenate(all_positions, axis=0)
+        # World position = stored + coordinate_offset (see
+        # skeletons.py:COORDINATE_OFFSET_KEY) -- applied here, before the
+        # bbox filter below, so a caller's bbox is compared in the same
+        # world frame the returned positions are in.  Every real store
+        # `run_ingest` builds (its default `align=True` shifts storage to
+        # start at the origin and records the shift here) has a nonzero
+        # offset; every synthetic fixture built directly at the origin in
+        # this repo's own tests has always had a zero one, which is why
+        # this was missing for so long without a test catching it.
+        offset = get_coordinate_offset(root, ndim)
+        if positions_out.size and np.any(offset != 0):
+            positions_out = positions_out + offset.astype(positions_out.dtype)
 
         # Edges (delta=0; cross-pyramid-level edges live under delta != 0
         # and are not part of a single-level read).  One family, so intra
@@ -775,11 +792,37 @@ def _read_graph(
         # ``(chunk, vertex)`` form — a single remap covers both.  A record
         # touching a chunk outside ``chunk_keys`` has no offset and is
         # dropped, which is what applies the bbox/chunks filter to edges.
+        # A ``directed=True`` family (the per-chunk skeleton writer's
+        # policy -- see ``write_skeleton_cross_chunk_links``) stores
+        # cross-chunk records with endpoint 0 the PARENT, opposite to
+        # the intra array's ``[child, parent]``.  A ``directed=False``
+        # (canonical) family instead recovers exact input ``[child,
+        # parent]`` order via its ``perm_idx`` column regardless of
+        # physical chunk placement (``write_graph``'s own writer uses
+        # this policy), so no swap is needed there.  Only matters for
+        # ``is_tree`` reads, which are the only ones that assign
+        # column-0/column-1 a child/parent meaning at all.
+        family_directed = False
+        if is_tree:
+            policy = link_family_policy(level_group, 0)
+            if policy is not None:
+                family_directed = bool(policy[2])
+
         all_edges: list[npt.NDArray] = []
         # As arrays, not one tuple per edge: the remap is a gather.
         edge_chunks, edge_vi = read_link_arrays(level_group, delta=0)
         if edge_vi.shape[0] and edge_vi.shape[1] == 2:
             rows = link_endpoints_to_rows(edge_chunks, edge_vi, chunk_offsets)
+            if family_directed:
+                # Cross-chunk record under the directed policy: swap so
+                # column 0 stays "child" as every other record already is.
+                # ``read_link_arrays`` carries no ``perm_idx`` for a
+                # directed family (see ``links_has_perm``), so it returns
+                # these rows in raw physical order -- the swap has to
+                # happen here, not inside it.
+                cross = np.any(edge_chunks[:, 0] != edge_chunks[:, 1], axis=-1)
+                if cross.any():
+                    rows[cross] = rows[cross][:, ::-1]
             keep = (rows >= 0).all(axis=1)
             if keep.any():
                 all_edges.append(np.ascontiguousarray(rows[keep]))

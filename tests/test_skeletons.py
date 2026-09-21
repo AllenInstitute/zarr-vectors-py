@@ -169,3 +169,223 @@ class TestReadBySegmentId:
         )
         skel = read_skeleton_by_segment_id(str(tmp_path / "skel.zv"), 999)
         assert skel is None
+
+
+class TestReadBySegmentIdCrossChunk:
+    """``read_skeleton_by_segment_id`` must also read the OTHER population
+    in the ``links/0/`` family: boundary-crossing parent->child edges
+    written by ``write_skeleton_cross_chunk_links``.
+
+    Before this fix, edge assembly only ever consulted
+    ``read_chunk_link_fragment`` (intra-chunk branch links, keyed by the
+    ``link_fragments/`` sidecar, which -- per its own comment -- only
+    ever partitions the all-zero-offsets array).  Crossings were written
+    correctly and never read back: silent data loss, one edge per chunk
+    boundary an object crosses.
+    """
+
+    def test_crossing_edge_is_read_back(self, tmp_path: Path) -> None:
+        root, lg = _init(tmp_path)
+        piece_a = {
+            "segment_id": 77,
+            "positions": np.array(
+                [[10, 10, 10], [20, 10, 10]], dtype=np.float32,
+            ),
+            "edges": np.array([[1, 0]], dtype=np.int64),
+        }
+        piece_b = {
+            "segment_id": 77,
+            "positions": np.array(
+                [[110, 10, 10], [120, 10, 10]], dtype=np.float32,
+            ),
+            "edges": np.array([[1, 0]], dtype=np.int64),
+        }
+        write_skeleton_chunk(lg, (0, 0, 0), [piece_a])
+        write_skeleton_chunk(lg, (1, 0, 0), [piece_b])
+        # Parent = A's last vertex (chunk-local 1); child = B's first
+        # vertex (chunk-local 0) -- endpoint 0 is the parent, per
+        # write_skeleton_cross_chunk_links's own docstring.
+        write_skeleton_cross_chunk_links(
+            lg, [(((0, 0, 0), 1), ((1, 0, 0), 0))], ndim=3,
+        )
+        write_object_index(
+            lg, {0: [((0, 0, 0), 0), ((1, 0, 0), 0)]},
+            sid_ndim=3, total_objects=1,
+        )
+        write_object_attributes(
+            lg, "segment_id", np.array([77], dtype=np.uint64),
+        )
+
+        skel = read_skeleton_by_segment_id(str(tmp_path / "skel.zv"), 77)
+        assert skel is not None
+        edges = {tuple(e) for e in skel["edges"]}
+        # Global 0,1 = fragment A; global 2,3 = fragment B.  The
+        # crossing must come back as [child, parent] = (2, 1) --
+        # storage leads with the parent, so a reader that forgets to
+        # swap would instead report (1, 2).
+        assert edges == {(1, 0), (3, 2), (2, 1)}
+        assert (1, 2) not in edges, "cross-chunk edge direction reversed"
+        # A connected 4-node tree has exactly 3 edges; a stray
+        # duplicate would inflate the list without changing the set.
+        assert len(skel["edges"]) == 3
+
+    def test_crossing_read_exactly_once_with_two_fragments_in_source_chunk(
+        self, tmp_path: Path,
+    ) -> None:
+        """The chunk holding the crossing's source cell has TWO of this
+        object's fragments in it.  A reader that iterates manifest
+        entries rather than distinct chunks would fetch that cell's
+        cross-chunk record once per fragment and emit the same edge
+        twice; this is exactly the shape of the object built for
+        ``viz_data/out_fixed.zv``.
+        """
+        root, lg = _init(tmp_path)
+        piece_a1 = {
+            "segment_id": 77,
+            "positions": np.array(
+                [[10, 10, 10], [20, 10, 10]], dtype=np.float32,
+            ),
+            "edges": np.array([[1, 0]], dtype=np.int64),
+        }
+        piece_a2 = {
+            "segment_id": 77,
+            "positions": np.array(
+                [[30, 10, 10], [40, 10, 10]], dtype=np.float32,
+            ),
+            "edges": np.array([[1, 0]], dtype=np.int64),
+        }
+        piece_b = {
+            "segment_id": 77,
+            "positions": np.array([[110, 10, 10]], dtype=np.float32),
+            "edges": np.zeros((0, 2), dtype=np.int64),
+        }
+        write_skeleton_chunk(lg, (0, 0, 0), [piece_a1, piece_a2])
+        write_skeleton_chunk(lg, (1, 0, 0), [piece_b])
+        # Parent = A2's second vertex (chunk-local 3: A1 occupies 0-1,
+        # A2 occupies 2-3); child = B's only vertex.
+        write_skeleton_cross_chunk_links(
+            lg, [(((0, 0, 0), 3), ((1, 0, 0), 0))], ndim=3,
+        )
+        write_object_index(
+            lg,
+            {0: [((0, 0, 0), 0), ((0, 0, 0), 1), ((1, 0, 0), 0)]},
+            sid_ndim=3, total_objects=1,
+        )
+        write_object_attributes(
+            lg, "segment_id", np.array([77], dtype=np.uint64),
+        )
+
+        skel = read_skeleton_by_segment_id(str(tmp_path / "skel.zv"), 77)
+        assert skel is not None
+        edges = [tuple(e) for e in skel["edges"]]
+        # Global: A1 -> 0,1; A2 -> 2,3; B -> 4.  Crossing: child=4,
+        # parent=3.
+        assert edges.count((4, 3)) == 1, (
+            "crossing read once per manifest entry instead of once per "
+            "distinct chunk"
+        )
+        assert set(edges) == {(1, 0), (3, 2), (4, 3)}
+
+    def test_negative_offset_segment(self, tmp_path: Path) -> None:
+        """The source cell of a crossing is the PARENT's chunk, and the
+        parent's chunk sorting after the child's is equally valid (see
+        ``TestDirectedCrossChunk``) -- a fix that only derives positive
+        offsets correctly would miss half of all crossings.
+        """
+        root, lg = _init(tmp_path)
+        piece_c = {
+            "segment_id": 77,
+            "positions": np.array(
+                [[110, 10, 10], [120, 10, 10]], dtype=np.float32,
+            ),
+            "edges": np.array([[1, 0]], dtype=np.int64),
+        }
+        piece_d = {
+            "segment_id": 77,
+            "positions": np.array(
+                [[10, 10, 10], [20, 10, 10]], dtype=np.float32,
+            ),
+            "edges": np.array([[1, 0]], dtype=np.int64),
+        }
+        write_skeleton_chunk(lg, (1, 0, 0), [piece_c])
+        write_skeleton_chunk(lg, (0, 0, 0), [piece_d])
+        # Parent in chunk (1,0,0); child in chunk (0,0,0) -- the source
+        # cell is (1,0,0) and the offset to the child is "-1.0.0".
+        write_skeleton_cross_chunk_links(
+            lg, [(((1, 0, 0), 0), ((0, 0, 0), 1))], ndim=3,
+        )
+        segments = lg[links_group_path(0)].children()
+        assert "-1.0.0" in segments, "fixture did not land the intended offset"
+
+        write_object_index(
+            lg, {0: [((1, 0, 0), 0), ((0, 0, 0), 0)]},
+            sid_ndim=3, total_objects=1,
+        )
+        write_object_attributes(
+            lg, "segment_id", np.array([77], dtype=np.uint64),
+        )
+
+        skel = read_skeleton_by_segment_id(str(tmp_path / "skel.zv"), 77)
+        assert skel is not None
+        edges = {tuple(e) for e in skel["edges"]}
+        # Global 0,1 = C (the parent fragment); global 2,3 = D.  Parent
+        # local 0 -> global 0; child local 1 -> global 3.
+        assert (3, 0) in edges
+        assert (0, 3) not in edges, "negative-offset edge direction reversed"
+
+    def test_two_objects_sharing_the_crossing_cell(self, tmp_path: Path) -> None:
+        """Both objects' crossing records are filed in the SAME cell (same
+        source chunk, same offsets segment).  The per-object filter
+        (``_to_global`` returning ``None`` for a foreign index) must keep
+        each object's read from picking up the other's edge.
+        """
+        root, lg = _init(tmp_path)
+        piece_a0 = {
+            "segment_id": 77,
+            "positions": np.array([[10, 10, 10]], dtype=np.float32),
+            "edges": np.zeros((0, 2), dtype=np.int64),
+        }
+        piece_b0 = {
+            "segment_id": 88,
+            "positions": np.array([[20, 10, 10]], dtype=np.float32),
+            "edges": np.zeros((0, 2), dtype=np.int64),
+        }
+        piece_a1 = {
+            "segment_id": 77,
+            "positions": np.array([[110, 10, 10]], dtype=np.float32),
+            "edges": np.zeros((0, 2), dtype=np.int64),
+        }
+        piece_b1 = {
+            "segment_id": 88,
+            "positions": np.array([[120, 10, 10]], dtype=np.float32),
+            "edges": np.zeros((0, 2), dtype=np.int64),
+        }
+        write_skeleton_chunk(lg, (0, 0, 0), [piece_a0, piece_b0])
+        write_skeleton_chunk(lg, (1, 0, 0), [piece_a1, piece_b1])
+        write_skeleton_cross_chunk_links(
+            lg,
+            [
+                (((0, 0, 0), 0), ((1, 0, 0), 0)),  # object 77
+                (((0, 0, 0), 1), ((1, 0, 0), 1)),  # object 88
+            ],
+            ndim=3,
+        )
+        write_object_index(
+            lg,
+            {
+                0: [((0, 0, 0), 0), ((1, 0, 0), 0)],
+                1: [((0, 0, 0), 1), ((1, 0, 0), 1)],
+            },
+            sid_ndim=3, total_objects=2,
+        )
+        write_object_attributes(
+            lg, "segment_id", np.array([77, 88], dtype=np.uint64),
+        )
+
+        skel_a = read_skeleton_by_segment_id(str(tmp_path / "skel.zv"), 77)
+        skel_b = read_skeleton_by_segment_id(str(tmp_path / "skel.zv"), 88)
+        assert skel_a is not None and skel_b is not None
+        assert {tuple(e) for e in skel_a["edges"]} == {(1, 0)}
+        assert {tuple(e) for e in skel_b["edges"]} == {(1, 0)}
+        assert len(skel_a["edges"]) == 1, "object 77 picked up a foreign edge"
+        assert len(skel_b["edges"]) == 1, "object 88 picked up a foreign edge"

@@ -1341,13 +1341,28 @@ def create_resolution_level(
     # Mirror the spatial transform into the NGFF block.
     from zarr_vectors.core.multiscale import upsert_level_transform
     if level == 0:
-        # Level 0: scale = 1.0 per-axis; translation seeded by base_bin/2 if known.
+        # Level 0: scale = 1.0 per-axis; translation seeded by base_bin/2 —
+        # but ONLY when a real sub-chunk bin was actually configured
+        # (root_meta.base_bin_shape, the caller-declared field). Reading
+        # effective_bin_shape here instead — which silently substitutes
+        # chunk_shape when no bin was ever set — produced a translation of
+        # chunk_shape/2 for every store that never configured one at all
+        # (e.g. every skeleton store: init_skeleton_store has no
+        # base_bin_shape parameter to set in the first place). That value
+        # has no correspondence to any actual vertex shift; it just
+        # happened to survive because `upsert_level_transform` only omits
+        # the translation entry when it's exactly zero, and chunk_shape/2
+        # never is. A reader that treats the NGFF block as ground truth
+        # for spatial geometry (as intended — see this function's own
+        # docstring) then applies a spurious half-chunk shift to every
+        # vertex position. See the regression tests this fix adds in
+        # types/skeletons.py's test module for a worked example.
         try:
             root_meta = read_root_metadata(root)
             ndim = root_meta.sid_ndim
-            base_bin = root_meta.effective_bin_shape
+            base_bin = root_meta.base_bin_shape
             scale = [1.0] * ndim
-            translation = [bs / 2.0 for bs in base_bin]
+            translation = [bs / 2.0 for bs in base_bin] if base_bin is not None else None
         except Exception:
             scale = [1.0]
             translation = None

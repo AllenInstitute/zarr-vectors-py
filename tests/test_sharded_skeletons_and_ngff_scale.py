@@ -129,3 +129,55 @@ class TestNGFFScaleFromBinShape:
     def test_level_zero_is_identity(self) -> None:
         path = self._store_with_level1((75.0, 75.0, 75.0))
         np.testing.assert_allclose(self._scale_for(path, "0"), [1.0, 1.0, 1.0])
+
+
+def _translation_for(path: str, level: str) -> list[float] | None:
+    """None if the level's NGFF datasets entry has no translation transform at all."""
+    ms = read_multiscale_metadata(open_store(path))
+    for d in ms[0]["datasets"]:
+        if d["path"] == level:
+            for t in d["coordinateTransformations"]:
+                if t["type"] == "translation":
+                    return t["translation"]
+            return None
+    raise AssertionError(f"no dataset entry for level {level}")
+
+
+class TestLevelZeroTranslationRequiresARealBin:
+    """``create_resolution_level``'s level-0 branch must not invent a bin.
+
+    Before this fix it read ``root_meta.effective_bin_shape`` — which
+    silently substitutes ``chunk_shape`` when no ``base_bin_shape`` was
+    ever configured — so EVERY store with no real sub-chunk binning got a
+    level-0 translation of ``chunk_shape / 2`` anyway. That value has no
+    correspondence to any actual vertex shift; a reader that treats the
+    NGFF block as ground truth for spatial geometry (as intended — see
+    ``create_resolution_level``'s own docstring) then applies a spurious
+    half-chunk shift to the whole layer. Skeleton stores hit this on
+    every store, since ``init_skeleton_store`` has no ``base_bin_shape``
+    parameter at all — there is no bin to report in the first place.
+    """
+
+    def test_skeleton_store_has_no_level0_translation(self) -> None:
+        # _skeleton_store uses chunk_shape=(50,50,50) and never configures
+        # a bin — the exact shape of the bug: effective_bin_shape used to
+        # silently substitute chunk_shape, producing a translation of
+        # (25,25,25) with no corresponding vertex shift anywhere.
+        path = _skeleton_store(None)
+        assert _translation_for(path, "0") is None
+
+    def test_point_cloud_with_a_real_bin_shape_still_gets_one(self) -> None:
+        # The legitimate case must be unaffected: a caller that DOES
+        # configure a real base_bin_shape (write_points' bin_shape=)
+        # still gets translation = bin_shape / 2 at level 0.
+        path = os.path.join(tempfile.mkdtemp(), "ngff.zv")
+        write_points(
+            path,
+            np.random.default_rng(0).uniform(0, 400, (200, 3)).astype("f4"),
+            chunk_shape=(100.0, 100.0, 100.0),
+            bin_shape=(50.0, 50.0, 50.0),
+            bounds=([0.0, 0.0, 0.0], [400.0, 400.0, 400.0]),
+        )
+        np.testing.assert_allclose(
+            _translation_for(path, "0"), [25.0, 25.0, 25.0],
+        )
