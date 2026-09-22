@@ -118,7 +118,7 @@ Three new keys on the level `.zattrs`:
 |---------------------------|------------|-------------------------------------------------------------------------------------------|
 | `chunk_dims`              | `list[str]` | Names of chunk-key axes, leading axis first. e.g. `["gene", "x", "y", "z"]`.            |
 | `chunk_attribute_name`    | `str`      | Name of the per-vertex attribute used as the leading axis.                                |
-| `chunk_attribute_values`  | `list`     | Ordered list mapping `attr_bin` → original attribute value. `[i]` is the value for bin `i`. |
+| `chunk_attribute_values`  | `list`     | One label per bin, in bin order: `[i]` is what `attribute_filter` names to select bin `i`. See *Bin labels* below. |
 
 When `chunk_dims` is absent (legacy stores), readers default to a
 spatial-only layout with `sid_ndim` axes.
@@ -215,6 +215,28 @@ prefix_dim_name="bundle_label")` and runs the standard rechunk engine.
 `categorical=True` disables the legacy quartile fallback in
 `DimensionMapper._map_by_attribute`, which would otherwise collapse
 high-cardinality attributes (>10 unique values) to 4 quartile bins.
+
+#### Bin labels
+
+A rechunk's bins are numbered densely from 0 in the order below, whatever
+bins its `RechunkSpec` could have produced. A bin no object falls in is not
+allocated. A bin's label, its entry in `chunk_attribute_values`, is the
+value `attribute_filter` names to select it:
+
+| `RechunkSpec`                                   | Bin order                  | Label                                  |
+|-------------------------------------------------|----------------------------|----------------------------------------|
+| `by="attribute:<name>"`, categorical            | ascending value            | the value                              |
+| `by="attribute:<name>"` or `by="object_id"`, with `bins` | ascending edge  | the bin's lower edge                   |
+| `by="attribute:<name>"`, quartile fallback      | ascending edge             | the bin's lower edge                   |
+| `by="object_id"`, no `bins`                     | ascending id               | the object id                          |
+| `by="group"`                                    | ascending group index, then ungrouped objects | the group index; `-1` for ungrouped |
+
+A bin cut by edges spans `[edges[i], edges[i + 1])`. Values below the
+first edge fall in the first bin, and the last bin is open above, so
+`bins=[0, 30, 80, inf]` puts a length of 45 in the bin labelled `30`.
+`chunk_attribute_name` is the attribute's name, or the dimension's
+name (`group`, `object_id`, or `prefix_dim_name`) for the other kinds.
+`by="spatial"` has no bins to select between and records no labels.
 
 ### Atomicity and writes
 

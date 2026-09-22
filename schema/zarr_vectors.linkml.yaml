@@ -250,6 +250,14 @@ classes:
       the runtime writes.  The per-entry shape is documented on the slot.
     class_uri: linkml:Any
 
+  BinLabel:
+    description: >
+      One entry of ``chunk_attribute_values``: a string or a number.
+      Modelled as ``linkml:Any`` so the slot's ``any_of`` is the whole
+      constraint -- a plain slot takes the schema's default ``string``
+      range as well, and the generated JSON Schema then demands both.
+    class_uri: linkml:Any
+
   # ----- root + level metadata ------------------------------------------
 
   RootMetadata:
@@ -668,10 +676,18 @@ slots:
     range: string
   chunk_attribute_values:
     description: >
-      Ordered list mapping attribute-bin index to original attribute
-      value.  Must be non-empty when set, and coherent with
-      ``chunk_attribute_name`` (both set or both absent).
-    range: string
+      One label per leading-axis bin, in bin order: entry ``i`` is what a
+      reader's ``attribute_filter`` names to select bin ``i``, so its
+      length is the bin count.  A categorical bin is labelled by its
+      value (a string or a number), a bin cut by edges by its lower edge,
+      and a group bin by its group index (``-1`` for ungrouped objects,
+      which are the last bin).  Must be non-empty when set, and coherent
+      with ``chunk_attribute_name`` (both set or both absent).
+    range: BinLabel
+    any_of:
+      - range: string
+      - range: integer
+      - range: float
     multivalued: true
   preserves_object_ids:
     description: >
