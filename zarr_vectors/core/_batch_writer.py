@@ -190,10 +190,20 @@ def _flush_one_array(
     for chunk_key, (data, _record_presence) in cells.items():
         coords = tuple(int(p) for p in chunk_key.split("."))
         # Cell index = coord - origin (grid anchored at min coord).
+        # A rank disagreement leaves the coords alone rather than letting
+        # ``zip`` truncate them into a plausible-looking wrong cell; the
+        # arity check below then rejects it. Same reasoning as
+        # ``group._coord_to_index``.
         index = (
-            coords if origin is None
+            coords if origin is None or len(coords) != len(origin)
             else tuple(c - o for c, o in zip(coords, origin))
         )
+        if len(index) != ndim:
+            raise StoreError(
+                f"Cannot write to array {array_name!r}: chunk_key "
+                f"{chunk_key!r} has rank {len(index)} but the array's "
+                f"grid has rank {ndim}"
+            )
         for ax in range(ndim):
             axis_coords[ax].append(index[ax])
         values.append(bytes(data))

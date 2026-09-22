@@ -2460,8 +2460,21 @@ async def _any_key_under(store: Any, prefix: str) -> bool:
 def _coord_to_index(
     coords: tuple[int, ...], origin: tuple[int, ...] | None,
 ) -> tuple[int, ...]:
-    """Translate an absolute chunk coord to a 0-based array index."""
-    if origin is None:
+    """Translate an absolute chunk coord to a 0-based array index.
+
+    A coord whose rank does not match the origin's is returned UNCHANGED
+    rather than zipped.  ``zip`` truncates to the shorter sequence, which
+    turned a rank disagreement into a silently wrong cell: a rank-4 key
+    against a rank-3 origin produced a rank-3 index that dropped the last
+    spatial axis and offset the leading one by the wrong origin
+    component, then passed the length check in
+    :func:`_coords_in_bounds` and aliased every key differing only in the
+    dropped axis onto one cell.  Returning the coords lets that same
+    length check reject them, which is what every caller here already
+    handles -- :meth:`Group.read_bytes` treats it as absent,
+    :meth:`Group.write_bytes` raises.
+    """
+    if origin is None or len(coords) != len(origin):
         return coords
     return tuple(c - o for c, o in zip(coords, origin))
 
@@ -2574,6 +2587,19 @@ def _coords_in_bounds(coords: tuple[int, ...], shape: tuple[int, ...]) -> bool:
 def _check_coords_in_bounds(
     coords: tuple[int, ...], shape: tuple[int, ...], array_name: str,
 ) -> None:
+    if len(coords) != len(shape):
+        # Named separately from an out-of-range coord because the cause
+        # is different and the fix is elsewhere: the array was allocated
+        # at the wrong rank, not addressed at the wrong place.  The usual
+        # reason is a level chunked by an attribute -- its keys carry a
+        # leading bin axis -- whose array was allocated spatial-only.
+        raise StoreError(
+            f"Chunk coords {coords} have rank {len(coords)} but array "
+            f"{array_name!r} has grid {shape}, rank {len(shape)}. The "
+            f"array was allocated at the wrong rank for this level; if "
+            f"the level is chunked by an attribute its keys carry a "
+            f"leading bin axis that the array does not have."
+        )
     if not _coords_in_bounds(coords, shape):
         raise StoreError(
             f"Chunk coords {coords} out of grid {shape} for "

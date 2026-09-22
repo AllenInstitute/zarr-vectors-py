@@ -289,6 +289,51 @@ def _default_fill_value_for_dtype(dtype: np.dtype) -> Any:
 _UNSET = object()
 
 
+def _leading_grid_axes(
+    level_group: Group, level_meta: Any, spatial_rank: int,
+) -> tuple[int, ...]:
+    """Extents of the level's non-spatial LEADING grid axes, if any.
+
+    A level chunked by an attribute puts the attribute bin first in every
+    chunk key -- ``gene.z.y.x`` -- and its per-chunk arrays are allocated
+    one axis wider to match, extent ``K`` bins.  ``()`` for an ordinary
+    spatial level.
+
+    Two sources, because neither covers everything:
+
+    1. **An existing sibling.**  ``vertices`` is allocated before anything
+       else in the level, by a writer that knew the bin count, so its
+       shape IS the level's grid.  This is the same ground truth readers
+       already use -- :func:`_chunks_in_box` takes ``len(shape) - ndim``
+       off the allocated array rather than off metadata.
+    2. **``LevelMetadata.chunk_attribute_values``**, whose length is the
+       bin count.  It is what ``bin_count`` already is at every
+       :func:`open_write_session` call site, and the spec names it the
+       authoritative bin-to-value map.
+
+    Source 2 alone is not enough: ``rechunk`` sets ``chunk_dims``
+    unconditionally but ``chunk_attribute_*`` only for ``attribute:``
+    specs, so a group- or object-id rechunk yields a wider grid with no
+    bin values recorded at all.  Source 1 is what covers those.
+
+    ``chunk_dims`` is deliberately NOT consulted.  It carries axis
+    *names*, nothing validates it against the spatial rank or against the
+    other two fields, and no other code reads its length.
+
+    The mirror-image repair on the scale side is :func:`_pad_scale`,
+    which front-pads chunk-scale factors for the same skew.
+    """
+    arr = level_group._sharded_chunk_array(VERTICES)
+    if arr is not None and arr.ndim > spatial_rank:
+        return tuple(int(x) for x in arr.shape[: arr.ndim - spatial_rank])
+
+    values = getattr(level_meta, "chunk_attribute_values", None)
+    if values:
+        return (len(values),)
+
+    return ()
+
+
 def _derive_native_config(level_group: Group) -> dict[str, Any] | None:
     """Best-effort single-array grid config from the store's metadata.
 
@@ -329,10 +374,23 @@ def _derive_native_config(level_group: Group) -> dict[str, Any] | None:
         root_meta = read_root_metadata(root_group)
         try:
             level_meta = LevelMetadata.from_dict(level_group.attrs.to_dict())
-        except Exception:
+        except (MetadataError, KeyError, ValueError, TypeError):
+            # Narrow: a blanket except here drops the bin axis below and
+            # silently allocates at the spatial rank, which is the bug
+            # this function's leading-axis handling exists to fix.
             level_meta = None
         chunk_shape = get_level_chunk_shape(root_meta, level_meta)
         origin, grid_shape = level_grid_layout(root_meta.bounds, chunk_shape)
+        # A level chunked by an attribute carries leading bin axes that
+        # the spatial derivation above knows nothing about.  Prepending
+        # them here is what makes an array allocated WITHOUT a write
+        # session -- an attribute array created by a decentralised worker,
+        # a links segment created by an edit -- come out at the same rank
+        # as the level's own keys.  Mirrors ``open_write_session``'s
+        # ``bin_count`` handling, including anchoring the bin axis at 0.
+        leading = _leading_grid_axes(level_group, level_meta, len(grid_shape))
+        origin = (*((0,) * len(leading)), *origin)
+        grid_shape = (*leading, *grid_shape)
         cfg = {
             "origin": origin,
             "grid_shape": grid_shape,
@@ -344,6 +402,7 @@ def _derive_native_config(level_group: Group) -> dict[str, Any] | None:
             # everything else.
             "shard_shape": normalise_shard_shape(
                 root_meta.shard_shape, len(grid_shape),
+                bin_axis=bool(leading),
             ),
         }
     except (StoreError, MetadataError, KeyError, ValueError, TypeError):
@@ -497,7 +556,7 @@ def _ensure_array_dir(
         level_group.create_sharded_chunk_array(
             array_name,
             grid_shape=cfg["grid_shape"],
-            shard_shape=cfg["shard_shape"],
+            shard_shape=cfg.get("shard_shape"),
             origin=cfg.get("origin"),
             compressors=compressors,
             attributes=attributes,
