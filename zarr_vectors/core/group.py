@@ -33,10 +33,10 @@ Public surface mirrors the legacy :class:`FsGroup` for back-compat:
 from __future__ import annotations
 
 import warnings
-from collections.abc import Iterable, Iterator, Sequence
+from collections.abc import Callable, Iterable, Iterator, Sequence
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any, Literal, NamedTuple
 
 import numpy as np
 import zarr
@@ -140,6 +140,14 @@ class Group:
     # without needing to remember to set the attributes.
     # Queued cell writes: (array_name, chunk_key, data, record_presence).
     _pending_writes: list[tuple[str, str, bytes, bool]] | None = None
+    # Collected presence stamps: (array_name, chunk_key, present).  Set by
+    # :meth:`collect_presence`; while it is set the two stamp sites append
+    # here instead of writing ``nonempty_chunks``, and the PAYLOADS still
+    # go out inline -- which is the whole difference from
+    # ``_pending_writes``.  Deliberately NOT propagated to derived Groups:
+    # a collecting token is per-worker state, and sharing it across
+    # threads would reintroduce the interleaving this exists to remove.
+    _pending_presence: list[tuple[str, str, bool]] | None = None
     _pending_array_metas: dict[str, dict[str, Any]] | None = None
     _prefetch_cache: dict[tuple[str, str], bytes] | None = None
     # Active codec spec for chunk-array writes, set by
@@ -202,6 +210,7 @@ class Group:
         # against the underlying Store on context exit.
         self._pending_writes = None
         self._pending_array_metas = None
+        self._pending_presence = None
         # Prefetch cache activated by :meth:`batched_reads`.  When set,
         # :meth:`read_bytes` looks here first before hitting the store.
         self._prefetch_cache = None
@@ -222,6 +231,7 @@ class Group:
         instance._zarr = zarr_group
         instance._pending_writes = None
         instance._pending_array_metas = None
+        instance._pending_presence = None
         instance._prefetch_cache = None
         instance._active_codecs = None
         # An offline snapshot covers the whole tree, so a Group derived
@@ -412,7 +422,12 @@ class Group:
             return
         _vlen_set_cell(sharded_arr, index, bytes(data))
         if record_presence:
-            _record_nonempty_chunk(sharded_arr, chunk_key, present=bool(data))
+            if self._pending_presence is not None:
+                self._pending_presence.append((array_name, chunk_key, bool(data)))
+            else:
+                _record_nonempty_chunk(
+                    sharded_arr, array_name, chunk_key, present=bool(data),
+                )
 
     def write_cells(
         self,
@@ -459,7 +474,14 @@ class Group:
                 continue
             _vlen_set_cell(sharded_arr, index, bytes(data))
             if record_presence:
-                _record_nonempty_chunk(sharded_arr, chunk_key, present=bool(data))
+                if self._pending_presence is not None:
+                    self._pending_presence.append(
+                        (array_name, chunk_key, bool(data))
+                    )
+                else:
+                    _record_nonempty_chunk(
+                        sharded_arr, array_name, chunk_key, present=bool(data),
+                    )
         return n
 
     @contextmanager
@@ -803,6 +825,14 @@ class Group:
         """
         if self._pending_writes is not None:
             raise StoreError("batched_writes() does not support nesting")
+        if self._pending_presence is not None:
+            raise StoreError(
+                "batched_writes() cannot run inside collect_presence(): this "
+                "block stamps nonempty_chunks itself when it flushes, which "
+                "would land the very stamps the collecting block is holding "
+                "back -- and land them on the flush's thread, outside "
+                "whatever lock the caller meant to apply them under."
+            )
         from zarr_vectors.encoding.compression import resolve_compressor
 
         codecs = resolve_compressor(compressor)
@@ -842,6 +872,143 @@ class Group:
             # freshly-resolved nodes, so anything held here is stale the
             # moment the session ends.
             self._node_cache = None
+
+    @contextmanager
+    def collect_presence(self) -> Iterator[list[tuple[str, str, bool]]]:
+        """Defer the ``nonempty_chunks`` stamps inside the block, so the
+        caller decides when — and under what lock — they are applied.
+
+        The third presence mode, for a writer that can serialise a short
+        section but not the whole flush.  The other two each give up one
+        of the properties such a writer needs:
+
+        * ``record_presence=True`` (the default) stamps inline.  Correct
+          serially, but the manifest is ONE attribute shared by every
+          cell, so it is a read-modify-write of state outside the cell
+          being written: two workers writing DISJOINT cells still race,
+          and the loser's key vanishes while its payload sits on disk.
+        * ``record_presence=False`` plus a coordinator's
+          :func:`zarr_vectors.building.rebuild_presence` has no race, but
+          the cell is invisible to :meth:`list_chunks` until the rebuild
+          runs — and consumers legitimately run before it.
+
+        Inside the block, any write that would stamp instead records
+        ``(array_name, chunk_key, present)`` into the yielded list.  The
+        PAYLOADS ARE NOT DEFERRED: they go out inline, exactly as they
+        would otherwise, which is the essential difference from
+        :meth:`batched_writes`.  So the bulk of the I/O proceeds
+        unlocked and only :meth:`apply_presence` needs serialising::
+
+            with level_group.collect_presence() as pending:
+                flush(level_group)          # payloads, no lock held
+            with store_write_lock(path):    # short, lock held
+                level_group.apply_presence(pending)
+
+        Leaving the block restores normal stamping but DOES NOT apply —
+        the caller choosing the moment is the entire point.  ``pending``
+        is the list itself, so if the body raises it is still fully
+        populated and still applicable; the payloads that did land are
+        recorded, and applying is how they become visible.
+
+        ``record_presence=False`` is still honoured inside the block: an
+        opt-out is a decision not to stamp at all, not a request to stamp
+        later.
+
+        ``pending`` belongs to one thread.  This Group must not be shared
+        across workers while collecting, and the token must not be handed
+        to another thread to apply.
+
+        Nesting is not supported and raises :class:`StoreError`, as is
+        collecting inside :meth:`batched_writes` — that block defers the
+        payloads too and stamps its own manifest at flush time, so the
+        two cannot both own the stamp.
+        """
+        if self._pending_presence is not None:
+            raise StoreError("collect_presence() does not support nesting")
+        if self._pending_writes is not None:
+            raise StoreError(
+                "collect_presence() cannot run inside batched_writes(): that "
+                "block defers the cell payloads and stamps nonempty_chunks "
+                "itself when it flushes, so the stamps are not this block's "
+                "to collect. Use chunk_array_codecs() if what you wanted was "
+                "the codec selection without the deferred writes."
+            )
+        pending: list[tuple[str, str, bool]] = []
+        self._pending_presence = pending
+        try:
+            yield pending
+        finally:
+            self._pending_presence = None
+
+    def apply_presence(self, pending: list[tuple[str, str, bool]]) -> int:
+        """Apply stamps collected by :meth:`collect_presence`.
+
+        Coalesced to ONE read-modify-write of ``nonempty_chunks`` per
+        array, not one per cell.  That is what makes the call short
+        enough to hold a lock across, and it is fewer attribute writes
+        than stamping each in turn would have been.
+
+        Entries are folded in order, so the last write to a chunk key
+        wins: present-then-absent within a block leaves the key absent,
+        matching the ``present=bool(data)`` semantics of an inline stamp.
+
+        Each array is re-resolved BY NAME here rather than through a
+        handle held from collection time — a sharded array resolves via
+        ``_sharded_chunk_array``, and the level may have been re-opened
+        in between.
+
+        Applying an empty ``pending`` is a no-op, not an error, so a
+        caller need not test before calling.
+
+        Returns:
+            How many arrays were stamped.
+
+        Raises:
+            StoreError: If an array named in ``pending`` is gone.
+        """
+        if not pending:
+            return 0
+
+        # dict preserves insertion order and last-write-wins, which IS
+        # the ordering rule -- no explicit sort or dedupe needed.
+        by_array: dict[str, dict[str, bool]] = {}
+        for array_name, chunk_key, present in pending:
+            by_array.setdefault(array_name, {})[chunk_key] = present
+
+        for array_name, stamps in by_array.items():
+            arr = self._sharded_chunk_array(array_name)
+            if arr is None:
+                raise StoreError(
+                    f"Cannot apply presence to {array_name!r} in "
+                    f"{self._zarr.path or '<root>'}: no chunk array at that "
+                    f"path. The cells were written, so the array existed "
+                    f"when they landed; it has been deleted or replaced "
+                    f"since. Rebuild with rebuild_presence() instead."
+                )
+            current = arr.attrs.get(_NONEMPTY_CHUNKS_ATTR)
+            keys = set(current) if current else set()
+            for chunk_key, present in stamps.items():
+                if present:
+                    keys.add(chunk_key)
+                else:
+                    keys.discard(chunk_key)
+            # Same mechanism as ``_record_nonempty_chunk``, so the handle
+            # we just resolved keeps serving the value we just wrote.
+            arr.attrs[_NONEMPTY_CHUNKS_ATTR] = sorted(keys)
+            # ``_chunk_listing`` memoizes the manifest and has no refresh
+            # path, so a warm entry would keep answering with the
+            # pre-stamp list and defeat the visibility this call exists
+            # to provide.  Targeted rather than ``_invalidate_node``,
+            # which would also drop the node handle and the unrelated
+            # object-id lookup.  Belt-and-braces: ``cached_nodes`` is
+            # documented read-only, so a caller mixing the two is
+            # already outside the contract.
+            if self._listing_cache:
+                self._listing_cache.pop(self._full_path(array_name), None)
+            for chunk_key, present in stamps.items():
+                _emit_presence(array_name, chunk_key, present)
+
+        return len(by_array)
 
     @contextmanager
     def native_sharded_arrays(
@@ -1811,6 +1978,13 @@ class Group:
         ordering :func:`zarr_vectors.sharding.shard_store` already
         requires.  Returns the sorted keys now recorded.
 
+        Not reported to :func:`observe_presence_writes`.  That instrument
+        watches the INCREMENTAL stamps, where a read-modify-write of
+        shared state can lose a key; this rebuild derives the whole
+        manifest from what is on disk, so it is idempotent, has no
+        per-cell semantics, and there is nothing for an observer to
+        police.
+
         Args:
             on_sharded: What to do when ``array_name`` *is* natively
                 sharded.  ``"raise"`` (the default) raises
@@ -2077,6 +2251,82 @@ def _local_root(store: LocalStore) -> Path:
 # scanning every shard tail.
 _NONEMPTY_CHUNKS_ATTR = "nonempty_chunks"
 
+
+class PresenceEvent(NamedTuple):
+    """One stamp applied to an array's ``nonempty_chunks`` manifest.
+
+    Delivered to whatever :func:`observe_presence_writes` has installed.
+    ``present`` mirrors ``_record_nonempty_chunk``'s own argument: True
+    added the key, False discarded it.
+    """
+
+    array_name: str
+    chunk_key: str
+    present: bool
+
+
+# Installed by :func:`observe_presence_writes`.  A list rather than a
+# single slot so the block nests, and module-level rather than per-Group
+# because the writers that stamp are spread across Group, the batch
+# flush and apply_presence.
+_presence_observers: list[Callable[[PresenceEvent], None]] = []
+
+
+@contextmanager
+def observe_presence_writes(
+    callback: Callable[[PresenceEvent], None],
+) -> Iterator[None]:
+    """Call ``callback`` for every incremental ``nonempty_chunks`` stamp.
+
+    An INSTRUMENT, not a data API: it exists so a test can assert *where*
+    a stamp happened — inside a lock, on which thread — which nothing
+    observable from the store can answer after the fact.  Reach for
+    :meth:`Group.list_chunks` to ask what the manifest says.
+
+    ``callback`` runs SYNCHRONOUSLY, on the thread performing the write,
+    at the moment the stamp lands.  That is the whole point: a caller
+    checking its own lock depth can only do so while the write is
+    happening, so an async or batched-at-exit notification would answer a
+    different question.  Keep the callback cheap and non-raising — it
+    runs in the ``write_bytes`` hot path, and an exception propagates
+    into the writer.
+
+    Covers the INCREMENTAL stamp sites: :meth:`Group.write_bytes`,
+    :meth:`Group.write_cells`, :meth:`Group.apply_presence` and the
+    :meth:`Group.batched_writes` flush.  NOT
+    :meth:`Group.derive_nonempty_chunks`, which rebuilds the whole
+    manifest from the store listing: it is idempotent and has no
+    per-cell semantics, so it cannot lose a key the way a
+    read-modify-write can, and there is nothing there to police.
+
+    Example::
+
+        seen = []
+        with observe_presence_writes(seen.append):
+            write_chunk_vertices(level_group, (0, 0, 0), positions)
+        assert [e.chunk_key for e in seen] == ["0.0.0"]
+    """
+    _presence_observers.append(callback)
+    try:
+        yield
+    finally:
+        _presence_observers.remove(callback)
+
+
+def _emit_presence(array_name: str, chunk_key: str, present: bool) -> None:
+    """Notify observers that ``chunk_key``'s stamp just landed.
+
+    The empty-list check is why this is cheap enough to sit in the write
+    path: with nothing installed it costs one truth test and no
+    allocation.
+    """
+    if not _presence_observers:
+        return
+    event = PresenceEvent(array_name, chunk_key, present)
+    # Copy: a callback is allowed to unwind its own block.
+    for callback in tuple(_presence_observers):
+        callback(event)
+
 # Per-array attribute holding the chunk-grid origin (``floor(min_corner
 # / chunk_shape)`` per axis).  A single vlen array is 0-indexed, so a
 # spatial chunk at coord ``c`` lands in cell ``c - origin``.  Absent (the
@@ -2252,7 +2502,7 @@ def _vlen_set_cell(
 
 
 def _record_nonempty_chunk(
-    arr: zarr.Array, chunk_key: str, *, present: bool,
+    arr: zarr.Array, array_name: str, chunk_key: str, *, present: bool,
 ) -> None:
     """Update the per-array ``nonempty_chunks`` manifest.
 
@@ -2260,6 +2510,9 @@ def _record_nonempty_chunk(
     consulted by :meth:`Group.list_chunks` and :meth:`chunk_exists` so
     those calls don't have to scan every shard tail just to enumerate
     non-empty cells.
+
+    ``array_name`` is carried only to name the array in the
+    :func:`observe_presence_writes` event; ``arr`` is what gets written.
     """
     current = arr.attrs.get(_NONEMPTY_CHUNKS_ATTR)
     keys = set(current) if current else set()
@@ -2268,6 +2521,7 @@ def _record_nonempty_chunk(
     else:
         keys.discard(chunk_key)
     arr.attrs[_NONEMPTY_CHUNKS_ATTR] = sorted(keys)
+    _emit_presence(array_name, chunk_key, present)
 
 
 def _json_safe(d: dict[str, Any]) -> dict[str, Any]:

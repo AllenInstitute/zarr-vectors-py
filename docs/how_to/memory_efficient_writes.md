@@ -150,6 +150,12 @@ attribute shared by every cell of an array, so a partition that stamps it
 races every other partition. Partitions skip it; the coordinator rebuilds it
 once, below.
 
+That rebuild is also what makes the cells *visible*: until it runs,
+`list_chunks` reports none of them. If something downstream reads the store
+before the coordinator gets there, deferring the stamp to your own lock keeps
+both properties — see
+[Stamping under your own lock](hpc_pipelines.md#stamping-under-your-own-lock).
+
 ### One fragment per bin, not one per cell
 
 The `verts` list above has one entry per *bin*, most of them empty. That is
@@ -200,7 +206,9 @@ ReadResult(kind='point_cloud', vertices=16000, attributes=['intensity'])
 `refresh_arrays_present` walks the level rather than trusting the list the
 writers declared, which is why `vertex_fragments` appears even though the
 `LevelMetadata` above never mentioned it. Both verbs are coordinator-only:
-never run either while partitions are still writing.
+never run either while partitions are still writing. A writer that has no
+coordinator to wait for should use `collect_presence` / `apply_presence`
+instead of `rebuild_presence`.
 
 Coarser levels come afterwards, from the finished store:
 

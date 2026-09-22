@@ -66,6 +66,7 @@ from zarr_vectors.constants import (
 )
 from zarr_vectors.core.arrays import (
     OBJECT_INDEX_LAYOUT_V1,
+    OBJECT_INDEX_MANIFEST_BUCKET,
     attribute_layout,
     # --- links ---
     cell_endpoint_chunks,
@@ -134,7 +135,7 @@ from zarr_vectors.core.arrays import (
     write_object_attributes,
     write_object_index,
 )
-from zarr_vectors.core.group import Group
+from zarr_vectors.core.group import Group, observe_presence_writes
 from zarr_vectors.core.metadata import (
     LevelMetadata,
     RootMetadata,
@@ -273,6 +274,7 @@ GROUP_SUPPORTED_METHODS: frozenset[str] = frozenset({
     # batching + presence
     "batched_reads", "batched_writes", "offline_reads", "chunk_array_codecs",
     "derive_nonempty_chunks", "native_sharded_arrays",
+    "collect_presence", "apply_presence",
     # identity
     "url", "prefix", "path",
 })
@@ -624,6 +626,7 @@ __all__ = [
     "OBJECT_ATTRIBUTES",
     "OBJECT_INDEX",
     "OBJECT_INDEX_LAYOUT_V1",
+    "OBJECT_INDEX_MANIFEST_BUCKET",
     "ObjectIndexAppender",
     "RechunkSpec",
     "RootMetadata",
@@ -696,6 +699,7 @@ __all__ = [
     "list_resolution_levels",
     "neighbouring_chunk_keys",
     "object_count",
+    "observe_presence_writes",
     "open_store",
     "open_write_session",
     "parse_offsets",
