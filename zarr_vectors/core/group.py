@@ -2440,20 +2440,44 @@ def _grid_origin(arr: zarr.Array) -> tuple[int, ...] | None:
     return tuple(int(x) for x in raw)
 
 
+def _listable_prefix(cells_prefix: str) -> str:
+    """The array node a ``<array>/c/`` prefix lives under.
+
+    Listing is asked of the ARRAY'S prefix and filtered to its cells,
+    never of ``c/`` directly: icechunk accepts only a prefix that names a
+    group or an array, and ``c/`` is neither, so asking for it raised on
+    every icechunk store -- which took ``write_points`` down with it once
+    the layout check started asking the store whether an array is empty.
+    The cost is the array's own ``zarr.json`` in the listing, dropped by
+    the filter.
+    """
+    if not cells_prefix.endswith("c/"):
+        raise ValueError(f"not a cell prefix: {cells_prefix!r}")
+    return cells_prefix[: -len("c/")]
+
+
 async def _collect_store_prefix(store: Any, prefix: str) -> list[str]:
-    return [key async for key in store.list_prefix(prefix)]
+    return [
+        key async for key in store.list_prefix(_listable_prefix(prefix))
+        if key.startswith(prefix)
+    ]
 
 
 def _list_store_prefix(store: Any, prefix: str) -> list[str]:
-    """List every stored key under ``prefix`` (a zarr Store is async-only)."""
+    """List every stored key under the cell prefix ``<array>/c/``.
+
+    A zarr Store is async-only, hence the ``sync``.  See
+    :func:`_listable_prefix` for why the listing starts one level up.
+    """
     from zarr.core.sync import sync
 
     return sync(_collect_store_prefix(store, prefix))
 
 
 async def _any_key_under(store: Any, prefix: str) -> bool:
-    async for _key in store.list_prefix(prefix):
-        return True
+    async for key in store.list_prefix(_listable_prefix(prefix)):
+        if key.startswith(prefix):
+            return True
     return False
 
 

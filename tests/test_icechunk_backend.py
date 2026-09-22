@@ -227,3 +227,23 @@ def test_write_points_auto_commits(ic_repo_path: str) -> None:
     # should have flushed the session before write_points returned.
     out = read_points(ic_repo_path, backend="icechunk")
     assert out["vertex_count"] == 32
+
+
+def test_rebuild_presence_lists_cells_on_icechunk(ic_repo_path: str) -> None:
+    """icechunk refuses a listing prefix that is not a node, and
+    ``<array>/c/`` is not one; the rebuild lists the array and filters."""
+    import numpy as np
+    from zarr_vectors.building import get_resolution_level, rebuild_presence
+    from zarr_vectors.types.points import write_points
+
+    rng = np.random.default_rng(1)
+    write_points(
+        ic_repo_path, rng.uniform(0, 100, (64, 3)).astype(np.float32),
+        chunk_shape=(50.0, 50.0, 50.0), backend="icechunk",
+    )
+    root = open_store(ic_repo_path, backend="icechunk", mode="r+")
+    level = get_resolution_level(root, 0)
+    recorded = level.list_chunks("vertices")
+    assert recorded
+
+    assert rebuild_presence(level, "vertices") == recorded
