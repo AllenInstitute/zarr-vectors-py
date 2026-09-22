@@ -128,62 +128,23 @@ deadlock: the caller's loop and zarr's loop have different executors.
 
 ---
 
-## 3. `rechunk` produces non-dense bins that readers resolve wrongly
+## 3. `rechunk` leftovers after the bin fix
 
-**Severity: high — silent wrong data.** `rechunk` / `rechunk_by_attribute` /
-`RechunkSpec` are all on the supported surface (`building/__init__.py:200`).
+**Severity: low.** The non-dense bins, per-object reads, group rewrite and
+dtype were fixed on `todo-backlog`; these were left out of scope.
 
-`rechunk/engine.py` carries **four** notions of bin count:
-
-| | site | value |
-|---|---|---|
-| bins actually used | `engine.py:134-137` | `sorted(set(obj_to_bin.values()))` |
-| grid extent | `engine.py:211` | `max(unique_bins) + 1` |
-| `chunk_attribute_values` | `engine.py:183-185` | compacted `[bin_to_value[b] for b in sorted(...)]`, length `len(unique_bins)` |
-| chunk key prefixes | `engine.py:230,268,287` | the raw `bin_idx` |
-
-Readers resolve a value positionally through the compacted list —
-`chunk_attribute_values.index(v)` at `types/points.py:904`, `lazy/level.py:234`
-and the four sibling type readers. So with a hole:
-
-- `unique_bins = [0, 2]` → asking for bin 2's value gives index 1 → filters
-  `k[0] == 1` → **empty result, no error**.
-- `unique_bins = [0, 2, 3]` → asking for bin 3's value gives index 2 →
-  **returns bin 2's data under bin 3's label**.
-
-Verified producers of holes: `_map_by_attribute` with explicit `bins`
-(`spec.py:162-165` — e.g. `bins=[0,30,80,inf]` gives `unique_bins=[0,2]`),
-`_map_by_object_id` with `bins`, and `_map_by_group` (empty groupings).
-`assign_attribute_bins` (`core/attr_chunking.py:82-87`) is dense by
-construction, which is why the non-rechunk writers never trip this.
-
-**Suggested fix:** canonicalise once — remap `obj_to_bin` through
-`{old: new for new, old in enumerate(sorted(unique_bins))}` before anything
-consumes it, so keys, grid extent and the values list agree by construction.
-
-**Related in the same file:**
-- **`-1` bins.** `_map_by_group` assigns `-1` to ungrouped objects
-  (`spec.py:114-117`). The key `(-1, z, y, x)` raises `StoreError` from
-  `_check_coords_in_bounds` — and since the rank now matches, it raises with the
-  *rank* diagnosis, which is the wrong message. All-ungrouped gives
-  `max([-1])+1 == 0`, i.e. a zero-extent leading axis. A remap makes `-1` simply
-  bin 0; decide whether that is the wanted semantics and document it.
-- **`by="object_id"` with `bins=None`** gives `{oid: oid}` (`spec.py:123-125`).
-  10 000 objects → a 10 000-wide leading axis, and the loop at
-  `engine.py:230-293` is O(n²). Scaling bug, not correctness.
-- **`bin_to_value` records the value of the lowest oid in each bin**
-  (`engine.py:173-181`), not a bin edge. For a continuous `bins=[...]` rechunk
-  the stored `chunk_attribute_values` is a list of arbitrary sample values, so
-  `.index(v)` can only match by luck even when bins are dense.
-- **`by="spatial"`** yields a pointless extent-1 leading axis and
-  `chunk_dims[0] == "spatial"`.
-
-**Tests:** no test in `tests/test_rechunk_by_attribute.py` reads data back — all
-six stop at `read_level_metadata`, and the one that asserts the values list uses
-a sorted-set comparison, which is blind to a positional shift. The
-non-dense-capable config is exercised at
-`tests/integration/test_lazy_sharding_rechunk.py:339-363` but only asserts
-`bins_created >= 2`.
+- **`by="spatial"`** still writes a pointless extent-1 leading axis with
+  `chunk_dims[0] == "spatial"`, and records no labels. `rechunk_spatial`
+  (`rechunk/spatial.py:355`) does the spatial job losslessly; decide whether
+  `by="spatial"` should delegate to it or be removed.
+- **Object ids are renumbered** by a running counter in bin order, so they
+  no longer join back to the source, and object attributes are not
+  copied. Links are never copied either, so only a point cloud survives a
+  non-spatial rechunk intact (see the module docstring of
+  `rechunk/spatial.py`).
+- **`chunk_attribute_name` vs `chunk_dims[0]`** disagree for an explicit
+  `RechunkSpec(by="attribute:x")` without `prefix_dim_name`: the name is `x`,
+  the axis is `attribute`.
 
 ---
 

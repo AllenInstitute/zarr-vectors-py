@@ -21,6 +21,7 @@ from zarr_vectors.core.arrays import (
     create_vertices_array,
     read_all_object_manifests,
     read_object_vertices,
+    vertices_dtype,
     write_chunk_vertices,
     write_object_index,
 )
@@ -34,7 +35,6 @@ from zarr_vectors.core.store import (
     read_root_metadata,
 )
 from zarr_vectors.rechunk.spec import DimensionMapper, RechunkSpec
-from zarr_vectors.spatial.chunking import assign_chunks
 from zarr_vectors.typing import ChunkCoords, ObjectManifest
 
 
@@ -121,20 +121,31 @@ def rechunk(
     # Map objects to rechunk bins
     mapper = DimensionMapper(spec)
     if n_objects > 0:
-        obj_to_bin = mapper.map_objects(
+        raw_bins = mapper.map_objects(
             n_objects=n_objects,
             groupings=groupings,
             object_attributes=object_attributes,
         )
     else:
         # No objects — rechunk spatially only
-        obj_to_bin = {}
+        raw_bins = {}
 
-    # Determine unique bins
-    if obj_to_bin:
-        unique_bins = sorted(set(obj_to_bin.values()))
-    else:
-        unique_bins = [0]
+    # Renumber the bins densely before anything consumes them.  The
+    # mapper's indices can have holes -- edges no object falls between,
+    # an empty group -- and a reader resolves a value to a bin by its
+    # position in chunk_attribute_values.  With holes, the key prefixes
+    # and the grid kept the raw index while that list was compacted, so a
+    # query came back empty, or with another bin's data under its label.
+    # Ungrouped objects (-1) go last, so group g stays ahead of them.
+    used = sorted(set(raw_bins.values()) - {-1})
+    if -1 in raw_bins.values():
+        used.append(-1)
+    renumber = {old: new for new, old in enumerate(used)}
+    obj_to_bin = {oid: renumber[b] for oid, b in raw_bins.items()}
+    unique_bins = list(range(len(used))) or [0]
+    by_bin: dict[int, list[int]] = {b: [] for b in unique_bins}
+    for oid in sorted(obj_to_bin):
+        by_bin[obj_to_bin[oid]].append(oid)
 
     # Create output store
     spatial_dim_names = [
@@ -159,30 +170,18 @@ def rechunk(
         base_bin_shape=src_meta.base_bin_shape,
     )
 
-    # Compute the bin → original-value list for attribute-based rechunking.
-    # Only meaningful when ``by="attribute:..."`` and we have the source
-    # values; non-attribute rechunks leave chunk_attribute_* unset.
+    # One label per bin, in bin order: what a reader's attribute_filter
+    # names to select it.  Recorded for group and object-id rechunks too,
+    # under the dimension's name: renumbering is otherwise the one step
+    # that loses which bin holds which group.
     chunk_attribute_name: str | None = None
     chunk_attribute_values: list[Any] | None = None
-    if spec.by.startswith("attribute:") and object_attributes is not None:
-        attr_name = spec.by.split(":", 1)[1]
-        src_vals = object_attributes.get(attr_name)
-        if src_vals is not None and obj_to_bin:
-            # Build {bin_idx: value} from (object_id → bin_idx) and the
-            # source value array; an object's value picks the bin.
-            bin_to_value: dict[int, Any] = {}
-            for oid, b in obj_to_bin.items():
-                if b not in bin_to_value:
-                    v = src_vals[oid]
-                    if hasattr(v, "item"):
-                        v = v.item()
-                    if isinstance(v, bytes):
-                        v = v.decode("utf-8")
-                    bin_to_value[b] = v
-            chunk_attribute_name = attr_name
-            chunk_attribute_values = [
-                bin_to_value[b] for b in sorted(bin_to_value)
-            ]
+    if obj_to_bin and spec.by != "spatial":
+        chunk_attribute_name = (
+            spec.by.split(":", 1)[1] if spec.by.startswith("attribute:")
+            else spec.dimension_name
+        )
+        chunk_attribute_values = [mapper.labels[old] for old in used]
 
     # Create level 0
     level_meta = LevelMetadata(
@@ -208,7 +207,7 @@ def rechunk(
     # which is what a scalar means.
     from zarr_vectors.core.metadata import normalise_shard_shape
 
-    _rechunk_grid = (max(unique_bins) + 1, *_spatial_grid)
+    _rechunk_grid = (len(unique_bins), *_spatial_grid)
     _rechunk_session = out_level.native_sharded_arrays(
         normalise_shard_shape(
             src_meta.shard_shape, len(_rechunk_grid), bin_axis=True,
@@ -216,122 +215,73 @@ def rechunk(
         _rechunk_grid,
         origin=(0, *_spatial_origin),
     )
-    _rechunk_session.__enter__()
-    create_vertices_array(out_level, dtype="float32")
-    create_object_index_array(out_level)
 
-    # Rechunk: for each bin, gather all objects, assign to spatial chunks
-    # with prefixed keys
+    # Read at the dtype the source declares: a float64 cell read as
+    # float32 decodes to garbage at twice the row count.
+    vdtype = vertices_dtype(src_level)
+    cs = np.asarray(chunk_shape, dtype=np.float64)
+
     total_vertices = 0
-    total_objects = 0
     object_manifests_out: dict[int, ObjectManifest] = {}
-    global_obj_counter = 0
+    # Source id -> output id, for objects that were written.  An object
+    # with no vertices gets no manifest, so it gets no id either.
+    old_to_new: dict[int, int] = {}
 
-    for bin_idx in unique_bins:
-        # Collect objects in this bin
-        if obj_to_bin:
-            bin_objects = sorted(
-                oid for oid, b in obj_to_bin.items() if b == bin_idx
-            )
-        else:
-            bin_objects = []
+    with _rechunk_session:
+        create_vertices_array(out_level, dtype=vdtype.name)
+        create_object_index_array(out_level)
 
-        # Read vertex data for these objects
-        bin_positions: list[npt.NDArray] = []
-        bin_obj_boundaries: list[int] = []  # cumulative vertex counts per object
+        for bin_idx in unique_bins:
+            # Each object keeps its own fragments: one per run of its
+            # vertices inside one cell, as the type writers lay them out.
+            # Merging a cell into one fragment made every manifest name
+            # fragment 0, so reading one object returned the whole cell.
+            cells: dict[ChunkCoords, list[npt.NDArray]] = {}
+            for oid in by_bin[bin_idx]:
+                try:
+                    fragments = read_object_vertices(
+                        src_level, oid, dtype=vdtype, ndim=ndim,
+                    )
+                except Exception:
+                    fragments = []
+                manifest: ObjectManifest = []
+                for fragment in fragments:
+                    for cell, run in _runs_by_cell(fragment, cs):
+                        key: ChunkCoords = (bin_idx, *cell)
+                        runs = cells.setdefault(key, [])
+                        manifest.append((key, len(runs)))
+                        runs.append(run)
+                if not manifest:
+                    continue
+                old_to_new[oid] = len(object_manifests_out)
+                object_manifests_out[old_to_new[oid]] = manifest
 
-        for oid in bin_objects:
-            try:
-                verts_list = read_object_vertices(
-                    src_level, oid, dtype=np.float32, ndim=ndim,
-                )
-                obj_verts = np.concatenate(
-                    [v for v in verts_list if len(v) > 0], axis=0,
-                ) if any(len(v) > 0 for v in verts_list) else np.zeros((0, ndim), dtype=np.float32)
-            except Exception:
-                obj_verts = np.zeros((0, ndim), dtype=np.float32)
+            for key in sorted(cells):
+                write_chunk_vertices(out_level, key, cells[key], dtype=vdtype)
+                total_vertices += sum(len(r) for r in cells[key])
 
-            bin_positions.append(obj_verts)
-            bin_obj_boundaries.append(len(obj_verts))
-
-        if not bin_positions or all(len(p) == 0 for p in bin_positions):
-            continue
-
-        # Assign to spatial chunks within this bin prefix
-        all_pos = np.concatenate(bin_positions, axis=0)
-        spatial_assignments = assign_chunks(all_pos, chunk_shape)
-
-        # Build object-to-vertex mapping for this bin
-
-        for spatial_cc, global_indices in sorted(spatial_assignments.items()):
-            # Prefixed chunk key: (bin_idx, z, y, x)
-            prefixed_cc: ChunkCoords = (bin_idx,) + spatial_cc
-            chunk_verts = all_pos[global_indices]
-
-            write_chunk_vertices(
-                out_level, prefixed_cc, [chunk_verts], dtype=np.float32,
-            )
-            total_vertices += len(chunk_verts)
-
-        # Build object manifests for this bin
-        for local_idx, oid in enumerate(bin_objects):
-            n_verts = bin_obj_boundaries[local_idx]
-            if n_verts == 0:
-                continue
-
-            obj_positions = bin_positions[local_idx]
-            obj_spatial = assign_chunks(obj_positions, chunk_shape)
-
-            manifest: ObjectManifest = []
-            for scc, _ in sorted(obj_spatial.items()):
-                prefixed = (bin_idx,) + scc
-                fragment_idx = 0  # single fragment per chunk in rechunked stores
-                manifest.append((prefixed, fragment_idx))
-
-            object_manifests_out[global_obj_counter] = manifest
-            global_obj_counter += 1
-            total_objects += 1
-
-    # Write object index (with extended ndim for prefix dimension)
-    if object_manifests_out:
         # The manifests use (prefix, z, y, x) coords — ndim+1 dimensions
-        extended_ndim = ndim + 1 if obj_to_bin else ndim
-        write_object_index(out_level, object_manifests_out, sid_ndim=extended_ndim)
-
-    # Close the single-array write context; the per-chunk writes are done.
-    _rechunk_session.__exit__(None, None, None)
+        if object_manifests_out:
+            write_object_index(
+                out_level, object_manifests_out, sid_ndim=ndim + 1,
+            )
 
     # Write groupings if rechunked by group (preserve group structure)
     if spec.by == "group" and groupings is not None:
-        try:
-            from zarr_vectors.core.arrays import (
-                create_groupings_array,
-                write_groupings,
-            )
-            # Remap group memberships to new object IDs
-            old_to_new: dict[int, int] = {}
-            new_idx = 0
-            for bin_idx in unique_bins:
-                bin_objects = sorted(
-                    oid for oid, b in obj_to_bin.items() if b == bin_idx
-                )
-                for old_oid in bin_objects:
-                    old_to_new[old_oid] = new_idx
-                    new_idx += 1
+        from zarr_vectors.core.arrays import (
+            create_groupings_array,
+            write_groupings,
+        )
 
-            new_groupings: dict[int, list[int]] = {}
-            for gid, members in enumerate(groupings):
-                new_members = [
-                    old_to_new[m] for m in members if m in old_to_new
-                ]
-                if new_members:
-                    new_groupings[gid] = new_members
+        new_groupings: dict[int, list[int]] = {}
+        for gid, members in enumerate(groupings):
+            new_members = [old_to_new[m] for m in members if m in old_to_new]
+            if new_members:
+                new_groupings[gid] = new_members
 
-            if new_groupings:
-                create_groupings_array(out_level)
-                write_groupings(out_level, new_groupings)
-        except Exception:
-            pass
+        if new_groupings:
+            create_groupings_array(out_level)
+            write_groupings(out_level, new_groupings)
 
     # In-place: replace source with output
     if in_place:
@@ -342,12 +292,35 @@ def rechunk(
         output_path = store_path
 
     return {
-        "objects_rechunked": total_objects,
+        "objects_rechunked": len(object_manifests_out),
         "bins_created": len(unique_bins),
         "total_vertices": total_vertices,
         "rechunk_dims": rechunk_dims,
         "output_path": str(output_path),
     }
+
+
+def _runs_by_cell(
+    positions: npt.NDArray, cs: npt.NDArray[np.float64],
+) -> list[tuple[tuple[int, ...], npt.NDArray]]:
+    """Split ``positions`` into maximal runs of vertices sharing a cell.
+
+    A fragment is one contiguous run of an object's vertices inside one
+    cell; a polyline that leaves a cell and comes back is two fragments
+    there, not one with a segment invented across the gap.  Cells are
+    ``floor(position / chunk_shape)``, as
+    :func:`~zarr_vectors.spatial.chunking.assign_chunks` computes them.
+    """
+    if len(positions) == 0:
+        return []
+    cells = np.floor(positions / cs).astype(np.int64)
+    breaks = (np.flatnonzero(np.any(cells[1:] != cells[:-1], axis=1)) + 1).tolist()
+    starts = [0, *breaks]
+    ends = [*breaks, len(positions)]
+    return [
+        (tuple(cells[a].tolist()), positions[a:b])
+        for a, b in zip(starts, ends)
+    ]
 
 
 def _compute_object_lengths(
@@ -357,10 +330,11 @@ def _compute_object_lengths(
 ) -> npt.NDArray[np.float64]:
     """Compute path length for each object (for polyline-like data)."""
     lengths = np.zeros(n_objects, dtype=np.float64)
+    vdtype = vertices_dtype(level_group)
     for oid in range(n_objects):
         try:
             verts_list = read_object_vertices(
-                level_group, oid, dtype=np.float32, ndim=ndim,
+                level_group, oid, dtype=vdtype, ndim=ndim,
             )
             all_verts = np.concatenate(
                 [v for v in verts_list if len(v) > 0], axis=0,
