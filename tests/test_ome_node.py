@@ -115,6 +115,14 @@ class TestNodeShape:
         # Vertices are stored in world coordinates, so there is no edge.
         assert scene["coordinateTransformations"] == []
 
+    def test_world_is_identified_by_id_as_well_as_name(self, store):
+        # RFC 8 binds a Reference to a coordinate system's id; RFC 5
+        # readers look for its name.  Both, so neither kind is stranded.
+        system = _root_attrs(store)[OME_ATTRS_KEY]["attributes"]["scene"][
+            "coordinateSystems"
+        ][0]
+        assert system["id"] == WORLD and system["name"] == WORLD
+
     def test_an_axis_without_a_unit_carries_no_unit_key(self, tmp_path):
         # NGFF requires UDUNITS-2 names and rejects a placeholder, so an
         # undeclared unit must be an absent key rather than "".
@@ -238,3 +246,40 @@ class TestName:
         refreshed = stamp_ome_node(str(store))
         assert refreshed["attributes"]["zv:companionImage"]["id"] == "em"
         assert refreshed["attributes"]["scene"]["coordinateSystems"][0]["name"] == WORLD
+
+
+class TestForeignChildren:
+    """``refresh_root_node`` owns the ``zv:level`` entries, nothing else."""
+
+    BACKREF = {
+        "type": "collection", "name": "bridge_subject",
+        "path": {"type": "zarr", "path": "../"},
+    }
+
+    def _add_child(self, store, child):
+        root = open_store(store, mode="r+")
+        node = root.attrs.to_dict()[OME_ATTRS_KEY]
+        node["nodes"] = [*node["nodes"], child]
+        root.attrs.update({OME_ATTRS_KEY: node})
+
+    def test_a_foreign_child_survives_a_refresh(self, store):
+        self._add_child(store, self.BACKREF)
+        refreshed = stamp_ome_node(str(store))
+        assert self.BACKREF in refreshed["nodes"]
+        assert [n["name"] for n in refreshed["nodes"]] == [
+            "0", "1", "bridge_subject",
+        ]
+        _assert_rfc8_legal(refreshed, is_root=True)
+
+    def test_a_foreign_child_survives_a_level_being_removed(self, store):
+        self._add_child(store, self.BACKREF)
+        remove_resolution_level(open_store(store, mode="r+"), 1)
+        node = _root_attrs(store)[OME_ATTRS_KEY]
+        assert [n["name"] for n in node["nodes"]] == ["0", "bridge_subject"]
+
+    def test_a_foreign_child_named_like_a_level_is_dropped(self, store):
+        # Names are unique within a collection, and the level is owned.
+        self._add_child(store, {"type": "zv:thing", "name": "1"})
+        refreshed = stamp_ome_node(str(store))
+        assert [n["type"] for n in refreshed["nodes"]] == ["zv:level", "zv:level"]
+        _assert_rfc8_legal(refreshed, is_root=True)

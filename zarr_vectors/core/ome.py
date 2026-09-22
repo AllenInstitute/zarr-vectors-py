@@ -96,8 +96,11 @@ NODE_TYPE_LEVEL: str = f"{ZV_PREFIX}:level"
 #: a collection of levels.
 NODE_TYPE_COLLECTION: str = "collection"
 
-#: Name of the one coordinate system every ZV store declares.  Vertices are
-#: stored in it directly.
+#: Identifier of the one coordinate system every ZV store declares.
+#: Vertices are stored in it directly.  Written as both ``id`` and
+#: ``name``: RFC 8 identifies a coordinate system by ``id`` -- it is what a
+#: ``Reference`` from another document binds to -- and leaves ``name``
+#: descriptive, while RFC 5 readers know only ``name``.
 WORLD: str = "world"
 
 #: Used when a store's name cannot be derived from its URL (a store opened
@@ -175,10 +178,14 @@ def build_scene(axes: list[dict[str, str]] | None) -> dict[str, Any]:
     list is written rather than omitted because its emptiness is the
     claim: a reader learns the store needs no edge, instead of having to
     guess whether one is missing.
+
+    The system carries ``id`` as well as ``name`` so a collection
+    elsewhere can bind an edge to it -- ``{"path": ..., "id": "world"}``
+    -- instead of redeclaring the frame.  See :data:`WORLD`.
     """
     return {
         "coordinateSystems": [
-            {"name": WORLD, "axes": _clean_axes(axes)},
+            {"id": WORLD, "name": WORLD, "axes": _clean_axes(axes)},
         ],
         "coordinateTransformations": [],
     }
@@ -275,7 +282,24 @@ def refresh_root_node(
     # keys built above are authoritative.
     merged_attributes = dict(existing.get("attributes") or {})
     merged_attributes.update(node["attributes"])
-    node = {**existing, **node, "attributes": merged_attributes}
+    # The same for ``nodes``: this function owns the ``zv:level`` entries
+    # and nothing else, so a child another tool placed here -- a
+    # back-reference to the collection that holds this store -- survives a
+    # level being added.  Replacing the list wholesale dropped it.  A
+    # foreign child named like a level is dropped: RFC 8 requires names
+    # to be unique within a collection, and the level is the one owned.
+    owned = {child["name"] for child in node["nodes"]}
+    foreign = [
+        child for child in existing.get("nodes") or []
+        if isinstance(child, dict)
+        and child.get("type") != NODE_TYPE_LEVEL
+        and child.get("name") not in owned
+    ]
+    node = {
+        **existing, **node,
+        "attributes": merged_attributes,
+        "nodes": node["nodes"] + foreign,
+    }
 
     root.attrs.update({OME_ATTRS_KEY: node})
     return node
@@ -285,7 +309,7 @@ def _axes_from_node(node: dict[str, Any]) -> list[dict[str, str]] | None:
     """The ``world`` axes already declared on a node, if any."""
     scene = (node.get("attributes") or {}).get("scene") or {}
     for system in scene.get("coordinateSystems") or []:
-        if system.get("name") == WORLD:
+        if WORLD in (system.get("id"), system.get("name")):
             axes = system.get("axes")
             return list(axes) if axes else None
     return None
