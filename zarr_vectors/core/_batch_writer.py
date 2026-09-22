@@ -125,7 +125,12 @@ def _presence_after(
     """
     from zarr_vectors.core.group import _NONEMPTY_CHUNKS_ATTR
 
-    present = set(arr.attrs.get(_NONEMPTY_CHUNKS_ATTR) or [])
+    current = arr.attrs.get(_NONEMPTY_CHUNKS_ATTR)
+    if current is None:
+        # No manifest: presence is derived from the store, and a list of
+        # this batch's keys would hide every cell written before it.
+        return None
+    present = set(current)
     stamp = False
     for chunk_key, (data, record_presence) in cells.items():
         if not record_presence:

@@ -335,11 +335,18 @@ The coordinator-side verbs: what is actually on disk, and rebuilding the
 ``nonempty_chunks`` and ``arrays_present`` records after a parallel write
 phase that deliberately did not stamp them.
 
+:func:`~zarr_vectors.building.defer_presence` is the other end of that
+phase: a coordinator declares a level deferred before its workers start, so
+they share no state between cells, and :func:`~zarr_vectors.building.rebuild_presence`
+ends the declaration when it writes the manifests.
+
 The worker-side alternative is :meth:`Group.collect_presence
 <zarr_vectors.building.Group.collect_presence>` and
 :meth:`~zarr_vectors.building.Group.apply_presence`, for a writer whose
-consumers run before any coordinator pass -- see
+consumers cannot ask the store and run before any coordinator pass -- see
 :doc:`/how_to/hpc_pipelines`.
+
+.. autofunction:: zarr_vectors.building.defer_presence
 
 .. autofunction:: zarr_vectors.building.refresh_arrays_present
 

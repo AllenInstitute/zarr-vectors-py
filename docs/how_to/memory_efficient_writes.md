@@ -76,8 +76,8 @@ import numpy as np
 import zarr_vectors as zv
 from zarr_vectors.building import (
     LevelMetadata, create_store, create_resolution_level,
-    create_vertices_array, create_attribute_array, open_write_session,
-    open_store, get_resolution_level, write_chunk_vertices,
+    create_vertices_array, create_attribute_array, defer_presence,
+    open_write_session, open_store, get_resolution_level, write_chunk_vertices,
     write_chunk_attributes, rebuild_presence, refresh_arrays_present,
     update_level_metadata, write_multiscale_metadata,
 )
@@ -97,6 +97,8 @@ level = create_resolution_level(root, 0, LevelMetadata(
 with open_write_session(level, bounds=BOUNDS, chunk_shape=CHUNK):
     create_vertices_array(level, dtype="float32")
     create_attribute_array(level, "intensity", dtype="float32")
+
+defer_presence(level)        # partitions write no state shared between cells
 ```
 
 ```{warning}
@@ -145,16 +147,18 @@ for slab in range(4):                      # 4 z-slabs, one chunk deep each
     del positions, intensity
 ```
 
-`record_presence=False` is not an optimisation. `nonempty_chunks` is a single
+Deferring presence is not an optimisation. `nonempty_chunks` is a single
 attribute shared by every cell of an array, so a partition that stamps it
-races every other partition. Partitions skip it; the coordinator rebuilds it
-once, below.
+races every other partition. After `defer_presence` the arrays carry no
+manifest, no write stamps one, and the coordinator writes each once, below.
+`record_presence=False` says the same per call; with the declaration it is
+redundant but harmless, and without it it is the only thing keeping the
+partitions apart.
 
-That rebuild is also what makes the cells *visible*: until it runs,
-`list_chunks` reports none of them. If something downstream reads the store
-before the coordinator gets there, deferring the stamp to your own lock keeps
-both properties — see
-[Stamping under your own lock](hpc_pipelines.md#stamping-under-your-own-lock).
+While the level is deferred, zarr-vectors readers find the cells by asking the
+store, so something downstream that reads before the coordinator gets there
+still sees them. An offline-read session or an older zarr-vectors does not —
+see [Stamping under your own lock](hpc_pipelines.md#stamping-under-your-own-lock).
 
 ### One fragment per bin, not one per cell
 
@@ -187,7 +191,7 @@ coarsening cost above.
 root = open_store(STORE, mode="r+")
 level = get_resolution_level(root, 0)
 
-rebuild_presence(level)                    # the nonempty_chunks nobody stamped
+rebuild_presence(level)                    # every manifest, once; ends the deferral
 print(refresh_arrays_present(level))       # what is actually on disk
 update_level_metadata(level, vertex_count=written)
 write_multiscale_metadata(root)
