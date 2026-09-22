@@ -213,16 +213,3 @@ while the arrays are rank 4, and `grid.cells` under-reports by a factor of K.
 question is only what `Level.grid` should return for a store that exists. Either
 carry the leading axis, or document that `grid` is the spatial grid and that
 `cell_of` / `cells_in` / `holds` are spatial predicates.
-
----
-
-## 6. Two carried-over minor items
-
-- **`write_cells` is absent from `GROUP_SUPPORTED_METHODS`**
-  (`building/__init__.py:261-280`). It is one of the two presence stamp sites and
-  the path the links writers funnel through (`core/arrays.py:3069`), so
-  promising `collect_presence` while leaving it unpromised is incoherent.
-  Widening the contract is a deliberate decision, not an oversight to fix
-  silently.
-- **`chunk_exists` scans a list linearly** — `chunk_key in present` at
-  `core/group.py:954`, against a manifest that is already sorted.
