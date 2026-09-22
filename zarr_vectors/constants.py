@@ -9,8 +9,27 @@ everywhere in the package.
 # Format version
 # ---------------------------------------------------------------------------
 
-FORMAT_VERSION: str = "0.9.2"
+FORMAT_VERSION: str = "0.9.3"
 """Current ZV specification version.
+
+0.9.3: optional, backward-compatible ``shard_shape`` on the root (absent
+⇒ unsharded, so 0.9.0-0.9.2 stores read unchanged).  Cells per shard per
+axis -- an ``int`` when every axis agrees, a list when they do not.
+
+The store's declared PACKING, which had nowhere to live before.  Sharding
+was per-array and per-call: a writer passed ``shard_shape=`` and the
+arrays that call created were sharded, while every array allocated later
+-- an attribute array or links segment made on first write, in a worker
+that never saw the argument -- came out flat.  Recording it on the root
+is what lets those paths find it.  ``create_store(shard_shape=)``
+previously had no parameter at all, so the value was absorbed by
+``**backend_kwargs`` and dropped without a word.
+
+Additive: no reader needs it.  Sharding is transparent to any conformant
+Zarr v3 reader, and each array's own ``zarr.json`` remains the truth
+about that array -- this is a writer default, not a claim about what is
+on disk, which is why it is a field rather than a ``format_capabilities``
+token.  A 0.9.2 reader ignoring the key reads the store correctly.
 
 0.9.2: optional, backward-compatible ``ome`` block on the root (absent ⇒
 the prior behaviour, so 0.9.0 and 0.9.1 stores read unchanged).  It is an
