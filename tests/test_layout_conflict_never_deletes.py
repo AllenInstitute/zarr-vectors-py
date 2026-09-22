@@ -6,16 +6,22 @@ node first.  That is correct for the array ``create_store`` warm-creates
 and nobody has written to — it is how a later session applies its shard
 shape and codecs — but it is catastrophic for an array that holds data.
 
-Two things made it reachable.  ``shard_shape=None`` is the default of
-every type writer, so a plain second write into a store built with
-``shard_shape=`` reads as "unsharded wanted, sharded found".  And the
+Two things put real data on that path.  ``shard_shape=None`` was the
+default of every type writer, so a plain second write into a store built
+with ``shard_shape=`` read as "unsharded wanted, sharded found".  And the
 emptiness test was ``nonempty_chunks``, which is empty in exactly the
 cases where it must not be believed: a decentralised writer passing
 ``record_presence=False`` leaves it so while the payloads are on disk.
 
+The first of those is gone -- the writers default to ``"inherit"`` now,
+so an unsaid shard shape takes the store's own and there is nothing to
+disagree about.  The guard still has to hold for a caller who asks for a
+different layout outright, which is what these tests do.
+
 Covers:
 
-* A second, differently-laid-out write preserves the first.
+* An explicitly differently-laid-out write preserves the first.
+* An ordinary second write neither deletes nor warns.
 * An unstamped-but-populated array is not treated as empty.
 * An array that really is empty is still re-laid-out (no over-correction).
 """
@@ -40,8 +46,23 @@ def _level(root):
     return get_resolution_level(root, 0)
 
 
-def test_second_write_into_a_sharded_store_preserves_the_first(tmp_path):
-    """The headline case: this used to delete the first write outright."""
+def test_an_explicitly_unsharded_write_into_a_sharded_store_preserves_it(
+    tmp_path,
+):
+    """The headline case: this used to delete the first write outright.
+
+    The second write says ``shard_shape=None`` -- *explicitly* unsharded,
+    against a store that is sharded. That is a real disagreement, and the
+    caller is told about it; what must not happen is the array being
+    recreated to satisfy it.
+
+    The default no longer reaches here: an unsaid ``shard_shape`` inherits
+    the store's own declaration, so the ordinary second write has nothing
+    to disagree about (see
+    ``test_declared_shard_layout.py::test_a_second_write_inherits_rather_than_unsharding``).
+    Asking for the conflict outright is the only way to exercise the
+    guard now, which is the shape a regression test for it should have.
+    """
     path = str(tmp_path / "s.zarrvectors")
     first = np.array([[1.0, 1.0, 1.0], [2.0, 2.0, 2.0]], dtype="float32")
     second = np.array([[40.0, 40.0, 40.0]], dtype="float32")
@@ -49,10 +70,11 @@ def test_second_write_into_a_sharded_store_preserves_the_first(tmp_path):
     write_points(path, first, bounds=_BOUNDS, chunk_shape=_CHUNK, shard_shape=2)
     assert len(read_points(path)["positions"]) == 2
 
-    # The default shard_shape=None: "unsharded wanted, sharded found".
     with warnings.catch_warnings(record=True) as caught:
         warnings.simplefilter("always")
-        write_points(path, second, bounds=_BOUNDS, chunk_shape=_CHUNK)
+        write_points(
+            path, second, bounds=_BOUNDS, chunk_shape=_CHUNK, shard_shape=None,
+        )
 
     assert len(read_points(path)["positions"]) == 3, (
         "the first write's vertices were destroyed by the second"
@@ -61,6 +83,27 @@ def test_second_write_into_a_sharded_store_preserves_the_first(tmp_path):
         "holds data with a different layout" in str(w.message)
         for w in caught
     ), "reused a mismatched array without saying so"
+
+
+def test_an_ordinary_second_write_neither_deletes_nor_warns(tmp_path):
+    """Inheriting means there is no disagreement to report."""
+    path = str(tmp_path / "s.zarrvectors")
+    write_points(
+        path, np.array([[1.0, 1.0, 1.0]], dtype="float32"),
+        bounds=_BOUNDS, chunk_shape=_CHUNK, shard_shape=2,
+    )
+
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        write_points(
+            path, np.array([[40.0, 40.0, 40.0]], dtype="float32"),
+            bounds=_BOUNDS, chunk_shape=_CHUNK,
+        )
+
+    assert len(read_points(path)["positions"]) == 2
+    assert not [
+        w for w in caught if "different layout" in str(w.message)
+    ]
 
 
 def test_the_reused_array_keeps_its_own_layout(tmp_path):
@@ -73,7 +116,7 @@ def test_the_reused_array_keeps_its_own_layout(tmp_path):
         warnings.simplefilter("ignore", RuntimeWarning)
         write_points(
             path, np.array([[40.0, 40.0, 40.0]], dtype="float32"),
-            bounds=_BOUNDS, chunk_shape=_CHUNK,
+            bounds=_BOUNDS, chunk_shape=_CHUNK, shard_shape=None,
         )
 
     from zarr_vectors.core.store import open_store
