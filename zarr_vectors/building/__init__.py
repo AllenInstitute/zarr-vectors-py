@@ -561,7 +561,7 @@ def rebuild_presence(
     level_group: Group,
     array_name: str | None = None,
     *,
-    on_sharded: str = "skip",
+    on_sharded: str = "derive",
 ) -> list[str]:
     """Rebuild ``nonempty_chunks`` from the store — one array, or the level.
 
@@ -570,21 +570,27 @@ def rebuild_presence(
     one attribute shared by every cell, so stamping it races.  This
     rebuilds it once, afterwards.
 
+    Covers sharded arrays.  It did not, and defaulted to ``"skip"``,
+    while a sharded array's manifest could not be rebuilt from a per-cell
+    listing — safe then, because sharding ran after the rebuild by
+    contract, so anything sharded was already correct.  A store can now
+    be born sharded, and under that premise "skip" quietly declined to
+    repair the arrays most in need of it.
+
     Args:
         array_name: One array's path, or ``None`` (the default) to walk
             every per-chunk array in the level — the shape a coordinator
             actually needs after a parallel phase.
         on_sharded: Forwarded to
-            :meth:`Group.derive_nonempty_chunks`.  Defaults to ``"skip"``
-            here, not ``"raise"``: this verb legitimately runs over a
-            level's mixed arrays, and a sharded one already has a correct
-            manifest because sharding runs after the rebuild by contract.
-            Pass ``"raise"`` to assert that ordering instead.
+            :meth:`Group.derive_nonempty_chunks`.  ``"derive"`` (the
+            default) rebuilds sharded arrays like any other; ``"skip"``
+            leaves them alone; ``"raise"`` asserts none are sharded.
 
     Returns:
         The sorted keys recorded, for the single-array form; for the
-        level-wide form, the array paths whose manifests were rebuilt
-        (sharded arrays are skipped and therefore absent).
+        level-wide form, every per-chunk array path walked.  Under
+        ``on_sharded="skip"`` a sharded array is left alone and therefore
+        absent, so the return still says what was actually rebuilt.
     """
     if array_name is not None:
         return level_group.derive_nonempty_chunks(
@@ -593,7 +599,7 @@ def rebuild_presence(
 
     rebuilt: list[str] = []
     for name in per_chunk_array_paths(level_group):
-        if array_is_sharded(level_group, name):
+        if on_sharded == "skip" and array_is_sharded(level_group, name):
             # Consult before the call so the caller learns which arrays
             # were rebuilt; "skip" alone would return a manifest and make
             # a skipped array indistinguishable from a rebuilt one.

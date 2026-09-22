@@ -3844,26 +3844,25 @@ def finalize_links(
     # ``list_link_offsets`` discovers segments via ``children()`` — a
     # store listing — so segment discovery is already race-free.
     #
-    # Only valid unsharded: a shard packs many cells into one object whose
-    # inner index is not derivable from key names.  Hence the ordering
-    # requirement that ``shard_store`` runs *after* finalize.
+    # Valid sharded or not: ``derive_nonempty_chunks`` reads a sharded
+    # array's cells out of its shard objects.  This used to pass
+    # ``on_sharded="skip"`` on the premise that sharding ran after
+    # finalize by contract, so a sharded segment's manifest was already
+    # correct.  A store can now be born sharded, which makes that premise
+    # false and "skip" a silent no-op over exactly the cells this rebuild
+    # exists to recover.
     family_group = links_group_path(delta)
     for seg in list_link_offsets(level_group, delta):
-        try:
-            # on_sharded="skip": this loop legitimately walks whatever the
-            # family holds, and a sharded segment's manifest is already
-            # correct (sharding runs after finalize by contract).  Asking
-            # for the default "raise" here would make the except below
-            # swallow the guard and re-open the hole it closes.
-            level_group.derive_nonempty_chunks(
-                f"{family_group}/{seg}", on_sharded="skip",
-            )
-        except StoreError:
-            # An already-stamped array (the whole-family writer path)
-            # needs no rebuild; never let that mask the counts below.
-            # Narrow to StoreError so a genuine bug in the rebuild
-            # surfaces instead of silently producing a count of zero.
-            pass
+        name = f"{family_group}/{seg}"
+        if level_group._sharded_chunk_array(name) is None:
+            # Not a chunk array: an already-stamped segment from the
+            # whole-family writer path needs no rebuild.  This is exactly
+            # what ``derive_nonempty_chunks`` raises StoreError on, tested
+            # up front rather than caught, so a genuine failure inside the
+            # rebuild surfaces instead of being swallowed into a count of
+            # zero.
+            continue
+        level_group.derive_nonempty_chunks(name)
 
     physical = 0
     cell_indices: dict[tuple[str, ChunkCoords], list[int]] = {}

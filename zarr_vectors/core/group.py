@@ -1956,9 +1956,9 @@ class Group:
         self,
         array_name: str,
         *,
-        on_sharded: Literal["raise", "skip"] = "raise",
+        on_sharded: Literal["derive", "skip", "raise"] = "derive",
     ) -> list[str]:
-        """Rebuild ``array_name``'s ``nonempty_chunks`` from the store listing.
+        """Rebuild ``array_name``'s ``nonempty_chunks`` from what is on disk.
 
         The coordinator half of ``write_bytes(..., record_presence=False)``:
         workers write cell payloads without touching the shared manifest
@@ -1970,13 +1970,20 @@ class Group:
         same prefetch :meth:`batched_reads` uses — so the cost is one
         listing plus one round-trip per array rather than a GET per cell.
 
-        Only meaningful for an **unsharded** array, where each cell is its
-        own object at ``<array>/c/i/j/k`` and therefore visible in the
-        listing.  A sharded array packs many cells into one object whose
-        inner index is not derivable from key names — so sharding stays a
-        coordinator pass that runs *after* this, which is the same
-        ordering :func:`zarr_vectors.sharding.shard_store` already
-        requires.  Returns the sorted keys now recorded.
+        Works on a **sharded** array too, by a different route.  There the
+        listing enumerates shard objects rather than cells — zarr builds a
+        sharded array's chunk grid from the SHARD shape, so a key under
+        ``<array>/c/`` is a shard index — so each listed key is expanded
+        to the cell region it covers (``index * shards`` up to
+        ``+shards``, clipped to the array) and that region is read in one
+        slice.  One read per shard that exists, which is strictly fewer
+        than the unsharded branch pays, and only shards that were written
+        are visited.  Returns the sorted keys now recorded.
+
+        This is why sharding no longer has to be the last coordinator
+        pass.  It used to: presence could only be rebuilt from a per-cell
+        listing, so an array had to stay flat until every worker had
+        finished.  A store may now be born sharded.
 
         Not reported to :func:`observe_presence_writes`.  That instrument
         watches the INCREMENTAL stamps, where a read-modify-write of
@@ -1987,19 +1994,23 @@ class Group:
 
         Args:
             on_sharded: What to do when ``array_name`` *is* natively
-                sharded.  ``"raise"`` (the default) raises
-                :class:`~zarr_vectors.exceptions.ShardedPresenceError`;
-                ``"skip"`` returns the manifest already recorded, without
-                rewriting it, for a caller legitimately looping over a
-                level's mixed arrays.
+                sharded.  ``"derive"`` (the default) rebuilds it, as
+                above; the name is a little odd, since deriving is also
+                what happens when the array is flat, but it is kept
+                because the parameter is on a supported surface.
+                ``"skip"`` returns the manifest already recorded without
+                rewriting it, for a caller that wants the cheap answer.
+                ``"raise"`` raises
+                :class:`~zarr_vectors.exceptions.ShardedPresenceError`,
+                for a caller asserting an array is not sharded.
 
-        Until this guard existed the ordering above was documented here
-        and enforced nowhere: running against a sharded array rewrote the
-        manifest from a listing that resolves nothing, so a store with
-        1605 recorded cells came back with 2 and the rest became
-        unreachable through ``list_chunks`` — no exception, no warning.
-        Returning an empty list under ``"skip"`` would be the same bug
-        wearing a keyword, hence the read.
+        ``"raise"`` was the default while the sharded case could not be
+        derived at all, and it guarded a real failure: rebuilding from a
+        listing that resolves nothing took a store with 1605 recorded
+        cells down to 2, with no exception and no warning, and the rest
+        became unreachable through ``list_chunks``.  The guard is kept as
+        an assertion rather than removed, but it is no longer what a
+        caller wants by default.
         """
         arr = self._sharded_chunk_array(array_name)
         if arr is None:
@@ -2007,17 +2018,21 @@ class Group:
                 f"{array_name!r} in {self._zarr.path or '<root>'} is not a "
                 f"chunk array; nothing to derive presence for"
             )
-        if getattr(arr, "shards", None) is not None:
+        shards = getattr(arr, "shards", None)
+        if shards is not None:
             if on_sharded == "skip":
                 return sorted(arr.attrs.get(_NONEMPTY_CHUNKS_ATTR, []) or [])
-            raise ShardedPresenceError(
-                f"Cannot derive presence for {array_name!r} in "
-                f"{self._zarr.path or '<root>'}: it is natively sharded, so "
-                f"its cells are packed into shard objects the key listing "
-                f"cannot resolve and the manifest would be rewritten to "
-                f"(almost) empty. Rebuild presence BEFORE sharding, or pass "
-                f"on_sharded='skip' to leave this array's manifest alone."
-            )
+            if on_sharded == "raise":
+                raise ShardedPresenceError(
+                    f"Cannot derive presence for {array_name!r} in "
+                    f"{self._zarr.path or '<root>'}: it is natively sharded "
+                    f"and on_sharded='raise' was requested. Pass "
+                    f"on_sharded='derive' (the default) to rebuild it, or "
+                    f"'skip' to leave this array's manifest alone."
+                )
+            keys = self._derive_presence_sharded(arr, array_name, tuple(shards))
+            arr.attrs[_NONEMPTY_CHUNKS_ATTR] = sorted(keys)
+            return sorted(keys)
         base = self._zarr.path.strip("/")
         prefix = f"{base}/{array_name}/c/" if base else f"{array_name}/c/"
         origin = _grid_origin(arr)
@@ -2051,6 +2066,68 @@ class Group:
             }
         arr.attrs[_NONEMPTY_CHUNKS_ATTR] = sorted(keys)
         return sorted(keys)
+
+    def _derive_presence_sharded(
+        self, arr: zarr.Array, array_name: str, shards: tuple[int, ...],
+    ) -> set[str]:
+        """The sharded half of :meth:`derive_nonempty_chunks`.
+
+        Zarr builds a sharded array's chunk grid from the SHARD shape
+        (``chunks_out = shard_shape`` when ``shards=`` is given), so a
+        stored key ``c/i/j/k`` names a shard, not a cell.  Each one is
+        expanded to the cell region it covers and read whole: unwritten
+        cells come back as ``b""``, which is exactly the emptiness test
+        the unsharded branch applies to its per-cell reads.
+
+        Deliberately not routed through ``flush_prefetch``: its direct
+        path already declines sharded arrays, and its gather path would
+        issue one request per CELL — a thousand reads for an 8³ shard
+        that one slice satisfies.  Reading region by region also keeps
+        peak memory at one shard, where the unsharded branch holds every
+        cell payload at once.
+        """
+        base = self._zarr.path.strip("/")
+        prefix = f"{base}/{array_name}/c/" if base else f"{array_name}/c/"
+        origin = _grid_origin(arr)
+        shape = arr.shape
+        ndim = arr.ndim
+
+        keys: set[str] = set()
+        for stored in _list_store_prefix(self._zarr.store, prefix):
+            parts = stored[len(prefix):].split("/")
+            if len(parts) != ndim:
+                continue
+            try:
+                shard_index = tuple(int(p) for p in parts)
+            except ValueError:
+                continue
+            # The cell region this shard covers, clipped to the array: a
+            # shard at the edge of the grid is only partly in bounds, and
+            # a shard may legitimately be larger than the whole array.
+            starts = tuple(i * s for i, s in zip(shard_index, shards))
+            stops = tuple(
+                min(start + s, dim)
+                for start, s, dim in zip(starts, shards, shape)
+            )
+            if any(stop <= start for start, stop in zip(starts, stops)):
+                continue
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore", UnstableSpecificationWarning)
+                block = np.asarray(
+                    arr[tuple(slice(a, b) for a, b in zip(starts, stops))]
+                )
+            for offset in np.ndindex(block.shape):
+                if not block[offset]:
+                    continue
+                index = tuple(a + o for a, o in zip(starts, offset))
+                coords = (
+                    index if origin is None
+                    else tuple(i + o for i, o in zip(index, origin))
+                )
+                keys.add(_format_chunk_key(coords))
+            # Dropped before the next shard: only truthiness was wanted.
+            del block
+        return keys
 
     def read_array_attrs(self, path: str) -> dict[str, Any]:
         """Read the ``attributes`` block of a Zarr array at ``path``.
