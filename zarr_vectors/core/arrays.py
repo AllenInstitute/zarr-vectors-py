@@ -3250,6 +3250,7 @@ def write_links(
                 groups = list(_decode_link_cell(
                     level_group, src_chunk, delta=delta, offsets=offsets,
                     dtype=dtype, width=rows.shape[1], default=[],
+                    trust_presence=False,
                 ))
             groups.append(rows)
             # Route through the per-cell writer so the flat+sidecar vs
@@ -3458,11 +3459,8 @@ def write_link_attributes(
                 continue
             key = _chunk_key(src_chunk)
             new_rows = arr[np.asarray(input_idxs, dtype=np.int64)]
-            if mode == "append" and level_group.chunk_exists(full_name, key):
-                combined = np.concatenate(
-                    [_read_attr_cell(level_group, full_name, key, arr), new_rows],
-                    axis=0,
-                )
+            if mode == "append":
+                combined = _append_attr_rows(level_group, full_name, key, new_rows)
             else:
                 combined = new_rows
             level_group.write_bytes(
@@ -3493,12 +3491,15 @@ def write_link_attributes(
 
 def _read_attr_cell(
     level_group: Group, full_name: str, key: str, like: npt.NDArray,
+    *,
+    blob: bytes | None = None,
 ) -> npt.NDArray:
     """Decode one attribute cell as ``(M, *row_shape)``, matching ``like``.
 
     Row shape comes from the array's own meta and must agree with the
     incoming rows — an append that changes the tail dims would make the
-    blob undecodable, so it raises instead.
+    blob undecodable, so it raises instead.  ``blob`` is the cell's bytes
+    when the caller has already read them.
     """
     meta = level_group.read_array_meta(full_name) or {}
     dtype = np.dtype(meta["dtype"]) if "dtype" in meta else like.dtype
@@ -3508,10 +3509,30 @@ def _read_attr_cell(
             f"{full_name}: append shape mismatch — existing row shape "
             f"{tail} vs new {like.shape[1:]}"
         )
-    blob = level_group.read_bytes(full_name, key)
+    if blob is None:
+        blob = level_group.read_bytes(full_name, key)
     return np.frombuffer(blob, dtype=dtype).reshape((-1, *tail)).astype(
         like.dtype, copy=False,
     )
+
+
+def _append_attr_rows(
+    level_group: Group, full_name: str, key: str, new_rows: npt.NDArray,
+) -> npt.NDArray:
+    """``new_rows`` after whatever the attribute cell already holds.
+
+    Reads the cell rather than asking the presence manifest whether it is
+    there: the manifest lags the cells whenever stamps are collected or
+    deferred, and an append told "absent" overwrites the rows it should
+    have kept.  The array's metadata is read only when the cell turns out
+    to hold something, so a first write to a cell costs no more than it
+    did.
+    """
+    blob = level_group.read_bytes(full_name, key)
+    if not blob:
+        return new_rows
+    existing = _read_attr_cell(level_group, full_name, key, new_rows, blob=blob)
+    return np.concatenate([existing, new_rows], axis=0)
 
 
 def _parse_offsets_for_family(
@@ -3586,6 +3607,7 @@ def _decode_link_cell(
     dtype: np.dtype | str,
     width: int,
     default: Any = _UNSET,
+    trust_presence: bool = True,
 ) -> list[npt.NDArray[np.integer]] | Any:
     """Decode one ``links/<delta>/<offsets>/`` cell into its row groups.
 
@@ -3597,18 +3619,28 @@ def _decode_link_cell(
     The encoding branch mirrors :func:`write_chunk_links` exactly and
     must stay in lockstep with it: a cell written under one branch is
     undecodable under the other.
+
+    ``trust_presence=False`` reads the cell itself instead of asking the
+    presence manifest first, and is what every read-modify-write must
+    pass.  The manifest lags the cells by design -- :func:`write_link_cells`
+    writes with ``record_presence=False`` -- so a writer appending to a
+    cell it filled one batch earlier was told the cell was absent, and
+    replaced the first batch with the second.  A reader keeps the default:
+    for it the manifest saves a request per absent cell.
     """
     dtype = np.dtype(dtype)
     full_name = links_path(delta, offsets)
     key = _chunk_key(chunk_coords)
     try:
-        if not level_group.chunk_exists(full_name, key):
+        if trust_presence and not level_group.chunk_exists(full_name, key):
             raise ArrayError(f"{full_name}: no cell {key}")
         raw = level_group.read_bytes(full_name, key)
     except (ArrayError, StoreError):
         if default is _UNSET:
             raise
         return default
+    if not raw and not trust_presence:
+        return []
 
     if delta == 0 and is_intra(offsets):
         # Flat blob + link_fragments/<chunk> sidecar.  An empty cell is
@@ -3862,6 +3894,7 @@ def write_link_cells(
         groups = list(_decode_link_cell(
             level_group, src_chunk, delta=delta, offsets=offsets,
             dtype=dtype, width=rows.shape[1], default=[],
+            trust_presence=False,
         ))
         groups.append(rows)
         # Route through the per-cell writer so the flat+sidecar vs
@@ -3949,13 +3982,7 @@ def write_link_attribute_cells(
                 continue
             key = _chunk_key(src_chunk)
             new_rows = arr[np.asarray(input_idxs, dtype=np.int64)]
-            if level_group.chunk_exists(full_name, key):
-                combined = np.concatenate(
-                    [_read_attr_cell(level_group, full_name, key, arr), new_rows],
-                    axis=0,
-                )
-            else:
-                combined = new_rows
+            combined = _append_attr_rows(level_group, full_name, key, new_rows)
             level_group.write_bytes(
                 full_name, key, np.ascontiguousarray(combined).tobytes(),
             )

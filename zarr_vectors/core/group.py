@@ -1148,11 +1148,11 @@ class Group:
         """``chunk_key in present``, without rescanning an unchanged list.
 
         Inside a :meth:`batched_writes` or :meth:`cached_nodes` block the
-        node handle is cached, so every call sees the same manifest list;
-        a writer that asks per cell -- :func:`~zarr_vectors.core.arrays.write_link_attribute_cells`
-        decides append-or-create that way -- scanned it once per cell.
-        The second sighting of a list builds a set and later ones reuse
-        it.  The first is still a plain scan: outside a block every call
+        node handle is cached, so every call sees the same manifest list,
+        and a caller asking per cell -- the per-tuple link readers,
+        :func:`~zarr_vectors.core.arrays.read_chunk_fragment_attributes`
+        -- scanned it once per cell.  The second sighting of a list builds
+        a set and later ones reuse it.  The first is still a plain scan: outside a block every call
         re-reads ``zarr.json`` and parses a fresh list, and building a set
         from it would only add to a lookup that is never repeated.
 
