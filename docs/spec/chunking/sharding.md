@@ -66,9 +66,35 @@ object model, and multiscale metadata are identical with or without sharding.
 
 ### Configuration
 
-Sharding is configured via the `codec_config` argument to write functions,
-or by passing a pre-configured Zarr array spec. A minimal sharding
-configuration for a 3-D Zarr Vectors store:
+Declare it on the store. `create_store(shard_shape=N)` records the shape
+in the root `zarr_vectors` block, and **every array allocated afterwards
+honours it** — including the ones created lazily, on first write, inside
+workers that never saw the argument:
+
+```python
+from zarr_vectors.building import create_store
+
+create_store(
+    "scan.zarrvectors",
+    bounds=[[0, 0, 0], [1000, 1000, 1000]],
+    chunk_shape=(100.0, 100.0, 100.0),
+    geometry_types=["point_cloud"],
+    shard_shape=4,          # 4 cells per shard edge, every axis
+)
+```
+
+The units are grid **cells**, not coordinates, so one declaration stays
+meaningful at every level of a pyramid even though their grids differ. An
+`int` broadcasts to every axis; pass a per-axis list when they differ.
+
+Without the declaration, sharding reaches only the arrays a given writer
+call creates. That was the whole story before 0.9.3, and it produced
+stores that were sharded in whatever the coordinator made and flat in
+everything a worker added — a half-sharded store whose object count was
+nowhere near what was asked for.
+
+The per-call argument still works and still wins, for a writer that wants
+a different packing than the store's:
 
 ```python
 from zarr_vectors.types.points import write_points
@@ -244,28 +270,36 @@ reshard("scan.zv", None)                       # equivalent to unshard_store
 Both conversion functions are idempotent: shards already in the
 requested layout are skipped, and unsharding a flat store is a no-op.
 
-### Ordering: shard the links family last
+### Ordering: rebuild presence before repacking
 
 ```{important}
 `shard_store` MUST run **after** `finalize_links`, never before.
 ```
 
-`finalize_links` rebuilds each link array's `nonempty_chunks` manifest
-from the store listing, via `Group.derive_nonempty_chunks`. That rebuild
-is **unsharded-only**: it works by listing chunk objects at
-`<array>/c/i/j/k` and reading the cell coordinate back out of the key
-name. A shard packs many cells into a single object whose inner index is
-**not derivable from key names**, so once an array is sharded the listing
-no longer enumerates its cells and the rebuild finds nothing.
+This constrains `shard_store` — the pass that repacks an existing store.
+It does **not** mean a store has to be built flat: a store declaring
+`shard_shape` is born sharded and needs no repacking pass at all, which
+is cheaper and sidesteps this ordering constraint entirely.
 
-The constraint is a consequence of how the decentralized write protocol
-splits work. `nonempty_chunks` is array-wide state, so stamping it is a
-read-modify-write that two workers race on even when their *cells* are
-disjoint — the loser's key vanishes while its payload sits on disk.
-Workers therefore write with `record_presence=False` and skip the
-manifest entirely, leaving one coordinator to reconstruct it. Sharding
-before that reconstruction strands the payloads: the cells are on disk,
-but nothing enumerates them.
+`shard_store` selects each array's cells through `list_chunks`, which
+reads the `nonempty_chunks` manifest. The decentralized write protocol
+leaves that manifest empty on purpose: it is array-wide state, so
+stamping it is a read-modify-write that two workers race on even when
+their *cells* are disjoint — the loser's key vanishes while its payload
+sits on disk. Workers therefore pass `record_presence=False` and leave
+one coordinator to reconstruct it. Repacking before that reconstruction
+strands the payloads: the cells are on disk, but nothing enumerates them.
+
+```{note}
+Until 0.9.3 this section stated a second, stronger constraint: that a
+sharded array's presence could not be rebuilt at all, because
+`derive_nonempty_chunks` listed one object per cell and a sharded array
+has none. It now reads a sharded array's cells out of the shard objects
+themselves — zarr builds a sharded array's chunk grid from the *shard*
+shape, so a listed key names a shard, and the cells it covers are read in
+one slice. That is what makes born-sharded stores repairable, and it is
+why sharding is no longer forced to be the last pass.
+```
 
 The safe order for a scale-out ingest is:
 

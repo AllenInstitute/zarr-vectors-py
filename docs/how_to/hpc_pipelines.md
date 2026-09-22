@@ -467,6 +467,13 @@ carry the bulk of the bytes.
   genuinely shared state. If a consumer runs before that rebuild, collect the
   stamps and apply them under your own lock instead — see
   [Stamping under your own lock](#stamping-under-your-own-lock).
+- **Declare `shard_shape` on the store if you need one.** Pass it to
+  `create_store`, not to each writer: tasks allocate attribute arrays and link
+  segments on first write, and a task never sees the coordinator's arguments.
+  Declared on the store, those arrays are born sharded too; passed per call,
+  only the arrays that call creates are, and the store comes out half sharded.
+  Sharding also changes the locking you need — many cells share one object, so
+  two tasks writing *disjoint* cells are no longer writing disjoint files.
 - **Use a large `chunk_shape` on Lustre.** Stripe granularity is typically
   1–4 MB; cells smaller than that see no parallelism benefit.
   `Grid.plan(...).capacity(n_vertices=...)` gives the per-cell figure before
