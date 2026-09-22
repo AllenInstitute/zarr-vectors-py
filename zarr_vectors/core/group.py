@@ -192,6 +192,10 @@ class Group:
     # as ``_node_cache`` and keyed the same way.  See
     # :meth:`_chunk_listing` and :class:`_ChunkListing`.
     _listing_cache: dict[str, _ChunkListing] | None = None
+    # ``chunk_exists`` membership sets, keyed by array path and tied to
+    # the exact manifest list they were built from.  See
+    # :meth:`_presence_contains`.
+    _presence_sets: dict[str, tuple[list[str], frozenset[str] | None]] | None = None
     # Active offline-read snapshot, or None for normal store-backed
     # reads.  When set, reads must not touch the store: a miss records
     # itself and raises rather than falling through to a synchronous GET.
@@ -1118,7 +1122,7 @@ class Group:
             return False
         present = sharded_arr.attrs.get(_NONEMPTY_CHUNKS_ATTR)
         if present is not None:
-            return chunk_key in present
+            return self._presence_contains(array_name, present, chunk_key)
         # Fall back to inspecting the cell — slow path used when the
         # presence manifest is missing (e.g. mid-migration, or before a
         # coordinator's ``derive_nonempty_chunks``).  That inspection is
@@ -1137,6 +1141,44 @@ class Group:
         if index is None or not _coords_in_bounds(index, sharded_arr.shape):
             return False
         return _vlen_get_cell(sharded_arr, index) != b""
+
+    def _presence_contains(
+        self, array_name: str, present: list[str], chunk_key: str,
+    ) -> bool:
+        """``chunk_key in present``, without rescanning an unchanged list.
+
+        Inside a :meth:`batched_writes` or :meth:`cached_nodes` block the
+        node handle is cached, so every call sees the same manifest list;
+        a writer that asks per cell -- :func:`~zarr_vectors.core.arrays.write_link_attribute_cells`
+        decides append-or-create that way -- scanned it once per cell.
+        The second sighting of a list builds a set and later ones reuse
+        it.  The first is still a plain scan: outside a block every call
+        re-reads ``zarr.json`` and parses a fresh list, and building a set
+        from it would only add to a lookup that is never repeated.
+
+        Not a binary search, even though every writer here stores the
+        list sorted: only the sharding spec says it must be, and a list
+        from any other writer out of order would make a bisection answer
+        "absent" for a cell that is there.
+
+        Keyed to the list OBJECT, not its contents.  Every stamp assigns
+        a new list rather than mutating the old one, so identity is an
+        exact staleness test; holding the list in the entry keeps its id
+        from being reused while the entry lives.
+        """
+        cache = self._presence_sets
+        if cache is None:
+            cache = self._presence_sets = {}
+        key = self._full_path(array_name)
+        hit = cache.get(key)
+        if hit is None or hit[0] is not present:
+            cache[key] = (present, None)
+            return chunk_key in present
+        members = hit[1]
+        if members is None:
+            members = frozenset(present)
+            cache[key] = (present, members)
+        return chunk_key in members
 
     def _chunk_listing(self, array_name: str) -> _ChunkListing:
         """The presence manifest for ``array_name``, session-cached.

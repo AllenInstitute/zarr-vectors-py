@@ -264,7 +264,7 @@ GROUP_SUPPORTED_METHODS: frozenset[str] = frozenset({
     "attrs", "children", "create_group", "require_group",
     "array_exists", "standalone_array_exists", "delete_subtree",
     # per-chunk cell I/O
-    "read_bytes", "write_bytes", "chunk_exists", "list_chunks",
+    "read_bytes", "write_bytes", "write_cells", "chunk_exists", "list_chunks",
     "create_sharded_chunk_array",
     # per-array metadata
     "read_array_meta", "write_array_meta", "read_array_attrs",
