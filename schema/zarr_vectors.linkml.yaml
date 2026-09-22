@@ -275,6 +275,7 @@ classes:
       - base_bin_shape
       - format_capabilities
       - attribute_specs
+      - shard_shape
 
   LevelMetadata:
     description: >
@@ -581,6 +582,22 @@ slots:
       every axis (enforced runtime-side in ``RootMetadata.validate``).
     range: float
     multivalued: true
+  shard_shape:
+    description: >
+      Cells per shard per axis, or absent for one storage object per
+      cell.  The store's declared packing, read by every path that
+      allocates a per-chunk array -- including the ones that run long
+      after creation, inside workers that never saw the argument.  Units
+      are grid cells, so one declaration is meaningful at every level of
+      a pyramid even though their grids differ.  A store where every axis
+      agrees writes the scalar edge; the multivalued form carries a
+      per-axis shape.  Optional and additive from 0.9.3: absent means
+      unsharded, which is every store written before it.  It is a writer
+      default, not a claim about what is on disk -- an array's own
+      ``zarr.json`` remains the truth about that array.
+    range: integer
+    multivalued: true
+    minimum_value: 1
   format_capabilities:
     description: Optional 0.3+ feature tokens advertised by this store.
     range: FormatCapability

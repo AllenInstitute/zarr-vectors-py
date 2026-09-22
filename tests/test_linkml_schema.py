@@ -69,6 +69,14 @@ def _to_linkml_logical_form(root_dict: dict) -> dict:
             "min_corner": list(out["bounds"][0]),
             "max_corner": list(out["bounds"][1]),
         }
+    # ``shard_shape`` on disk is a bare int when every axis agrees -- the
+    # compact form ``create_store`` stamps and a reader looks for. LinkML
+    # has no int-or-list union the generator renders cleanly, so the slot
+    # is multivalued and the scalar is widened here.
+    if isinstance(out.get("shard_shape"), int) and not isinstance(
+        out["shard_shape"], bool
+    ):
+        out["shard_shape"] = [out["shard_shape"]]
     return out
 
 
