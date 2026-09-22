@@ -129,6 +129,16 @@ def validate_metadata(store_path: str | Path | Group) -> ValidationResult:
             lg = get_resolution_level(root, li)
             la = lg.attrs
             result.add_pass(f"resolution_{li} metadata parsed")
+            if lg.presence_deferred():
+                # Legal -- readers derive presence from the store -- but a
+                # build-time state: a finished store has run its rebuild,
+                # and every reader that trusts the manifest sees nothing
+                # of this level until it does.
+                result.add_warning(
+                    f"resolution_{li}: presence is deferred (a build that "
+                    f"did not finish, or whose coordinator never ran "
+                    f"rebuild_presence); its arrays carry no nonempty_chunks"
+                )
             vc = la.get("vertex_count")
             if vc is not None:
                 if not isinstance(vc, int) or vc < 0:
