@@ -216,6 +216,85 @@ def validate_conventions(
             )
 
 
+def _read_shard_shape(raw: Any) -> int | list[int] | None:
+    """A stored ``shard_shape`` back as an int or a list of ints.
+
+    Tolerant on read, like the rest of ``from_dict``: a store written by
+    something else may hold a tuple, a float that is really an int, or a
+    value that means nothing here. Anything unusable reads as ``None`` --
+    unsharded, the conservative answer, and the one every store written
+    before this field gives.
+    """
+    if raw is None or isinstance(raw, bool):
+        return None
+    if isinstance(raw, int):
+        return raw if raw >= 1 else None
+    if isinstance(raw, (list, tuple)):
+        try:
+            vals = [int(x) for x in raw]
+        except (TypeError, ValueError):
+            return None
+        return vals if vals and all(v >= 1 for v in vals) else None
+    return None
+
+
+def normalise_shard_shape(
+    shard_shape: int | Sequence[int] | None,
+    ndim: int,
+    *,
+    bin_axis: bool = False,
+) -> tuple[int, ...] | None:
+    """A shard declaration as a per-axis tuple for a grid of rank ``ndim``.
+
+    The value is *cells per shard per axis*, which says nothing about how
+    big the grid is — the same declaration is meaningful at every level of
+    a pyramid, whose grids differ. So it is stored verbatim and normalised
+    here, against whichever grid is being allocated. A shard larger than
+    the array is legal and is left alone; clipping it would make a coarse
+    level's arrays disagree with the shape the store declared.
+
+    Args:
+        ndim: Rank of the TARGET grid, including the bin axis if there is
+            one.
+        bin_axis: True when the target grid carries a leading
+            attribute-bin axis that the declaration does not describe
+            (``chunk_by_attribute``, and the rechunk engine's output).
+            A scalar still broadcasts across it — that is what a scalar
+            means. An explicit per-axis list gets ``1`` prepended instead,
+            so a shard never straddles bins, which are queried
+            independently and would otherwise be dragged into each
+            other's reads.
+
+    Returns:
+        ``None`` when ``shard_shape`` is ``None`` (explicitly unsharded).
+
+    Raises:
+        ValueError: On a non-positive component, or a list whose rank
+            fits neither the grid nor the grid without its bin axis.
+    """
+    if shard_shape is None:
+        return None
+    if isinstance(shard_shape, bool):
+        # bool is an int subclass; (1,)*ndim from True is never intended.
+        raise ValueError(f"shard_shape must be an int or a sequence, got {shard_shape!r}")
+    if isinstance(shard_shape, int):
+        if shard_shape < 1:
+            raise ValueError(f"shard_shape must be >= 1, got {shard_shape}")
+        return (shard_shape,) * ndim
+    shape = tuple(int(s) for s in shard_shape)
+    if any(s < 1 for s in shape):
+        raise ValueError(f"shard_shape components must be >= 1, got {shape}")
+    if bin_axis and len(shape) == ndim - 1:
+        return (1, *shape)
+    if len(shape) != ndim:
+        expected = f"{ndim - 1} or {ndim}" if bin_axis else str(ndim)
+        raise ValueError(
+            f"shard_shape {shape} has rank {len(shape)} but the chunk grid "
+            f"has rank {ndim}; expected {expected} components"
+        )
+    return shape
+
+
 def requires_links_array(convention: str) -> bool:
     """Return whether the links array is required for this convention."""
     return convention == "explicit"
@@ -288,6 +367,26 @@ class RootMetadata:
     that the array exists -- it appears when data is written -- but it is
     what lets :meth:`zarr_vectors.api.schema.Schema.from_store` round-trip
     and ``open_or_create`` report a store missing something declared."""
+    shard_shape: int | list[int] | None = None
+    """Cells per shard per axis, or ``None`` for one object per cell.
+
+    The store's declared PACKING, read by every path that allocates a
+    per-chunk array -- including the ones that run long after creation,
+    inside workers that never saw the argument. That is the point of
+    recording it: sharding a store used to mean passing ``shard_shape=``
+    to each writer, so the arrays a worker created lazily came out flat
+    and the store was half sharded.
+
+    Units are grid cells, not coordinates, so one declaration is
+    meaningful at every level of a pyramid even though their grids
+    differ. Stored verbatim -- an ``int`` when every axis agrees, a list
+    when they do not -- and normalised against the target grid by
+    :func:`normalise_shard_shape` at each point of use.
+
+    Optional and additive (0.9.3): absent means unsharded, which is every
+    store written before it. It is a writer default, not a claim about
+    what is on disk; an array's own ``zarr.json`` remains the truth about
+    that array, and ``sharding.get_shard_info`` reports it."""
 
     def validate(self) -> None:
         """Validate this metadata object.
@@ -415,6 +514,16 @@ class RootMetadata:
                         f"of base_bin_shape[{i}]={bs} (ratio={ratio:.6f})"
                     )
 
+        # Validate shard_shape if set.  Rank is checked against the
+        # spatial dims here; a grid carrying an attribute-bin axis is
+        # reconciled by ``normalise_shard_shape`` when it allocates,
+        # because the declaration describes the spatial grid either way.
+        if self.shard_shape is not None:
+            try:
+                normalise_shard_shape(self.shard_shape, sid_ndim)
+            except ValueError as exc:
+                raise MetadataError(f"Invalid shard_shape: {exc}") from exc
+
     @property
     def effective_bin_shape(self) -> tuple[float, ...]:
         """Base bin shape, defaulting to chunk_shape if not set."""
@@ -454,6 +563,12 @@ class RootMetadata:
         }
         if self.base_bin_shape is not None:
             d["zarr_vectors"]["base_bin_shape"] = list(self.base_bin_shape)
+        if self.shard_shape is not None:
+            d["zarr_vectors"]["shard_shape"] = (
+                int(self.shard_shape)
+                if isinstance(self.shard_shape, int)
+                else [int(x) for x in self.shard_shape]
+            )
         if self.format_capabilities:
             d["zarr_vectors"]["format_capabilities"] = list(self.format_capabilities)
         if self.attribute_specs:
@@ -540,6 +655,7 @@ class RootMetadata:
                 }
                 if (specs := zv.get("attribute_specs")) else None
             ),
+            shard_shape=_read_shard_shape(zv.get("shard_shape")),
         )
 
     def is_complete(self) -> bool:

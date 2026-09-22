@@ -70,7 +70,7 @@ from zarr_vectors.encoding.ragged import (
     encode_ragged_floats,
     encode_ragged_ints,
 )
-from zarr_vectors.exceptions import ArrayError, StoreError
+from zarr_vectors.exceptions import ArrayError, MetadataError, StoreError
 from zarr_vectors.typing import (
     ChunkCoords,
     CrossChunkLink,
@@ -319,6 +319,7 @@ def _derive_native_config(level_group: Group) -> dict[str, Any] | None:
         from zarr_vectors.core.metadata import (
             LevelMetadata,
             get_level_chunk_shape,
+            normalise_shard_shape,
         )
         from zarr_vectors.core.store import read_root_metadata
 
@@ -335,9 +336,23 @@ def _derive_native_config(level_group: Group) -> dict[str, Any] | None:
         cfg = {
             "origin": origin,
             "grid_shape": grid_shape,
-            "shard_shape": None,
+            # The store's declared packing. Reading it HERE is what
+            # reaches the arrays nobody passed it to: a links segment or
+            # attribute array allocated on first write, in a worker that
+            # never saw create_store's arguments. Without it a store came
+            # out sharded in whatever the coordinator made and flat in
+            # everything else.
+            "shard_shape": normalise_shard_shape(
+                root_meta.shard_shape, len(grid_shape),
+            ),
         }
-    except Exception:
+    except (StoreError, MetadataError, KeyError, ValueError, TypeError):
+        # Narrow deliberately. This branch means "the grid cannot be
+        # derived", and it used to swallow everything -- including a
+        # failure to read the shard declaration, which would silently
+        # produce flat arrays in a store that asked to be sharded. That
+        # is the bug this function exists to fix, so it must not be the
+        # way the fix fails.
         cfg = None
 
     level_group.__dict__["_derived_native_config"] = cfg
@@ -646,7 +661,7 @@ def open_write_session(
     level_group: Group,
     *,
     compressor: Any = None,
-    shard_shape: int | tuple[int, ...] | None = None,
+    shard_shape: int | tuple[int, ...] | None | Literal["inherit"] = "inherit",
     bounds: tuple[list[float], list[float]] | None = None,
     chunk_shape: tuple[float, ...] | None = None,
     bin_count: int | None = None,
@@ -669,10 +684,19 @@ def open_write_session(
         compressor: Forwarded to :meth:`Group.batched_writes`; also
             determines each array's on-disk codec pipeline (``None`` →
             no compression, the default).
-        shard_shape: ``None`` (default) → unsharded, one storage object
-            per spatial chunk.  An int (broadcast to every axis) or a
-            per-axis tuple wraps the cells in the ``sharding_indexed``
-            codec so many chunks pack into one storage object.
+        shard_shape: ``"inherit"`` (the default) takes the store's own
+            declaration, so a session opened against a sharded store
+            stays sharded without every caller having to repeat the
+            argument.  An int (broadcast to every axis) or a per-axis
+            tuple wraps the cells in the ``sharding_indexed`` codec so
+            many chunks pack into one storage object.  ``None`` means
+            *explicitly* unsharded, one storage object per spatial chunk.
+
+            ``None`` used to be the default, which made every second
+            write into a sharded store look like a request to unshard it
+            — and since that request was honoured by recreating the
+            array, the earlier data went with it.  The sentinel exists so
+            "I did not say" and "I said no" can be told apart.
         bounds: ``(min_corner, max_corner)`` for the level — used to
             compute the chunk grid extent and origin.
         chunk_shape: Physical chunk size per axis — paired with
@@ -696,13 +720,17 @@ def open_write_session(
         origin = (0, *origin)
         grid_shape = (int(bin_count), *grid_shape)
 
-    ss: tuple[int, ...] | None
-    if shard_shape is None:
-        ss = None
-    elif isinstance(shard_shape, int):
-        ss = (int(shard_shape),) * len(grid_shape)
-    else:
-        ss = tuple(int(x) for x in shard_shape)
+    from zarr_vectors.core.metadata import normalise_shard_shape
+
+    if shard_shape == "inherit":
+        cfg = _derive_native_config(level_group)
+        declared = cfg.get("shard_shape") if cfg else None
+        # Already normalised against the SPATIAL grid by the derive; the
+        # bin axis, if any, is prepended below by the same rule.
+        shard_shape = list(declared) if declared is not None else None
+    ss = normalise_shard_shape(
+        shard_shape, len(grid_shape), bin_axis=bin_count is not None,
+    )
 
     _warn_on_cell_count(grid_shape, sharded=ss is not None)
 

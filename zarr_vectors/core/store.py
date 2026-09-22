@@ -57,6 +57,7 @@ from zarr_vectors.core.metadata import (
     ParametricTypeDef,
     RootMetadata,
     deserialise_parametric_types,
+    normalise_shard_shape,
     serialise_parametric_types,
 )
 from zarr_vectors.exceptions import MetadataError, StoreError
@@ -322,6 +323,7 @@ def create_store(
     base_bin_shape: tuple[float, ...] | None = None,
     format_capabilities: list[str] | None = None,
     attribute_specs: dict[str, dict[str, Any]] | None = None,
+    shard_shape: int | Sequence[int] | None = None,
     name: str | None = None,
     backend: str | None = None,
     storage_options: dict[str, Any] | None = None,
@@ -416,6 +418,13 @@ def create_store(
     resolved_ndim = _resolve_ndim(
         ndim=ndim, axes=axes, chunk_shape=chunk_shape, bounds=bounds,
     )
+    # Checked here rather than at first use: a bad shape should fail at
+    # the call that declared it, not inside whichever worker later
+    # allocates an array from the declaration.
+    try:
+        normalise_shard_shape(shard_shape, resolved_ndim)
+    except ValueError as exc:
+        raise MetadataError(f"Invalid shard_shape: {exc}") from exc
     if axes is None:
         if resolved_ndim > len(DEFAULT_AXES_NAMES):
             raise MetadataError(
@@ -478,6 +487,7 @@ def create_store(
         base_bin_shape=base_bin_shape,
         format_capabilities=format_capabilities,
         attribute_specs=attribute_specs,
+        shard_shape=shard_shape,
         name=name,
     )
 
@@ -559,6 +569,7 @@ def _write_root_attrs(
     base_bin_shape: tuple[float, ...] | None = None,
     format_capabilities: list[str] | None = None,
     attribute_specs: dict[str, dict[str, Any]] | None = None,
+    shard_shape: int | Sequence[int] | None = None,
     name: str | None = None,
 ) -> None:
     """Write the ``zarr_vectors`` root-attrs block plus the eager NGFF
@@ -602,6 +613,13 @@ def _write_root_attrs(
         zv["reduction_factor"] = int(reduction_factor)
     if base_bin_shape is not None:
         zv["base_bin_shape"] = list(base_bin_shape)
+    if shard_shape is not None:
+        # Verbatim: the scalar form is what a reader looks for, and the
+        # value is cells-per-shard, which is meaningful against any grid.
+        zv["shard_shape"] = (
+            int(shard_shape) if isinstance(shard_shape, int)
+            else [int(x) for x in shard_shape]
+        )
     if attribute_specs:
         # Only non-empty scopes, so a store that declares nothing carries
         # no key at all rather than three empty dicts.
@@ -905,6 +923,7 @@ def _create_or_open_store(
     axes: list[dict[str, str]] | None = None,
     geometry_types: list[str] | None = None,
     ndim: int | None = None,
+    shard_shape: int | Sequence[int] | None = None,
     **backend_kwargs: Any,
 ) -> Group:
     """Warm the store with :func:`create_store` if no store exists at
@@ -917,9 +936,18 @@ def _create_or_open_store(
     — this lets callers write through a handle they already hold.
 
     The create-only kwargs (``bounds`` / ``chunk_shape`` / ``axes`` /
-    ``geometry_types`` / ``ndim``) are forwarded to :func:`create_store`
-    on a fresh path and ignored when opening an existing store — the
-    existing store's structural metadata stays authoritative.
+    ``geometry_types`` / ``ndim`` / ``shard_shape``) are forwarded to
+    :func:`create_store` on a fresh path and ignored when opening an
+    existing store — the existing store's structural metadata stays
+    authoritative.
+
+    ``shard_shape`` is named rather than left to ``**backend_kwargs``
+    precisely because it is not a backend option: absorbed there it was
+    forwarded to a store constructor that has no notion of sharding, and
+    on a local path dropped without a word.  Declaring it here is also
+    what makes ``write_points(path, shard_shape=8)`` produce a sharded
+    STORE rather than a store with sharded level-0 arrays and flat
+    everything a worker adds later.
     """
     # Pass-through for an already-opened Group handle.
     if isinstance(path, Group):
@@ -936,6 +964,8 @@ def _create_or_open_store(
         creator_kwargs["geometry_types"] = geometry_types
     if ndim is not None:
         creator_kwargs["ndim"] = ndim
+    if shard_shape is not None:
+        creator_kwargs["shard_shape"] = shard_shape
 
     if backend == "icechunk":
         try:

@@ -32,7 +32,7 @@ from __future__ import annotations
 from collections import defaultdict
 from collections.abc import Sequence
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Literal
 
 import numpy as np
 import numpy.typing as npt
@@ -338,7 +338,7 @@ def init_skeleton_store(
     backend: str | None = None,
     coordinate_offset: Sequence[float] | None = None,
     compressor: Any = None,
-    shard_shape: int | tuple[int, ...] | None = None,
+    shard_shape: int | tuple[int, ...] | None | Literal["inherit"] = "inherit",
 ):
     """Create a new skeleton store + an empty level 0 with its arrays.
 
@@ -375,6 +375,7 @@ def init_skeleton_store(
         str(store_path), backend=backend,
         bounds=(list(bounds[0]), list(bounds[1])),
         chunk_shape=tuple(chunk_shape), ndim=ndim, axes=axes,
+        shard_shape=None if shard_shape == "inherit" else shard_shape,
     )
     _ensure_root_metadata_for_write(
         root, inferred_ndim=ndim, geometry_type="skeleton",

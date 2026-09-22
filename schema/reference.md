@@ -80,6 +80,7 @@ Name: zarr_vectors
 | [reduction_factor](reduction_factor.md) | Multi-resolution coarsening factor (≥ 2) |
 | [row_shape](row_shape.md) | Tail dimensions of one attribute row (``[]`` for a 1-D per-link attribute), l... |
 | [shape](shape.md) | Shape of a dense per-object/per-group array |
+| [shard_shape](shard_shape.md) | Cells per shard per axis, or absent for one storage object per cell |
 | [shared_fragments](shared_fragments.md) | True when per-chunk fragments may be referenced by multiple objects' manifest... |
 | [sid_ndim](sid_ndim.md) | Number of spatial-index dimensions encoded in chunk keys |
 | [store](store.md) | Cell-duplication policy for a links family; see CrossChunkStore |
@@ -9522,6 +9523,8 @@ URI: [zv:RootMetadata](https://w3id.org/zarr-vectors/schema/0.5/RootMetadata)
         
       RootMetadata : reduction_factor
         
+      RootMetadata : shard_shape
+        
       RootMetadata : zv_version
         
       
@@ -9550,6 +9553,7 @@ URI: [zv:RootMetadata](https://w3id.org/zarr-vectors/schema/0.5/RootMetadata)
 | [base_bin_shape](base_bin_shape.md) | * <br/> [Float](Float.md) | Supervoxel bin edge lengths at level 0 | direct |
 | [format_capabilities](format_capabilities.md) | * <br/> [FormatCapability](FormatCapability.md) | Optional 0 | direct |
 | [attribute_specs](attribute_specs.md) | 0..1 <br/> [AttributeSpecs](AttributeSpecs.md) | What the store declares its attributes to be, keyed by scope (``vertex`` / ``... | direct |
+| [shard_shape](shard_shape.md) | * <br/> [Integer](Integer.md) | Cells per shard per axis, or absent for one storage object per cell | direct |
 
 
 
@@ -9621,6 +9625,7 @@ slots:
 - base_bin_shape
 - format_capabilities
 - attribute_specs
+- shard_shape
 
 ```
 </details>
@@ -9808,6 +9813,27 @@ attributes:
     domain_of:
     - RootMetadata
     range: AttributeSpecs
+  shard_shape:
+    name: shard_shape
+    description: 'Cells per shard per axis, or absent for one storage object per cell.  The
+      store''s declared packing, read by every path that allocates a per-chunk array
+      -- including the ones that run long after creation, inside workers that never
+      saw the argument.  Units are grid cells, so one declaration is meaningful at
+      every level of a pyramid even though their grids differ.  A store where every
+      axis agrees writes the scalar edge; the multivalued form carries a per-axis
+      shape.  Optional and additive from 0.9.3: absent means unsharded, which is every
+      store written before it.  It is a writer default, not a claim about what is
+      on disk -- an array''s own ``zarr.json`` remains the truth about that array.
+
+      '
+    from_schema: https://w3id.org/zarr-vectors/schema/0.5
+    rank: 1000
+    owner: RootMetadata
+    domain_of:
+    - RootMetadata
+    range: integer
+    multivalued: true
+    minimum_value: 1
 
 ```
 </details></div>
@@ -10021,6 +10047,127 @@ domain_of:
 range: integer
 required: true
 multivalued: true
+
+```
+</details></div>
+
+
+---
+
+---
+search:
+  boost: 5.0
+---
+
+# Slot: shard_shape 
+
+
+_Cells per shard per axis, or absent for one storage object per cell.  The store's declared packing, read by every path that allocates a per-chunk array -- including the ones that run long after creation, inside workers that never saw the argument.  Units are grid cells, so one declaration is meaningful at every level of a pyramid even though their grids differ.  A store where every axis agrees writes the scalar edge; the multivalued form carries a per-axis shape.  Optional and additive from 0.9.3: absent means unsharded, which is every store written before it.  It is a writer default, not a claim about what is on disk -- an array's own ``zarr.json`` remains the truth about that array._
+
+__
+
+
+
+<div data-search-exclude markdown="1">
+
+
+
+URI: [zv:shard_shape](https://w3id.org/zarr-vectors/schema/0.5/shard_shape)
+<!-- no inheritance hierarchy -->
+
+
+
+
+
+## Applicable Classes
+
+| Name | Description | Modifies Slot |
+| --- | --- | --- |
+| [RootMetadata](RootMetadata.md) | Root-level `` |  no  |
+
+
+
+
+
+
+## Properties
+
+### Type and Range
+
+| Property | Value |
+| --- | --- |
+| Range | [Integer](Integer.md) |
+| Domain Of | [RootMetadata](RootMetadata.md) |
+
+### Cardinality and Requirements
+
+| Property | Value |
+| --- | --- |
+| Multivalued | Yes |
+### Value Constraints
+
+| Property | Value |
+| --- | --- |
+| Minimum Value | 1 |
+
+
+
+
+
+
+
+
+
+
+
+
+## Identifier and Mapping Information
+
+
+
+
+
+### Schema Source
+
+
+* from schema: https://w3id.org/zarr-vectors/schema/0.5
+
+
+
+
+## Mappings
+
+| Mapping Type | Mapped Value |
+| ---  | ---  |
+| self | zv:shard_shape |
+| native | zv:shard_shape |
+
+
+
+
+## LinkML Source
+
+<details>
+```yaml
+name: shard_shape
+description: 'Cells per shard per axis, or absent for one storage object per cell.  The
+  store''s declared packing, read by every path that allocates a per-chunk array --
+  including the ones that run long after creation, inside workers that never saw the
+  argument.  Units are grid cells, so one declaration is meaningful at every level
+  of a pyramid even though their grids differ.  A store where every axis agrees writes
+  the scalar edge; the multivalued form carries a per-axis shape.  Optional and additive
+  from 0.9.3: absent means unsharded, which is every store written before it.  It
+  is a writer default, not a claim about what is on disk -- an array''s own ``zarr.json``
+  remains the truth about that array.
+
+  '
+from_schema: https://w3id.org/zarr-vectors/schema/0.5
+rank: 1000
+domain_of:
+- RootMetadata
+range: integer
+multivalued: true
+minimum_value: 1
 
 ```
 </details></div>

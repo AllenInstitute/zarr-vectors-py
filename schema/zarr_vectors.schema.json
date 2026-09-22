@@ -787,6 +787,17 @@
             "null"
           ]
         },
+        "shard_shape": {
+          "description": "Cells per shard per axis, or absent for one storage object per cell.  The store's declared packing, read by every path that allocates a per-chunk array -- including the ones that run long after creation, inside workers that never saw the argument.  Units are grid cells, so one declaration is meaningful at every level of a pyramid even though their grids differ.  A store where every axis agrees writes the scalar edge; the multivalued form carries a per-axis shape.  Optional and additive from 0.9.3: absent means unsharded, which is every store written before it.  It is a writer default, not a claim about what is on disk -- an array's own ``zarr.json`` remains the truth about that array.\n",
+          "items": {
+            "minimum": 1,
+            "type": "integer"
+          },
+          "type": [
+            "array",
+            "null"
+          ]
+        },
         "zv_version": {
           "description": "ZV spec version this store was written against (e.g. \"0.5.0\"). Renamed from ``format_version`` in 0.5.0 to disambiguate from Zarr v3's ``zarr_format`` field.\n",
           "pattern": "^\\d+\\.\\d+(\\.\\d+)?$",
