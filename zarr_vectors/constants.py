@@ -31,6 +31,19 @@ about that array -- this is a writer default, not a claim about what is
 on disk, which is why it is a field rather than a ``format_capabilities``
 token.  A 0.9.2 reader ignoring the key reads the store correctly.
 
+Also in 0.9.3, both additive in the same sense:
+
+* The root ``ome`` scene's ``world`` coordinate system carries ``id``
+  beside ``name``, so a collection elsewhere can bind an edge to it; a
+  reader that looks for ``name`` finds it unchanged.
+* A per-chunk array may omit ``nonempty_chunks``, meaning presence is
+  not recorded and a reader takes it from the store.  That happens only
+  while a level declares ``zarr_vectors_presence: "deferred"`` -- a
+  build-time state that the coordinator's rebuild ends, restoring every
+  manifest -- so a finished store is readable by a 0.9.2 reader.  One
+  caught mid-build is not: that reader treats the missing manifest as an
+  empty array.
+
 0.9.2: optional, backward-compatible ``ome`` block on the root (absent ⇒
 the prior behaviour, so 0.9.0 and 0.9.1 stores read unchanged).  It is an
 OME-Zarr RFC 8 **node** — ``version``, ``type: "collection"``, ``name``,
