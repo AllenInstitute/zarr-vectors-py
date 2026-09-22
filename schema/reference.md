@@ -14,6 +14,7 @@ Name: zarr_vectors
 | Class | Description |
 | --- | --- |
 | [AttributeMeta](AttributeMeta.md) | `` |
+| [AttributeSpecs](AttributeSpecs.md) | What the store declares its attributes to be, keyed by scope (``vertex`` / ``... |
 | [Axis](Axis.md) | One axis of the spatial index |
 | [BoundingBox](BoundingBox.md) | Two parallel ``ndim``-length arrays representing the global ``(min_corner, ma... |
 | [CRS](CRS.md) | Free-form coordinate reference system metadata |
@@ -37,6 +38,7 @@ Name: zarr_vectors
 | Slot | Description |
 | --- | --- |
 | [arrays_present](arrays_present.md) | Names of arrays present in the level group |
+| [attribute_specs](attribute_specs.md) | What the store declares its attributes to be, keyed by scope (``vertex`` / ``... |
 | [base_bin_shape](base_bin_shape.md) | Supervoxel bin edge lengths at level 0 |
 | [bin_ratio](bin_ratio.md) | Integer fold-change per axis relative to level 0 |
 | [bin_shape](bin_shape.md) | Per-axis supervoxel edge lengths at this level |
@@ -55,6 +57,7 @@ Name: zarr_vectors
 | [dtype](dtype.md) | Numpy dtype string of the array's value type (e |
 | [encoding](encoding.md) | How the chunk bytes are encoded |
 | [format_capabilities](format_capabilities.md) | Optional 0 |
+| [fragments_tile](fragments_tile.md) | True when every chunk in this level has a vertex fragment index that tiles it... |
 | [geometry_types](geometry_types.md) | One or more geometry kinds present in the store |
 | [has_perm](has_perm.md) | Whether each row of this links array carries a leading ``perm_idx`` column — ... |
 | [inherited_num_objects](inherited_num_objects.md) | OID-space size inherited from the parent level (= ``parent_level |
@@ -232,6 +235,116 @@ domain_of:
 range: string
 required: true
 multivalued: true
+
+```
+</details></div>
+
+
+---
+
+---
+search:
+  boost: 5.0
+---
+
+# Slot: attribute_specs 
+
+
+_What the store declares its attributes to be, keyed by scope (``vertex`` / ``object`` / ``link``) and then by attribute name. Each entry carries ``dtype`` and optionally ``channels``, ``categorical``, ``unit`` and ``description``.  Optional and backward-compatible from 0.9.1: absent means undeclared, which is every store written before it.  A declaration is not a promise the array exists -- the array appears when data is written -- but it is what lets a Schema round-trip and what ``open_or_create`` compares against.  ``unit`` and ``description`` are additionally stamped on the attribute array's own metadata block._
+
+__
+
+
+
+<div data-search-exclude markdown="1">
+
+
+
+URI: [zv:attribute_specs](https://w3id.org/zarr-vectors/schema/0.5/attribute_specs)
+<!-- no inheritance hierarchy -->
+
+
+
+
+
+## Applicable Classes
+
+| Name | Description | Modifies Slot |
+| --- | --- | --- |
+| [RootMetadata](RootMetadata.md) | Root-level `` |  no  |
+
+
+
+
+
+
+## Properties
+
+### Type and Range
+
+| Property | Value |
+| --- | --- |
+| Range | [AttributeSpecs](AttributeSpecs.md) |
+| Domain Of | [RootMetadata](RootMetadata.md) |
+
+### Cardinality and Requirements
+
+| Property | Value |
+| --- | --- |
+
+
+
+
+
+
+
+
+
+
+## Identifier and Mapping Information
+
+
+
+
+
+### Schema Source
+
+
+* from schema: https://w3id.org/zarr-vectors/schema/0.5
+
+
+
+
+## Mappings
+
+| Mapping Type | Mapped Value |
+| ---  | ---  |
+| self | zv:attribute_specs |
+| native | zv:attribute_specs |
+
+
+
+
+## LinkML Source
+
+<details>
+```yaml
+name: attribute_specs
+description: 'What the store declares its attributes to be, keyed by scope (``vertex``
+  / ``object`` / ``link``) and then by attribute name. Each entry carries ``dtype``
+  and optionally ``channels``, ``categorical``, ``unit`` and ``description``.  Optional
+  and backward-compatible from 0.9.1: absent means undeclared, which is every store
+  written before it.  A declaration is not a promise the array exists -- the array
+  appears when data is written -- but it is what lets a Schema round-trip and what
+  ``open_or_create`` compares against.  ``unit`` and ``description`` are additionally
+  stamped on the attribute array''s own metadata block.
+
+  '
+from_schema: https://w3id.org/zarr-vectors/schema/0.5
+rank: 1000
+domain_of:
+- RootMetadata
+range: AttributeSpecs
 
 ```
 </details></div>
@@ -446,6 +559,144 @@ attributes:
     - FragmentAttributeMeta
     range: string
     multivalued: true
+
+```
+</details></div>
+
+
+---
+
+---
+search:
+  boost: 10.0
+---
+
+# Class: AttributeSpecs 
+
+
+_What the store declares its attributes to be, keyed by scope (``vertex`` / ``object`` / ``link``) and then by attribute name. Modelled as an open dict for the same reason as ``CRS``: the value is a nested mapping, and the generators render a plain ``range: string`` slot as a string -- which would reject the very payload the runtime writes.  The per-entry shape is documented on the slot._
+
+__
+
+
+
+<div data-search-exclude markdown="1">
+
+
+
+URI: [linkml:Any](https://w3id.org/linkml/Any)
+
+
+
+
+
+```mermaid
+ classDiagram
+    class AttributeSpecs
+    click AttributeSpecs href "../AttributeSpecs/"
+      
+```
+
+
+
+
+<!-- no inheritance hierarchy -->
+
+## Class Properties
+
+| Property | Value |
+| --- | --- |
+| Class URI | [linkml:Any](https://w3id.org/linkml/Any) |
+
+
+## Slots
+
+| Name | Cardinality and Range | Description | Inheritance |
+| ---  | --- | --- | --- |
+
+
+
+
+
+## Usages
+
+| used by | used in | type | used |
+| ---  | --- | --- | --- |
+| [RootMetadata](RootMetadata.md) | [attribute_specs](attribute_specs.md) | range | [AttributeSpecs](AttributeSpecs.md) |
+
+
+
+
+
+
+
+
+
+
+
+
+## Identifier and Mapping Information
+
+
+
+
+
+### Schema Source
+
+
+* from schema: https://w3id.org/zarr-vectors/schema/0.5
+
+
+
+
+## Mappings
+
+| Mapping Type | Mapped Value |
+| ---  | ---  |
+| self | linkml:Any |
+| native | zv:AttributeSpecs |
+
+
+
+
+
+
+## LinkML Source
+
+### Direct
+
+<details>
+```yaml
+name: AttributeSpecs
+description: 'What the store declares its attributes to be, keyed by scope (``vertex``
+  / ``object`` / ``link``) and then by attribute name. Modelled as an open dict for
+  the same reason as ``CRS``: the value is a nested mapping, and the generators render
+  a plain ``range: string`` slot as a string -- which would reject the very payload
+  the runtime writes.  The per-entry shape is documented on the slot.
+
+  '
+from_schema: https://w3id.org/zarr-vectors/schema/0.5
+rank: 1000
+class_uri: linkml:Any
+
+```
+</details>
+
+### Induced
+
+<details>
+```yaml
+name: AttributeSpecs
+description: 'What the store declares its attributes to be, keyed by scope (``vertex``
+  / ``object`` / ``link``) and then by attribute name. Modelled as an open dict for
+  the same reason as ``CRS``: the value is a nested mapping, and the generators render
+  a plain ``range: string`` slot as a string -- which would reject the very payload
+  the runtime writes.  The per-entry shape is documented on the slot.
+
+  '
+from_schema: https://w3id.org/zarr-vectors/schema/0.5
+rank: 1000
+class_uri: linkml:Any
 
 ```
 </details></div>
@@ -3799,6 +4050,114 @@ search:
   boost: 5.0
 ---
 
+# Slot: fragments_tile 
+
+
+_True when every chunk in this level has a vertex fragment index that tiles its buffer, so the concatenation of a chunk's fragments IS its vertex buffer and a bulk read may skip ``vertex_fragments`` entirely.  Unlike the other flags here this is a claim about what has NOT happened since: it is stamped by a bulk writer and cleared by any later write to ``vertices`` or ``vertex_fragments``. Readers MUST treat an absent value as False._
+
+__
+
+
+
+<div data-search-exclude markdown="1">
+
+
+
+URI: [zv:fragments_tile](https://w3id.org/zarr-vectors/schema/0.5/fragments_tile)
+<!-- no inheritance hierarchy -->
+
+
+
+
+
+## Applicable Classes
+
+| Name | Description | Modifies Slot |
+| --- | --- | --- |
+| [LevelMetadata](LevelMetadata.md) | Per-resolution-level `` |  no  |
+
+
+
+
+
+
+## Properties
+
+### Type and Range
+
+| Property | Value |
+| --- | --- |
+| Range | [Boolean](Boolean.md) |
+| Domain Of | [LevelMetadata](LevelMetadata.md) |
+
+### Cardinality and Requirements
+
+| Property | Value |
+| --- | --- |
+
+
+
+
+
+
+
+
+
+
+## Identifier and Mapping Information
+
+
+
+
+
+### Schema Source
+
+
+* from schema: https://w3id.org/zarr-vectors/schema/0.5
+
+
+
+
+## Mappings
+
+| Mapping Type | Mapped Value |
+| ---  | ---  |
+| self | zv:fragments_tile |
+| native | zv:fragments_tile |
+
+
+
+
+## LinkML Source
+
+<details>
+```yaml
+name: fragments_tile
+description: 'True when every chunk in this level has a vertex fragment index that
+  tiles its buffer, so the concatenation of a chunk''s fragments IS its vertex buffer
+  and a bulk read may skip ``vertex_fragments`` entirely.  Unlike the other flags
+  here this is a claim about what has NOT happened since: it is stamped by a bulk
+  writer and cleared by any later write to ``vertices`` or ``vertex_fragments``. Readers
+  MUST treat an absent value as False.
+
+  '
+from_schema: https://w3id.org/zarr-vectors/schema/0.5
+rank: 1000
+domain_of:
+- LevelMetadata
+range: boolean
+
+```
+</details></div>
+
+
+---
+
+---
+search:
+  boost: 5.0
+---
+
 # Slot: geometry_types 
 
 
@@ -5064,6 +5423,8 @@ URI: [zv:LevelMetadata](https://w3id.org/zarr-vectors/schema/0.5/LevelMetadata)
         
       LevelMetadata : coarsening_method
         
+      LevelMetadata : fragments_tile
+        
       LevelMetadata : inherited_num_objects
         
       LevelMetadata : level
@@ -5105,6 +5466,7 @@ URI: [zv:LevelMetadata](https://w3id.org/zarr-vectors/schema/0.5/LevelMetadata)
 | [preserves_object_ids](preserves_object_ids.md) | 0..1 <br/> [Boolean](Boolean.md) | True for levels written by the per-object pyramid regime | direct |
 | [inherited_num_objects](inherited_num_objects.md) | 0..1 <br/> [Integer](Integer.md) | OID-space size inherited from the parent level (= ``parent_level | direct |
 | [shared_fragments](shared_fragments.md) | 0..1 <br/> [Boolean](Boolean.md) | True when per-chunk fragments may be referenced by multiple objects' manifest... | direct |
+| [fragments_tile](fragments_tile.md) | 0..1 <br/> [Boolean](Boolean.md) | True when every chunk in this level has a vertex fragment index that tiles it... | direct |
 
 
 
@@ -5175,6 +5537,7 @@ slots:
 - preserves_object_ids
 - inherited_num_objects
 - shared_fragments
+- fragments_tile
 slot_usage:
   chunk_shape:
     name: chunk_shape
@@ -5379,6 +5742,22 @@ attributes:
     description: 'True when per-chunk fragments may be referenced by multiple objects''
       manifests (shared metavertices in the per-object pyramid regime).  v0.6 successor
       to ``shared_vertex_groups``.  Readers MAY use this to short-circuit dedup work.
+
+      '
+    from_schema: https://w3id.org/zarr-vectors/schema/0.5
+    rank: 1000
+    owner: LevelMetadata
+    domain_of:
+    - LevelMetadata
+    range: boolean
+  fragments_tile:
+    name: fragments_tile
+    description: 'True when every chunk in this level has a vertex fragment index
+      that tiles its buffer, so the concatenation of a chunk''s fragments IS its vertex
+      buffer and a bulk read may skip ``vertex_fragments`` entirely.  Unlike the other
+      flags here this is a claim about what has NOT happened since: it is stamped
+      by a bulk writer and cleared by any later write to ``vertices`` or ``vertex_fragments``.
+      Readers MUST treat an absent value as False.
 
       '
     from_schema: https://w3id.org/zarr-vectors/schema/0.5
@@ -9036,6 +9415,17 @@ URI: [zv:RootMetadata](https://w3id.org/zarr-vectors/schema/0.5/RootMetadata)
  classDiagram
     class RootMetadata
     click RootMetadata href "../RootMetadata/"
+      RootMetadata : attribute_specs
+        
+          
+    
+        
+        
+        RootMetadata --> "0..1" AttributeSpecs : attribute_specs
+        click AttributeSpecs href "../AttributeSpecs/"
+    
+
+        
       RootMetadata : base_bin_shape
         
       RootMetadata : bounds
@@ -9159,6 +9549,7 @@ URI: [zv:RootMetadata](https://w3id.org/zarr-vectors/schema/0.5/RootMetadata)
 | [reduction_factor](reduction_factor.md) | 0..1 <br/> [Integer](Integer.md) | Multi-resolution coarsening factor (≥ 2) | direct |
 | [base_bin_shape](base_bin_shape.md) | * <br/> [Float](Float.md) | Supervoxel bin edge lengths at level 0 | direct |
 | [format_capabilities](format_capabilities.md) | * <br/> [FormatCapability](FormatCapability.md) | Optional 0 | direct |
+| [attribute_specs](attribute_specs.md) | 0..1 <br/> [AttributeSpecs](AttributeSpecs.md) | What the store declares its attributes to be, keyed by scope (``vertex`` / ``... | direct |
 
 
 
@@ -9229,6 +9620,7 @@ slots:
 - reduction_factor
 - base_bin_shape
 - format_capabilities
+- attribute_specs
 
 ```
 </details>
@@ -9398,6 +9790,24 @@ attributes:
     - RootMetadata
     range: FormatCapability
     multivalued: true
+  attribute_specs:
+    name: attribute_specs
+    description: 'What the store declares its attributes to be, keyed by scope (``vertex``
+      / ``object`` / ``link``) and then by attribute name. Each entry carries ``dtype``
+      and optionally ``channels``, ``categorical``, ``unit`` and ``description``.  Optional
+      and backward-compatible from 0.9.1: absent means undeclared, which is every
+      store written before it.  A declaration is not a promise the array exists --
+      the array appears when data is written -- but it is what lets a Schema round-trip
+      and what ``open_or_create`` compares against.  ``unit`` and ``description``
+      are additionally stamped on the attribute array''s own metadata block.
+
+      '
+    from_schema: https://w3id.org/zarr-vectors/schema/0.5
+    rank: 1000
+    owner: RootMetadata
+    domain_of:
+    - RootMetadata
+    range: AttributeSpecs
 
 ```
 </details></div>
