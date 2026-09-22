@@ -9,68 +9,24 @@ Line references are against `cf4c2f1`.
 
 ---
 
-## 1. `build_pyramid` fails on an attribute-chunked level
+## 1. `build_pyramid` leftovers after the attribute-chunked fix
 
-**Severity: high.** Public API (`Dataset.build_pyramid`), documented feature
-combination, fails outright and leaves a half-built store behind.
+**Severity: low.** Pyramids over attribute-chunked levels, the depth-0
+gate, per-step rollback and the empty-level `chunk_shape` were fixed on
+`todo-backlog`; these were left out of scope.
 
-```
-ChunkingError: partition_arrays_by_offset: src_chunks has shape (M, 4);
-expected (M, 3)
-```
-from `zarr_vectors/spatial/boundary.py:736-741`.
-
-Three things disagree:
-
-| | rank | source |
-|---|---|---|
-| `sid_ndim` passed to the link writer | 3 | `root_meta.sid_ndim`, set once at `multiresolution/coarsen.py:195` |
-| `src_chunks` (`fine_cc`, `coarsen.py:996-1010`) | 4 | the fine level's real on-disk keys, via `_reconstruct_chunk_assignments` → `chunk_local_to_global_offsets` |
-| `trg_chunks` (`coarse_cc`, `coarsen.py:1012`) | 3 | `assign_chunks(meta_positions, target_chunk_shape)` at `coarsen.py:407`, purely spatial |
-
-The partitioner's single-rank contract is load-bearing, not incidental: the
-group-by key is `concatenate([src_chunks, offsets])` and it splits back with
-`head[:sid_ndim]` / `head[sid_ndim:]` (`boundary.py:758,775-776`), then
-`format_offsets` (`core/paths.py:78`) encodes the offset tuple into the on-disk
-array path and `parse_offsets` validates arity against `sid_ndim` on read.
-
-**Decided:** make cross-level links work, rather than failing fast or skipping
-them. That makes the coarse level itself attribute-chunked with the same bins,
-so both endpoints are rank `sid_ndim + 1`.
-
-**Open design question, must be settled first.** Coarsening currently groups per
-object. A polyline with mixed attribute values *is* split across bins by design
-(`docs/spec/chunking/attribute_chunking.md`), so a per-object metavertex can
-draw vertices from several bins. The bin has to become part of the grouping key
-so a metavertex never mixes bins — otherwise a categorical query at a coarse
-level returns the wrong set, which defeats the purpose of attribute chunking.
-Confirm where the grouping key is formed in `_per_object_coarsen`
-(`coarsen.py:195-560`) before committing to this.
-
-**Precedent to reuse:** `_pad_scale` (`core/arrays.py:2727-2745`) already states
-the rule — the bin axis indexes bins, not space, so it never rescales across
-levels; pad with 1s at the front. It is currently inert on this path only
-because the coarsener passes the spatial `sid_ndim`. Passing the widened rank
-should make the partitioner arithmetic work unchanged.
-
-**Also fix while here:** `coarsen.py:428-448` and `:701-718` build the coarse
-`LevelMetadata` without `chunk_dims` / `chunk_attribute_name` /
-`chunk_attribute_values`. They need propagating.
-
-**Related, worth folding in:**
-- **Partial write with no rollback.** By the time it raises, the coarse level
-  group, `vertices`, `object_index`, every coarse vertex chunk,
-  `object_attributes` and two `CAP_*` root tokens are already written
-  (`coarsen.py:449-546`). There is no cleanup anywhere in the module, and
-  `create_resolution_level` uses `require_group`, so a retry silently merges
-  into the half-built level.
-- **`cross_level_depth=0` does not avoid it.** `build_pyramid` never forwards
-  `cross_level_depth` to `coarsen_level` (`coarsen.py:1126-1138`), so the inline
-  ±1 emission still runs. Only `cross_level_storage="none"` escapes;
-  `"implicit"` fails at the same line as `"explicit"`.
-
-**No test covers a pyramid over an attribute-chunked store.** The sets of tests
-touching `build_pyramid` and `chunk_by_attribute` are disjoint.
+- **A pyramid is not atomic across levels.** Each `coarsen_level` step rolls
+  itself back, but a failure at level k keeps levels 1..k-1, and the
+  finalize pass (`±N`, N ≥ 2) does not run.
+- **Registered coarsen strategies** (`zarr-vectors-tools`) over an
+  attribute-chunked source are untested. They receive the same kwargs as
+  before; if they reach `_write_cross_level_edges` with mismatched ranks they
+  now get a `CoarseningError` naming both levels instead of the
+  partitioner's shape error.
+- **A pre-existing `links/+1` family on the source** cannot be restored by
+  the rollback once `write_links(mode="replace")` has rewritten it. It is
+  unreachable today: a target level must not exist, and only an old,
+  half-removed pyramid leaves a `+1` family behind.
 
 ---
 

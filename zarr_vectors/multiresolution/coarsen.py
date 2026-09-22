@@ -15,6 +15,7 @@ between objects, and per-object OIDs are preserved across levels.
 
 from __future__ import annotations
 
+from contextlib import contextmanager, nullcontext
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -28,6 +29,7 @@ from zarr_vectors.constants import (
     COARSEN_PER_OBJECT,
     DEFAULT_CROSS_LEVEL_DEPTH,
     DEFAULT_CROSS_LEVEL_STORAGE,
+    LINKS,
     OBJECT_ATTRIBUTES,
     VALID_XLEVEL_STORAGE,
     VERTEX_FRAGMENTS,
@@ -36,6 +38,7 @@ from zarr_vectors.constants import (
     XLEVEL_NONE,
 )
 from zarr_vectors.core.arrays import (
+    _leading_grid_axes,
     create_object_attributes_array,
     create_object_index_array,
     create_vertices_array,
@@ -54,7 +57,9 @@ from zarr_vectors.core.arrays import (
 from zarr_vectors.core.metadata import (
     LevelMetadata,
     get_level_chunk_shape,
+    normalise_shard_shape,
 )
+from zarr_vectors.core.paths import links_group_path
 from zarr_vectors.core.store import (
     create_resolution_level,
     get_resolution_level,
@@ -62,6 +67,7 @@ from zarr_vectors.core.store import (
     open_store,
     read_level_metadata,
     read_root_metadata,
+    remove_resolution_level,
 )
 from zarr_vectors.exceptions import ArrayError, CoarseningError
 from zarr_vectors.multiresolution.object_selection import apply_sparsity
@@ -98,10 +104,20 @@ def coarsen_level(
     the resulting metavertex appears in each of those objects' manifests
     at the coarser level.
 
+    A level chunked by an attribute keeps its bins: the coarse level has
+    the same leading bin axis and ``chunk_attribute_*`` metadata, and a
+    metavertex aggregates vertices of one bin only.
+
+    If the step raises part-way, what it wrote is removed before the
+    error propagates: the target level, a ``links/+1`` family it added to
+    the source level, and the root attributes it stamped.
+
     Args:
         store_path: Path to the zarr vectors store.
         source_level: Level to read from.
-        target_level: Level to write to (must not exist).
+        target_level: Level to write to.  Must not exist: raises
+            :class:`~zarr_vectors.exceptions.CoarseningError` rather than
+            merging into one that does.
         coarsen_factor: Per-object vertex aggregation factor (>= 1),
             expressed as a **ratio against the source level's bin**, not the
             root's: the target bin is ``source_level.bin_shape *
@@ -243,6 +259,48 @@ def _per_object_coarsen(
 
     src_group = get_resolution_level(root, source_level)
 
+    # The docstring has always said the target must not exist; nothing
+    # checked, and ``create_resolution_level`` uses require_group, so a
+    # second run merged into the first.  Refusing is also what lets a
+    # failed run below roll back everything it wrote: all of it is new.
+    if target_level in list_resolution_levels(root):
+        raise CoarseningError(
+            f"level {target_level} already exists; coarsening into it would "
+            f"merge into what is there. Remove it first with "
+            f"remove_resolution_level(root, {target_level})."
+        )
+
+    # A level chunked by an attribute puts a bin index first in every
+    # chunk key.  The coarse level keeps the same bins, so both ends of a
+    # cross-level link have one rank, and a metavertex never mixes bins,
+    # or a categorical read of a coarse level would return vertices from
+    # other categories.  ``ndim`` stays the coordinate width, which is
+    # what every read and row count below needs; ``key_ndim`` is the rank
+    # of a chunk key, which is what the object index and links need.
+    leading = _leading_grid_axes(src_group, src_level_meta, ndim)
+    if len(leading) > 1:
+        raise CoarseningError(
+            f"level {source_level} has {len(leading)} leading grid axes; "
+            f"coarsening supports at most one (a single chunk_by_attribute "
+            f"or rechunk bin axis)"
+        )
+    key_ndim = ndim + len(leading)
+    src_keys = list_chunk_keys(src_group, VERTICES)
+    if src_keys and len(src_keys[0]) != key_ndim:
+        raise CoarseningError(
+            f"level {source_level}'s chunk keys have {len(src_keys[0])} "
+            f"components but its grid has rank {key_ndim}; the level is "
+            f"inconsistent (validate(store, level=1) reports where)"
+        )
+    bin_meta: dict[str, Any] = {}
+    if leading:
+        bin_meta = {
+            name: getattr(src_level_meta, name, None)
+            for name in (
+                "chunk_dims", "chunk_attribute_name", "chunk_attribute_values",
+            )
+        }
+
     # --- Step 0: read source manifests + vertex positions ----------------
     # Read source vertex positions, indexed by (chunk_coords, fragment_idx).
     # One prefetch for the level: read chunk by chunk, each read opened
@@ -253,7 +311,7 @@ def _per_object_coarsen(
     # resolved the ``vertices`` node again to look it up.
     src_dtype = vertices_dtype(src_group)
     with _level_prefetch(src_group):
-        for cc in list_chunk_keys(src_group, VERTICES):
+        for cc in src_keys:
             try:
                 fragments = read_chunk_vertices(src_group, cc, dtype=src_dtype, ndim=ndim)
             except ArrayError:
@@ -273,7 +331,7 @@ def _per_object_coarsen(
         # No object_index — treat the level as one implicit object whose
         # manifest enumerates every fragment in chunk-major order.
         implicit: list[tuple[ChunkCoords, int]] = []
-        for cc in list_chunk_keys(src_group, VERTICES):
+        for cc in src_keys:
             fragment_idx = 0
             while (cc, fragment_idx) in src_fragment_positions:
                 implicit.append((cc, fragment_idx))
@@ -314,6 +372,11 @@ def _per_object_coarsen(
     # ``all_pos``. On a million vertices the peak was 68 times the data.
     per_object_count: dict[int, int] = {}
     flat_positions: list[np.ndarray] = []
+    # Each vertex's bin, as run lengths in ``all_pos`` order: the bin is
+    # the leading component of the key its fragment was read from, and a
+    # fragment lies in one cell, so one run per fragment.
+    run_bins: list[int] = []
+    run_lengths: list[int] = []
     for oid in keep_oids:
         manifest = src_manifests[oid]
         parts: list[np.ndarray] = []
@@ -322,6 +385,9 @@ def _per_object_coarsen(
             if fragment is None or len(fragment) == 0:
                 continue
             parts.append(np.asarray(fragment, dtype=np.float32))
+            if leading:
+                run_bins.append(int(cc[0]))
+                run_lengths.append(len(fragment))
         if not parts:
             per_object_count[oid] = 0
             continue
@@ -336,14 +402,19 @@ def _per_object_coarsen(
 
     if not flat_positions:
         # Surviving objects had no vertices.  Write an empty level.
-        _write_empty_preserve_level(
-            root, source_level, target_level,
-            base_bin=base_bin,
-            root_bin=root_meta.effective_bin_shape,
-            coarsen_factor=coarsen_factor,
-            sparsity_factor=sparsity_factor,
-            inherited_num_objects=n_src_objects,
-        )
+        with _rollback_level_on_failure(root, source_level, target_level):
+            _write_empty_preserve_level(
+                root, source_level, target_level,
+                base_bin=base_bin,
+                root_meta=root_meta,
+                coarsen_factor=coarsen_factor,
+                sparsity_factor=sparsity_factor,
+                inherited_num_objects=n_src_objects,
+                chunk_shape=chunk_shape,
+                chunk_shape_override=target_chunk_shape_override,
+                leading=leading,
+                bin_meta=bin_meta,
+            )
         return {
             "vertex_count": 0,
             "object_count": 0,
@@ -366,6 +437,15 @@ def _per_object_coarsen(
     # Compute per-vertex bin coords: (N, ndim) int64.
     bin_shape_arr = np.asarray(target_bin_shape, dtype=np.float64)
     bin_coords = np.floor(all_pos / bin_shape_arr).astype(np.int64)
+    all_bins: npt.NDArray[np.int64] | None = None
+    if leading:
+        # The attribute bin leads the grouping key, so vertices of two
+        # bins that share a spatial bin become two metavertices.
+        all_bins = np.repeat(
+            np.asarray(run_bins, dtype=np.int64),
+            np.asarray(run_lengths, dtype=np.int64),
+        )
+        bin_coords = np.concatenate([all_bins[:, None], bin_coords], axis=1)
     # Combine each bin coord tuple into a single sort-key for np.unique.
     bin_keys = np.ascontiguousarray(bin_coords).view(
         np.dtype((np.void, bin_coords.dtype.itemsize * bin_coords.shape[1]))
@@ -373,6 +453,12 @@ def _per_object_coarsen(
     unique_keys, inverse = np.unique(bin_keys, return_inverse=True)
     inverse = inverse.astype(np.int64, copy=False)
     n_metavertices = int(inverse.max()) + 1 if inverse.size > 0 else 0
+    # Each metavertex's attribute bin: all its members share one.
+    mv_bin: npt.NDArray[np.int64] | None = None
+    if all_bins is not None:
+        mv_bin = np.empty(n_metavertices, dtype=np.int64)
+        mv_bin[inverse] = all_bins
+        del all_bins
     # bin_coords and the view over it are one int64 per axis per source
     # vertex -- twice all_pos -- and were held to the end of the function
     # purely so the cross-level step could recompute this np.unique on
@@ -405,6 +491,8 @@ def _per_object_coarsen(
 
     # --- Step 4: chunk-assign metavertices ------------------------------
     chunk_assignments = assign_chunks(meta_positions, chunk_shape)
+    if mv_bin is not None:
+        chunk_assignments = _split_by_bin(chunk_assignments, mv_bin)
 
     # --- Step 5: per-chunk fragment layout (one fragment per metavertex) ------------
     per_chunk_groups: dict[ChunkCoords, list[np.ndarray]] = {}
@@ -423,143 +511,149 @@ def _per_object_coarsen(
         mv_fragment_idx[idx] = np.arange(idx.size, dtype=np.int64)
         per_chunk_groups[cc] = list(np.split(meta_positions[idx], idx.size))
 
-    # --- Step 6: write per-chunk fragments --------------------------
-    arrays_present = [VERTICES, "object_index"] if src_has_objects else [VERTICES]
-    level_meta_initial = LevelMetadata(
-        level=target_level,
-        vertex_count=int(n_metavertices),
-        arrays_present=arrays_present,
-        bin_shape=target_bin_shape,
-        # Fold-change relative to LEVEL 0, not to the source level: this is
-        # what becomes the NGFF ``scale`` transform. With per-level coarsen
-        # factors the two differ — [2, 2] is ratio 2 then 4 — so it has to be
-        # derived from the bin shapes rather than echoing coarsen_factor.
-        bin_ratio=tuple(
-            max(1, int(round(float(t) / float(r))))
-            for t, r in zip(target_bin_shape, root_meta.effective_bin_shape)
-        ),
-        chunk_shape=target_chunk_shape_override,
-        object_sparsity=(1.0 / sparsity_factor),
-        coarsening_method=COARSEN_PER_OBJECT,
-        parent_level=source_level,
-        preserves_object_ids=src_has_objects,
-        inherited_num_objects=n_src_objects if src_has_objects else 0,
-        shared_fragments=True,
-    )
-    level_group = create_resolution_level(root, target_level, level_meta_initial)
-    create_vertices_array(level_group, dtype="float32")
-    if src_has_objects:
-        create_object_index_array(level_group)
+    # Everything from here writes.  A failure part-way used to leave a
+    # half-built level behind, which a retry then merged into.
+    with _rollback_level_on_failure(root, source_level, target_level):
+        # --- Step 6: write per-chunk fragments --------------------------
+        arrays_present = [VERTICES, "object_index"] if src_has_objects else [VERTICES]
+        level_meta_initial = LevelMetadata(
+            level=target_level,
+            vertex_count=int(n_metavertices),
+            arrays_present=arrays_present,
+            bin_shape=target_bin_shape,
+            # Fold-change relative to LEVEL 0, not to the source level: this is
+            # what becomes the NGFF ``scale`` transform. With per-level coarsen
+            # factors the two differ — [2, 2] is ratio 2 then 4 — so it has to be
+            # derived from the bin shapes rather than echoing coarsen_factor.
+            bin_ratio=tuple(
+                max(1, int(round(float(t) / float(r))))
+                for t, r in zip(target_bin_shape, root_meta.effective_bin_shape)
+            ),
+            chunk_shape=target_chunk_shape_override,
+            object_sparsity=(1.0 / sparsity_factor),
+            coarsening_method=COARSEN_PER_OBJECT,
+            parent_level=source_level,
+            preserves_object_ids=src_has_objects,
+            inherited_num_objects=n_src_objects if src_has_objects else 0,
+            shared_fragments=True,
+            **bin_meta,
+        )
+        level_group = create_resolution_level(root, target_level, level_meta_initial)
+        with _coarse_grid(level_group, root_meta, chunk_shape, leading):
+            create_vertices_array(level_group, dtype="float32")
+            if src_has_objects:
+                create_object_index_array(level_group)
 
-    # One batch for the whole level. Unbatched, each cell write is a
-    # parse-insert-sort-rewrite of the array's presence manifest, so
-    # writing C cells costs O(C^2) -- 32,768 cells took 207s to write
-    # through this path and 262,144 did not finish in 25 minutes.
-    # Batched, the cells go out in one gather and presence is stamped
-    # once for the array.
-    with level_group.batched_writes():
-        for cc, groups in sorted(per_chunk_groups.items()):
-            write_chunk_vertices(level_group, cc, groups, dtype=np.float32)
+            # One batch for the whole level. Unbatched, each cell write is a
+            # parse-insert-sort-rewrite of the array's presence manifest, so
+            # writing C cells costs O(C^2) -- 32,768 cells took 207s to write
+            # through this path and 262,144 did not finish in 25 minutes.
+            # Batched, the cells go out in one gather and presence is stamped
+            # once for the array.
+            with level_group.batched_writes():
+                for cc, groups in sorted(per_chunk_groups.items()):
+                    write_chunk_vertices(level_group, cc, groups, dtype=np.float32)
 
-    # --- Step 7: emit per-object manifests ------------------------------
-    # We need to map each source vertex back to its metavertex_index.
-    # Walk per-object slices of the flat ``inverse`` array.
-    cursor = 0
-    new_manifests: dict[int, list[tuple[ChunkCoords, int]]] = {}
+        # --- Step 7: emit per-object manifests ------------------------------
+        # We need to map each source vertex back to its metavertex_index.
+        # Walk per-object slices of the flat ``inverse`` array.
+        cursor = 0
+        new_manifests: dict[int, list[tuple[ChunkCoords, int]]] = {}
 
-    def _id_of(row: int) -> int:
-        """The object id at a source row -- the row itself when the
-        source stored its objects densely from zero."""
-        return int(src_ids[row]) if src_ids is not None else int(row)
+        def _id_of(row: int) -> int:
+            """The object id at a source row -- the row itself when the
+            source stored its objects densely from zero."""
+            return int(src_ids[row]) if src_ids is not None else int(row)
 
-    for oid in keep_oids:
-        n = per_object_count[oid]
-        if n == 0:
-            cursor += 0
-            new_manifests[_id_of(oid)] = []
-            continue
-        mv_seq = inverse[cursor:cursor + n]
-        cursor += n
-        # Drop consecutive duplicates, preserving order -- vectorised,
-        # because this runs once per source vertex across the level.
-        if mv_seq.size > 1:
-            keep = np.concatenate(([True], mv_seq[1:] != mv_seq[:-1]))
-            mv_seq = mv_seq[keep]
-        new_manifests[_id_of(oid)] = [
-            (chunk_slots[slot], int(frag))
-            for slot, frag in zip(
-                mv_chunk_slot[mv_seq].tolist(),
-                mv_fragment_idx[mv_seq].tolist(),
+        for oid in keep_oids:
+            n = per_object_count[oid]
+            if n == 0:
+                cursor += 0
+                new_manifests[_id_of(oid)] = []
+                continue
+            mv_seq = inverse[cursor:cursor + n]
+            cursor += n
+            # Drop consecutive duplicates, preserving order -- vectorised,
+            # because this runs once per source vertex across the level.
+            if mv_seq.size > 1:
+                keep = np.concatenate(([True], mv_seq[1:] != mv_seq[:-1]))
+                mv_seq = mv_seq[keep]
+            new_manifests[_id_of(oid)] = [
+                (chunk_slots[slot], int(frag))
+                for slot, frag in zip(
+                    mv_chunk_slot[mv_seq].tolist(),
+                    mv_fragment_idx[mv_seq].tolist(),
+                )
+            ]
+
+        # --- Step 9: emit object_index (dropped OIDs stay addressable) ------
+        if src_has_objects:
+            # Every source id gets a row, so a sparsified level keeps the
+            # ids it dropped addressable -- as empty manifests, exactly as
+            # the old slot padding did, but named rather than implied by
+            # position. ``total_objects`` is deliberately not passed: it
+            # declares the id space as range(n), which is only the source's
+            # id space when that source numbered its objects densely.
+            ids_for_index = (
+                src_ids.tolist() if src_ids is not None
+                else list(range(n_src_objects))
             )
-        ]
+            write_object_index(
+                level_group,
+                {int(oid): new_manifests.get(int(oid), []) for oid in ids_for_index},
+                sid_ndim=key_ndim,
+            )
 
-    # --- Step 9: emit object_index (dropped OIDs stay addressable) ------
-    if src_has_objects:
-        # Every source id gets a row, so a sparsified level keeps the
-        # ids it dropped addressable -- as empty manifests, exactly as
-        # the old slot padding did, but named rather than implied by
-        # position. ``total_objects`` is deliberately not passed: it
-        # declares the id space as range(n), which is only the source's
-        # id space when that source numbered its objects densely.
-        ids_for_index = (
-            src_ids.tolist() if src_ids is not None
-            else list(range(n_src_objects))
-        )
-        write_object_index(
-            level_group,
-            {int(oid): new_manifests.get(int(oid), []) for oid in ids_for_index},
-            sid_ndim=ndim,
-        )
+        # --- Step 10: per-object attributes with present_mask ---------------
+        src_obj_attr_group_name = f"{OBJECT_ATTRIBUTES}"
+        if src_obj_attr_group_name in src_group:
+            src_obj_attr_group = src_group[src_obj_attr_group_name]
+            # children() covers both layouts: legacy per-chunk-array groups
+            # under group_keys() and standalone arrays under array_keys().
+            attr_names = src_obj_attr_group.children()
+        else:
+            attr_names = []
+        for attr_name in attr_names:
+            try:
+                src_data = read_object_attributes(src_group, attr_name)
+            except ArrayError:
+                continue
+            # Dense (O, C) or (O,) padded to the inherited OID space, with
+            # rows for survivors copied over.  Layout matches the source's
+            # OID space (which already equals n_src_objects).
+            out_data = np.zeros_like(src_data)
+            # One scatter each, rather than a Python iteration per surviving
+            # object over a column that is already an array.
+            keep_arr = np.asarray(keep_oids, dtype=np.int64)
+            keep_arr = keep_arr[keep_arr < len(src_data)]
+            if keep_arr.size:
+                out_data[keep_arr] = src_data[keep_arr]
+            mask = np.zeros(n_src_objects, dtype=np.uint8)
+            mask[np.asarray(keep_oids, dtype=np.int64)] = 1
+            create_object_attributes_array(level_group, attr_name)
+            write_object_attributes(level_group, attr_name, out_data, present_mask=mask)
 
-    # --- Step 10: per-object attributes with present_mask ---------------
-    src_obj_attr_group_name = f"{OBJECT_ATTRIBUTES}"
-    if src_obj_attr_group_name in src_group:
-        src_obj_attr_group = src_group[src_obj_attr_group_name]
-        # children() covers both layouts: legacy per-chunk-array groups
-        # under group_keys() and standalone arrays under array_keys().
-        attr_names = src_obj_attr_group.children()
-    else:
-        attr_names = []
-    for attr_name in attr_names:
-        try:
-            src_data = read_object_attributes(src_group, attr_name)
-        except ArrayError:
-            continue
-        # Dense (O, C) or (O,) padded to the inherited OID space, with
-        # rows for survivors copied over.  Layout matches the source's
-        # OID space (which already equals n_src_objects).
-        out_data = np.zeros_like(src_data)
-        # One scatter each, rather than a Python iteration per surviving
-        # object over a column that is already an array.
-        keep_arr = np.asarray(keep_oids, dtype=np.int64)
-        keep_arr = keep_arr[keep_arr < len(src_data)]
-        if keep_arr.size:
-            out_data[keep_arr] = src_data[keep_arr]
-        mask = np.zeros(n_src_objects, dtype=np.uint8)
-        mask[np.asarray(keep_oids, dtype=np.int64)] = 1
-        create_object_attributes_array(level_group, attr_name)
-        write_object_attributes(level_group, attr_name, out_data, present_mask=mask)
+        # --- Step 12: stamp root capability tokens --------------------------
+        if src_has_objects:
+            _stamp_root_capability(root, CAP_PRESERVED_OBJECT_IDS)
+        _stamp_root_capability(root, CAP_SHARED_FRAGMENTS)
 
-    # --- Step 12: stamp root capability tokens --------------------------
-    if src_has_objects:
-        _stamp_root_capability(root, CAP_PRESERVED_OBJECT_IDS)
-    _stamp_root_capability(root, CAP_SHARED_FRAGMENTS)
-
-    # --- Step 13: emit inline ±1 cross-level link arrays ----------------
-    # Must stay after step 6's create_resolution_level: the anchor's
-    # scale factors are read off the target level's metadata.
-    if cross_level_storage != XLEVEL_NONE and n_metavertices > 0:
-        _emit_inline_cross_level_links(
-            root,
-            src_group=src_group,
-            level_group=level_group,
-            source_level=source_level,
-            ndim=ndim,
-            bin_shape_arr=bin_shape_arr,
-            unique_keys=unique_keys,
-            coarse_chunk_assignments_mv=chunk_assignments,
-            storage=cross_level_storage,
-        )
+        # --- Step 13: emit inline ±1 cross-level link arrays ----------------
+        # Must stay after step 6's create_resolution_level: the anchor's
+        # scale factors are read off the target level's metadata.
+        if cross_level_storage != XLEVEL_NONE and n_metavertices > 0:
+            _emit_inline_cross_level_links(
+                root,
+                src_group=src_group,
+                level_group=level_group,
+                source_level=source_level,
+                ndim=ndim,
+                n_leading=len(leading),
+                bin_shape_arr=bin_shape_arr,
+                unique_keys=unique_keys,
+                coarse_chunk_assignments_mv=chunk_assignments,
+                storage=cross_level_storage,
+            )
 
     return {
         "vertex_count": int(n_metavertices),
@@ -579,6 +673,7 @@ def _emit_inline_cross_level_links(
     level_group,
     source_level: int,
     ndim: int,
+    n_leading: int = 0,
     bin_shape_arr: npt.NDArray[np.float64],
     unique_keys: npt.NDArray,
     coarse_chunk_assignments_mv: dict[ChunkCoords, npt.NDArray[np.int64]],
@@ -587,7 +682,9 @@ def _emit_inline_cross_level_links(
     """Emit the ``±1`` link families for one coarsen step.
 
     Re-walks the source level in chunk-major order, re-bins each
-    vertex against ``bin_shape_arr``, and looks up the matching
+    vertex against ``bin_shape_arr`` -- prefixed with the first
+    ``n_leading`` components of its chunk key, the attribute bin, exactly
+    as the grouping key was built -- and looks up the matching
     metavertex via the ``bin_key`` ↔ ``mv_idx`` map implicit in
     ``np.unique(bin_keys, return_inverse=inverse)``.  Translates
     metavertex IDs to chunk-major-flat coarse indices via the
@@ -632,13 +729,17 @@ def _emit_inline_cross_level_links(
     parent = np.full(n_fine, -1, dtype=np.int64)
     cursor = 0
     key_dtype = np.dtype((
-        np.void, int(bin_shape_arr.shape[0]) * np.dtype(np.int64).itemsize,
+        np.void,
+        (int(bin_shape_arr.shape[0]) + n_leading) * np.dtype(np.int64).itemsize,
     ))
+    # Read at the declared dtype, then binned in float32 as the grouping
+    # was: a float64 level read as float32 decodes to garbage.
+    src_dtype = vertices_dtype(src_group)
     with _level_prefetch(src_group):
         for cc in list_chunk_keys(src_group, VERTICES):
             try:
                 fragments = read_chunk_vertices(
-                    src_group, cc, dtype=np.float32, ndim=ndim,
+                    src_group, cc, dtype=src_dtype, ndim=ndim,
                 )
             except ArrayError:
                 continue
@@ -649,6 +750,14 @@ def _emit_inline_cross_level_links(
                 local_bins = np.floor(
                     np.asarray(fragment, dtype=np.float32) / bin_shape_arr,
                 ).astype(np.int64)
+                if n_leading:
+                    local_bins = np.concatenate([
+                        np.broadcast_to(
+                            np.asarray(cc[:n_leading], dtype=np.int64),
+                            (n_local, n_leading),
+                        ),
+                        local_bins,
+                    ], axis=1)
                 local_keys = np.ascontiguousarray(local_bins).view(key_dtype).ravel()
                 # One searchsorted per fragment, not one dict lookup per
                 # vertex. ``unique_keys`` is np.unique output and therefore
@@ -675,7 +784,6 @@ def _emit_inline_cross_level_links(
         n_fine=n_fine,
         n_coarse=n_coarse,
         parent=parent,
-        sid_ndim=ndim,
         storage=storage,
     )
 
@@ -686,15 +794,23 @@ def _write_empty_preserve_level(
     target_level: int,
     *,
     base_bin: tuple[float, ...],
-    root_bin: tuple[float, ...],
+    root_meta: Any,
     coarsen_factor: float,
     sparsity_factor: float,
     inherited_num_objects: int,
+    chunk_shape: tuple[float, ...],
+    chunk_shape_override: tuple[float, ...] | None,
+    leading: tuple[int, ...] = (),
+    bin_meta: dict[str, Any] | None = None,
 ) -> None:
     """Write an empty ID-preserving level when no surviving object has vertices.
 
     ``base_bin`` is the SOURCE level's bin (what ``coarsen_factor`` multiplies);
-    ``root_bin`` is level 0's, needed for the level-0-relative ``bin_ratio``.
+    the root's is needed for the level-0-relative ``bin_ratio``.  The level
+    is otherwise the one a populated coarsen would have written: the same
+    ``chunk_shape`` override, and the same leading bin axis, so a later
+    level coarsened from it -- or an array added to it -- lands on the
+    grid its siblings have.
     """
     ndim = len(base_bin)
     target_bin_shape = tuple(float(b) * float(coarsen_factor) for b in base_bin)
@@ -707,24 +823,112 @@ def _write_empty_preserve_level(
         # factor.
         bin_ratio=tuple(
             max(1, int(round(float(t) / float(r))))
-            for t, r in zip(target_bin_shape, root_bin)
+            for t, r in zip(target_bin_shape, root_meta.effective_bin_shape)
         ),
+        chunk_shape=chunk_shape_override,
         object_sparsity=(1.0 / sparsity_factor),
         coarsening_method=COARSEN_PER_OBJECT,
         parent_level=source_level,
         preserves_object_ids=True,
         inherited_num_objects=inherited_num_objects,
         shared_fragments=True,
+        **(bin_meta or {}),
     )
     level_group = create_resolution_level(root, target_level, level_meta)
-    create_vertices_array(level_group, dtype="float32")
-    create_object_index_array(level_group)
+    with _coarse_grid(level_group, root_meta, chunk_shape, leading):
+        create_vertices_array(level_group, dtype="float32")
+        create_object_index_array(level_group)
     # Empty object_index with the inherited size — all manifests are [].
     write_object_index(
-        level_group, {}, sid_ndim=ndim,
+        level_group, {}, sid_ndim=ndim + len(leading),
         total_objects=inherited_num_objects,
     )
     _stamp_root_capability(root, CAP_PRESERVED_OBJECT_IDS)
+
+
+def _split_by_bin(
+    assignments: dict[ChunkCoords, npt.NDArray],
+    mv_bin: npt.NDArray[np.int64],
+) -> dict[ChunkCoords, npt.NDArray]:
+    """Prefix each spatial chunk's metavertices with their attribute bin.
+
+    ``{(z, y, x): idx}`` becomes ``{(bin, z, y, x): idx[mv_bin[idx] == bin]}``,
+    the on-disk keys of a level chunked by an attribute.  Order within a
+    chunk is kept, which is what fixes each metavertex's fragment index.
+    """
+    out: dict[ChunkCoords, npt.NDArray] = {}
+    for scc, idx in assignments.items():
+        idx = np.asarray(idx)
+        bins = mv_bin[idx]
+        for b in np.unique(bins):
+            out[(int(b), *scc)] = idx[bins == b]
+    return out
+
+
+def _coarse_grid(
+    level_group, root_meta: Any, chunk_shape: tuple[float, ...],
+    leading: tuple[int, ...],
+):
+    """The allocation context for a coarse level's per-chunk arrays.
+
+    A spatial level needs none: arrays allocated without a session derive
+    their grid from the store.  A level with a leading bin axis is given
+    its grid outright.  The derivation would find the bin count in
+    ``chunk_attribute_values``, but a rechunk made before bin labels were
+    recorded has the axis with no values, and there it would allocate one
+    rank short.  Once ``vertices`` exists at the full rank, every later
+    allocation in the level derives the axis from it.
+    """
+    if not leading:
+        return nullcontext()
+    from zarr_vectors.core.arrays import level_grid_layout
+
+    origin, grid = level_grid_layout(root_meta.bounds, chunk_shape)
+    grid = (*leading, *grid)
+    return level_group.native_sharded_arrays(
+        normalise_shard_shape(root_meta.shard_shape, len(grid), bin_axis=True),
+        grid,
+        origin=(*((0,) * len(leading)), *origin),
+    )
+
+
+@contextmanager
+def _rollback_level_on_failure(root, source_level: int, target_level: int):
+    """Undo one coarsen step's writes if it raises.
+
+    The step writes the target level, stamps the root (the NGFF
+    ``multiscales`` entry, capability tokens, the ``ome`` node) and may
+    add a ``links/+1`` family to the source level.  All of it is new,
+    because the caller refuses a target that already exists, so undoing
+    it is deleting it and restoring the attributes it changed.  A cleanup
+    failure is attached to the original error rather than replacing it.
+    """
+    src = get_resolution_level(root, source_level)
+    root_before = root.attrs.to_dict()
+    src_before = src.attrs.to_dict()
+    had_links = src.array_exists(LINKS)
+    had_plus_one = src.array_exists(links_group_path(1))
+    try:
+        yield
+    except BaseException as exc:
+        try:
+            if target_level in list_resolution_levels(root):
+                remove_resolution_level(root, target_level)
+            src = get_resolution_level(root, source_level)
+            if not had_plus_one:
+                stray = links_group_path(1) if had_links else LINKS
+                if src.array_exists(stray):
+                    src.delete_subtree(stray)
+            for group, before in ((root, root_before), (src, src_before)):
+                now = group.attrs.to_dict()
+                changed = {k: v for k, v in before.items() if now.get(k) != v}
+                if changed:
+                    group.attrs.update(changed)
+        except Exception as cleanup:
+            exc.add_note(
+                f"rolling back level {target_level} also failed: {cleanup!r}"
+            )
+        raise
 
 
 def _stamp_root_capability(root_group, cap: str) -> None:
@@ -943,7 +1147,6 @@ def _finalize_cross_level_for_store(
                 n_fine=n_fine,
                 n_coarse=n_coarse,
                 parent=parent,
-                sid_ndim=ndim,
                 storage=cross_level_storage,
             )
 
@@ -958,7 +1161,6 @@ def _write_cross_level_edges(
     n_fine: int,
     n_coarse: int,
     parent: npt.NDArray[np.int64],
-    sid_ndim: int,
     storage: str,
 ) -> None:
     """Materialize ``delta``-step cross-level edges between two adjacent levels.
@@ -1007,6 +1209,16 @@ def _write_cross_level_edges(
     # them back together was the dominant cost of a pyramid build.
     fine_chunk_arr = np.asarray(fine_chunk_list, dtype=np.int64)
     coarse_chunk_arr = np.asarray(coarse_chunk_list, dtype=np.int64)
+    # The key rank, read off the keys rather than the root's sid_ndim: a
+    # level chunked by an attribute has one more axis than the spatial
+    # rank, and both ends of a link must have the same number.
+    sid_ndim = int(fine_chunk_arr.shape[1])
+    if coarse_chunk_arr.shape[1] != sid_ndim:
+        raise CoarseningError(
+            f"level {fine_level} has rank-{sid_ndim} chunk keys but level "
+            f"{fine_level + delta} has rank-{coarse_chunk_arr.shape[1]}; "
+            f"cross-level links need both ends on one grid rank"
+        )
     fine_cc = fine_chunk_arr[fine_vchunks[fine_global]]
     fine_vi = fine_vlocal[fine_global]
     coarse_cc = coarse_chunk_arr[coarse_vchunks[parent_valid]]
@@ -1063,7 +1275,12 @@ def build_pyramid(
     at ``1.0`` opts out of that axis.  Uses the per-object pyramid:
     each surviving object's vertices are aggregated into bin centroids
     (metavertices); metavertices may be shared between objects and OIDs
-    are preserved across levels.
+    are preserved across levels.  A store chunked by an attribute keeps
+    its bins at every level (see :func:`coarsen_level`).
+
+    Each level is written by one :func:`coarsen_level` step, which rolls
+    itself back if it fails.  The pyramid as a whole is not atomic:
+    levels built before a failing step are kept.
 
     Args:
         store_path: Path to the store with level 0.
@@ -1084,7 +1301,8 @@ def build_pyramid(
             ``zarr-vectors-tools``-registered method (see
             :func:`coarsen_level`).
         cross_level_depth: Maximum absolute level delta for materialized
-            cross-pyramid-level link arrays.  ``0`` = none, ``N`` = up
+            cross-pyramid-level link arrays.  ``0`` = none, whatever
+            ``cross_level_storage`` says, ``N`` = up
             to ``±N`` per pair (or ``+N`` only when
             ``cross_level_storage='implicit'``), ``-1`` = walk all
             available level pairs.  Default ``1``.
@@ -1132,7 +1350,12 @@ def build_pyramid(
             chunk_scale_factor=chunk_scale,
             sparsity_strategy=sparsity_strategy,
             sparsity_seed=sparsity_seed,
-            cross_level_storage=cross_level_storage,
+            # Depth 0 asks for no cross-level links, but the storage mode
+            # was all the inline ±1 emission checked, so it wrote them
+            # anyway while the root recorded depth 0.
+            cross_level_storage=(
+                XLEVEL_NONE if cross_level_depth == 0 else cross_level_storage
+            ),
             method=method,
             options=options,
         ))
