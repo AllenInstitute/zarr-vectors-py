@@ -437,6 +437,7 @@ def rechunk_spatial(
     create_store(str(out_path), bounds=meta.bounds, chunk_shape=chunk_shape,
                  geometry_types=list(meta.geometry_types), ndim=ndim,
                  base_bin_shape=tuple(float(b) for b in base_bin),
+                 shard_shape=getattr(meta, "shard_shape", None),
                  links_convention=getattr(meta, "links_convention", None)
                  or "explicit",
                  object_index_convention=getattr(

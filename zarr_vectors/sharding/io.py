@@ -44,6 +44,26 @@ The Morton / Hilbert curve indirection of older versions is gone; the
 native sharding codec already clusters spatially-adjacent inner chunks
 into the same shard via its C-order outer grid, giving the same
 read-locality benefit without a custom mapping.
+
+Post-hoc, not the only way
+--------------------------
+
+These verbs repack a store that already exists.  A store can also be
+born sharded -- ``create_store(shard_shape=)`` records the shape and
+every array allocated afterwards honours it, including the ones created
+lazily in workers.  That is cheaper than writing flat and repacking, and
+it is what a pipeline that knows its own object budget should do.
+
+This module used to document the opposite as a contract: sharding had to
+be the LAST coordinator pass, because ``nonempty_chunks`` could only be
+rebuilt from a per-cell store listing and a sharded array does not have
+one.  :meth:`~zarr_vectors.core.group.Group.derive_nonempty_chunks` now
+reads a sharded array's cells out of its shard objects, so that ordering
+is no longer forced.  What remains true is narrower: ``shard_store``
+selects cells through the presence manifest, so a store whose workers
+wrote with ``record_presence=False`` still needs its rebuild before it
+is repacked -- otherwise there is nothing to migrate and the pass
+silently does nothing.
 """
 
 from __future__ import annotations
@@ -211,12 +231,6 @@ def shard_store(
         for array_name in _list_array_names(level, arrays):
             if not level.array_exists(array_name):
                 continue
-            chunk_keys = [
-                k for k in level.list_chunks(array_name)
-                if _parse_chunk_coords(k) is not None
-            ]
-            if not chunk_keys:
-                continue
 
             import zarr
             existing = level.zarr_group[array_name]
@@ -241,11 +255,17 @@ def shard_store(
                 final_shard_shape = this_shard_shape
 
             # Already native-sharded with the right shape → skip.
-            if (
-                isinstance(existing, zarr.Array)
-                and _is_native_sharded(existing)
-                and existing.shards == this_shard_shape
-            ):
+            # Tested BEFORE the manifest walk below: on a store that was
+            # born sharded this is every array, and the answer is one
+            # zarr.json read rather than a presence enumeration per array.
+            if _is_native_sharded(existing) and existing.shards == this_shard_shape:
+                continue
+
+            chunk_keys = [
+                k for k in level.list_chunks(array_name)
+                if _parse_chunk_coords(k) is not None
+            ]
+            if not chunk_keys:
                 continue
 
             # Snapshot existing per-chunk payloads + array metadata so
@@ -342,9 +362,13 @@ def unshard_store(
                 tuple(int(x) for x in raw_origin) if raw_origin else None
             )
             chunk_keys = level.list_chunks(array_name)
-            chunk_payloads: dict[str, bytes] = {
-                k: level.read_bytes(array_name, k) for k in chunk_keys
-            }
+            # One gather rather than a round trip per cell, as the shard
+            # direction already does. It matters more here: every one of
+            # these reads is currently a whole-shard fetch.
+            with level.batched_reads([(array_name, chunk_keys)]):
+                chunk_payloads: dict[str, bytes] = {
+                    k: level.read_bytes(array_name, k) for k in chunk_keys
+                }
             preserved_attrs = dict(level.read_array_meta(array_name))
             preserved_attrs.pop("nonempty_chunks", None)
             preserved_attrs.pop("chunk_grid_origin", None)

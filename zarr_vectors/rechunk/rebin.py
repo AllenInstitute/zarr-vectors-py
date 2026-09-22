@@ -30,7 +30,6 @@ from zarr_vectors.core.arrays import (
 )
 from zarr_vectors.core.metadata import (
     LevelMetadata,
-    RootMetadata,
     compute_bin_ratio,
     validate_bin_shape_divides_chunk,
 )
@@ -39,6 +38,7 @@ from zarr_vectors.core.store import (
     open_store,
     read_level_metadata,
     read_root_metadata,
+    update_root_metadata,
 )
 from zarr_vectors.exceptions import StoreError
 from zarr_vectors.spatial.chunking import assign_bins
@@ -170,24 +170,16 @@ def rebin_level(
 
     # Update root base_bin_shape when re-binning level 0 (so future
     # writes / reads see the new default).
+    #
+    # Through ``update_root_metadata``, which read-modify-writes the one
+    # field named.  This used to rebuild a whole RootMetadata from named
+    # fields and ``attrs.update(to_dict())``, which REPLACES the block --
+    # so every field the reconstruction forgot was destroyed.
+    # ``attribute_specs`` already was, silently, and ``shard_shape`` would
+    # have been next.  Listing one more field here would only re-arm that;
+    # not rebuilding the block is the fix.
     if level == 0:
-        new_root = RootMetadata(
-            spatial_index_dims=root_meta.spatial_index_dims,
-            chunk_shape=root_meta.chunk_shape,
-            bounds=root_meta.bounds,
-            geometry_types=root_meta.geometry_types,
-            zv_version=root_meta.zv_version,
-            crs=root_meta.crs,
-            links_convention=root_meta.links_convention,
-            object_index_convention=root_meta.object_index_convention,
-            cross_chunk_strategy=root_meta.cross_chunk_strategy,
-            reduction_factor=root_meta.reduction_factor,
-            base_bin_shape=new_bin_shape,
-            cross_level_depth=root_meta.cross_level_depth,
-            cross_level_storage=root_meta.cross_level_storage,
-            format_capabilities=list(root_meta.format_capabilities),
-        )
-        root.attrs.update(new_root.to_dict())
+        update_root_metadata(root, base_bin_shape=new_bin_shape)
 
     return {
         "chunks_processed": chunks_processed,
