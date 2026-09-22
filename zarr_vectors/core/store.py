@@ -449,13 +449,35 @@ def create_store(
             "link": ...}``.  Optional and additive; a reader that does
             not know about it is unaffected.  Declaring an attribute does
             not create it.
+        shard_shape: Cells per shard per axis, or ``None`` (the default)
+            for one storage object per cell.  An ``int`` broadcasts to
+            every axis; a per-axis sequence must have one entry per
+            spatial dimension.
+
+            Recorded on the root, which is what makes it reach the arrays
+            nobody passes it to -- an attribute array or links segment
+            allocated on first write, in a worker that never saw this
+            call.  Per-call ``shard_shape=`` on a writer reaches only the
+            arrays that writer creates, which is how a store ends up
+            sharded in some arrays and flat in the rest.
+
+            The units are grid cells, not coordinates, so one declaration
+            stays meaningful at every level of a pyramid even though
+            their grids differ.  It is a writer default rather than a
+            claim about what is on disk: each array's own ``zarr.json``
+            remains the truth about that array.
         name: Human-readable store name, recorded on the RFC 8 ``ome``
             node so an OME collection can present it.  Defaults to the
             store path's last segment with its extension stripped.  Not an
             identifier: a collection referencing this store supplies its
             own name for the node, which is what addresses it there.
         backend: Force a particular backend (``"local"`` / ``"icechunk"``).
-        **backend_kwargs: Forwarded to the backend constructor.
+        **backend_kwargs: Forwarded to the backend constructor.  A
+            backend that takes no options -- ``local``, or a store you
+            built yourself -- raises :class:`TypeError` rather than
+            discarding them, so a misspelled parameter fails here instead
+            of being silently ignored.  Structured ``storage_options=``
+            is always accepted.
 
     Returns:
         The root :class:`Group`.
