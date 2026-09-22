@@ -213,3 +213,29 @@ while the arrays are rank 4, and `grid.cells` under-reports by a factor of K.
 question is only what `Level.grid` should return for a store that exists. Either
 carry the leading axis, or document that `grid` is the spatial grid and that
 `cell_of` / `cells_in` / `holds` are spatial predicates.
+
+---
+
+## 6. No device-side read path
+
+**Severity: none today — a recorded constraint, not a request.** Asked for by
+BRIDGE (its D8, GPU-direct reads), which has dropped it from its own backlog
+because nothing it can do reaches past this.
+
+Every read ends in `np.frombuffer` on host memory, so a device buffer handed up
+by zarr (`zarr.config.enable_gpu()`, kvikio) is copied to the host on its first
+contact with this package. The batched reader and writer already pass zarr a
+buffer prototype, but it is fixed at import to the host-side
+`default_buffer_prototype()` (`core/_batch_reader.py:61`,
+`core/_batch_writer.py:90`).
+
+There is also no partial-cell read. `read_fragment` advertises a byte-slice
+fast path for range fragments but fetches the whole cell and slices it on the
+host. The only genuinely sub-cell read is row selection on 1-D standalone
+arrays (`Group.read_vlen_elements`).
+
+**If taken up:** make the prototype configurable, then a read path that honours
+it instead of calling `np.frombuffer`, then byte-range plumbing so a range
+fragment is fetched without its cell. The last only works for an uncompressed
+cell — under a compressor there is no byte range to ask for — so it is a
+codec-dependent fast path, not a general one.

@@ -1180,9 +1180,10 @@ class Group:
         and a caller asking per cell -- the per-tuple link readers,
         :func:`~zarr_vectors.core.arrays.read_chunk_fragment_attributes`
         -- scanned it once per cell.  The second sighting of a list builds
-        a set and later ones reuse it.  The first is still a plain scan: outside a block every call
-        re-reads ``zarr.json`` and parses a fresh list, and building a set
-        from it would only add to a lookup that is never repeated.
+        a set and later ones reuse it.  The first is still a plain scan:
+        outside a block every call re-reads ``zarr.json`` and parses a
+        fresh list, and building a set from it would only add to a lookup
+        that is never repeated.
 
         Not a binary search, even though every writer here stores the
         list sorted: only the sharding spec says it must be, and a list
