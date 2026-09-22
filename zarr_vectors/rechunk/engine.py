@@ -149,6 +149,10 @@ def rechunk(
         chunk_shape=chunk_shape,
         bounds=src_meta.bounds,
         geometry_types=src_meta.geometry_types,
+        # Packing is a property of the store, so a rechunk of a sharded
+        # store produces a sharded store. Dropping it here would have
+        # quietly unsharded every rechunk output.
+        shard_shape=src_meta.shard_shape,
         links_convention=src_meta.links_convention,
         object_index_convention=src_meta.object_index_convention,
         cross_chunk_strategy=src_meta.cross_chunk_strategy,
@@ -197,9 +201,19 @@ def rechunk(
     _spatial_origin, _spatial_grid = level_grid_layout(
         src_meta.bounds, chunk_shape,
     )
+    # The output grid carries a leading attribute-bin axis. A per-axis
+    # declaration gets 1 prepended for it, so a shard never straddles
+    # bins -- they are queried independently, and packing two into one
+    # object drags each into the other's reads. A scalar broadcasts,
+    # which is what a scalar means.
+    from zarr_vectors.core.metadata import normalise_shard_shape
+
+    _rechunk_grid = (max(unique_bins) + 1, *_spatial_grid)
     _rechunk_session = out_level.native_sharded_arrays(
-        None,
-        (max(unique_bins) + 1, *_spatial_grid),
+        normalise_shard_shape(
+            src_meta.shard_shape, len(_rechunk_grid), bin_axis=True,
+        ),
+        _rechunk_grid,
         origin=(0, *_spatial_origin),
     )
     _rechunk_session.__enter__()

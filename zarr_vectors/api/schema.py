@@ -212,6 +212,14 @@ class Layout:
         Four per axis, so a bbox read touches about 1/64th of a 3-D chunk.
     ``pack="auto"``
         On for object stores, off for local ones.
+    ``shard_cells="auto"``
+        Derived from ``pack``.  Set it to take the decision directly —
+        an explicit value wins over ``pack``, and ``None`` forces one
+        object per cell.  :meth:`Schema.from_store` fills it in from what
+        a store declared, so re-resolving a layout against an existing
+        store does not silently contradict it: "auto" would consult
+        ``store_kind`` and answer *unsharded* for every local store,
+        including one deliberately built sharded.
     ``compression="auto"``
         ``zstd``, or ``$ZARR_VECTORS_COMPRESSION`` when set.  It used to
         resolve to *no* compression, which is not what the word means.
@@ -221,6 +229,7 @@ class Layout:
     cell_size: Sequence[float] | None = None
     subcells: int | Literal["auto"] = "auto"
     pack: bool | Literal["auto"] = "auto"
+    shard_cells: int | Sequence[int] | None | Literal["auto"] = "auto"
     compression: str | None | Literal["auto"] = "auto"
     target_object_bytes: int = _DEFAULT_TARGET_OBJECT_BYTES
 
@@ -242,8 +251,20 @@ class Layout:
 
         chunk_shape = self._chunk_shape(extent, ndim, schema)
         bin_shape = self._bin_shape(chunk_shape)
-        pack = store_kind != "local" if self.pack == "auto" else bool(self.pack)
-        shard_shape = self._shard_shape(extent, chunk_shape, schema) if pack else None
+        if self.shard_cells != "auto":
+            # Said outright: neither ``pack`` nor ``store_kind`` gets a vote.
+            from zarr_vectors.core.metadata import normalise_shard_shape
+
+            shard_shape = normalise_shard_shape(self.shard_cells, ndim)
+        else:
+            pack = (
+                store_kind != "local" if self.pack == "auto"
+                else bool(self.pack)
+            )
+            shard_shape = (
+                self._shard_shape(extent, chunk_shape, schema) if pack
+                else None
+            )
         compressor = self.compression
         if self.compression == "auto":
             # "auto" resolved to *no* compression unless an environment
@@ -470,6 +491,16 @@ class Schema:
             layout=Layout(
                 cell_size=tuple(chunk_shape) if chunk_shape else None,
                 subcells=subcells,
+                # What the store SAYS it is, not what "auto" would guess
+                # about it. Re-resolving with "auto" consults store_kind
+                # and answers unsharded for every local store, so a write
+                # back into a store deliberately built sharded arrived
+                # asking to unshard it.
+                shard_cells=(
+                    root_meta.shard_shape
+                    if getattr(root_meta, "shard_shape", None) is not None
+                    else "auto"
+                ),
             ),
         )
 
