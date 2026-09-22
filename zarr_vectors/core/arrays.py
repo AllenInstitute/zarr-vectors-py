@@ -578,22 +578,28 @@ def _array_matches_layout(
     if existing is None:
         return False
 
-    desired_sharded = cfg.get("shard_shape") is not None
-    existing_sharded = getattr(existing, "shards", None) is not None
-    matches = (
-        tuple(existing.shape) == tuple(cfg["grid_shape"])
-        and existing_sharded == desired_sharded
-    )
-    if matches:
-        return True
-
-    # Mismatch. Recreating is only safe if there is nothing to lose.
+    # Does it hold anything?  The manifest answers cheaply when it says
+    # yes; only when it says no is the store asked, because that is the
+    # answer that cannot be trusted.
     if existing.attrs.get("nonempty_chunks"):
         has_data = True
     else:
         has_data = level_group._array_has_stored_data(array_name)
+
+    # Nothing to lose: recreate unconditionally, even if the grid and
+    # sharding already agree.  The session's CODECS are not part of that
+    # comparison, and applying them to the warm-created array is the
+    # whole reason this branch exists.
     if not has_data:
         return False
+
+    desired_sharded = cfg.get("shard_shape") is not None
+    existing_sharded = getattr(existing, "shards", None) is not None
+    if (
+        tuple(existing.shape) == tuple(cfg["grid_shape"])
+        and existing_sharded == desired_sharded
+    ):
+        return True
 
     warnings.warn(
         f"{array_name!r} in {level_group._zarr.path or '<root>'} already "
