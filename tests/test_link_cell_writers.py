@@ -228,6 +228,52 @@ class TestAttributeCells:
         assert all(np.isclose(a, 0.5) for a in attrs)
 
 
+class TestRepeatBatchesIntoOneCell:
+    """A second batch into a cell appends; it does not replace the first.
+
+    ``write_link_cells`` writes with ``record_presence=False``, so the
+    manifest never lists the cell it just filled.  Its append asked the
+    manifest whether the cell existed, heard "no", and overwrote the first
+    batch with the second -- although its own comment says a worker may
+    call it repeatedly.
+    """
+
+    def test_both_link_batches_survive(self, tmp_path: Path) -> None:
+        lg = _new_lg(tmp_path)
+        create_links_array(lg, link_width=2, delta=0, sid_ndim=3)
+        write_link_cells(lg, [[((0, 0, 0), 1), ((0, 0, 0), 2)]], sid_ndim=3)
+        write_link_cells(lg, [[((0, 0, 0), 3), ((0, 0, 0), 4)]], sid_ndim=3)
+        finalize_links(lg, delta=0)
+        assert _as_set(read_links(lg, delta=0)) == {
+            (((0, 0, 0), 1), ((0, 0, 0), 2)),
+            (((0, 0, 0), 3), ((0, 0, 0), 4)),
+        }
+
+    def test_both_attribute_batches_survive_while_collecting(
+        self, tmp_path: Path,
+    ) -> None:
+        lg = _new_lg(tmp_path)
+        create_links_array(lg, link_width=2, delta=0, sid_ndim=3)
+        p1 = write_link_cells(lg, [[((0, 0, 0), 1), ((0, 0, 0), 2)]], sid_ndim=3)
+        p2 = write_link_cells(lg, [[((0, 0, 0), 3), ((0, 0, 0), 4)]], sid_ndim=3)
+        with lg.collect_presence() as pending:
+            write_link_attribute_cells(
+                lg, "w", np.array([1.0], dtype=np.float32), partition=p1,
+            )
+            write_link_attribute_cells(
+                lg, "w", np.array([2.0], dtype=np.float32), partition=p2,
+            )
+        lg.apply_presence(pending)
+        finalize_links(lg, delta=0)
+        links = read_links(lg, delta=0)
+        attrs = read_link_attributes(lg, "w", delta=0)
+        by_rec = dict(zip((tuple(r) for r in links), attrs))
+        assert by_rec == {
+            (((0, 0, 0), 1), ((0, 0, 0), 2)): 1.0,
+            (((0, 0, 0), 3), ((0, 0, 0), 4)): 2.0,
+        }
+
+
 class TestAttributeMetadataStamps:
     """The per-segment metadata stamp is written once, not per batch.
 
