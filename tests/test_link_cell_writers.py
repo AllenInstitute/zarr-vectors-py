@@ -228,6 +228,111 @@ class TestAttributeCells:
         assert all(np.isclose(a, 0.5) for a in attrs)
 
 
+class TestAttributeMetadataStamps:
+    """The per-segment metadata stamp is written once, not per batch.
+
+    It restamped ``dtype`` / ``row_shape`` on every call for every
+    segment touched, though the values never change after the first
+    batch -- tens of ``zarr.json`` rewrites per chunk flush on a shared
+    filesystem, each also a read-modify-write of the document holding
+    ``nonempty_chunks``.
+    """
+
+    @staticmethod
+    def _count_metadata_writes(monkeypatch) -> list[str]:
+        """Every ``zarr.json`` the local store is asked to write."""
+        from zarr.storage import LocalStore
+
+        keys: list[str] = []
+        original = LocalStore.set
+
+        async def counting(self, key, value, *a, **kw):
+            if key.endswith("zarr.json"):
+                keys.append(key)
+            return await original(self, key, value, *a, **kw)
+
+        monkeypatch.setattr(LocalStore, "set", counting)
+        return keys
+
+    def test_a_repeat_batch_writes_no_attribute_metadata(
+        self, tmp_path: Path, monkeypatch,
+    ) -> None:
+        lg = _new_lg(tmp_path)
+        create_links_array(lg, link_width=2, delta=0, sid_ndim=3)
+        p1 = write_link_cells(lg, [[((0, 0, 0), 1), ((1, 0, 0), 2)]], sid_ndim=3)
+        p2 = write_link_cells(lg, [[((0, 0, 0), 3), ((1, 0, 0), 4)]], sid_ndim=3)
+
+        keys = self._count_metadata_writes(monkeypatch)
+        # Presence stamps are a separate cost with its own remedy; keep
+        # them out of the count.
+        with lg.collect_presence():
+            write_link_attribute_cells(
+                lg, "weight", np.array([0.1], dtype=np.float32), partition=p1,
+            )
+            first = [k for k in keys if "link_attributes" in k]
+            keys.clear()
+            write_link_attribute_cells(
+                lg, "weight", np.array([0.2], dtype=np.float32), partition=p2,
+            )
+        repeat = [k for k in keys if "link_attributes" in k]
+
+        # The segment is written once, by the create that carries its
+        # metadata -- not created and then restamped.  (The family group
+        # is created with the segment's parent and stamped, once per
+        # family, not per batch.)
+        segment = [k for k in first if k.endswith("/0/+1.0.0/zarr.json")]
+        assert len(segment) == 1, first
+        assert repeat == []
+
+    def test_a_pre_created_segment_gets_its_row_shape_once(
+        self, tmp_path: Path, monkeypatch,
+    ) -> None:
+        # A coordinator pre-creating with only a dtype -- which is what a
+        # downstream consumer does -- leaves row_shape unset.  The first
+        # batch must still stamp it, or a multi-channel attribute reads
+        # back one column wide.
+        lg = _new_lg(tmp_path)
+        create_links_array(lg, link_width=2, delta=0, sid_ndim=3)
+        create_link_attributes_array(lg, "rgb", dtype="float32", delta=0, sid_ndim=3)
+        p1 = write_link_cells(lg, [[((0, 0, 0), 1), ((0, 0, 0), 2)]], sid_ndim=3)
+        # Same intra segment, another cell: the restamp is per segment.
+        p2 = write_link_cells(lg, [[((1, 0, 0), 3), ((1, 0, 0), 4)]], sid_ndim=3)
+
+        keys = self._count_metadata_writes(monkeypatch)
+        with lg.collect_presence() as pending:
+            write_link_attribute_cells(
+                lg, "rgb", np.array([[1, 2, 3]], dtype=np.float32),
+                partition=p1, allocate=False,
+            )
+            stamped = [k for k in keys if "link_attributes/rgb/" in k]
+            keys.clear()
+            write_link_attribute_cells(
+                lg, "rgb", np.array([[4, 5, 6]], dtype=np.float32),
+                partition=p2, allocate=False,
+            )
+            restamped = [k for k in keys if "link_attributes/rgb/" in k]
+        assert len(stamped) == 1 and restamped == []
+
+        lg.apply_presence(pending)
+        finalize_links(lg, delta=0)
+        attrs = read_link_attributes(lg, "rgb", delta=0)
+        assert np.asarray(attrs).shape == (2, 3)
+
+    def test_a_multi_key_stamp_is_one_write(
+        self, tmp_path: Path, monkeypatch,
+    ) -> None:
+        # attrs.update is MutableMapping.update: one __setitem__, and so
+        # one whole-document rewrite, per key.
+        lg = _new_lg(tmp_path)
+        lg.create_sharded_chunk_array("probe", (2, 2, 2))
+        keys = self._count_metadata_writes(monkeypatch)
+        lg.write_array_meta(
+            "probe", {"a": 1, "b": 2, "c": 3, "d": 4, "e": 5, "f": 6},
+        )
+        assert len(keys) == 1, keys
+        assert lg.read_array_meta("probe")["f"] == 6
+
+
 class TestPolicyGuards:
     def test_store_mismatch_raises(self, tmp_path: Path) -> None:
         lg = _new_lg(tmp_path)

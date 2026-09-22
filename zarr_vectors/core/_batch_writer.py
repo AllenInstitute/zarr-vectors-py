@@ -604,8 +604,10 @@ def _flush_group_metas(
     # Icechunk tracks groups as first-class entities and doesn't pick up
     # one added via a raw ``store.set`` of its ``zarr.json``.
     if _is_icechunk_store(zarr_group.store):
+        from zarr_vectors.core.group import _merge_attributes
+
         for group_name, meta in sorted(array_metas.items()):
-            zarr_group.require_group(group_name).attrs.update(meta)
+            _merge_attributes(zarr_group.require_group(group_name), meta)
         return
 
     base_path = zarr_group.path
