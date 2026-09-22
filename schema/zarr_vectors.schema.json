@@ -36,6 +36,18 @@
       "title": "AttributeMeta",
       "type": "object"
     },
+    "AttributeSpecs": {
+      "additionalProperties": true,
+      "description": "What the store declares its attributes to be, keyed by scope (``vertex`` / ``object`` / ``link``) and then by attribute name. Modelled as an open dict for the same reason as ``CRS``: the value is a nested mapping, and the generators render a plain ``range: string`` slot as a string -- which would reject the very payload the runtime writes.  The per-entry shape is documented on the slot.",
+      "title": "AttributeSpecs",
+      "type": [
+        "null",
+        "boolean",
+        "object",
+        "number",
+        "string"
+      ]
+    },
     "Axis": {
       "additionalProperties": false,
       "description": "One axis of the spatial index.  Mirrors the OME-Zarr NGFF axis object (RFC 4/5).",
@@ -328,6 +340,13 @@
           "description": "How this level was generated (e.g. \"grid_metanode\").",
           "type": [
             "string",
+            "null"
+          ]
+        },
+        "fragments_tile": {
+          "description": "True when every chunk in this level has a vertex fragment index that tiles its buffer, so the concatenation of a chunk's fragments IS its vertex buffer and a bulk read may skip ``vertex_fragments`` entirely.  Unlike the other flags here this is a claim about what has NOT happened since: it is stamped by a bulk writer and cleared by any later write to ``vertices`` or ``vertex_fragments``. Readers MUST treat an absent value as False.\n",
+          "type": [
+            "boolean",
             "null"
           ]
         },
@@ -678,6 +697,17 @@
       "additionalProperties": false,
       "description": "Root-level ``.zattrs`` payload, persisted under the key ``zarr_vectors``.  Validates the runtime :class:`zarr_vectors.core.metadata.RootMetadata` dataclass. Note: the canonical axis list lives in ``multiscales[0].axes`` at root level (NGFF-style), NOT under ``zarr_vectors`` \u2014 see ``MultiscalesMetadata``.",
       "properties": {
+        "attribute_specs": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/AttributeSpecs"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "What the store declares its attributes to be, keyed by scope (``vertex`` / ``object`` / ``link``) and then by attribute name. Each entry carries ``dtype`` and optionally ``channels``, ``categorical``, ``unit`` and ``description``.  Optional and backward-compatible from 0.9.1: absent means undeclared, which is every store written before it.  A declaration is not a promise the array exists -- the array appears when data is written -- but it is what lets a Schema round-trip and what ``open_or_create`` compares against.  ``unit`` and ``description`` are additionally stamped on the attribute array's own metadata block.\n"
+        },
         "base_bin_shape": {
           "description": "Supervoxel bin edge lengths at level 0.  When set, every value must be > 0 and ``chunk_shape`` must be an integer multiple along every axis (enforced runtime-side in ``RootMetadata.validate``).\n",
           "items": {

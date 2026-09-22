@@ -240,6 +240,16 @@ classes:
       should emit ``additionalProperties: true`` or equivalent.
     class_uri: linkml:Any
 
+  AttributeSpecs:
+    description: >
+      What the store declares its attributes to be, keyed by scope
+      (``vertex`` / ``object`` / ``link``) and then by attribute name.
+      Modelled as an open dict for the same reason as ``CRS``: the value
+      is a nested mapping, and the generators render a plain ``range:
+      string`` slot as a string -- which would reject the very payload
+      the runtime writes.  The per-entry shape is documented on the slot.
+    class_uri: linkml:Any
+
   # ----- root + level metadata ------------------------------------------
 
   RootMetadata:
@@ -287,6 +297,7 @@ classes:
       - preserves_object_ids
       - inherited_num_objects
       - shared_fragments
+      - fragments_tile
     slot_usage:
       chunk_shape:
         required: false
@@ -586,8 +597,7 @@ slots:
       what lets a Schema round-trip and what ``open_or_create`` compares
       against.  ``unit`` and ``description`` are additionally stamped on
       the attribute array's own metadata block.
-    range: string
-    inlined: true
+    range: AttributeSpecs
 
   # -- LevelMetadata -----------------------------------------------------
 
@@ -667,6 +677,16 @@ slots:
       objects' manifests (shared metavertices in the per-object pyramid
       regime).  v0.6 successor to ``shared_vertex_groups``.  Readers
       MAY use this to short-circuit dedup work.
+    range: boolean
+  fragments_tile:
+    description: >
+      True when every chunk in this level has a vertex fragment index
+      that tiles its buffer, so the concatenation of a chunk's fragments
+      IS its vertex buffer and a bulk read may skip ``vertex_fragments``
+      entirely.  Unlike the other flags here this is a claim about what
+      has NOT happened since: it is stamped by a bulk writer and cleared
+      by any later write to ``vertices`` or ``vertex_fragments``.
+      Readers MUST treat an absent value as False.
     range: boolean
 
   # -- per-array .zattrs ------------------------------------------------
