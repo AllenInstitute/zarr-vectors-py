@@ -97,6 +97,7 @@ from zarr_vectors.core.arrays import (
     object_count,
     # --- write sessions ---
     open_write_session,
+    patch_object_manifests,
     read_all_groupings,
     read_all_object_manifests,
     read_attribute_fragment,
@@ -710,6 +711,7 @@ __all__ = [
     "open_write_session",
     "parse_offsets",
     "partition_cross_level_edges",
+    "patch_object_manifests",
     "per_chunk_array_paths",
     "read_all_groupings",
     "read_all_object_manifests",

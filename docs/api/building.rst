@@ -304,6 +304,8 @@ per-object attribute arrays beside it.
 
 .. autofunction:: zarr_vectors.building.write_object_manifests
 
+.. autofunction:: zarr_vectors.building.patch_object_manifests
+
 .. autofunction:: zarr_vectors.building.read_object_attributes
 
 .. autofunction:: zarr_vectors.building.read_object_attribute_present_mask
