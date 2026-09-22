@@ -98,6 +98,7 @@ For every resolution level:
 | `bin_ratio`, if present, has length `sid_ndim` | Error |
 | Every `bin_ratio[i] >= 1` | Error |
 | `object_sparsity` (default `1.0`) is in `(0, 1]` | Error |
+| The level does not declare its presence deferred (`zarr_vectors_presence`) | Warning |
 
 ### What L2 does *not* check
 

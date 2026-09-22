@@ -290,6 +290,11 @@ sits on disk. Workers therefore pass `record_presence=False` and leave
 one coordinator to reconstruct it. Repacking before that reconstruction
 strands the payloads: the cells are on disk, but nothing enumerates them.
 
+A level declared with `defer_presence` is the exception. Its arrays carry
+no manifest at all rather than an empty one, `list_chunks` answers for
+them from the store, and so `shard_store` finds every cell whether or not
+the rebuild has run.
+
 ```{note}
 Until 0.9.3 this section stated a second, stronger constraint: that a
 sharded array's presence could not be rebuilt at all, because

@@ -81,7 +81,8 @@ half-open range (`z_lo <= z < z_hi`), never a closed one.
 import numpy as np
 from zarr_vectors.building import (
     LevelMetadata, create_store, create_resolution_level,
-    create_vertices_array, create_attribute_array, open_write_session,
+    create_vertices_array, create_attribute_array, defer_presence,
+    open_write_session,
 )
 
 STORE  = "/scratch/scan.zarrvectors"
@@ -98,6 +99,8 @@ level = create_resolution_level(root, 0, LevelMetadata(
 with open_write_session(level, bounds=BOUNDS, chunk_shape=CHUNK):
     create_vertices_array(level, dtype="float32")
     create_attribute_array(level, "intensity", dtype="float32")
+
+defer_presence(level)        # tasks write no state shared between cells
 ```
 
 ```{warning}
@@ -181,17 +184,29 @@ if __name__ == "__main__":
     main()
 ```
 
-`record_presence=False` is what makes this safe to run in parallel.
-`nonempty_chunks` is one attribute shared by every cell of an array, so a task
-that stamps it races every other task; tasks skip it and the finalisation step
-rebuilds it from disk.
+`defer_presence` in `init_store.py` is what makes this safe to run in
+parallel. `nonempty_chunks` is one attribute shared by every cell of an array,
+so a task that stamps it races every other task, and each stamp rewrites the
+whole list. A deferred level's arrays carry no manifest at all, so no write
+stamps one — whatever `record_presence` says, and including writers that do
+not take the flag. The finalisation step writes each manifest once.
+
+`record_presence=False` says the same thing one call at a time, and is what to
+use on a level nobody declared. It is harmless alongside the declaration.
 
 ```{note}
-This works because a finalisation step follows. If your consumers run
-*before* any coordinator pass — a downstream stage that enumerates
-`list_chunks` as soon as a worker returns — a cell written this way is
-invisible to them, and the rebuild comes too late to help. For that shape,
-see [Stamping under your own lock](#stamping-under-your-own-lock) below.
+A cell in a deferred level is visible as soon as its payload lands:
+`list_chunks` lists the array and `chunk_exists` reads the cell, so a stage
+that reads what a worker just wrote sees it without waiting for the
+coordinator. That costs a listing per array, so the rebuild is still what a
+finished store wants. An offline-read session and a zarr-vectors older than
+0.9.3 see the cells only after the rebuild; neuroglancer's datasource probes
+every cell of an array with no manifest, which finds them, slowly. If one of
+those has to run mid-build, see
+[Stamping under your own lock](#stamping-under-your-own-lock) below.
+
+Without the declaration, `record_presence=False` alone leaves the cells
+invisible to `list_chunks` until the rebuild runs.
 ```
 
 Write the vertices of a cell as one fragment **per bin**, as above, rather
@@ -237,7 +252,7 @@ args = parser.parse_args()
 root = open_store(args.output, mode="r+")
 level = get_resolution_level(root, 0)
 
-rebuild_presence(level)                      # the nonempty_chunks nobody stamped
+rebuild_presence(level)                      # every manifest, once; ends the deferral
 print(refresh_arrays_present(level))         # what is actually on disk
 update_level_metadata(level, vertex_count=args.vertices)
 write_multiscale_metadata(root)
@@ -259,10 +274,12 @@ run either while tasks are still writing.
 
 ### Stamping under your own lock
 
-The protocol above trades visibility for safety: nothing races, but a cell is
-absent from `list_chunks` until `rebuild_presence` runs. Some pipelines cannot
-pay that — a stage that reads the chunks a worker just wrote, with no
-coordinator in between, sees nothing and silently does no work.
+A deferred level keeps every cell visible to current zarr-vectors readers, but
+not to an offline-read session or a zarr-vectors older than 0.9.3, and a viewer
+reading `nonempty_chunks` straight from `zarr.json` has to fall back to probing
+every cell. Without the declaration, `record_presence=False` hides the cells
+from everyone until `rebuild_presence` runs, and a stage that reads the chunks a
+worker just wrote sees nothing and silently does no work.
 
 If your workers already serialise *something* (a file lock, a queue, a
 database row), you can keep the payloads unlocked and move only the manifest
@@ -285,8 +302,9 @@ Pick by what follows the write:
 
 | Situation | Use |
 |---|---|
-| A coordinator pass follows | `record_presence=False` + `rebuild_presence` |
-| Consumers run before any coordinator, and you hold a lock | `collect_presence` / `apply_presence` |
+| A coordinator pass follows | `defer_presence` + `rebuild_presence` |
+| Consumers run before the coordinator, and read through zarr-vectors | the same — they ask the store while the level is deferred |
+| Consumers that cannot ask the store run before the coordinator, and you hold a lock | `collect_presence` / `apply_presence` |
 | Single writer, no concurrency | the default — stamp inline |
 
 `collect_presence` cannot be combined with `batched_writes`, which defers the

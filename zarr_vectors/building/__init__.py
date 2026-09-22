@@ -275,7 +275,7 @@ GROUP_SUPPORTED_METHODS: frozenset[str] = frozenset({
     # batching + presence
     "batched_reads", "batched_writes", "offline_reads", "chunk_array_codecs",
     "derive_nonempty_chunks", "native_sharded_arrays",
-    "collect_presence", "apply_presence",
+    "collect_presence", "apply_presence", "presence_deferred",
     # identity
     "url", "prefix", "path",
 })
@@ -558,6 +558,68 @@ def build_fragment_owner_index(store_path, *, level: int | None = None) -> int:
     return total
 
 
+def defer_presence(level_group: Group) -> list[str]:
+    """Declare this level's presence deferred to one coordinator rebuild.
+
+    The build mode for many workers writing one level.  ``nonempty_chunks``
+    is ONE attribute per array, shared by every cell, so each stamp is a
+    read-modify-write of the whole list: two workers writing disjoint
+    cells still race, and every stamp costs the full list again, which
+    makes a build of N cells O(N²) in metadata bytes.  Declaring the
+    level deferred removes both at the source:
+
+    * every per-chunk array in the level drops its manifest, and arrays
+      allocated afterwards -- a links segment a worker creates on first
+      write -- are born without one;
+    * a write into an array with no manifest stamps nothing, whatever
+      ``record_presence`` says, so a worker needs no flag threaded
+      through every call, including the writers that do not expose one;
+    * readers ask the store instead: :meth:`Group.chunk_exists` reads the
+      cell, :meth:`Group.list_chunks` lists the array.  A cell is visible
+      the moment its payload lands, not only after the rebuild.
+
+    Then one :func:`rebuild_presence` over the level, after the workers
+    finish, writes every manifest once and clears the declaration.  The
+    finished store records the same presence an undeferred build does.
+
+    Call it from the coordinator BEFORE the workers open the level: the
+    declaration is read from the level handle a worker holds, so a handle
+    opened earlier still allocates arrays with a manifest.  Those stay
+    correct -- the rebuild rewrites them too -- but their stamps are back
+    to racing.
+
+    While deferred, readers pay for asking the store: a listing per
+    array per :meth:`Group.list_chunks` (cached inside
+    :meth:`Group.cached_nodes`), a request per :meth:`Group.chunk_exists`,
+    and a sharded array is read shard by shard.  Three kinds of reader
+    see nothing until the rebuild: an offline-read session, which must
+    not touch the store; one on a store that cannot list; and a
+    zarr-vectors older than 0.9.3, which reads a missing manifest as an
+    empty array.  A reader of the manifest itself may do better:
+    neuroglancer's datasource probes every cell when there is none,
+    which finds them all, slowly.
+
+    Returns:
+        Every per-chunk array path in the level.
+    """
+    from zarr_vectors.core.group import (
+        _NONEMPTY_CHUNKS_ATTR,
+        _PRESENCE_DECL_ATTR,
+        _PRESENCE_DEFERRED,
+    )
+
+    # Declared first, so an array allocated while the manifests are
+    # being dropped is born without one rather than slipping between.
+    level_group.attrs.update({_PRESENCE_DECL_ATTR: _PRESENCE_DEFERRED})
+    names = per_chunk_array_paths(level_group)
+    for name in names:
+        arr = level_group._sharded_chunk_array(name)
+        if arr is not None and _NONEMPTY_CHUNKS_ATTR in arr.attrs:
+            del arr.attrs[_NONEMPTY_CHUNKS_ATTR]
+            level_group._invalidate_node(name)
+    return names
+
+
 def rebuild_presence(
     level_group: Group,
     array_name: str | None = None,
@@ -577,6 +639,11 @@ def rebuild_presence(
     contract, so anything sharded was already correct.  A store can now
     be born sharded, and under that premise "skip" quietly declined to
     repair the arrays most in need of it.
+
+    The level-wide form also ends a :func:`defer_presence` declaration,
+    once every manifest is written: arrays allocated afterwards get a
+    manifest again, and stamps resume.  The single-array form leaves the
+    declaration alone.
 
     Args:
         array_name: One array's path, or ``None`` (the default) to walk
@@ -607,6 +674,13 @@ def rebuild_presence(
             continue
         level_group.derive_nonempty_chunks(name, on_sharded=on_sharded)
         rebuilt.append(name)
+
+    from zarr_vectors.core.group import _PRESENCE_DECL_ATTR
+
+    # Last, so a rebuild that fails part-way leaves the level still
+    # declared -- and its remaining arrays still derived, not trusted.
+    if level_group.presence_deferred():
+        del level_group.zarr_group.attrs[_PRESENCE_DECL_ATTR]
     return rebuilt
 
 
@@ -670,6 +744,7 @@ __all__ = [
     "create_store",
     "create_vertices_array",
     "decode_object_manifest_blocks",
+    "defer_presence",
     "decompose_tree_to_paths",
     "encode_object_manifest_blocks",
     "expand_manifest_blocks",

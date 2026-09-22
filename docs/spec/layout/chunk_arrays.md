@@ -27,6 +27,12 @@
 **`nonempty_chunks`**
 : An array attribute listing the dotted chunk keys (`"i.j.k"`) that hold a
   non-empty payload, so chunk enumeration is O(1) without scanning cells.
+  **Absent** means presence is not recorded — the array belongs to a level
+  whose presence is deferred (see
+  [Level groups](level_groups.md#build-time-keys)) — and a reader must take
+  it from the store instead: read the cell, or list the array's `c/`
+  objects. A reader must not treat an absent manifest as an empty array.
+  (Since 0.9.3; before it, every array carried one.)
 
 **Chunk grid shape**
 : The number of chunks along each spatial axis: for spatial extent up to

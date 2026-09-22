@@ -27,7 +27,8 @@
   coord `c` maps to cell `c - origin`, where
   `origin = floor(min_corner / chunk_shape)` is stored in the array's
   `chunk_grid_origin` attribute (absent ⇒ zero origin). The set of
-  non-empty cells is listed in the array's `nonempty_chunks` attribute.
+  non-empty cells is listed in the array's `nonempty_chunks` attribute
+  (absent ⇒ taken from the store, while a level's presence is deferred).
 
   This pattern is now **universal — there is no exception.** Before 0.9.0
   `cross_chunk_links/<delta>/` was one: its cells were keyed by

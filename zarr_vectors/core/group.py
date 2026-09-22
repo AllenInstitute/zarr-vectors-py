@@ -965,7 +965,10 @@ class Group:
         caller need not test before calling.
 
         Returns:
-            How many arrays were stamped.
+            How many arrays were stamped.  An array with no manifest --
+            one in a deferred level -- is left alone and not counted:
+            its presence is derived from the store, and folding these
+            keys into a new list would hide every other cell.
 
         Raises:
             StoreError: If an array named in ``pending`` is gone.
@@ -978,6 +981,7 @@ class Group:
         by_array: dict[str, dict[str, bool]] = {}
         for array_name, chunk_key, present in pending:
             by_array.setdefault(array_name, {})[chunk_key] = present
+        skipped = 0
 
         for array_name, stamps in by_array.items():
             arr = self._sharded_chunk_array(array_name)
@@ -990,7 +994,13 @@ class Group:
                     f"since. Rebuild with rebuild_presence() instead."
                 )
             current = arr.attrs.get(_NONEMPTY_CHUNKS_ATTR)
-            keys = set(current) if current else set()
+            if current is None:
+                # No manifest to fold into: presence here is derived from
+                # the store (a deferred level), and a list of just these
+                # keys would claim the array holds nothing else.
+                skipped += 1
+                continue
+            keys = set(current)
             for chunk_key, present in stamps.items():
                 if present:
                     keys.add(chunk_key)
@@ -1012,7 +1022,7 @@ class Group:
             for chunk_key, present in stamps.items():
                 _emit_presence(array_name, chunk_key, present)
 
-        return len(by_array)
+        return len(by_array) - skipped
 
     @contextmanager
     def native_sharded_arrays(
@@ -1142,6 +1152,24 @@ class Group:
             return False
         return _vlen_get_cell(sharded_arr, index) != b""
 
+    def _derived_listing(self, array_name: str, arr: zarr.Array) -> list[str]:
+        """Presence for an array that records none, asked of the store.
+
+        An array carries no ``nonempty_chunks`` while its level's presence
+        is deferred (see :func:`zarr_vectors.building.defer_presence`), and
+        answering "no cells" for it -- what this used to do -- hid every
+        cell a worker had written until the coordinator's rebuild.
+
+        Two cases still answer empty, as before, because neither can ask:
+        an offline-read session, which must not touch the store, and a
+        store that cannot list.
+        """
+        if self._offline is not None:
+            return []
+        if not getattr(self._zarr.store, "supports_listing", True):
+            return []
+        return self._presence_from_store(array_name, arr, verify=False)
+
     def _presence_contains(
         self, array_name: str, present: list[str], chunk_key: str,
     ) -> bool:
@@ -1203,6 +1231,8 @@ class Group:
         present = (
             arr.attrs.get(_NONEMPTY_CHUNKS_ATTR) if arr is not None else None
         )
+        if present is None and arr is not None:
+            present = self._derived_listing(array_name, arr)
         listing = _ChunkListing(sorted(present) if present else [])
         if cache is not None:
             cache[key] = listing
@@ -1744,7 +1774,7 @@ class Group:
         # write per attribute on top of the creation itself — three writes
         # of the same object where one does.  Writers that allocate an
         # array per offsets segment pay that per array.
-        initial_attrs: dict[str, Any] = {_NONEMPTY_CHUNKS_ATTR: []}
+        initial_attrs: dict[str, Any] = self._initial_presence_attrs()
         # Store the grid origin so cell ``index = coord - origin``.
         # Only when non-trivial — a zero origin is the common case
         # and its absence means "coords are array indices".
@@ -1819,7 +1849,7 @@ class Group:
         }
         if shard_shape is not None:
             base_kwargs["shards"] = tuple(shard_shape)
-        base_attrs: dict[str, Any] = {_NONEMPTY_CHUNKS_ATTR: []}
+        base_attrs: dict[str, Any] = self._initial_presence_attrs()
         if origin is not None and any(int(o) != 0 for o in origin):
             base_attrs[_CHUNK_GRID_ORIGIN_ATTR] = [int(o) for o in origin]
 
@@ -1996,6 +2026,31 @@ class Group:
             ]:
                 del cache[key]
 
+    def presence_deferred(self) -> bool:
+        """Whether this level declares its presence deferred.
+
+        See :func:`zarr_vectors.building.defer_presence`.  Read from the
+        handle's own metadata, so it costs nothing -- and it is only as
+        fresh as the handle: a worker must open the level after the
+        coordinator declares, which is the order a coordinator runs in
+        anyway.
+        """
+        try:
+            return self._zarr.attrs.get(_PRESENCE_DECL_ATTR) == _PRESENCE_DEFERRED
+        except Exception:  # noqa: BLE001 - a node with no readable attrs
+            return False
+
+    def _initial_presence_attrs(self) -> dict[str, Any]:
+        """The presence attribute a new chunk array is born with.
+
+        An empty manifest normally, which is a claim -- "no cell holds
+        data" -- that each stamp then keeps true.  In a deferred level
+        there is no manifest at all, because every stamp would be a
+        write of state shared between cells, and absence is what tells a
+        reader to ask the store instead.
+        """
+        return {} if self.presence_deferred() else {_NONEMPTY_CHUNKS_ATTR: []}
+
     def _sharded_chunk_array(self, array_name: str) -> zarr.Array | None:
         """Return the multidim vlen-bytes Zarr array at ``array_name``
         (the per-spatial-chunk layout), else ``None``.
@@ -2087,6 +2142,20 @@ class Group:
             keys = self._derive_presence_sharded(arr, array_name, tuple(shards))
             arr.attrs[_NONEMPTY_CHUNKS_ATTR] = sorted(keys)
             return sorted(keys)
+        keys = self._presence_from_store(array_name, arr, verify=True)
+        arr.attrs[_NONEMPTY_CHUNKS_ATTR] = keys
+        return keys
+
+    def _stored_cell_keys(self, array_name: str, arr: zarr.Array) -> list[str]:
+        """The chunk keys of the cell objects an unsharded array has.
+
+        One listing, no cell reads.  Under zarr's default
+        ``write_empty_chunks=False`` a cell written empty leaves no
+        object, so for an unsharded array this is its presence exactly;
+        :meth:`derive_nonempty_chunks` still reads every candidate,
+        because a store configured otherwise keeps empty cells as
+        objects and the recorded manifest must not list them.
+        """
         base = self._zarr.path.strip("/")
         prefix = f"{base}/{array_name}/c/" if base else f"{array_name}/c/"
         origin = _grid_origin(arr)
@@ -2105,21 +2174,39 @@ class Group:
                 else tuple(i + o for i, o in zip(index, origin))
             )
             candidates.append(_format_chunk_key(coords))
+        return candidates
 
-        keys: set[str] = set()
-        if candidates:
-            from zarr_vectors.core._batch_reader import flush_prefetch
+    def _presence_from_store(
+        self, array_name: str, arr: zarr.Array, *, verify: bool,
+    ) -> list[str]:
+        """``array_name``'s populated cells, asked of the store.  Sorted.
 
-            # flush_prefetch applies the grid origin itself and omits any
-            # cell that reads back empty or missing, so a key surviving in
-            # the cache is exactly the ``if _vlen_get_cell(...)`` this
-            # replaced.  It also carries the icechunk serial fallback.
-            cells = flush_prefetch(self._zarr, [(array_name, candidates)])
-            keys = {
-                chunk_key for (_name, chunk_key), data in cells.items() if data
-            }
-        arr.attrs[_NONEMPTY_CHUNKS_ATTR] = sorted(keys)
-        return sorted(keys)
+        ``verify=True`` is the rebuild's standard: every candidate is
+        read and an empty one dropped.  ``verify=False`` is a reader's:
+        an unsharded array is answered from the listing alone (see
+        :meth:`_stored_cell_keys`), because a reader asking what an array
+        holds should not have to download it to find out.  A sharded
+        array is always read shard by shard -- one listed object covers
+        many cells, so a listing alone cannot say which.
+        """
+        shards = getattr(arr, "shards", None)
+        if shards is not None:
+            return sorted(
+                self._derive_presence_sharded(arr, array_name, tuple(shards))
+            )
+        candidates = self._stored_cell_keys(array_name, arr)
+        if not verify or not candidates:
+            return sorted(candidates)
+        from zarr_vectors.core._batch_reader import flush_prefetch
+
+        # flush_prefetch applies the grid origin itself and omits any
+        # cell that reads back empty or missing, so a key surviving in
+        # the cache is exactly the ``if _vlen_get_cell(...)`` this
+        # replaced.  It also carries the icechunk serial fallback.
+        cells = flush_prefetch(self._zarr, [(array_name, candidates)])
+        return sorted(
+            chunk_key for (_name, chunk_key), data in cells.items() if data
+        )
 
     def _array_has_stored_data(self, array_name: str) -> bool:
         """Whether ``array_name`` has any chunk object on disk.
@@ -2406,6 +2493,15 @@ def _local_root(store: LocalStore) -> Path:
 # tiny sidecar so ``list_chunks`` / ``chunk_exists`` stay O(1) without
 # scanning every shard tail.
 _NONEMPTY_CHUNKS_ATTR = "nonempty_chunks"
+
+#: Level-group attribute declaring that the level's presence is deferred
+#: to a coordinator: its per-chunk arrays carry no ``nonempty_chunks``
+#: while it is set, so no write touches state shared between cells, and
+#: readers derive presence from the store instead.  Set by
+#: :func:`zarr_vectors.building.defer_presence`, cleared by the level-wide
+#: :func:`zarr_vectors.building.rebuild_presence`.
+_PRESENCE_DECL_ATTR = "zarr_vectors_presence"
+_PRESENCE_DEFERRED = "deferred"
 
 
 class PresenceEvent(NamedTuple):
@@ -2727,7 +2823,12 @@ def _record_nonempty_chunk(
     :func:`observe_presence_writes` event; ``arr`` is what gets written.
     """
     current = arr.attrs.get(_NONEMPTY_CHUNKS_ATTR)
-    keys = set(current) if current else set()
+    if current is None:
+        # An array with no manifest derives presence from the store (see
+        # ``_PRESENCE_DECL_ATTR``).  Starting a list here would claim this
+        # is its only cell, hiding every other one from ``list_chunks``.
+        return
+    keys = set(current)
     if present:
         keys.add(chunk_key)
     else:
