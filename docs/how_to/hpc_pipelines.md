@@ -186,6 +186,14 @@ if __name__ == "__main__":
 that stamps it races every other task; tasks skip it and the finalisation step
 rebuilds it from disk.
 
+```{note}
+This works because a finalisation step follows. If your consumers run
+*before* any coordinator pass — a downstream stage that enumerates
+`list_chunks` as soon as a worker returns — a cell written this way is
+invisible to them, and the rebuild comes too late to help. For that shape,
+see [Stamping under your own lock](#stamping-under-your-own-lock) below.
+```
+
 Write the vertices of a cell as one fragment **per bin**, as above, rather
 than one fragment for the whole cell. Fragments are what a coarsener draws
 representatives from, so a single-fragment cell produces a nearly empty
@@ -248,6 +256,42 @@ Store finalised.
 declared, which is why `vertex_fragments` shows up even though `init_store.py`
 never listed it. Both it and `rebuild_presence` are coordinator verbs — never
 run either while tasks are still writing.
+
+### Stamping under your own lock
+
+The protocol above trades visibility for safety: nothing races, but a cell is
+absent from `list_chunks` until `rebuild_presence` runs. Some pipelines cannot
+pay that — a stage that reads the chunks a worker just wrote, with no
+coordinator in between, sees nothing and silently does no work.
+
+If your workers already serialise *something* (a file lock, a queue, a
+database row), you can keep the payloads unlocked and move only the manifest
+update inside that section. `collect_presence` holds the stamps back;
+`apply_presence` lands them, coalesced to one attribute write per array:
+
+```python
+with level.collect_presence() as pending:
+    flush(level)                    # payloads -- the bulk of the I/O, unlocked
+with store_write_lock(path):        # short, and the only thing serialised
+    level.apply_presence(pending)
+```
+
+Unlike `batched_writes`, the cell payloads are **not** deferred — they land
+inline, exactly as they would otherwise. Only the stamp waits. By the time
+`apply_presence` returns, `list_chunks` reports every cell in the block, so a
+consumer running immediately afterwards sees the work.
+
+Pick by what follows the write:
+
+| Situation | Use |
+|---|---|
+| A coordinator pass follows | `record_presence=False` + `rebuild_presence` |
+| Consumers run before any coordinator, and you hold a lock | `collect_presence` / `apply_presence` |
+| Single writer, no concurrency | the default — stamp inline |
+
+`collect_presence` cannot be combined with `batched_writes`, which defers the
+payloads too and stamps its own manifest when it flushes; nesting the two
+raises `StoreError`. A `pending` token belongs to the thread that collected it.
 
 `build_pyramid` needs the whole store, so it belongs here rather than in a
 task. Coarsening a single level in isolation is not on the supported surface;
@@ -420,7 +464,9 @@ carry the bulk of the bytes.
   format detects the collision; the second writer simply wins.
 - **Skip the presence manifest in tasks.** Pass `record_presence=False` to
   every per-chunk write and rebuild once, afterwards. This is the one piece of
-  genuinely shared state.
+  genuinely shared state. If a consumer runs before that rebuild, collect the
+  stamps and apply them under your own lock instead — see
+  [Stamping under your own lock](#stamping-under-your-own-lock).
 - **Use a large `chunk_shape` on Lustre.** Stripe granularity is typically
   1–4 MB; cells smaller than that see no parallelism benefit.
   `Grid.plan(...).capacity(n_vertices=...)` gives the per-cell figure before

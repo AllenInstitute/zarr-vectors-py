@@ -138,6 +138,26 @@ def _presence_after(
     return sorted(present) if stamp else None
 
 
+def _emit_batch_presence(
+    array_name: str, cells: dict[str, tuple[bytes, bool]],
+) -> None:
+    """Report this array's landed stamps to ``observe_presence_writes``.
+
+    Only the cells that asked to be recorded, matching what
+    ``_presence_after`` folded into the manifest.  The batch paths write
+    the whole list at once rather than through
+    ``_record_nonempty_chunk``, so without this the instrument would be
+    silent on exactly the writes that bypass it.
+    """
+    from zarr_vectors.core.group import _emit_presence, _presence_observers
+
+    if not _presence_observers:
+        return
+    for chunk_key, (data, record_presence) in cells.items():
+        if record_presence:
+            _emit_presence(array_name, chunk_key, bool(data))
+
+
 def _flush_one_array(
     zarr_group: zarr.Group,
     array_name: str,
@@ -186,6 +206,10 @@ def _flush_one_array(
     present = _presence_after(arr, cells)
     if present is not None:
         arr.attrs[_NONEMPTY_CHUNKS_ATTR] = present
+        # On a worker thread when several arrays flush at once, which is
+        # what ``observe_presence_writes`` promises: the calling thread
+        # is whichever one performed the write.
+        _emit_batch_presence(array_name, cells)
 
 
 # --------------------------------------------------------------------
@@ -372,7 +396,7 @@ def _direct_write_many(
 
 
 def _stamp_presence(
-    stamps: list[tuple[zarr.Array, list[str]]],
+    stamps: list[tuple[str, zarr.Array, list[str], dict[str, tuple[bytes, bool]]]],
 ) -> None:
     """Rewrite each array's ``nonempty_chunks`` in one gather.
 
@@ -380,31 +404,37 @@ def _stamp_presence(
     with hundreds of offsets arrays would otherwise pay a serial
     ``sync()`` per array for a metadata write that is independent of
     every other.
+
+    Each entry carries its array name and the cell batch it came from,
+    used only to report the landed stamps to
+    :func:`~zarr_vectors.core.group.observe_presence_writes`.
     """
     from zarr_vectors.core.group import _NONEMPTY_CHUNKS_ATTR
 
     if not stamps:
         return
     if len(stamps) == 1:
-        arr, present = stamps[0]
+        array_name, arr, present, cells = stamps[0]
         arr.attrs[_NONEMPTY_CHUNKS_ATTR] = present
+        _emit_batch_presence(array_name, cells)
         return
 
     async def _all() -> None:
         await asyncio.gather(*(
             arr._async_array.update_attributes({_NONEMPTY_CHUNKS_ATTR: present})
-            for arr, present in stamps
+            for _name, arr, present, _cells in stamps
         ))
 
     sync(_all())
     # The sync handles carry a copy of the metadata; the async twins were
     # replaced by ``update_attributes``, so anything still holding the
     # old handle would read a stale manifest.
-    for arr, present in stamps:
+    for array_name, arr, present, cells in stamps:
         try:
             arr.metadata.attributes[_NONEMPTY_CHUNKS_ATTR] = present
         except Exception:
             pass
+        _emit_batch_presence(array_name, cells)
 
 
 def _flush_native_cells(
@@ -450,15 +480,18 @@ def _flush_native_cells(
     resolved = sync(_resolve_nodes(zarr_group._async_group, set(by_array)))
 
     direct_jobs: list[tuple[_DirectWriteSpec, str, bytes]] = []
-    stamps: list[tuple[zarr.Array, list[str]]] = []
+    stamps: list[
+        tuple[str, zarr.Array, list[str], dict[str, tuple[bytes, bool]]]
+    ] = []
     general: dict[str, tuple[zarr.Array | None, dict[str, tuple[bytes, bool]]]] = {}
     for array_name, cells in by_array.items():
         node = resolved.get(array_name)
         arr = node if isinstance(node, zarr.Array) else None
-        spec = (
-            _direct_write_spec(zarr_group, array_name, arr)
-            if arr is not None else None
-        )
+        if arr is None:
+            # Unresolved here; the general path resolves it itself.
+            general[array_name] = (None, cells)
+            continue
+        spec = _direct_write_spec(zarr_group, array_name, arr)
         if spec is None:
             general[array_name] = (arr, cells)
             continue
@@ -472,7 +505,7 @@ def _flush_native_cells(
             direct_jobs.append((spec, path, bytes(data)))
         present = _presence_after(arr, cells)
         if present is not None:
-            stamps.append((arr, present))
+            stamps.append((array_name, arr, present, cells))
 
     # Suppressed out here, once: ``catch_warnings`` swaps global state and
     # is not safe to enter from the workers.

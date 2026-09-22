@@ -280,6 +280,17 @@ finalize_links(lg, delta=0)     # rebuilds nonempty_chunks + counts
 shard_store("scan.zv", shard_shape=8)
 ```
 
+```{note}
+Step 1's `record_presence=False` leaves the cells invisible to
+`list_chunks` until step 2 runs. Where a writer has no step 2 to wait for
+— consumers reading as soon as it returns — `Group.collect_presence` and
+`Group.apply_presence` hold the stamps back instead, and apply them
+coalesced under a lock the caller already holds. The payloads still go
+out unlocked, so the race this section describes is avoided the same way;
+only the moment of the stamp moves. Sharding remains a coordinator pass
+that runs after all of it.
+```
+
 Reversing steps 2 and 3 fails **silently, not loudly**. `shard_store`
 selects each array's cells via `list_chunks`, which reads the very
 manifest the workers skipped; finding it empty, it takes its
