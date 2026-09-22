@@ -552,26 +552,63 @@ def _array_matches_layout(
     """Whether an existing single vlen array can be reused as-is under an
     explicit session, rather than recreated to match ``cfg``.
 
-    An **empty** array (no cells written) is never a match: it is
-    recreated so it picks up the session's full config — grid shape,
-    sharding, *and* codec pipeline.  This is what lets a store whose
-    ``vertices`` was warm-created (unsharded, uncompressed) by
-    :func:`create_store` be rewritten with ``shard_shape=`` or
-    ``compressor=``.  A non-empty array is reused only when its grid and
-    sharded-ness already match (a legit second writer pass), so its data
-    is preserved.
+    An **empty** array is never a match: it is recreated so it picks up
+    the session's full config — grid shape, sharding, *and* codec
+    pipeline.  This is what lets a store whose ``vertices`` was
+    warm-created (unsharded, uncompressed) by :func:`create_store` be
+    rewritten with ``shard_shape=`` or ``compressor=``.
+
+    An array that HOLDS DATA is always reused, even when the session asks
+    for a different layout, because recreating it means
+    :meth:`Group.create_sharded_chunk_array` deleting the node first.
+    The mismatch is real and worth saying out loud, but re-laying-out a
+    populated array is :func:`zarr_vectors.sharding.reshard`'s job and it
+    does it without losing the bytes.
+
+    Emptiness is asked of the STORE, not only of ``nonempty_chunks``.
+    The manifest is empty in exactly the cases where it must not be
+    believed: a decentralised writer passing ``record_presence=False``
+    leaves it so while the payloads are on disk, and a manifest that lost
+    an update under-reports.  Trusting it deleted populated arrays —
+    a second ``write_points`` into a store built with ``shard_shape=``
+    takes the default ``shard_shape=None``, which read as a layout
+    mismatch, and the first write was silently destroyed.
     """
     existing = level_group._sharded_chunk_array(array_name)
     if existing is None:
         return False
-    if not existing.attrs.get("nonempty_chunks"):
-        return False
+
     desired_sharded = cfg.get("shard_shape") is not None
     existing_sharded = getattr(existing, "shards", None) is not None
-    return (
+    matches = (
         tuple(existing.shape) == tuple(cfg["grid_shape"])
         and existing_sharded == desired_sharded
     )
+    if matches:
+        return True
+
+    # Mismatch. Recreating is only safe if there is nothing to lose.
+    if existing.attrs.get("nonempty_chunks"):
+        has_data = True
+    else:
+        has_data = level_group._array_has_stored_data(array_name)
+    if not has_data:
+        return False
+
+    warnings.warn(
+        f"{array_name!r} in {level_group._zarr.path or '<root>'} already "
+        f"holds data with a different layout "
+        f"(grid {tuple(existing.shape)}, "
+        f"{'sharded' if existing_sharded else 'unsharded'}) than this write "
+        f"session requests (grid {tuple(cfg['grid_shape'])}, "
+        f"{'sharded' if desired_sharded else 'unsharded'}); reusing it as-is. "
+        f"Recreating it would delete the data. Use "
+        f"zarr_vectors.sharding.reshard() to change an existing store's "
+        f"layout.",
+        RuntimeWarning,
+        stacklevel=3,
+    )
+    return True
 
 
 def level_grid_layout(
