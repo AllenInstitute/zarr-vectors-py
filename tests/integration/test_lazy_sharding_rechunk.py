@@ -347,20 +347,42 @@ class TestRechunkByAttribute:
         store = str(tmp_path / "tracts.zv")
         write_polylines(store, polys, chunk_shape=(200., 200., 200.))
 
+        from zarr_vectors.core.store import read_level_metadata
+        from zarr_vectors.types.polylines import read_polylines
+
         out = str(tmp_path / "by_length.zv")
+        edges = [0, 30, 80, float("inf")]
         result = rechunk(
             store,
-            RechunkSpec(by="attribute:length", bins=[0, 30, 80, float("inf")]),
+            RechunkSpec(by="attribute:length", bins=edges),
             output=out,
         )
-        assert result["bins_created"] >= 2
-        assert result["objects_rechunked"] == 80
 
-        # 4D keys with prefix = length bin
+        # Each polyline is labelled by the lower edge of its length bin.
+        # No streamline here is shorter than 30, so the bins in use are
+        # the mapper's 1 and 2 -- a hole at 0 that must not survive.
+        lengths = [
+            float(np.sum(np.sqrt(np.sum(np.diff(p, axis=0) ** 2, axis=1))))
+            for p in polys
+        ]
+        label_of = [
+            float(edges[np.searchsorted(edges, v, side="right") - 1])
+            for v in lengths
+        ]
+        labels = sorted(set(label_of))
+        assert labels == [30.0, 80.0]
+        assert result["bins_created"] == len(labels)
+        assert result["objects_rechunked"] == 80
+        assert read_level_metadata(open_store(out), 0).chunk_attribute_values == labels
+
+        # 4D keys with prefix = length bin, dense from 0
         keys = list_chunk_keys(open_store(out)["0"])
         assert all(len(k) == 4 for k in keys)
-        bin_prefixes = sorted(set(k[0] for k in keys))
-        assert len(bin_prefixes) >= 2
+        assert sorted(set(k[0] for k in keys)) == list(range(len(labels)))
+
+        for label in labels:
+            got = read_polylines(out, attribute_filter={"length": label})
+            assert got["polyline_count"] == label_of.count(label)
 
 
 class TestRechunkViaLazy:

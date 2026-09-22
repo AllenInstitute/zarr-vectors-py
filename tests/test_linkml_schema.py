@@ -133,6 +133,21 @@ def test_level_metadata_with_attribute_chunking_validates(schema):
     _validate(schema, "LevelMetadata", wire)
 
 
+@pytest.mark.parametrize("values", [[0, 2, -1], [30.0, 80.0], [3, 7]])
+def test_level_metadata_with_numeric_bin_labels_validates(schema, values):
+    """Categorical ints, lower edges and group indices are all numbers."""
+    lm = LevelMetadata(
+        level=0,
+        vertex_count=500,
+        arrays_present=["vertices", "object_index"],
+        chunk_dims=["group", "x", "y", "z"],
+        chunk_attribute_name="group",
+        chunk_attribute_values=values,
+    )
+    wire = lm.to_dict()["zarr_vectors_level"]
+    _validate(schema, "LevelMetadata", wire)
+
+
 # ===================================================================
 # Per-array .zattrs shapes — sampled from the writers in core/arrays.py
 # ===================================================================

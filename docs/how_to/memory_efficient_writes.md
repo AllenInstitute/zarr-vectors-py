@@ -265,8 +265,11 @@ argument above applies to them unchanged.
 If your data is already in a format that can be read block by block, the
 smallest change to an existing pipeline is to write it once with a coarse
 chunk shape and re-cut the grid afterwards. `rechunk` with
-`RechunkSpec(by="spatial")` changes the spatial chunk shape and keeps the
-store's topology, levels and object ids:
+`RechunkSpec(by="spatial")` changes the spatial chunk shape. It copies
+level 0's vertices and object index only, which is lossless for a point
+cloud. Links, attributes and coarser levels are not carried over, and the
+grid gains a leading axis of extent 1. For any other geometry kind, use
+`rechunk_spatial`, which keeps links, levels, object ids and attributes:
 
 ```python
 import numpy as np

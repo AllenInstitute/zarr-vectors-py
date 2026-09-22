@@ -720,10 +720,14 @@ class LevelMetadata:
         chunk_attribute_name: Name of the per-vertex attribute that is
             used as the leading chunk axis (single-axis attribute
             chunking; v1 supports only one).  ``None`` for spatial-only.
-        chunk_attribute_values: Ordered list mapping attribute-bin index
-            to the original attribute value.  ``chunk_attribute_values[i]``
-            is the value of the attribute for any vertex in chunks with
-            leading coord ``i``.  ``None`` for spatial-only.
+        chunk_attribute_values: One label per leading-axis bin, in bin
+            order.  ``chunk_attribute_values[i]`` is what a reader's
+            ``attribute_filter`` names to select the chunks with leading
+            coord ``i``, so its length is the bin count.  A writer's
+            categorical bin is labelled by its value.  A rechunk bin cut
+            by edges is labelled by its lower edge, and a group bin by
+            its group index (``-1`` for ungrouped objects, the last bin).
+            ``None`` for spatial-only.
     """
 
     level: int
