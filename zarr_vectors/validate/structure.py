@@ -166,7 +166,96 @@ def validate_structure(store_path: str | Path | Group) -> ValidationResult:
             else:
                 result.add_warning(f"{ln}/links/ exists but has no <delta> subdirs")
 
+        _check_chunk_ranks(root, lv, level, result)
+
     if root.array_exists(PARAMETRIC_GROUP):
         result.add_pass("parametric/ group exists")
 
     return result
+
+
+def _check_chunk_ranks(
+    root: Group, lv: int, level: Group, result: ValidationResult,
+) -> None:
+    """Every per-chunk array in a level shares one rank, and so do its keys.
+
+    A level's per-chunk arrays are cells of one chunk grid, so they have
+    one rank: the spatial rank, plus one when the level is chunked by an
+    attribute. An array allocated a rank short aliases cells (the bug
+    fixed in ``cf4c2f1``), and no other validator notices: the
+    consistency check compares a fragment's column count with
+    ``sid_ndim``, which says nothing about how its cell was addressed.
+
+    Both halves are needed. A presence key whose arity differs from its
+    array's rank names a cell the array cannot hold. But
+    ``derive_nonempty_chunks`` rebuilds the manifest at the array's own
+    rank, so after a rebuild a mis-ranked array agrees with itself. Only
+    comparing it with ``vertices`` then catches it.
+    """
+    from zarr_vectors.building import per_chunk_array_paths
+
+    ln = str(lv)
+    try:
+        paths = per_chunk_array_paths(level)
+    except Exception as e:
+        result.add_warning(f"{ln}/ per-chunk arrays cannot be listed: {e}")
+        return
+
+    ranks: dict[str, int] = {}
+    shapes: dict[str, tuple[int, ...]] = {}
+    for path in paths:
+        bounds = level.chunk_grid_bounds(path)
+        if bounds is None:
+            continue
+        shapes[path] = bounds[1]
+        rank = ranks[path] = len(bounds[1])
+        # A missing manifest lists empty: that is the legitimate state of
+        # a ``record_presence=False`` write awaiting its rebuild.
+        bad = [
+            k for k in level.list_chunks(path) if len(k.split(".")) != rank
+        ]
+        if bad:
+            result.add_error(
+                f"{ln}/{path} has rank {rank} but {len(bad)} of its "
+                f"presence keys do not (e.g. {bad[0]!r})"
+            )
+
+    ref = ranks.get(VERTICES)
+    if ref is None:
+        return
+    skewed = sorted(p for p, r in ranks.items() if r != ref)
+    for path in skewed:
+        result.add_error(
+            f"{ln}/{path} has rank {ranks[path]} but {ln}/{VERTICES} has "
+            f"rank {ref}; every per-chunk array in a level shares one "
+            f"chunk grid"
+        )
+    if not skewed:
+        result.add_pass(
+            f"{ln}/ per-chunk arrays share rank {ref} ({len(ranks)} arrays)"
+        )
+
+    # A level chunked by an attribute has a leading bin axis with one
+    # entry per bin. Read loosely: metadata is level 2's to judge, and a
+    # level whose metadata does not parse is reported there.
+    from zarr_vectors.core.store import read_level_metadata, read_root_metadata
+
+    try:
+        sid_ndim = read_root_metadata(root).sid_ndim
+        values = read_level_metadata(root, lv).chunk_attribute_values
+    except Exception:
+        return
+    if values is None:
+        return
+    if ref != sid_ndim + 1:
+        result.add_error(
+            f"{ln}/ is chunked by attribute, so its arrays need rank "
+            f"{sid_ndim + 1} (a leading bin axis), but {ln}/{VERTICES} has "
+            f"rank {ref}"
+        )
+    elif shapes[VERTICES][0] != len(values):
+        result.add_error(
+            f"{ln}/{VERTICES} has {shapes[VERTICES][0]} bins on its leading "
+            f"axis but chunk_attribute_values names {len(values)}; a reader "
+            f"resolves a value to a bin by its position in that list"
+        )
