@@ -2174,14 +2174,17 @@ def patch_object_manifests(
         row_of[oid] = n0 + offset
 
     # What those rows held before, so num_present moves by the delta
-    # rather than being recounted over the whole index.
-    existing_rows = [row_of[o] for o in ids if o in known.tolist()]
+    # rather than being recounted over the whole index.  Read in row order
+    # and paired in the same order: ids need not ascend with their rows
+    # once an id table exists, so pairing id order against row order
+    # would hand each id another object's manifest.
+    held = sorted((row_of[o], o) for o in ids if row_of[o] < n0)
     previous = dict(zip(
-        [o for o in ids if row_of[o] < n0],
+        [o for _row, o in held],
         level_group.read_vlen_elements(
-            f"{OBJECT_INDEX}/manifests", sorted(existing_rows),
+            f"{OBJECT_INDEX}/manifests", [row for row, _o in held],
         ),
-    )) if existing_rows else {}
+    )) if held else {}
 
     target_rows = [row_of[o] for o in ids]
     with warnings.catch_warnings():
