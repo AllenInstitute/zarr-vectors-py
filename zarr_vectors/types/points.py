@@ -15,7 +15,7 @@ Supports three point cloud variants:
 from __future__ import annotations
 
 import itertools
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Literal
 
 import numpy as np
 import numpy.typing as npt
@@ -129,7 +129,7 @@ def write_points(
     chunk_by_attribute: str | None = None,
     out_of_bounds: str = DEFAULT_OOB_POLICY,
     compressor: Any = None,
-    shard_shape: int | tuple[int, ...] | None = None,
+    shard_shape: int | tuple[int, ...] | None | Literal["inherit"] = "inherit",
     # Deprecated alias for ``vertex_attributes``; will be removed.
     attributes: dict[str, npt.NDArray] | None = None,
 ) -> dict[str, Any]:
@@ -255,6 +255,10 @@ def write_points(
         bounds=bounds_list,
         chunk_shape=tuple(chunk_shape),
         ndim=ndim,
+        # Only meaningful when this call CREATES the store; an existing
+        # one keeps its own declaration. "inherit" means the caller said
+        # nothing, so there is nothing to declare on a fresh store.
+        shard_shape=None if shard_shape == "inherit" else shard_shape,
     )
 
     # Apply out-of-bounds policy against the store's persisted bounds.
