@@ -9,6 +9,14 @@
   (Zarr Vectors-encoded vertices, edges, fragment index, attribute values, …).
   Chunk files land at `<array>/c/i/j/k`.
 
+  The per-array tables below give the shape as `chunk_grid_shape`, which is
+  the spatial grid. On a level chunked by an attribute that grid — and so
+  every array in the level — gains a **leading bin axis**, making the rank
+  `1 + sid_ndim` and the cells `bin.i.j.k`; see
+  [Attribute-based chunking](../chunking/attribute_chunking.md#array-shape).
+  Every per-chunk array in a level shares one rank. An array allocated at
+  the spatial rank alone cannot be addressed by that level's own keys.
+
 **Chunk grid origin**
 : `origin = floor(min_corner / chunk_shape)` per axis, stored in the array's
   `chunk_grid_origin` attribute (absent ⇒ all-zero). A spatial chunk at

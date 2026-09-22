@@ -84,6 +84,32 @@ uses for `vertices/`. Callers passing `fragment_attributes={name:
 combined coords (the leading `attr_bin` plus the spatial coords), not
 the raw spatial coords.
 
+### Array shape
+
+The leading axis is not only a key convention — it is part of the physical
+layout. Every per-chunk array in an attribute-chunked level is allocated at
+rank `1 + sid_ndim`, with the leading axis spanning `K` bins and anchored at
+origin `0`:
+
+```
+vertices                  shape = (K, g_0, g_1, g_2)
+vertex_fragments          shape = (K, g_0, g_1, g_2)
+vertex_attributes/<name>  shape = (K, g_0, g_1, g_2)
+links/<delta>/<offsets>   shape = (K, g_0, g_1, g_2)
+```
+
+`chunk_attribute_values` is authoritative for `K` — it is what writers pass
+as `bin_count`, and its length is the extent. `chunk_dims` names the axes but
+carries no cardinality, so do not size an array from it.
+
+This matters to anything that allocates an array into an existing level.
+A writer that opens a write session is handed the bin count; one that does
+not — a decentralized worker calling `create_attribute_array`, an edit adding
+a links segment — must take the rank from the level rather than deriving a
+spatial grid from the store bounds. An array allocated one axis short cannot
+be addressed by the level's own keys, and where the grid origin is non-zero
+the mismatch used to alias cells rather than raise.
+
 ### Level metadata fields
 
 Three new keys on the level `.zattrs`:
