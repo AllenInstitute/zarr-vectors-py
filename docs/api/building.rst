@@ -40,6 +40,7 @@ The :doc:`constants` page documents the values of some but not all of them —
    * ``LINK_FRAGMENTS``
    * ``LINK_ATTRIBUTES``
    * ``OBJECT_INDEX_LAYOUT_V1``
+   * ``OBJECT_INDEX_MANIFEST_BUCKET``
    * ``LINKS_IMPLICIT_SEQUENTIAL``
    * ``LINKS_IMPLICIT_BRANCHES``
    * ``XLEVEL_NONE``
@@ -332,6 +333,12 @@ The coordinator-side verbs: what is actually on disk, and rebuilding the
 ``nonempty_chunks`` and ``arrays_present`` records after a parallel write
 phase that deliberately did not stamp them.
 
+The worker-side alternative is :meth:`Group.collect_presence
+<zarr_vectors.building.Group.collect_presence>` and
+:meth:`~zarr_vectors.building.Group.apply_presence`, for a writer whose
+consumers run before any coordinator pass -- see
+:doc:`/how_to/hpc_pipelines`.
+
 .. autofunction:: zarr_vectors.building.refresh_arrays_present
 
 .. autofunction:: zarr_vectors.building.rebuild_presence
@@ -341,6 +348,16 @@ phase that deliberately did not stamp them.
 .. autofunction:: zarr_vectors.building.array_is_sharded
 
 .. autofunction:: zarr_vectors.building.is_sharded
+
+.. autofunction:: zarr_vectors.building.observe_presence_writes
+
+.. note::
+
+   ``observe_presence_writes`` is an *instrument*, not a data API.  It
+   answers "where did this stamp happen -- under which lock, on which
+   thread", which nothing readable from the store can answer after the
+   fact.  To ask what the manifest says, use
+   :meth:`Group.list_chunks <zarr_vectors.building.Group.list_chunks>`.
 
 Sharding and rechunking
 -----------------------
