@@ -238,6 +238,29 @@ first edge fall in the first bin, and the last bin is open above, so
 name (`group`, `object_id`, or `prefix_dim_name`) for the other kinds.
 `by="spatial"` has no bins to select between and records no labels.
 
+### Pyramids
+
+`build_pyramid` and `coarsen_level` keep a level's bins at every coarser
+level. The coarse level gets the same leading bin axis, and copies the fine
+level's `chunk_dims`, `chunk_attribute_name` and `chunk_attribute_values`
+verbatim, so bin `i` means the same value at every level, and
+`attribute_filter` works on a coarse level as it does on level 0.
+
+A metavertex aggregates vertices of **one** bin. The grouping key is the
+attribute bin followed by the spatial bin, so a polyline that turns from
+one value to another in a single spatial bin gives one metavertex per
+value. The bin is taken from each vertex's chunk key, because the
+chunk-by attribute is not stored per vertex.
+
+Cross-level links (`links/+N`, `links/-N`) are written at the full rank,
+`sid_ndim + 1`, at both ends. A link never crosses bins, so the bin
+component of its offset is always 0.
+
+A level with a leading axis but no `chunk_attribute_values` is carried
+the same way. Such a level comes from a rechunk made before bin labels
+were recorded. The coarse level's arrays get the axis from the fine
+level's `vertices` shape.
+
 ### Atomicity and writes
 
 Attribute-chunked writes inherit the same atomicity guarantees as

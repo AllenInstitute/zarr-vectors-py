@@ -10,6 +10,12 @@ from __future__ import annotations
 
 import numpy as np
 
+from tests.test_attr_chunked_allocation import (
+    _CHUNK,
+    _OFFSET_BOUNDS,
+    _attr_store,
+    _level,
+)
 from zarr_vectors.core.arrays import level_grid_layout
 from zarr_vectors.core.store import open_store
 from zarr_vectors.rechunk import RechunkSpec, rechunk
@@ -17,13 +23,6 @@ from zarr_vectors.types.points import write_points
 from zarr_vectors.types.polylines import write_polylines
 from zarr_vectors.validate import validate
 from zarr_vectors.validate.structure import validate_structure
-
-from tests.test_attr_chunked_allocation import (
-    _CHUNK,
-    _OFFSET_BOUNDS,
-    _attr_store,
-    _level,
-)
 
 
 def _errors_mentioning(result, *words):
