@@ -233,6 +233,7 @@ def test_rebuild_presence_lists_cells_on_icechunk(ic_repo_path: str) -> None:
     """icechunk refuses a listing prefix that is not a node, and
     ``<array>/c/`` is not one; the rebuild lists the array and filters."""
     import numpy as np
+
     from zarr_vectors.building import get_resolution_level, rebuild_presence
     from zarr_vectors.types.points import write_points
 
