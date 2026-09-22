@@ -187,21 +187,6 @@ non-dense-capable config is exercised at
 
 ---
 
-## 4. Add a validator rule for array rank vs key arity
-
-**Severity: medium.** **Decided: do it.**
-
-A store corrupted by the rank bug fixed in `cf4c2f1` passes all four validators
-clean. `validate/structure.py:67-172` never opens an array node;
-`validate/consistency.py:169-170` checks the decoded fragment's column count
-against `sid_ndim`, which is unrelated to key arity.
-
-Proposed L1 rule: every per-chunk array in a level shares one rank, and the keys
-in its `nonempty_chunks` have that many components. Flags already-broken stores,
-which nothing else can.
-
----
-
 ## 5. `Level.grid` reports the spatial grid on an attribute-chunked level
 
 **Severity: low.** `Level.grid` (`api/level.py:270-284`) calls
