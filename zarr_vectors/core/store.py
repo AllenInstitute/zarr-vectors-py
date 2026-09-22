@@ -160,6 +160,36 @@ def _make_fsspec_zarr_store(
     )
 
 
+def _reject_unused_backend_kwargs(
+    kwargs: dict[str, Any], *, backend: str,
+) -> None:
+    """Raise ``TypeError`` for loose kwargs this backend cannot use.
+
+    Only for the branches that discard them ENTIRELY -- a local store, or
+    one the caller built themselves.  The remote backends genuinely take
+    open-ended options (obstore's ``from_url`` and fsspec's per-filesystem
+    ``storage_options`` are both ``**kwargs``), so there is nothing
+    honest to validate them against and they stay permissive.
+
+    Explicit ``storage_options=`` is never rejected, here or anywhere: a
+    caller passing one options dict across several backends means it, and
+    a key that is meaningless for the local one is not a typo.  The loose
+    ``**backend_kwargs`` channel is the one where a misspelling lands,
+    which is how ``create_store(path, shard_shape=8)`` came to be accepted
+    and silently dropped for the whole life of the feature.
+    """
+    if not kwargs:
+        return
+    names = ", ".join(repr(k) for k in sorted(kwargs))
+    raise TypeError(
+        f"unexpected keyword argument(s) {names}: the {backend!r} backend "
+        f"takes no backend options, so these would be silently ignored. "
+        f"If you meant a store option, pass storage_options={{...}}; if you "
+        f"meant a zarr-vectors argument, check its spelling against the "
+        f"function signature."
+    )
+
+
 def _make_zarr_store_with_session(
     path: StoreLike,
     *,
@@ -180,6 +210,15 @@ def _make_zarr_store_with_session(
     constructor — fsspec ``storage_options``, obstore ``from_url`` kwargs,
     or icechunk ``*_storage`` kwargs.
 
+    The three branches that cannot use options at all — a pre-built
+    store, a pre-built obstore object, and ``local`` — raise
+    :class:`TypeError` on loose ``**backend_kwargs`` rather than
+    discarding them.  Explicit ``storage_options=`` is always accepted,
+    including there: a caller passing one options dict across several
+    backends means it, whereas a loose keyword that fits nothing is a
+    misspelling.  The remote backends stay permissive because their
+    constructors are genuinely open-ended.
+
     Dispatch order:
 
     1. Pre-built :class:`zarr.abc.store.Store` → pass through (honoring
@@ -199,6 +238,8 @@ def _make_zarr_store_with_session(
 
     # 1. Pre-built Zarr store: pass through.
     if isinstance(path, _ZStore):
+        # Nothing here can act on options -- the store is already built.
+        _reject_unused_backend_kwargs(backend_kwargs, backend="pre-built store")
         if mode == "r" and not path.read_only and hasattr(path, "with_read_only"):
             path = path.with_read_only(True)
         return path, None
@@ -211,6 +252,9 @@ def _make_zarr_store_with_session(
     if _obs_store_mod is not None and isinstance(path, _obs_store_mod.ObjectStore):
         from zarr.storage import ObjectStore as _ZarrObjStore
 
+        _reject_unused_backend_kwargs(
+            backend_kwargs, backend="pre-built obstore store",
+        )
         return _ZarrObjStore(path, read_only=(mode == "r")), None
 
     # 3. icechunk — transactional, explicit only.
@@ -236,6 +280,11 @@ def _make_zarr_store_with_session(
 
     name = resolve_backend_name(str(path), backend)
     if name == "local":
+        # ``LocalStore`` takes a path and nothing else, so ``opts`` is
+        # dropped here. That silent drop is the whole bug: a store-level
+        # argument with no parameter to land in was collected by
+        # ``**backend_kwargs``, carried this far, and discarded.
+        _reject_unused_backend_kwargs(backend_kwargs, backend="local")
         return LocalStore(_resolve_local_path(path)), None
     if name == "obstore":
         return _make_obstore_zarr_store(str(path), mode=mode, storage_options=opts)
