@@ -1518,6 +1518,7 @@ def create_link_attributes_array(
     link_width: int = 2,
     offsets: Sequence[ChunkCoords] | None = None,
     exist_ok: bool = True,
+    row_shape: Sequence[int] | None = None,
 ) -> None:
     """Create a ``link_attributes/<name>/<delta>/<offsets>/`` array.
 
@@ -1530,6 +1531,12 @@ def create_link_attributes_array(
 
     ``exist_ok=True`` (default) makes the call idempotent; pass
     ``exist_ok=False`` to raise :class:`ArrayError` on conflict.
+
+    ``row_shape`` is the tail shape of one row (``[]`` for a scalar
+    column, ``[k]`` for ``k`` channels).  Readers need it to reshape a
+    bare cell, and the cell writers stamp it if it is missing; passing
+    it here settles the array's metadata in the one write that creates
+    it, so later writes have nothing to restamp.
     """
     if offsets is None:
         if sid_ndim is None:
@@ -1541,19 +1548,51 @@ def create_link_attributes_array(
     full_name = link_attributes_path(name, delta, offsets)
     if _short_circuit_existing(level_group, full_name, exist_ok):
         return
-    _ensure_array_dir(level_group, full_name)
-    level_group.write_array_meta(link_attributes_group_path(name, delta), {
-        "zv_array": "link_attribute_family",
-        "name": name,
-        "level_delta": int(delta),
-    })
-    level_group.write_array_meta(full_name, {
+    meta: dict[str, Any] = {
         "zv_array": "link_attribute",
         "name": name,
         "dtype": dtype,
         "offsets": [list(int(c) for c in o) for o in offsets],
         "level_delta": int(delta),
-    })
+    }
+    if row_shape is not None:
+        meta["row_shape"] = [int(d) for d in row_shape]
+    # The metadata rides on the create rather than following it: a
+    # second write of the same ``zarr.json`` per segment was half of
+    # what allocating a segment cost.
+    _ensure_array_dir(level_group, full_name, attributes=meta)
+    _write_array_meta_if_changed(
+        level_group, link_attributes_group_path(name, delta), {
+            "zv_array": "link_attribute_family",
+            "name": name,
+            "level_delta": int(delta),
+        },
+    )
+
+
+def _write_array_meta_if_changed(
+    level_group: Group, array_name: str, meta: dict[str, Any],
+) -> bool:
+    """:meth:`Group.write_array_meta`, skipped when nothing would change.
+
+    For stamps that repeat on every call but whose values settle once:
+    the link-attribute writers restamp ``dtype`` / ``row_shape`` per
+    segment per batch, and a family group is restamped for every segment
+    allocated under it.  Each stamp is a rewrite of the whole
+    ``zarr.json`` -- a metadata operation that, on a shared filesystem,
+    is the expensive part of a small write -- and on a chunk array it is
+    also a read-modify-write of the same document ``nonempty_chunks``
+    lives in.
+
+    Compared key by key against what the node already holds, so a key
+    the stamp does not mention is never a reason to write.  Returns
+    whether it wrote.
+    """
+    current = level_group.read_array_meta(array_name)
+    if all(current.get(k) == v for k, v in meta.items()):
+        return False
+    level_group.write_array_meta(array_name, meta)
+    return True
 
 
 # ===================================================================
@@ -3411,7 +3450,7 @@ def write_link_attributes(
         create_link_attributes_array(
             level_group, attr_name, dtype=str(arr.dtype), delta=delta,
             sid_ndim=sid_ndim, link_width=link_width, offsets=offsets,
-            exist_ok=True,
+            exist_ok=True, row_shape=arr.shape[1:],
         )
         full_name = link_attributes_path(attr_name, delta, offsets)
         for (bucket_seg, src_chunk), input_idxs in partition.cell_indices.items():
@@ -3430,8 +3469,11 @@ def write_link_attributes(
                 full_name, key, np.ascontiguousarray(combined).tobytes(),
             )
         # ``row_shape`` (the tail dims per row, ``()`` for 1-D) lets the
-        # reader reconstruct shape from a bare byte blob.
-        level_group.write_array_meta(full_name, {
+        # reader reconstruct shape from a bare byte blob.  Stamped only
+        # when it differs: the values settle on the first batch, and a
+        # pre-created segment may lack ``row_shape`` or carry a dtype the
+        # data does not have.
+        _write_array_meta_if_changed(level_group, full_name, {
             "zv_array": "link_attribute",
             "name": attr_name,
             "dtype": str(arr.dtype),
@@ -3892,7 +3934,7 @@ def write_link_attribute_cells(
             create_link_attributes_array(
                 level_group, attr_name, dtype=str(arr.dtype), delta=delta,
                 sid_ndim=sid_ndim, link_width=link_width, offsets=offsets,
-                exist_ok=True,
+                exist_ok=True, row_shape=arr.shape[1:],
             )
         elif not level_group.array_exists(full_name):
             raise ArrayError(
@@ -3918,8 +3960,11 @@ def write_link_attribute_cells(
                 full_name, key, np.ascontiguousarray(combined).tobytes(),
             )
         # ``row_shape`` (the tail dims per row, ``()`` for 1-D) lets the
-        # reader reconstruct shape from a bare byte blob.
-        level_group.write_array_meta(full_name, {
+        # reader reconstruct shape from a bare byte blob.  Stamped only
+        # when it differs: the values settle on the first batch, and a
+        # pre-created segment may lack ``row_shape`` or carry a dtype the
+        # data does not have.
+        _write_array_meta_if_changed(level_group, full_name, {
             "zv_array": "link_attribute",
             "name": attr_name,
             "dtype": str(arr.dtype),

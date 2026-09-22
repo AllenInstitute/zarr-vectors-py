@@ -281,7 +281,7 @@ class Group:
 
     @property
     def attrs(self) -> _Attrs:
-        return _Attrs(self._zarr.attrs)
+        return _Attrs(self._zarr.attrs, self._zarr)
 
     # ---------------- sub-groups ----------------
 
@@ -1323,7 +1323,7 @@ class Group:
         # through the group-meta flush.
         sharded_arr = self._sharded_chunk_array(array_name)
         if sharded_arr is not None:
-            sharded_arr.attrs.update(_json_safe(meta))
+            _merge_attributes(sharded_arr, _json_safe(meta))
             return
         # Otherwise ``array_name`` is a group — a ``links/<delta>``
         # family, an attribute namespace, ``object_index``.  Batched-write
@@ -1339,7 +1339,7 @@ class Group:
             self._pending_array_metas[array_name] = merged
             return
         arr_group = self._zarr.require_group(array_name)
-        arr_group.attrs.update(_json_safe(meta))
+        _merge_attributes(arr_group, _json_safe(meta))
 
     def read_array_meta(self, array_name: str) -> dict[str, Any]:
         node = self._lookup_node(array_name)
@@ -1420,7 +1420,7 @@ class Group:
         arr[:] = arr_data
 
         if attributes:
-            arr.attrs.update(_json_safe(attributes))
+            _merge_attributes(arr, _json_safe(attributes))
 
     def extend_array(
         self,
@@ -1470,15 +1470,27 @@ class Group:
             )
         n0 = int(arr.shape[0])
         total = n0 + int(row_data.shape[0])
-        if total != n0:
-            arr.resize((total,) + tuple(arr.shape[1:]))
-            arr[n0:total] = row_data.astype(arr.dtype, copy=False)
         stamped = dict(attributes) if attributes else {}
         if "shape" in arr.attrs:
             stamped["shape"] = [total, *arr.shape[1:]]
-        if stamped:
-            arr.attrs.update(_json_safe(stamped))
-        self._invalidate_node(path)
+        try:
+            if total != n0:
+                # One ``zarr.json`` write, not two.  ``resize`` saves a
+                # shallow copy of this metadata, attributes dict included,
+                # so staging the attributes on the handle first makes the
+                # resize's own write carry them; a separate update after
+                # it rewrote the document a second time.  Staged before
+                # the rows land, exactly as the grown shape is.
+                if stamped:
+                    arr.metadata.attributes.update(_json_safe(stamped))
+                arr.resize((total,) + tuple(arr.shape[1:]))
+                arr[n0:total] = row_data.astype(arr.dtype, copy=False)
+            elif stamped:
+                _merge_attributes(arr, _json_safe(stamped))
+        finally:
+            # Also on failure: a handle whose staged attributes never
+            # reached the store must not keep answering with them.
+            self._invalidate_node(path)
         return total
 
     def read_array(self, path: str) -> np.ndarray:
@@ -1561,7 +1573,7 @@ class Group:
             arr[:] = obj
 
         if attributes:
-            arr.attrs.update(_json_safe(attributes))
+            _merge_attributes(arr, _json_safe(attributes))
 
     def read_vlen_array(self, path: str) -> list[bytes]:
         """Read a vlen-bytes Zarr array at ``path`` as a list of bytes."""
@@ -2315,8 +2327,9 @@ class _Attrs:
     ``attrs[k]``, ``attrs.get(k, default)``, ``k in attrs``.
     """
 
-    def __init__(self, zarr_attrs: Any) -> None:
+    def __init__(self, zarr_attrs: Any, node: Any = None) -> None:
         self._attrs = zarr_attrs
+        self._node = node
 
     def __getitem__(self, key: str) -> Any:
         return self._attrs[key]
@@ -2334,7 +2347,10 @@ class _Attrs:
             return default
 
     def update(self, other: dict[str, Any]) -> None:
-        self._attrs.update(_json_safe(other))
+        if self._node is None:
+            self._attrs.update(_json_safe(other))
+        else:
+            _merge_attributes(self._node, _json_safe(other))
 
     def to_dict(self) -> dict[str, Any]:
         return dict(self._attrs)
@@ -2722,6 +2738,21 @@ def _record_nonempty_chunk(
 
 def _json_safe(d: dict[str, Any]) -> dict[str, Any]:
     return {k: _json_safe_value(v) for k, v in d.items()}
+
+
+def _merge_attributes(node: zarr.Array | zarr.Group, attrs: dict[str, Any]) -> None:
+    """Merge ``attrs`` into ``node``'s attributes in ONE ``zarr.json`` write.
+
+    ``node.attrs.update(d)`` is :meth:`MutableMapping.update`: it calls
+    ``__setitem__`` once per key, and in zarr 3 every ``__setitem__``
+    rewrites the whole document.  So a six-key stamp was six writes of the
+    same object -- and on a chunk array, six read-modify-writes of the
+    document ``nonempty_chunks`` lives in.  ``update_attributes`` merges
+    with exactly the same semantics and writes once; it updates the
+    handle's metadata in place, so ``node`` stays current.
+    """
+    if attrs:
+        node.update_attributes(attrs)
 
 
 def _json_safe_value(v: Any) -> Any:
