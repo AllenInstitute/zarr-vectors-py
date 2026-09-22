@@ -63,5 +63,11 @@ jobs:
       - name: Sync dependencies (frozen, all extras + dev)
         run: uv sync --frozen --extra all --extra dev
 
+      - name: Check schema artefacts are in sync
+        # The JSON Schema and reference.md are GENERATED from the LinkML
+        # source. Nothing regenerated them in CI, which is how they drifted
+        # far enough to omit fields the runtime was already writing.
+        run: uv run python schema/regen.py --check
+
       - name: Run tests
         run: uv run pytest tests/ --ignore=tests/integration -v
