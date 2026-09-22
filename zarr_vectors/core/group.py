@@ -2067,6 +2067,27 @@ class Group:
         arr.attrs[_NONEMPTY_CHUNKS_ATTR] = sorted(keys)
         return sorted(keys)
 
+    def _array_has_stored_data(self, array_name: str) -> bool:
+        """Whether ``array_name`` has any chunk object on disk.
+
+        The question ``nonempty_chunks`` is *supposed* to answer, asked of
+        the store instead — because the cases where it matters are exactly
+        the cases where the manifest is not to be trusted.  A decentralised
+        writer passing ``record_presence=False`` leaves it empty while the
+        payloads are on disk, and an array whose manifest lost an update
+        under-reports.  Believing it there is how a populated array gets
+        deleted as "empty".
+
+        Short-circuits on the first key, so it costs one listing request
+        rather than a full enumeration, and it is only asked when the
+        cheap signal already said "empty".
+        """
+        from zarr.core.sync import sync
+
+        base = self._zarr.path.strip("/")
+        prefix = f"{base}/{array_name}/c/" if base else f"{array_name}/c/"
+        return bool(sync(_any_key_under(self._zarr.store, prefix)))
+
     def _derive_presence_sharded(
         self, arr: zarr.Array, array_name: str, shards: tuple[int, ...],
     ) -> set[str]:
@@ -2428,6 +2449,12 @@ def _list_store_prefix(store: Any, prefix: str) -> list[str]:
     from zarr.core.sync import sync
 
     return sync(_collect_store_prefix(store, prefix))
+
+
+async def _any_key_under(store: Any, prefix: str) -> bool:
+    async for _key in store.list_prefix(prefix):
+        return True
+    return False
 
 
 def _coord_to_index(
