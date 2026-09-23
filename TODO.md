@@ -71,20 +71,6 @@ dtype were fixed on `todo-backlog`; these were left out of scope.
 
 ---
 
-## 5. `Level.grid` reports the spatial grid on an attribute-chunked level
-
-**Severity: low.** `Level.grid` (`api/level.py:270-284`) calls
-`Grid.plan(bounds, cell_size=self.scale)`, which computes a purely spatial grid
-(`api/grid.py:160-162`). On an attribute-chunked level `grid.shape` is rank 3
-while the arrays are rank 4, and `grid.cells` under-reports by a factor of K.
-
-`Grid.plan` itself is a pre-write prediction and is right to be spatial. The
-question is only what `Level.grid` should return for a store that exists. Either
-carry the leading axis, or document that `grid` is the spatial grid and that
-`cell_of` / `cells_in` / `holds` are spatial predicates.
-
----
-
 ## 6. No device-side read path
 
 **Severity: none today — a recorded constraint, not a request.** Asked for by

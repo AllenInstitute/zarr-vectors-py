@@ -94,7 +94,14 @@ class GridCapacity:
 
 @dataclass(frozen=True, slots=True)
 class Grid:
-    """A level's cell grid, in physical units."""
+    """A level's cell grid, in physical units.
+
+    Spatial: every axis is a physical axis, and :meth:`cell_of`,
+    :meth:`cells_in` and :meth:`holds` are spatial predicates.  A level
+    chunked by an attribute adds a leading bin axis to its keys that this
+    grid does not model; a :class:`CellRef` from it selects its cell in
+    every bin of such a level.
+    """
 
     shape: tuple[int, ...]
     """Cells per axis."""

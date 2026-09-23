@@ -276,6 +276,13 @@ class Level:
         business — "will my data fit this allocation" and "which cells is
         this region" — and answering them by hand means re-deriving the
         allocator, which one consumer does and documents as fragile.
+
+        The grid is **spatial**.  On a level chunked by an attribute the
+        arrays carry a leading bin axis as well, so ``grid.shape`` is the
+        spatial tail of their shape and ``grid.cells`` counts spatial
+        cells, not keys.  A cell from the grid selects that cell in every
+        bin; :meth:`cells` lists the keys the level actually holds, bin
+        included, and one of those selects one bin's cell.
         """
         from zarr_vectors.api.grid import Grid
 
@@ -788,8 +795,14 @@ class Level:
                     f"level {target.index} declares no cell size, so a "
                     f"cells= selection cannot be resolved against it"
                 )
+            # On the spatial tail: a ref from ``Level.cells`` on a level
+            # chunked by an attribute leads with a bin, and a position has
+            # no bin to compare it with.  Such a ref therefore keeps its
+            # cell in every bin here -- only a reader that takes the cells
+            # itself can tell bins apart.
+            rank = cell.size
             wanted = {
-                tuple(int(c) for c in getattr(ref, "coords", ref))
+                tuple(int(c) for c in getattr(ref, "coords", ref))[-rank:]
                 for ref in selection.cells
             }
             # Absolute, matching ref.coords and the keys on disk.  There is

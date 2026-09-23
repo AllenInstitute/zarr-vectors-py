@@ -128,6 +128,34 @@ def test_a_one_cell_box_on_a_binned_store_finds_every_bin(tmp_path):
     np.testing.assert_array_equal(_sorted_rows(got), _sorted_rows(want))
 
 
+def test_a_spatial_chunks_tuple_on_a_binned_store_selects_every_bin(tmp_path):
+    """``chunks=`` is what ``select(cells=grid.cells_in(...))`` becomes.
+
+    A spatial tuple matched no key of a binned level, so a cell selection
+    built from the grid read nothing.  It now names that cell in every
+    bin, as a box does; a tuple with the bin names one key.
+    """
+    from zarr_vectors.core.arrays import resolve_chunk_keys
+
+    rng = np.random.default_rng(13)
+    pos = rng.uniform(0, 100.0, (2000, 3)).astype(np.float32)
+    gene = rng.choice(["A", "B", "C"], 2000)
+    store = str(tmp_path / "b2.zv")
+    write_points(
+        store, pos, chunk_shape=CHUNK,
+        vertex_attributes={"gene": gene}, chunk_by_attribute="gene",
+    )
+    lg = _level(store)
+    in_cell = [k for k in list_chunk_keys(lg) if k[1:] == (0, 0, 0)]
+    assert len(in_cell) == 3
+
+    spatial = resolve_chunk_keys(lg, CHUNK, chunks=[(0, 0, 0)])
+    exact = resolve_chunk_keys(lg, CHUNK, chunks=[in_cell[1]])
+
+    assert spatial == sorted(in_cell)
+    assert exact == [in_cell[1]]
+
+
 # ---------------------------------------------------------------------------
 # Grid origin
 # ---------------------------------------------------------------------------

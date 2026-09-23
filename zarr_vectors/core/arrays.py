@@ -6776,7 +6776,11 @@ def resolve_chunk_keys(
             stored keys via :func:`chunks_intersecting_bbox`.
         chunks: Optional explicit whitelist of chunk coordinate tuples.
             Pass ``[]`` for "no chunks" (yields an empty result). Pass
-            ``None`` (the default) for "no filter".
+            ``None`` (the default) for "no filter".  A tuple with one
+            entry per spatial axis names a spatial cell, and on a level
+            chunked by an attribute it selects that cell in every bin --
+            matched on the key's trailing components, as a box is.  A
+            tuple with the extra leading bin names one key exactly.
         array_name: Array whose chunk keys to enumerate.
 
     Returns:
@@ -6799,21 +6803,32 @@ def resolve_chunk_keys(
 
     if chunks is not None:
         expected_arity = len(chunk_shape)
-        normalised: set[ChunkCoords] = set()
+        exact: set[ChunkCoords] = set()
+        spatial: set[ChunkCoords] = set()
         for c in chunks:
             t = tuple(int(x) for x in c)
-            if len(t) != expected_arity:
+            if len(t) == expected_arity:
+                spatial.add(t)
+            elif len(t) == expected_arity + 1:
                 # Some stores (e.g. attribute-binned points / graphs) prefix
                 # spatial chunk coords with an extra binning axis, giving
                 # keys of length ``expected_arity + 1``. Accept those too.
-                if len(t) != expected_arity + 1:
-                    raise ValueError(
-                        f"chunks tuple {c!r} has arity {len(t)}; "
-                        f"expected {expected_arity} (or {expected_arity + 1} "
-                        f"for attribute-binned stores)"
-                    )
-            normalised.add(t)
-        keys &= normalised
+                exact.add(t)
+            else:
+                raise ValueError(
+                    f"chunks tuple {c!r} has arity {len(t)}; "
+                    f"expected {expected_arity} (or {expected_arity + 1} "
+                    f"for attribute-binned stores)"
+                )
+        # A spatial tuple is what ``Grid`` hands out, and on a binned level
+        # it used to match no key at all: the keys lead with the bin.  It
+        # names the cell in every bin, as a box does (``_chunks_in_box``
+        # also compares on the trailing axes).  On a spatial level the tail
+        # is the whole key, so this is the old exact match.
+        keys = {
+            k for k in keys
+            if k in exact or k[len(k) - expected_arity:] in spatial
+        }
 
     return sorted(keys)
 
