@@ -30,57 +30,24 @@ gate, per-step rollback and the empty-level `chunk_shape` were fixed on
 
 ---
 
-## 2. `ZVWriter.add_attribute_sync` deadlocks on an attribute-chunked store
+## 2. Lazy-layer leftovers after the deadlock fix
 
-**Severity: high.** A permanent hang — no traceback, no timeout, indistinguishable
-from slowness.
+**Severity: medium.** The `*_sync` deadlock and the `_prefetch_cache` race
+were fixed on `todo-backlog`; these were found on the way and left out.
 
-**Decided:** fix it properly rather than failing fast, despite the lazy layer
-being deprecated.
-
-**Root cause, verified.** Thread-pool exhaustion of zarr's shared loop's default
-executor:
-
-1. `add_attribute_sync` (`lazy/writer.py:622-629`) runs the outer coroutine on
-   zarr's **process-global** loop via `sync()`.
-2. `_write_per_vertex_attribute` (`writer.py:202-299`) does `asyncio.gather` over
-   one task per chunk key, unbounded (`writer.py:287`). Each task's first act is
-   `asyncio.to_thread`, which resolves to **that loop's** default executor —
-   `min(32, cpu_count+4)` = 16 threads on this machine.
-3. `read_chunk_vertices` opens a `batched_reads` block **per call** for a single
-   key (`core/arrays.py:4089-4092`) — the degenerate case `_maybe_batched_reads`'
-   own docstring says it exists to avoid.
-4. `batched_reads` entry calls `sync()` (`core/group.py:556-561` →
-   `_lookup_node` → zarr's `_sync` → `wait(timeout=None)`), and that inner
-   coroutine's `LocalStore.get` needs a thread from **the same** executor, which
-   has none free.
-
-Deadlocks at **≥16 chunk keys**; 15 or fewer completes. Attribute chunking
-triggers it purely by cardinality — populated cells ≈ spatial cells × bins, so
-the 8-cell store `tests/test_lazy_writer.py:24-33` uses becomes 24+ with 3 bins,
-which is why the existing test passes. The async `add_attribute` does **not**
-deadlock: the caller's loop and zarr's loop have different executors.
-
-**Candidate fixes, in preference order:**
-- Hoist one `batched_reads` over all keys before the gather.
-  `_maybe_batched_reads` is a no-op when `_prefetch_cache` is set
-  (`arrays.py:189-191`), so inner calls stop opening their own blocks. Check
-  whether the *write* half (`writer.py:259-263`) re-opens the cycle.
-- Run the `*_sync` wrappers on a private loop so the two executors differ — the
-  same asymmetry that already makes the async form safe. Smallest change, fixes
-  every `*_sync` method at once.
-- Bound the gather with a semaphore. Machine-dependent threshold; a band-aid.
-
-**Two more bugs in the same function:**
-- **`_prefetch_cache` race.** It is plain instance state on the shared `Group`
-  (`group.py:152,216,235`). The nesting check at `:525-526` and the set at `:557`
-  are not atomic, and the `finally` at `:572` lets one thread null it while
-  another is inside its block. Below 16 keys the fan-out can spuriously raise
-  `StoreError("batched_reads() does not support nesting")`.
-- **Hardcoded dtype.** `writer.py:237` passes `np.float32` to
-  `read_chunk_vertices`, overriding the store's declared dtype.
-  `arrays.py:4070-4074` documents why that is dangerous: a float64 cell read as
-  float32 decodes to garbage at twice the row count, silently.
+- **The lazy readers read vertices as float32 whatever the level declares**,
+  and return the decoded positions, so a float64 level reads back as garbage:
+  `ZVLevel.vertices` (`lazy/level.py:262`), the view read path
+  (`lazy/views.py:203`), and `_read_polyline` (`lazy/views.py:527`). The
+  writer had the same hardcoded dtype but used only row counts, which come
+  from the fragment index, so it was harmless there.
+- **`add_face_attribute` always raises `StoreError`.** `face_attributes/<n>`
+  is not a per-chunk array (`_is_per_chunk_array`, `core/arrays.py:880`), and
+  the writer pre-creates it as a group (`lazy/writer.py`,
+  `_write_per_face_attribute`), so the first cell write fails.
+- **`append_vertices` writes rank-3 keys into an attribute-chunked level.** It
+  assigns chunks with the root's spatial `chunk_shape` and no bin, so every
+  key is one component short of the level's arrays.
 
 ---
 
