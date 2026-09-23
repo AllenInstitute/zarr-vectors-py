@@ -1003,6 +1003,196 @@ def decode_object_manifests_many(
     return out, True
 
 
+def encode_object_manifests_csr(
+    chunk_coords: Any,
+    fragment_idx: Any,
+    manifest_offsets: Any = None,
+    *,
+    sid_ndim: int | None = None,
+) -> npt.NDArray[np.object_]:
+    """Manifest blobs for objects held as CSR arrays, with no per-object Python.
+
+    Object ``o`` owns the blocks ``manifest_offsets[o]:manifest_offsets[o+1]``;
+    block ``b`` names chunk ``chunk_coords[b]`` and fragment
+    ``fragment_idx[b]`` in it (a single-fragment, mode-0 block). With
+    ``manifest_offsets=None`` every object owns exactly one block. The
+    blobs are the ones :func:`encode_object_manifest_blocks` writes for
+    ``[(chunk_coords, int(fragment_idx)), ...]``, byte for byte.
+
+    Returns:
+        An object array of ``bytes``, one per object, ready to store.
+    """
+    cc = np.asarray(chunk_coords)
+    idx = np.asarray(fragment_idx)
+    if idx.ndim != 1:
+        raise ArrayError(f"fragment_idx must be 1-D, got shape {idx.shape}")
+    total = int(idx.size)
+    if cc.size == 0:
+        cc = cc.reshape(0, sid_ndim if sid_ndim is not None else 0)
+    if cc.ndim != 2 or cc.shape[0] != total:
+        raise ArrayError(
+            f"chunk_coords must be ({total}, sid_ndim); got shape {cc.shape}"
+        )
+    if sid_ndim is None:
+        sid_ndim = int(cc.shape[1])
+    elif total and cc.shape[1] != sid_ndim:
+        raise ArrayError(
+            f"chunk_coords have rank {cc.shape[1]}, expected sid_ndim={sid_ndim}"
+        )
+    for name, arr in (("chunk_coords", cc), ("fragment_idx", idx)):
+        if arr.size and arr.dtype.kind not in "iu":
+            raise ArrayError(f"{name} must be integers, got {arr.dtype}")
+    idx = idx.astype(np.int64, copy=False)
+    if total and int(idx.min()) < 0:
+        raise ArrayError(f"fragment_index must be >= 0, got {int(idx.min())}")
+    if manifest_offsets is None:
+        off = np.arange(total + 1, dtype=np.int64)
+    else:
+        off = _as_int64(manifest_offsets, "manifest_offsets")
+        if off.size == 0 or off[0] != 0 or off[-1] != total:
+            raise ArrayError(
+                f"manifest_offsets must start at 0 and end at {total}"
+            )
+    counts = np.diff(off)
+    if counts.size and int(counts.min()) < 0:
+        raise ArrayError("manifest_offsets must be non-decreasing")
+
+    width = sid_ndim * 8 + 1 + 8
+    table = np.empty((total, width), dtype=np.uint8)
+    table[:, : sid_ndim * 8] = (
+        np.ascontiguousarray(cc, dtype="<i8").view(np.uint8).reshape(total, sid_ndim * 8)
+    )
+    table[:, sid_ndim * 8] = MANIFEST_MODE_SINGLE
+    table[:, sid_ndim * 8 + 1:] = (
+        np.ascontiguousarray(idx, dtype="<i8").view(np.uint8).reshape(total, 8)
+    )
+
+    out = np.empty(counts.size, dtype=object)
+    # One pass per distinct block count, never per object. Each blob is a
+    # fixed-width row there, and a void view of the rows turns into full
+    # ``bytes`` in C -- a fixed-width byte string would strip the trailing
+    # NULs every manifest ends with.
+    for k in np.unique(counts).tolist():
+        rows = np.flatnonzero(counts == k)
+        blob_width = 4 + k * width
+        blobs = np.empty((rows.size, blob_width), dtype=np.uint8)
+        blobs[:, :4] = np.array([k], dtype="<u4").view(np.uint8)
+        if k:
+            gather = off[rows][:, None] + np.arange(k)
+            blobs[:, 4:] = table[gather].reshape(rows.size, k * width)
+        out[rows] = blobs.view(f"V{blob_width}").ravel().astype(object)
+    return out
+
+
+def _expand_blocks(blocks: list) -> tuple[list[tuple[int, ...]], list[int]]:
+    """One ``(coords, fragment)`` pair per fragment a block list names."""
+    coords: list[tuple[int, ...]] = []
+    frags: list[int] = []
+    for cc, ref in blocks:
+        if isinstance(ref, int):
+            members = [ref]
+        elif isinstance(ref, tuple):
+            members = list(range(int(ref[0]), int(ref[0]) + int(ref[1])))
+        else:
+            members = [int(v) for v in ref]
+        coords.extend([tuple(cc)] * len(members))
+        frags.extend(members)
+    return coords, frags
+
+
+def decode_object_manifests_csr(
+    blobs: Sequence[bytes | None],
+    sid_ndim: int,
+) -> tuple[npt.NDArray[np.int64], npt.NDArray[np.int64], npt.NDArray[np.int64]]:
+    """Every manifest as CSR: ``(offsets, chunk_coords, fragment_idx)``.
+
+    Object ``o``'s fragments are rows ``offsets[o]:offsets[o+1]`` of
+    ``chunk_coords`` (``(M, sid_ndim)``) and ``fragment_idx`` (``(M,)``),
+    in manifest order, with range and explicit-list blocks expanded to one
+    row per fragment -- the pairs :func:`decode_object_manifest_blocks`
+    followed by the usual expansion would give.
+
+    A blob made only of single-fragment blocks -- what every bulk writer
+    produces -- is parsed with array operations. That test is exact, not
+    a guess from the length: if a blob's first block is single-fragment,
+    the next block starts where a single-fragment block ends, and so on,
+    so checking every such position's mode byte proves the whole blob.
+    Anything else is decoded blob by blob and merged in place. An empty
+    or ``None`` blob is an object with no fragments.
+    """
+    n = len(blobs)
+    width = sid_ndim * 8 + 1 + 8
+    empty = (
+        np.zeros(n + 1, dtype=np.int64),
+        np.empty((0, sid_ndim), dtype=np.int64),
+        np.empty(0, dtype=np.int64),
+    )
+    if n == 0:
+        return empty
+    lengths = np.fromiter(
+        (0 if b is None else len(b) for b in blobs), dtype=np.int64, count=n,
+    )
+    if np.any((lengths > 0) & (lengths < 4)):
+        raise ArrayError("a manifest blob is shorter than its 4-byte header")
+    buf = np.frombuffer(b"".join(b for b in blobs if b), dtype=np.uint8)
+    starts = np.cumsum(lengths) - lengths
+    has = lengths > 0
+    num_blocks = np.zeros(n, dtype=np.int64)
+    num_blocks[has] = (
+        buf[starts[has][:, None] + np.arange(4)].copy().view("<u4").ravel()
+    )
+    fast = (lengths == 0) | (lengths == 4 + num_blocks * width)
+    cand = fast & (num_blocks > 0)
+    if cand.any():
+        blob_of = np.repeat(np.flatnonzero(cand), num_blocks[cand])
+        first = np.cumsum(num_blocks[cand]) - num_blocks[cand]
+        within = np.arange(blob_of.size) - np.repeat(first, num_blocks[cand])
+        mode_at = starts[blob_of] + 4 + within * width + sid_ndim * 8
+        wrong = buf[mode_at] != MANIFEST_MODE_SINGLE
+        if wrong.any():
+            fast[np.unique(blob_of[wrong])] = False
+    slow = ~fast
+
+    # Fast blocks: drop every header and every slow blob with one byte
+    # mask over the buffer, then the rest is a (blocks, width) table.
+    keep = np.ones(buf.size, dtype=bool)
+    keep[(starts[has][:, None] + np.arange(4)).ravel()] = False
+    if slow.any():
+        edge = np.zeros(buf.size + 1, dtype=np.int64)
+        np.add.at(edge, starts[slow], 1)
+        np.add.at(edge, starts[slow] + lengths[slow], -1)
+        keep &= np.cumsum(edge[:-1]) == 0
+    blocks = buf[keep].reshape(-1, width)
+    fast_coords = np.ascontiguousarray(blocks[:, : sid_ndim * 8]).view("<i8").reshape(-1, sid_ndim)
+    fast_idx = np.ascontiguousarray(blocks[:, sid_ndim * 8 + 1:]).view("<i8").ravel()
+
+    counts = np.where(fast, num_blocks, 0)
+    slow_parts: dict[int, tuple[list, list]] = {}
+    for o in np.flatnonzero(slow).tolist():
+        slow_parts[o] = _expand_blocks(decode_object_manifest_blocks(bytes(blobs[o]), sid_ndim))
+        counts[o] = len(slow_parts[o][1])
+    offsets = np.concatenate([[0], np.cumsum(counts)]).astype(np.int64)
+    if not slow_parts:
+        return offsets, fast_coords.astype(np.int64, copy=False), fast_idx.astype(np.int64)
+
+    total = int(offsets[-1])
+    coords = np.empty((total, sid_ndim), dtype=np.int64)
+    frags = np.empty(total, dtype=np.int64)
+    fast_objects = np.flatnonzero(fast & (num_blocks > 0))
+    if fast_objects.size:
+        per = num_blocks[fast_objects]
+        rank = np.arange(int(per.sum())) - np.repeat(np.cumsum(per) - per, per)
+        pos = np.repeat(offsets[fast_objects], per) + rank
+        coords[pos] = fast_coords
+        frags[pos] = fast_idx
+    for o, (cs, fs) in slow_parts.items():
+        lo = offsets[o]
+        if fs:
+            coords[lo:lo + len(fs)] = np.asarray(cs, dtype=np.int64).reshape(-1, sid_ndim)
+            frags[lo:lo + len(fs)] = fs
+    return offsets, coords, frags
+
+
 def decode_object_manifest_blocks(
     raw: bytes,
     sid_ndim: int,

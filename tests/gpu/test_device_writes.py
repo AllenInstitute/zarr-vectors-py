@@ -41,3 +41,47 @@ def test_csr_fragments_from_the_device(tmp_path):
         )
     assert stats.d2h_calls == 2
     assert_stores_identical(host_path, dev_path)
+
+
+def test_manifests_from_the_device_and_read_back_to_it(tmp_path):
+    from tests._store_compare import assert_stores_identical
+    from zarr_vectors.building import (
+        create_store,
+        get_resolution_level,
+        read_all_object_manifests_csr,
+        write_object_manifests,
+    )
+    from zarr_vectors.constants import OBJECT_INDEX
+    from zarr_vectors.core.arrays import OBJECT_INDEX_LAYOUT_V1
+
+    rng = np.random.default_rng(5)
+    counts = rng.integers(0, 4, 50)
+    offsets = np.concatenate([[0], np.cumsum(counts)]).astype(np.int64)
+    coords = rng.integers(0, 2, (int(offsets[-1]), 3)).astype(np.int64)
+    frags = rng.integers(0, 100, int(offsets[-1])).astype(np.int64)
+
+    def _write(name, *arrays):
+        (tmp_path / name).mkdir()
+        path = tmp_path / name / "s.zarrvectors"
+        lg = get_resolution_level(create_store(
+            path, bounds=([0.0] * 3, [100.0] * 3), chunk_shape=(50.0,) * 3,
+        ), 0)
+        write_object_manifests(
+            lg, chunk_coords=arrays[0], fragment_idx=arrays[1],
+            manifest_offsets=arrays[2], mode="append",
+        )
+        lg.write_array_meta(OBJECT_INDEX, {
+            "zv_array": "object_index", "num_objects": 50, "num_present": 50,
+            "sid_ndim": 3, "layout": OBJECT_INDEX_LAYOUT_V1,
+        })
+        return path, lg
+
+    host_path, _ = _write("host", coords, frags, offsets)
+    dev_path, dev = _write("dev", *(cupy.asarray(a) for a in (coords, frags, offsets)))
+    assert_stores_identical(host_path, dev_path)
+
+    csr = read_all_object_manifests_csr(dev, device="cuda")
+    assert all(isinstance(a, cupy.ndarray) for a in csr)
+    np.testing.assert_array_equal(csr.offsets.get(), offsets)
+    np.testing.assert_array_equal(csr.chunk_coords.get(), coords)
+    np.testing.assert_array_equal(csr.fragment_idx.get(), frags)

@@ -18,8 +18,8 @@ import functools
 _STATIC: dict[str, bool] = {
     # Array-form writers and readers (BRIDGE R1/R3/R12).
     "csr_fragments": True,
-    "array_manifests": False,
-    "manifests_csr_read": False,
+    "array_manifests": True,
+    "manifests_csr_read": True,
     "object_attribute_columns": False,
     "array_link_cells": False,
     "read_cells": True,
