@@ -134,6 +134,35 @@ def _arrays_for(
     return _Wanted(arrays=tuple(arrays), whole_arrays=tuple(whole))
 
 
+def _match_known(
+    named: Sequence[str], known: Sequence[str], rank: int,
+) -> tuple[str, ...]:
+    """The cells in ``known`` that the keys in ``named`` select, sorted.
+
+    A key of the level's own rank selects itself.  A spatial key -- what
+    ``Grid`` hands out, and what a box expands to -- selects every known
+    cell with that spatial tail: on a level chunked by an attribute, one
+    per bin, compared on the trailing components as :func:`_key_in_box`
+    is.  On a spatial level the tail is the whole key, so this is an
+    exact match there.
+    """
+    known_set = set(known)
+    by_tail: dict[str, list[str]] | None = None
+    out: set[str] = set()
+    for key in named:
+        if key in known_set:
+            out.add(key)
+            continue
+        if key.count(".") + 1 != rank:
+            continue
+        if by_tail is None:
+            by_tail = {}
+            for k in known:
+                by_tail.setdefault(".".join(k.split(".")[-rank:]), []).append(k)
+        out.update(by_tail.get(key, ()))
+    return tuple(sorted(out))
+
+
 def _key_in_box(
     key: str, lo: npt.NDArray[np.int64], hi: npt.NDArray[np.int64],
 ) -> bool:
@@ -197,8 +226,7 @@ def _cells_in_bbox(
     coords = chunks_intersecting_bbox(lo, hi, tuple(ctx.chunk_shape))
     keys = [".".join(str(int(c)) for c in cc) for cc in coords]
     if ctx.known_cells:
-        known = set(ctx.known_cells)
-        keys = [k for k in keys if k in known]
+        return _match_known(keys, ctx.known_cells, len(ctx.chunk_shape))
     return tuple(sorted(set(keys)))
 
 
@@ -251,7 +279,11 @@ def resolve(selection: Any, ctx: LevelContext) -> ReadPlan:
         # different by orders of magnitude.
         named = sorted({ref.key for ref in explicit})
         cells: tuple[str, ...] | None
-        if ctx.known_cells:
+        if ctx.known_cells and ctx.chunk_shape:
+            # A spatial ref names that cell in every bin of a binned
+            # level; matched as a box is, on the spatial tail.
+            cells = _match_known(named, ctx.known_cells, len(ctx.chunk_shape))
+        elif ctx.known_cells:
             known = set(ctx.known_cells)
             cells = tuple(k for k in named if k in known)
         else:

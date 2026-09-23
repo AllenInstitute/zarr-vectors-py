@@ -374,3 +374,98 @@ class TestGridPlanMatchesTheAllocator:
             for ref in level.grid
         )
         assert total == level.read().vertex_count
+
+
+class TestGridOnAnAttributeChunkedLevel:
+    """The grid is spatial; the level's keys lead with a bin.
+
+    ``Grid`` hands out spatial cells, and they used to match no key of a
+    level chunked by an attribute, so ``select(cells=grid.cells_in(box))``
+    read nothing.  A spatial cell now selects that cell in every bin, as
+    a box does; a ref from ``Level.cells`` names one bin's cell exactly.
+    Offset bounds, as in ``offset_cloud``, so a frame error cannot hide.
+    """
+
+    @pytest.fixture
+    def binned(self, tmp_path):
+        rng = np.random.default_rng(29)
+        pos = rng.uniform(1050, 2050, size=(1500, 3)).astype(np.float32)
+        genes = np.array(["A", "B", "C"])[rng.integers(0, 3, 1500)]
+        path = tmp_path / "binned.zarrvectors"
+        write_points(
+            path, pos, bounds=([1050.0] * 3, [2050.0] * 3),
+            chunk_shape=(200.0, 200.0, 200.0),
+            vertex_attributes={"gene": genes}, chunk_by_attribute="gene",
+        )
+        return path, pos, genes
+
+    @staticmethod
+    def _rows(a):
+        return sorted(map(tuple, np.asarray(a).tolist()))
+
+    @staticmethod
+    def _in_cells(pos, coords):
+        cells = np.floor(pos / 200.0).astype(np.int64)
+        want = {tuple(c) for c in coords}
+        return np.array([tuple(c) in want for c in cells.tolist()])
+
+    def test_the_grid_is_the_spatial_tail_of_the_allocation(self, binned):
+        path, _, _ = binned
+        level = zv.open(path).level(0)
+        origin, shape = level.store.chunk_grid_bounds("vertices")
+        assert len(shape) == 4
+        assert level.grid.shape == shape[1:]
+        assert level.grid.anchor == tuple(origin[1:])
+
+    @pytest.mark.parametrize("split", [True, False])
+    def test_grid_cells_select_their_cell_in_every_bin(self, binned, split):
+        path, pos, _ = binned
+        level = zv.open(path).level(0)
+        refs = level.grid.cells_in(([1100.0] * 3, [1500.0] * 3))
+
+        got = level.read(cells=refs, cells_split=split)
+
+        want = pos[self._in_cells(pos, [ref.coords for ref in refs])]
+        assert len(want) > 0
+        assert self._rows(got.positions) == self._rows(want)
+
+    def test_iterating_the_grid_partitions_a_binned_level(self, binned):
+        level = zv.open(binned[0]).level(0)
+        total = sum(
+            level.select(cells=[ref]).read().vertex_count for ref in level.grid
+        )
+        assert total == level.read().vertex_count
+
+    def test_a_level_cells_ref_names_one_bins_cell(self, binned):
+        path, pos, genes = binned
+        level = zv.open(path).level(0)
+        ref = next(iter(level.cells()))
+        values = level.store.attrs.to_dict()["zarr_vectors_level"][
+            "chunk_attribute_values"
+        ]
+
+        got = level.read(cells=[ref])
+
+        mask = self._in_cells(pos, [ref.coords[1:]]) & (
+            genes == values[ref.coords[0]]
+        )
+        assert mask.any()
+        assert self._rows(got.positions) == self._rows(pos[mask])
+
+    def test_a_level_cells_ref_post_filtered_keeps_its_cell_in_every_bin(
+        self, binned,
+    ):
+        """A position has no bin, so the post-filter can only go spatial.
+
+        It compared the whole ref, bin included, with a spatial cell and
+        matched nothing.  Only a reader that takes the cells itself can
+        tell bins apart; the post-filter keeps the cell in every bin.
+        """
+        path, pos, _ = binned
+        level = zv.open(path).level(0)
+        ref = next(iter(level.cells()))
+
+        got = level.read(cells=[ref], cells_split=False)
+
+        want = pos[self._in_cells(pos, [ref.coords[1:]])]
+        assert self._rows(got.positions) == self._rows(want)
