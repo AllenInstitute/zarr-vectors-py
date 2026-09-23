@@ -1,19 +1,40 @@
 # Known issues
 
-Found while fixing build-time sharding and the attribute-chunked grid
-derivation on this branch, and deliberately left out of those changes. Each
-entry says what fails, why, and what has already been decided — the research
-is done, the work is not.
+What is still open after the attribute-chunking backlog (validator rank
+rule, rechunk bins, pyramids, the lazy writer deadlock, spatial cell
+matching) was fixed on this branch. Each entry says what fails, why, and
+anything already decided. Line references are against this branch.
 
-Line references are against `cf4c2f1`.
+In order of priority: 1 returns wrong data silently; 2 and 3 fail loudly
+or only in narrow cases; 4 is a recorded constraint; 5 is housekeeping.
 
 ---
 
-## 1. `build_pyramid` leftovers after the attribute-chunked fix
+## 1. The lazy layer's leftovers
 
-**Severity: low.** Pyramids over attribute-chunked levels, the depth-0
-gate, per-step rollback and the empty-level `chunk_shape` were fixed on
-`todo-backlog`; these were left out of scope.
+**Severity: medium.**
+
+- **The lazy readers read vertices as float32 whatever the level declares**,
+  and return the decoded positions, so a float64 level reads back as
+  garbage: `ZVLevel.vertices` (`lazy/level.py:262`), the view read path
+  (`lazy/views.py:203`), and `_read_polyline` (`lazy/views.py:527`). The
+  writer had the same hardcoded dtype but used only row counts, which come
+  from the fragment index, so it was harmless there; it now reads at the
+  declared dtype.
+- **`add_face_attribute` always raises `StoreError`.** `face_attributes/<n>`
+  is not a per-chunk array (`_is_per_chunk_array`, `core/arrays.py:885`
+  accepts only `vertex_attributes` and `fragment_attributes`), and the
+  writer creates it as a group (`lazy/writer.py:430`), so the first cell
+  write fails.
+- **`append_vertices` writes rank-3 keys into an attribute-chunked level.**
+  It assigns chunks with the root's spatial `chunk_shape` and no bin, so
+  every key is one component short of the level's arrays.
+
+---
+
+## 2. `build_pyramid` leftovers
+
+**Severity: low.**
 
 - **A pyramid is not atomic across levels.** Each `coarsen_level` step rolls
   itself back, but a failure at level k keeps levels 1..k-1, and the
@@ -30,31 +51,9 @@ gate, per-step rollback and the empty-level `chunk_shape` were fixed on
 
 ---
 
-## 2. Lazy-layer leftovers after the deadlock fix
+## 3. `rechunk` leftovers
 
-**Severity: medium.** The `*_sync` deadlock and the `_prefetch_cache` race
-were fixed on `todo-backlog`; these were found on the way and left out.
-
-- **The lazy readers read vertices as float32 whatever the level declares**,
-  and return the decoded positions, so a float64 level reads back as garbage:
-  `ZVLevel.vertices` (`lazy/level.py:262`), the view read path
-  (`lazy/views.py:203`), and `_read_polyline` (`lazy/views.py:527`). The
-  writer had the same hardcoded dtype but used only row counts, which come
-  from the fragment index, so it was harmless there.
-- **`add_face_attribute` always raises `StoreError`.** `face_attributes/<n>`
-  is not a per-chunk array (`_is_per_chunk_array`, `core/arrays.py:880`), and
-  the writer pre-creates it as a group (`lazy/writer.py`,
-  `_write_per_face_attribute`), so the first cell write fails.
-- **`append_vertices` writes rank-3 keys into an attribute-chunked level.** It
-  assigns chunks with the root's spatial `chunk_shape` and no bin, so every
-  key is one component short of the level's arrays.
-
----
-
-## 3. `rechunk` leftovers after the bin fix
-
-**Severity: low.** The non-dense bins, per-object reads, group rewrite and
-dtype were fixed on `todo-backlog`; these were left out of scope.
+**Severity: low.**
 
 - **`by="spatial"`** still writes a pointless extent-1 leading axis with
   `chunk_dims[0] == "spatial"`, and records no labels. `rechunk_spatial`
@@ -71,7 +70,7 @@ dtype were fixed on `todo-backlog`; these were left out of scope.
 
 ---
 
-## 6. No device-side read path
+## 4. No device-side read path
 
 **Severity: none today — a recorded constraint, not a request.** Asked for by
 BRIDGE (its D8, GPU-direct reads), which has dropped it from its own backlog
@@ -94,3 +93,12 @@ it instead of calling `np.frombuffer`, then byte-range plumbing so a range
 fragment is fetched without its cell. The last only works for an uncompressed
 cell — under a compressor there is no byte range to ask for — so it is a
 codec-dependent fast path, not a general one.
+
+---
+
+## 5. Housekeeping
+
+**`schema/reference.md` is stale.** Regenerating it with `schema/regen.py`
+(linkml 1.11.0) changes about 10k lines before any schema edit, and CI only
+byte-checks the JSON Schema, so the `chunk_attribute_values` change was not
+carried into it. A plain regeneration belongs in a commit of its own.
