@@ -56,6 +56,7 @@ from zarr_vectors.core.metadata import (
     NgffAxis,
     ParametricTypeDef,
     RootMetadata,
+    axes_with_unit,
     deserialise_parametric_types,
     normalise_shard_shape,
     serialise_parametric_types,
@@ -374,6 +375,7 @@ def create_store(
     attribute_specs: dict[str, dict[str, Any]] | None = None,
     shard_shape: int | Sequence[int] | None = None,
     name: str | None = None,
+    unit: str | None = None,
     backend: str | None = None,
     storage_options: dict[str, Any] | None = None,
     **backend_kwargs: Any,
@@ -471,6 +473,17 @@ def create_store(
             store path's last segment with its extension stripped.  Not an
             identifier: a collection referencing this store supplies its
             own name for the node, which is what addresses it there.
+        unit: What vertex coordinates are measured in -- an NGFF space
+            unit such as ``"micrometer"``.  Declared on every space axis
+            (``axes`` as given, or the generated defaults), so it is
+            recorded in ``multiscales[0].axes`` and written into the
+            ``world`` coordinate system of the root ``ome`` scene.
+            ``None`` (the default) declares nothing and writes exactly
+            what a store created without it always has: a unit is a
+            claim, and a store that does not know one must not make it.
+            Raises :class:`MetadataError` for a non-NGFF spelling or a
+            conflict with a unit already on ``axes``; see
+            :func:`zarr_vectors.core.metadata.axes_with_unit`.
         backend: Force a particular backend (``"local"`` / ``"icechunk"``).
         **backend_kwargs: Forwarded to the backend constructor.  A
             backend that takes no options -- ``local``, or a store you
@@ -506,6 +519,8 @@ def create_store(
             {"name": n, "type": "space"}
             for n in DEFAULT_AXES_NAMES[:resolved_ndim]
         ]
+    if unit is not None:
+        axes = axes_with_unit(axes, unit)
     if bounds is None:
         bounds = (
             [0.0] * resolved_ndim,

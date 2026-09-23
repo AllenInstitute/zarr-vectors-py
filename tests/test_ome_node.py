@@ -13,17 +13,20 @@ import pytest
 import zarr_vectors as zv
 from zarr_vectors.building import stamp_ome_node
 from zarr_vectors.constants import FORMAT_VERSION
+from zarr_vectors.core.metadata import axes_with_unit
 from zarr_vectors.core.ome import (
     OME_ATTRS_KEY,
     OME_VERSION,
     WORLD,
     derive_store_name,
+    is_owned_node,
 )
 from zarr_vectors.core.store import (
     create_store,
     open_store,
     remove_resolution_level,
 )
+from zarr_vectors.exceptions import MetadataError
 
 MICRON_AXES = [
     {"name": "x", "type": "space", "unit": "micrometer"},
@@ -283,3 +286,229 @@ class TestForeignChildren:
         refreshed = stamp_ome_node(str(store))
         assert [n["type"] for n in refreshed["nodes"]] == ["zv:level", "zv:level"]
         _assert_rfc8_legal(refreshed, is_root=True)
+# ---------------------------------------------------------------------------
+# ``world`` carries an RFC 8 ``id``
+# ---------------------------------------------------------------------------
+
+def _world(attrs):
+    systems = attrs[OME_ATTRS_KEY]["attributes"]["scene"]["coordinateSystems"]
+    assert len(systems) == 1
+    return systems[0]
+
+
+class TestWorldId:
+    """RFC 8 identifies a coordinate system by ``id``; ``name`` is descriptive.
+
+    Without the ``id`` a collection elsewhere has nothing to bind a
+    ``Reference`` like ``{"path": {...}, "id": "world"}`` to, and has to
+    re-declare the frame itself.
+    """
+
+    def test_world_is_identified_by_id_and_keeps_its_name(self, store):
+        world = _world(_root_attrs(store))
+        assert world["id"] == WORLD
+        # The RFC 5 spelling stays, for a reader written against it.
+        assert world["name"] == WORLD
+
+    def test_a_store_stamped_before_the_id_gains_it_in_place(self, store):
+        """An older block declares ``world`` by name only; a refresh adds
+        the id and still finds the axes (units included) by that name."""
+        root = open_store(store, mode="r+")
+        node = root.attrs.to_dict()[OME_ATTRS_KEY]
+        del node["attributes"]["scene"]["coordinateSystems"][0]["id"]
+        root.attrs.update({OME_ATTRS_KEY: node})
+
+        stamped = stamp_ome_node(str(store))
+        world = stamped["attributes"]["scene"]["coordinateSystems"][0]
+        assert world["id"] == WORLD
+        assert world["axes"] == MICRON_AXES
+
+
+# ---------------------------------------------------------------------------
+# Foreign nodes survive a refresh
+# ---------------------------------------------------------------------------
+
+#: A back-reference to the collection the store sits in -- the case this
+#: exists for.  A prefixed leaf, so a generic walker does not follow it
+#: back up into the parent and round again.
+BACKREF = {
+    "type": "bridge:container",
+    "name": "container",
+    "path": {"type": "zarr", "path": "../"},
+    "attributes": {"bridge:role": "graph"},
+}
+
+
+def _add_children(path, *children):
+    root = open_store(path, mode="r+")
+    node = root.attrs.to_dict()[OME_ATTRS_KEY]
+    node["nodes"] = list(node["nodes"]) + [dict(c) for c in children]
+    root.attrs.update({OME_ATTRS_KEY: node})
+
+
+def _children(path):
+    return _root_attrs(path)[OME_ATTRS_KEY]["nodes"]
+
+
+class TestForeignNodes:
+    """``refresh_root_node`` owns the ``zv:level`` entries and nothing else."""
+
+    def test_removing_a_level_keeps_a_foreign_node(self, store):
+        _add_children(store, BACKREF)
+        remove_resolution_level(open_store(store, mode="r+"), 1)
+
+        children = _children(store)
+        assert children == [{"type": "zv:level", "name": "0"}, BACKREF]
+        _assert_rfc8_legal(_root_attrs(store)[OME_ATTRS_KEY], is_root=True)
+
+    def test_adding_a_level_keeps_a_foreign_node(self, tmp_path):
+        path = tmp_path / "s.zarrvectors"
+        create_store(path)
+        _add_children(path, BACKREF)
+
+        ds = zv.open(str(path), mode="r+")
+        ds.add_points(np.zeros((10, 3), dtype="float32"))
+        ds.build_pyramid(factors=[(2.0, 1.0)])
+
+        assert _children(path) == [
+            {"type": "zv:level", "name": "0"},
+            {"type": "zv:level", "name": "1"},
+            BACKREF,
+        ]
+
+    def test_stamping_keeps_foreign_nodes_in_order_and_is_idempotent(self, store):
+        other = {"type": "multiscale", "name": "em",
+                 "path": {"type": "zarr", "path": "../em.ome.zarr"},
+                 "attributes": {"coordinateSystems": []}}
+        _add_children(store, BACKREF, other)
+
+        first = stamp_ome_node(str(store))
+        assert first["nodes"][2:] == [BACKREF, other]
+        assert stamp_ome_node(str(store)) == first
+
+    def test_a_stale_level_entry_is_regenerated_away(self, store):
+        """Level entries are owned: one with no level group behind it goes."""
+        _add_children(store, {"type": "zv:level", "name": "7"})
+        stamped = stamp_ome_node(str(store))
+        assert [c["name"] for c in stamped["nodes"]] == ["0", "1"]
+
+    def test_another_zv_type_is_foreign(self, store):
+        """Ownership is the level type, not the whole ``zv:`` prefix --
+        the same line the attributes merge draws around ``scene``."""
+        companion = {"type": "zv:companionImage", "name": "em",
+                     "path": {"type": "zarr", "path": "../em.ome.zarr"}}
+        _add_children(store, companion)
+        assert stamp_ome_node(str(store))["nodes"][-1] == companion
+
+    def test_a_foreign_node_named_like_a_level_is_dropped_loudly(self, store):
+        """Child names are unique within an RFC 8 collection; the level
+        list is derived from disk, so it wins -- with a warning, not
+        silently."""
+        _add_children(store, {"type": "bridge:container", "name": "1"}, BACKREF)
+        with pytest.warns(UserWarning, match="unique within a collection"):
+            stamped = stamp_ome_node(str(store))
+        assert stamped["nodes"] == [
+            {"type": "zv:level", "name": "0"},
+            {"type": "zv:level", "name": "1"},
+            BACKREF,
+        ]
+        _assert_rfc8_legal(stamped, is_root=True)
+
+    def test_a_child_that_is_not_an_object_is_dropped_loudly(self, store):
+        _add_children(store, BACKREF)
+        root = open_store(store, mode="r+")
+        node = root.attrs.to_dict()[OME_ATTRS_KEY]
+        node["nodes"].append("not a node")
+        root.attrs.update({OME_ATTRS_KEY: node})
+
+        with pytest.warns(UserWarning, match="JSON object"):
+            stamped = stamp_ome_node(str(store))
+        assert stamped["nodes"][-1] == BACKREF
+
+    @pytest.mark.parametrize(
+        "child, owned",
+        [
+            ({"type": "zv:level", "name": "0"}, True),
+            ({"type": "zv:level", "name": "0", "attributes": {"x:y": 1}}, True),
+            ({"type": "zv:companionImage", "name": "em"}, False),
+            ({"type": "collection", "name": "c", "path": {"type": "zarr", "path": "../"}}, False),
+            ({"type": "bridge:container", "name": "container"}, False),
+            ({"name": "untyped"}, False),
+            ("zv:level", False),
+        ],
+    )
+    def test_the_ownership_rule(self, child, owned):
+        assert is_owned_node(child) is owned
+
+
+# ---------------------------------------------------------------------------
+# A unit on the vertex frame
+# ---------------------------------------------------------------------------
+
+def _root_json_bytes(path) -> bytes:
+    return (path / "zarr.json").read_bytes()
+
+
+class TestWorldUnit:
+    """``create_store(unit=)``: the frame's unit, when the writer knows it."""
+
+    def test_unit_reaches_the_scene_and_the_canonical_axes(self, tmp_path):
+        root = create_store(tmp_path / "u.zarrvectors", unit="micrometer")
+        attrs = root.attrs.to_dict()
+        expected = [{"name": n, "type": "space", "unit": "micrometer"} for n in "xyz"]
+        assert _world(attrs)["axes"] == expected
+        assert attrs["multiscales"][0]["axes"] == expected
+
+    def test_unit_fills_axes_that_carry_none(self, tmp_path):
+        root = create_store(
+            tmp_path / "u.zarrvectors",
+            axes=[{"name": n, "type": "space"} for n in "zyx"],
+            unit="nanometer",
+        )
+        assert [a["unit"] for a in _world(root.attrs.to_dict())["axes"]] == ["nanometer"] * 3
+        assert [a["name"] for a in _world(root.attrs.to_dict())["axes"]] == list("zyx")
+
+    def test_a_matching_unit_on_axes_is_accepted(self, tmp_path):
+        root = create_store(tmp_path / "u.zarrvectors", axes=MICRON_AXES, unit="micrometer")
+        assert _world(root.attrs.to_dict())["axes"] == MICRON_AXES
+
+    def test_a_conflicting_unit_is_refused(self, tmp_path):
+        with pytest.raises(MetadataError, match="declare it once"):
+            create_store(tmp_path / "u.zarrvectors", axes=MICRON_AXES, unit="millimeter")
+
+    @pytest.mark.parametrize("bad", ["um", "micron", "pixel", ""])
+    def test_a_non_ngff_spelling_is_refused(self, tmp_path, bad):
+        with pytest.raises(MetadataError, match="NGFF space unit"):
+            create_store(tmp_path / "u.zarrvectors", unit=bad)
+
+    def test_only_space_axes_take_the_unit(self):
+        axes = [{"name": "t", "type": "time", "unit": "second"},
+                {"name": "c", "type": "channel"},
+                {"name": "y"},
+                {"name": "x", "type": "space"}]
+        out = axes_with_unit(axes, "micrometer")
+        assert out[0] == {"name": "t", "type": "time", "unit": "second"}
+        assert out[1] == {"name": "c", "type": "channel"}
+        assert out[2]["unit"] == out[3]["unit"] == "micrometer"
+        assert "unit" not in axes[2], "the input is not modified"
+
+    def test_no_unit_writes_exactly_what_it_always_did(self, tmp_path):
+        """Absent unit is no claim: no ``unit`` key anywhere, and the
+        root document is byte-identical to one created without the
+        keyword."""
+        a = tmp_path / "a" / "s.zarrvectors"
+        b = tmp_path / "b" / "s.zarrvectors"
+        create_store(a)
+        create_store(b, unit=None)
+        assert _root_json_bytes(a) == _root_json_bytes(b)
+        assert '"unit"' not in _root_json_bytes(a).decode()
+
+    def test_the_unit_survives_a_later_level(self, tmp_path):
+        path = tmp_path / "u.zarrvectors"
+        create_store(path, unit="micrometer")
+        ds = zv.open(str(path), mode="r+")
+        ds.add_points(np.zeros((10, 3), dtype="float32"))
+        ds.build_pyramid(factors=[(2.0, 1.0)])
+        world = _world(_root_attrs(path))
+        assert {a["unit"] for a in world["axes"]} == {"micrometer"}
+        assert world["id"] == WORLD
