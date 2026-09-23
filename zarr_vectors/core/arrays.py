@@ -57,12 +57,17 @@ from zarr_vectors.core.paths import (
 from zarr_vectors.core.store import FsGroup  # noqa: F401  (re-exported for callers)
 from zarr_vectors.encoding.fragments import (
     ChunkFragmentIndex,
+    classify_fragments_csr,
+    concat_fragment_sections,
     decode_fragments,
     decode_object_manifest_blocks,
     decode_object_manifests_many,
     encode_fragments,
     encode_object_manifest_blocks,
     encode_object_manifests_many,
+    fragment_sections_from_index,
+    pack_fragment_sections,
+    range_fragment_sections,
 )
 from zarr_vectors.encoding.ragged import (
     decode_ragged_blob,
@@ -1677,17 +1682,15 @@ def write_chunk_vertices(
     )
 
     # Express each group as a contiguous (start_row, count) fragment.
-    cumulative = 0
-    if len(groups) == 0:
-        fragments: list[tuple[int, int]] = []
-    else:
-        per_group_counts = [int(np.asarray(g).shape[0]) for g in groups]
-        fragments = []
-        for n in per_group_counts:
-            fragments.append((cumulative, n))
-            cumulative += n
+    counts = np.fromiter(
+        (int(np.asarray(g).shape[0]) for g in groups), dtype=np.int64, count=len(groups),
+    )
+    cumulative = int(counts.sum())
     level_group.write_bytes(
-        VERTEX_FRAGMENTS, key, encode_fragments(fragments),
+        VERTEX_FRAGMENTS, key,
+        pack_fragment_sections(
+            range_fragment_sections(np.cumsum(counts) - counts, counts),
+        ),
         record_presence=record_presence,
     )
     # Tell the level how many rows this cell now holds, so the tiling
@@ -1793,15 +1796,16 @@ def write_chunk_links(
             ) else 1
         )
         # Fragment per group as a contiguous range of link rows.
-        if len(link_groups) == 0:
-            link_fragments: list[tuple[int, int]] = []
-        else:
-            cumulative = 0
-            link_fragments = []
-            for g in link_groups:
-                n = int(np.asarray(g).shape[0]) if np.asarray(g).ndim >= 1 else 0
-                link_fragments.append((cumulative, n))
-                cumulative += n
+        link_counts = np.fromiter(
+            (
+                int(np.asarray(g).shape[0]) if np.asarray(g).ndim >= 1 else 0
+                for g in link_groups
+            ),
+            dtype=np.int64, count=len(link_groups),
+        )
+        link_fragments = range_fragment_sections(
+            np.cumsum(link_counts) - link_counts, link_counts,
+        )
         # Ensure the sibling array container exists.  Routes through
         # ``_ensure_array_dir`` so that native-sharded writers allocate
         # a multidim vlen-bytes array at this path instead of the
@@ -1826,7 +1830,7 @@ def write_chunk_links(
         # collide on link_fragments/zarr.json (a Windows hard-fail) even
         # though the caller asked to defer manifest maintenance.
         level_group.write_bytes(
-            LINK_FRAGMENTS, key, encode_fragments(link_fragments),
+            LINK_FRAGMENTS, key, pack_fragment_sections(link_fragments),
             record_presence=record_presence,
         )
         del link_row_size  # silence unused-variable warning
@@ -1844,46 +1848,67 @@ def write_chunk_links(
 def write_chunk_fragments(
     level_group: Group,
     chunk_coords: ChunkCoords,
-    new_fragments: list,
+    new_fragments: list | None = None,
     *,
+    csr: tuple[Any, Any] | None = None,
     target: Literal["vertex", "link"] = "vertex",
     mode: Literal["replace", "append"] = "replace",
-) -> list[int]:
+    force_explicit: bool = False,
+    record_presence: bool = True,
+) -> list[int] | tuple[int, int]:
     """Write fragment-index entries to a chunk's vertex_fragments/<chunk>
     or link_fragments/<chunk> blob.
+
+    Give the new fragments one of two ways:
+
+    - ``new_fragments``: a list mixing ``(start, count)`` range tuples and
+      1-D integer index arrays, one Python object per fragment;
+    - ``csr=(indices, offsets)``: fragment ``f`` is
+      ``indices[offsets[f]:offsets[f + 1]]``. No Python object per
+      fragment; device arrays are copied to the host once.
+
+    Both write the bytes :func:`encode_fragments` would: a fragment that
+    is a non-empty run of consecutive indices from >= 0 is stored as a
+    range, anything else as an explicit list, unless ``force_explicit``.
 
     Args:
         level_group: Resolution level group.
         chunk_coords: Spatial chunk coordinates.
-        new_fragments: Mix of ``(start, count)`` range tuples and
-            ``np.ndarray[int64]`` explicit index arrays. Order is
-            preserved in the output index.
+        new_fragments: The list form. Order is preserved.
+        csr: The array form, ``(indices, offsets)``.
         target: ``"vertex"`` writes to ``vertex_fragments/<chunk>``;
             ``"link"`` writes to ``link_fragments/<chunk>``.
-        mode: ``"replace"`` writes ``new_fragments`` as the whole blob.
-            ``"append"`` reads the existing blob, decodes its fragments,
-            concatenates ``new_fragments``, re-encodes, writes back.
-            If the blob does not yet exist, ``"append"`` behaves like a
-            first-time ``"replace"``.
+        mode: ``"replace"`` writes the new fragments as the whole blob.
+            ``"append"`` adds them after the existing ones. The existing
+            fragments are kept exactly as stored -- their sections are
+            concatenated, never decoded to a list and re-classified -- so
+            appending costs the cell's bytes, not a Python object per
+            fragment already there. Without an existing blob it behaves
+            like ``"replace"``.
+        force_explicit: Store every new fragment as an explicit list.
+        record_presence: ``False`` skips stamping the presence manifest,
+            for writers that rebuild it once afterwards.
 
     Returns:
-        Fragment-index values assigned to the newly-written entries.
-        ``"replace"`` returns ``list(range(len(new_fragments)))``.
-        ``"append"`` returns
-        ``list(range(n_existing, n_existing + len(new_fragments)))``;
-        existing fragment_index values are stable. An empty
-        ``new_fragments`` in append mode returns ``[]`` and does not
-        write the blob.
+        The list form returns the new entries' fragment indices,
+        ``list(range(n_existing, n_existing + n_new))`` (``[]`` for an
+        empty append, which does not touch the blob). The ``csr`` form
+        returns ``(n_existing, n_new)``.
 
     Raises:
-        ArrayError: If ``target`` or ``mode`` is invalid.
+        ArrayError: If ``target`` or ``mode`` is invalid, neither or both
+            fragment forms are given, or the fragments are malformed.
 
     Concurrency:
         Read-modify-write. ``write_bytes`` is delete-then-create — last
         writer wins. This is NOT cross-writer-safe; callers must
         serialise concurrent appends to the same chunk's fragment-index
-        (per-chunk sharding satisfies this).
+        (per-chunk sharding satisfies this). An append reads the cell
+        through :meth:`Group.read_bytes`, so it must not run inside an
+        enclosing ``batched_reads`` block, whose cache would be stale.
     """
+    from zarr_vectors import _xp
+
     if target == "vertex":
         constant = VERTEX_FRAGMENTS
     elif target == "link":
@@ -1896,34 +1921,62 @@ def write_chunk_fragments(
         raise ArrayError(
             f"mode must be 'replace' or 'append', got {mode!r}"
         )
+    if (new_fragments is None) == (csr is None):
+        raise ArrayError(
+            "give the fragments as new_fragments or as csr=(indices, offsets), "
+            "exactly one of them"
+        )
 
     key = _chunk_key(chunk_coords)
-    new_list = list(new_fragments)
+    as_csr = csr is not None
+    if as_csr:
+        indices, offsets = csr  # type: ignore[misc]
+        new = classify_fragments_csr(
+            _xp.to_host(indices), _xp.to_host(offsets),
+            force_explicit=force_explicit,
+        )
+    else:
+        new_list = list(new_fragments)  # type: ignore[arg-type]
+        if mode == "append" and not new_list:
+            return []   # no-op append — don't touch the blob
+        encoded = encode_fragments(new_list, force_explicit=force_explicit)
+        if mode == "replace":
+            level_group.write_bytes(
+                constant, key, encoded, record_presence=record_presence,
+            )
+            return list(range(len(new_list)))
+        new = fragment_sections_from_index(decode_fragments(encoded))
+    n_new = new.num_fragments
+
+    def _done(n_before: int) -> list[int] | tuple[int, int]:
+        if as_csr:
+            return (n_before, n_new)
+        return list(range(n_before, n_before + n_new))
 
     if mode == "replace":
-        level_group.write_bytes(constant, key, encode_fragments(new_list))
-        return list(range(len(new_list)))
+        level_group.write_bytes(
+            constant, key, pack_fragment_sections(new),
+            record_presence=record_presence,
+        )
+        return _done(0)
 
-    # append
-    if not new_list:
-        return []   # no-op append — don't touch the blob
-
-    def _fi_to_list(raw: bytes) -> list:
-        fi = decode_fragments(raw)
-        return [
-            fi.range(i) if fi.is_range(i) else fi.indices(i)
-            for i in range(fi.num_fragments)
-        ]
-
-    _, existing = _read_modify_write_blob(
-        level_group, constant, key,
-        decode_fn=_fi_to_list,
-        merge_fn=lambda ex: ex + new_list,
-        encode_fn=encode_fragments,
-        initial=[],
+    try:
+        raw = level_group.read_bytes(constant, key)
+    except StoreError:
+        raw = b""
+    # An allocated-but-never-written cell reads back b"" (the vlen fill
+    # value): nothing there yet.
+    existing = (
+        fragment_sections_from_index(decode_fragments(raw)) if raw
+        else range_fragment_sections([], [])
     )
-    n_before = len(existing)
-    return list(range(n_before, n_before + len(new_list)))
+    if n_new:
+        level_group.write_bytes(
+            constant, key,
+            pack_fragment_sections(concat_fragment_sections(existing, new)),
+            record_presence=record_presence,
+        )
+    return _done(existing.num_fragments)
 
 
 def write_chunk_attributes(

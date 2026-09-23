@@ -60,6 +60,9 @@ FEATURES: frozenset[str] = frozenset({
     # building.read_cells / read_neighbourhood: many cells of many arrays
     # in one prefetch, as CSR; flat readers and ReadResult take device=.
     "read-cells",
+    # write_chunk_fragments(csr=(indices, offsets)): fragments as arrays,
+    # and appends that concatenate sections instead of re-encoding.
+    "csr-fragments",
 })
 
 
