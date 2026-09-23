@@ -12,12 +12,21 @@ Adds the write-back surface the algorithms package needs:
 * :meth:`commit` / :meth:`compact` — pending-sidecar lifecycle.
 
 Each public method has both an async and a sync mirror.  The async
-methods drive the zarr store's async I/O directly; the sync mirrors are
-thin wrappers over zarr's :func:`~zarr.core.sync.sync`, which dispatches
-onto zarr's own background event loop.  ``asyncio.run`` is deliberately
-*not* used: it raises when called from inside a running event loop, which
-rules out every embedded/browser host.  Same reasoning as
-:mod:`zarr_vectors.ops.relocate`.
+methods drive the zarr store's async I/O directly; the sync mirrors run
+them to completion with zarr's :func:`~zarr.core.sync.sync`, on this
+module's own background event loop (:func:`_writer_loop`), not zarr's.
+``asyncio.run`` is deliberately *not* used: it raises when called from
+inside a running event loop, which rules out every embedded/browser host.
+Same reasoning as :mod:`zarr_vectors.ops.relocate`.
+
+Why not zarr's loop: the methods fan work out with
+:func:`asyncio.to_thread`, which uses the running loop's default thread
+pool, and every storage call inside that work is itself a zarr ``sync()``
+that needs a thread from *zarr's* pool.  On zarr's loop those are one
+pool, so once there are as many chunk keys as threads, every thread
+waits on a storage call that no free thread can run: a permanent hang.
+On a loop of our own the two pools differ, which is the same asymmetry
+that keeps the async methods safe when a caller awaits them on theirs.
 
 v1 is **single-writer-only**.  Concurrent writers against the same
 level can race on object_index sidecar batch numbering; documented
@@ -27,18 +36,24 @@ loudly and not protected at runtime.
 from __future__ import annotations
 
 import asyncio
+import os
+import threading
 from typing import TYPE_CHECKING
 
 import numpy as np
 import numpy.typing as npt
 from zarr.core.sync import sync
 
+from zarr_vectors.constants import VERTEX_FRAGMENTS, VERTICES
 from zarr_vectors.core.arrays import (
+    _chunk_key,
+    _maybe_batched_reads,
     list_chunk_keys,
     object_count,
     patch_object_manifests,
     read_all_object_manifests,
     read_chunk_vertices,
+    vertices_dtype,
     write_chunk_attributes,
     write_chunk_vertices,
 )
@@ -49,6 +64,46 @@ from zarr_vectors.typing import ChunkCoords, ObjectManifest
 
 if TYPE_CHECKING:
     from zarr_vectors.lazy.level import ZVLevel
+
+
+_LOOP: asyncio.AbstractEventLoop | None = None
+_LOOP_LOCK = threading.Lock()
+
+
+def _writer_loop() -> asyncio.AbstractEventLoop:
+    """The event loop the ``*_sync`` mirrors run on, started on first use.
+
+    Deliberately not zarr's (see the module docstring): the mirrors'
+    ``to_thread`` fan-out must draw on a different thread pool from the
+    one zarr's own ``sync()`` calls need, or it can take every thread
+    those calls are waiting for.
+    """
+    global _LOOP
+    if _LOOP is None:
+        with _LOOP_LOCK:
+            if _LOOP is None:
+                loop = asyncio.new_event_loop()
+                threading.Thread(
+                    target=loop.run_forever, name="zv_writer_loop", daemon=True,
+                ).start()
+                _LOOP = loop
+    return _LOOP
+
+
+def _reset_writer_loop_after_fork() -> None:
+    """A forked child inherits the loop object but not its thread."""
+    global _LOOP, _LOOP_LOCK
+    _LOOP = None
+    _LOOP_LOCK = threading.Lock()
+
+
+if hasattr(os, "register_at_fork"):
+    os.register_at_fork(after_in_child=_reset_writer_loop_after_fork)
+
+
+def _run(coro):
+    """Run ``coro`` to completion on :func:`_writer_loop`."""
+    return sync(coro, loop=_writer_loop())
 
 
 class ZVWriter:
@@ -215,28 +270,45 @@ class ZVWriter:
                 f"attribute values must be at least 1D; got shape {arr.shape}"
             )
 
-        # Build the per-chunk → global offset table and total count.
-        # to_thread because this can hit many small sidecar reads.
-        offsets, chunk_keys, total = await asyncio.to_thread(
-            chunk_local_to_global_offsets, self._group,
-        )
+        ndim = self._level._root_meta.sid_ndim
+        group = self._group
+
+        def _layout():
+            """The offset table and every chunk's fragment sizes.
+
+            All the reading happens here, in one thread under one
+            prefetch, before the fan-out below.  Reading inside the
+            fan-out opened a one-cell prefetch per task, and those raced
+            on the level's one prefetch slot.  The sizes are read at the
+            dtype the level declares: a float64 cell read as float32
+            decodes to twice its row count, and every attribute row after
+            it lands against the wrong vertex.
+            """
+            keys = [_chunk_key(cc) for cc in list_chunk_keys(group, VERTICES)]
+            vdtype = vertices_dtype(group)
+            with _maybe_batched_reads(
+                group, [(VERTICES, keys), (VERTEX_FRAGMENTS, keys)],
+            ):
+                offsets, chunk_keys, total = chunk_local_to_global_offsets(group)
+                sizes = {
+                    cc: [len(g) for g in read_chunk_vertices(group, cc, vdtype, ndim)]
+                    for cc in chunk_keys
+                }
+            return offsets, chunk_keys, total, sizes
+
+        offsets, chunk_keys, total, chunk_sizes = await asyncio.to_thread(_layout)
         if arr.shape[0] != total:
             raise ArrayError(
                 f"add_attribute({name!r}): values length {arr.shape[0]} "
                 f"!= level vertex count {total}"
             )
 
-        ndim = self._level._root_meta.sid_ndim
-
-        # Schedule one per-chunk write in parallel.  Each task reads the
-        # chunk's fragments to discover per-group sizes, slices the
-        # values array, and emits the attribute bytes.
+        # Schedule one per-chunk write in parallel.  Each task slices the
+        # values array by the chunk's fragment sizes and emits the
+        # attribute bytes.
         async def _write_one(cc: ChunkCoords) -> None:
             start = offsets[cc]
-            groups = await asyncio.to_thread(
-                read_chunk_vertices, self._group, cc, np.float32, ndim,
-            )
-            sizes = [len(g) for g in groups]
+            sizes = chunk_sizes[cc]
             chunk_total = sum(sizes)
             if chunk_total == 0:
                 return
@@ -319,22 +391,22 @@ class ZVWriter:
 
         chunk_keys = await asyncio.to_thread(list_chunk_keys, self._group)
 
-        # Phase 1: gather per-chunk face counts.
-        async def _count(cc: ChunkCoords) -> int:
-            try:
-                # delta=0: face counts come from intra-level links only.
-                groups = await asyncio.to_thread(
-                    lambda: read_chunk_links(
-                        self._group, cc, np.int64, delta=0,
-                    ),
-                )
-            except Exception:
-                return 0
-            return sum(int(g.shape[0]) for g in groups)
+        # Phase 1: per-chunk face counts, read in one thread.  Fanned out,
+        # each read opened its own prefetch, and those raced on the
+        # level's one prefetch slot.
+        def _counts() -> list[int]:
+            counts: list[int] = []
+            for cc in chunk_keys:
+                try:
+                    # delta=0: face counts come from intra-level links only.
+                    groups = read_chunk_links(self._group, cc, np.int64, delta=0)
+                except Exception:
+                    counts.append(0)
+                    continue
+                counts.append(sum(int(g.shape[0]) for g in groups))
+            return counts
 
-        per_chunk_counts = await asyncio.gather(
-            *(_count(cc) for cc in chunk_keys)
-        )
+        per_chunk_counts = await asyncio.to_thread(_counts)
         total_faces = sum(per_chunk_counts)
         if arr.shape[0] != total_faces:
             raise ArrayError(
@@ -457,6 +529,22 @@ class ZVWriter:
             assign_chunks, positions, root_meta.chunk_shape,
         )
 
+        # Read every touched chunk's existing groups first, in one thread
+        # under one prefetch (a new chunk reads as empty).  Reading inside
+        # the fan-out below opened a one-cell prefetch per task, and those
+        # raced on the level's one prefetch slot.
+        def _read_existing() -> dict[ChunkCoords, list[npt.NDArray]]:
+            keys = [_chunk_key(cc) for cc in chunk_assignments]
+            with _maybe_batched_reads(
+                self._group, [(VERTICES, keys), (VERTEX_FRAGMENTS, keys)],
+            ):
+                return {
+                    cc: _safe_read_chunk_vertices(self._group, cc, dtype, ndim)
+                    for cc in chunk_assignments
+                }
+
+        existing = await asyncio.to_thread(_read_existing)
+
         # RMW per chunk in parallel.  Each chunk gets one new vertex
         # group per **unique** object id present in the chunk; an
         # object whose vertices span multiple chunks gets multiple
@@ -467,11 +555,7 @@ class ZVWriter:
             sub_positions = positions[indices]
             sub_oids = object_ids[indices]
 
-            # Read existing groups (may be empty if chunk is new).
-            existing_groups = await asyncio.to_thread(
-                _safe_read_chunk_vertices,
-                self._group, cc, dtype, ndim,
-            )
+            existing_groups = existing[cc]
             existing_count = len(existing_groups)
 
             # Append one new fragment per unique object in this chunk.
@@ -498,8 +582,6 @@ class ZVWriter:
         await asyncio.gather(*(
             _rmw_chunk(cc, idxs) for cc, idxs in chunk_assignments.items()
         ))
-
-        from zarr_vectors.constants import VERTEX_FRAGMENTS, VERTICES
 
         for _arr in (VERTICES, VERTEX_FRAGMENTS):
             await asyncio.to_thread(self._group.derive_nonempty_chunks, _arr)
@@ -626,7 +708,7 @@ class ZVWriter:
         *,
         dtype: str | np.dtype | None = None,
     ) -> None:
-        sync(self.add_attribute(name, values, dtype=dtype))
+        _run(self.add_attribute(name, values, dtype=dtype))
 
     def add_node_attribute_sync(
         self,
@@ -635,7 +717,7 @@ class ZVWriter:
         *,
         dtype: str | np.dtype | None = None,
     ) -> None:
-        sync(self.add_node_attribute(name, values, dtype=dtype))
+        _run(self.add_node_attribute(name, values, dtype=dtype))
 
     def add_face_attribute_sync(
         self,
@@ -644,7 +726,7 @@ class ZVWriter:
         *,
         dtype: str | np.dtype | None = None,
     ) -> None:
-        sync(self.add_face_attribute(name, values, dtype=dtype))
+        _run(self.add_face_attribute(name, values, dtype=dtype))
 
     def add_object_attribute_sync(
         self,
@@ -653,7 +735,7 @@ class ZVWriter:
         *,
         dtype: str | np.dtype | None = None,
     ) -> None:
-        sync(self.add_object_attribute(name, values, dtype=dtype))
+        _run(self.add_object_attribute(name, values, dtype=dtype))
 
     def append_vertices_sync(
         self,
@@ -662,15 +744,15 @@ class ZVWriter:
         object_ids: npt.NDArray | None = None,
         dtype: str | np.dtype | None = None,
     ) -> dict:
-        return sync(self.append_vertices(
+        return _run(self.append_vertices(
             positions, object_ids=object_ids, dtype=dtype,
         ))
 
     def commit_sync(self) -> dict:
-        return sync(self.commit())
+        return _run(self.commit())
 
     def compact_sync(self) -> dict:
-        return sync(self.compact())
+        return _run(self.compact())
 
 
 def _safe_read_chunk_vertices(
@@ -680,7 +762,6 @@ def _safe_read_chunk_vertices(
     ndim: int,
 ) -> list[npt.NDArray]:
     """Read existing fragments; return ``[]`` if the chunk is missing."""
-    from zarr_vectors.core.arrays import _chunk_key
     if not level_group.chunk_exists("vertices", _chunk_key(cc)):
         return []
     try:
@@ -718,7 +799,6 @@ def _write_custom_subpath(
     ``vertex_fragments`` table; no ``_offsets`` sibling is
     written.
     """
-    from zarr_vectors.core.arrays import _chunk_key
     from zarr_vectors.encoding.ragged import encode_ragged_floats
 
     dtype = np.dtype(dtype)

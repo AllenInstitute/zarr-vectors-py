@@ -190,3 +190,142 @@ def test_append_vertices_overlap_oid_raises(tmp_path):
     from zarr_vectors.exceptions import ArrayError
     with pytest.raises(ArrayError, match="overlap existing"):
         _run(go())
+
+
+# ===================================================================
+# Sync mirrors: no deadlock, one prefetch, the declared dtype
+# ===================================================================
+
+# Run in a child process: a deadlock here is permanent, and inside the
+# test process it would also leave zarr's global thread pool blocked for
+# every test after it.  ZARR_THREADING__MAX_WORKERS pins zarr's pool at 4
+# threads, so the hang threshold does not depend on the machine's cores.
+_DEADLOCK_CHILD = """
+import sys, warnings
+import numpy as np
+warnings.simplefilter("ignore")
+from zarr.core import sync as zsync
+from zarr_vectors.lazy.store import open_zv
+from zarr_vectors.types.points import read_points, write_points
+
+path, mode = sys.argv[1], sys.argv[2]
+rng = np.random.default_rng(0)
+n = 400
+pos = rng.uniform(0, 100, (n, 3)).astype("f4")
+kw = {}
+if mode == "attr":
+    genes = np.array(["A", "B"])[rng.integers(0, 2, n)]
+    kw = dict(vertex_attributes={"gene": genes}, chunk_by_attribute="gene")
+write_points(path, pos, chunk_shape=(25.0, 25.0, 25.0),
+             bounds=[[0, 0, 0], [100, 100, 100]], object_ids=np.arange(n), **kw)
+assert zsync._executor._max_workers == 4, zsync._executor._max_workers
+lg = open_zv(path)[0]._group
+n_keys = len(lg.list_chunks("vertices"))
+assert n_keys >= 8, n_keys  # well past the pool, or the test proves nothing
+w = open_zv(path)[0].writer()
+if mode == "append":
+    w.append_vertices_sync(rng.uniform(0, 100, (64, 3)).astype("f4"))
+    w.commit_sync()
+    assert read_points(path)["vertex_count"] == n + 64
+else:
+    w.add_attribute_sync("x", np.arange(n, dtype="f4"))
+    assert len(lg.list_chunks("vertex_attributes/x")) == n_keys
+print("DONE")
+"""
+
+
+@pytest.mark.parametrize("mode", ["attr", "plain", "append"])
+def test_sync_mirrors_do_not_deadlock_past_zarrs_thread_pool(tmp_path, mode):
+    """Past as many chunk keys as zarr has threads, these hung forever."""
+    import os
+    import subprocess
+    import sys
+
+    env = {**os.environ, "ZARR_THREADING__MAX_WORKERS": "4"}
+    try:
+        proc = subprocess.run(
+            [sys.executable, "-c", _DEADLOCK_CHILD, str(tmp_path / "s.zv"), mode],
+            env=env, capture_output=True, text=True, timeout=120,
+        )
+    except subprocess.TimeoutExpired:
+        pytest.fail(f"{mode}: the sync mirror deadlocked")
+    assert proc.returncode == 0, proc.stderr
+    assert "DONE" in proc.stdout
+
+
+def test_the_writer_loop_is_its_own_and_is_reused():
+    from zarr.core.sync import _get_loop
+
+    from zarr_vectors.lazy.writer import _writer_loop
+
+    loop = _writer_loop()
+    assert loop is not _get_loop()
+    assert _writer_loop() is loop
+    assert loop.is_running()
+
+
+def test_add_attribute_prefetches_the_level_once(tmp_path, monkeypatch):
+    """One prefetch for the level, not one per chunk racing for the slot."""
+    from zarr_vectors.core.group import Group
+
+    store, _ = _make_store(tmp_path, n=200)
+    lg = get_resolution_level(open_store(str(store)), 0)
+    assert len(lg.list_chunks("vertices")) == 8
+    zv = open_zv(str(store))
+    w = zv[0].writer()
+
+    calls = []
+    real = Group.batched_reads
+
+    def _counting(self, *args, **kw):
+        calls.append(1)
+        return real(self, *args, **kw)
+
+    monkeypatch.setattr(Group, "batched_reads", _counting)
+    w.add_attribute_sync("x", np.zeros(200, dtype="f4"))
+
+    assert len(calls) == 1
+
+
+@pytest.mark.parametrize("path", ["sync", "async"])
+def test_add_attribute_on_a_float64_store_lines_up_with_the_vertices(tmp_path, path):
+    """A guard, not a regression: the writer read cells as float32.
+
+    The row counts it needs come from the fragment index, so the float32
+    read counted them right even on a float64 level; the decoded values
+    were garbage but unused.  It now reads at the declared dtype, and this
+    pins that attribute rows line up with a float64 level's vertices.
+    """
+    from zarr_vectors.core.arrays import (
+        list_chunk_keys,
+        read_chunk_attributes,
+        read_chunk_vertices,
+    )
+
+    rng = np.random.default_rng(4)
+    store = str(tmp_path / "f64.zv")
+    write_points(
+        store, rng.uniform(0, 100, (120, 3)), dtype="float64",
+        chunk_shape=(50.0, 50.0, 50.0), object_ids=np.arange(120),
+    )
+    lg = get_resolution_level(open_store(store), 0)
+    keys = list_chunk_keys(lg)
+    cells = {
+        cc: np.concatenate(read_chunk_vertices(lg, cc, dtype="float64", ndim=3))
+        for cc in keys
+    }
+    # The x column, in the order the level stores its vertices.
+    xs = np.concatenate([cells[cc][:, 0] for cc in keys])
+
+    w = open_zv(store)[0].writer()
+    if path == "sync":
+        w.add_attribute_sync("x", xs)
+    else:
+        _run(w.add_attribute("x", xs))
+
+    lg = get_resolution_level(open_store(store), 0)
+    for cc in keys:
+        got = np.concatenate(
+            read_chunk_attributes(lg, "x", cc, dtype="float64", ncols=1),
+        ).ravel()
+        np.testing.assert_array_equal(got, cells[cc][:, 0])
