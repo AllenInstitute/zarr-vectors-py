@@ -146,6 +146,67 @@ def validate_axes(axes: list[dict[str, str]]) -> None:
         last_rank = rank
 
 
+#: The space-axis units NGFF lists (UDUNITS-2 names).  The spec says a
+#: space axis's unit SHOULD be one of these, and a validator flags any
+#: other string -- ``"um"`` included, which is the usual slip.
+NGFF_SPACE_UNITS: frozenset[str] = frozenset({
+    "angstrom", "attometer", "centimeter", "decimeter", "exameter",
+    "femtometer", "foot", "gigameter", "hectometer", "inch", "kilometer",
+    "megameter", "meter", "micrometer", "mile", "millimeter", "nanometer",
+    "parsec", "petameter", "picometer", "terameter", "yard", "yoctometer",
+    "yottameter", "zeptometer", "zettameter",
+})
+
+
+def axes_with_unit(
+    axes: Sequence[dict[str, str]], unit: str,
+) -> list[dict[str, str]]:
+    """``axes`` with ``unit`` declared on every space axis.
+
+    The one-word way to say what the store's vertex coordinates are
+    measured in, for a caller that knows the unit but has no reason to
+    spell out the axes.  It lands in ``multiscales[0].axes`` -- the
+    canonical axis store -- and from there in the ``world`` coordinate
+    system of the RFC 8 ``scene`` (:mod:`zarr_vectors.core.ome`), which
+    is where a collection placing this store beside an image reads it.
+
+    Only ``space`` axes (or axes with no ``type``, which the scene reads
+    as space) get it: a time or channel axis is not measured in metres.
+
+    Args:
+        axes: NGFF axis descriptors.  Not modified.
+        unit: A space unit from :data:`NGFF_SPACE_UNITS`.
+
+    Returns:
+        New axis dicts.
+
+    Raises:
+        MetadataError: If ``unit`` is not an NGFF space unit, or a space
+            axis already declares a *different* one -- two answers to one
+            question, and silently picking one would mislabel every
+            coordinate in the store by a power of ten.
+    """
+    if unit not in NGFF_SPACE_UNITS:
+        raise MetadataError(
+            f"unit={unit!r} is not an NGFF space unit.  Use the UDUNITS-2 "
+            f"name (e.g. 'micrometer', not 'um'); valid: "
+            f"{', '.join(sorted(NGFF_SPACE_UNITS))}"
+        )
+    out: list[dict[str, str]] = []
+    for axis in axes:
+        ax = dict(axis)
+        if ax.get("type", "space") == "space":
+            declared = ax.get("unit")
+            if declared and declared != unit:
+                raise MetadataError(
+                    f"axis {ax.get('name')!r} declares unit {declared!r} "
+                    f"but unit={unit!r} was passed; declare it once"
+                )
+            ax["unit"] = unit
+        out.append(ax)
+    return out
+
+
 def build_coordinate_transforms(
     scale: list[float],
     translation: list[float] | None = None,
