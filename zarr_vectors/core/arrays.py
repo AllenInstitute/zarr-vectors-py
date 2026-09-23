@@ -4172,17 +4172,33 @@ def _derive_partition_from_links(
 
 def write_link_cells(
     level_group: Group,
-    links: list[list[tuple[ChunkCoords, int]]] | list[CrossChunkLink],
-    sid_ndim: int,
+    links: list[list[tuple[ChunkCoords, int]]] | list[CrossChunkLink] | None = None,
+    sid_ndim: int | None = None,
     *,
+    chunks: Any = None,
+    vids: Any = None,
+    attributes: Mapping[str, Any] | None = None,
     delta: int = 0,
     link_width: int | None = None,
     dtype: np.dtype | str = np.int64,
     directed: bool = False,
     store: Literal["canonical", "duplicate"] = "canonical",
     allocate: bool = True,
+    record_presence: bool = False,
 ) -> LinkPartition:
     """Write a batch of records into only the cells they touch.
+
+    Records come one of two ways: ``links``, a list with a Python object
+    per endpoint, or as arrays -- ``chunks`` ``(R, L, sid_ndim)`` and
+    ``vids`` ``(R, L)`` -- optionally with per-record ``attributes``
+    ``{name: (R, *row_shape)}``. The array form places records with
+    array arithmetic and reads every cell it touches (links, their
+    fragment sidecar, and each attribute) in one prefetch, then writes
+    each array's cells in one call: one read-modify-write per cell for
+    the links and all their attributes together, where the list form
+    plus :func:`write_link_attribute_cells` makes one per attribute. The
+    store it leaves is the one those two calls leave. Device arrays are
+    copied to the host once each.
 
     The decentralized counterpart to :func:`write_links`: it leaves every
     other cell untouched and does **not** maintain the family-wide
@@ -4223,6 +4239,18 @@ def write_link_cells(
         raise ArrayError(
             f"store must be 'canonical' or 'duplicate', got {store!r}"
         )
+    if chunks is not None or vids is not None:
+        if links is not None or chunks is None or vids is None:
+            raise ArrayError("give links, or chunks= and vids=, not both")
+        return _write_link_cells_arrays(
+            level_group, chunks, vids, attributes or {},
+            sid_ndim=sid_ndim, delta=delta, dtype=dtype, directed=directed,
+            store=store, allocate=allocate, record_presence=record_presence,
+        )
+    if attributes:
+        raise ArrayError("attributes= goes with the array form (chunks=, vids=)")
+    if links is None or sid_ndim is None:
+        raise ArrayError("the list form needs links and sid_ndim")
     if not links:
         return LinkPartition(
             cell_indices={}, num_links=0, num_physical_records=0, first_new=0,
@@ -4301,7 +4329,7 @@ def write_link_cells(
         write_chunk_links(
             level_group, src_chunk, groups, cell_dtype,
             delta=delta, offsets=offsets, link_width=link_width,
-            record_presence=False,
+            record_presence=record_presence,
         )
 
     return LinkPartition(
@@ -4309,6 +4337,242 @@ def write_link_cells(
         num_links=len(normalised),
         num_physical_records=physical,
         first_new=0,
+    )
+
+
+def _write_link_cells_arrays(
+    level_group: Group,
+    chunks: Any,
+    vids: Any,
+    attributes: Mapping[str, Any],
+    *,
+    sid_ndim: int | None,
+    delta: int,
+    dtype: Any,
+    directed: bool,
+    store: str,
+    allocate: bool,
+    record_presence: bool,
+) -> LinkPartition:
+    """:func:`write_link_cells` for records and attributes held as arrays."""
+    from zarr_vectors import _xp
+    from zarr_vectors.core._batch_reader import flush_prefetch
+    from zarr_vectors.spatial.boundary import (
+        _MAX_ARRAY_LINK_WIDTH,
+        partition_link_arrays,
+    )
+
+    cc = _xp.to_host(chunks, dtype=np.int64)
+    vi = _xp.to_host(vids, dtype=np.int64)
+    attrs = {name: _xp.to_host(a) for name, a in attributes.items()}
+    if cc.ndim != 3 or vi.shape != cc.shape[:2]:
+        raise ArrayError(
+            f"chunks must be (R, L, sid_ndim) and vids (R, L); got "
+            f"{cc.shape} and {vi.shape}"
+        )
+    num, link_width = int(cc.shape[0]), int(cc.shape[1])
+    if sid_ndim is None:
+        sid_ndim = int(cc.shape[2])
+    elif cc.shape[2] != sid_ndim:
+        raise ArrayError(f"chunks have rank {cc.shape[2]}, expected sid_ndim={sid_ndim}")
+    for name, a in attrs.items():
+        if a.shape[:1] != (num,):
+            raise ArrayError(f"attribute {name!r} has {a.shape[0]} rows for {num} records")
+    if num == 0:
+        return LinkPartition(cell_indices={}, num_links=0, num_physical_records=0, first_new=0)
+
+    fam_meta = level_group.read_array_meta(links_group_path(delta)) or {}
+    if fam_meta:
+        _check_link_family_policy(
+            fam_meta, delta=delta, link_width=link_width, sid_ndim=sid_ndim,
+            directed=directed, store=store, action="append to",
+        )
+
+    # Placement: the array partitioner where it applies (pinned to the
+    # record one by test), the record one otherwise.
+    buckets: dict[tuple[str, ChunkCoords], tuple[npt.NDArray, npt.NDArray]]
+    if store == "canonical" and link_width <= _MAX_ARRAY_LINK_WIDTH:
+        scale_src, scale_trg = _link_scales(level_group, delta, sid_ndim)
+        buckets = partition_link_arrays(
+            cc, vi, link_width=link_width, sid_ndim=sid_ndim,
+            scale_src=scale_src, scale_trg=scale_trg,
+            directed=directed, cross_level=delta != 0,
+        )
+    else:
+        records = [
+            [(tuple(cc[r, k].tolist()), int(vi[r, k])) for k in range(link_width)]
+            for r in range(num)
+        ]
+        normalised, _ = _normalise_link_records(records, link_width, sid_ndim, delta)
+        buckets = {}
+        for key, entries in _partition_links(
+            level_group, normalised, link_width, sid_ndim,
+            delta=delta, directed=directed, store=store,
+        ).items():
+            offsets = parse_offsets(key[0], sid_ndim=sid_ndim, link_width=link_width)
+            has_perm = links_has_perm(offsets, delta=delta, directed=directed, store=store)
+            buckets[key] = (
+                _pack_link_rows(entries, has_perm=has_perm, link_width=link_width, dtype=np.int64),
+                np.asarray([idx for _, _, idx in entries], dtype=np.int64),
+            )
+
+    by_seg: dict[str, list[tuple[ChunkCoords, npt.NDArray, npt.NDArray]]] = {}
+    for (seg, src), (rows, idx) in sorted(buckets.items()):
+        by_seg.setdefault(seg, []).append((src, rows, idx))
+
+    # Allocate, and learn each segment's stored element types.
+    seg_info: dict[str, tuple[Any, np.dtype, bool]] = {}
+    for seg in by_seg:
+        offsets = parse_offsets(seg, sid_ndim=sid_ndim, link_width=link_width)
+        name = links_path(delta, offsets)
+        if allocate:
+            create_links_array(
+                level_group, link_width, dtype=str(np.dtype(dtype)), delta=delta,
+                sid_ndim=sid_ndim, offsets=offsets, directed=directed,
+                store=store, exist_ok=True,
+            )
+        elif not level_group.array_exists(name):
+            raise ArrayError(
+                f"write_link_cells(allocate=False) requires {name!r} to exist "
+                f"already; a coordinator must pre-create every offsets segment "
+                f"its workers will touch (create_links_family / create_links_array)."
+            )
+        for attr_name, a in attrs.items():
+            attr_path = link_attributes_path(attr_name, delta, offsets)
+            if allocate:
+                create_link_attributes_array(
+                    level_group, attr_name, dtype=str(a.dtype), delta=delta,
+                    sid_ndim=sid_ndim, link_width=link_width, offsets=offsets,
+                    exist_ok=True, row_shape=a.shape[1:],
+                )
+            elif not level_group.array_exists(attr_path):
+                raise ArrayError(
+                    f"write_link_cells(allocate=False) requires {attr_path!r} "
+                    f"to exist already (create_link_attributes_array)."
+                )
+        seg_info[seg] = (
+            offsets,
+            _stamped_link_dtype(level_group, name, dtype),
+            delta == 0 and is_intra(offsets),
+        )
+
+    # One prefetch of every cell this batch touches.
+    plan: list[tuple[str, list[str]]] = []
+    intra_keys: list[str] = []
+    for seg, cells in by_seg.items():
+        offsets, _, flat = seg_info[seg]
+        keys = [_chunk_key(src) for src, _, _ in cells]
+        plan.append((links_path(delta, offsets), keys))
+        plan += [(link_attributes_path(n, delta, offsets), keys) for n in attrs]
+        if flat:
+            intra_keys += keys
+    if intra_keys:
+        plan.append((LINK_FRAGMENTS, sorted(set(intra_keys))))
+    cache = flush_prefetch(level_group._zarr, plan)
+
+    def raw(name: str, key: str) -> bytes:
+        return cache.get((name, key)) or b""
+
+    physical = 0
+    writes: dict[str, list[tuple[str, bytes]]] = {}
+    attr_stamps: list[tuple[str, str, npt.NDArray, np.dtype, Any]] = []
+    for seg, cells in by_seg.items():
+        offsets, cell_dtype, flat = seg_info[seg]
+        name = links_path(delta, offsets)
+        for src, rows, _idx in cells:
+            key = _chunk_key(src)
+            new = _cast_checked(rows, cell_dtype, name)
+            physical += new.shape[0]
+            old = raw(name, key)
+            if flat:
+                data, sidecar = _append_flat_link_cell(
+                    old, raw(LINK_FRAGMENTS, key), new, cell_dtype,
+                )
+                writes.setdefault(name, []).append((key, data))
+                writes.setdefault(LINK_FRAGMENTS, []).append((key, sidecar))
+            else:
+                groups = decode_ragged_blob(old, cell_dtype, ncols=new.shape[1]) if old else []
+                writes.setdefault(name, []).append(
+                    (key, encode_ragged_blob([*groups, new], cell_dtype)),
+                )
+        for attr_name, a in attrs.items():
+            attr_path = link_attributes_path(attr_name, delta, offsets)
+            meta = level_group.read_array_meta(attr_path) or {}
+            tail = tuple(meta.get("row_shape", a.shape[1:]))
+            if tail != a.shape[1:]:
+                raise ArrayError(
+                    f"{attr_path}: append shape mismatch — existing row shape "
+                    f"{tail} vs new {a.shape[1:]}"
+                )
+            olds = {_chunk_key(src): raw(attr_path, _chunk_key(src)) for src, _, _ in cells}
+            stamped = meta.get("dtype")
+            holds = bool(stamped) and (
+                any(olds.values()) or bool(level_group.list_chunks(attr_path))
+            )
+            target = np.dtype(stamped) if holds else a.dtype
+            for src, _rows, idx in cells:
+                key = _chunk_key(src)
+                new_rows = _cast_checked(a[idx], target, attr_path)
+                writes.setdefault(attr_path, []).append(
+                    (key, olds[key] + np.ascontiguousarray(new_rows).tobytes()),
+                )
+            attr_stamps.append((attr_name, attr_path, a, target, offsets))
+
+    for name, cells in writes.items():
+        level_group.write_cells(name, cells, record_presence=record_presence)
+    for attr_name, attr_path, a, target, offsets in attr_stamps:
+        _write_array_meta_if_changed(level_group, attr_path, {
+            "zv_array": "link_attribute",
+            "name": attr_name,
+            "dtype": str(target),
+            "row_shape": list(a.shape[1:]),
+            "offsets": [list(int(c) for c in o) for o in offsets],
+            "level_delta": int(delta),
+        })
+
+    return LinkPartition(
+        cell_indices={
+            (seg, src): idx for seg, cells in by_seg.items() for src, _, idx in cells
+        },
+        num_links=num,
+        num_physical_records=physical,
+        first_new=0,
+    )
+
+
+def _append_flat_link_cell(
+    raw: bytes, raw_sidecar: bytes, rows: npt.NDArray, dtype: np.dtype,
+) -> tuple[bytes, bytes]:
+    """An intra cell and its fragment sidecar with ``rows`` added as a group.
+
+    What decoding the cell into its groups, appending ``rows`` and
+    writing it back through :func:`write_chunk_links` produces. When the
+    sidecar tiles the cell -- every bulk writer's layout -- that is the
+    old bytes with the new rows after them, and one more range; otherwise
+    the groups are materialised and laid out afresh, as that path does.
+    """
+    width = rows.shape[1]
+    new_bytes = np.ascontiguousarray(rows, dtype=dtype).tobytes()
+    if not raw:
+        sections = range_fragment_sections([0], [rows.shape[0]])
+        return new_bytes, pack_fragment_sections(sections)
+    fi = decode_fragments(raw_sidecar)
+    full = np.frombuffer(raw, dtype=dtype).reshape(-1, width)
+    if fi.tiles(full.shape[0]):
+        sections = concat_fragment_sections(
+            fragment_sections_from_index(fi),
+            range_fragment_sections([full.shape[0]], [rows.shape[0]]),
+        )
+        return raw + new_bytes, pack_fragment_sections(sections)
+    groups = [
+        full[fi.range(f)[0]:fi.range(f)[0] + fi.range(f)[1]] if fi.is_range(f)
+        else full[fi.indices(f)]
+        for f in range(fi.num_fragments)
+    ] + [np.asarray(rows, dtype=dtype)]
+    counts = np.array([g.shape[0] for g in groups], dtype=np.int64)
+    data = b"".join(np.ascontiguousarray(g, dtype=dtype).tobytes() for g in groups)
+    return data, pack_fragment_sections(
+        range_fragment_sections(np.cumsum(counts) - counts, counts),
     )
 
 

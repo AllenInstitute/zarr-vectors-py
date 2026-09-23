@@ -85,3 +85,40 @@ def test_manifests_from_the_device_and_read_back_to_it(tmp_path):
     np.testing.assert_array_equal(csr.offsets.get(), offsets)
     np.testing.assert_array_equal(csr.chunk_coords.get(), coords)
     np.testing.assert_array_equal(csr.fragment_idx.get(), frags)
+
+
+def test_link_cells_from_the_device(tmp_path):
+    from tests._store_compare import assert_stores_identical
+    from zarr_vectors.building import (
+        create_store,
+        finalize_links,
+        get_resolution_level,
+        write_link_cells,
+    )
+
+    rng = np.random.default_rng(6)
+    n = 80
+    base = rng.integers(0, 3, (n, 1, 3))
+    chunks = np.clip(base + rng.integers(-1, 2, (n, 2, 3)), 0, 3).astype(np.int64)
+    vids = rng.integers(0, 50, (n, 2)).astype(np.int64)
+    attrs = {"w": rng.uniform(0, 1, n).astype(np.float32)}
+
+    def _level(name):
+        (tmp_path / name).mkdir()
+        path = tmp_path / name / "s.zarrvectors"
+        return path, get_resolution_level(create_store(
+            path, bounds=([0.0] * 3, [200.0] * 3), chunk_shape=(50.0,) * 3,
+        ), 0)
+
+    host_path, host = _level("host")
+    dev_path, dev = _level("dev")
+    write_link_cells(host, chunks=chunks, vids=vids, attributes=attrs)
+    with _xp.count_transfers() as stats:
+        write_link_cells(
+            dev, chunks=cupy.asarray(chunks), vids=cupy.asarray(vids),
+            attributes={k: cupy.asarray(v) for k, v in attrs.items()},
+        )
+    assert stats.d2h_calls == 3
+    for lg in (host, dev):
+        finalize_links(lg, delta=0)
+    assert_stores_identical(host_path, dev_path)
