@@ -2775,6 +2775,92 @@ def write_object_attributes(
     )
 
 
+def write_object_attribute_columns(
+    level_group: Group,
+    columns: Mapping[str, Any],
+    *,
+    mode: Literal["replace", "append"] = "append",
+    at: int | None = None,
+    fill_values: Any = None,
+) -> None:
+    """Write several object attribute columns in one call.
+
+    The store ends up exactly as one :func:`write_object_attributes` call
+    per column would leave it, for the same arguments. What changes is
+    the cost of the common case, a column that grows in place: one node
+    lookup per column instead of three, one resize covering any gap and
+    the new rows instead of two, and the columns grown concurrently.
+    A column that is new, reaches back past its end (a torn flush) or has
+    metadata too thin to grow from goes through the single-column writer.
+
+    Args:
+        level_group: Resolution level group.
+        columns: ``{name: rows}``; device arrays are copied off once each.
+        mode: ``"append"`` (the default) or ``"replace"``.
+        at: Row the new rows start at, as for :func:`write_object_attributes`.
+        fill_values: The absent-row sentinel: one value for every column,
+            or a mapping by name (missing names use the dtype default).
+    """
+    from concurrent.futures import ThreadPoolExecutor
+
+    import zarr
+
+    from zarr_vectors import _xp
+
+    def _fill(name: str) -> Any:
+        if isinstance(fill_values, Mapping):
+            return fill_values.get(name)
+        return fill_values
+
+    host = {name: _xp.to_host(col) for name, col in columns.items()}
+    if mode != "append":
+        for name, data in host.items():
+            write_object_attributes(
+                level_group, name, data, mode=mode, at=at, fill_value=_fill(name),
+            )
+        return
+    if at is not None and int(at) < 0:
+        raise ArrayError(f"at must be >= 0, got {at}")
+
+    grow: list[tuple[str, npt.NDArray, Any]] = []
+    for name, data in host.items():
+        full_name = f"{OBJECT_ATTRIBUTES}/{name}"
+        node = level_group._lookup_node(full_name)
+        meta = dict(node.attrs) if isinstance(node, zarr.Array) else {}
+        shape = tuple(meta.get("shape") or ())
+        n0 = int(shape[0]) if shape else 0
+        start = n0 if at is None else int(at)
+        if not shape or not meta.get("dtype") or start < n0:
+            write_object_attributes(
+                level_group, name, data, mode="append", at=at, fill_value=_fill(name),
+            )
+            continue
+        if tuple(shape[1:]) != tuple(data.shape[1:]):
+            raise ArrayError(
+                f"append shape mismatch for {name!r}: existing {shape} vs "
+                f"new {data.shape} — tail dimensions must match"
+            )
+        dtype = np.dtype(meta["dtype"])
+        fill = _fill(name)
+        if fill is None:
+            fill = _default_fill_value_for_dtype(dtype)
+        block = np.concatenate([
+            np.full((start - n0, *data.shape[1:]), fill, dtype=dtype),
+            data.astype(dtype, copy=False),
+        ])
+        if block.shape[0]:
+            grow.append((full_name, block, node))
+
+    if not grow:
+        return
+    with ThreadPoolExecutor(max_workers=min(8, len(grow))) as pool:
+        for fut in [
+            pool.submit(level_group.extend_array, path, rows, _node=node)
+            for path, rows, node in grow
+        ]:
+            fut.result()
+
+
 def read_object_attribute_present_mask(
     level_group: Group,
     attr_name: str,

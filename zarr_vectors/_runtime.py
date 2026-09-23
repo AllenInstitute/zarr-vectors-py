@@ -20,7 +20,7 @@ _STATIC: dict[str, bool] = {
     "csr_fragments": True,
     "array_manifests": True,
     "manifests_csr_read": True,
-    "object_attribute_columns": False,
+    "object_attribute_columns": True,
     "array_link_cells": False,
     "read_cells": True,
     "read_neighbourhood": True,
