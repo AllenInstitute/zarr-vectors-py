@@ -58,6 +58,10 @@ INTERNAL: tuple[str, ...] = (
     "zarr_vectors._api_version",
     "zarr_vectors._stability",
     "zarr_vectors._version",
+    # Host/device array plumbing and the install probe; the probe's name
+    # is re-exported as ``zarr_vectors.runtime_capabilities``.
+    "zarr_vectors._xp",
+    "zarr_vectors._runtime",
     "zarr_vectors.core",
     "zarr_vectors.encoding",
     "zarr_vectors.spatial",
@@ -81,6 +85,12 @@ UNDECIDED: dict[str, str] = {
     "zarr_vectors.validate": (
         "Stable in practice and widely used, but its result objects have "
         "never been given a compatibility promise."
+    ),
+    "zarr_vectors.gpu": (
+        "The optional GPU extension (the `[gpu]` extra). Callers reach it "
+        "through `device=` and `runtime_capabilities()`, not by importing "
+        "it; its own surface stays unpromised until device-side decode and "
+        "GPUDirect I/O settle what it has to offer."
     ),
     "zarr_vectors.composite": (
         "Multi-geometry stores round-trip now — add_geometry allocates its "
