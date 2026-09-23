@@ -28,8 +28,8 @@ What is *not* here
 ------------------
 
 ``zarr_vectors.core``, ``.encoding``, ``.spatial``, ``.lazy``, ``.ops``,
-``.sharding``, ``.multiresolution``, ``._engine`` and ``.rechunk`` are
-**internal**. They change without notice — they always did — so they are no
+``.sharding``, ``.multiresolution``, ``._engine``, ``._xp``, ``._runtime`` and
+``.rechunk`` are **internal**. They change without notice — they always did — so they are no
 longer advertised here. Earlier versions of this page listed ``lazy`` and
 ``spatial`` as public API; that was wrong, and importing from them is what made
 previous refactors into downstream breaks. If you need a name that only exists
@@ -51,7 +51,10 @@ Two pages below document **undecided** modules — neither promised nor disowned
 
 Treat both as internal until that changes. (``zarr_vectors.composite`` is
 undecided too, and undocumented: multi-geometry stores round-trip, but the
-layout they use to namespace each geometry has not been specified.)
+layout they use to namespace each geometry has not been specified. So is
+``zarr_vectors.gpu``, the optional GPU extension: reach it through
+``device=`` and :func:`zarr_vectors.runtime_capabilities`, not by importing
+it -- see :doc:`../how_to/gpu`.)
 
 Asking at runtime
 -----------------

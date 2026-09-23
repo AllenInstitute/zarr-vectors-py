@@ -132,6 +132,7 @@ Where to start
    how_to/choose_chunk_and_bin
    how_to/memory_efficient_writes
    how_to/hpc_pipelines
+   how_to/gpu
    how_to/cite
 
 .. toctree::
