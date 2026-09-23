@@ -3551,23 +3551,32 @@ def write_links(
                 cells.append((_chunk_key(src_chunk), encode_ragged_blob([rows], dtype)))
             level_group.write_cells(links_path(delta, offsets), cells)
             continue
+        # Appending: the segment's stamped element type wins (see
+        # write_link_cells). A replace owns the segment and keeps ``dtype``.
+        seg_dtype = (
+            _stamped_link_dtype(level_group, links_path(delta, offsets), dtype)
+            if mode == "append" else np.dtype(dtype)
+        )
         for src_chunk, entries in by_segment[seg]:
-            rows = _pack_link_rows(
-                entries, has_perm=has_perm, link_width=link_width, dtype=dtype,
+            rows = _cast_checked(
+                _pack_link_rows(
+                    entries, has_perm=has_perm, link_width=link_width, dtype=np.int64,
+                ),
+                seg_dtype, links_path(delta, offsets),
             )
             new_physical += rows.shape[0]
             groups: list[npt.NDArray] = []
             if mode == "append":
                 groups = list(_decode_link_cell(
                     level_group, src_chunk, delta=delta, offsets=offsets,
-                    dtype=dtype, width=rows.shape[1], default=[],
+                    dtype=seg_dtype, width=rows.shape[1], default=[],
                     trust_presence=False,
                 ))
             groups.append(rows)
             # Route through the per-cell writer so the flat+sidecar vs
             # inline-blob choice has exactly one definition.
             write_chunk_links(
-                level_group, src_chunk, groups, dtype,
+                level_group, src_chunk, groups, seg_dtype,
                 delta=delta, offsets=offsets, link_width=link_width,
             )
 
@@ -3765,13 +3774,25 @@ def write_link_attributes(
             exist_ok=True, row_shape=arr.shape[1:],
         )
         full_name = link_attributes_path(attr_name, delta, offsets)
-        for (bucket_seg, src_chunk), input_idxs in partition.cell_indices.items():
-            if bucket_seg != seg:
-                continue
-            key = _chunk_key(src_chunk)
-            new_rows = arr[np.asarray(input_idxs, dtype=np.int64)]
-            if mode == "append":
-                combined = _append_attr_rows(level_group, full_name, key, new_rows)
+        cells = [
+            (_chunk_key(src_chunk), input_idxs)
+            for (bucket_seg, src_chunk), input_idxs in partition.cell_indices.items()
+            if bucket_seg == seg
+        ]
+        if mode == "append":
+            target, blobs = _link_attr_target_dtype(
+                level_group, full_name, [k for k, _ in cells], arr.dtype,
+            )
+        else:
+            target, blobs = arr.dtype, {}
+        for key, input_idxs in cells:
+            new_rows = _cast_checked(
+                arr[np.asarray(input_idxs, dtype=np.int64)], target, full_name,
+            )
+            blob = blobs.get(key)
+            if blob:
+                existing = _read_attr_cell(level_group, full_name, key, new_rows, blob=blob)
+                combined = np.concatenate([existing, new_rows], axis=0)
             else:
                 combined = new_rows
             level_group.write_bytes(
@@ -3785,7 +3806,7 @@ def write_link_attributes(
         _write_array_meta_if_changed(level_group, full_name, {
             "zv_array": "link_attribute",
             "name": attr_name,
-            "dtype": str(arr.dtype),
+            "dtype": str(target),
             "row_shape": list(arr.shape[1:]),
             "offsets": [list(int(c) for c in o) for o in offsets],
             "level_delta": int(delta),
@@ -3907,6 +3928,57 @@ def list_link_attribute_offsets(
         return sorted(level_group[group_path].children())
     except Exception:
         return []
+
+
+def _cast_checked(values: npt.NDArray, dtype: Any, what: str) -> npt.NDArray:
+    """``values`` as ``dtype``, raising rather than changing a value.
+
+    Integer targets must hold every value exactly; float targets must not
+    turn a finite value infinite. A store's stamped element type wins over
+    the caller's, so a cast is how new rows join old ones -- and a silent
+    wrap there is the corruption this guards against.
+    """
+    dtype = np.dtype(dtype)
+    if values.dtype == dtype:
+        return values
+    cast = values.astype(dtype)
+    if dtype.kind in "iub":
+        ok = np.array_equal(cast.astype(values.dtype), values)
+    else:
+        ok = bool(np.all(np.isfinite(cast) | ~np.isfinite(values)))
+    if not ok:
+        raise ArrayError(
+            f"{what} is stored as {dtype}; these values do not fit it"
+        )
+    return cast
+
+
+def _stamped_link_dtype(level_group: Group, name: str, fallback: Any) -> np.dtype:
+    """The element type a links segment is stored in, else ``fallback``."""
+    meta = level_group.read_array_meta(name) or {}
+    return np.dtype(meta.get("dtype", fallback))
+
+
+def _link_attr_target_dtype(
+    level_group: Group, full_name: str, keys: Sequence[str], new_dtype: Any,
+) -> tuple[np.dtype, dict[str, bytes]]:
+    """The dtype an attribute segment's cells are written in, and their bytes.
+
+    The stamped dtype wins once the segment holds data, so rows appended
+    later join the old ones instead of re-typing the segment under them
+    (every cell written before would then decode at the wrong width). A
+    segment with no data yet -- pre-created with a placeholder dtype --
+    takes the data's. "Holds data" is asked of the cells being written as
+    well as of the presence manifest, which lags whenever stamps are
+    deferred.
+    """
+    meta = level_group.read_array_meta(full_name) or {}
+    blobs = {k: level_group.read_bytes(full_name, k) for k in keys}
+    stamped = meta.get("dtype")
+    holds = bool(stamped) and (
+        any(blobs.values()) or bool(level_group.list_chunks(full_name))
+    )
+    return (np.dtype(stamped) if holds else np.dtype(new_dtype)), blobs
 
 
 def _decode_link_cell(
@@ -4196,15 +4268,22 @@ def write_link_cells(
         has_perm = links_has_perm(
             offsets, delta=delta, directed=directed, store=store,
         )
-        rows = _pack_link_rows(
-            entries, has_perm=has_perm, link_width=link_width, dtype=dtype,
+        # The segment's stamped element type wins over this call's: an
+        # int32 segment appended with the default int64 used to decode its
+        # old rows at the wrong width and write the new ones in another.
+        cell_dtype = _stamped_link_dtype(level_group, links_path(delta, offsets), dtype)
+        rows = _cast_checked(
+            _pack_link_rows(
+                entries, has_perm=has_perm, link_width=link_width, dtype=np.int64,
+            ),
+            cell_dtype, links_path(delta, offsets),
         )
         physical += rows.shape[0]
         # RMW: this batch is a new group appended after whatever the cell
         # already holds, so a worker may call this repeatedly.
         groups = list(_decode_link_cell(
             level_group, src_chunk, delta=delta, offsets=offsets,
-            dtype=dtype, width=rows.shape[1], default=[],
+            dtype=cell_dtype, width=rows.shape[1], default=[],
             trust_presence=False,
         ))
         groups.append(rows)
@@ -4220,7 +4299,7 @@ def write_link_cells(
         # rebuilt from the store listing by :func:`finalize_links`, which
         # the coordinator must run before any ``shard_store``.
         write_chunk_links(
-            level_group, src_chunk, groups, dtype,
+            level_group, src_chunk, groups, cell_dtype,
             delta=delta, offsets=offsets, link_width=link_width,
             record_presence=False,
         )
@@ -4241,8 +4320,13 @@ def write_link_attribute_cells(
     partition: LinkPartition,
     delta: int = 0,
     allocate: bool = True,
+    record_presence: bool = True,
 ) -> None:
     """Append attribute rows for the cells one batch wrote.
+
+    ``record_presence=False`` skips stamping each cell into the segment's
+    presence manifest, as the link writers do; :func:`finalize_links`
+    rebuilds it.
 
     ``attr_data`` holds one row per logical record in the SAME batch, in
     the input order used for the matching :func:`write_link_cells` call;
@@ -4288,24 +4372,37 @@ def write_link_attribute_cells(
                 f"touch (create_link_attributes_array). Pre-creating the "
                 f"links/ family alone does not cover link_attributes/."
             )
-        for (bucket_seg, src_chunk), input_idxs in partition.cell_indices.items():
-            if bucket_seg != seg:
-                continue
-            key = _chunk_key(src_chunk)
-            new_rows = arr[np.asarray(input_idxs, dtype=np.int64)]
-            combined = _append_attr_rows(level_group, full_name, key, new_rows)
+        cells = [
+            (_chunk_key(src_chunk), input_idxs)
+            for (bucket_seg, src_chunk), input_idxs in partition.cell_indices.items()
+            if bucket_seg == seg
+        ]
+        target, blobs = _link_attr_target_dtype(
+            level_group, full_name, [k for k, _ in cells], arr.dtype,
+        )
+        for key, input_idxs in cells:
+            new_rows = _cast_checked(
+                arr[np.asarray(input_idxs, dtype=np.int64)], target, full_name,
+            )
+            blob = blobs[key]
+            if blob:
+                existing = _read_attr_cell(level_group, full_name, key, new_rows, blob=blob)
+                combined = np.concatenate([existing, new_rows], axis=0)
+            else:
+                combined = new_rows
             level_group.write_bytes(
                 full_name, key, np.ascontiguousarray(combined).tobytes(),
+                record_presence=record_presence,
             )
         # ``row_shape`` (the tail dims per row, ``()`` for 1-D) lets the
         # reader reconstruct shape from a bare byte blob.  Stamped only
-        # when it differs: the values settle on the first batch, and a
-        # pre-created segment may lack ``row_shape`` or carry a dtype the
-        # data does not have.
+        # when it differs.  ``dtype`` is the data's only while the segment
+        # holds none -- a pre-created segment may carry a placeholder --
+        # and the stored one after that, which the rows were cast to.
         _write_array_meta_if_changed(level_group, full_name, {
             "zv_array": "link_attribute",
             "name": attr_name,
-            "dtype": str(arr.dtype),
+            "dtype": str(target),
             "row_shape": list(arr.shape[1:]),
             "offsets": [list(int(c) for c in o) for o in offsets],
             "level_delta": int(delta),
@@ -4316,6 +4413,7 @@ def finalize_links(
     level_group: Group,
     *,
     delta: int = 0,
+    attributes: bool = True,
 ) -> LinkPartition:
     """Reconcile a ``links/<delta>/`` family's counts after decentralized
     per-cell writes.
@@ -4368,8 +4466,22 @@ def finalize_links(
     # false and "skip" a silent no-op over exactly the cells this rebuild
     # exists to recover.
     family_group = links_group_path(delta)
-    for seg in list_link_offsets(level_group, delta):
-        name = f"{family_group}/{seg}"
+    rebuild = [f"{family_group}/{seg}" for seg in list_link_offsets(level_group, delta)]
+    if attributes:
+        # The same holds for what rides alongside the links: every link
+        # attribute segment of this delta, and at delta 0 the intra cells'
+        # fragment sidecar. Workers skip their stamps too, and a reader of
+        # those arrays asks the same manifest.
+        attr_root = LINK_ATTRIBUTES
+        if level_group.array_exists(attr_root):
+            for name in level_group[attr_root].children():
+                rebuild += [
+                    f"{link_attributes_group_path(name, delta)}/{seg}"
+                    for seg in list_link_attribute_offsets(level_group, name, delta)
+                ]
+        if delta == 0:
+            rebuild.append(LINK_FRAGMENTS)
+    for name in rebuild:
         if level_group._sharded_chunk_array(name) is None:
             # Not a chunk array: an already-stamped segment from the
             # whole-family writer path needs no rebuild.  This is exactly
