@@ -35,6 +35,12 @@ Two shapes are written:
     into a level, which costs nothing today — there is nothing in a level
     it could render.
 
+    The level leaves are the only entries this package owns.  Anything
+    else in the list — a node some other tool put there, such as a
+    back-reference to the collection this store sits in — is *foreign*,
+    and :func:`refresh_root_node` carries it through a level refresh
+    unchanged.  See :func:`is_owned_node` for the exact rule.
+
 ``attributes.scene``
     An RFC 8 ``scene`` declaring one RFC 5 coordinate system, ``world``,
     carrying the store's axes and units.  This is what makes membership
@@ -42,6 +48,17 @@ Two shapes are written:
     beside an image pyramid.  ZV vertices are already stored in world
     coordinates, so there are no edges and
     ``coordinateTransformations`` is empty.
+
+    The system carries ``"id": "world"`` as well as ``"name": "world"``.
+    RFC 8 identifies a coordinate system by ``id`` — ``name`` is optional
+    and descriptive there — so the ``id`` is what lets a collection
+    *elsewhere* bind to this frame with a ``Reference``::
+
+        {"path": {"type": "zarr", "path": "./skeleton.zarrvectors"},
+         "id": "world"}
+
+    ``name`` stays because it is the RFC 5 spelling of the identifier,
+    and a reader written against that draft looks for it.
 
 Nothing here reads the bare-root ``multiscales`` block, whose ``scale`` is
 a dimensionless bin ratio sitting in a slot NGFF defines as
@@ -64,6 +81,7 @@ __all__ = [
     "ZV_PREFIX",
     "build_root_node",
     "derive_store_name",
+    "is_owned_node",
     "read_root_node",
     "refresh_root_node",
 ]
@@ -246,6 +264,31 @@ def refresh_root_node(
     reader would look.  (The same reasoning as
     :func:`zarr_vectors.building.refresh_arrays_present`.)
 
+    **What is rebuilt and what is kept.**  This function owns the node's
+    ``version``, ``type``, ``name``, ``attributes.scene``, and the
+    *level entries* of ``nodes``.  Everything else is kept as found:
+
+    * any other key of ``attributes`` (a ``zv:companionImage``, say);
+    * any other top-level key of the node;
+    * every **foreign** child in ``nodes`` — one for which
+      :func:`is_owned_node` is false — verbatim and in its original
+      relative order, after the level entries.
+
+    So a tool that files its own node here (a back-reference from the
+    store to the collection that contains it is the motivating case)
+    keeps it across ``build_pyramid``, ``remove_resolution_level`` and
+    :func:`zarr_vectors.building.stamp_ome_node`, all of which call this.
+
+    Two things are *not* kept, both with a :class:`UserWarning` naming
+    them, because keeping them would make the written node illegal:
+
+    * a foreign child that is not a JSON object (it is not a node);
+    * a foreign child whose ``name`` equals a level's name.  RFC 8
+      requires child names to be unique within a collection, and the
+      level list is the side derived from disk, so it wins.  Level names
+      are the decimal level indices, so a foreign node never collides
+      with one unless it is named like a level.
+
     Args:
         root: Store root group.
         name: Store name.  ``None`` keeps the name already recorded, and
@@ -278,35 +321,89 @@ def refresh_root_node(
     )
 
     # Preserve anything a caller put on the node that this function does
-    # not own -- a ``zv:companionImage`` reference, say.  Only the four
-    # keys built above are authoritative.
+    # not own -- a ``zv:companionImage`` reference, say.  Only the keys
+    # built above are authoritative, and of ``nodes`` only the level
+    # entries.
     merged_attributes = dict(existing.get("attributes") or {})
     merged_attributes.update(node["attributes"])
-    # The same for ``nodes``: this function owns the ``zv:level`` entries
-    # and nothing else, so a child another tool placed here -- a
-    # back-reference to the collection that holds this store -- survives a
-    # level being added.  Replacing the list wholesale dropped it.  A
-    # foreign child named like a level is dropped: RFC 8 requires names
-    # to be unique within a collection, and the level is the one owned.
-    owned = {child["name"] for child in node["nodes"]}
-    foreign = [
-        child for child in existing.get("nodes") or []
-        if isinstance(child, dict)
-        and child.get("type") != NODE_TYPE_LEVEL
-        and child.get("name") not in owned
-    ]
+    merged_nodes = node["nodes"] + _foreign_nodes(
+        existing.get("nodes"),
+        level_names={child["name"] for child in node["nodes"]},
+    )
     node = {
         **existing, **node,
-        "attributes": merged_attributes,
-        "nodes": node["nodes"] + foreign,
+        "attributes": merged_attributes, "nodes": merged_nodes,
     }
 
     root.attrs.update({OME_ATTRS_KEY: node})
     return node
 
 
+def is_owned_node(child: Any) -> bool:
+    """Whether a child of the root's ``nodes`` list is one this package writes.
+
+    **The rule:** a child is owned iff it is a JSON object whose ``type``
+    is exactly :data:`NODE_TYPE_LEVEL` (``"zv:level"``).  Owned children
+    are regenerated from the level groups on disk by every refresh, so a
+    stale one disappears and anything a caller added *to* one is lost.
+    Every other child is foreign and is carried through unchanged — a
+    core ``collection`` or ``multiscale``, another tool's prefixed type,
+    or a ``zv:``-prefixed type other than ``zv:level``.
+
+    Keyed on the type rather than on the ``zv:`` prefix as a whole for
+    the same reason the attributes merge is keyed on ``scene`` rather
+    than on every ``zv:`` key: the refresh owns what it builds and
+    nothing more, so a ``zv:`` identifier some other part of this
+    package (or a caller) files here is not silently discarded.
+
+    When the level entries become ``collection`` nodes carrying a
+    ``path`` (the 0.10.0 re-seating described above), a core type can no
+    longer say "this is a level", and this predicate must grow a marker
+    those entries carry.  That is why the rule lives in one function.
+    """
+    return isinstance(child, dict) and child.get("type") == NODE_TYPE_LEVEL
+
+
+def _foreign_nodes(
+    existing: Any, *, level_names: set[str],
+) -> list[dict[str, Any]]:
+    """The children of an existing ``nodes`` list that a refresh keeps.
+
+    See :func:`refresh_root_node` for why the two dropped cases are
+    dropped rather than kept.
+    """
+    import warnings
+
+    kept: list[dict[str, Any]] = []
+    for child in existing if isinstance(existing, list) else []:
+        if is_owned_node(child):
+            continue
+        if not isinstance(child, dict):
+            warnings.warn(
+                f"dropping {child!r} from the root 'ome' node's children: "
+                f"an RFC 8 node is a JSON object",
+                UserWarning, stacklevel=3,
+            )
+            continue
+        if child.get("name") in level_names:
+            warnings.warn(
+                f"dropping the foreign {child.get('type')!r} node named "
+                f"{child.get('name')!r} from the root 'ome' node: a "
+                f"resolution level has that name, and RFC 8 requires "
+                f"child names to be unique within a collection",
+                UserWarning, stacklevel=3,
+            )
+            continue
+        kept.append(dict(child))
+    return kept
+
+
 def _axes_from_node(node: dict[str, Any]) -> list[dict[str, str]] | None:
-    """The ``world`` axes already declared on a node, if any."""
+    """The ``world`` axes already declared on a node, if any.
+
+    Matched by ``id`` or by ``name``: a store stamped before the ``id``
+    was added declares the system by ``name`` alone.
+    """
     scene = (node.get("attributes") or {}).get("scene") or {}
     for system in scene.get("coordinateSystems") or []:
         if WORLD in (system.get("id"), system.get("name")):
