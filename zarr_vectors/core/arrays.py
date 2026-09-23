@@ -61,6 +61,7 @@ from zarr_vectors.encoding.fragments import (
     concat_fragment_sections,
     decode_fragments,
     decode_object_manifest_blocks,
+    decode_object_manifests_csr,
     decode_object_manifests_many,
     encode_fragments,
     encode_object_manifest_blocks,
@@ -2363,13 +2364,111 @@ def patch_object_manifests(
     level_group.write_array_meta(OBJECT_INDEX, new_meta)
 
 
+def _object_array(blobs: Any) -> npt.NDArray[np.object_]:
+    """``blobs`` as a 1-D object array of ``bytes``, without a Python loop.
+
+    Never through a fixed-width byte string: that strips trailing NULs,
+    and every manifest ends in them (an empty one is four zero bytes).
+    """
+    if isinstance(blobs, np.ndarray) and blobs.dtype == object:
+        return blobs.reshape(-1)
+    blobs = list(blobs)
+    return np.fromiter(blobs, dtype=object, count=len(blobs))
+
+
+def _extend_object_id_table(
+    level_group: Group, keep: int, new_ids: npt.NDArray[np.int64],
+) -> None:
+    """Keep the first ``keep`` rows of ``object_index/object_ids``, add ``new_ids``.
+
+    Appends in place once the table is chunked at the manifest bucket;
+    the first time (tables are written as one chunk) and on a truncation
+    it is rewritten with that chunking, so later appends touch only the
+    rows they add.
+    """
+    path = f"{OBJECT_INDEX}/{OBJECT_IDS_ARRAY}"
+    node = level_group.zarr_group[path]
+    n0 = int(node.shape[0])
+    if n0 < keep:
+        raise ArrayError(
+            f"object id table holds {n0} rows; cannot keep {keep}"
+        )
+    last = int(node[keep - 1]) if keep else None
+    if keep == n0 and int(node.chunks[0]) >= OBJECT_INDEX_MANIFEST_BUCKET:
+        level_group.extend_array(path, new_ids)
+    else:
+        head = np.asarray(node[:keep], dtype=np.int64)
+        level_group.write_array(
+            path, np.concatenate([head, new_ids]),
+            chunks=(OBJECT_INDEX_MANIFEST_BUCKET,),
+        )
+    meta = level_group.read_array_meta(OBJECT_INDEX) or {}
+    ascending = bool(meta.get(OBJECT_IDS_SORTED_ATTR, False)) and bool(
+        np.all(np.diff(new_ids) > 0)
+        and (last is None or not new_ids.size or int(new_ids[0]) > last)
+    )
+    if ascending != bool(meta.get(OBJECT_IDS_SORTED_ATTR, False)):
+        level_group.write_array_meta(OBJECT_INDEX, {OBJECT_IDS_SORTED_ATTR: ascending})
+
+
+def _ids_for_append(
+    level_group: Group, start: int, n_rows: int, n_new: int, ids: Any,
+) -> npt.NDArray[np.int64] | None:
+    """The ids appended rows get, or ``None`` when rows are the ids (V1).
+
+    Appending by row to an index whose ids are *stored* (V2) used to add
+    rows with no id, so they could not be found by id and a read by id
+    dropped them. Now the ids are given (``ids=``) or, when the stored
+    table is the identity, extended as the identity; anything else raises.
+    """
+    meta = level_group.read_array_meta(OBJECT_INDEX) if OBJECT_INDEX in level_group else {}
+    table_path = f"{OBJECT_INDEX}/{OBJECT_IDS_ARRAY}"
+    stored = (meta or {}).get("layout") == OBJECT_INDEX_LAYOUT_V2 and (
+        level_group.array_exists(table_path)
+    )
+    new_ids = None if ids is None else np.asarray(ids, dtype=np.int64).reshape(-1)
+    if new_ids is not None and new_ids.size != n_new:
+        raise ArrayError(f"{new_ids.size} ids for {n_new} manifests")
+    if not stored:
+        if new_ids is not None and not np.array_equal(
+            new_ids, np.arange(start, start + n_new),
+        ):
+            raise ArrayError(
+                "this object index stores ids positionally (row i is object "
+                "i); ids= must be the rows being written"
+            )
+        return None
+    if start > n_rows:
+        raise ArrayError(
+            "cannot pad an object index that stores its ids: the padding "
+            "rows would have none"
+        )
+    if new_ids is not None:
+        return new_ids
+    node = level_group.zarr_group[table_path]
+    n_ids = int(node.shape[0])
+    identity = n_ids == start and (
+        n_ids == 0 or (
+            bool(meta.get(OBJECT_IDS_SORTED_ATTR, False))
+            and int(node[0]) == 0 and int(node[n_ids - 1]) == n_ids - 1
+        )
+    )
+    if not identity:
+        raise ArrayError(
+            "this object index stores its ids, and they are not simply the "
+            "rows; pass ids= for the objects being appended"
+        )
+    return np.arange(start, start + n_new, dtype=np.int64)
+
+
 def _write_object_index_manifests(
     level_group: Group,
-    manifest_blobs: list[bytes],
+    manifest_blobs: Any,
     *,
     mode: Literal["replace", "append"] = "replace",
     at: int | None = None,
-) -> None:
+    ids: Any = None,
+) -> int:
     """Write ``object_index/manifests`` as a single ragged vlen-bytes array.
 
     One zarr chunk holds ``OBJECT_INDEX_MANIFEST_BUCKET`` consecutive
@@ -2391,7 +2490,18 @@ def _write_object_index_manifests(
     is padded with empty manifests up to ``at``, and an array already longer
     than ``at`` (residue past the commit point) falls back to a full
     rewrite that truncates it.  ``None`` means "append at the current end".
+
+    ``manifest_blobs`` may be a list of ``bytes`` or an object array of
+    them. On an index that stores its object ids (V2), an append also
+    extends the id table: with ``ids=`` when given, else as the identity
+    when the table is the identity, else it raises (see
+    :func:`_ids_for_append`). Replace mode leaves ids to the caller, as
+    :func:`write_object_index` does.
+
+    Returns:
+        The row the written blobs start at.
     """
+    manifest_blobs = _object_array(manifest_blobs)
     n = len(manifest_blobs)
     oi_group = level_group.zarr_group.require_group(OBJECT_INDEX)
 
@@ -2404,39 +2514,44 @@ def _write_object_index_manifests(
         start = n0 if at is None else int(at)
         if start < 0:
             raise ArrayError(f"Append index {at} is negative")
+        new_ids = _ids_for_append(level_group, start, n0, n, ids)
         if existing is None or start < n0:
             # Nothing to extend, or the array reaches past where this append
             # must begin (a torn flush). Rebuild the whole thing: the
             # truncation is what makes the ids line up again, and zarr does
             # not promise to drop chunks beyond a shrink.
             head = (
-                [bytes(b) for b in existing[:start]] if existing is not None
-                else []
+                _object_array(existing[:start]) if existing is not None
+                else np.empty(0, dtype=object)
             )
-            head += [_EMPTY_MANIFEST_BLOB] * (start - len(head))
-            _write_object_index_manifests(level_group, head + list(manifest_blobs))
-            return
+            pad = np.full(start - len(head), _EMPTY_MANIFEST_BLOB, dtype=object)
+            _write_object_index_manifests(
+                level_group, np.concatenate([head, pad, manifest_blobs]),
+            )
+            if new_ids is not None:
+                _extend_object_id_table(level_group, start, new_ids)
+            return start
         if n == 0 and start == n0:
-            return
-        pad = [_EMPTY_MANIFEST_BLOB] * (start - n0)
-        rows = pad + list(manifest_blobs)
+            return start
+        rows = np.concatenate([
+            np.full(start - n0, _EMPTY_MANIFEST_BLOB, dtype=object), manifest_blobs,
+        ])
         total = n0 + len(rows)
         with warnings.catch_warnings():
             warnings.simplefilter("ignore", UnstableSpecificationWarning)
             existing.resize((total,))
-            obj = np.empty(len(rows), dtype=object)
-            for i, blob in enumerate(rows):
-                obj[i] = blob
-            existing[n0:total] = obj
+            existing[n0:total] = rows
         level_group._invalidate_node(f"{OBJECT_INDEX}/manifests")
-        return
+        if new_ids is not None:
+            _extend_object_id_table(level_group, start, new_ids)
+        return start
 
     for legacy in ("manifests", "data", "offsets"):
         if legacy in oi_group:
             del oi_group[legacy]
 
     if n == 0:
-        return
+        return 0
 
     # A fixed bucket, NOT clamped to the current blob count -- the same rule
     # and the same reason as ``write_object_attributes`` below, and as
@@ -2470,10 +2585,8 @@ def _write_object_index_manifests(
             dtype="bytes",
             serializer=VLenBytesCodec(),
         )
-        obj = np.empty(n, dtype=object)
-        for i, blob in enumerate(manifest_blobs):
-            obj[i] = blob
-        arr[:] = obj
+        arr[:] = manifest_blobs
+    return 0
 
 
 def write_object_attributes(
@@ -5441,6 +5554,63 @@ def read_all_object_manifests(
     # chokepoint the offline snapshot can serve (see Group.offline_reads).
     blobs = level_group.read_vlen_array(f"{OBJECT_INDEX}/manifests")
     return _decode_manifests(blobs, sid_ndim)
+
+
+@dataclass(frozen=True)
+class ManifestCSR:
+    """Every object's manifest as flat arrays.
+
+    Object row ``o`` owns rows ``offsets[o]:offsets[o + 1]`` of
+    ``chunk_coords`` and ``fragment_idx``. ``object_ids[o]`` is its id,
+    or ``object_ids`` is ``None`` when rows are the ids. Unpacks as
+    ``offsets, chunk_coords, fragment_idx = read_all_object_manifests_csr(lg)``.
+    """
+
+    offsets: Any
+    chunk_coords: Any
+    fragment_idx: Any
+    object_ids: Any = None
+
+    def __iter__(self) -> Iterator[Any]:
+        return iter((self.offsets, self.chunk_coords, self.fragment_idx))
+
+
+@_device_result
+def _manifest_csr_arrays(level_group: Group) -> tuple[npt.NDArray, ...]:
+    meta = level_group.read_array_meta(OBJECT_INDEX)
+    _require_object_index_layout(meta)
+    sid_ndim = int(meta["sid_ndim"])
+    num_objects = int(meta.get("num_objects", 0))
+    blobs = (
+        level_group.read_vlen_array_raw(f"{OBJECT_INDEX}/manifests", stop=num_objects)
+        if num_objects else np.empty(0, dtype=object)
+    )
+    offsets, coords, frags = decode_object_manifests_csr(blobs, sid_ndim)
+    if len(offsets) - 1 < num_objects:
+        # A committed count past the stored rows: the missing rows are
+        # objects with no fragments, as a read by id would find them.
+        offsets = np.concatenate([
+            offsets, np.full(num_objects - len(offsets) + 1, offsets[-1]),
+        ])
+    return offsets, coords, frags
+
+
+def read_all_object_manifests_csr(
+    level_group: Group, *, device: str | None = None,
+) -> ManifestCSR:
+    """Every committed manifest as CSR arrays, decoded without per-object Python.
+
+    Reads rows ``[0, num_objects)``: the committed prefix, where
+    :func:`read_all_object_manifests` also decodes any rows a torn flush
+    left past it. Range and explicit-list blocks are expanded to one row
+    per fragment, in manifest order. ``device="cuda"`` returns the three
+    arrays on the device (ids stay on the host).
+    """
+    offsets, coords, frags = _manifest_csr_arrays(level_group, device=device)
+    table = read_object_id_table(level_group)
+    if table is not None:
+        table = table[: int(offsets.shape[0]) - 1]
+    return ManifestCSR(offsets, coords, frags, table)
 
 
 def _decode_manifests(blobs: Sequence[bytes], sid_ndim: int) -> list[ObjectManifest]:

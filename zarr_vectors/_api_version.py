@@ -63,6 +63,9 @@ FEATURES: frozenset[str] = frozenset({
     # write_chunk_fragments(csr=(indices, offsets)): fragments as arrays,
     # and appends that concatenate sections instead of re-encoding.
     "csr-fragments",
+    # write_object_manifests(chunk_coords=, fragment_idx=, ...) and
+    # read_all_object_manifests_csr: manifests as arrays both ways.
+    "array-manifests",
 })
 
 

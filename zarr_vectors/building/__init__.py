@@ -67,6 +67,7 @@ from zarr_vectors.constants import (
 from zarr_vectors.core.arrays import (
     OBJECT_INDEX_LAYOUT_V1,
     OBJECT_INDEX_MANIFEST_BUCKET,
+    ManifestCSR,
     attribute_layout,
     # --- links ---
     cell_endpoint_chunks,
@@ -100,6 +101,7 @@ from zarr_vectors.core.arrays import (
     patch_object_manifests,
     read_all_groupings,
     read_all_object_manifests,
+    read_all_object_manifests_csr,
     read_attribute_fragment,
     read_chunk_attributes,
     read_chunk_fragment_attributes,
@@ -192,9 +194,11 @@ from zarr_vectors.core.store import (
 from zarr_vectors.core.streaming import ObjectIndexAppender
 from zarr_vectors.encoding.fragments import (
     decode_object_manifest_blocks,
+    decode_object_manifests_csr,
     encode_object_manifest_blocks,
+    encode_object_manifests_csr,
 )
-from zarr_vectors.exceptions import StoreError
+from zarr_vectors.exceptions import ArrayError, StoreError
 from zarr_vectors.multiresolution.registry import (
     register_coarsen_strategy,
     register_selection_strategy,
@@ -460,24 +464,39 @@ def link_endpoint_scales(
 
 def write_object_manifests(
     level_group: Group,
-    manifest_blobs: list[bytes],
+    manifest_blobs: Any = None,
     *,
+    chunk_coords: Any = None,
+    fragment_idx: Any = None,
+    manifest_offsets: Any = None,
+    ids: Any = None,
     mode: str = "replace",
     at: int | None = None,
-) -> None:
+) -> tuple[int, int]:
     """Write ``object_index/manifests`` as one ragged vlen-bytes array.
 
-    The promoted spelling of an internal that two consuming call sites
-    use, so that writing an object index does not require a private name.
-    Takes already-encoded blobs -- one per object, in object-id order --
-    which is what those call sites already have; encode them with
-    :func:`encode_object_manifest_blocks`.
+    Give the manifests one of two ways:
+
+    - ``manifest_blobs``: already-encoded blobs, one per object, in
+      object order (encode them with :func:`encode_object_manifest_blocks`);
+    - as arrays: object ``o`` owns blocks
+      ``manifest_offsets[o]:manifest_offsets[o + 1]``, block ``b`` naming
+      fragment ``fragment_idx[b]`` of chunk ``chunk_coords[b]``. Without
+      ``manifest_offsets`` every object owns one block. Encoded with no
+      Python object per object, to the same bytes; device arrays are
+      copied to the host once each.
+
+    Only the manifests array is written: committing the index's metadata
+    (``num_objects`` and the rest) stays the caller's step.
 
     Args:
         level_group: Resolution level group.
-        manifest_blobs: Encoded manifests, one per object.  Under the
-            default ``mode="replace"`` these are the WHOLE index; under
-            ``mode="append"`` they are only the new objects.
+        manifest_blobs: Encoded manifests (list of bytes or object array).
+        chunk_coords: ``(M, sid_ndim)`` block chunk coordinates.
+        fragment_idx: ``(M,)`` block fragment indices.
+        manifest_offsets: ``(n + 1,)`` CSR offsets of blocks per object.
+        ids: Object ids of the rows written, for an index that stores
+            ids rather than using rows as ids; see below.
         mode: ``"replace"`` rewrites every row.  ``"append"`` extends the
             existing array, touching only the zarr chunks the new rows fall
             in — the write a per-chunk emitter wants, since replacing costs
@@ -485,10 +504,42 @@ def write_object_manifests(
         at: Row index the appended blobs must start at (``mode="append"``
             only).  Pass the object-id being claimed so a torn previous
             flush cannot shift ids; ``None`` appends at the current end.
-    """
-    from zarr_vectors.core.arrays import _write_object_index_manifests
 
-    _write_object_index_manifests(level_group, manifest_blobs, mode=mode, at=at)
+    On an index that stores its object ids (layout V2), an append extends
+    the id table with ``ids``, or with the rows when the table is simply
+    the rows; otherwise it raises, where it used to add rows with no id
+    that a read by id could not find.
+
+    Returns:
+        ``(first_row, n)``: where the written manifests start, and how many.
+    """
+    from zarr_vectors import _xp
+    from zarr_vectors.core.arrays import _write_object_index_manifests
+    from zarr_vectors.encoding.fragments import encode_object_manifests_csr
+
+    as_arrays = chunk_coords is not None or fragment_idx is not None
+    if as_arrays == (manifest_blobs is not None) or (
+        as_arrays and (chunk_coords is None or fragment_idx is None)
+    ):
+        raise ArrayError(
+            "give manifest_blobs, or chunk_coords and fragment_idx "
+            "(optionally with manifest_offsets), not both"
+        )
+    if as_arrays:
+        try:
+            sid = int((level_group.read_array_meta(OBJECT_INDEX) or {}).get("sid_ndim"))
+        except Exception:
+            sid = None
+        manifest_blobs = encode_object_manifests_csr(
+            _xp.to_host(chunk_coords), _xp.to_host(fragment_idx),
+            None if manifest_offsets is None else _xp.to_host(manifest_offsets),
+            sid_ndim=sid,
+        )
+    first = _write_object_index_manifests(
+        level_group, manifest_blobs, mode=mode, at=at,
+        ids=None if ids is None else _xp.to_host(ids),
+    )
+    return int(first), len(manifest_blobs)
 
 
 def per_chunk_array_paths(level_group: Group) -> list[str]:
@@ -696,6 +747,7 @@ __all__ = [
     "CellBatch",
     "CellColumn",
     "CellReadError",
+    "ManifestCSR",
     "CAP_MULTISCALE_LINKS",
     "CAP_PRESERVED_OBJECT_IDS",
     "CAP_SHARED_FRAGMENTS",
@@ -761,7 +813,9 @@ __all__ = [
     "decode_object_manifest_blocks",
     "defer_presence",
     "decompose_tree_to_paths",
+    "decode_object_manifests_csr",
     "encode_object_manifest_blocks",
+    "encode_object_manifests_csr",
     "expand_manifest_blocks",
     "finalize_links",
     "finalize_skeleton_store",
@@ -805,6 +859,7 @@ __all__ = [
     "per_chunk_array_paths",
     "read_all_groupings",
     "read_all_object_manifests",
+    "read_all_object_manifests_csr",
     "read_attribute_fragment",
     "read_cells",
     "read_chunk_attributes",

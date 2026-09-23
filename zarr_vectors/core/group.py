@@ -1621,6 +1621,23 @@ class Group:
         node = self._require_array_node(path)
         return [bytes(b) for b in node[:]]
 
+    def read_vlen_array_raw(self, path: str, stop: int | None = None) -> Any:
+        """Rows ``[0, stop)`` of a vlen-bytes array as zarr returns them.
+
+        An object array of ``bytes``, without the Python ``bytes()`` per
+        row :meth:`read_vlen_array` makes -- for a reader that hands the
+        rows to an array decoder, which is all of them it touches.
+        """
+        cached = self._offline_array(path)
+        if cached is not None:
+            rows = np.asarray(cached, dtype=object).reshape(-1)
+            return rows if stop is None else rows[:stop]
+        node = self._require_array_node(path)
+        n = int(node.shape[0]) if stop is None else min(int(stop), int(node.shape[0]))
+        if n == 0:
+            return np.empty(0, dtype=object)
+        return np.asarray(node[:n], dtype=object).reshape(-1)
+
     def read_vlen_element(self, path: str, index: int) -> bytes:
         """Read ONE element of the vlen-bytes array at ``path``.
 
