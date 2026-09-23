@@ -410,6 +410,51 @@ mutable state is the presence manifest, which is exactly what
 
 ---
 
+## Workers that append objects
+
+A pipeline that builds objects chunk by chunk (skeleton paths, say, with
+seam links between neighbouring chunks) flushes in a fixed order. Each call
+takes whole arrays, numpy or device, and leaves the same bytes as its
+per-object counterpart:
+
+```python
+from zarr_vectors import building as zb
+
+n0 = committed_objects                      # the coordinator's count
+start, k = zb.write_chunk_fragments(        # 1. the new objects' fragments
+    lg, cc, csr=(indices, offsets), mode="append")
+zb.write_object_manifests(                  # 2. one manifest row per object
+    lg, chunk_coords=np.tile(cc, (k, 1)), fragment_idx=np.arange(start, start + k),
+    mode="append", at=n0)
+zb.write_object_attribute_columns(          # 3. their attribute columns
+    lg, {"length": lengths, "n_nodes": counts}, at=n0)
+zb.write_link_cells(                        # 4. seams and their attributes
+    lg, chunks=seam_chunks, vids=seam_vids, attributes={"w": weights})
+# the coordinator then commits num_objects = n0 + k
+```
+
+When every worker has finished, the coordinator runs `zb.finalize_links(lg,
+delta=0)` once. It rebuilds presence for the link, link-attribute and
+link-fragment arrays, which the array-form link writer does not record.
+
+Two things are shared between workers here, unlike the cell writes in the
+patterns above:
+
+- **The object index and object attribute columns.** Pass the row with
+  `at=` on every append, and never let flush order choose it. Until the
+  concurrency contract is written down, append to them from one process at
+  a time, for example under the lock that guards the object count.
+- **Seam link cells.** A seam is stored in the cell of its anchor chunk,
+  which may belong to another worker's partition. Either route each seam to
+  the worker that owns its anchor, or serialise these writes too.
+
+A worker that needs a halo around its own chunk reads it in one prefetch
+with `zb.read_neighbourhood(lg, cc, arrays, halo=1)`. See
+[GPU arrays and array-form I/O](gpu.md) for the read side and the device
+model.
+
+---
+
 ## Sharding read work across ranks
 
 Reading back is easier than writing, because `Query.cells()` computes which
