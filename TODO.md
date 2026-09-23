@@ -70,29 +70,36 @@ or only in narrow cases; 4 is a recorded constraint; 5 is housekeeping.
 
 ---
 
-## 4. No device-side read path
+## 4. Device-side decode and GPU-direct reads
 
-**Severity: none today — a recorded constraint, not a request.** Asked for by
-BRIDGE (its D8, GPU-direct reads), which has dropped it from its own backlog
-because nothing it can do reaches past this.
+**Severity: none today — the next step for the optional GPU extension.**
 
-Every read ends in `np.frombuffer` on host memory, so a device buffer handed up
-by zarr (`zarr.config.enable_gpu()`, kvikio) is copied to the host on its first
-contact with this package. The batched reader and writer already pass zarr a
-buffer prototype, but it is fixed at import to the host-side
-`default_buffer_prototype()` (`core/_batch_reader.py:61`,
-`core/_batch_writer.py:90`).
+Device arrays in and out now work (`zarr_vectors.gpu`, the `[gpu]` extra):
+readers take `device="cuda"`, writers take cupy arrays, `read_cells` /
+`read_neighbourhood` read many cells in one prefetch, and
+`runtime_capabilities()` says which of it an install has. But the bytes
+still go through the host. A read fetches and decompresses each cell there
+and uploads the result once; a write downloads each argument once and
+encodes there. `runtime_capabilities()` reports what is missing as
+`gpu_encode`, `gpu_io` and `gpu_codecs`.
+
+Why not zarr's own GPU buffers: every per-chunk array is vlen bytes, and
+zarr's GPU buffer rejects the object dtype a vlen decode produces
+(`zarr/core/buffer/gpu.py`), while the sharding codec asserts the default
+host prototype. A configurable prototype would only help the numeric
+standalone arrays (object attributes, the object-id table).
 
 There is also no partial-cell read. `read_fragment` advertises a byte-slice
 fast path for range fragments but fetches the whole cell and slices it on the
 host. The only genuinely sub-cell read is row selection on 1-D standalone
 arrays (`Group.read_vlen_elements`).
 
-**If taken up:** make the prototype configurable, then a read path that honours
-it instead of calling `np.frombuffer`, then byte-range plumbing so a range
-fragment is fetched without its cell. The last only works for an uncompressed
-cell — under a compressor there is no byte range to ask for — so it is a
-codec-dependent fast path, not a general one.
+**If taken up:** decode fragment indices and vlen payloads with cupy
+(`encoding/fragments.py` is already array-shaped); nvCOMP for a zstd cell
+payload, so decompression moves too; kvikio for uncompressed, unsharded
+local cells (the direct reader already opens those files itself,
+`core/_batch_reader.py`); then byte-range reads for range fragments, which
+only exist for an uncompressed cell.
 
 ---
 

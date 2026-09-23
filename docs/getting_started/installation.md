@@ -43,13 +43,29 @@ Enables reading from and writing to Amazon S3, Google Cloud Storage, and
 Azure Blob Storage via `s3fs` and `gcsfs`. See
 [Cloud stores](../tutorials/io/cloud_stores.md) for configuration details.
 
+### GPU arrays
+
+```bash
+pip install "zarr-vectors[gpu]"
+```
+
+Lets the array-form readers and writers take and return device (cupy)
+arrays: `device="cuda"` on a reader, or a cupy array passed to a writer.
+Linux only; it installs `cupy-cuda12x`. In a conda environment install
+cupy from conda-forge instead (`conda install -c conda-forge cupy`) —
+the extra would add a second, pip-built cupy. Nothing needs it: every
+call works with numpy, and a store written from device arrays is
+byte-identical to one written from numpy. See
+[GPU arrays](../how_to/gpu.md).
+
 ### Everything
 
 ```bash
 pip install "zarr-vectors[all]"
 ```
 
-Installs all optional extras in a single command.
+Installs all optional extras in a single command, except `[gpu]`, which is
+tied to a CUDA version and so is always asked for explicitly.
 
 ## Development install
 
