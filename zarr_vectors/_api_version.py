@@ -69,6 +69,9 @@ FEATURES: frozenset[str] = frozenset({
     # write_object_attribute_columns: many object attribute columns in
     # one call, grown in place concurrently.
     "object-attribute-columns",
+    # write_link_cells(chunks=, vids=, attributes=): link records and
+    # their attributes as arrays, one read-modify-write per cell.
+    "array-link-cells",
 })
 
 
