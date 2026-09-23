@@ -23,6 +23,10 @@ def _files(root: Path) -> dict[str, Path]:
 def assert_stores_identical(a, b, *, ignore=()) -> None:
     """Fail naming the first differences between stores ``a`` and ``b``.
 
+    The root metadata records the store's directory name, so two stores
+    compared this way should share a basename (put them in different
+    directories).
+
     ``ignore`` holds relative-path prefixes to skip, for a difference a
     test declares deliberately.
     """

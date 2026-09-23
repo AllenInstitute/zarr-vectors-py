@@ -251,6 +251,188 @@ def encode_fragments(
     return b"".join(parts)
 
 
+# Array-form encoding ------------------------------------------------
+#
+# The same byte layout, built from CSR arrays with array operations only:
+# no Python object per fragment, and an append that concatenates sections
+# instead of decoding the existing index to a list and re-encoding it.
+# ``encode_fragments`` above stays the definition these are tested
+# against, byte for byte.
+
+
+@dataclass(frozen=True)
+class FragmentSections:
+    """A fragment index as its four sections, before packing.
+
+    ``is_range[f]`` says which section fragment ``f`` lives in; the range
+    table and the explicit CSR each hold their fragments in fragment
+    order, exactly as the packed blob does.
+    """
+
+    is_range: npt.NDArray[np.bool_]           # (F,)
+    range_table: npt.NDArray[np.int64]        # (R, 2): start, count
+    explicit_offsets: npt.NDArray[np.int64]   # (E + 1,), [0] == 0
+    explicit_indices: npt.NDArray[np.int64]   # (T,)
+
+    @property
+    def num_fragments(self) -> int:
+        return int(self.is_range.shape[0])
+
+
+def _as_int64(a: Any, what: str) -> npt.NDArray[np.int64]:
+    arr = np.asarray(a)
+    if arr.ndim != 1:
+        raise ArrayError(f"{what} must be 1-D, got shape {arr.shape}")
+    if arr.size and arr.dtype.kind not in "iu":
+        raise ArrayError(f"{what} must be integers, got {arr.dtype}")
+    return arr.astype(np.int64, copy=False)
+
+
+def classify_fragments_csr(
+    indices: Any,
+    offsets: Any,
+    *,
+    force_explicit: bool = False,
+) -> FragmentSections:
+    """Split CSR fragments into range and explicit sections.
+
+    Fragment ``f`` is ``indices[offsets[f]:offsets[f + 1]]``. It becomes a
+    range exactly when :func:`encode_fragments` would make it one: it is
+    non-empty, starts at an index >= 0, and steps by one throughout. An
+    empty fragment stays explicit. A negative index anywhere raises, as it
+    does there: it can never sit in a range, so the explicit path would
+    reject it.
+
+    Vectorised: a fragment is a run of +1 steps exactly when the running
+    count of steps that are not +1 is the same at its first and last
+    index.
+    """
+    idx = _as_int64(indices, "indices")
+    off = _as_int64(offsets, "offsets")
+    if off.size == 0 or off[0] != 0 or off[-1] != idx.size:
+        raise ArrayError(
+            f"offsets must start at 0 and end at len(indices)={idx.size}; "
+            f"got {off[:1].tolist()}..{off[-1:].tolist()}"
+        )
+    counts = np.diff(off)
+    if counts.size and int(counts.min()) < 0:
+        raise ArrayError("offsets must be non-decreasing")
+    if idx.size and int(idx.min()) < 0:
+        raise ArrayError("Explicit fragment indices must be non-negative")
+
+    num = counts.size
+    starts = off[:-1]
+    if force_explicit or idx.size == 0:
+        is_range = np.zeros(num, dtype=bool)
+    else:
+        breaks = np.concatenate(([0], np.cumsum(np.diff(idx) != 1)))
+        nonempty = counts > 0
+        is_range = np.zeros(num, dtype=bool)
+        is_range[nonempty] = (
+            breaks[off[1:][nonempty] - 1] == breaks[starts[nonempty]]
+        )
+    range_table = np.stack(
+        [idx[starts[is_range]], counts[is_range]], axis=1,
+    ).reshape(-1, 2)
+    explicit = ~is_range
+    return FragmentSections(
+        is_range=is_range,
+        range_table=range_table,
+        explicit_offsets=np.concatenate(([0], np.cumsum(counts[explicit]))).astype(np.int64),
+        explicit_indices=idx[np.repeat(explicit, counts)],
+    )
+
+
+def range_fragment_sections(starts: Any, counts: Any) -> FragmentSections:
+    """Sections for fragments that are all ``(start, count)`` ranges.
+
+    The array form of passing ``encode_fragments`` a list of tuples.
+    """
+    st = _as_int64(starts, "starts")
+    ct = _as_int64(counts, "counts")
+    if st.shape != ct.shape:
+        raise ArrayError(f"starts {st.shape} and counts {ct.shape} differ")
+    if ct.size and int(ct.min()) < 0:
+        raise ArrayError("Fragment count must be >= 0")
+    return FragmentSections(
+        is_range=np.ones(st.size, dtype=bool),
+        range_table=np.stack([st, ct], axis=1).reshape(-1, 2),
+        explicit_offsets=np.zeros(1, dtype=np.int64),
+        explicit_indices=np.empty(0, dtype=np.int64),
+    )
+
+
+def fragment_sections_from_index(fi: ChunkFragmentIndex) -> FragmentSections:
+    """The sections of a decoded index, as they are stored."""
+    num = fi.num_fragments
+    is_range = np.unpackbits(fi._bitmap, bitorder="little")[:num].astype(bool)
+    if int(is_range.sum()) != fi.num_range_fragments:
+        raise ArrayError(
+            f"fragment index bitmap marks {int(is_range.sum())} ranges but "
+            f"its table holds {fi.num_range_fragments}"
+        )
+    return FragmentSections(
+        is_range=is_range,
+        range_table=np.asarray(fi._range_table, dtype=np.int64).reshape(-1, 2),
+        explicit_offsets=np.asarray(fi._csr_offsets, dtype=np.int64),
+        explicit_indices=np.asarray(fi._csr_indices, dtype=np.int64),
+    )
+
+
+def concat_fragment_sections(a: FragmentSections, b: FragmentSections) -> FragmentSections:
+    """``a``'s fragments followed by ``b``'s, each kept as it was classified."""
+    return FragmentSections(
+        is_range=np.concatenate([a.is_range, b.is_range]),
+        range_table=np.concatenate([a.range_table, b.range_table]).reshape(-1, 2),
+        explicit_offsets=np.concatenate([
+            a.explicit_offsets, b.explicit_offsets[1:] + a.explicit_offsets[-1],
+        ]),
+        explicit_indices=np.concatenate([a.explicit_indices, b.explicit_indices]),
+    )
+
+
+def pack_fragment_sections(sections: FragmentSections) -> bytes:
+    """The v1 blob for ``sections``; the bytes :func:`encode_fragments` writes."""
+    num = sections.num_fragments
+    num_ranges = int(sections.range_table.shape[0])
+    if num == 0:
+        return _HEADER_STRUCT.pack(
+            FRAGMENT_INDEX_MAGIC, FRAGMENT_INDEX_VERSION, 0, 0, 0,
+        )
+    if int(sections.is_range.sum()) != num_ranges:
+        raise ArrayError("range bitmap and range table disagree")
+    total = int(sections.explicit_offsets[-1])
+    if total >= 2**32:
+        raise ArrayError(
+            f"{total} explicit indices in one cell; the v1 layout stores "
+            f"their offsets as uint32"
+        )
+    bitmap = np.zeros(_bitmap_padded_length(num), dtype=np.uint8)
+    packed = np.packbits(sections.is_range, bitorder="little")
+    bitmap[:packed.size] = packed
+    return b"".join([
+        _HEADER_STRUCT.pack(
+            FRAGMENT_INDEX_MAGIC, FRAGMENT_INDEX_VERSION, 0, num, num_ranges,
+        ),
+        bitmap.tobytes(),
+        np.ascontiguousarray(sections.range_table, dtype="<i8").tobytes(),
+        np.ascontiguousarray(sections.explicit_offsets, dtype="<u4").tobytes(),
+        np.ascontiguousarray(sections.explicit_indices, dtype="<i8").tobytes(),
+    ])
+
+
+def encode_fragments_csr(
+    indices: Any,
+    offsets: Any,
+    *,
+    force_explicit: bool = False,
+) -> bytes:
+    """:func:`encode_fragments` for fragments held as CSR arrays."""
+    return pack_fragment_sections(
+        classify_fragments_csr(indices, offsets, force_explicit=force_explicit),
+    )
+
+
 # Decoding -----------------------------------------------------------
 
 

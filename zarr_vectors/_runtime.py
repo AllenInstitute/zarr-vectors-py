@@ -17,7 +17,7 @@ import functools
 #: are only ever added, so a caller can rely on one being present.
 _STATIC: dict[str, bool] = {
     # Array-form writers and readers (BRIDGE R1/R3/R12).
-    "csr_fragments": False,
+    "csr_fragments": True,
     "array_manifests": False,
     "manifests_csr_read": False,
     "object_attribute_columns": False,
