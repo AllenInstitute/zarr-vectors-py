@@ -39,6 +39,7 @@ from zarr_vectors._api_version import (  # noqa: F401
     __api_version__,
     require_api,
 )
+from zarr_vectors._runtime import runtime_capabilities  # noqa: F401
 from zarr_vectors._stability import stability  # noqa: F401
 from zarr_vectors.api import (
     Attributes,
@@ -151,6 +152,7 @@ __all__ = [
     "__api_version__",
     "FEATURES",
     "require_api",
+    "runtime_capabilities",
     # --- the builder surface, as a module ---
     "building",
     "stability",

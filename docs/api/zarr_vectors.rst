@@ -24,3 +24,5 @@ they answer questions about the installed package rather than about a store.
 .. autofunction:: zarr_vectors.require_api
 
 .. autodata:: zarr_vectors.FEATURES
+
+.. autofunction:: zarr_vectors.runtime_capabilities
