@@ -135,6 +135,8 @@ async def _gather_plan(
     async_group: Any,
     plan: list[tuple[str, list[str]]],
     resolved: dict[str, Any] | None = None,
+    *,
+    tolerant: bool = False,
 ) -> dict[tuple[str, str], bytes]:
     """Resolve each ``array_name`` once, then fan out per-chunk reads
     via :func:`asyncio.gather`.
@@ -149,6 +151,11 @@ async def _gather_plan(
     read returned ``None``, are omitted — the caller's sync
     :meth:`Group.read_bytes` then raises :class:`StoreError` on the
     cache miss, exactly as it would have without the prefetch.
+
+    ``tolerant`` leaves a cell whose read *failed* out of the cache as
+    well, instead of failing the whole gather: one corrupt cell no longer
+    costs every other cell in the plan, and the caller's sync read of it
+    raises its own error.
     """
     # Resolve each array_name once.
     nodes: dict[str, Any] = {}
@@ -178,12 +185,14 @@ async def _gather_plan(
 
     if not tasks:
         return {}
-    results = await asyncio.gather(*tasks)
+    results = await asyncio.gather(*tasks, return_exceptions=tolerant)
 
     cache: dict[tuple[str, str], bytes] = {}
     for (array_name, chunk_key), data in zip(flat, results):
-        if data is not None:
+        if isinstance(data, bytes):
             cache[(array_name, chunk_key)] = data
+        elif isinstance(data, BaseException) and not isinstance(data, Exception):
+            raise data
     return cache
 
 
@@ -423,6 +432,8 @@ def _direct_read_many(
 
 def _direct_read_plan(
     entries: list[tuple[str, _DirectSpec, list[str]]],
+    *,
+    tolerant: bool = False,
 ) -> dict[tuple[str, str], bytes]:
     """Read and decode the cells of several arrays as one job.
 
@@ -454,7 +465,13 @@ def _direct_read_plan(
         raws = [_read_file(w[3]) for w in wanted]
     out: dict[tuple[str, str], bytes] = {}
     for (array_name, spec, chunk_key, _path), raw in zip(wanted, raws):
-        data = _decode_direct(spec, raw)
+        try:
+            data = _decode_direct(spec, raw)
+        except Exception:
+            # Tolerant: the cell is left out, and its sync read raises.
+            if not tolerant:
+                raise
+            continue
         if data is not None:
             out[(array_name, chunk_key)] = data
     return out
@@ -465,6 +482,8 @@ def flush_prefetch(
     plan: list[tuple[str, list[str]]],
     nodes: dict[str, Any] | None = None,
     specs: dict[str, Any] | None = None,
+    *,
+    tolerant: bool = False,
 ) -> dict[tuple[str, str], bytes]:
     """Prefetch every chunk in ``plan`` and return a flat cache.
 
@@ -491,12 +510,15 @@ def flush_prefetch(
     For icechunk-backed stores, falls back to serial sync reads via
     :func:`_sync_fallback` — the async-gather pattern bypasses
     icechunk's session-tracking contract.
+
+    ``tolerant`` omits a cell whose read or decode fails rather than
+    raising, on every path; see :func:`_gather_plan`.
     """
     if not plan:
         return {}
 
     if _is_icechunk_store(zarr_group.store):
-        return _sync_fallback(zarr_group, plan)
+        return _sync_fallback(zarr_group, plan, tolerant=tolerant)
 
     # Resolve each array_name once, as ``_gather_plan`` does, then split
     # the plan on whether the direct reader recognised it.
@@ -518,21 +540,23 @@ def flush_prefetch(
 
     cache: dict[tuple[str, str], bytes] = {}
     if gathered:
-        cache.update(
-            sync(_gather_plan(zarr_group._async_group, gathered, nodes))
-        )
+        cache.update(sync(_gather_plan(
+            zarr_group._async_group, gathered, nodes, tolerant=tolerant,
+        )))
 
     cache.update(_direct_read_plan([
         (array_name, direct[array_name], list(chunk_keys))
         for array_name, chunk_keys in plan
         if array_name in direct
-    ]))
+    ], tolerant=tolerant))
     return cache
 
 
 def _sync_fallback(
     zarr_group: zarr.Group,
     plan: list[tuple[str, list[str]]],
+    *,
+    tolerant: bool = False,
 ) -> dict[tuple[str, str], bytes]:
     """Serial-read fallback for icechunk and other stores that don't
     play well with the async-gather pattern.
@@ -558,7 +582,11 @@ def _sync_fallback(
             if any(c < 0 or c >= s for c, s in zip(coords, shape)):
                 continue
             region = _vlen_cell_region(coords)
-            cache[(array_name, chunk_key)] = _vlen_region_to_bytes(
-                node[region]
-            )
+            try:
+                cache[(array_name, chunk_key)] = _vlen_region_to_bytes(
+                    node[region]
+                )
+            except Exception:
+                if not tolerant:
+                    raise
     return cache

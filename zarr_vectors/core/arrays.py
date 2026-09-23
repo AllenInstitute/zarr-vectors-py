@@ -177,6 +177,42 @@ def _parse_chunk_key(key: str) -> ChunkCoords:
     return tuple(int(x) for x in key.split("."))
 
 
+def _device_result(fn):
+    """Give a flat-array reader a keyword-only ``device=`` argument.
+
+    The reader decodes on the host as always; ``device="cuda"`` then moves
+    each array it returns to the device in one copy (see
+    :mod:`zarr_vectors._xp`). ``None`` and ``"cpu"`` return host arrays.
+    Only numpy results move: a ``default`` the caller supplied comes back
+    untouched, and a tuple of arrays moves element by element.
+    """
+    import functools
+    import inspect
+
+    from zarr_vectors import _xp
+
+    @functools.wraps(fn)
+    def wrapper(*args: Any, device: str | None = None, **kwargs: Any) -> Any:
+        out = fn(*args, **kwargs)
+        target = _xp.resolve_device(device)
+        if target == "cpu":
+            return out
+        if isinstance(out, np.ndarray):
+            return _xp.to_device(out, target)
+        if isinstance(out, tuple) and all(isinstance(o, np.ndarray) for o in out):
+            return tuple(_xp.to_device(o, target) for o in out)
+        return out
+
+    sig = inspect.signature(fn)
+    params = list(sig.parameters.values())
+    params.append(inspect.Parameter(
+        "device", inspect.Parameter.KEYWORD_ONLY, default=None,
+        annotation="str | None",
+    ))
+    wrapper.__signature__ = sig.replace(parameters=params)  # type: ignore[attr-defined]
+    return wrapper
+
+
 @contextmanager
 def _maybe_batched_reads(
     level_group: Group,
@@ -4275,6 +4311,7 @@ def shape_attribute_rows(rows: npt.NDArray, ncols: int) -> npt.NDArray:
     return flat if ncols == 1 else flat.reshape(-1, ncols)
 
 
+@_device_result
 def read_chunk_attribute_rows(
     level_group: Group,
     attr_name: str,
@@ -4428,6 +4465,7 @@ def stamp_fragments_tile(level_group: Group, ndim: int) -> bool:
     return True
 
 
+@_device_result
 def read_chunk_vertex_rows(
     level_group: Group,
     chunk_coords: ChunkCoords,
@@ -4502,6 +4540,7 @@ def read_chunk_vertex_rows(
     return np.concatenate(groups, axis=0) if groups else full[:0]
 
 
+@_device_result
 def read_chunk_vertex_buffer(
     level_group: Group,
     chunk_coords: ChunkCoords,
@@ -5103,6 +5142,7 @@ def read_attribute_fragment(
         return default
 
 
+@_device_result
 def read_chunk_fragment_attributes(
     level_group: Group,
     attr_name: str,
@@ -6150,6 +6190,7 @@ def read_links(
     return out
 
 
+@_device_result
 def read_link_arrays(
     level_group: Group,
     *,
@@ -6194,8 +6235,11 @@ def read_link_arrays(
     # ``out[sigma[i]] = placed[i]`` of apply_perm_inverse, as one index.
     inverse: npt.NDArray[np.int64] | None = None
 
-    chunk_parts: list[npt.NDArray[np.int64]] = []
-    vi_parts: list[npt.NDArray[np.int64]] = []
+    # Two passes: work out every segment's layout and cells first, so all
+    # of them are fetched in one batched prefetch rather than one read
+    # per cell -- on an object store, one round trip instead of one per
+    # cell.
+    segments: list[tuple[Any, ...]] = []
     for seg in list_link_offsets(level_group, delta):
         arr_name = f"{family}/{seg}"
         try:
@@ -6220,10 +6264,27 @@ def read_link_arrays(
         flat = delta == 0 and is_intra(offsets)
         cell_dtype = np.dtype(arr_meta.get("dtype", "int64"))
 
+        segments.append((
+            arr_name, offsets, has_perm, ncols, flat, cell_dtype,
+            sorted(level_group.list_chunks(arr_name)),
+        ))
+
+    chunk_parts: list[npt.NDArray[np.int64]] = []
+    vi_parts: list[npt.NDArray[np.int64]] = []
+    with _maybe_batched_reads(level_group, [
+        (seg_info[0], seg_info[6]) for seg_info in segments if seg_info[6]
+    ]):
+        segment_rows = [
+            (seg_info, [
+                (cell_key, level_group.read_bytes(seg_info[0], cell_key))
+                for cell_key in seg_info[6]
+            ])
+            for seg_info in segments
+        ]
+    for (arr_name, offsets, has_perm, ncols, flat, cell_dtype, _keys), blobs in segment_rows:
         cell_rows: list[npt.NDArray[np.int64]] = []
         cell_chunks: list[tuple[ChunkCoords, ...]] = []
-        for cell_key in sorted(level_group.list_chunks(arr_name)):
-            blob = level_group.read_bytes(arr_name, cell_key)
+        for cell_key, blob in blobs:
             if not blob:
                 continue
             rows_arr = _link_cell_rows(
@@ -6437,6 +6498,7 @@ def read_links_for_tuple(
     return out
 
 
+@_device_result
 def read_link_attributes(
     level_group: Group,
     attr_name: str,
@@ -6472,8 +6534,17 @@ def read_link_attributes(
     blocks: list[npt.NDArray] = []
     row_shape: tuple[int, ...] = ()
     out_dtype = np.dtype(dtype) if dtype is not None else np.dtype(np.float32)
-    for seg in list_link_attribute_offsets(level_group, attr_name, delta):
-        full_name = f"{group_path}/{seg}"
+    segments = [
+        (f"{group_path}/{seg}", sorted(level_group.list_chunks(f"{group_path}/{seg}")))
+        for seg in list_link_attribute_offsets(level_group, attr_name, delta)
+    ]
+    # One batched prefetch for every cell of every segment, then decode.
+    with _maybe_batched_reads(level_group, [(n, k) for n, k in segments if k]):
+        fetched = [
+            (full_name, [(k, level_group.read_bytes(full_name, k)) for k in keys])
+            for full_name, keys in segments
+        ]
+    for full_name, blobs in fetched:
         meta = level_group.read_array_meta(full_name) or {}
         # ``dtype`` / ``row_shape`` come from each array's own meta — a
         # bare byte blob is undecodable without them.
@@ -6483,8 +6554,7 @@ def read_link_attributes(
         row_shape = tuple(meta.get("row_shape", ()))
         row_size = int(np.prod(row_shape)) if row_shape else 1
         row_bytes = out_dtype.itemsize * row_size
-        for cell_key in sorted(level_group.list_chunks(full_name)):
-            blob = level_group.read_bytes(full_name, cell_key)
+        for _cell_key, blob in blobs:
             if not blob:
                 continue
             n = len(blob) // row_bytes

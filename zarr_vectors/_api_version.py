@@ -57,6 +57,9 @@ FEATURES: frozenset[str] = frozenset({
     # zarr_vectors.runtime_capabilities() reports what this install can
     # do, including whether device arrays are usable.
     "runtime-capabilities",
+    # building.read_cells / read_neighbourhood: many cells of many arrays
+    # in one prefetch, as CSR; flat readers and ReadResult take device=.
+    "read-cells",
 })
 
 

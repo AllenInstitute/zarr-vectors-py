@@ -308,6 +308,35 @@ class ReadResult:
             bits.append(f"errors={len(self.errors)}")
         return f"ReadResult({', '.join(bits)})"
 
+    def to_device(self, device: str) -> ReadResult:
+        """This result with its arrays on ``device`` (``"cpu"`` or ``"cuda"``).
+
+        One copy per array: positions, part objects, object ids, edges,
+        faces and every attribute. Terminal: filter first, because
+        :meth:`restrict` works on host arrays. ``"cuda"`` needs the
+        optional GPU extension (``pip install "zarr-vectors[gpu]"``).
+        """
+        from zarr_vectors import _xp
+
+        target = _xp.resolve_device(device)
+
+        def move(a: Any) -> Any:
+            return None if a is None else _xp.to_device(a, target)
+
+        return type(self)(
+            kind=self.kind,
+            positions=move(self.positions),
+            parts=self.parts,
+            part_objects=move(self.part_objects),
+            object_ids=move(self.object_ids),
+            edges=move(self.edges),
+            faces=move(self.faces),
+            attributes=Attributes({k: move(v) for k, v in self.attributes.items()}),
+            attributes_read=self.attributes_read,
+            truncated=self.truncated,
+            errors=self.errors,
+        )
+
     def restrict(self, keep: npt.NDArray[np.bool_], *, truncated: bool = False) -> ReadResult:
         """This result with only the vertices ``keep`` selects.
 
@@ -321,6 +350,13 @@ class ReadResult:
         Parts are re-cut from what survives, so a partly-kept polyline
         stays one part and simply gets shorter.
         """
+        from zarr_vectors import _xp
+        from zarr_vectors.exceptions import ZVError
+
+        if _xp.is_device_array(self.positions):
+            raise ZVError(
+                "restrict() works on host arrays; filter before to_device()"
+            )
         keep = np.asarray(keep, dtype=bool)
         if keep.all():
             return self if not truncated else replace_truncated(self, True)

@@ -492,6 +492,8 @@ class Group:
     def batched_reads(
         self,
         plan: list[tuple[str, list[str]]],
+        *,
+        tolerant: bool = False,
     ) -> Iterator[None]:
         """Prefetch every chunk in ``plan`` via one
         :func:`asyncio.gather` and serve subsequent :meth:`read_bytes`
@@ -514,6 +516,10 @@ class Group:
 
         Nesting is not supported and raises :class:`StoreError`.
         Writes inside the block are unaffected.
+
+        ``tolerant=True`` keeps one failing cell from failing the whole
+        prefetch: it is left uncached, and reading it inside the block
+        raises its own error while every other cell is served.
 
         Example::
 
@@ -562,6 +568,7 @@ class Group:
             self._zarr, plan,
             {name: self._sharded_chunk_array(name) for name in names},
             specs={name: self._direct_spec_cached(name) for name in names},
+            tolerant=tolerant,
         )
         # No node cache opened here, deliberately: :meth:`read_bytes`
         # answers from ``_prefetch_cache`` before it resolves a node, so
