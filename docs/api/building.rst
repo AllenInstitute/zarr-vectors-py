@@ -458,3 +458,35 @@ one-shot counterpart.
 
 .. autofunction:: zarr_vectors.building.read_skeleton_by_segment_id
 
+
+Array-form I/O and device arrays
+--------------------------------
+
+Many cells, many objects or many records per call, as flat arrays rather
+than a Python object each -- the shape a vectorised or GPU pipeline
+already holds. Each writer leaves the store its per-object counterpart
+leaves, byte for byte; each accepts device (cupy) arrays, and the readers
+return them with ``device="cuda"``. See :doc:`../how_to/gpu`.
+
+.. autofunction:: zarr_vectors.building.read_cells
+
+.. autofunction:: zarr_vectors.building.read_neighbourhood
+
+.. autoclass:: zarr_vectors.building.CellBatch
+   :members:
+
+.. autoclass:: zarr_vectors.building.CellColumn
+   :members:
+
+.. autoclass:: zarr_vectors.building.CellReadError
+
+.. autofunction:: zarr_vectors.building.read_all_object_manifests_csr
+
+.. autoclass:: zarr_vectors.building.ManifestCSR
+
+.. autofunction:: zarr_vectors.building.encode_object_manifests_csr
+
+.. autofunction:: zarr_vectors.building.decode_object_manifests_csr
+
+.. autofunction:: zarr_vectors.building.write_object_attribute_columns
+
