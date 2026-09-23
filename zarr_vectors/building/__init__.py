@@ -135,6 +135,7 @@ from zarr_vectors.core.arrays import (
     write_link_attributes,
     write_link_cells,
     write_links,
+    write_object_attribute_columns,
     write_object_attributes,
     write_object_index,
 )
@@ -921,6 +922,7 @@ __all__ = [
     "write_links",
     "write_mesh",
     "write_multiscale_metadata",
+    "write_object_attribute_columns",
     "write_object_attributes",
     "write_object_index",
     "write_object_manifests",

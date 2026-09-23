@@ -1466,6 +1466,7 @@ class Group:
         rows: Any,
         *,
         attributes: dict[str, Any] | None = None,
+        _node: Any = None,
     ) -> int:
         """Append ``rows`` along axis 0, leaving existing rows untouched.
 
@@ -1498,7 +1499,9 @@ class Group:
             StoreError: If ``path`` does not exist or is not an array.
             ValueError: If the tail dimensions do not match.
         """
-        arr = self._require_array_node(path)
+        # ``_node``: a caller that has just resolved the array hands it over
+        # rather than paying a second lookup for it.
+        arr = _node if _node is not None else self._require_array_node(path)
         row_data = np.asarray(rows)
         if tuple(row_data.shape[1:]) != tuple(arr.shape[1:]):
             raise ValueError(

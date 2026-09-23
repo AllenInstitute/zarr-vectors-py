@@ -66,6 +66,9 @@ FEATURES: frozenset[str] = frozenset({
     # write_object_manifests(chunk_coords=, fragment_idx=, ...) and
     # read_all_object_manifests_csr: manifests as arrays both ways.
     "array-manifests",
+    # write_object_attribute_columns: many object attribute columns in
+    # one call, grown in place concurrently.
+    "object-attribute-columns",
 })
 
 
