@@ -22,9 +22,9 @@ _STATIC: dict[str, bool] = {
     "manifests_csr_read": False,
     "object_attribute_columns": False,
     "array_link_cells": False,
-    "read_cells": False,
-    "read_neighbourhood": False,
-    "batched_link_reads": False,
+    "read_cells": True,
+    "read_neighbourhood": True,
+    "batched_link_reads": True,
     # Already true of this build.
     "defer_presence": True,
     "append_safe_sharding": True,

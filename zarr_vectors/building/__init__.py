@@ -137,6 +137,13 @@ from zarr_vectors.core.arrays import (
     write_object_attributes,
     write_object_index,
 )
+from zarr_vectors.core.cells import (
+    CellBatch,
+    CellColumn,
+    CellReadError,
+    read_cells,
+    read_neighbourhood,
+)
 from zarr_vectors.core.group import Group, observe_presence_writes
 from zarr_vectors.core.metadata import (
     LevelMetadata,
@@ -691,6 +698,9 @@ __all__ = [
     "MeshChunkInfo",
     "MeshReader",
     "CAP_FRAGMENT_INDEX",
+    "CellBatch",
+    "CellColumn",
+    "CellReadError",
     "CAP_MULTISCALE_LINKS",
     "CAP_PRESERVED_OBJECT_IDS",
     "CAP_SHARED_FRAGMENTS",
@@ -802,6 +812,7 @@ __all__ = [
     "read_all_groupings",
     "read_all_object_manifests",
     "read_attribute_fragment",
+    "read_cells",
     "read_chunk_attributes",
     "read_chunk_fragment_attributes",
     "read_chunk_link_attributes",
@@ -813,6 +824,7 @@ __all__ = [
     "read_groupings_attributes",
     "read_level_metadata",
     "read_link_arrays",
+    "read_neighbourhood",
     "read_link_attributes",
     "read_links",
     "read_links_for_tuple",
