@@ -433,6 +433,11 @@ zb.write_link_cells(                        # 4. seams and their attributes
 # the coordinator then commits num_objects = n0 + k
 ```
 
+If the store was created with `manifest_layout="dense"`, step 2 writes the
+arrays as they are, with no blob per object, and a later
+`read_all_object_manifests_csr` is a gather rather than a decode; see
+[Dense object indexes](gpu.md#dense-object-indexes).
+
 When every worker has finished, the coordinator runs `zb.finalize_links(lg,
 delta=0)` once. It rebuilds presence for the link, link-attribute and
 link-fragment arrays, which the array-form link writer does not record.
