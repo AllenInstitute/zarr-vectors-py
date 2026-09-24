@@ -42,6 +42,7 @@ if TYPE_CHECKING:
     WriteTarget = StoreLike | Group
 
 from zarr_vectors.constants import (
+    CAP_DENSE_MANIFESTS,
     DEFAULT_AXES_NAMES,
     DEFAULT_BOUNDS_SIDE,
     FORMAT_VERSION,  # noqa: F401  (re-exported for callers)
@@ -374,6 +375,7 @@ def create_store(
     format_capabilities: list[str] | None = None,
     attribute_specs: dict[str, dict[str, Any]] | None = None,
     shard_shape: int | Sequence[int] | None = None,
+    manifest_layout: str | None = None,
     name: str | None = None,
     unit: str | None = None,
     backend: str | None = None,
@@ -468,6 +470,13 @@ def create_store(
             their grids differ.  It is a writer default rather than a
             claim about what is on disk: each array's own ``zarr.json``
             remains the truth about that array.
+        manifest_layout: ``"dense"`` to write object indexes as
+            fixed-width integer arrays (``manifest_spans`` +
+            ``manifest_blocks``) rather than one vlen blob per object;
+            ``None`` or ``"vlen"`` (the default) for blobs. Recorded on
+            the root as the default for every index created later; an
+            index that exists keeps its layout. See
+            :mod:`zarr_vectors.core.dense_manifests`.
         name: Human-readable store name, recorded on the RFC 8 ``ome``
             node so an OME collection can present it.  Defaults to the
             store path's last segment with its extension stripped.  Not an
@@ -574,6 +583,7 @@ def create_store(
         format_capabilities=format_capabilities,
         attribute_specs=attribute_specs,
         shard_shape=shard_shape,
+        manifest_layout=manifest_layout,
         name=name,
     )
 
@@ -656,6 +666,7 @@ def _write_root_attrs(
     format_capabilities: list[str] | None = None,
     attribute_specs: dict[str, dict[str, Any]] | None = None,
     shard_shape: int | Sequence[int] | None = None,
+    manifest_layout: str | None = None,
     name: str | None = None,
 ) -> None:
     """Write the ``zarr_vectors`` root-attrs block plus the eager NGFF
@@ -706,6 +717,17 @@ def _write_root_attrs(
             int(shard_shape) if isinstance(shard_shape, int)
             else [int(x) for x in shard_shape]
         )
+    if manifest_layout not in (None, "vlen", "dense"):
+        raise MetadataError(
+            f"manifest_layout={manifest_layout!r}; expected 'vlen' or 'dense'"
+        )
+    if manifest_layout == "dense":
+        # Absent means vlen, so only the non-default value is written and
+        # a store that never asks carries no key.
+        zv["manifest_layout"] = "dense"
+        caps = list(zv.get("format_capabilities") or [])
+        if CAP_DENSE_MANIFESTS not in caps:
+            zv["format_capabilities"] = [*caps, CAP_DENSE_MANIFESTS]
     if attribute_specs:
         # Only non-empty scopes, so a store that declares nothing carries
         # no key at all rather than three empty dicts.

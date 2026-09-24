@@ -72,6 +72,12 @@ FEATURES: frozenset[str] = frozenset({
     # write_link_cells(chunks=, vids=, attributes=): link records and
     # their attributes as arrays, one read-modify-write per cell.
     "array-link-cells",
+    # create_store(manifest_layout="dense") and write_object_index /
+    # write_object_manifests(layout=): object indexes as fixed-width
+    # integer arrays (format 0.9.4).
+    "dense-manifests",
+    # read_cells(device="cuda", decode=...): cells decoded on the device.
+    "device-decode",
 })
 
 

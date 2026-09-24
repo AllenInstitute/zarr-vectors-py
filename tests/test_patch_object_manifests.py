@@ -11,6 +11,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pytest
+
 from zarr_vectors.building import (
     OBJECT_INDEX_MANIFEST_BUCKET,
     patch_object_manifests,
@@ -36,6 +38,7 @@ def _bucket_files(store: Path) -> dict[str, tuple[int, bytes]]:
     }
 
 
+@pytest.mark.vlen_only
 def test_blanking_touches_only_the_buckets_holding_the_ids(tmp_path):
     n = 3 * B + 10
     path = tmp_path / "s.zarrvectors"

@@ -266,3 +266,21 @@ def assert_arrays_equal():
     def _assert(a: np.ndarray, b: np.ndarray) -> None:
         np.testing.assert_array_equal(a, b)
     return _assert
+
+
+def pytest_addoption(parser):
+    parser.addoption(
+        "--manifest-layout", choices=("vlen", "dense"), default=None,
+        help="Create every new object index in this layout, whatever the "
+             "store declares (runs the whole suite against the dense layout).",
+    )
+
+
+@pytest.fixture(autouse=True)
+def _forced_manifest_layout(request, monkeypatch):
+    layout = request.config.getoption("--manifest-layout")
+    if layout is not None and request.node.get_closest_marker("vlen_only") is None:
+        from zarr_vectors.core import dense_manifests
+
+        monkeypatch.setattr(dense_manifests, "store_default", lambda _lg: layout)
+    yield
