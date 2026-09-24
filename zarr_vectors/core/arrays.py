@@ -2375,6 +2375,19 @@ def _object_array(blobs: Any) -> npt.NDArray[np.object_]:
     return np.fromiter(blobs, dtype=object, count=len(blobs))
 
 
+def _empty_manifests(n: int) -> npt.NDArray[np.object_]:
+    """``n`` empty-manifest blobs as an object array.
+
+    Not ``np.full(n, blob, dtype=object)``: that converts the fill value
+    through a fixed-width byte string, which strips the trailing NULs --
+    and an empty manifest is nothing but four NULs, so it became ``b""``,
+    which no reader accepts.
+    """
+    out = np.empty(max(int(n), 0), dtype=object)
+    out.fill(_EMPTY_MANIFEST_BLOB)
+    return out
+
+
 def _extend_object_id_table(
     level_group: Group, keep: int, new_ids: npt.NDArray[np.int64],
 ) -> None:
@@ -2523,7 +2536,7 @@ def _write_object_index_manifests(
                 _object_array(existing[:start]) if existing is not None
                 else np.empty(0, dtype=object)
             )
-            pad = np.full(start - len(head), _EMPTY_MANIFEST_BLOB, dtype=object)
+            pad = _empty_manifests(start - len(head))
             _write_object_index_manifests(
                 level_group, np.concatenate([head, pad, manifest_blobs]),
             )
@@ -2533,7 +2546,7 @@ def _write_object_index_manifests(
         if n == 0 and start == n0:
             return start
         rows = np.concatenate([
-            np.full(start - n0, _EMPTY_MANIFEST_BLOB, dtype=object), manifest_blobs,
+            _empty_manifests(start - n0), manifest_blobs,
         ])
         total = n0 + len(rows)
         with warnings.catch_warnings():
