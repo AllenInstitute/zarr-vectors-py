@@ -169,6 +169,26 @@ def test_array_appends_leave_the_store_blob_appends_do(tmp_path):
     assert_stores_identical(path_a, path_b)
 
 
+def test_a_gap_is_padded_with_readable_empty_manifests(tmp_path):
+    """Padding rows once came out zero-length, and then no read worked."""
+    from zarr_vectors.building import read_all_object_manifests, write_object_manifests
+
+    _, lg = _store(tmp_path, "gap")
+    write_object_manifests(lg, chunk_coords=[[0, 0, 0]], fragment_idx=[1], mode="append")
+    write_object_manifests(
+        lg, chunk_coords=[[1, 0, 0]], fragment_idx=[2], mode="append", at=4,
+    )  # rows 1..3 are a gap
+    write_object_manifests(
+        lg, chunk_coords=[[1, 1, 0]], fragment_idx=[3], mode="append", at=3,
+    )  # a torn flush reaching back into it
+    _commit(lg, 4)
+    stored = lg.zarr_group["object_index"]["manifests"][:]
+    assert [len(b) for b in stored] == [len(stored[0]), 4, 4, len(stored[3])]
+    assert read_all_object_manifests(lg) == [
+        [((0, 0, 0), 1)], [], [], [((1, 1, 0), 3)],
+    ]
+
+
 def test_the_csr_read_is_the_flattened_manifest_read(tmp_path):
     from zarr_vectors.building import read_all_object_manifests, write_object_manifests
     from zarr_vectors.core.arrays import read_all_object_manifests_csr
