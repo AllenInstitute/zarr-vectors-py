@@ -9,8 +9,20 @@ everywhere in the package.
 # Format version
 # ---------------------------------------------------------------------------
 
-FORMAT_VERSION: str = "0.9.3"
+FORMAT_VERSION: str = "0.9.4"
 """Current ZV specification version.
+
+0.9.4: an optional dense object-index layout, ``"dense_manifests_v1"``:
+``object_index/manifest_spans`` (``int64 (n_objects, 2)``, start and
+count) indexing ``object_index/manifest_blocks`` (``int64 (n_blocks,
+sid_ndim + 1)``, chunk coordinates then fragment index, one row per
+fragment an object references), with ``object_index/object_ids`` as in
+the V2 vlen layout. Chosen per store by the root's
+``manifest_layout: "dense"`` (absent means vlen, so every 0.9.3 store
+reads unchanged), and declared by the ``dense_manifests`` capability.
+A store that uses it is not readable by a 0.9.3 build, whose object
+index reader rejects the unknown ``layout`` with an error rather than
+misreading it.
 
 0.9.3: optional, backward-compatible ``shard_shape`` on the root (absent
 ⇒ unsharded, so 0.9.0-0.9.2 stores read unchanged).  Cells per shard per
@@ -224,6 +236,12 @@ CAP_FRAGMENT_INDEX: str = "fragment_index"
 """The store uses the v0.6 fragment-index encoding for ``vertex_fragments``
 and ``link_fragments`` (single uint8 blob per chunk; see
 :mod:`zarr_vectors.encoding.fragments`)."""
+
+CAP_DENSE_MANIFESTS: str = "dense_manifests"
+"""At least one level's object index is (or will be written) in the
+dense layout, ``"dense_manifests_v1"``: fixed-width integer arrays
+rather than one vlen blob per object. Stamped with the root's
+``manifest_layout: "dense"``."""
 
 CAP_MULTISCALE_LINKS: str = "multiscale_links"
 """Store uses the multiscale links layout (``links/<delta>/<offsets>/``

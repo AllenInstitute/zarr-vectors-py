@@ -157,6 +157,49 @@ Zarr Vectors 0.x stores written with `vlen-bytes` may need to be re-encoded if
 the eventual spec lands incompatibly.
 ```
 
+#### Dense layout (0.9.4)
+
+A store may instead keep its object indexes as fixed-width integer
+arrays, with no blob per object (`layout: "dense_manifests_v1"`):
+
+| Key | Type | Contents |
+|-----|------|----------|
+| `manifest_spans` | `int64`, shape `(num_objects, 2)`, chunked at 16,384 rows | Row `o` is `(start, count)`: object row `o` owns rows `start .. start + count` of `manifest_blocks` |
+| `manifest_blocks` | `int64`, shape `(n_blocks, sid_ndim + 1)`, chunked at 16,384 rows | One row per fragment reference: `sid_ndim` chunk coordinates, then the fragment index |
+| `object_ids` | `int64`, shape `(num_objects,)` | Row `o`'s object id, as in the `vlen_manifests_v2` layout |
+
+An object's blocks are its manifest, in order. Each block names exactly
+one fragment: a range or explicit-list block of the vlen encoding is
+stored as one row per fragment it names. An empty manifest is
+`count == 0` (its `start` is not read). Blocks are not required to be
+contiguous or ordered by object: an append adds rows to both arrays,
+and a patch appends an object's new blocks and rewrites only its span,
+so blocks a patch replaced stay in `manifest_blocks` unreferenced until
+the index is next rewritten in full.
+
+The layout is chosen per store by the root's `manifest_layout: "dense"`
+(absent means vlen), which also stamps the `dense_manifests`
+capability. That is a default for indexes created later: an index keeps
+the layout it was created with, and the `layout` field on
+`object_index` is the truth about it. A reader that finds no `layout`
+it knows, or `manifest_spans` without `manifests`, must not read the
+index as vlen.
+
+Reading every manifest is a gather, with no decode:
+
+```python
+spans  = object_index["manifest_spans"][:]            # (n, 2)
+blocks = object_index["manifest_blocks"][:]           # (b, sid_ndim + 1)
+counts = spans[:, 1]
+offsets = np.concatenate([[0], np.cumsum(counts)])    # CSR over objects
+rows = np.repeat(spans[:, 0], counts) + (
+    np.arange(offsets[-1]) - np.repeat(offsets[:-1], counts))
+chunk_coords, fragment_idx = blocks[rows, :-1], blocks[rows, -1]
+```
+
+Stores that do not use it are unchanged, and a 0.9.3 reader rejects an
+index in this layout by its unknown `layout` rather than misreading it.
+
 #### Legacy layout
 
 Stores written before the `vlen_manifests_v1` layout was introduced
@@ -374,10 +417,17 @@ uniform shape (always an array of indices) can map over the result.
     (legacy layout: `layout` absent).
 - `object_index/`'s `zv_array` metadata names `num_objects` and
   `sid_ndim`.
+- Dense layout (`layout == "dense_manifests_v1"`): `manifest_spans`,
+  `manifest_blocks` and `object_ids` are present and `manifests` is
+  not.
 
 **L2 (metadata).**
 - New layout: `manifests.shape == (num_objects,)` and `manifests.dtype
   == object` (vlen-bytes).
+- Dense layout: `manifest_spans.shape == (num_objects, 2)`,
+  `manifest_blocks.shape[1] == sid_ndim + 1`, both `int64`; every span
+  has `count >= 0`, and a span with `count > 0` lies inside
+  `manifest_blocks`.
 - Legacy layout: `len(offsets) == num_objects`; `offsets` is
   monotonically non-decreasing; `offsets[0] == 0` when `num_objects >
   0`; `offsets[i] <= len(data)` for all `i`.

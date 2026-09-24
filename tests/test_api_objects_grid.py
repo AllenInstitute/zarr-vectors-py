@@ -73,6 +73,7 @@ def _level_group(path):
     return get_resolution_level(open_store(str(path)), 0)
 
 
+@pytest.mark.vlen_only
 class TestSelectiveManifests:
     def test_a_subset_matches_the_full_decode(self, tracts):
         group = _level_group(tracts)

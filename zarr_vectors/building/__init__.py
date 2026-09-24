@@ -473,8 +473,9 @@ def write_object_manifests(
     ids: Any = None,
     mode: str = "replace",
     at: int | None = None,
+    layout: str | None = None,
 ) -> tuple[int, int]:
-    """Write ``object_index/manifests`` as one ragged vlen-bytes array.
+    """Write object manifests to the level's object index.
 
     Give the manifests one of two ways:
 
@@ -487,8 +488,16 @@ def write_object_manifests(
       Python object per object, to the same bytes; device arrays are
       copied to the host once each.
 
-    Only the manifests array is written: committing the index's metadata
-    (``num_objects`` and the rest) stays the caller's step.
+    The index is vlen (one blob per object) or dense (fixed-width integer
+    arrays; see :mod:`zarr_vectors.core.dense_manifests`). An existing
+    index keeps its layout; a new one takes ``layout``, or the store's
+    ``manifest_layout``. On a dense index the array form is written as it
+    is -- no blob per object is ever built, and device arrays are copied
+    to the host once each.
+
+    Only the manifests (and, on an index that stores ids, the id table)
+    are written: committing the index's metadata (``num_objects`` and the
+    rest) stays the caller's step.
 
     Args:
         level_group: Resolution level group.
@@ -505,6 +514,7 @@ def write_object_manifests(
         at: Row index the appended blobs must start at (``mode="append"``
             only).  Pass the object-id being claimed so a torn previous
             flush cannot shift ids; ``None`` appends at the current end.
+        layout: ``"vlen"`` or ``"dense"`` for an index this call creates.
 
     On an index that stores its object ids (layout V2), an append extends
     the id table with ``ids``, or with the rows when the table is simply
@@ -515,7 +525,12 @@ def write_object_manifests(
         ``(first_row, n)``: where the written manifests start, and how many.
     """
     from zarr_vectors import _xp
-    from zarr_vectors.core.arrays import _write_object_index_manifests
+    from zarr_vectors.core.arrays import (
+        _index_layout_for_write,
+        _index_sid_ndim,
+        _write_dense_index,
+        _write_object_index_manifests,
+    )
     from zarr_vectors.encoding.fragments import encode_object_manifests_csr
 
     as_arrays = chunk_coords is not None or fragment_idx is not None
@@ -526,6 +541,26 @@ def write_object_manifests(
             "give manifest_blobs, or chunk_coords and fragment_idx "
             "(optionally with manifest_offsets), not both"
         )
+    if as_arrays and _index_layout_for_write(level_group, layout) == "dense":
+        import numpy as np
+
+        cc = _xp.to_host(chunk_coords, dtype=np.int64)
+        fi = _xp.to_host(fragment_idx, dtype=np.int64).reshape(-1)
+        sid = _index_sid_ndim(level_group)
+        cc = cc.reshape(-1, sid)
+        off = (
+            np.arange(fi.size + 1, dtype=np.int64) if manifest_offsets is None
+            else _xp.to_host(manifest_offsets, dtype=np.int64)
+        )
+        if off.size == 0 or off[0] != 0 or off[-1] != fi.size or np.any(np.diff(off) < 0):
+            raise ArrayError(
+                f"manifest_offsets must start at 0, end at {fi.size} and not decrease"
+            )
+        first = _write_dense_index(
+            level_group, off, cc, fi, mode=mode, at=at,
+            ids=None if ids is None else _xp.to_host(ids), sid_ndim=sid,
+        )
+        return int(first), int(off.size - 1)
     if as_arrays:
         try:
             sid = int((level_group.read_array_meta(OBJECT_INDEX) or {}).get("sid_ndim"))
@@ -536,7 +571,7 @@ def write_object_manifests(
         )
     first = _write_object_index_manifests(
         level_group, manifest_blobs, mode=mode, at=at,
-        ids=None if ids is None else _xp.to_host(ids),
+        ids=None if ids is None else _xp.to_host(ids), layout=layout,
     )
     return int(first), len(manifest_blobs)
 

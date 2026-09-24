@@ -112,6 +112,12 @@ OBJECT_INDEX_LAYOUT_V1 = "vlen_manifests_v1"
 #: cut here and 0.9.x stores keep reading unchanged.
 OBJECT_INDEX_LAYOUT_V2 = "vlen_manifests_v2"
 
+#: Layout in which manifests are fixed-width integer arrays rather than
+#: vlen blobs; see :mod:`zarr_vectors.core.dense_manifests`. Ids are
+#: stored as under V2.
+OBJECT_INDEX_LAYOUT_DENSE = "dense_manifests_v1"
+_LAYOUT_DENSE = OBJECT_INDEX_LAYOUT_DENSE
+
 #: Name of the row-to-id array under ``object_index/``.
 OBJECT_IDS_ARRAY = "object_ids"
 
@@ -2162,6 +2168,7 @@ def write_object_index(
     sid_ndim: int,
     *,
     total_objects: int | None = None,
+    layout: str | None = None,
 ) -> None:
     """Write object index: object_id → ordered fragment references.
 
@@ -2177,6 +2184,10 @@ def write_object_index(
             sparse subset of the parent's OID space.  When ``None``
             (default), the size is ``max(manifests.keys()) + 1``
             (legacy behaviour).
+        layout: ``"vlen"`` or ``"dense"`` (see
+            :mod:`zarr_vectors.core.dense_manifests`). ``None`` keeps the
+            index's current layout, or takes the store's
+            ``manifest_layout`` for a new one.
     """
     if not manifests and total_objects is None:
         return
@@ -2197,6 +2208,24 @@ def write_object_index(
     manifest_list: list[list[tuple[tuple[int, ...], int]]] = [
         manifests.get(oid, []) for oid in row_ids
     ]
+    if _index_layout_for_write(level_group, layout) == "dense":
+        from zarr_vectors.core import dense_manifests as dense
+
+        offsets, coords, frags = dense.csr_from_manifests(manifest_list, sid_ndim)
+        _write_dense_index(
+            level_group, offsets, coords, frags,
+            mode="replace", at=None, ids=None, sid_ndim=sid_ndim,
+        )
+        _write_object_id_table(level_group, row_ids)
+        level_group.write_array_meta(OBJECT_INDEX, {
+            "zv_array": "object_index",
+            "num_objects": len(row_ids),
+            "num_present": int(np.count_nonzero(np.diff(offsets))),
+            "sid_ndim": sid_ndim,
+            "layout": dense.OBJECT_INDEX_LAYOUT_DENSE,
+            OBJECT_IDS_SORTED_ATTR: True,
+        })
+        return
 
     # v0.6 manifest-block encoding.  Each old (chunk, fragment_index) tuple
     # becomes one mode-0 (single fragment) block.  Range / explicit
@@ -2211,7 +2240,7 @@ def write_object_index(
     # its business instead of ours.
     _empty_manifest = encode_object_manifest_blocks([], sid_ndim=sid_ndim)
 
-    _write_object_index_manifests(level_group, manifest_blobs)
+    _write_object_index_manifests(level_group, manifest_blobs, layout="vlen")
     _write_object_id_table(level_group, row_ids)
     level_group.write_array_meta(OBJECT_INDEX, {
         "zv_array": "object_index",
@@ -2272,6 +2301,11 @@ def patch_object_manifests(
     if not updates:
         return
 
+    from zarr_vectors.core import dense_manifests as dense
+
+    if dense.is_dense(level_group):
+        _patch_dense_manifests(level_group, updates, sid_ndim)
+        return
     oi_group = level_group.zarr_group.require_group(OBJECT_INDEX)
     if "manifests" not in oi_group:
         # Nothing to patch into -- this is the first index for the level.
@@ -2363,6 +2397,53 @@ def patch_object_manifests(
     level_group.write_array_meta(OBJECT_INDEX, new_meta)
 
 
+def _patch_dense_manifests(
+    level_group: Group, updates: dict[int, ObjectManifest], sid_ndim: int,
+) -> None:
+    """:func:`patch_object_manifests` for a dense index: the new blocks are
+    appended and only the patched objects' span rows rewritten."""
+    from zarr_vectors.core import dense_manifests as dense
+
+    meta = level_group.read_array_meta(OBJECT_INDEX)
+    n0 = dense.num_rows(level_group)
+    ids = sorted(int(o) for o in updates)
+    known, known_rows = object_rows_for_ids(level_group, ids)
+    row_of = dict(zip(known.tolist(), known_rows.tolist()))
+    fresh = [o for o in ids if o not in row_of]
+    _check_object_index_size(n0 + len(fresh), n0 + len(fresh))
+    for offset, oid in enumerate(fresh):
+        row_of[oid] = n0 + offset
+    offsets, coords, frags = dense.csr_from_manifests(
+        [updates[o] or [] for o in ids], sid_ndim,
+    )
+    held = dense.patch(
+        level_group, np.asarray([row_of[o] for o in ids], dtype=np.int64),
+        offsets, coords, frags, sid_ndim=sid_ndim,
+    )
+    if fresh:
+        table = read_object_id_table(level_group)
+        if table is None:
+            table = np.arange(n0, dtype=np.int64)
+        _write_object_id_table(
+            level_group, np.concatenate([table, np.asarray(fresh, dtype=np.int64)]).tolist(),
+        )
+    now = int(np.count_nonzero(np.diff(offsets)))
+    prior_present = int(meta.get("num_present", meta.get("num_objects", n0)))
+    new_meta = {
+        **meta,
+        "num_objects": n0 + len(fresh),
+        "num_present": max(0, prior_present - int(held.sum()) + now),
+        "sid_ndim": sid_ndim,
+        "layout": dense.OBJECT_INDEX_LAYOUT_DENSE,
+    }
+    if fresh:
+        table = read_object_id_table(level_group)
+        new_meta[OBJECT_IDS_SORTED_ATTR] = bool(
+            meta.get(OBJECT_IDS_SORTED_ATTR) and np.all(np.diff(table) > 0)
+        )
+    level_group.write_array_meta(OBJECT_INDEX, new_meta)
+
+
 def _object_array(blobs: Any) -> npt.NDArray[np.object_]:
     """``blobs`` as a 1-D object array of ``bytes``, without a Python loop.
 
@@ -2435,9 +2516,9 @@ def _ids_for_append(
     """
     meta = level_group.read_array_meta(OBJECT_INDEX) if OBJECT_INDEX in level_group else {}
     table_path = f"{OBJECT_INDEX}/{OBJECT_IDS_ARRAY}"
-    stored = (meta or {}).get("layout") == OBJECT_INDEX_LAYOUT_V2 and (
-        level_group.array_exists(table_path)
-    )
+    stored = (meta or {}).get("layout") in (
+        OBJECT_INDEX_LAYOUT_V2, _LAYOUT_DENSE,
+    ) and level_group.array_exists(table_path)
     new_ids = None if ids is None else np.asarray(ids, dtype=np.int64).reshape(-1)
     if new_ids is not None and new_ids.size != n_new:
         raise ArrayError(f"{new_ids.size} ids for {n_new} manifests")
@@ -2450,27 +2531,129 @@ def _ids_for_append(
                 "i); ids= must be the rows being written"
             )
         return None
-    if start > n_rows:
-        raise ArrayError(
-            "cannot pad an object index that stores its ids: the padding "
-            "rows would have none"
-        )
-    if new_ids is not None:
-        return new_ids
     node = level_group.zarr_group[table_path]
     n_ids = int(node.shape[0])
-    identity = n_ids == start and (
-        n_ids == 0 or (
-            bool(meta.get(OBJECT_IDS_SORTED_ATTR, False))
-            and int(node[0]) == 0 and int(node[n_ids - 1]) == n_ids - 1
-        )
+    # The table is the rows themselves -- what an index built by appends
+    # without ids holds -- so a row's id is its row, padding included.
+    keep = min(start, n_ids)
+    identity = keep == 0 or (
+        bool(meta.get(OBJECT_IDS_SORTED_ATTR, False))
+        and int(node[0]) == 0 and int(node[keep - 1]) == keep - 1
     )
-    if not identity:
+    if start > n_rows:
+        dense_identity = (
+            meta.get("layout") == _LAYOUT_DENSE and identity and new_ids is None
+            and n_ids == n_rows
+        )
+        if not dense_identity:
+            raise ArrayError(
+                "cannot pad an object index that stores its ids: the padding "
+                "rows would have none"
+            )
+    if new_ids is not None:
+        return new_ids
+    if not identity or n_ids < start and n_ids != n_rows:
         raise ArrayError(
             "this object index stores its ids, and they are not simply the "
             "rows; pass ids= for the objects being appended"
         )
     return np.arange(start, start + n_new, dtype=np.int64)
+
+
+def _index_layout_for_write(level_group: Group, requested: str | None = None) -> str:
+    """``"dense"`` or ``"vlen"``: the layout a write to this index uses.
+
+    An explicit request wins; an index that exists keeps its layout; a
+    new one takes the store's ``manifest_layout``.
+    """
+    from zarr_vectors.core import dense_manifests as dense
+
+    if requested is not None:
+        if requested not in ("vlen", "dense"):
+            raise ArrayError(f"layout={requested!r}; expected 'vlen' or 'dense'")
+        return requested
+    if dense.is_dense(level_group):
+        return "dense"
+    if level_group.array_exists(f"{OBJECT_INDEX}/manifests"):
+        return "vlen"
+    return dense.store_default(level_group)
+
+
+def _index_sid_ndim(level_group: Group) -> int:
+    try:
+        meta = level_group.read_array_meta(OBJECT_INDEX) or {}
+    except Exception:
+        meta = {}
+    if meta.get("sid_ndim") is not None:
+        return int(meta["sid_ndim"])
+    return _infer_vert_ndim(level_group)
+
+
+def _write_dense_index(
+    level_group: Group,
+    offsets: Any,
+    coords: Any,
+    frags: Any,
+    *,
+    mode: Literal["replace", "append"],
+    at: int | None,
+    ids: Any,
+    sid_ndim: int,
+) -> int:
+    """Write manifests as CSR arrays to a dense index (see
+    :mod:`zarr_vectors.core.dense_manifests`), keeping its id table and
+    ``layout`` stamp in step. Returns the first row written."""
+    from zarr_vectors.core import dense_manifests as dense
+
+    if mode == "replace" and level_group.array_exists(f"{OBJECT_INDEX}/manifests"):
+        oi = level_group.zarr_group.require_group(OBJECT_INDEX)
+        for legacy in ("manifests", "data", "offsets"):
+            if legacy in oi:
+                del oi[legacy]
+        level_group._invalidate_node(f"{OBJECT_INDEX}/manifests")
+    fresh = not dense.is_dense(level_group)
+    n = int(np.asarray(offsets).size) - 1
+    n0 = 0 if fresh or mode == "replace" else dense.num_rows(level_group)
+    start = n0 if at is None or mode == "replace" else int(at)
+    new_ids = None
+    if mode == "append" and not fresh:
+        new_ids = _ids_for_append(level_group, start, n0, n, ids)
+    first = dense.write(
+        level_group, offsets, coords, frags, sid_ndim=sid_ndim, mode=mode, at=at,
+    )
+    meta = level_group.read_array_meta(OBJECT_INDEX) or {}
+    level_group.write_array_meta(OBJECT_INDEX, {
+        "zv_array": "object_index",
+        **{k: v for k, v in meta.items() if k != "layout"},
+        "sid_ndim": sid_ndim,
+        "layout": dense.OBJECT_INDEX_LAYOUT_DENSE,
+    })
+    if mode == "append":
+        if fresh:
+            # A new index: ids are the rows unless the caller named them.
+            table = (
+                np.arange(first + n, dtype=np.int64) if ids is None
+                else np.concatenate([
+                    np.arange(first, dtype=np.int64),
+                    np.asarray(ids, dtype=np.int64).reshape(-1),
+                ])
+            )
+            level_group.write_array(
+                f"{OBJECT_INDEX}/{OBJECT_IDS_ARRAY}", table,
+                chunks=(OBJECT_INDEX_MANIFEST_BUCKET,),
+            )
+            level_group.write_array_meta(OBJECT_INDEX, {
+                OBJECT_IDS_SORTED_ATTR: bool(np.all(np.diff(table) > 0)),
+            })
+        elif new_ids is not None:
+            n_ids = int(level_group.zarr_group[f"{OBJECT_INDEX}/{OBJECT_IDS_ARRAY}"].shape[0])
+            if start > n_ids:
+                # Padding rows of an identity table: their ids are their rows.
+                new_ids = np.concatenate([np.arange(n_ids, start, dtype=np.int64), new_ids])
+                _extend_object_id_table(level_group, n_ids, new_ids)
+            else:
+                _extend_object_id_table(level_group, start, new_ids)
+    return first
 
 
 def _write_object_index_manifests(
@@ -2480,6 +2663,7 @@ def _write_object_index_manifests(
     mode: Literal["replace", "append"] = "replace",
     at: int | None = None,
     ids: Any = None,
+    layout: str | None = None,
 ) -> int:
     """Write ``object_index/manifests`` as a single ragged vlen-bytes array.
 
@@ -2510,10 +2694,24 @@ def _write_object_index_manifests(
     :func:`_ids_for_append`). Replace mode leaves ids to the caller, as
     :func:`write_object_index` does.
 
+    On a dense index (see :mod:`zarr_vectors.core.dense_manifests`) the
+    blobs are decoded to arrays and written there instead; ``layout``
+    chooses for an index this call creates.
+
     Returns:
         The row the written blobs start at.
     """
     manifest_blobs = _object_array(manifest_blobs)
+    if _index_layout_for_write(level_group, layout) == "dense":
+        sid = _index_sid_ndim(level_group)
+        offsets, coords, frags = decode_object_manifests_csr(list(manifest_blobs), sid)
+        return _write_dense_index(
+            level_group, offsets, coords, frags,
+            mode=mode, at=at, ids=ids, sid_ndim=sid,
+        )
+    from zarr_vectors.core import dense_manifests as dense
+
+    dense.remove(level_group)
     n = len(manifest_blobs)
     oi_group = level_group.zarr_group.require_group(OBJECT_INDEX)
 
@@ -6005,6 +6203,10 @@ def read_object_manifest(
             f"Object ID {object_id} is not in this level "
             f"({num_objects} object(s))"
         )
+    from zarr_vectors.core import dense_manifests as dense
+
+    if dense.is_dense(level_group, meta):
+        return dense.manifests_from_csr(*dense.read_csr(level_group, rows[:1]))[0]
     # Via the Group rather than the raw zarr node, so the read passes a
     # chokepoint the offline snapshot can serve (see Group.offline_reads).
     # Slice-then-extract, never scalar-index: see zarr_vectors.core._vlen.
@@ -6031,6 +6233,10 @@ def read_all_object_manifests(
     _require_object_index_layout(meta)
     if num_objects == 0:
         return []
+    from zarr_vectors.core import dense_manifests as dense
+
+    if dense.is_dense(level_group, meta):
+        return dense.manifests_from_csr(*dense.read_csr(level_group))
     # Via the Group rather than the raw zarr node, so the read passes a
     # chokepoint the offline snapshot can serve (see Group.offline_reads).
     blobs = level_group.read_vlen_array(f"{OBJECT_INDEX}/manifests")
@@ -6062,11 +6268,19 @@ def _manifest_csr_arrays(level_group: Group) -> tuple[npt.NDArray, ...]:
     _require_object_index_layout(meta)
     sid_ndim = int(meta["sid_ndim"])
     num_objects = int(meta.get("num_objects", 0))
-    blobs = (
-        level_group.read_vlen_array_raw(f"{OBJECT_INDEX}/manifests", stop=num_objects)
-        if num_objects else np.empty(0, dtype=object)
-    )
-    offsets, coords, frags = decode_object_manifests_csr(blobs, sid_ndim)
+    from zarr_vectors.core import dense_manifests as dense
+
+    if dense.is_dense(level_group, meta):
+        offsets, coords, frags = (
+            dense.read_csr(level_group, stop=num_objects) if num_objects
+            else (np.zeros(1, np.int64), np.empty((0, sid_ndim), np.int64), np.empty(0, np.int64))
+        )
+    else:
+        blobs = (
+            level_group.read_vlen_array_raw(f"{OBJECT_INDEX}/manifests", stop=num_objects)
+            if num_objects else np.empty(0, dtype=object)
+        )
+        offsets, coords, frags = decode_object_manifests_csr(blobs, sid_ndim)
     if len(offsets) - 1 < num_objects:
         # A committed count past the stored rows: the missing rows are
         # objects with no fragments, as a read by id would find them.
@@ -6273,6 +6487,19 @@ def read_object_manifests(
     if num_objects == 0:
         return {}
 
+    from zarr_vectors.core import dense_manifests as dense
+
+    if dense.is_dense(level_group, meta):
+        if ids is None:
+            rows = None
+            wanted = object_ids_for_rows(level_group).tolist()
+        else:
+            found, rows = object_rows_for_ids(level_group, list(ids))
+            if found.size == 0:
+                return {}
+            wanted = found.tolist()
+        manifests = dense.manifests_from_csr(*dense.read_csr(level_group, rows))
+        return dict(zip(wanted, manifests))
     path = f"{OBJECT_INDEX}/manifests"
     if ids is None:
         blobs = level_group.read_vlen_array(path)
@@ -6306,7 +6533,7 @@ def read_object_id_table(level_group: Group) -> npt.NDArray[np.int64] | None:
         meta = level_group.read_array_meta(OBJECT_INDEX)
     except Exception:
         return None
-    if meta.get("layout") != OBJECT_INDEX_LAYOUT_V2:
+    if meta.get("layout") not in (OBJECT_INDEX_LAYOUT_V2, _LAYOUT_DENSE):
         return None
     try:
         table = level_group.read_array(f"{OBJECT_INDEX}/{OBJECT_IDS_ARRAY}")
@@ -6429,6 +6656,10 @@ def object_present_mask(level_group: Group) -> npt.NDArray[np.bool_]:
     _require_object_index_layout(meta)
     if int(meta.get("num_objects", 0)) == 0:
         return np.zeros((0,), dtype=bool)
+    from zarr_vectors.core import dense_manifests as dense
+
+    if dense.is_dense(level_group, meta):
+        return dense.present_mask(level_group)
     blobs = level_group.read_vlen_array(f"{OBJECT_INDEX}/manifests")
     # A never-written row reads back empty, which is absent too.
     return np.array(
@@ -6462,7 +6693,7 @@ def _require_object_index_layout(meta: dict[str, Any]) -> None:
     than this build supports.
     """
     layout = meta.get("layout")
-    if layout in (OBJECT_INDEX_LAYOUT_V1, OBJECT_INDEX_LAYOUT_V2):
+    if layout in (OBJECT_INDEX_LAYOUT_V1, OBJECT_INDEX_LAYOUT_V2, _LAYOUT_DENSE):
         return
     _require_object_index_v1(meta)
 

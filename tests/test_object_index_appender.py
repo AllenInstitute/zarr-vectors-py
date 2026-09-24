@@ -18,6 +18,7 @@ from __future__ import annotations
 from pathlib import Path
 
 import numpy as np
+import pytest
 
 from zarr_vectors.constants import OBJECT_INDEX
 from zarr_vectors.core.arrays import (
@@ -97,6 +98,7 @@ def test_parity_with_full_rebuild(tmp_path: Path):
     assert list(read_group_object_ids(stream, 1)) == path_oids
 
 
+@pytest.mark.vlen_only
 def test_base_oid_truncation(tmp_path: Path):
     n, stale, k = 5, 8, 6  # fragments [0,5), stale paths [5,13)
     m = n + stale

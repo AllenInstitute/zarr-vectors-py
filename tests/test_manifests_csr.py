@@ -169,6 +169,7 @@ def test_array_appends_leave_the_store_blob_appends_do(tmp_path):
     assert_stores_identical(path_a, path_b)
 
 
+@pytest.mark.vlen_only
 def test_a_gap_is_padded_with_readable_empty_manifests(tmp_path):
     """Padding rows once came out zero-length, and then no read worked."""
     from zarr_vectors.building import read_all_object_manifests, write_object_manifests
@@ -268,6 +269,7 @@ def test_a_v2_append_without_ids_raises_unless_the_table_is_the_rows(tmp_path):
     assert object_ids_for_rows(dense).tolist()[:4] == [0, 1, 2, 3]
 
 
+@pytest.mark.vlen_only
 def test_positional_ids_must_be_the_rows(tmp_path):
     from zarr_vectors.building import write_object_manifests
 

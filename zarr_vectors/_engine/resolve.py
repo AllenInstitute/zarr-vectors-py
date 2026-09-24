@@ -74,6 +74,10 @@ class LevelContext:
     bounds: tuple[tuple[float, ...], tuple[float, ...]] | None = None
     attribute_names: tuple[str, ...] = ()
     has_object_index: bool = False
+    manifest_layout: str = "vlen"
+    """The layout the object index is stored in: ``"vlen"`` (one blob per
+    object, in ``manifests``) or ``"dense"`` (``manifest_spans`` into
+    ``manifest_blocks``). Only which arrays are taken whole depends on it."""
     known_cells: tuple[str, ...] = ()
     """Cells known to be populated, when the caller already knows.
 
@@ -127,8 +131,16 @@ def _arrays_for(
         ]
     whole = []
     if ctx.has_object_index:
+        dense = ctx.manifest_layout == "dense"
         if by_object:
             whole.append(ctx.path(OBJECT_INDEX, _OBJECT_IDS_TABLE))
+            if dense:
+                # One span row per object; the blocks it names are
+                # fetched when the reader asks for them.
+                whole.append(ctx.path(OBJECT_INDEX, "manifest_spans"))
+        elif dense:
+            whole.append(ctx.path(OBJECT_INDEX, "manifest_spans"))
+            whole.append(ctx.path(OBJECT_INDEX, "manifest_blocks"))
         else:
             whole.append(ctx.path(OBJECT_INDEX, "manifests"))
     return _Wanted(arrays=tuple(arrays), whole_arrays=tuple(whole))
@@ -349,6 +361,9 @@ def context_from_level(level: Any) -> LevelContext:
         ),
         attribute_names=level.attribute_names("vertex"),
         has_object_index=True,
+        manifest_layout=(
+            "dense" if getattr(root, "manifest_layout", None) == "dense" else "vlen"
+        ),
         known_cells=_known_cells(level),
     )
 

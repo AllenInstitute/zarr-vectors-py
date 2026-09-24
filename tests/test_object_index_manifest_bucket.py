@@ -48,6 +48,8 @@ from zarr_vectors.core.arrays import (
     OBJECT_INDEX_MANIFEST_BUCKET,
 )
 
+pytestmark = pytest.mark.vlen_only
+
 SID_NDIM = 3
 
 
