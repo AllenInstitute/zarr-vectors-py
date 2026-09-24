@@ -16,6 +16,7 @@ Name: zarr_vectors
 | [AttributeMeta](AttributeMeta.md) | `` |
 | [AttributeSpecs](AttributeSpecs.md) | What the store declares its attributes to be, keyed by scope (``vertex`` / ``... |
 | [Axis](Axis.md) | One axis of the spatial index |
+| [BinLabel](BinLabel.md) | One entry of ``chunk_attribute_values``: a string or a number |
 | [BoundingBox](BoundingBox.md) | Two parallel ``ndim``-length arrays representing the global ``(min_corner, ma... |
 | [CRS](CRS.md) | Free-form coordinate reference system metadata |
 | [FragmentAttributeMeta](FragmentAttributeMeta.md) | `` |
@@ -45,7 +46,7 @@ Name: zarr_vectors
 | [bounds](bounds.md) | Global vertex bounding box |
 | [channel_names](channel_names.md) | For multi-channel per-vertex attributes, the channel labels |
 | [chunk_attribute_name](chunk_attribute_name.md) | Name of the per-vertex attribute used as the leading chunk axis |
-| [chunk_attribute_values](chunk_attribute_values.md) | Ordered list mapping attribute-bin index to original attribute value |
+| [chunk_attribute_values](chunk_attribute_values.md) | One label per leading-axis bin, in bin order: entry ``i`` is what a reader's ... |
 | [chunk_dims](chunk_dims.md) | Chunk-key axis names; the leading axis names appear first |
 | [chunk_shape](chunk_shape.md) | Physical spatial chunk size per axis (all values > 0) |
 | [coarsening_method](coarsening_method.md) | How this level was generated (e |
@@ -61,10 +62,12 @@ Name: zarr_vectors
 | [geometry_types](geometry_types.md) | One or more geometry kinds present in the store |
 | [has_perm](has_perm.md) | Whether each row of this links array carries a leading ``perm_idx`` column — ... |
 | [inherited_num_objects](inherited_num_objects.md) | OID-space size inherited from the parent level (= ``parent_level |
+| [layout](layout.md) | The object index's storage layout: ``vlen_manifests_v1`` (vlen blobs, rows ar... |
 | [level](level.md) | Resolution level index (0 = full resolution) |
 | [level_delta](level_delta.md) | Pyramid-level delta between the source side (the level that owns this array) ... |
 | [link_width](link_width.md) | Width of a links row (1 for parent→child metanode references, 2 for edges, 3 ... |
 | [links_convention](links_convention.md) |  |
+| [manifest_layout](manifest_layout.md) | ``dense`` when object indexes are created in the dense layout (``manifest_spa... |
 | [max_corner](max_corner.md) | Per-axis maxima |
 | [min_corner](min_corner.md) | Per-axis minima |
 | [name](name.md) | NGFF axis or attribute name (e |
@@ -102,7 +105,9 @@ Name: zarr_vectors
 | [FormatCapability](FormatCapability.md) | Optional feature tokens a store advertises in :attr:`RootMetadata |
 | [GeometryType](GeometryType.md) | The kind of geometry a store (or one of its sub-types) holds |
 | [LinksConvention](LinksConvention.md) | How intra-chunk links are represented for a polyline/graph/mesh |
+| [ManifestLayout](ManifestLayout.md) | Object-index layout a store creates new indexes in |
 | [ObjectIndexConvention](ObjectIndexConvention.md) | How the object_id → fragment mapping is encoded |
+| [ObjectIndexLayout](ObjectIndexLayout.md) | How one object index stores its manifests |
 | [ZvArrayTag](ZvArrayTag.md) | Discriminator value for per-array `` |
 
 
@@ -136,219 +141,6 @@ Name: zarr_vectors
 | Subset | Description |
 | --- | --- |
 
-
-
----
-
----
-search:
-  boost: 5.0
----
-
-# Slot: arrays_present 
-
-
-_Names of arrays present in the level group._
-
-
-
-<div data-search-exclude markdown="1">
-
-
-
-URI: [zv:arrays_present](https://w3id.org/zarr-vectors/schema/0.5/arrays_present)
-<!-- no inheritance hierarchy -->
-
-
-
-
-
-## Applicable Classes
-
-| Name | Description | Modifies Slot |
-| --- | --- | --- |
-| [LevelMetadata](LevelMetadata.md) | Per-resolution-level `` |  no  |
-
-
-
-
-
-
-## Properties
-
-### Type and Range
-
-| Property | Value |
-| --- | --- |
-| Range | [String](String.md) |
-| Domain Of | [LevelMetadata](LevelMetadata.md) |
-
-### Cardinality and Requirements
-
-| Property | Value |
-| --- | --- |
-| Required | Yes |
-| Multivalued | Yes |
-
-
-
-
-
-
-
-
-
-
-## Identifier and Mapping Information
-
-
-
-
-
-### Schema Source
-
-
-* from schema: https://w3id.org/zarr-vectors/schema/0.5
-
-
-
-
-## Mappings
-
-| Mapping Type | Mapped Value |
-| ---  | ---  |
-| self | zv:arrays_present |
-| native | zv:arrays_present |
-
-
-
-
-## LinkML Source
-
-<details>
-```yaml
-name: arrays_present
-description: Names of arrays present in the level group.
-from_schema: https://w3id.org/zarr-vectors/schema/0.5
-rank: 1000
-domain_of:
-- LevelMetadata
-range: string
-required: true
-multivalued: true
-
-```
-</details></div>
-
-
----
-
----
-search:
-  boost: 5.0
----
-
-# Slot: attribute_specs 
-
-
-_What the store declares its attributes to be, keyed by scope (``vertex`` / ``object`` / ``link``) and then by attribute name. Each entry carries ``dtype`` and optionally ``channels``, ``categorical``, ``unit`` and ``description``.  Optional and backward-compatible from 0.9.1: absent means undeclared, which is every store written before it.  A declaration is not a promise the array exists -- the array appears when data is written -- but it is what lets a Schema round-trip and what ``open_or_create`` compares against.  ``unit`` and ``description`` are additionally stamped on the attribute array's own metadata block._
-
-__
-
-
-
-<div data-search-exclude markdown="1">
-
-
-
-URI: [zv:attribute_specs](https://w3id.org/zarr-vectors/schema/0.5/attribute_specs)
-<!-- no inheritance hierarchy -->
-
-
-
-
-
-## Applicable Classes
-
-| Name | Description | Modifies Slot |
-| --- | --- | --- |
-| [RootMetadata](RootMetadata.md) | Root-level `` |  no  |
-
-
-
-
-
-
-## Properties
-
-### Type and Range
-
-| Property | Value |
-| --- | --- |
-| Range | [AttributeSpecs](AttributeSpecs.md) |
-| Domain Of | [RootMetadata](RootMetadata.md) |
-
-### Cardinality and Requirements
-
-| Property | Value |
-| --- | --- |
-
-
-
-
-
-
-
-
-
-
-## Identifier and Mapping Information
-
-
-
-
-
-### Schema Source
-
-
-* from schema: https://w3id.org/zarr-vectors/schema/0.5
-
-
-
-
-## Mappings
-
-| Mapping Type | Mapped Value |
-| ---  | ---  |
-| self | zv:attribute_specs |
-| native | zv:attribute_specs |
-
-
-
-
-## LinkML Source
-
-<details>
-```yaml
-name: attribute_specs
-description: 'What the store declares its attributes to be, keyed by scope (``vertex``
-  / ``object`` / ``link``) and then by attribute name. Each entry carries ``dtype``
-  and optionally ``channels``, ``categorical``, ``unit`` and ``description``.  Optional
-  and backward-compatible from 0.9.1: absent means undeclared, which is every store
-  written before it.  A declaration is not a promise the array exists -- the array
-  appears when data is written -- but it is what lets a Schema round-trip and what
-  ``open_or_create`` compares against.  ``unit`` and ``description`` are additionally
-  stamped on the attribute array''s own metadata block.
-
-  '
-from_schema: https://w3id.org/zarr-vectors/schema/0.5
-rank: 1000
-domain_of:
-- RootMetadata
-range: AttributeSpecs
-
-```
-</details></div>
 
 
 ---
@@ -882,13 +674,13 @@ class_uri: ngff:Axis
 
 ---
 search:
-  boost: 5.0
+  boost: 10.0
 ---
 
-# Slot: base_bin_shape 
+# Class: BinLabel 
 
 
-_Supervoxel bin edge lengths at level 0.  When set, every value must be > 0 and ``chunk_shape`` must be an integer multiple along every axis (enforced runtime-side in ``RootMetadata.validate``)._
+_One entry of ``chunk_attribute_values``: a string or a number. Modelled as ``linkml:Any`` so the slot's ``any_of`` is the whole constraint -- a plain slot takes the schema's default ``string`` range as well, and the generated JSON Schema then demands both._
 
 __
 
@@ -898,38 +690,47 @@ __
 
 
 
-URI: [zv:base_bin_shape](https://w3id.org/zarr-vectors/schema/0.5/base_bin_shape)
+URI: [linkml:Any](https://w3id.org/linkml/Any)
+
+
+
+
+
+```mermaid
+ classDiagram
+    class BinLabel
+    click BinLabel href "../BinLabel/"
+      
+```
+
+
+
+
 <!-- no inheritance hierarchy -->
 
-
-
-
-
-## Applicable Classes
-
-| Name | Description | Modifies Slot |
-| --- | --- | --- |
-| [RootMetadata](RootMetadata.md) | Root-level `` |  no  |
-
-
-
-
-
-
-## Properties
-
-### Type and Range
+## Class Properties
 
 | Property | Value |
 | --- | --- |
-| Range | [Float](Float.md) |
-| Domain Of | [RootMetadata](RootMetadata.md) |
+| Class URI | [linkml:Any](https://w3id.org/linkml/Any) |
 
-### Cardinality and Requirements
 
-| Property | Value |
-| --- | --- |
-| Multivalued | Yes |
+## Slots
+
+| Name | Cardinality and Range | Description | Inheritance |
+| ---  | --- | --- | --- |
+
+
+
+
+
+## Usages
+
+| used by | used in | type | used |
+| ---  | --- | --- | --- |
+| [LevelMetadata](LevelMetadata.md) | [chunk_attribute_values](chunk_attribute_values.md) | range | [BinLabel](BinLabel.md) |
+
+
 
 
 
@@ -958,235 +759,48 @@ URI: [zv:base_bin_shape](https://w3id.org/zarr-vectors/schema/0.5/base_bin_shape
 
 | Mapping Type | Mapped Value |
 | ---  | ---  |
-| self | zv:base_bin_shape |
-| native | zv:base_bin_shape |
+| self | linkml:Any |
+| native | zv:BinLabel |
+
+
 
 
 
 
 ## LinkML Source
 
+### Direct
+
 <details>
 ```yaml
-name: base_bin_shape
-description: 'Supervoxel bin edge lengths at level 0.  When set, every value must
-  be > 0 and ``chunk_shape`` must be an integer multiple along every axis (enforced
-  runtime-side in ``RootMetadata.validate``).
+name: BinLabel
+description: 'One entry of ``chunk_attribute_values``: a string or a number. Modelled
+  as ``linkml:Any`` so the slot''s ``any_of`` is the whole constraint -- a plain slot
+  takes the schema''s default ``string`` range as well, and the generated JSON Schema
+  then demands both.
 
   '
 from_schema: https://w3id.org/zarr-vectors/schema/0.5
 rank: 1000
-domain_of:
-- RootMetadata
-range: float
-multivalued: true
+class_uri: linkml:Any
 
 ```
-</details></div>
+</details>
 
-
----
-
----
-search:
-  boost: 5.0
----
-
-# Slot: bin_ratio 
-
-
-_Integer fold-change per axis relative to level 0._
-
-
-
-<div data-search-exclude markdown="1">
-
-
-
-URI: [zv:bin_ratio](https://w3id.org/zarr-vectors/schema/0.5/bin_ratio)
-<!-- no inheritance hierarchy -->
-
-
-
-
-
-## Applicable Classes
-
-| Name | Description | Modifies Slot |
-| --- | --- | --- |
-| [LevelMetadata](LevelMetadata.md) | Per-resolution-level `` |  no  |
-
-
-
-
-
-
-## Properties
-
-### Type and Range
-
-| Property | Value |
-| --- | --- |
-| Range | [Integer](Integer.md) |
-| Domain Of | [LevelMetadata](LevelMetadata.md) |
-
-### Cardinality and Requirements
-
-| Property | Value |
-| --- | --- |
-| Multivalued | Yes |
-
-
-
-
-
-
-
-
-
-
-## Identifier and Mapping Information
-
-
-
-
-
-### Schema Source
-
-
-* from schema: https://w3id.org/zarr-vectors/schema/0.5
-
-
-
-
-## Mappings
-
-| Mapping Type | Mapped Value |
-| ---  | ---  |
-| self | zv:bin_ratio |
-| native | zv:bin_ratio |
-
-
-
-
-## LinkML Source
+### Induced
 
 <details>
 ```yaml
-name: bin_ratio
-description: Integer fold-change per axis relative to level 0.
-from_schema: https://w3id.org/zarr-vectors/schema/0.5
-rank: 1000
-domain_of:
-- LevelMetadata
-range: integer
-multivalued: true
-
-```
-</details></div>
-
-
----
-
----
-search:
-  boost: 5.0
----
-
-# Slot: bin_shape 
-
-
-_Per-axis supervoxel edge lengths at this level.  Must be ``None`` for level 0 (inherits ``base_bin_shape``); must be set for level > 0._
-
-__
-
-
-
-<div data-search-exclude markdown="1">
-
-
-
-URI: [zv:bin_shape](https://w3id.org/zarr-vectors/schema/0.5/bin_shape)
-<!-- no inheritance hierarchy -->
-
-
-
-
-
-## Applicable Classes
-
-| Name | Description | Modifies Slot |
-| --- | --- | --- |
-| [LevelMetadata](LevelMetadata.md) | Per-resolution-level `` |  no  |
-
-
-
-
-
-
-## Properties
-
-### Type and Range
-
-| Property | Value |
-| --- | --- |
-| Range | [Float](Float.md) |
-| Domain Of | [LevelMetadata](LevelMetadata.md) |
-
-### Cardinality and Requirements
-
-| Property | Value |
-| --- | --- |
-| Multivalued | Yes |
-
-
-
-
-
-
-
-
-
-
-## Identifier and Mapping Information
-
-
-
-
-
-### Schema Source
-
-
-* from schema: https://w3id.org/zarr-vectors/schema/0.5
-
-
-
-
-## Mappings
-
-| Mapping Type | Mapped Value |
-| ---  | ---  |
-| self | zv:bin_shape |
-| native | zv:bin_shape |
-
-
-
-
-## LinkML Source
-
-<details>
-```yaml
-name: bin_shape
-description: 'Per-axis supervoxel edge lengths at this level.  Must be ``None`` for
-  level 0 (inherits ``base_bin_shape``); must be set for level > 0.
+name: BinLabel
+description: 'One entry of ``chunk_attribute_values``: a string or a number. Modelled
+  as ``linkml:Any`` so the slot''s ``any_of`` is the whole constraint -- a plain slot
+  takes the schema''s default ``string`` range as well, and the generated JSON Schema
+  then demands both.
 
   '
 from_schema: https://w3id.org/zarr-vectors/schema/0.5
 rank: 1000
-domain_of:
-- LevelMetadata
-range: float
-multivalued: true
+class_uri: linkml:Any
 
 ```
 </details></div>
@@ -1418,316 +1032,13 @@ attributes:
 
 ---
 search:
-  boost: 5.0
+  boost: 10.0
 ---
 
-# Slot: bounds 
+# Class: CRS 
 
 
-_Global vertex bounding box._
-
-
-
-<div data-search-exclude markdown="1">
-
-
-
-URI: [zv:bounds](https://w3id.org/zarr-vectors/schema/0.5/bounds)
-<!-- no inheritance hierarchy -->
-
-
-
-
-
-## Applicable Classes
-
-| Name | Description | Modifies Slot |
-| --- | --- | --- |
-| [RootMetadata](RootMetadata.md) | Root-level `` |  no  |
-
-
-
-
-
-
-## Properties
-
-### Type and Range
-
-| Property | Value |
-| --- | --- |
-| Range | [BoundingBox](BoundingBox.md) |
-| Domain Of | [RootMetadata](RootMetadata.md) |
-
-### Cardinality and Requirements
-
-| Property | Value |
-| --- | --- |
-| Required | Yes |
-
-
-
-
-
-
-
-
-
-
-## Identifier and Mapping Information
-
-
-
-
-
-### Schema Source
-
-
-* from schema: https://w3id.org/zarr-vectors/schema/0.5
-
-
-
-
-## Mappings
-
-| Mapping Type | Mapped Value |
-| ---  | ---  |
-| self | zv:bounds |
-| native | zv:bounds |
-
-
-
-
-## LinkML Source
-
-<details>
-```yaml
-name: bounds
-description: Global vertex bounding box.
-from_schema: https://w3id.org/zarr-vectors/schema/0.5
-rank: 1000
-domain_of:
-- RootMetadata
-range: BoundingBox
-required: true
-
-```
-</details></div>
-
-
----
-
----
-search:
-  boost: 5.0
----
-
-# Slot: channel_names 
-
-
-_For multi-channel per-vertex attributes, the channel labels._
-
-
-
-<div data-search-exclude markdown="1">
-
-
-
-URI: [zv:channel_names](https://w3id.org/zarr-vectors/schema/0.5/channel_names)
-<!-- no inheritance hierarchy -->
-
-
-
-
-
-## Applicable Classes
-
-| Name | Description | Modifies Slot |
-| --- | --- | --- |
-| [AttributeMeta](AttributeMeta.md) | `` |  no  |
-| [FragmentAttributeMeta](FragmentAttributeMeta.md) | `` |  no  |
-
-
-
-
-
-
-## Properties
-
-### Type and Range
-
-| Property | Value |
-| --- | --- |
-| Range | [String](String.md) |
-| Domain Of | [AttributeMeta](AttributeMeta.md), [FragmentAttributeMeta](FragmentAttributeMeta.md) |
-
-### Cardinality and Requirements
-
-| Property | Value |
-| --- | --- |
-| Multivalued | Yes |
-
-
-
-
-
-
-
-
-
-
-## Identifier and Mapping Information
-
-
-
-
-
-### Schema Source
-
-
-* from schema: https://w3id.org/zarr-vectors/schema/0.5
-
-
-
-
-## Mappings
-
-| Mapping Type | Mapped Value |
-| ---  | ---  |
-| self | zv:channel_names |
-| native | zv:channel_names |
-
-
-
-
-## LinkML Source
-
-<details>
-```yaml
-name: channel_names
-description: For multi-channel per-vertex attributes, the channel labels.
-from_schema: https://w3id.org/zarr-vectors/schema/0.5
-rank: 1000
-domain_of:
-- AttributeMeta
-- FragmentAttributeMeta
-range: string
-multivalued: true
-
-```
-</details></div>
-
-
----
-
----
-search:
-  boost: 5.0
----
-
-# Slot: chunk_attribute_name 
-
-
-_Name of the per-vertex attribute used as the leading chunk axis._
-
-
-
-<div data-search-exclude markdown="1">
-
-
-
-URI: [zv:chunk_attribute_name](https://w3id.org/zarr-vectors/schema/0.5/chunk_attribute_name)
-<!-- no inheritance hierarchy -->
-
-
-
-
-
-## Applicable Classes
-
-| Name | Description | Modifies Slot |
-| --- | --- | --- |
-| [LevelMetadata](LevelMetadata.md) | Per-resolution-level `` |  no  |
-
-
-
-
-
-
-## Properties
-
-### Type and Range
-
-| Property | Value |
-| --- | --- |
-| Range | [String](String.md) |
-| Domain Of | [LevelMetadata](LevelMetadata.md) |
-
-### Cardinality and Requirements
-
-| Property | Value |
-| --- | --- |
-
-
-
-
-
-
-
-
-
-
-## Identifier and Mapping Information
-
-
-
-
-
-### Schema Source
-
-
-* from schema: https://w3id.org/zarr-vectors/schema/0.5
-
-
-
-
-## Mappings
-
-| Mapping Type | Mapped Value |
-| ---  | ---  |
-| self | zv:chunk_attribute_name |
-| native | zv:chunk_attribute_name |
-
-
-
-
-## LinkML Source
-
-<details>
-```yaml
-name: chunk_attribute_name
-description: Name of the per-vertex attribute used as the leading chunk axis.
-from_schema: https://w3id.org/zarr-vectors/schema/0.5
-rank: 1000
-domain_of:
-- LevelMetadata
-range: string
-
-```
-</details></div>
-
-
----
-
----
-search:
-  boost: 5.0
----
-
-# Slot: chunk_attribute_values 
-
-
-_Ordered list mapping attribute-bin index to original attribute value.  Must be non-empty when set, and coherent with ``chunk_attribute_name`` (both set or both absent)._
+_Free-form coordinate reference system metadata.  Modelled as an open dict because real-world CRS payloads come from many vocabularies (WKT, PROJ4, EPSG, CF conventions, ...) and we don't want to force a single one.  Generators that consume this schema should emit ``additionalProperties: true`` or equivalent._
 
 __
 
@@ -1737,38 +1048,47 @@ __
 
 
 
-URI: [zv:chunk_attribute_values](https://w3id.org/zarr-vectors/schema/0.5/chunk_attribute_values)
+URI: [linkml:Any](https://w3id.org/linkml/Any)
+
+
+
+
+
+```mermaid
+ classDiagram
+    class CRS
+    click CRS href "../CRS/"
+      
+```
+
+
+
+
 <!-- no inheritance hierarchy -->
 
-
-
-
-
-## Applicable Classes
-
-| Name | Description | Modifies Slot |
-| --- | --- | --- |
-| [LevelMetadata](LevelMetadata.md) | Per-resolution-level `` |  no  |
-
-
-
-
-
-
-## Properties
-
-### Type and Range
+## Class Properties
 
 | Property | Value |
 | --- | --- |
-| Range | [String](String.md) |
-| Domain Of | [LevelMetadata](LevelMetadata.md) |
+| Class URI | [linkml:Any](https://w3id.org/linkml/Any) |
 
-### Cardinality and Requirements
 
-| Property | Value |
-| --- | --- |
-| Multivalued | Yes |
+## Slots
+
+| Name | Cardinality and Range | Description | Inheritance |
+| ---  | --- | --- | --- |
+
+
+
+
+
+## Usages
+
+| used by | used in | type | used |
+| ---  | --- | --- | --- |
+| [RootMetadata](RootMetadata.md) | [crs](crs.md) | range | [CRS](CRS.md) |
+
+
 
 
 
@@ -1797,650 +1117,48 @@ URI: [zv:chunk_attribute_values](https://w3id.org/zarr-vectors/schema/0.5/chunk_
 
 | Mapping Type | Mapped Value |
 | ---  | ---  |
-| self | zv:chunk_attribute_values |
-| native | zv:chunk_attribute_values |
+| self | linkml:Any |
+| native | zv:CRS |
+
+
 
 
 
 
 ## LinkML Source
 
+### Direct
+
 <details>
 ```yaml
-name: chunk_attribute_values
-description: 'Ordered list mapping attribute-bin index to original attribute value.  Must
-  be non-empty when set, and coherent with ``chunk_attribute_name`` (both set or both
-  absent).
+name: CRS
+description: 'Free-form coordinate reference system metadata.  Modelled as an open
+  dict because real-world CRS payloads come from many vocabularies (WKT, PROJ4, EPSG,
+  CF conventions, ...) and we don''t want to force a single one.  Generators that
+  consume this schema should emit ``additionalProperties: true`` or equivalent.
 
   '
 from_schema: https://w3id.org/zarr-vectors/schema/0.5
 rank: 1000
-domain_of:
-- LevelMetadata
-range: string
-multivalued: true
+class_uri: linkml:Any
 
 ```
-</details></div>
+</details>
 
-
----
-
----
-search:
-  boost: 5.0
----
-
-# Slot: chunk_dims 
-
-
-_Chunk-key axis names; the leading axis names appear first.  Set when the level uses attribute chunking (e.g. ``["gene", "z", "y", "x"]``)._
-
-__
-
-
-
-<div data-search-exclude markdown="1">
-
-
-
-URI: [zv:chunk_dims](https://w3id.org/zarr-vectors/schema/0.5/chunk_dims)
-<!-- no inheritance hierarchy -->
-
-
-
-
-
-## Applicable Classes
-
-| Name | Description | Modifies Slot |
-| --- | --- | --- |
-| [LevelMetadata](LevelMetadata.md) | Per-resolution-level `` |  no  |
-
-
-
-
-
-
-## Properties
-
-### Type and Range
-
-| Property | Value |
-| --- | --- |
-| Range | [String](String.md) |
-| Domain Of | [LevelMetadata](LevelMetadata.md) |
-
-### Cardinality and Requirements
-
-| Property | Value |
-| --- | --- |
-| Multivalued | Yes |
-
-
-
-
-
-
-
-
-
-
-## Identifier and Mapping Information
-
-
-
-
-
-### Schema Source
-
-
-* from schema: https://w3id.org/zarr-vectors/schema/0.5
-
-
-
-
-## Mappings
-
-| Mapping Type | Mapped Value |
-| ---  | ---  |
-| self | zv:chunk_dims |
-| native | zv:chunk_dims |
-
-
-
-
-## LinkML Source
+### Induced
 
 <details>
 ```yaml
-name: chunk_dims
-description: 'Chunk-key axis names; the leading axis names appear first.  Set when
-  the level uses attribute chunking (e.g. ``["gene", "z", "y", "x"]``).
+name: CRS
+description: 'Free-form coordinate reference system metadata.  Modelled as an open
+  dict because real-world CRS payloads come from many vocabularies (WKT, PROJ4, EPSG,
+  CF conventions, ...) and we don''t want to force a single one.  Generators that
+  consume this schema should emit ``additionalProperties: true`` or equivalent.
 
   '
 from_schema: https://w3id.org/zarr-vectors/schema/0.5
 rank: 1000
-domain_of:
-- LevelMetadata
-range: string
-multivalued: true
-
-```
-</details></div>
-
-
----
-
----
-search:
-  boost: 5.0
----
-
-# Slot: chunk_shape 
-
-
-_Physical spatial chunk size per axis (all values > 0)._
-
-
-
-<div data-search-exclude markdown="1">
-
-
-
-URI: [zv:chunk_shape](https://w3id.org/zarr-vectors/schema/0.5/chunk_shape)
-<!-- no inheritance hierarchy -->
-
-
-
-
-
-## Applicable Classes
-
-| Name | Description | Modifies Slot |
-| --- | --- | --- |
-| [RootMetadata](RootMetadata.md) | Root-level `` |  no  |
-| [LevelMetadata](LevelMetadata.md) | Per-resolution-level `` |  yes  |
-
-
-
-
-
-
-## Properties
-
-### Type and Range
-
-| Property | Value |
-| --- | --- |
-| Range | [Float](Float.md) |
-| Domain Of | [RootMetadata](RootMetadata.md), [LevelMetadata](LevelMetadata.md) |
-
-### Cardinality and Requirements
-
-| Property | Value |
-| --- | --- |
-| Required | Yes |
-| Multivalued | Yes |
-
-
-
-
-
-
-
-
-
-
-## Identifier and Mapping Information
-
-
-
-
-
-### Schema Source
-
-
-* from schema: https://w3id.org/zarr-vectors/schema/0.5
-
-
-
-
-## Mappings
-
-| Mapping Type | Mapped Value |
-| ---  | ---  |
-| self | zv:chunk_shape |
-| native | zv:chunk_shape |
-
-
-
-
-## LinkML Source
-
-<details>
-```yaml
-name: chunk_shape
-description: Physical spatial chunk size per axis (all values > 0).
-from_schema: https://w3id.org/zarr-vectors/schema/0.5
-rank: 1000
-domain_of:
-- RootMetadata
-- LevelMetadata
-range: float
-required: true
-multivalued: true
-
-```
-</details></div>
-
-
----
-
----
-search:
-  boost: 5.0
----
-
-# Slot: coarsening_method 
-
-
-_How this level was generated (e.g. "grid_metanode")._
-
-
-
-<div data-search-exclude markdown="1">
-
-
-
-URI: [zv:coarsening_method](https://w3id.org/zarr-vectors/schema/0.5/coarsening_method)
-<!-- no inheritance hierarchy -->
-
-
-
-
-
-## Applicable Classes
-
-| Name | Description | Modifies Slot |
-| --- | --- | --- |
-| [LevelMetadata](LevelMetadata.md) | Per-resolution-level `` |  no  |
-
-
-
-
-
-
-## Properties
-
-### Type and Range
-
-| Property | Value |
-| --- | --- |
-| Range | [String](String.md) |
-| Domain Of | [LevelMetadata](LevelMetadata.md) |
-
-### Cardinality and Requirements
-
-| Property | Value |
-| --- | --- |
-
-
-
-
-
-
-
-
-
-
-## Identifier and Mapping Information
-
-
-
-
-
-### Schema Source
-
-
-* from schema: https://w3id.org/zarr-vectors/schema/0.5
-
-
-
-
-## Mappings
-
-| Mapping Type | Mapped Value |
-| ---  | ---  |
-| self | zv:coarsening_method |
-| native | zv:coarsening_method |
-
-
-
-
-## LinkML Source
-
-<details>
-```yaml
-name: coarsening_method
-description: How this level was generated (e.g. "grid_metanode").
-from_schema: https://w3id.org/zarr-vectors/schema/0.5
-rank: 1000
-domain_of:
-- LevelMetadata
-range: string
-
-```
-</details></div>
-
-
----
-
----
-search:
-  boost: 5.0
----
-
-# Slot: cross_chunk_strategy 
-
-<div data-search-exclude markdown="1">
-
-
-
-URI: [zv:cross_chunk_strategy](https://w3id.org/zarr-vectors/schema/0.5/cross_chunk_strategy)
-<!-- no inheritance hierarchy -->
-
-
-
-
-
-## Applicable Classes
-
-| Name | Description | Modifies Slot |
-| --- | --- | --- |
-| [RootMetadata](RootMetadata.md) | Root-level `` |  no  |
-
-
-
-
-
-
-## Properties
-
-### Type and Range
-
-| Property | Value |
-| --- | --- |
-| Range | [CrossChunkStrategy](CrossChunkStrategy.md) |
-| Domain Of | [RootMetadata](RootMetadata.md) |
-
-### Cardinality and Requirements
-
-| Property | Value |
-| --- | --- |
-
-
-
-
-
-
-
-
-
-
-## Identifier and Mapping Information
-
-
-
-
-
-### Schema Source
-
-
-* from schema: https://w3id.org/zarr-vectors/schema/0.5
-
-
-
-
-## Mappings
-
-| Mapping Type | Mapped Value |
-| ---  | ---  |
-| self | zv:cross_chunk_strategy |
-| native | zv:cross_chunk_strategy |
-
-
-
-
-## LinkML Source
-
-<details>
-```yaml
-name: cross_chunk_strategy
-from_schema: https://w3id.org/zarr-vectors/schema/0.5
-rank: 1000
-domain_of:
-- RootMetadata
-range: CrossChunkStrategy
-
-```
-</details></div>
-
-
----
-
----
-search:
-  boost: 5.0
----
-
-# Slot: cross_level_depth 
-
-
-_Maximum absolute level delta for which cross-pyramid-level link arrays are materialized.  ``0`` = none (no ``+N`` or ``-N`` arrays), ``N`` = generate up to ``±N`` (or ``+N`` only when ``cross_level_storage="implicit"``), ``-1`` = all available pyramid levels.  Default ``1``._
-
-__
-
-
-
-<div data-search-exclude markdown="1">
-
-
-
-URI: [zv:cross_level_depth](https://w3id.org/zarr-vectors/schema/0.5/cross_level_depth)
-<!-- no inheritance hierarchy -->
-
-
-
-
-
-## Applicable Classes
-
-| Name | Description | Modifies Slot |
-| --- | --- | --- |
-| [RootMetadata](RootMetadata.md) | Root-level `` |  no  |
-
-
-
-
-
-
-## Properties
-
-### Type and Range
-
-| Property | Value |
-| --- | --- |
-| Range | [Integer](Integer.md) |
-| Domain Of | [RootMetadata](RootMetadata.md) |
-
-### Cardinality and Requirements
-
-| Property | Value |
-| --- | --- |
-### Value Constraints
-
-| Property | Value |
-| --- | --- |
-| Minimum Value | -1 |
-
-
-
-
-
-
-
-
-
-
-
-
-## Identifier and Mapping Information
-
-
-
-
-
-### Schema Source
-
-
-* from schema: https://w3id.org/zarr-vectors/schema/0.5
-
-
-
-
-## Mappings
-
-| Mapping Type | Mapped Value |
-| ---  | ---  |
-| self | zv:cross_level_depth |
-| native | zv:cross_level_depth |
-
-
-
-
-## LinkML Source
-
-<details>
-```yaml
-name: cross_level_depth
-description: 'Maximum absolute level delta for which cross-pyramid-level link arrays
-  are materialized.  ``0`` = none (no ``+N`` or ``-N`` arrays), ``N`` = generate up
-  to ``±N`` (or ``+N`` only when ``cross_level_storage="implicit"``), ``-1`` = all
-  available pyramid levels.  Default ``1``.
-
-  '
-from_schema: https://w3id.org/zarr-vectors/schema/0.5
-rank: 1000
-domain_of:
-- RootMetadata
-range: integer
-minimum_value: -1
-
-```
-</details></div>
-
-
----
-
----
-search:
-  boost: 5.0
----
-
-# Slot: cross_level_storage 
-
-
-_Whether cross-level link arrays are written in both directions (``explicit``: ``+N`` at the finer level AND ``-N`` at the coarser level) or only positive deltas (``implicit``: only ``+N``, with ``-N`` reconstructed on read).  Default ``explicit``._
-
-__
-
-
-
-<div data-search-exclude markdown="1">
-
-
-
-URI: [zv:cross_level_storage](https://w3id.org/zarr-vectors/schema/0.5/cross_level_storage)
-<!-- no inheritance hierarchy -->
-
-
-
-
-
-## Applicable Classes
-
-| Name | Description | Modifies Slot |
-| --- | --- | --- |
-| [RootMetadata](RootMetadata.md) | Root-level `` |  no  |
-
-
-
-
-
-
-## Properties
-
-### Type and Range
-
-| Property | Value |
-| --- | --- |
-| Range | [CrossLevelStorage](CrossLevelStorage.md) |
-| Domain Of | [RootMetadata](RootMetadata.md) |
-
-### Cardinality and Requirements
-
-| Property | Value |
-| --- | --- |
-
-
-
-
-
-
-
-
-
-
-## Identifier and Mapping Information
-
-
-
-
-
-### Schema Source
-
-
-* from schema: https://w3id.org/zarr-vectors/schema/0.5
-
-
-
-
-## Mappings
-
-| Mapping Type | Mapped Value |
-| ---  | ---  |
-| self | zv:cross_level_storage |
-| native | zv:cross_level_storage |
-
-
-
-
-## LinkML Source
-
-<details>
-```yaml
-name: cross_level_storage
-description: 'Whether cross-level link arrays are written in both directions (``explicit``:
-  ``+N`` at the finer level AND ``-N`` at the coarser level) or only positive deltas
-  (``implicit``: only ``+N``, with ``-N`` reconstructed on read).  Default ``explicit``.
-
-  '
-from_schema: https://w3id.org/zarr-vectors/schema/0.5
-rank: 1000
-domain_of:
-- RootMetadata
-range: CrossLevelStorage
+class_uri: linkml:Any
 
 ```
 </details></div>
@@ -2732,113 +1450,6 @@ permissible_values:
 </details>
 
 </div>
-
-
----
-
----
-search:
-  boost: 5.0
----
-
-# Slot: crs 
-
-
-_Optional coordinate reference system metadata (free-form dict matching whatever CRS vocabulary the store uses, e.g. WKT, PROJ4, EPSG, CF conventions)._
-
-__
-
-
-
-<div data-search-exclude markdown="1">
-
-
-
-URI: [schema:coordinateReferenceSystem](http://schema.org/coordinateReferenceSystem)
-<!-- no inheritance hierarchy -->
-
-
-
-
-
-## Applicable Classes
-
-| Name | Description | Modifies Slot |
-| --- | --- | --- |
-| [RootMetadata](RootMetadata.md) | Root-level `` |  no  |
-
-
-
-
-
-
-## Properties
-
-### Type and Range
-
-| Property | Value |
-| --- | --- |
-| Range | [CRS](CRS.md) |
-| Domain Of | [RootMetadata](RootMetadata.md) |
-| Slot URI | [schema:coordinateReferenceSystem](http://schema.org/coordinateReferenceSystem) |
-
-### Cardinality and Requirements
-
-| Property | Value |
-| --- | --- |
-
-
-
-
-
-
-
-
-
-
-## Identifier and Mapping Information
-
-
-
-
-
-### Schema Source
-
-
-* from schema: https://w3id.org/zarr-vectors/schema/0.5
-
-
-
-
-## Mappings
-
-| Mapping Type | Mapped Value |
-| ---  | ---  |
-| self | schema:coordinateReferenceSystem |
-| native | zv:crs |
-
-
-
-
-## LinkML Source
-
-<details>
-```yaml
-name: crs
-description: 'Optional coordinate reference system metadata (free-form dict matching
-  whatever CRS vocabulary the store uses, e.g. WKT, PROJ4, EPSG, CF conventions).
-
-  '
-from_schema: https://w3id.org/zarr-vectors/schema/0.5
-rank: 1000
-slot_uri: schema:coordinateReferenceSystem
-domain_of:
-- RootMetadata
-range: CRS
-inlined: true
-
-```
-</details></div>
 
 
 ---
@@ -3173,112 +1784,6 @@ URI: [xsd:decimal](http://www.w3.org/2001/XMLSchema#decimal)
 
 ---
 search:
-  boost: 5.0
----
-
-# Slot: directed 
-
-
-_When true, endpoint order is meaningful and preserved (no canonical sort): ``A→B`` and ``B→A`` occupy distinct cells and every stored ``perm_idx`` is 0.  Family-wide; defaults to false (undirected)._
-
-__
-
-
-
-<div data-search-exclude markdown="1">
-
-
-
-URI: [zv:directed](https://w3id.org/zarr-vectors/schema/0.5/directed)
-<!-- no inheritance hierarchy -->
-
-
-
-
-
-## Applicable Classes
-
-| Name | Description | Modifies Slot |
-| --- | --- | --- |
-| [LinksFamilyMeta](LinksFamilyMeta.md) | `` |  no  |
-
-
-
-
-
-
-## Properties
-
-### Type and Range
-
-| Property | Value |
-| --- | --- |
-| Range | [Boolean](Boolean.md) |
-| Domain Of | [LinksFamilyMeta](LinksFamilyMeta.md) |
-
-### Cardinality and Requirements
-
-| Property | Value |
-| --- | --- |
-
-
-
-
-
-
-
-
-
-
-## Identifier and Mapping Information
-
-
-
-
-
-### Schema Source
-
-
-* from schema: https://w3id.org/zarr-vectors/schema/0.5
-
-
-
-
-## Mappings
-
-| Mapping Type | Mapped Value |
-| ---  | ---  |
-| self | zv:directed |
-| native | zv:directed |
-
-
-
-
-## LinkML Source
-
-<details>
-```yaml
-name: directed
-description: 'When true, endpoint order is meaningful and preserved (no canonical
-  sort): ``A→B`` and ``B→A`` occupy distinct cells and every stored ``perm_idx`` is
-  0.  Family-wide; defaults to false (undirected).
-
-  '
-from_schema: https://w3id.org/zarr-vectors/schema/0.5
-rank: 1000
-domain_of:
-- LinksFamilyMeta
-range: boolean
-required: false
-
-```
-</details></div>
-
-
----
-
----
-search:
   boost: 1.0
 ---# Type: Double 
 
@@ -3337,119 +1842,6 @@ URI: [xsd:double](http://www.w3.org/2001/XMLSchema#double)
 
 
 </div>
-
-
----
-
----
-search:
-  boost: 5.0
----
-
-# Slot: dtype 
-
-
-_Numpy dtype string of the array's value type (e.g. "float32")._
-
-
-
-<div data-search-exclude markdown="1">
-
-
-
-URI: [zv:dtype](https://w3id.org/zarr-vectors/schema/0.5/dtype)
-<!-- no inheritance hierarchy -->
-
-
-
-
-
-## Applicable Classes
-
-| Name | Description | Modifies Slot |
-| --- | --- | --- |
-| [VerticesMeta](VerticesMeta.md) | `` |  no  |
-| [LinksMeta](LinksMeta.md) | `` |  no  |
-| [AttributeMeta](AttributeMeta.md) | `` |  no  |
-| [FragmentAttributeMeta](FragmentAttributeMeta.md) | `` |  no  |
-| [ObjectAttributeMeta](ObjectAttributeMeta.md) | `` |  no  |
-| [GroupingsAttributeMeta](GroupingsAttributeMeta.md) | `` |  no  |
-| [LinkAttributeMeta](LinkAttributeMeta.md) | `` |  no  |
-
-
-
-
-
-
-## Properties
-
-### Type and Range
-
-| Property | Value |
-| --- | --- |
-| Range | [String](String.md) |
-| Domain Of | [VerticesMeta](VerticesMeta.md), [LinksMeta](LinksMeta.md), [AttributeMeta](AttributeMeta.md), [FragmentAttributeMeta](FragmentAttributeMeta.md), [ObjectAttributeMeta](ObjectAttributeMeta.md), [GroupingsAttributeMeta](GroupingsAttributeMeta.md), [LinkAttributeMeta](LinkAttributeMeta.md) |
-
-### Cardinality and Requirements
-
-| Property | Value |
-| --- | --- |
-| Required | Yes |
-
-
-
-
-
-
-
-
-
-
-## Identifier and Mapping Information
-
-
-
-
-
-### Schema Source
-
-
-* from schema: https://w3id.org/zarr-vectors/schema/0.5
-
-
-
-
-## Mappings
-
-| Mapping Type | Mapped Value |
-| ---  | ---  |
-| self | zv:dtype |
-| native | zv:dtype |
-
-
-
-
-## LinkML Source
-
-<details>
-```yaml
-name: dtype
-description: Numpy dtype string of the array's value type (e.g. "float32").
-from_schema: https://w3id.org/zarr-vectors/schema/0.5
-rank: 1000
-domain_of:
-- VerticesMeta
-- LinksMeta
-- AttributeMeta
-- FragmentAttributeMeta
-- ObjectAttributeMeta
-- GroupingsAttributeMeta
-- LinkAttributeMeta
-range: string
-required: true
-
-```
-</details></div>
 
 
 ---
@@ -3597,107 +1989,6 @@ URI: [xsd:float](http://www.w3.org/2001/XMLSchema#float)
 
 
 </div>
-
-
----
-
----
-search:
-  boost: 5.0
----
-
-# Slot: format_capabilities 
-
-
-_Optional 0.3+ feature tokens advertised by this store._
-
-
-
-<div data-search-exclude markdown="1">
-
-
-
-URI: [zv:format_capabilities](https://w3id.org/zarr-vectors/schema/0.5/format_capabilities)
-<!-- no inheritance hierarchy -->
-
-
-
-
-
-## Applicable Classes
-
-| Name | Description | Modifies Slot |
-| --- | --- | --- |
-| [RootMetadata](RootMetadata.md) | Root-level `` |  no  |
-
-
-
-
-
-
-## Properties
-
-### Type and Range
-
-| Property | Value |
-| --- | --- |
-| Range | [FormatCapability](FormatCapability.md) |
-| Domain Of | [RootMetadata](RootMetadata.md) |
-
-### Cardinality and Requirements
-
-| Property | Value |
-| --- | --- |
-| Multivalued | Yes |
-
-
-
-
-
-
-
-
-
-
-## Identifier and Mapping Information
-
-
-
-
-
-### Schema Source
-
-
-* from schema: https://w3id.org/zarr-vectors/schema/0.5
-
-
-
-
-## Mappings
-
-| Mapping Type | Mapped Value |
-| ---  | ---  |
-| self | zv:format_capabilities |
-| native | zv:format_capabilities |
-
-
-
-
-## LinkML Source
-
-<details>
-```yaml
-name: format_capabilities
-description: Optional 0.3+ feature tokens advertised by this store.
-from_schema: https://w3id.org/zarr-vectors/schema/0.5
-rank: 1000
-domain_of:
-- RootMetadata
-range: FormatCapability
-multivalued: true
-
-```
-</details></div>
 
 
 ---
@@ -4039,219 +2330,6 @@ attributes:
     - FragmentAttributeMeta
     range: string
     multivalued: true
-
-```
-</details></div>
-
-
----
-
----
-search:
-  boost: 5.0
----
-
-# Slot: fragments_tile 
-
-
-_True when every chunk in this level has a vertex fragment index that tiles its buffer, so the concatenation of a chunk's fragments IS its vertex buffer and a bulk read may skip ``vertex_fragments`` entirely.  Unlike the other flags here this is a claim about what has NOT happened since: it is stamped by a bulk writer and cleared by any later write to ``vertices`` or ``vertex_fragments``. Readers MUST treat an absent value as False._
-
-__
-
-
-
-<div data-search-exclude markdown="1">
-
-
-
-URI: [zv:fragments_tile](https://w3id.org/zarr-vectors/schema/0.5/fragments_tile)
-<!-- no inheritance hierarchy -->
-
-
-
-
-
-## Applicable Classes
-
-| Name | Description | Modifies Slot |
-| --- | --- | --- |
-| [LevelMetadata](LevelMetadata.md) | Per-resolution-level `` |  no  |
-
-
-
-
-
-
-## Properties
-
-### Type and Range
-
-| Property | Value |
-| --- | --- |
-| Range | [Boolean](Boolean.md) |
-| Domain Of | [LevelMetadata](LevelMetadata.md) |
-
-### Cardinality and Requirements
-
-| Property | Value |
-| --- | --- |
-
-
-
-
-
-
-
-
-
-
-## Identifier and Mapping Information
-
-
-
-
-
-### Schema Source
-
-
-* from schema: https://w3id.org/zarr-vectors/schema/0.5
-
-
-
-
-## Mappings
-
-| Mapping Type | Mapped Value |
-| ---  | ---  |
-| self | zv:fragments_tile |
-| native | zv:fragments_tile |
-
-
-
-
-## LinkML Source
-
-<details>
-```yaml
-name: fragments_tile
-description: 'True when every chunk in this level has a vertex fragment index that
-  tiles its buffer, so the concatenation of a chunk''s fragments IS its vertex buffer
-  and a bulk read may skip ``vertex_fragments`` entirely.  Unlike the other flags
-  here this is a claim about what has NOT happened since: it is stamped by a bulk
-  writer and cleared by any later write to ``vertices`` or ``vertex_fragments``. Readers
-  MUST treat an absent value as False.
-
-  '
-from_schema: https://w3id.org/zarr-vectors/schema/0.5
-rank: 1000
-domain_of:
-- LevelMetadata
-range: boolean
-
-```
-</details></div>
-
-
----
-
----
-search:
-  boost: 5.0
----
-
-# Slot: geometry_types 
-
-
-_One or more geometry kinds present in the store._
-
-
-
-<div data-search-exclude markdown="1">
-
-
-
-URI: [zv:geometry_types](https://w3id.org/zarr-vectors/schema/0.5/geometry_types)
-<!-- no inheritance hierarchy -->
-
-
-
-
-
-## Applicable Classes
-
-| Name | Description | Modifies Slot |
-| --- | --- | --- |
-| [RootMetadata](RootMetadata.md) | Root-level `` |  no  |
-
-
-
-
-
-
-## Properties
-
-### Type and Range
-
-| Property | Value |
-| --- | --- |
-| Range | [GeometryType](GeometryType.md) |
-| Domain Of | [RootMetadata](RootMetadata.md) |
-
-### Cardinality and Requirements
-
-| Property | Value |
-| --- | --- |
-| Required | Yes |
-| Multivalued | Yes |
-| Minimum Cardinality | 1 |
-
-
-
-
-
-
-
-
-
-
-## Identifier and Mapping Information
-
-
-
-
-
-### Schema Source
-
-
-* from schema: https://w3id.org/zarr-vectors/schema/0.5
-
-
-
-
-## Mappings
-
-| Mapping Type | Mapped Value |
-| ---  | ---  |
-| self | zv:geometry_types |
-| native | zv:geometry_types |
-
-
-
-
-## LinkML Source
-
-<details>
-```yaml
-name: geometry_types
-description: One or more geometry kinds present in the store.
-from_schema: https://w3id.org/zarr-vectors/schema/0.5
-rank: 1000
-domain_of:
-- RootMetadata
-range: GeometryType
-required: true
-multivalued: true
-minimum_cardinality: 1
 
 ```
 </details></div>
@@ -4745,228 +2823,6 @@ attributes:
 
 ---
 search:
-  boost: 5.0
----
-
-# Slot: has_perm 
-
-
-_Whether each row of this links array carries a leading ``perm_idx`` column — i.e. whether rows are ``1 + link_width`` ints rather than ``link_width``.  True exactly when a non-identity endpoint placement is possible: non-intra ``offsets`` AND ``level_delta == 0`` AND (``store="duplicate"`` OR not ``directed``).  Readers must take the record width from this stamp rather than inferring it: decoding physical bytes at the logical width does not reliably raise, it silently fabricates rows._
-
-__
-
-
-
-<div data-search-exclude markdown="1">
-
-
-
-URI: [zv:has_perm](https://w3id.org/zarr-vectors/schema/0.5/has_perm)
-<!-- no inheritance hierarchy -->
-
-
-
-
-
-## Applicable Classes
-
-| Name | Description | Modifies Slot |
-| --- | --- | --- |
-| [LinksMeta](LinksMeta.md) | `` |  no  |
-
-
-
-
-
-
-## Properties
-
-### Type and Range
-
-| Property | Value |
-| --- | --- |
-| Range | [Boolean](Boolean.md) |
-| Domain Of | [LinksMeta](LinksMeta.md) |
-
-### Cardinality and Requirements
-
-| Property | Value |
-| --- | --- |
-| Required | Yes |
-
-
-
-
-
-
-
-
-
-
-## Identifier and Mapping Information
-
-
-
-
-
-### Schema Source
-
-
-* from schema: https://w3id.org/zarr-vectors/schema/0.5
-
-
-
-
-## Mappings
-
-| Mapping Type | Mapped Value |
-| ---  | ---  |
-| self | zv:has_perm |
-| native | zv:has_perm |
-
-
-
-
-## LinkML Source
-
-<details>
-```yaml
-name: has_perm
-description: 'Whether each row of this links array carries a leading ``perm_idx``
-  column — i.e. whether rows are ``1 + link_width`` ints rather than ``link_width``.  True
-  exactly when a non-identity endpoint placement is possible: non-intra ``offsets``
-  AND ``level_delta == 0`` AND (``store="duplicate"`` OR not ``directed``).  Readers
-  must take the record width from this stamp rather than inferring it: decoding physical
-  bytes at the logical width does not reliably raise, it silently fabricates rows.
-
-  '
-from_schema: https://w3id.org/zarr-vectors/schema/0.5
-rank: 1000
-domain_of:
-- LinksMeta
-range: boolean
-required: true
-
-```
-</details></div>
-
-
----
-
----
-search:
-  boost: 5.0
----
-
-# Slot: inherited_num_objects 
-
-
-_OID-space size inherited from the parent level (= ``parent_level.num_objects``).  Required when ``preserves_object_ids`` is true; absent on standalone levels._
-
-__
-
-
-
-<div data-search-exclude markdown="1">
-
-
-
-URI: [zv:inherited_num_objects](https://w3id.org/zarr-vectors/schema/0.5/inherited_num_objects)
-<!-- no inheritance hierarchy -->
-
-
-
-
-
-## Applicable Classes
-
-| Name | Description | Modifies Slot |
-| --- | --- | --- |
-| [LevelMetadata](LevelMetadata.md) | Per-resolution-level `` |  no  |
-
-
-
-
-
-
-## Properties
-
-### Type and Range
-
-| Property | Value |
-| --- | --- |
-| Range | [Integer](Integer.md) |
-| Domain Of | [LevelMetadata](LevelMetadata.md) |
-
-### Cardinality and Requirements
-
-| Property | Value |
-| --- | --- |
-### Value Constraints
-
-| Property | Value |
-| --- | --- |
-| Minimum Value | 0 |
-
-
-
-
-
-
-
-
-
-
-
-
-## Identifier and Mapping Information
-
-
-
-
-
-### Schema Source
-
-
-* from schema: https://w3id.org/zarr-vectors/schema/0.5
-
-
-
-
-## Mappings
-
-| Mapping Type | Mapped Value |
-| ---  | ---  |
-| self | zv:inherited_num_objects |
-| native | zv:inherited_num_objects |
-
-
-
-
-## LinkML Source
-
-<details>
-```yaml
-name: inherited_num_objects
-description: 'OID-space size inherited from the parent level (= ``parent_level.num_objects``).  Required
-  when ``preserves_object_ids`` is true; absent on standalone levels.
-
-  '
-from_schema: https://w3id.org/zarr-vectors/schema/0.5
-rank: 1000
-domain_of:
-- LevelMetadata
-range: integer
-minimum_value: 0
-
-```
-</details></div>
-
-
----
-
----
-search:
   boost: 1.0
 ---# Type: Integer 
 
@@ -5159,229 +3015,6 @@ URI: [xsd:string](http://www.w3.org/2001/XMLSchema#string)
 
 ---
 search:
-  boost: 5.0
----
-
-# Slot: level 
-
-
-_Resolution level index (0 = full resolution)._
-
-
-
-<div data-search-exclude markdown="1">
-
-
-
-URI: [zv:level](https://w3id.org/zarr-vectors/schema/0.5/level)
-<!-- no inheritance hierarchy -->
-
-
-
-
-
-## Applicable Classes
-
-| Name | Description | Modifies Slot |
-| --- | --- | --- |
-| [LevelMetadata](LevelMetadata.md) | Per-resolution-level `` |  no  |
-
-
-
-
-
-
-## Properties
-
-### Type and Range
-
-| Property | Value |
-| --- | --- |
-| Range | [Integer](Integer.md) |
-| Domain Of | [LevelMetadata](LevelMetadata.md) |
-
-### Cardinality and Requirements
-
-| Property | Value |
-| --- | --- |
-| Required | Yes |
-### Value Constraints
-
-| Property | Value |
-| --- | --- |
-| Minimum Value | 0 |
-
-
-
-
-
-
-
-
-
-
-
-
-## Identifier and Mapping Information
-
-
-
-
-
-### Schema Source
-
-
-* from schema: https://w3id.org/zarr-vectors/schema/0.5
-
-
-
-
-## Mappings
-
-| Mapping Type | Mapped Value |
-| ---  | ---  |
-| self | zv:level |
-| native | zv:level |
-
-
-
-
-## LinkML Source
-
-<details>
-```yaml
-name: level
-description: Resolution level index (0 = full resolution).
-from_schema: https://w3id.org/zarr-vectors/schema/0.5
-rank: 1000
-domain_of:
-- LevelMetadata
-range: integer
-required: true
-minimum_value: 0
-
-```
-</details></div>
-
-
----
-
----
-search:
-  boost: 5.0
----
-
-# Slot: level_delta 
-
-
-_Pyramid-level delta between the source side (the level that owns this array) and the target side of the edges.  ``0`` for intra-level arrays (the only kind written pre-0.4), ``+N`` for edges from this level to ``this_level + N`` (coarser), ``-N`` for edges to ``this_level - N`` (finer)._
-
-__
-
-
-
-<div data-search-exclude markdown="1">
-
-
-
-URI: [zv:level_delta](https://w3id.org/zarr-vectors/schema/0.5/level_delta)
-<!-- no inheritance hierarchy -->
-
-
-
-
-
-## Applicable Classes
-
-| Name | Description | Modifies Slot |
-| --- | --- | --- |
-| [LinksFamilyMeta](LinksFamilyMeta.md) | `` |  no  |
-| [LinksMeta](LinksMeta.md) | `` |  no  |
-| [LinkAttributeFamilyMeta](LinkAttributeFamilyMeta.md) | `` |  no  |
-| [LinkAttributeMeta](LinkAttributeMeta.md) | `` |  no  |
-
-
-
-
-
-
-## Properties
-
-### Type and Range
-
-| Property | Value |
-| --- | --- |
-| Range | [Integer](Integer.md) |
-| Domain Of | [LinksFamilyMeta](LinksFamilyMeta.md), [LinksMeta](LinksMeta.md), [LinkAttributeFamilyMeta](LinkAttributeFamilyMeta.md), [LinkAttributeMeta](LinkAttributeMeta.md) |
-
-### Cardinality and Requirements
-
-| Property | Value |
-| --- | --- |
-| Required | Yes |
-
-
-
-
-
-
-
-
-
-
-## Identifier and Mapping Information
-
-
-
-
-
-### Schema Source
-
-
-* from schema: https://w3id.org/zarr-vectors/schema/0.5
-
-
-
-
-## Mappings
-
-| Mapping Type | Mapped Value |
-| ---  | ---  |
-| self | zv:level_delta |
-| native | zv:level_delta |
-
-
-
-
-## LinkML Source
-
-<details>
-```yaml
-name: level_delta
-description: 'Pyramid-level delta between the source side (the level that owns this
-  array) and the target side of the edges.  ``0`` for intra-level arrays (the only
-  kind written pre-0.4), ``+N`` for edges from this level to ``this_level + N`` (coarser),
-  ``-N`` for edges to ``this_level - N`` (finer).
-
-  '
-from_schema: https://w3id.org/zarr-vectors/schema/0.5
-rank: 1000
-domain_of:
-- LinksFamilyMeta
-- LinksMeta
-- LinkAttributeFamilyMeta
-- LinkAttributeMeta
-range: integer
-required: true
-
-```
-</details></div>
-
-
----
-
----
-search:
   boost: 10.0
 ---
 
@@ -5417,6 +3050,15 @@ URI: [zv:LevelMetadata](https://w3id.org/zarr-vectors/schema/0.5/LevelMetadata)
       LevelMetadata : chunk_attribute_name
         
       LevelMetadata : chunk_attribute_values
+        
+          
+    
+        
+        
+        LevelMetadata --> "*" BinLabel : chunk_attribute_values
+        click BinLabel href "../BinLabel/"
+    
+
         
       LevelMetadata : chunk_dims
         
@@ -5463,7 +3105,7 @@ URI: [zv:LevelMetadata](https://w3id.org/zarr-vectors/schema/0.5/LevelMetadata)
 | [parent_level](parent_level.md) | 0..1 <br/> [Integer](Integer.md) | Source level index (None for level 0) | direct |
 | [chunk_dims](chunk_dims.md) | * <br/> [String](String.md) | Chunk-key axis names; the leading axis names appear first | direct |
 | [chunk_attribute_name](chunk_attribute_name.md) | 0..1 <br/> [String](String.md) | Name of the per-vertex attribute used as the leading chunk axis | direct |
-| [chunk_attribute_values](chunk_attribute_values.md) | * <br/> [String](String.md) | Ordered list mapping attribute-bin index to original attribute value | direct |
+| [chunk_attribute_values](chunk_attribute_values.md) | * <br/> [BinLabel](BinLabel.md)&nbsp;or&nbsp;<br />[String](String.md)&nbsp;or&nbsp;<br />[Integer](Integer.md)&nbsp;or&nbsp;<br />[Float](Float.md) | One label per leading-axis bin, in bin order: entry ``i`` is what a reader's ... | direct |
 | [preserves_object_ids](preserves_object_ids.md) | 0..1 <br/> [Boolean](Boolean.md) | True for levels written by the per-object pyramid regime | direct |
 | [inherited_num_objects](inherited_num_objects.md) | 0..1 <br/> [Integer](Integer.md) | OID-space size inherited from the parent level (= ``parent_level | direct |
 | [shared_fragments](shared_fragments.md) | 0..1 <br/> [Boolean](Boolean.md) | True when per-chunk fragments may be referenced by multiple objects' manifest... | direct |
@@ -5699,9 +3341,12 @@ attributes:
     range: string
   chunk_attribute_values:
     name: chunk_attribute_values
-    description: 'Ordered list mapping attribute-bin index to original attribute value.  Must
-      be non-empty when set, and coherent with ``chunk_attribute_name`` (both set
-      or both absent).
+    description: 'One label per leading-axis bin, in bin order: entry ``i`` is what
+      a reader''s ``attribute_filter`` names to select bin ``i``, so its length is
+      the bin count.  A categorical bin is labelled by its value (a string or a number),
+      a bin cut by edges by its lower edge, and a group bin by its group index (``-1``
+      for ungrouped objects, which are the last bin).  Must be non-empty when set,
+      and coherent with ``chunk_attribute_name`` (both set or both absent).
 
       '
     from_schema: https://w3id.org/zarr-vectors/schema/0.5
@@ -5709,8 +3354,12 @@ attributes:
     owner: LevelMetadata
     domain_of:
     - LevelMetadata
-    range: string
+    range: BinLabel
     multivalued: true
+    any_of:
+    - range: string
+    - range: integer
+    - range: float
   preserves_object_ids:
     name: preserves_object_ids
     description: 'True for levels written by the per-object pyramid regime.  When
@@ -5767,122 +3416,6 @@ attributes:
     domain_of:
     - LevelMetadata
     range: boolean
-
-```
-</details></div>
-
-
----
-
----
-search:
-  boost: 5.0
----
-
-# Slot: link_width 
-
-
-_Width of a links row (1 for parent→child metanode references, 2 for edges, 3 for triangle faces, 4 for quads)._
-
-__
-
-
-
-<div data-search-exclude markdown="1">
-
-
-
-URI: [zv:link_width](https://w3id.org/zarr-vectors/schema/0.5/link_width)
-<!-- no inheritance hierarchy -->
-
-
-
-
-
-## Applicable Classes
-
-| Name | Description | Modifies Slot |
-| --- | --- | --- |
-| [LinksFamilyMeta](LinksFamilyMeta.md) | `` |  no  |
-| [LinksMeta](LinksMeta.md) | `` |  no  |
-
-
-
-
-
-
-## Properties
-
-### Type and Range
-
-| Property | Value |
-| --- | --- |
-| Range | [Integer](Integer.md) |
-| Domain Of | [LinksFamilyMeta](LinksFamilyMeta.md), [LinksMeta](LinksMeta.md) |
-
-### Cardinality and Requirements
-
-| Property | Value |
-| --- | --- |
-| Required | Yes |
-### Value Constraints
-
-| Property | Value |
-| --- | --- |
-| Minimum Value | 1 |
-
-
-
-
-
-
-
-
-
-
-
-
-## Identifier and Mapping Information
-
-
-
-
-
-### Schema Source
-
-
-* from schema: https://w3id.org/zarr-vectors/schema/0.5
-
-
-
-
-## Mappings
-
-| Mapping Type | Mapped Value |
-| ---  | ---  |
-| self | zv:link_width |
-| native | zv:link_width |
-
-
-
-
-## LinkML Source
-
-<details>
-```yaml
-name: link_width
-description: 'Width of a links row (1 for parent→child metanode references, 2 for
-  edges, 3 for triangle faces, 4 for quads).
-
-  '
-from_schema: https://w3id.org/zarr-vectors/schema/0.5
-rank: 1000
-domain_of:
-- LinksFamilyMeta
-- LinksMeta
-range: integer
-required: true
-minimum_value: 1
 
 ```
 </details></div>
@@ -6417,99 +3950,6 @@ attributes:
     - LinkAttributeMeta
     range: integer
     required: true
-
-```
-</details></div>
-
-
----
-
----
-search:
-  boost: 5.0
----
-
-# Slot: links_convention 
-
-<div data-search-exclude markdown="1">
-
-
-
-URI: [zv:links_convention](https://w3id.org/zarr-vectors/schema/0.5/links_convention)
-<!-- no inheritance hierarchy -->
-
-
-
-
-
-## Applicable Classes
-
-| Name | Description | Modifies Slot |
-| --- | --- | --- |
-| [RootMetadata](RootMetadata.md) | Root-level `` |  no  |
-
-
-
-
-
-
-## Properties
-
-### Type and Range
-
-| Property | Value |
-| --- | --- |
-| Range | [LinksConvention](LinksConvention.md) |
-| Domain Of | [RootMetadata](RootMetadata.md) |
-
-### Cardinality and Requirements
-
-| Property | Value |
-| --- | --- |
-
-
-
-
-
-
-
-
-
-
-## Identifier and Mapping Information
-
-
-
-
-
-### Schema Source
-
-
-* from schema: https://w3id.org/zarr-vectors/schema/0.5
-
-
-
-
-## Mappings
-
-| Mapping Type | Mapped Value |
-| ---  | ---  |
-| self | zv:links_convention |
-| native | zv:links_convention |
-
-
-
-
-## LinkML Source
-
-<details>
-```yaml
-name: links_convention
-from_schema: https://w3id.org/zarr-vectors/schema/0.5
-rank: 1000
-domain_of:
-- RootMetadata
-range: LinksConvention
 
 ```
 </details></div>
@@ -7289,6 +4729,5235 @@ attributes:
 
 ---
 search:
+  boost: 2.0
+---
+
+
+# Enum: ManifestLayout 
+
+
+
+
+_Object-index layout a store creates new indexes in._
+
+
+
+<div data-search-exclude markdown="1">
+
+URI: [zv:ManifestLayout](https://w3id.org/zarr-vectors/schema/0.5/ManifestLayout)
+
+## Permissible Values
+| Value | Meaning | Description |
+| --- | --- | --- |
+| vlen | None | One vlen-bytes manifest blob per object (the default) |
+| dense | None | Fixed-width integer arrays, ``manifest_spans`` into ``manifest_blocks`` (0 |
+
+
+
+
+## Slots
+
+| Name | Description |
+| ---  | --- |
+| [manifest_layout](manifest_layout.md) | ``dense`` when object indexes are created in the dense layout (``manifest_spa... |
+
+
+
+
+
+
+
+
+
+
+## Identifier and Mapping Information
+
+
+
+
+
+### Schema Source
+
+
+* from schema: https://w3id.org/zarr-vectors/schema/0.5
+
+
+
+
+
+
+## LinkML Source
+
+<details>
+```yaml
+name: ManifestLayout
+description: Object-index layout a store creates new indexes in.
+from_schema: https://w3id.org/zarr-vectors/schema/0.5
+rank: 1000
+permissible_values:
+  vlen:
+    text: vlen
+    description: One vlen-bytes manifest blob per object (the default).
+  dense:
+    text: dense
+    description: 'Fixed-width integer arrays, ``manifest_spans`` into ``manifest_blocks``
+      (0.9.4).
+
+      '
+
+```
+</details>
+
+</div>
+
+
+---
+
+---
+search:
+  boost: 1.0
+---# Type: Ncname 
+
+
+
+
+_Prefix part of CURIE_
+
+
+
+<div data-search-exclude markdown="1">
+
+URI: [xsd:string](http://www.w3.org/2001/XMLSchema#string)
+
+## Type Properties
+
+| Property | Value |
+| --- | --- |
+| Base | `NCName` |
+| Type URI | [xsd:string](http://www.w3.org/2001/XMLSchema#string) |
+| Representation | `str` |
+
+
+
+
+
+
+## Notes
+
+* If you are authoring schemas in LinkML YAML, the type is referenced with the lower case "ncname".
+
+
+
+## Identifier and Mapping Information
+
+
+
+
+
+### Schema Source
+
+
+* from schema: https://w3id.org/zarr-vectors/schema/0.5
+
+
+
+
+## Mappings
+
+| Mapping Type | Mapped Value |
+| ---  | ---  |
+| self | xsd:string |
+| native | zv:ncname |
+
+
+
+
+</div>
+
+
+---
+
+---
+search:
+  boost: 1.0
+---# Type: Nodeidentifier 
+
+
+
+
+_A URI, CURIE or BNODE that represents a node in a model._
+
+
+
+<div data-search-exclude markdown="1">
+
+URI: [shex:nonLiteral](http://www.w3.org/ns/shex#nonLiteral)
+
+## Type Properties
+
+| Property | Value |
+| --- | --- |
+| Base | `NodeIdentifier` |
+| Type URI | [shex:nonLiteral](http://www.w3.org/ns/shex#nonLiteral) |
+| Representation | `str` |
+
+
+
+
+
+
+## Notes
+
+* If you are authoring schemas in LinkML YAML, the type is referenced with the lower case "nodeidentifier".
+
+
+
+## Identifier and Mapping Information
+
+
+
+
+
+### Schema Source
+
+
+* from schema: https://w3id.org/zarr-vectors/schema/0.5
+
+
+
+
+## Mappings
+
+| Mapping Type | Mapped Value |
+| ---  | ---  |
+| self | shex:nonLiteral |
+| native | zv:nodeidentifier |
+
+
+
+
+</div>
+
+
+---
+
+---
+search:
+  boost: 10.0
+---
+
+# Class: ObjectAttributeMeta 
+
+
+_``.zattrs`` for each ``object_attributes/<name>/`` array._
+
+
+
+<div data-search-exclude markdown="1">
+
+
+
+URI: [zv:ObjectAttributeMeta](https://w3id.org/zarr-vectors/schema/0.5/ObjectAttributeMeta)
+
+
+
+
+
+```mermaid
+ classDiagram
+    class ObjectAttributeMeta
+    click ObjectAttributeMeta href "../ObjectAttributeMeta/"
+      ObjectAttributeMeta : dtype
+        
+      ObjectAttributeMeta : name
+        
+      ObjectAttributeMeta : shape
+        
+      ObjectAttributeMeta : zv_array
+        
+          
+    
+        
+        
+        ObjectAttributeMeta --> "1" ZvArrayTag : zv_array
+        click ZvArrayTag href "../ZvArrayTag/"
+    
+
+        
+      
+```
+
+
+
+
+<!-- no inheritance hierarchy -->
+
+## Slots
+
+| Name | Cardinality and Range | Description | Inheritance |
+| ---  | --- | --- | --- |
+| [zv_array](zv_array.md) | 1 <br/> [ZvArrayTag](ZvArrayTag.md) | Discriminator slot identifying the kind of per-array `` | direct |
+| [name](name.md) | 1 <br/> [String](String.md) | NGFF axis or attribute name (e | direct |
+| [dtype](dtype.md) | 1 <br/> [String](String.md) | Numpy dtype string of the array's value type (e | direct |
+| [shape](shape.md) | 1..* <br/> [Integer](Integer.md) | Shape of a dense per-object/per-group array | direct |
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+## Identifier and Mapping Information
+
+
+
+
+
+### Schema Source
+
+
+* from schema: https://w3id.org/zarr-vectors/schema/0.5
+
+
+
+
+## Mappings
+
+| Mapping Type | Mapped Value |
+| ---  | ---  |
+| self | zv:ObjectAttributeMeta |
+| native | zv:ObjectAttributeMeta |
+
+
+
+
+
+
+## LinkML Source
+
+### Direct
+
+<details>
+```yaml
+name: ObjectAttributeMeta
+description: '``.zattrs`` for each ``object_attributes/<name>/`` array.'
+from_schema: https://w3id.org/zarr-vectors/schema/0.5
+rank: 1000
+slots:
+- zv_array
+- name
+- dtype
+- shape
+slot_usage:
+  zv_array:
+    name: zv_array
+    required: true
+    equals_string: object_attribute
+
+```
+</details>
+
+### Induced
+
+<details>
+```yaml
+name: ObjectAttributeMeta
+description: '``.zattrs`` for each ``object_attributes/<name>/`` array.'
+from_schema: https://w3id.org/zarr-vectors/schema/0.5
+rank: 1000
+slot_usage:
+  zv_array:
+    name: zv_array
+    required: true
+    equals_string: object_attribute
+attributes:
+  zv_array:
+    name: zv_array
+    description: 'Discriminator slot identifying the kind of per-array ``.zattrs``
+      block.  Each writer in ``core/arrays.py`` stamps the corresponding token from
+      :class:`ZvArrayTag`.
+
+      '
+    from_schema: https://w3id.org/zarr-vectors/schema/0.5
+    rank: 1000
+    owner: ObjectAttributeMeta
+    domain_of:
+    - VerticesMeta
+    - LinksFamilyMeta
+    - LinksMeta
+    - AttributeMeta
+    - FragmentAttributeMeta
+    - ObjectIndexMeta
+    - ObjectAttributeMeta
+    - GroupingsMeta
+    - GroupingsAttributeMeta
+    - LinkAttributeFamilyMeta
+    - LinkAttributeMeta
+    range: ZvArrayTag
+    required: true
+    equals_string: object_attribute
+  name:
+    name: name
+    description: NGFF axis or attribute name (e.g. "x", "intensity").
+    from_schema: https://w3id.org/zarr-vectors/schema/0.5
+    rank: 1000
+    slot_uri: schema:name
+    owner: ObjectAttributeMeta
+    domain_of:
+    - Axis
+    - AttributeMeta
+    - FragmentAttributeMeta
+    - ObjectAttributeMeta
+    - GroupingsAttributeMeta
+    - LinkAttributeFamilyMeta
+    - LinkAttributeMeta
+    range: string
+    required: true
+  dtype:
+    name: dtype
+    description: Numpy dtype string of the array's value type (e.g. "float32").
+    from_schema: https://w3id.org/zarr-vectors/schema/0.5
+    rank: 1000
+    owner: ObjectAttributeMeta
+    domain_of:
+    - VerticesMeta
+    - LinksMeta
+    - AttributeMeta
+    - FragmentAttributeMeta
+    - ObjectAttributeMeta
+    - GroupingsAttributeMeta
+    - LinkAttributeMeta
+    range: string
+    required: true
+  shape:
+    name: shape
+    description: Shape of a dense per-object/per-group array.
+    from_schema: https://w3id.org/zarr-vectors/schema/0.5
+    rank: 1000
+    owner: ObjectAttributeMeta
+    domain_of:
+    - ObjectAttributeMeta
+    - GroupingsAttributeMeta
+    range: integer
+    required: true
+    multivalued: true
+
+```
+</details></div>
+
+
+---
+
+---
+search:
+  boost: 2.0
+---
+
+
+# Enum: ObjectIndexConvention 
+
+
+
+
+_How the object_id → fragment mapping is encoded._
+
+
+
+<div data-search-exclude markdown="1">
+
+URI: [zv:ObjectIndexConvention](https://w3id.org/zarr-vectors/schema/0.5/ObjectIndexConvention)
+
+## Permissible Values
+| Value | Meaning | Description |
+| --- | --- | --- |
+| standard | None | Full ``object_index`` array maps each object to its fragment refs |
+| identity | None | One object per vertex; only valid in single-chunk stores where the object_ind... |
+
+
+
+
+## Slots
+
+| Name | Description |
+| ---  | --- |
+| [object_index_convention](object_index_convention.md) |  |
+
+
+
+
+
+
+
+
+
+
+## Identifier and Mapping Information
+
+
+
+
+
+### Schema Source
+
+
+* from schema: https://w3id.org/zarr-vectors/schema/0.5
+
+
+
+
+
+
+## LinkML Source
+
+<details>
+```yaml
+name: ObjectIndexConvention
+description: How the object_id → fragment mapping is encoded.
+from_schema: https://w3id.org/zarr-vectors/schema/0.5
+rank: 1000
+permissible_values:
+  standard:
+    text: standard
+    description: Full ``object_index`` array maps each object to its fragment refs.
+  identity:
+    text: identity
+    description: 'One object per vertex; only valid in single-chunk stores where the
+      object_index would be redundant.
+
+      '
+
+```
+</details>
+
+</div>
+
+
+---
+
+---
+search:
+  boost: 2.0
+---
+
+
+# Enum: ObjectIndexLayout 
+
+
+
+
+_How one object index stores its manifests._
+
+
+
+<div data-search-exclude markdown="1">
+
+URI: [zv:ObjectIndexLayout](https://w3id.org/zarr-vectors/schema/0.5/ObjectIndexLayout)
+
+## Permissible Values
+| Value | Meaning | Description |
+| --- | --- | --- |
+| vlen_manifests_v1 | None | One vlen blob per object; rows are object ids |
+| vlen_manifests_v2 | None | One vlen blob per object; ids stored in ``object_ids`` |
+| dense_manifests_v1 | None | ``manifest_spans`` (start, count) into ``manifest_blocks`` (chunk coords, fra... |
+
+
+
+
+## Slots
+
+| Name | Description |
+| ---  | --- |
+| [layout](layout.md) | The object index's storage layout: ``vlen_manifests_v1`` (vlen blobs, rows ar... |
+
+
+
+
+
+
+
+
+
+
+## Identifier and Mapping Information
+
+
+
+
+
+### Schema Source
+
+
+* from schema: https://w3id.org/zarr-vectors/schema/0.5
+
+
+
+
+
+
+## LinkML Source
+
+<details>
+```yaml
+name: ObjectIndexLayout
+description: How one object index stores its manifests.
+from_schema: https://w3id.org/zarr-vectors/schema/0.5
+rank: 1000
+permissible_values:
+  vlen_manifests_v1:
+    text: vlen_manifests_v1
+    description: One vlen blob per object; rows are object ids.
+  vlen_manifests_v2:
+    text: vlen_manifests_v2
+    description: One vlen blob per object; ids stored in ``object_ids``.
+  dense_manifests_v1:
+    text: dense_manifests_v1
+    description: '``manifest_spans`` (start, count) into ``manifest_blocks`` (chunk
+      coords, fragment index); ids stored in ``object_ids``.
+
+      '
+
+```
+</details>
+
+</div>
+
+
+---
+
+---
+search:
+  boost: 10.0
+---
+
+# Class: ObjectIndexMeta 
+
+
+_``.zattrs`` for ``object_index/``._
+
+
+
+<div data-search-exclude markdown="1">
+
+
+
+URI: [zv:ObjectIndexMeta](https://w3id.org/zarr-vectors/schema/0.5/ObjectIndexMeta)
+
+
+
+
+
+```mermaid
+ classDiagram
+    class ObjectIndexMeta
+    click ObjectIndexMeta href "../ObjectIndexMeta/"
+      ObjectIndexMeta : layout
+        
+          
+    
+        
+        
+        ObjectIndexMeta --> "0..1" ObjectIndexLayout : layout
+        click ObjectIndexLayout href "../ObjectIndexLayout/"
+    
+
+        
+      ObjectIndexMeta : num_objects
+        
+      ObjectIndexMeta : sid_ndim
+        
+      ObjectIndexMeta : zv_array
+        
+          
+    
+        
+        
+        ObjectIndexMeta --> "1" ZvArrayTag : zv_array
+        click ZvArrayTag href "../ZvArrayTag/"
+    
+
+        
+      
+```
+
+
+
+
+<!-- no inheritance hierarchy -->
+
+## Slots
+
+| Name | Cardinality and Range | Description | Inheritance |
+| ---  | --- | --- | --- |
+| [zv_array](zv_array.md) | 1 <br/> [ZvArrayTag](ZvArrayTag.md) | Discriminator slot identifying the kind of per-array `` | direct |
+| [num_objects](num_objects.md) | 1 <br/> [Integer](Integer.md) | Total object count this array carries | direct |
+| [sid_ndim](sid_ndim.md) | 1 <br/> [Integer](Integer.md) | Number of spatial-index dimensions encoded in chunk keys | direct |
+| [layout](layout.md) | 0..1 <br/> [ObjectIndexLayout](ObjectIndexLayout.md) | The object index's storage layout: ``vlen_manifests_v1`` (vlen blobs, rows ar... | direct |
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+## Identifier and Mapping Information
+
+
+
+
+
+### Schema Source
+
+
+* from schema: https://w3id.org/zarr-vectors/schema/0.5
+
+
+
+
+## Mappings
+
+| Mapping Type | Mapped Value |
+| ---  | ---  |
+| self | zv:ObjectIndexMeta |
+| native | zv:ObjectIndexMeta |
+
+
+
+
+
+
+## LinkML Source
+
+### Direct
+
+<details>
+```yaml
+name: ObjectIndexMeta
+description: '``.zattrs`` for ``object_index/``.'
+from_schema: https://w3id.org/zarr-vectors/schema/0.5
+rank: 1000
+slots:
+- zv_array
+- num_objects
+- sid_ndim
+- layout
+slot_usage:
+  zv_array:
+    name: zv_array
+    required: true
+    equals_string: object_index
+
+```
+</details>
+
+### Induced
+
+<details>
+```yaml
+name: ObjectIndexMeta
+description: '``.zattrs`` for ``object_index/``.'
+from_schema: https://w3id.org/zarr-vectors/schema/0.5
+rank: 1000
+slot_usage:
+  zv_array:
+    name: zv_array
+    required: true
+    equals_string: object_index
+attributes:
+  zv_array:
+    name: zv_array
+    description: 'Discriminator slot identifying the kind of per-array ``.zattrs``
+      block.  Each writer in ``core/arrays.py`` stamps the corresponding token from
+      :class:`ZvArrayTag`.
+
+      '
+    from_schema: https://w3id.org/zarr-vectors/schema/0.5
+    rank: 1000
+    owner: ObjectIndexMeta
+    domain_of:
+    - VerticesMeta
+    - LinksFamilyMeta
+    - LinksMeta
+    - AttributeMeta
+    - FragmentAttributeMeta
+    - ObjectIndexMeta
+    - ObjectAttributeMeta
+    - GroupingsMeta
+    - GroupingsAttributeMeta
+    - LinkAttributeFamilyMeta
+    - LinkAttributeMeta
+    range: ZvArrayTag
+    required: true
+    equals_string: object_index
+  num_objects:
+    name: num_objects
+    description: Total object count this array carries.
+    from_schema: https://w3id.org/zarr-vectors/schema/0.5
+    rank: 1000
+    owner: ObjectIndexMeta
+    domain_of:
+    - ObjectIndexMeta
+    range: integer
+    required: true
+    minimum_value: 0
+  sid_ndim:
+    name: sid_ndim
+    description: Number of spatial-index dimensions encoded in chunk keys.
+    from_schema: https://w3id.org/zarr-vectors/schema/0.5
+    rank: 1000
+    owner: ObjectIndexMeta
+    domain_of:
+    - LinksFamilyMeta
+    - ObjectIndexMeta
+    range: integer
+    required: true
+    minimum_value: 1
+  layout:
+    name: layout
+    description: 'The object index''s storage layout: ``vlen_manifests_v1`` (vlen
+      blobs, rows are ids), ``vlen_manifests_v2`` (vlen blobs, ids in ``object_ids``)
+      or ``dense_manifests_v1`` (``manifest_spans`` into ``manifest_blocks``, ids
+      in ``object_ids``; 0.9.4).
+
+      '
+    from_schema: https://w3id.org/zarr-vectors/schema/0.5
+    rank: 1000
+    owner: ObjectIndexMeta
+    domain_of:
+    - ObjectIndexMeta
+    range: ObjectIndexLayout
+
+```
+</details></div>
+
+
+---
+
+---
+search:
+  boost: 1.0
+---# Type: Objectidentifier 
+
+
+
+
+_A URI or CURIE that represents an object in the model._
+
+
+
+<div data-search-exclude markdown="1">
+
+URI: [shex:iri](http://www.w3.org/ns/shex#iri)
+
+## Type Properties
+
+| Property | Value |
+| --- | --- |
+| Base | `ElementIdentifier` |
+| Type URI | [shex:iri](http://www.w3.org/ns/shex#iri) |
+| Representation | `str` |
+
+
+
+
+
+
+## Comments
+
+* Used for inheritance and type checking
+
+## Notes
+
+* If you are authoring schemas in LinkML YAML, the type is referenced with the lower case "objectidentifier".
+
+
+
+## Identifier and Mapping Information
+
+
+
+
+
+### Schema Source
+
+
+* from schema: https://w3id.org/zarr-vectors/schema/0.5
+
+
+
+
+## Mappings
+
+| Mapping Type | Mapped Value |
+| ---  | ---  |
+| self | shex:iri |
+| native | zv:objectidentifier |
+
+
+
+
+</div>
+
+
+---
+
+---
+search:
+  boost: 10.0
+---
+
+# Class: RootMetadata 
+
+
+_Root-level ``.zattrs`` payload, persisted under the key ``zarr_vectors``.  Validates the runtime :class:`zarr_vectors.core.metadata.RootMetadata` dataclass. Note: the canonical axis list lives in ``multiscales[0].axes`` at root level (NGFF-style), NOT under ``zarr_vectors`` — see ``MultiscalesMetadata``._
+
+__
+
+
+
+<div data-search-exclude markdown="1">
+
+
+
+URI: [zv:RootMetadata](https://w3id.org/zarr-vectors/schema/0.5/RootMetadata)
+
+
+
+
+
+```mermaid
+ classDiagram
+    class RootMetadata
+    click RootMetadata href "../RootMetadata/"
+      RootMetadata : attribute_specs
+        
+          
+    
+        
+        
+        RootMetadata --> "0..1" AttributeSpecs : attribute_specs
+        click AttributeSpecs href "../AttributeSpecs/"
+    
+
+        
+      RootMetadata : base_bin_shape
+        
+      RootMetadata : bounds
+        
+          
+    
+        
+        
+        RootMetadata --> "1" BoundingBox : bounds
+        click BoundingBox href "../BoundingBox/"
+    
+
+        
+      RootMetadata : chunk_shape
+        
+      RootMetadata : cross_chunk_strategy
+        
+          
+    
+        
+        
+        RootMetadata --> "0..1" CrossChunkStrategy : cross_chunk_strategy
+        click CrossChunkStrategy href "../CrossChunkStrategy/"
+    
+
+        
+      RootMetadata : cross_level_depth
+        
+      RootMetadata : cross_level_storage
+        
+          
+    
+        
+        
+        RootMetadata --> "0..1" CrossLevelStorage : cross_level_storage
+        click CrossLevelStorage href "../CrossLevelStorage/"
+    
+
+        
+      RootMetadata : crs
+        
+          
+    
+        
+        
+        RootMetadata --> "0..1" CRS : crs
+        click CRS href "../CRS/"
+    
+
+        
+      RootMetadata : format_capabilities
+        
+          
+    
+        
+        
+        RootMetadata --> "*" FormatCapability : format_capabilities
+        click FormatCapability href "../FormatCapability/"
+    
+
+        
+      RootMetadata : geometry_types
+        
+          
+    
+        
+        
+        RootMetadata --> "1..*" GeometryType : geometry_types
+        click GeometryType href "../GeometryType/"
+    
+
+        
+      RootMetadata : links_convention
+        
+          
+    
+        
+        
+        RootMetadata --> "0..1" LinksConvention : links_convention
+        click LinksConvention href "../LinksConvention/"
+    
+
+        
+      RootMetadata : manifest_layout
+        
+          
+    
+        
+        
+        RootMetadata --> "0..1" ManifestLayout : manifest_layout
+        click ManifestLayout href "../ManifestLayout/"
+    
+
+        
+      RootMetadata : object_index_convention
+        
+          
+    
+        
+        
+        RootMetadata --> "0..1" ObjectIndexConvention : object_index_convention
+        click ObjectIndexConvention href "../ObjectIndexConvention/"
+    
+
+        
+      RootMetadata : reduction_factor
+        
+      RootMetadata : shard_shape
+        
+      RootMetadata : zv_version
+        
+      
+```
+
+
+
+
+<!-- no inheritance hierarchy -->
+
+## Slots
+
+| Name | Cardinality and Range | Description | Inheritance |
+| ---  | --- | --- | --- |
+| [zv_version](zv_version.md) | 1 <br/> [String](String.md) | ZV spec version this store was written against (e | direct |
+| [chunk_shape](chunk_shape.md) | 1..* <br/> [Float](Float.md) | Physical spatial chunk size per axis (all values > 0) | direct |
+| [bounds](bounds.md) | 1 <br/> [BoundingBox](BoundingBox.md) | Global vertex bounding box | direct |
+| [geometry_types](geometry_types.md) | 1..* <br/> [GeometryType](GeometryType.md) | One or more geometry kinds present in the store | direct |
+| [crs](crs.md) | 0..1 <br/> [CRS](CRS.md) | Optional coordinate reference system metadata (free-form dict matching whatev... | direct |
+| [links_convention](links_convention.md) | 0..1 <br/> [LinksConvention](LinksConvention.md) |  | direct |
+| [object_index_convention](object_index_convention.md) | 0..1 <br/> [ObjectIndexConvention](ObjectIndexConvention.md) |  | direct |
+| [cross_chunk_strategy](cross_chunk_strategy.md) | 0..1 <br/> [CrossChunkStrategy](CrossChunkStrategy.md) |  | direct |
+| [cross_level_depth](cross_level_depth.md) | 0..1 <br/> [Integer](Integer.md) | Maximum absolute level delta for which cross-pyramid-level link arrays are ma... | direct |
+| [cross_level_storage](cross_level_storage.md) | 0..1 <br/> [CrossLevelStorage](CrossLevelStorage.md) | Whether cross-level link arrays are written in both directions (``explicit``:... | direct |
+| [reduction_factor](reduction_factor.md) | 0..1 <br/> [Integer](Integer.md) | Multi-resolution coarsening factor (≥ 2) | direct |
+| [base_bin_shape](base_bin_shape.md) | * <br/> [Float](Float.md) | Supervoxel bin edge lengths at level 0 | direct |
+| [format_capabilities](format_capabilities.md) | * <br/> [FormatCapability](FormatCapability.md) | Optional 0 | direct |
+| [attribute_specs](attribute_specs.md) | 0..1 <br/> [AttributeSpecs](AttributeSpecs.md) | What the store declares its attributes to be, keyed by scope (``vertex`` / ``... | direct |
+| [shard_shape](shard_shape.md) | * <br/> [Integer](Integer.md) | Cells per shard per axis, or absent for one storage object per cell | direct |
+| [manifest_layout](manifest_layout.md) | 0..1 <br/> [ManifestLayout](ManifestLayout.md) | ``dense`` when object indexes are created in the dense layout (``manifest_spa... | direct |
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+## Identifier and Mapping Information
+
+
+
+
+
+### Schema Source
+
+
+* from schema: https://w3id.org/zarr-vectors/schema/0.5
+
+
+
+
+## Mappings
+
+| Mapping Type | Mapped Value |
+| ---  | ---  |
+| self | zv:RootMetadata |
+| native | zv:RootMetadata |
+
+
+
+
+
+
+## LinkML Source
+
+### Direct
+
+<details>
+```yaml
+name: RootMetadata
+description: 'Root-level ``.zattrs`` payload, persisted under the key ``zarr_vectors``.  Validates
+  the runtime :class:`zarr_vectors.core.metadata.RootMetadata` dataclass. Note: the
+  canonical axis list lives in ``multiscales[0].axes`` at root level (NGFF-style),
+  NOT under ``zarr_vectors`` — see ``MultiscalesMetadata``.
+
+  '
+from_schema: https://w3id.org/zarr-vectors/schema/0.5
+rank: 1000
+slots:
+- zv_version
+- chunk_shape
+- bounds
+- geometry_types
+- crs
+- links_convention
+- object_index_convention
+- cross_chunk_strategy
+- cross_level_depth
+- cross_level_storage
+- reduction_factor
+- base_bin_shape
+- format_capabilities
+- attribute_specs
+- shard_shape
+- manifest_layout
+
+```
+</details>
+
+### Induced
+
+<details>
+```yaml
+name: RootMetadata
+description: 'Root-level ``.zattrs`` payload, persisted under the key ``zarr_vectors``.  Validates
+  the runtime :class:`zarr_vectors.core.metadata.RootMetadata` dataclass. Note: the
+  canonical axis list lives in ``multiscales[0].axes`` at root level (NGFF-style),
+  NOT under ``zarr_vectors`` — see ``MultiscalesMetadata``.
+
+  '
+from_schema: https://w3id.org/zarr-vectors/schema/0.5
+rank: 1000
+attributes:
+  zv_version:
+    name: zv_version
+    description: 'ZV spec version this store was written against (e.g. "0.5.0"). Renamed
+      from ``format_version`` in 0.5.0 to disambiguate from Zarr v3''s ``zarr_format``
+      field.
+
+      '
+    from_schema: https://w3id.org/zarr-vectors/schema/0.5
+    rank: 1000
+    slot_uri: schema:version
+    owner: RootMetadata
+    domain_of:
+    - RootMetadata
+    range: string
+    required: true
+    pattern: ^\d+\.\d+(\.\d+)?$
+  chunk_shape:
+    name: chunk_shape
+    description: Physical spatial chunk size per axis (all values > 0).
+    from_schema: https://w3id.org/zarr-vectors/schema/0.5
+    rank: 1000
+    owner: RootMetadata
+    domain_of:
+    - RootMetadata
+    - LevelMetadata
+    range: float
+    required: true
+    multivalued: true
+  bounds:
+    name: bounds
+    description: Global vertex bounding box.
+    from_schema: https://w3id.org/zarr-vectors/schema/0.5
+    rank: 1000
+    owner: RootMetadata
+    domain_of:
+    - RootMetadata
+    range: BoundingBox
+    required: true
+  geometry_types:
+    name: geometry_types
+    description: One or more geometry kinds present in the store.
+    from_schema: https://w3id.org/zarr-vectors/schema/0.5
+    rank: 1000
+    owner: RootMetadata
+    domain_of:
+    - RootMetadata
+    range: GeometryType
+    required: true
+    multivalued: true
+    minimum_cardinality: 1
+  crs:
+    name: crs
+    description: 'Optional coordinate reference system metadata (free-form dict matching
+      whatever CRS vocabulary the store uses, e.g. WKT, PROJ4, EPSG, CF conventions).
+
+      '
+    from_schema: https://w3id.org/zarr-vectors/schema/0.5
+    rank: 1000
+    slot_uri: schema:coordinateReferenceSystem
+    owner: RootMetadata
+    domain_of:
+    - RootMetadata
+    range: CRS
+    inlined: true
+  links_convention:
+    name: links_convention
+    from_schema: https://w3id.org/zarr-vectors/schema/0.5
+    rank: 1000
+    owner: RootMetadata
+    domain_of:
+    - RootMetadata
+    range: LinksConvention
+  object_index_convention:
+    name: object_index_convention
+    from_schema: https://w3id.org/zarr-vectors/schema/0.5
+    rank: 1000
+    owner: RootMetadata
+    domain_of:
+    - RootMetadata
+    range: ObjectIndexConvention
+  cross_chunk_strategy:
+    name: cross_chunk_strategy
+    from_schema: https://w3id.org/zarr-vectors/schema/0.5
+    rank: 1000
+    owner: RootMetadata
+    domain_of:
+    - RootMetadata
+    range: CrossChunkStrategy
+  cross_level_depth:
+    name: cross_level_depth
+    description: 'Maximum absolute level delta for which cross-pyramid-level link
+      arrays are materialized.  ``0`` = none (no ``+N`` or ``-N`` arrays), ``N`` =
+      generate up to ``±N`` (or ``+N`` only when ``cross_level_storage="implicit"``),
+      ``-1`` = all available pyramid levels.  Default ``1``.
+
+      '
+    from_schema: https://w3id.org/zarr-vectors/schema/0.5
+    rank: 1000
+    owner: RootMetadata
+    domain_of:
+    - RootMetadata
+    range: integer
+    minimum_value: -1
+  cross_level_storage:
+    name: cross_level_storage
+    description: 'Whether cross-level link arrays are written in both directions (``explicit``:
+      ``+N`` at the finer level AND ``-N`` at the coarser level) or only positive
+      deltas (``implicit``: only ``+N``, with ``-N`` reconstructed on read).  Default
+      ``explicit``.
+
+      '
+    from_schema: https://w3id.org/zarr-vectors/schema/0.5
+    rank: 1000
+    owner: RootMetadata
+    domain_of:
+    - RootMetadata
+    range: CrossLevelStorage
+  reduction_factor:
+    name: reduction_factor
+    description: Multi-resolution coarsening factor (≥ 2).
+    from_schema: https://w3id.org/zarr-vectors/schema/0.5
+    rank: 1000
+    owner: RootMetadata
+    domain_of:
+    - RootMetadata
+    range: integer
+    minimum_value: 2
+  base_bin_shape:
+    name: base_bin_shape
+    description: 'Supervoxel bin edge lengths at level 0.  When set, every value must
+      be > 0 and ``chunk_shape`` must be an integer multiple along every axis (enforced
+      runtime-side in ``RootMetadata.validate``).
+
+      '
+    from_schema: https://w3id.org/zarr-vectors/schema/0.5
+    rank: 1000
+    owner: RootMetadata
+    domain_of:
+    - RootMetadata
+    range: float
+    multivalued: true
+  format_capabilities:
+    name: format_capabilities
+    description: Optional 0.3+ feature tokens advertised by this store.
+    from_schema: https://w3id.org/zarr-vectors/schema/0.5
+    rank: 1000
+    owner: RootMetadata
+    domain_of:
+    - RootMetadata
+    range: FormatCapability
+    multivalued: true
+  attribute_specs:
+    name: attribute_specs
+    description: 'What the store declares its attributes to be, keyed by scope (``vertex``
+      / ``object`` / ``link``) and then by attribute name. Each entry carries ``dtype``
+      and optionally ``channels``, ``categorical``, ``unit`` and ``description``.  Optional
+      and backward-compatible from 0.9.1: absent means undeclared, which is every
+      store written before it.  A declaration is not a promise the array exists --
+      the array appears when data is written -- but it is what lets a Schema round-trip
+      and what ``open_or_create`` compares against.  ``unit`` and ``description``
+      are additionally stamped on the attribute array''s own metadata block.
+
+      '
+    from_schema: https://w3id.org/zarr-vectors/schema/0.5
+    rank: 1000
+    owner: RootMetadata
+    domain_of:
+    - RootMetadata
+    range: AttributeSpecs
+  shard_shape:
+    name: shard_shape
+    description: 'Cells per shard per axis, or absent for one storage object per cell.  The
+      store''s declared packing, read by every path that allocates a per-chunk array
+      -- including the ones that run long after creation, inside workers that never
+      saw the argument.  Units are grid cells, so one declaration is meaningful at
+      every level of a pyramid even though their grids differ.  A store where every
+      axis agrees writes the scalar edge; the multivalued form carries a per-axis
+      shape.  Optional and additive from 0.9.3: absent means unsharded, which is every
+      store written before it.  It is a writer default, not a claim about what is
+      on disk -- an array''s own ``zarr.json`` remains the truth about that array.
+
+      '
+    from_schema: https://w3id.org/zarr-vectors/schema/0.5
+    rank: 1000
+    owner: RootMetadata
+    domain_of:
+    - RootMetadata
+    range: integer
+    multivalued: true
+    minimum_value: 1
+  manifest_layout:
+    name: manifest_layout
+    description: '``dense`` when object indexes are created in the dense layout (``manifest_spans``
+      + ``manifest_blocks``: fixed-width integer arrays), absent for the vlen default
+      of one blob per object. Optional and additive from 0.9.4. A default for indexes
+      created later; an existing index''s own ``layout`` is the truth about it.
+
+      '
+    from_schema: https://w3id.org/zarr-vectors/schema/0.5
+    rank: 1000
+    owner: RootMetadata
+    domain_of:
+    - RootMetadata
+    range: ManifestLayout
+
+```
+</details></div>
+
+
+---
+
+---
+search:
+  boost: 1.0
+---# Type: Sparqlpath 
+
+
+
+
+_A string encoding a SPARQL Property Path. The value of the string MUST conform to SPARQL syntax and SHOULD dereference to zero or more valid objects within the current instance document when encoded as RDF._
+
+
+
+<div data-search-exclude markdown="1">
+
+URI: [xsd:string](http://www.w3.org/2001/XMLSchema#string)
+
+## Type Properties
+
+| Property | Value |
+| --- | --- |
+| Base | `str` |
+| Type URI | [xsd:string](http://www.w3.org/2001/XMLSchema#string) |
+| Representation | `str` |
+
+
+
+
+
+
+## Notes
+
+* If you are authoring schemas in LinkML YAML, the type is referenced with the lower case "sparqlpath".
+
+
+
+## Identifier and Mapping Information
+
+
+
+
+
+### Schema Source
+
+
+* from schema: https://w3id.org/zarr-vectors/schema/0.5
+
+
+
+
+## Mappings
+
+| Mapping Type | Mapped Value |
+| ---  | ---  |
+| self | xsd:string |
+| native | zv:sparqlpath |
+
+
+
+
+</div>
+
+
+---
+
+---
+search:
+  boost: 1.0
+---# Type: String 
+
+
+
+
+_A character string_
+
+
+
+<div data-search-exclude markdown="1">
+
+URI: [xsd:string](http://www.w3.org/2001/XMLSchema#string)
+
+## Type Properties
+
+| Property | Value |
+| --- | --- |
+| Base | `str` |
+| Type URI | [xsd:string](http://www.w3.org/2001/XMLSchema#string) |
+
+
+
+
+
+
+## Notes
+
+* In RDF serializations, a slot with range of string is treated as a literal or type xsd:string. If you are authoring schemas in LinkML YAML, the type is referenced with the lower case "string".
+
+
+
+## Identifier and Mapping Information
+
+
+
+
+
+### Schema Source
+
+
+* from schema: https://w3id.org/zarr-vectors/schema/0.5
+
+
+
+
+## Mappings
+
+| Mapping Type | Mapped Value |
+| ---  | ---  |
+| self | xsd:string |
+| native | zv:string |
+| exact | schema:Text |
+
+
+
+
+</div>
+
+
+---
+
+---
+search:
+  boost: 1.0
+---# Type: Time 
+
+
+
+
+_A time object represents a (local) time of day, independent of any particular day_
+
+
+
+<div data-search-exclude markdown="1">
+
+URI: [xsd:time](http://www.w3.org/2001/XMLSchema#time)
+
+## Type Properties
+
+| Property | Value |
+| --- | --- |
+| Base | `XSDTime` |
+| Type URI | [xsd:time](http://www.w3.org/2001/XMLSchema#time) |
+| Representation | `str` |
+
+
+
+
+
+
+## Notes
+
+* URI is dateTime because OWL reasoners do not work with straight date or time
+* If you are authoring schemas in LinkML YAML, the type is referenced with the lower case "time".
+
+
+
+## Identifier and Mapping Information
+
+
+
+
+
+### Schema Source
+
+
+* from schema: https://w3id.org/zarr-vectors/schema/0.5
+
+
+
+
+## Mappings
+
+| Mapping Type | Mapped Value |
+| ---  | ---  |
+| self | xsd:time |
+| native | zv:time |
+| exact | schema:Time |
+
+
+
+
+</div>
+
+
+---
+
+---
+search:
+  boost: 1.0
+---# Type: Uri 
+
+
+
+
+_a complete URI_
+
+
+
+<div data-search-exclude markdown="1">
+
+URI: [xsd:anyURI](http://www.w3.org/2001/XMLSchema#anyURI)
+
+## Type Properties
+
+| Property | Value |
+| --- | --- |
+| Base | `URI` |
+| Type URI | [xsd:anyURI](http://www.w3.org/2001/XMLSchema#anyURI) |
+| Representation | `str` |
+
+
+
+
+
+
+## Comments
+
+* in RDF serializations a slot with range of uri is treated as a literal or type xsd:anyURI unless it is an identifier or a reference to an identifier, in which case it is translated directly to a node
+
+## Notes
+
+* If you are authoring schemas in LinkML YAML, the type is referenced with the lower case "uri".
+
+
+
+## Identifier and Mapping Information
+
+
+
+
+
+### Schema Source
+
+
+* from schema: https://w3id.org/zarr-vectors/schema/0.5
+
+
+
+
+## Mappings
+
+| Mapping Type | Mapped Value |
+| ---  | ---  |
+| self | xsd:anyURI |
+| native | zv:uri |
+| close | schema:URL |
+
+
+
+
+</div>
+
+
+---
+
+---
+search:
+  boost: 1.0
+---# Type: Uriorcurie 
+
+
+
+
+_a URI or a CURIE_
+
+
+
+<div data-search-exclude markdown="1">
+
+URI: [xsd:anyURI](http://www.w3.org/2001/XMLSchema#anyURI)
+
+## Type Properties
+
+| Property | Value |
+| --- | --- |
+| Base | `URIorCURIE` |
+| Type URI | [xsd:anyURI](http://www.w3.org/2001/XMLSchema#anyURI) |
+| Representation | `str` |
+
+
+
+
+
+
+## Notes
+
+* If you are authoring schemas in LinkML YAML, the type is referenced with the lower case "uriorcurie".
+
+
+
+## Identifier and Mapping Information
+
+
+
+
+
+### Schema Source
+
+
+* from schema: https://w3id.org/zarr-vectors/schema/0.5
+
+
+
+
+## Mappings
+
+| Mapping Type | Mapped Value |
+| ---  | ---  |
+| self | xsd:anyURI |
+| native | zv:uriorcurie |
+
+
+
+
+</div>
+
+
+---
+
+---
+search:
+  boost: 10.0
+---
+
+# Class: VerticesMeta 
+
+
+_``.zattrs`` for the ``vertices/`` array._
+
+
+
+<div data-search-exclude markdown="1">
+
+
+
+URI: [zv:VerticesMeta](https://w3id.org/zarr-vectors/schema/0.5/VerticesMeta)
+
+
+
+
+
+```mermaid
+ classDiagram
+    class VerticesMeta
+    click VerticesMeta href "../VerticesMeta/"
+      VerticesMeta : dtype
+        
+      VerticesMeta : encoding
+        
+          
+    
+        
+        
+        VerticesMeta --> "0..1" Encoding : encoding
+        click Encoding href "../Encoding/"
+    
+
+        
+      VerticesMeta : zv_array
+        
+          
+    
+        
+        
+        VerticesMeta --> "1" ZvArrayTag : zv_array
+        click ZvArrayTag href "../ZvArrayTag/"
+    
+
+        
+      
+```
+
+
+
+
+<!-- no inheritance hierarchy -->
+
+## Slots
+
+| Name | Cardinality and Range | Description | Inheritance |
+| ---  | --- | --- | --- |
+| [zv_array](zv_array.md) | 1 <br/> [ZvArrayTag](ZvArrayTag.md) | Discriminator slot identifying the kind of per-array `` | direct |
+| [dtype](dtype.md) | 1 <br/> [String](String.md) | Numpy dtype string of the array's value type (e | direct |
+| [encoding](encoding.md) | 0..1 <br/> [Encoding](Encoding.md) | How the chunk bytes are encoded | direct |
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+## Identifier and Mapping Information
+
+
+
+
+
+### Schema Source
+
+
+* from schema: https://w3id.org/zarr-vectors/schema/0.5
+
+
+
+
+## Mappings
+
+| Mapping Type | Mapped Value |
+| ---  | ---  |
+| self | zv:VerticesMeta |
+| native | zv:VerticesMeta |
+
+
+
+
+
+
+## LinkML Source
+
+### Direct
+
+<details>
+```yaml
+name: VerticesMeta
+description: '``.zattrs`` for the ``vertices/`` array.'
+from_schema: https://w3id.org/zarr-vectors/schema/0.5
+rank: 1000
+slots:
+- zv_array
+- dtype
+- encoding
+slot_usage:
+  zv_array:
+    name: zv_array
+    required: true
+    equals_string: vertices
+
+```
+</details>
+
+### Induced
+
+<details>
+```yaml
+name: VerticesMeta
+description: '``.zattrs`` for the ``vertices/`` array.'
+from_schema: https://w3id.org/zarr-vectors/schema/0.5
+rank: 1000
+slot_usage:
+  zv_array:
+    name: zv_array
+    required: true
+    equals_string: vertices
+attributes:
+  zv_array:
+    name: zv_array
+    description: 'Discriminator slot identifying the kind of per-array ``.zattrs``
+      block.  Each writer in ``core/arrays.py`` stamps the corresponding token from
+      :class:`ZvArrayTag`.
+
+      '
+    from_schema: https://w3id.org/zarr-vectors/schema/0.5
+    rank: 1000
+    owner: VerticesMeta
+    domain_of:
+    - VerticesMeta
+    - LinksFamilyMeta
+    - LinksMeta
+    - AttributeMeta
+    - FragmentAttributeMeta
+    - ObjectIndexMeta
+    - ObjectAttributeMeta
+    - GroupingsMeta
+    - GroupingsAttributeMeta
+    - LinkAttributeFamilyMeta
+    - LinkAttributeMeta
+    range: ZvArrayTag
+    required: true
+    equals_string: vertices
+  dtype:
+    name: dtype
+    description: Numpy dtype string of the array's value type (e.g. "float32").
+    from_schema: https://w3id.org/zarr-vectors/schema/0.5
+    rank: 1000
+    owner: VerticesMeta
+    domain_of:
+    - VerticesMeta
+    - LinksMeta
+    - AttributeMeta
+    - FragmentAttributeMeta
+    - ObjectAttributeMeta
+    - GroupingsAttributeMeta
+    - LinkAttributeMeta
+    range: string
+    required: true
+  encoding:
+    name: encoding
+    description: How the chunk bytes are encoded.
+    from_schema: https://w3id.org/zarr-vectors/schema/0.5
+    rank: 1000
+    owner: VerticesMeta
+    domain_of:
+    - VerticesMeta
+    range: Encoding
+
+```
+</details></div>
+
+
+---
+
+---
+search:
+  boost: 2.0
+---
+
+
+# Enum: ZvArrayTag 
+
+
+
+
+_Discriminator value for per-array ``.zattrs`` blocks (slot ``zv_array``).  Each writer in ``zarr_vectors/core/arrays.py`` stamps the corresponding tag._
+
+__
+
+
+
+<div data-search-exclude markdown="1">
+
+URI: [zv:ZvArrayTag](https://w3id.org/zarr-vectors/schema/0.5/ZvArrayTag)
+
+## Permissible Values
+| Value | Meaning | Description |
+| --- | --- | --- |
+| vertices | None |  |
+| vertex_fragments | None | Per-chunk fragment-index group for ``vertices/<chunk>`` (v0 |
+| link_fragments | None | Per-chunk fragment-index group for the intra-chunk link array at ``links/0/<a... |
+| links_family | None | The ``links/<delta>/`` group carrying family-wide policy for every offsets ar... |
+| links | None | One ``links/<delta>/<offsets>/`` array — a rank-D vlen array whose cell is th... |
+| attribute | None |  |
+| fragment_attribute | None | Per-fragment attribute array (``fragment_attributes/<name>/<chunk>``) |
+| object_index | None |  |
+| object_attribute | None |  |
+| groupings | None |  |
+| groupings_attribute | None |  |
+| link_attribute_family | None | The ``link_attributes/<name>/<delta>/`` group |
+| link_attribute | None | One ``link_attributes/<name>/<delta>/<offsets>/`` array, mirroring the matchi... |
+
+
+
+
+## Slots
+
+| Name | Description |
+| ---  | --- |
+| [zv_array](zv_array.md) | Discriminator slot identifying the kind of per-array `` |
+
+
+
+
+
+
+
+
+
+
+## Identifier and Mapping Information
+
+
+
+
+
+### Schema Source
+
+
+* from schema: https://w3id.org/zarr-vectors/schema/0.5
+
+
+
+
+
+
+## LinkML Source
+
+<details>
+```yaml
+name: ZvArrayTag
+description: 'Discriminator value for per-array ``.zattrs`` blocks (slot ``zv_array``).  Each
+  writer in ``zarr_vectors/core/arrays.py`` stamps the corresponding tag.
+
+  '
+from_schema: https://w3id.org/zarr-vectors/schema/0.5
+rank: 1000
+permissible_values:
+  vertices:
+    text: vertices
+  vertex_fragments:
+    text: vertex_fragments
+    description: 'Per-chunk fragment-index group for ``vertices/<chunk>`` (v0.6+).
+      Replaces the v0.5 ``vertex_group_offsets``.
+
+      '
+  link_fragments:
+    text: link_fragments
+    description: 'Per-chunk fragment-index group for the intra-chunk link array at
+      ``links/0/<all-zero offsets>/<chunk>``.  Keyed by chunk ALONE — it carries no
+      delta and no offsets segment — so exactly one array may write it.  Every other
+      offsets segment, and every ``delta != 0`` array, uses an inline self-describing
+      blob and has no sidecar.
+
+      '
+  links_family:
+    text: links_family
+    description: 'The ``links/<delta>/`` group carrying family-wide policy for every
+      offsets array beneath it.  See ``LinksFamilyMeta``.
+
+      '
+  links:
+    text: links
+    description: 'One ``links/<delta>/<offsets>/`` array — a rank-D vlen array whose
+      cell is the record''s SOURCE chunk.  See ``LinksMeta``.
+
+      '
+  attribute:
+    text: attribute
+  fragment_attribute:
+    text: fragment_attribute
+    description: 'Per-fragment attribute array (``fragment_attributes/<name>/<chunk>``).
+      Dense per-chunk byte blob with one row per fragment in that chunk; row count
+      is derived from ``vertex_fragments/<chunk>``. Optional; common opt-in use case
+      is materializing parent-IDs (e.g. the OID owning each fragment) as a fragment
+      attribute.
+
+      '
+  object_index:
+    text: object_index
+  object_attribute:
+    text: object_attribute
+  groupings:
+    text: groupings
+  groupings_attribute:
+    text: groupings_attribute
+  link_attribute_family:
+    text: link_attribute_family
+    description: 'The ``link_attributes/<name>/<delta>/`` group.  See ``LinkAttributeFamilyMeta``.
+
+      '
+  link_attribute:
+    text: link_attribute
+    description: 'One ``link_attributes/<name>/<delta>/<offsets>/`` array, mirroring
+      the matching links array cell-for-cell.  See ``LinkAttributeMeta``.
+
+      '
+
+```
+</details>
+
+</div>
+
+
+---
+
+---
+search:
+  boost: 5.0
+---
+
+# Slot: arrays_present 
+
+
+_Names of arrays present in the level group._
+
+
+
+<div data-search-exclude markdown="1">
+
+
+
+URI: [zv:arrays_present](https://w3id.org/zarr-vectors/schema/0.5/arrays_present)
+<!-- no inheritance hierarchy -->
+
+
+
+
+
+## Applicable Classes
+
+| Name | Description | Modifies Slot |
+| --- | --- | --- |
+| [LevelMetadata](LevelMetadata.md) | Per-resolution-level `` |  no  |
+
+
+
+
+
+
+## Properties
+
+### Type and Range
+
+| Property | Value |
+| --- | --- |
+| Range | [String](String.md) |
+| Domain Of | [LevelMetadata](LevelMetadata.md) |
+
+### Cardinality and Requirements
+
+| Property | Value |
+| --- | --- |
+| Required | Yes |
+| Multivalued | Yes |
+
+
+
+
+
+
+
+
+
+
+## Identifier and Mapping Information
+
+
+
+
+
+### Schema Source
+
+
+* from schema: https://w3id.org/zarr-vectors/schema/0.5
+
+
+
+
+## Mappings
+
+| Mapping Type | Mapped Value |
+| ---  | ---  |
+| self | zv:arrays_present |
+| native | zv:arrays_present |
+
+
+
+
+## LinkML Source
+
+<details>
+```yaml
+name: arrays_present
+description: Names of arrays present in the level group.
+from_schema: https://w3id.org/zarr-vectors/schema/0.5
+rank: 1000
+domain_of:
+- LevelMetadata
+range: string
+required: true
+multivalued: true
+
+```
+</details></div>
+
+
+---
+
+---
+search:
+  boost: 5.0
+---
+
+# Slot: attribute_specs 
+
+
+_What the store declares its attributes to be, keyed by scope (``vertex`` / ``object`` / ``link``) and then by attribute name. Each entry carries ``dtype`` and optionally ``channels``, ``categorical``, ``unit`` and ``description``.  Optional and backward-compatible from 0.9.1: absent means undeclared, which is every store written before it.  A declaration is not a promise the array exists -- the array appears when data is written -- but it is what lets a Schema round-trip and what ``open_or_create`` compares against.  ``unit`` and ``description`` are additionally stamped on the attribute array's own metadata block._
+
+__
+
+
+
+<div data-search-exclude markdown="1">
+
+
+
+URI: [zv:attribute_specs](https://w3id.org/zarr-vectors/schema/0.5/attribute_specs)
+<!-- no inheritance hierarchy -->
+
+
+
+
+
+## Applicable Classes
+
+| Name | Description | Modifies Slot |
+| --- | --- | --- |
+| [RootMetadata](RootMetadata.md) | Root-level `` |  no  |
+
+
+
+
+
+
+## Properties
+
+### Type and Range
+
+| Property | Value |
+| --- | --- |
+| Range | [AttributeSpecs](AttributeSpecs.md) |
+| Domain Of | [RootMetadata](RootMetadata.md) |
+
+### Cardinality and Requirements
+
+| Property | Value |
+| --- | --- |
+
+
+
+
+
+
+
+
+
+
+## Identifier and Mapping Information
+
+
+
+
+
+### Schema Source
+
+
+* from schema: https://w3id.org/zarr-vectors/schema/0.5
+
+
+
+
+## Mappings
+
+| Mapping Type | Mapped Value |
+| ---  | ---  |
+| self | zv:attribute_specs |
+| native | zv:attribute_specs |
+
+
+
+
+## LinkML Source
+
+<details>
+```yaml
+name: attribute_specs
+description: 'What the store declares its attributes to be, keyed by scope (``vertex``
+  / ``object`` / ``link``) and then by attribute name. Each entry carries ``dtype``
+  and optionally ``channels``, ``categorical``, ``unit`` and ``description``.  Optional
+  and backward-compatible from 0.9.1: absent means undeclared, which is every store
+  written before it.  A declaration is not a promise the array exists -- the array
+  appears when data is written -- but it is what lets a Schema round-trip and what
+  ``open_or_create`` compares against.  ``unit`` and ``description`` are additionally
+  stamped on the attribute array''s own metadata block.
+
+  '
+from_schema: https://w3id.org/zarr-vectors/schema/0.5
+rank: 1000
+domain_of:
+- RootMetadata
+range: AttributeSpecs
+
+```
+</details></div>
+
+
+---
+
+---
+search:
+  boost: 5.0
+---
+
+# Slot: base_bin_shape 
+
+
+_Supervoxel bin edge lengths at level 0.  When set, every value must be > 0 and ``chunk_shape`` must be an integer multiple along every axis (enforced runtime-side in ``RootMetadata.validate``)._
+
+__
+
+
+
+<div data-search-exclude markdown="1">
+
+
+
+URI: [zv:base_bin_shape](https://w3id.org/zarr-vectors/schema/0.5/base_bin_shape)
+<!-- no inheritance hierarchy -->
+
+
+
+
+
+## Applicable Classes
+
+| Name | Description | Modifies Slot |
+| --- | --- | --- |
+| [RootMetadata](RootMetadata.md) | Root-level `` |  no  |
+
+
+
+
+
+
+## Properties
+
+### Type and Range
+
+| Property | Value |
+| --- | --- |
+| Range | [Float](Float.md) |
+| Domain Of | [RootMetadata](RootMetadata.md) |
+
+### Cardinality and Requirements
+
+| Property | Value |
+| --- | --- |
+| Multivalued | Yes |
+
+
+
+
+
+
+
+
+
+
+## Identifier and Mapping Information
+
+
+
+
+
+### Schema Source
+
+
+* from schema: https://w3id.org/zarr-vectors/schema/0.5
+
+
+
+
+## Mappings
+
+| Mapping Type | Mapped Value |
+| ---  | ---  |
+| self | zv:base_bin_shape |
+| native | zv:base_bin_shape |
+
+
+
+
+## LinkML Source
+
+<details>
+```yaml
+name: base_bin_shape
+description: 'Supervoxel bin edge lengths at level 0.  When set, every value must
+  be > 0 and ``chunk_shape`` must be an integer multiple along every axis (enforced
+  runtime-side in ``RootMetadata.validate``).
+
+  '
+from_schema: https://w3id.org/zarr-vectors/schema/0.5
+rank: 1000
+domain_of:
+- RootMetadata
+range: float
+multivalued: true
+
+```
+</details></div>
+
+
+---
+
+---
+search:
+  boost: 5.0
+---
+
+# Slot: bin_ratio 
+
+
+_Integer fold-change per axis relative to level 0._
+
+
+
+<div data-search-exclude markdown="1">
+
+
+
+URI: [zv:bin_ratio](https://w3id.org/zarr-vectors/schema/0.5/bin_ratio)
+<!-- no inheritance hierarchy -->
+
+
+
+
+
+## Applicable Classes
+
+| Name | Description | Modifies Slot |
+| --- | --- | --- |
+| [LevelMetadata](LevelMetadata.md) | Per-resolution-level `` |  no  |
+
+
+
+
+
+
+## Properties
+
+### Type and Range
+
+| Property | Value |
+| --- | --- |
+| Range | [Integer](Integer.md) |
+| Domain Of | [LevelMetadata](LevelMetadata.md) |
+
+### Cardinality and Requirements
+
+| Property | Value |
+| --- | --- |
+| Multivalued | Yes |
+
+
+
+
+
+
+
+
+
+
+## Identifier and Mapping Information
+
+
+
+
+
+### Schema Source
+
+
+* from schema: https://w3id.org/zarr-vectors/schema/0.5
+
+
+
+
+## Mappings
+
+| Mapping Type | Mapped Value |
+| ---  | ---  |
+| self | zv:bin_ratio |
+| native | zv:bin_ratio |
+
+
+
+
+## LinkML Source
+
+<details>
+```yaml
+name: bin_ratio
+description: Integer fold-change per axis relative to level 0.
+from_schema: https://w3id.org/zarr-vectors/schema/0.5
+rank: 1000
+domain_of:
+- LevelMetadata
+range: integer
+multivalued: true
+
+```
+</details></div>
+
+
+---
+
+---
+search:
+  boost: 5.0
+---
+
+# Slot: bin_shape 
+
+
+_Per-axis supervoxel edge lengths at this level.  Must be ``None`` for level 0 (inherits ``base_bin_shape``); must be set for level > 0._
+
+__
+
+
+
+<div data-search-exclude markdown="1">
+
+
+
+URI: [zv:bin_shape](https://w3id.org/zarr-vectors/schema/0.5/bin_shape)
+<!-- no inheritance hierarchy -->
+
+
+
+
+
+## Applicable Classes
+
+| Name | Description | Modifies Slot |
+| --- | --- | --- |
+| [LevelMetadata](LevelMetadata.md) | Per-resolution-level `` |  no  |
+
+
+
+
+
+
+## Properties
+
+### Type and Range
+
+| Property | Value |
+| --- | --- |
+| Range | [Float](Float.md) |
+| Domain Of | [LevelMetadata](LevelMetadata.md) |
+
+### Cardinality and Requirements
+
+| Property | Value |
+| --- | --- |
+| Multivalued | Yes |
+
+
+
+
+
+
+
+
+
+
+## Identifier and Mapping Information
+
+
+
+
+
+### Schema Source
+
+
+* from schema: https://w3id.org/zarr-vectors/schema/0.5
+
+
+
+
+## Mappings
+
+| Mapping Type | Mapped Value |
+| ---  | ---  |
+| self | zv:bin_shape |
+| native | zv:bin_shape |
+
+
+
+
+## LinkML Source
+
+<details>
+```yaml
+name: bin_shape
+description: 'Per-axis supervoxel edge lengths at this level.  Must be ``None`` for
+  level 0 (inherits ``base_bin_shape``); must be set for level > 0.
+
+  '
+from_schema: https://w3id.org/zarr-vectors/schema/0.5
+rank: 1000
+domain_of:
+- LevelMetadata
+range: float
+multivalued: true
+
+```
+</details></div>
+
+
+---
+
+---
+search:
+  boost: 5.0
+---
+
+# Slot: bounds 
+
+
+_Global vertex bounding box._
+
+
+
+<div data-search-exclude markdown="1">
+
+
+
+URI: [zv:bounds](https://w3id.org/zarr-vectors/schema/0.5/bounds)
+<!-- no inheritance hierarchy -->
+
+
+
+
+
+## Applicable Classes
+
+| Name | Description | Modifies Slot |
+| --- | --- | --- |
+| [RootMetadata](RootMetadata.md) | Root-level `` |  no  |
+
+
+
+
+
+
+## Properties
+
+### Type and Range
+
+| Property | Value |
+| --- | --- |
+| Range | [BoundingBox](BoundingBox.md) |
+| Domain Of | [RootMetadata](RootMetadata.md) |
+
+### Cardinality and Requirements
+
+| Property | Value |
+| --- | --- |
+| Required | Yes |
+
+
+
+
+
+
+
+
+
+
+## Identifier and Mapping Information
+
+
+
+
+
+### Schema Source
+
+
+* from schema: https://w3id.org/zarr-vectors/schema/0.5
+
+
+
+
+## Mappings
+
+| Mapping Type | Mapped Value |
+| ---  | ---  |
+| self | zv:bounds |
+| native | zv:bounds |
+
+
+
+
+## LinkML Source
+
+<details>
+```yaml
+name: bounds
+description: Global vertex bounding box.
+from_schema: https://w3id.org/zarr-vectors/schema/0.5
+rank: 1000
+domain_of:
+- RootMetadata
+range: BoundingBox
+required: true
+
+```
+</details></div>
+
+
+---
+
+---
+search:
+  boost: 5.0
+---
+
+# Slot: channel_names 
+
+
+_For multi-channel per-vertex attributes, the channel labels._
+
+
+
+<div data-search-exclude markdown="1">
+
+
+
+URI: [zv:channel_names](https://w3id.org/zarr-vectors/schema/0.5/channel_names)
+<!-- no inheritance hierarchy -->
+
+
+
+
+
+## Applicable Classes
+
+| Name | Description | Modifies Slot |
+| --- | --- | --- |
+| [AttributeMeta](AttributeMeta.md) | `` |  no  |
+| [FragmentAttributeMeta](FragmentAttributeMeta.md) | `` |  no  |
+
+
+
+
+
+
+## Properties
+
+### Type and Range
+
+| Property | Value |
+| --- | --- |
+| Range | [String](String.md) |
+| Domain Of | [AttributeMeta](AttributeMeta.md), [FragmentAttributeMeta](FragmentAttributeMeta.md) |
+
+### Cardinality and Requirements
+
+| Property | Value |
+| --- | --- |
+| Multivalued | Yes |
+
+
+
+
+
+
+
+
+
+
+## Identifier and Mapping Information
+
+
+
+
+
+### Schema Source
+
+
+* from schema: https://w3id.org/zarr-vectors/schema/0.5
+
+
+
+
+## Mappings
+
+| Mapping Type | Mapped Value |
+| ---  | ---  |
+| self | zv:channel_names |
+| native | zv:channel_names |
+
+
+
+
+## LinkML Source
+
+<details>
+```yaml
+name: channel_names
+description: For multi-channel per-vertex attributes, the channel labels.
+from_schema: https://w3id.org/zarr-vectors/schema/0.5
+rank: 1000
+domain_of:
+- AttributeMeta
+- FragmentAttributeMeta
+range: string
+multivalued: true
+
+```
+</details></div>
+
+
+---
+
+---
+search:
+  boost: 5.0
+---
+
+# Slot: chunk_attribute_name 
+
+
+_Name of the per-vertex attribute used as the leading chunk axis._
+
+
+
+<div data-search-exclude markdown="1">
+
+
+
+URI: [zv:chunk_attribute_name](https://w3id.org/zarr-vectors/schema/0.5/chunk_attribute_name)
+<!-- no inheritance hierarchy -->
+
+
+
+
+
+## Applicable Classes
+
+| Name | Description | Modifies Slot |
+| --- | --- | --- |
+| [LevelMetadata](LevelMetadata.md) | Per-resolution-level `` |  no  |
+
+
+
+
+
+
+## Properties
+
+### Type and Range
+
+| Property | Value |
+| --- | --- |
+| Range | [String](String.md) |
+| Domain Of | [LevelMetadata](LevelMetadata.md) |
+
+### Cardinality and Requirements
+
+| Property | Value |
+| --- | --- |
+
+
+
+
+
+
+
+
+
+
+## Identifier and Mapping Information
+
+
+
+
+
+### Schema Source
+
+
+* from schema: https://w3id.org/zarr-vectors/schema/0.5
+
+
+
+
+## Mappings
+
+| Mapping Type | Mapped Value |
+| ---  | ---  |
+| self | zv:chunk_attribute_name |
+| native | zv:chunk_attribute_name |
+
+
+
+
+## LinkML Source
+
+<details>
+```yaml
+name: chunk_attribute_name
+description: Name of the per-vertex attribute used as the leading chunk axis.
+from_schema: https://w3id.org/zarr-vectors/schema/0.5
+rank: 1000
+domain_of:
+- LevelMetadata
+range: string
+
+```
+</details></div>
+
+
+---
+
+---
+search:
+  boost: 5.0
+---
+
+# Slot: chunk_attribute_values 
+
+
+_One label per leading-axis bin, in bin order: entry ``i`` is what a reader's ``attribute_filter`` names to select bin ``i``, so its length is the bin count.  A categorical bin is labelled by its value (a string or a number), a bin cut by edges by its lower edge, and a group bin by its group index (``-1`` for ungrouped objects, which are the last bin).  Must be non-empty when set, and coherent with ``chunk_attribute_name`` (both set or both absent)._
+
+__
+
+
+
+<div data-search-exclude markdown="1">
+
+
+
+URI: [zv:chunk_attribute_values](https://w3id.org/zarr-vectors/schema/0.5/chunk_attribute_values)
+<!-- no inheritance hierarchy -->
+
+
+
+
+
+## Applicable Classes
+
+| Name | Description | Modifies Slot |
+| --- | --- | --- |
+| [LevelMetadata](LevelMetadata.md) | Per-resolution-level `` |  no  |
+
+
+
+
+
+
+## Properties
+
+### Type and Range
+
+| Property | Value |
+| --- | --- |
+| Range | [BinLabel](BinLabel.md)&nbsp;or&nbsp;<br />[String](String.md)&nbsp;or&nbsp;<br />[Integer](Integer.md)&nbsp;or&nbsp;<br />[Float](Float.md) |
+| Domain Of | [LevelMetadata](LevelMetadata.md) |
+
+### Cardinality and Requirements
+
+| Property | Value |
+| --- | --- |
+| Multivalued | Yes |
+<details>
+<summary>Expressions & Logic</summary>
+#### Any Of
+
+Value must satisfy at least one of:
+- AnonymousSlotExpression({'range': 'string'})
+- AnonymousSlotExpression({'range': 'integer'})
+- AnonymousSlotExpression({'range': 'float'})
+
+</details>
+
+
+
+
+
+
+
+
+
+
+
+## Identifier and Mapping Information
+
+
+
+
+
+### Schema Source
+
+
+* from schema: https://w3id.org/zarr-vectors/schema/0.5
+
+
+
+
+## Mappings
+
+| Mapping Type | Mapped Value |
+| ---  | ---  |
+| self | zv:chunk_attribute_values |
+| native | zv:chunk_attribute_values |
+
+
+
+
+## LinkML Source
+
+<details>
+```yaml
+name: chunk_attribute_values
+description: 'One label per leading-axis bin, in bin order: entry ``i`` is what a
+  reader''s ``attribute_filter`` names to select bin ``i``, so its length is the bin
+  count.  A categorical bin is labelled by its value (a string or a number), a bin
+  cut by edges by its lower edge, and a group bin by its group index (``-1`` for ungrouped
+  objects, which are the last bin).  Must be non-empty when set, and coherent with
+  ``chunk_attribute_name`` (both set or both absent).
+
+  '
+from_schema: https://w3id.org/zarr-vectors/schema/0.5
+rank: 1000
+domain_of:
+- LevelMetadata
+range: BinLabel
+multivalued: true
+any_of:
+- range: string
+- range: integer
+- range: float
+
+```
+</details></div>
+
+
+---
+
+---
+search:
+  boost: 5.0
+---
+
+# Slot: chunk_dims 
+
+
+_Chunk-key axis names; the leading axis names appear first.  Set when the level uses attribute chunking (e.g. ``["gene", "z", "y", "x"]``)._
+
+__
+
+
+
+<div data-search-exclude markdown="1">
+
+
+
+URI: [zv:chunk_dims](https://w3id.org/zarr-vectors/schema/0.5/chunk_dims)
+<!-- no inheritance hierarchy -->
+
+
+
+
+
+## Applicable Classes
+
+| Name | Description | Modifies Slot |
+| --- | --- | --- |
+| [LevelMetadata](LevelMetadata.md) | Per-resolution-level `` |  no  |
+
+
+
+
+
+
+## Properties
+
+### Type and Range
+
+| Property | Value |
+| --- | --- |
+| Range | [String](String.md) |
+| Domain Of | [LevelMetadata](LevelMetadata.md) |
+
+### Cardinality and Requirements
+
+| Property | Value |
+| --- | --- |
+| Multivalued | Yes |
+
+
+
+
+
+
+
+
+
+
+## Identifier and Mapping Information
+
+
+
+
+
+### Schema Source
+
+
+* from schema: https://w3id.org/zarr-vectors/schema/0.5
+
+
+
+
+## Mappings
+
+| Mapping Type | Mapped Value |
+| ---  | ---  |
+| self | zv:chunk_dims |
+| native | zv:chunk_dims |
+
+
+
+
+## LinkML Source
+
+<details>
+```yaml
+name: chunk_dims
+description: 'Chunk-key axis names; the leading axis names appear first.  Set when
+  the level uses attribute chunking (e.g. ``["gene", "z", "y", "x"]``).
+
+  '
+from_schema: https://w3id.org/zarr-vectors/schema/0.5
+rank: 1000
+domain_of:
+- LevelMetadata
+range: string
+multivalued: true
+
+```
+</details></div>
+
+
+---
+
+---
+search:
+  boost: 5.0
+---
+
+# Slot: chunk_shape 
+
+
+_Physical spatial chunk size per axis (all values > 0)._
+
+
+
+<div data-search-exclude markdown="1">
+
+
+
+URI: [zv:chunk_shape](https://w3id.org/zarr-vectors/schema/0.5/chunk_shape)
+<!-- no inheritance hierarchy -->
+
+
+
+
+
+## Applicable Classes
+
+| Name | Description | Modifies Slot |
+| --- | --- | --- |
+| [RootMetadata](RootMetadata.md) | Root-level `` |  no  |
+| [LevelMetadata](LevelMetadata.md) | Per-resolution-level `` |  yes  |
+
+
+
+
+
+
+## Properties
+
+### Type and Range
+
+| Property | Value |
+| --- | --- |
+| Range | [Float](Float.md) |
+| Domain Of | [RootMetadata](RootMetadata.md), [LevelMetadata](LevelMetadata.md) |
+
+### Cardinality and Requirements
+
+| Property | Value |
+| --- | --- |
+| Required | Yes |
+| Multivalued | Yes |
+
+
+
+
+
+
+
+
+
+
+## Identifier and Mapping Information
+
+
+
+
+
+### Schema Source
+
+
+* from schema: https://w3id.org/zarr-vectors/schema/0.5
+
+
+
+
+## Mappings
+
+| Mapping Type | Mapped Value |
+| ---  | ---  |
+| self | zv:chunk_shape |
+| native | zv:chunk_shape |
+
+
+
+
+## LinkML Source
+
+<details>
+```yaml
+name: chunk_shape
+description: Physical spatial chunk size per axis (all values > 0).
+from_schema: https://w3id.org/zarr-vectors/schema/0.5
+rank: 1000
+domain_of:
+- RootMetadata
+- LevelMetadata
+range: float
+required: true
+multivalued: true
+
+```
+</details></div>
+
+
+---
+
+---
+search:
+  boost: 5.0
+---
+
+# Slot: coarsening_method 
+
+
+_How this level was generated (e.g. "grid_metanode")._
+
+
+
+<div data-search-exclude markdown="1">
+
+
+
+URI: [zv:coarsening_method](https://w3id.org/zarr-vectors/schema/0.5/coarsening_method)
+<!-- no inheritance hierarchy -->
+
+
+
+
+
+## Applicable Classes
+
+| Name | Description | Modifies Slot |
+| --- | --- | --- |
+| [LevelMetadata](LevelMetadata.md) | Per-resolution-level `` |  no  |
+
+
+
+
+
+
+## Properties
+
+### Type and Range
+
+| Property | Value |
+| --- | --- |
+| Range | [String](String.md) |
+| Domain Of | [LevelMetadata](LevelMetadata.md) |
+
+### Cardinality and Requirements
+
+| Property | Value |
+| --- | --- |
+
+
+
+
+
+
+
+
+
+
+## Identifier and Mapping Information
+
+
+
+
+
+### Schema Source
+
+
+* from schema: https://w3id.org/zarr-vectors/schema/0.5
+
+
+
+
+## Mappings
+
+| Mapping Type | Mapped Value |
+| ---  | ---  |
+| self | zv:coarsening_method |
+| native | zv:coarsening_method |
+
+
+
+
+## LinkML Source
+
+<details>
+```yaml
+name: coarsening_method
+description: How this level was generated (e.g. "grid_metanode").
+from_schema: https://w3id.org/zarr-vectors/schema/0.5
+rank: 1000
+domain_of:
+- LevelMetadata
+range: string
+
+```
+</details></div>
+
+
+---
+
+---
+search:
+  boost: 5.0
+---
+
+# Slot: cross_chunk_strategy 
+
+<div data-search-exclude markdown="1">
+
+
+
+URI: [zv:cross_chunk_strategy](https://w3id.org/zarr-vectors/schema/0.5/cross_chunk_strategy)
+<!-- no inheritance hierarchy -->
+
+
+
+
+
+## Applicable Classes
+
+| Name | Description | Modifies Slot |
+| --- | --- | --- |
+| [RootMetadata](RootMetadata.md) | Root-level `` |  no  |
+
+
+
+
+
+
+## Properties
+
+### Type and Range
+
+| Property | Value |
+| --- | --- |
+| Range | [CrossChunkStrategy](CrossChunkStrategy.md) |
+| Domain Of | [RootMetadata](RootMetadata.md) |
+
+### Cardinality and Requirements
+
+| Property | Value |
+| --- | --- |
+
+
+
+
+
+
+
+
+
+
+## Identifier and Mapping Information
+
+
+
+
+
+### Schema Source
+
+
+* from schema: https://w3id.org/zarr-vectors/schema/0.5
+
+
+
+
+## Mappings
+
+| Mapping Type | Mapped Value |
+| ---  | ---  |
+| self | zv:cross_chunk_strategy |
+| native | zv:cross_chunk_strategy |
+
+
+
+
+## LinkML Source
+
+<details>
+```yaml
+name: cross_chunk_strategy
+from_schema: https://w3id.org/zarr-vectors/schema/0.5
+rank: 1000
+domain_of:
+- RootMetadata
+range: CrossChunkStrategy
+
+```
+</details></div>
+
+
+---
+
+---
+search:
+  boost: 5.0
+---
+
+# Slot: cross_level_depth 
+
+
+_Maximum absolute level delta for which cross-pyramid-level link arrays are materialized.  ``0`` = none (no ``+N`` or ``-N`` arrays), ``N`` = generate up to ``±N`` (or ``+N`` only when ``cross_level_storage="implicit"``), ``-1`` = all available pyramid levels.  Default ``1``._
+
+__
+
+
+
+<div data-search-exclude markdown="1">
+
+
+
+URI: [zv:cross_level_depth](https://w3id.org/zarr-vectors/schema/0.5/cross_level_depth)
+<!-- no inheritance hierarchy -->
+
+
+
+
+
+## Applicable Classes
+
+| Name | Description | Modifies Slot |
+| --- | --- | --- |
+| [RootMetadata](RootMetadata.md) | Root-level `` |  no  |
+
+
+
+
+
+
+## Properties
+
+### Type and Range
+
+| Property | Value |
+| --- | --- |
+| Range | [Integer](Integer.md) |
+| Domain Of | [RootMetadata](RootMetadata.md) |
+
+### Cardinality and Requirements
+
+| Property | Value |
+| --- | --- |
+### Value Constraints
+
+| Property | Value |
+| --- | --- |
+| Minimum Value | -1 |
+
+
+
+
+
+
+
+
+
+
+
+
+## Identifier and Mapping Information
+
+
+
+
+
+### Schema Source
+
+
+* from schema: https://w3id.org/zarr-vectors/schema/0.5
+
+
+
+
+## Mappings
+
+| Mapping Type | Mapped Value |
+| ---  | ---  |
+| self | zv:cross_level_depth |
+| native | zv:cross_level_depth |
+
+
+
+
+## LinkML Source
+
+<details>
+```yaml
+name: cross_level_depth
+description: 'Maximum absolute level delta for which cross-pyramid-level link arrays
+  are materialized.  ``0`` = none (no ``+N`` or ``-N`` arrays), ``N`` = generate up
+  to ``±N`` (or ``+N`` only when ``cross_level_storage="implicit"``), ``-1`` = all
+  available pyramid levels.  Default ``1``.
+
+  '
+from_schema: https://w3id.org/zarr-vectors/schema/0.5
+rank: 1000
+domain_of:
+- RootMetadata
+range: integer
+minimum_value: -1
+
+```
+</details></div>
+
+
+---
+
+---
+search:
+  boost: 5.0
+---
+
+# Slot: cross_level_storage 
+
+
+_Whether cross-level link arrays are written in both directions (``explicit``: ``+N`` at the finer level AND ``-N`` at the coarser level) or only positive deltas (``implicit``: only ``+N``, with ``-N`` reconstructed on read).  Default ``explicit``._
+
+__
+
+
+
+<div data-search-exclude markdown="1">
+
+
+
+URI: [zv:cross_level_storage](https://w3id.org/zarr-vectors/schema/0.5/cross_level_storage)
+<!-- no inheritance hierarchy -->
+
+
+
+
+
+## Applicable Classes
+
+| Name | Description | Modifies Slot |
+| --- | --- | --- |
+| [RootMetadata](RootMetadata.md) | Root-level `` |  no  |
+
+
+
+
+
+
+## Properties
+
+### Type and Range
+
+| Property | Value |
+| --- | --- |
+| Range | [CrossLevelStorage](CrossLevelStorage.md) |
+| Domain Of | [RootMetadata](RootMetadata.md) |
+
+### Cardinality and Requirements
+
+| Property | Value |
+| --- | --- |
+
+
+
+
+
+
+
+
+
+
+## Identifier and Mapping Information
+
+
+
+
+
+### Schema Source
+
+
+* from schema: https://w3id.org/zarr-vectors/schema/0.5
+
+
+
+
+## Mappings
+
+| Mapping Type | Mapped Value |
+| ---  | ---  |
+| self | zv:cross_level_storage |
+| native | zv:cross_level_storage |
+
+
+
+
+## LinkML Source
+
+<details>
+```yaml
+name: cross_level_storage
+description: 'Whether cross-level link arrays are written in both directions (``explicit``:
+  ``+N`` at the finer level AND ``-N`` at the coarser level) or only positive deltas
+  (``implicit``: only ``+N``, with ``-N`` reconstructed on read).  Default ``explicit``.
+
+  '
+from_schema: https://w3id.org/zarr-vectors/schema/0.5
+rank: 1000
+domain_of:
+- RootMetadata
+range: CrossLevelStorage
+
+```
+</details></div>
+
+
+---
+
+---
+search:
+  boost: 5.0
+---
+
+# Slot: crs 
+
+
+_Optional coordinate reference system metadata (free-form dict matching whatever CRS vocabulary the store uses, e.g. WKT, PROJ4, EPSG, CF conventions)._
+
+__
+
+
+
+<div data-search-exclude markdown="1">
+
+
+
+URI: [schema:coordinateReferenceSystem](http://schema.org/coordinateReferenceSystem)
+<!-- no inheritance hierarchy -->
+
+
+
+
+
+## Applicable Classes
+
+| Name | Description | Modifies Slot |
+| --- | --- | --- |
+| [RootMetadata](RootMetadata.md) | Root-level `` |  no  |
+
+
+
+
+
+
+## Properties
+
+### Type and Range
+
+| Property | Value |
+| --- | --- |
+| Range | [CRS](CRS.md) |
+| Domain Of | [RootMetadata](RootMetadata.md) |
+| Slot URI | [schema:coordinateReferenceSystem](http://schema.org/coordinateReferenceSystem) |
+
+### Cardinality and Requirements
+
+| Property | Value |
+| --- | --- |
+
+
+
+
+
+
+
+
+
+
+## Identifier and Mapping Information
+
+
+
+
+
+### Schema Source
+
+
+* from schema: https://w3id.org/zarr-vectors/schema/0.5
+
+
+
+
+## Mappings
+
+| Mapping Type | Mapped Value |
+| ---  | ---  |
+| self | schema:coordinateReferenceSystem |
+| native | zv:crs |
+
+
+
+
+## LinkML Source
+
+<details>
+```yaml
+name: crs
+description: 'Optional coordinate reference system metadata (free-form dict matching
+  whatever CRS vocabulary the store uses, e.g. WKT, PROJ4, EPSG, CF conventions).
+
+  '
+from_schema: https://w3id.org/zarr-vectors/schema/0.5
+rank: 1000
+slot_uri: schema:coordinateReferenceSystem
+domain_of:
+- RootMetadata
+range: CRS
+inlined: true
+
+```
+</details></div>
+
+
+---
+
+---
+search:
+  boost: 5.0
+---
+
+# Slot: directed 
+
+
+_When true, endpoint order is meaningful and preserved (no canonical sort): ``A→B`` and ``B→A`` occupy distinct cells and every stored ``perm_idx`` is 0.  Family-wide; defaults to false (undirected)._
+
+__
+
+
+
+<div data-search-exclude markdown="1">
+
+
+
+URI: [zv:directed](https://w3id.org/zarr-vectors/schema/0.5/directed)
+<!-- no inheritance hierarchy -->
+
+
+
+
+
+## Applicable Classes
+
+| Name | Description | Modifies Slot |
+| --- | --- | --- |
+| [LinksFamilyMeta](LinksFamilyMeta.md) | `` |  no  |
+
+
+
+
+
+
+## Properties
+
+### Type and Range
+
+| Property | Value |
+| --- | --- |
+| Range | [Boolean](Boolean.md) |
+| Domain Of | [LinksFamilyMeta](LinksFamilyMeta.md) |
+
+### Cardinality and Requirements
+
+| Property | Value |
+| --- | --- |
+
+
+
+
+
+
+
+
+
+
+## Identifier and Mapping Information
+
+
+
+
+
+### Schema Source
+
+
+* from schema: https://w3id.org/zarr-vectors/schema/0.5
+
+
+
+
+## Mappings
+
+| Mapping Type | Mapped Value |
+| ---  | ---  |
+| self | zv:directed |
+| native | zv:directed |
+
+
+
+
+## LinkML Source
+
+<details>
+```yaml
+name: directed
+description: 'When true, endpoint order is meaningful and preserved (no canonical
+  sort): ``A→B`` and ``B→A`` occupy distinct cells and every stored ``perm_idx`` is
+  0.  Family-wide; defaults to false (undirected).
+
+  '
+from_schema: https://w3id.org/zarr-vectors/schema/0.5
+rank: 1000
+domain_of:
+- LinksFamilyMeta
+range: boolean
+required: false
+
+```
+</details></div>
+
+
+---
+
+---
+search:
+  boost: 5.0
+---
+
+# Slot: dtype 
+
+
+_Numpy dtype string of the array's value type (e.g. "float32")._
+
+
+
+<div data-search-exclude markdown="1">
+
+
+
+URI: [zv:dtype](https://w3id.org/zarr-vectors/schema/0.5/dtype)
+<!-- no inheritance hierarchy -->
+
+
+
+
+
+## Applicable Classes
+
+| Name | Description | Modifies Slot |
+| --- | --- | --- |
+| [VerticesMeta](VerticesMeta.md) | `` |  no  |
+| [LinksMeta](LinksMeta.md) | `` |  no  |
+| [AttributeMeta](AttributeMeta.md) | `` |  no  |
+| [FragmentAttributeMeta](FragmentAttributeMeta.md) | `` |  no  |
+| [ObjectAttributeMeta](ObjectAttributeMeta.md) | `` |  no  |
+| [GroupingsAttributeMeta](GroupingsAttributeMeta.md) | `` |  no  |
+| [LinkAttributeMeta](LinkAttributeMeta.md) | `` |  no  |
+
+
+
+
+
+
+## Properties
+
+### Type and Range
+
+| Property | Value |
+| --- | --- |
+| Range | [String](String.md) |
+| Domain Of | [VerticesMeta](VerticesMeta.md), [LinksMeta](LinksMeta.md), [AttributeMeta](AttributeMeta.md), [FragmentAttributeMeta](FragmentAttributeMeta.md), [ObjectAttributeMeta](ObjectAttributeMeta.md), [GroupingsAttributeMeta](GroupingsAttributeMeta.md), [LinkAttributeMeta](LinkAttributeMeta.md) |
+
+### Cardinality and Requirements
+
+| Property | Value |
+| --- | --- |
+| Required | Yes |
+
+
+
+
+
+
+
+
+
+
+## Identifier and Mapping Information
+
+
+
+
+
+### Schema Source
+
+
+* from schema: https://w3id.org/zarr-vectors/schema/0.5
+
+
+
+
+## Mappings
+
+| Mapping Type | Mapped Value |
+| ---  | ---  |
+| self | zv:dtype |
+| native | zv:dtype |
+
+
+
+
+## LinkML Source
+
+<details>
+```yaml
+name: dtype
+description: Numpy dtype string of the array's value type (e.g. "float32").
+from_schema: https://w3id.org/zarr-vectors/schema/0.5
+rank: 1000
+domain_of:
+- VerticesMeta
+- LinksMeta
+- AttributeMeta
+- FragmentAttributeMeta
+- ObjectAttributeMeta
+- GroupingsAttributeMeta
+- LinkAttributeMeta
+range: string
+required: true
+
+```
+</details></div>
+
+
+---
+
+---
+search:
+  boost: 5.0
+---
+
+# Slot: encoding 
+
+
+_How the chunk bytes are encoded._
+
+
+
+<div data-search-exclude markdown="1">
+
+
+
+URI: [zv:encoding](https://w3id.org/zarr-vectors/schema/0.5/encoding)
+<!-- no inheritance hierarchy -->
+
+
+
+
+
+## Applicable Classes
+
+| Name | Description | Modifies Slot |
+| --- | --- | --- |
+| [VerticesMeta](VerticesMeta.md) | `` |  no  |
+
+
+
+
+
+
+## Properties
+
+### Type and Range
+
+| Property | Value |
+| --- | --- |
+| Range | [Encoding](Encoding.md) |
+| Domain Of | [VerticesMeta](VerticesMeta.md) |
+
+### Cardinality and Requirements
+
+| Property | Value |
+| --- | --- |
+
+
+
+
+
+
+
+
+
+
+## Identifier and Mapping Information
+
+
+
+
+
+### Schema Source
+
+
+* from schema: https://w3id.org/zarr-vectors/schema/0.5
+
+
+
+
+## Mappings
+
+| Mapping Type | Mapped Value |
+| ---  | ---  |
+| self | zv:encoding |
+| native | zv:encoding |
+
+
+
+
+## LinkML Source
+
+<details>
+```yaml
+name: encoding
+description: How the chunk bytes are encoded.
+from_schema: https://w3id.org/zarr-vectors/schema/0.5
+rank: 1000
+domain_of:
+- VerticesMeta
+range: Encoding
+
+```
+</details></div>
+
+
+---
+
+---
+search:
+  boost: 5.0
+---
+
+# Slot: format_capabilities 
+
+
+_Optional 0.3+ feature tokens advertised by this store._
+
+
+
+<div data-search-exclude markdown="1">
+
+
+
+URI: [zv:format_capabilities](https://w3id.org/zarr-vectors/schema/0.5/format_capabilities)
+<!-- no inheritance hierarchy -->
+
+
+
+
+
+## Applicable Classes
+
+| Name | Description | Modifies Slot |
+| --- | --- | --- |
+| [RootMetadata](RootMetadata.md) | Root-level `` |  no  |
+
+
+
+
+
+
+## Properties
+
+### Type and Range
+
+| Property | Value |
+| --- | --- |
+| Range | [FormatCapability](FormatCapability.md) |
+| Domain Of | [RootMetadata](RootMetadata.md) |
+
+### Cardinality and Requirements
+
+| Property | Value |
+| --- | --- |
+| Multivalued | Yes |
+
+
+
+
+
+
+
+
+
+
+## Identifier and Mapping Information
+
+
+
+
+
+### Schema Source
+
+
+* from schema: https://w3id.org/zarr-vectors/schema/0.5
+
+
+
+
+## Mappings
+
+| Mapping Type | Mapped Value |
+| ---  | ---  |
+| self | zv:format_capabilities |
+| native | zv:format_capabilities |
+
+
+
+
+## LinkML Source
+
+<details>
+```yaml
+name: format_capabilities
+description: Optional 0.3+ feature tokens advertised by this store.
+from_schema: https://w3id.org/zarr-vectors/schema/0.5
+rank: 1000
+domain_of:
+- RootMetadata
+range: FormatCapability
+multivalued: true
+
+```
+</details></div>
+
+
+---
+
+---
+search:
+  boost: 5.0
+---
+
+# Slot: fragments_tile 
+
+
+_True when every chunk in this level has a vertex fragment index that tiles its buffer, so the concatenation of a chunk's fragments IS its vertex buffer and a bulk read may skip ``vertex_fragments`` entirely.  Unlike the other flags here this is a claim about what has NOT happened since: it is stamped by a bulk writer and cleared by any later write to ``vertices`` or ``vertex_fragments``. Readers MUST treat an absent value as False._
+
+__
+
+
+
+<div data-search-exclude markdown="1">
+
+
+
+URI: [zv:fragments_tile](https://w3id.org/zarr-vectors/schema/0.5/fragments_tile)
+<!-- no inheritance hierarchy -->
+
+
+
+
+
+## Applicable Classes
+
+| Name | Description | Modifies Slot |
+| --- | --- | --- |
+| [LevelMetadata](LevelMetadata.md) | Per-resolution-level `` |  no  |
+
+
+
+
+
+
+## Properties
+
+### Type and Range
+
+| Property | Value |
+| --- | --- |
+| Range | [Boolean](Boolean.md) |
+| Domain Of | [LevelMetadata](LevelMetadata.md) |
+
+### Cardinality and Requirements
+
+| Property | Value |
+| --- | --- |
+
+
+
+
+
+
+
+
+
+
+## Identifier and Mapping Information
+
+
+
+
+
+### Schema Source
+
+
+* from schema: https://w3id.org/zarr-vectors/schema/0.5
+
+
+
+
+## Mappings
+
+| Mapping Type | Mapped Value |
+| ---  | ---  |
+| self | zv:fragments_tile |
+| native | zv:fragments_tile |
+
+
+
+
+## LinkML Source
+
+<details>
+```yaml
+name: fragments_tile
+description: 'True when every chunk in this level has a vertex fragment index that
+  tiles its buffer, so the concatenation of a chunk''s fragments IS its vertex buffer
+  and a bulk read may skip ``vertex_fragments`` entirely.  Unlike the other flags
+  here this is a claim about what has NOT happened since: it is stamped by a bulk
+  writer and cleared by any later write to ``vertices`` or ``vertex_fragments``. Readers
+  MUST treat an absent value as False.
+
+  '
+from_schema: https://w3id.org/zarr-vectors/schema/0.5
+rank: 1000
+domain_of:
+- LevelMetadata
+range: boolean
+
+```
+</details></div>
+
+
+---
+
+---
+search:
+  boost: 5.0
+---
+
+# Slot: geometry_types 
+
+
+_One or more geometry kinds present in the store._
+
+
+
+<div data-search-exclude markdown="1">
+
+
+
+URI: [zv:geometry_types](https://w3id.org/zarr-vectors/schema/0.5/geometry_types)
+<!-- no inheritance hierarchy -->
+
+
+
+
+
+## Applicable Classes
+
+| Name | Description | Modifies Slot |
+| --- | --- | --- |
+| [RootMetadata](RootMetadata.md) | Root-level `` |  no  |
+
+
+
+
+
+
+## Properties
+
+### Type and Range
+
+| Property | Value |
+| --- | --- |
+| Range | [GeometryType](GeometryType.md) |
+| Domain Of | [RootMetadata](RootMetadata.md) |
+
+### Cardinality and Requirements
+
+| Property | Value |
+| --- | --- |
+| Required | Yes |
+| Multivalued | Yes |
+| Minimum Cardinality | 1 |
+
+
+
+
+
+
+
+
+
+
+## Identifier and Mapping Information
+
+
+
+
+
+### Schema Source
+
+
+* from schema: https://w3id.org/zarr-vectors/schema/0.5
+
+
+
+
+## Mappings
+
+| Mapping Type | Mapped Value |
+| ---  | ---  |
+| self | zv:geometry_types |
+| native | zv:geometry_types |
+
+
+
+
+## LinkML Source
+
+<details>
+```yaml
+name: geometry_types
+description: One or more geometry kinds present in the store.
+from_schema: https://w3id.org/zarr-vectors/schema/0.5
+rank: 1000
+domain_of:
+- RootMetadata
+range: GeometryType
+required: true
+multivalued: true
+minimum_cardinality: 1
+
+```
+</details></div>
+
+
+---
+
+---
+search:
+  boost: 5.0
+---
+
+# Slot: has_perm 
+
+
+_Whether each row of this links array carries a leading ``perm_idx`` column — i.e. whether rows are ``1 + link_width`` ints rather than ``link_width``.  True exactly when a non-identity endpoint placement is possible: non-intra ``offsets`` AND ``level_delta == 0`` AND (``store="duplicate"`` OR not ``directed``).  Readers must take the record width from this stamp rather than inferring it: decoding physical bytes at the logical width does not reliably raise, it silently fabricates rows._
+
+__
+
+
+
+<div data-search-exclude markdown="1">
+
+
+
+URI: [zv:has_perm](https://w3id.org/zarr-vectors/schema/0.5/has_perm)
+<!-- no inheritance hierarchy -->
+
+
+
+
+
+## Applicable Classes
+
+| Name | Description | Modifies Slot |
+| --- | --- | --- |
+| [LinksMeta](LinksMeta.md) | `` |  no  |
+
+
+
+
+
+
+## Properties
+
+### Type and Range
+
+| Property | Value |
+| --- | --- |
+| Range | [Boolean](Boolean.md) |
+| Domain Of | [LinksMeta](LinksMeta.md) |
+
+### Cardinality and Requirements
+
+| Property | Value |
+| --- | --- |
+| Required | Yes |
+
+
+
+
+
+
+
+
+
+
+## Identifier and Mapping Information
+
+
+
+
+
+### Schema Source
+
+
+* from schema: https://w3id.org/zarr-vectors/schema/0.5
+
+
+
+
+## Mappings
+
+| Mapping Type | Mapped Value |
+| ---  | ---  |
+| self | zv:has_perm |
+| native | zv:has_perm |
+
+
+
+
+## LinkML Source
+
+<details>
+```yaml
+name: has_perm
+description: 'Whether each row of this links array carries a leading ``perm_idx``
+  column — i.e. whether rows are ``1 + link_width`` ints rather than ``link_width``.  True
+  exactly when a non-identity endpoint placement is possible: non-intra ``offsets``
+  AND ``level_delta == 0`` AND (``store="duplicate"`` OR not ``directed``).  Readers
+  must take the record width from this stamp rather than inferring it: decoding physical
+  bytes at the logical width does not reliably raise, it silently fabricates rows.
+
+  '
+from_schema: https://w3id.org/zarr-vectors/schema/0.5
+rank: 1000
+domain_of:
+- LinksMeta
+range: boolean
+required: true
+
+```
+</details></div>
+
+
+---
+
+---
+search:
+  boost: 5.0
+---
+
+# Slot: inherited_num_objects 
+
+
+_OID-space size inherited from the parent level (= ``parent_level.num_objects``).  Required when ``preserves_object_ids`` is true; absent on standalone levels._
+
+__
+
+
+
+<div data-search-exclude markdown="1">
+
+
+
+URI: [zv:inherited_num_objects](https://w3id.org/zarr-vectors/schema/0.5/inherited_num_objects)
+<!-- no inheritance hierarchy -->
+
+
+
+
+
+## Applicable Classes
+
+| Name | Description | Modifies Slot |
+| --- | --- | --- |
+| [LevelMetadata](LevelMetadata.md) | Per-resolution-level `` |  no  |
+
+
+
+
+
+
+## Properties
+
+### Type and Range
+
+| Property | Value |
+| --- | --- |
+| Range | [Integer](Integer.md) |
+| Domain Of | [LevelMetadata](LevelMetadata.md) |
+
+### Cardinality and Requirements
+
+| Property | Value |
+| --- | --- |
+### Value Constraints
+
+| Property | Value |
+| --- | --- |
+| Minimum Value | 0 |
+
+
+
+
+
+
+
+
+
+
+
+
+## Identifier and Mapping Information
+
+
+
+
+
+### Schema Source
+
+
+* from schema: https://w3id.org/zarr-vectors/schema/0.5
+
+
+
+
+## Mappings
+
+| Mapping Type | Mapped Value |
+| ---  | ---  |
+| self | zv:inherited_num_objects |
+| native | zv:inherited_num_objects |
+
+
+
+
+## LinkML Source
+
+<details>
+```yaml
+name: inherited_num_objects
+description: 'OID-space size inherited from the parent level (= ``parent_level.num_objects``).  Required
+  when ``preserves_object_ids`` is true; absent on standalone levels.
+
+  '
+from_schema: https://w3id.org/zarr-vectors/schema/0.5
+rank: 1000
+domain_of:
+- LevelMetadata
+range: integer
+minimum_value: 0
+
+```
+</details></div>
+
+
+---
+
+---
+search:
+  boost: 5.0
+---
+
+# Slot: layout 
+
+
+_The object index's storage layout: ``vlen_manifests_v1`` (vlen blobs, rows are ids), ``vlen_manifests_v2`` (vlen blobs, ids in ``object_ids``) or ``dense_manifests_v1`` (``manifest_spans`` into ``manifest_blocks``, ids in ``object_ids``; 0.9.4)._
+
+__
+
+
+
+<div data-search-exclude markdown="1">
+
+
+
+URI: [zv:layout](https://w3id.org/zarr-vectors/schema/0.5/layout)
+<!-- no inheritance hierarchy -->
+
+
+
+
+
+## Applicable Classes
+
+| Name | Description | Modifies Slot |
+| --- | --- | --- |
+| [ObjectIndexMeta](ObjectIndexMeta.md) | `` |  no  |
+
+
+
+
+
+
+## Properties
+
+### Type and Range
+
+| Property | Value |
+| --- | --- |
+| Range | [ObjectIndexLayout](ObjectIndexLayout.md) |
+| Domain Of | [ObjectIndexMeta](ObjectIndexMeta.md) |
+
+### Cardinality and Requirements
+
+| Property | Value |
+| --- | --- |
+
+
+
+
+
+
+
+
+
+
+## Identifier and Mapping Information
+
+
+
+
+
+### Schema Source
+
+
+* from schema: https://w3id.org/zarr-vectors/schema/0.5
+
+
+
+
+## Mappings
+
+| Mapping Type | Mapped Value |
+| ---  | ---  |
+| self | zv:layout |
+| native | zv:layout |
+
+
+
+
+## LinkML Source
+
+<details>
+```yaml
+name: layout
+description: 'The object index''s storage layout: ``vlen_manifests_v1`` (vlen blobs,
+  rows are ids), ``vlen_manifests_v2`` (vlen blobs, ids in ``object_ids``) or ``dense_manifests_v1``
+  (``manifest_spans`` into ``manifest_blocks``, ids in ``object_ids``; 0.9.4).
+
+  '
+from_schema: https://w3id.org/zarr-vectors/schema/0.5
+rank: 1000
+domain_of:
+- ObjectIndexMeta
+range: ObjectIndexLayout
+
+```
+</details></div>
+
+
+---
+
+---
+search:
+  boost: 5.0
+---
+
+# Slot: level 
+
+
+_Resolution level index (0 = full resolution)._
+
+
+
+<div data-search-exclude markdown="1">
+
+
+
+URI: [zv:level](https://w3id.org/zarr-vectors/schema/0.5/level)
+<!-- no inheritance hierarchy -->
+
+
+
+
+
+## Applicable Classes
+
+| Name | Description | Modifies Slot |
+| --- | --- | --- |
+| [LevelMetadata](LevelMetadata.md) | Per-resolution-level `` |  no  |
+
+
+
+
+
+
+## Properties
+
+### Type and Range
+
+| Property | Value |
+| --- | --- |
+| Range | [Integer](Integer.md) |
+| Domain Of | [LevelMetadata](LevelMetadata.md) |
+
+### Cardinality and Requirements
+
+| Property | Value |
+| --- | --- |
+| Required | Yes |
+### Value Constraints
+
+| Property | Value |
+| --- | --- |
+| Minimum Value | 0 |
+
+
+
+
+
+
+
+
+
+
+
+
+## Identifier and Mapping Information
+
+
+
+
+
+### Schema Source
+
+
+* from schema: https://w3id.org/zarr-vectors/schema/0.5
+
+
+
+
+## Mappings
+
+| Mapping Type | Mapped Value |
+| ---  | ---  |
+| self | zv:level |
+| native | zv:level |
+
+
+
+
+## LinkML Source
+
+<details>
+```yaml
+name: level
+description: Resolution level index (0 = full resolution).
+from_schema: https://w3id.org/zarr-vectors/schema/0.5
+rank: 1000
+domain_of:
+- LevelMetadata
+range: integer
+required: true
+minimum_value: 0
+
+```
+</details></div>
+
+
+---
+
+---
+search:
+  boost: 5.0
+---
+
+# Slot: level_delta 
+
+
+_Pyramid-level delta between the source side (the level that owns this array) and the target side of the edges.  ``0`` for intra-level arrays (the only kind written pre-0.4), ``+N`` for edges from this level to ``this_level + N`` (coarser), ``-N`` for edges to ``this_level - N`` (finer)._
+
+__
+
+
+
+<div data-search-exclude markdown="1">
+
+
+
+URI: [zv:level_delta](https://w3id.org/zarr-vectors/schema/0.5/level_delta)
+<!-- no inheritance hierarchy -->
+
+
+
+
+
+## Applicable Classes
+
+| Name | Description | Modifies Slot |
+| --- | --- | --- |
+| [LinksFamilyMeta](LinksFamilyMeta.md) | `` |  no  |
+| [LinksMeta](LinksMeta.md) | `` |  no  |
+| [LinkAttributeFamilyMeta](LinkAttributeFamilyMeta.md) | `` |  no  |
+| [LinkAttributeMeta](LinkAttributeMeta.md) | `` |  no  |
+
+
+
+
+
+
+## Properties
+
+### Type and Range
+
+| Property | Value |
+| --- | --- |
+| Range | [Integer](Integer.md) |
+| Domain Of | [LinksFamilyMeta](LinksFamilyMeta.md), [LinksMeta](LinksMeta.md), [LinkAttributeFamilyMeta](LinkAttributeFamilyMeta.md), [LinkAttributeMeta](LinkAttributeMeta.md) |
+
+### Cardinality and Requirements
+
+| Property | Value |
+| --- | --- |
+| Required | Yes |
+
+
+
+
+
+
+
+
+
+
+## Identifier and Mapping Information
+
+
+
+
+
+### Schema Source
+
+
+* from schema: https://w3id.org/zarr-vectors/schema/0.5
+
+
+
+
+## Mappings
+
+| Mapping Type | Mapped Value |
+| ---  | ---  |
+| self | zv:level_delta |
+| native | zv:level_delta |
+
+
+
+
+## LinkML Source
+
+<details>
+```yaml
+name: level_delta
+description: 'Pyramid-level delta between the source side (the level that owns this
+  array) and the target side of the edges.  ``0`` for intra-level arrays (the only
+  kind written pre-0.4), ``+N`` for edges from this level to ``this_level + N`` (coarser),
+  ``-N`` for edges to ``this_level - N`` (finer).
+
+  '
+from_schema: https://w3id.org/zarr-vectors/schema/0.5
+rank: 1000
+domain_of:
+- LinksFamilyMeta
+- LinksMeta
+- LinkAttributeFamilyMeta
+- LinkAttributeMeta
+range: integer
+required: true
+
+```
+</details></div>
+
+
+---
+
+---
+search:
+  boost: 5.0
+---
+
+# Slot: link_width 
+
+
+_Width of a links row (1 for parent→child metanode references, 2 for edges, 3 for triangle faces, 4 for quads)._
+
+__
+
+
+
+<div data-search-exclude markdown="1">
+
+
+
+URI: [zv:link_width](https://w3id.org/zarr-vectors/schema/0.5/link_width)
+<!-- no inheritance hierarchy -->
+
+
+
+
+
+## Applicable Classes
+
+| Name | Description | Modifies Slot |
+| --- | --- | --- |
+| [LinksFamilyMeta](LinksFamilyMeta.md) | `` |  no  |
+| [LinksMeta](LinksMeta.md) | `` |  no  |
+
+
+
+
+
+
+## Properties
+
+### Type and Range
+
+| Property | Value |
+| --- | --- |
+| Range | [Integer](Integer.md) |
+| Domain Of | [LinksFamilyMeta](LinksFamilyMeta.md), [LinksMeta](LinksMeta.md) |
+
+### Cardinality and Requirements
+
+| Property | Value |
+| --- | --- |
+| Required | Yes |
+### Value Constraints
+
+| Property | Value |
+| --- | --- |
+| Minimum Value | 1 |
+
+
+
+
+
+
+
+
+
+
+
+
+## Identifier and Mapping Information
+
+
+
+
+
+### Schema Source
+
+
+* from schema: https://w3id.org/zarr-vectors/schema/0.5
+
+
+
+
+## Mappings
+
+| Mapping Type | Mapped Value |
+| ---  | ---  |
+| self | zv:link_width |
+| native | zv:link_width |
+
+
+
+
+## LinkML Source
+
+<details>
+```yaml
+name: link_width
+description: 'Width of a links row (1 for parent→child metanode references, 2 for
+  edges, 3 for triangle faces, 4 for quads).
+
+  '
+from_schema: https://w3id.org/zarr-vectors/schema/0.5
+rank: 1000
+domain_of:
+- LinksFamilyMeta
+- LinksMeta
+range: integer
+required: true
+minimum_value: 1
+
+```
+</details></div>
+
+
+---
+
+---
+search:
+  boost: 5.0
+---
+
+# Slot: links_convention 
+
+<div data-search-exclude markdown="1">
+
+
+
+URI: [zv:links_convention](https://w3id.org/zarr-vectors/schema/0.5/links_convention)
+<!-- no inheritance hierarchy -->
+
+
+
+
+
+## Applicable Classes
+
+| Name | Description | Modifies Slot |
+| --- | --- | --- |
+| [RootMetadata](RootMetadata.md) | Root-level `` |  no  |
+
+
+
+
+
+
+## Properties
+
+### Type and Range
+
+| Property | Value |
+| --- | --- |
+| Range | [LinksConvention](LinksConvention.md) |
+| Domain Of | [RootMetadata](RootMetadata.md) |
+
+### Cardinality and Requirements
+
+| Property | Value |
+| --- | --- |
+
+
+
+
+
+
+
+
+
+
+## Identifier and Mapping Information
+
+
+
+
+
+### Schema Source
+
+
+* from schema: https://w3id.org/zarr-vectors/schema/0.5
+
+
+
+
+## Mappings
+
+| Mapping Type | Mapped Value |
+| ---  | ---  |
+| self | zv:links_convention |
+| native | zv:links_convention |
+
+
+
+
+## LinkML Source
+
+<details>
+```yaml
+name: links_convention
+from_schema: https://w3id.org/zarr-vectors/schema/0.5
+rank: 1000
+domain_of:
+- RootMetadata
+range: LinksConvention
+
+```
+</details></div>
+
+
+---
+
+---
+search:
+  boost: 5.0
+---
+
+# Slot: manifest_layout 
+
+
+_``dense`` when object indexes are created in the dense layout (``manifest_spans`` + ``manifest_blocks``: fixed-width integer arrays), absent for the vlen default of one blob per object. Optional and additive from 0.9.4. A default for indexes created later; an existing index's own ``layout`` is the truth about it._
+
+__
+
+
+
+<div data-search-exclude markdown="1">
+
+
+
+URI: [zv:manifest_layout](https://w3id.org/zarr-vectors/schema/0.5/manifest_layout)
+<!-- no inheritance hierarchy -->
+
+
+
+
+
+## Applicable Classes
+
+| Name | Description | Modifies Slot |
+| --- | --- | --- |
+| [RootMetadata](RootMetadata.md) | Root-level `` |  no  |
+
+
+
+
+
+
+## Properties
+
+### Type and Range
+
+| Property | Value |
+| --- | --- |
+| Range | [ManifestLayout](ManifestLayout.md) |
+| Domain Of | [RootMetadata](RootMetadata.md) |
+
+### Cardinality and Requirements
+
+| Property | Value |
+| --- | --- |
+
+
+
+
+
+
+
+
+
+
+## Identifier and Mapping Information
+
+
+
+
+
+### Schema Source
+
+
+* from schema: https://w3id.org/zarr-vectors/schema/0.5
+
+
+
+
+## Mappings
+
+| Mapping Type | Mapped Value |
+| ---  | ---  |
+| self | zv:manifest_layout |
+| native | zv:manifest_layout |
+
+
+
+
+## LinkML Source
+
+<details>
+```yaml
+name: manifest_layout
+description: '``dense`` when object indexes are created in the dense layout (``manifest_spans``
+  + ``manifest_blocks``: fixed-width integer arrays), absent for the vlen default
+  of one blob per object. Optional and additive from 0.9.4. A default for indexes
+  created later; an existing index''s own ``layout`` is the truth about it.
+
+  '
+from_schema: https://w3id.org/zarr-vectors/schema/0.5
+rank: 1000
+domain_of:
+- RootMetadata
+range: ManifestLayout
+
+```
+</details></div>
+
+
+---
+
+---
+search:
   boost: 5.0
 ---
 
@@ -7604,134 +10273,6 @@ required: true
 
 ```
 </details></div>
-
-
----
-
----
-search:
-  boost: 1.0
----# Type: Ncname 
-
-
-
-
-_Prefix part of CURIE_
-
-
-
-<div data-search-exclude markdown="1">
-
-URI: [xsd:string](http://www.w3.org/2001/XMLSchema#string)
-
-## Type Properties
-
-| Property | Value |
-| --- | --- |
-| Base | `NCName` |
-| Type URI | [xsd:string](http://www.w3.org/2001/XMLSchema#string) |
-| Representation | `str` |
-
-
-
-
-
-
-## Notes
-
-* If you are authoring schemas in LinkML YAML, the type is referenced with the lower case "ncname".
-
-
-
-## Identifier and Mapping Information
-
-
-
-
-
-### Schema Source
-
-
-* from schema: https://w3id.org/zarr-vectors/schema/0.5
-
-
-
-
-## Mappings
-
-| Mapping Type | Mapped Value |
-| ---  | ---  |
-| self | xsd:string |
-| native | zv:ncname |
-
-
-
-
-</div>
-
-
----
-
----
-search:
-  boost: 1.0
----# Type: Nodeidentifier 
-
-
-
-
-_A URI, CURIE or BNODE that represents a node in a model._
-
-
-
-<div data-search-exclude markdown="1">
-
-URI: [shex:nonLiteral](http://www.w3.org/ns/shex#nonLiteral)
-
-## Type Properties
-
-| Property | Value |
-| --- | --- |
-| Base | `NodeIdentifier` |
-| Type URI | [shex:nonLiteral](http://www.w3.org/ns/shex#nonLiteral) |
-| Representation | `str` |
-
-
-
-
-
-
-## Notes
-
-* If you are authoring schemas in LinkML YAML, the type is referenced with the lower case "nodeidentifier".
-
-
-
-## Identifier and Mapping Information
-
-
-
-
-
-### Schema Source
-
-
-* from schema: https://w3id.org/zarr-vectors/schema/0.5
-
-
-
-
-## Mappings
-
-| Mapping Type | Mapped Value |
-| ---  | ---  |
-| self | shex:nonLiteral |
-| native | zv:nodeidentifier |
-
-
-
-
-</div>
 
 
 ---
@@ -8388,564 +10929,6 @@ maximum_value: 1.0
 
 ---
 search:
-  boost: 10.0
----
-
-# Class: ObjectAttributeMeta 
-
-
-_``.zattrs`` for each ``object_attributes/<name>/`` array._
-
-
-
-<div data-search-exclude markdown="1">
-
-
-
-URI: [zv:ObjectAttributeMeta](https://w3id.org/zarr-vectors/schema/0.5/ObjectAttributeMeta)
-
-
-
-
-
-```mermaid
- classDiagram
-    class ObjectAttributeMeta
-    click ObjectAttributeMeta href "../ObjectAttributeMeta/"
-      ObjectAttributeMeta : dtype
-        
-      ObjectAttributeMeta : name
-        
-      ObjectAttributeMeta : shape
-        
-      ObjectAttributeMeta : zv_array
-        
-          
-    
-        
-        
-        ObjectAttributeMeta --> "1" ZvArrayTag : zv_array
-        click ZvArrayTag href "../ZvArrayTag/"
-    
-
-        
-      
-```
-
-
-
-
-<!-- no inheritance hierarchy -->
-
-## Slots
-
-| Name | Cardinality and Range | Description | Inheritance |
-| ---  | --- | --- | --- |
-| [zv_array](zv_array.md) | 1 <br/> [ZvArrayTag](ZvArrayTag.md) | Discriminator slot identifying the kind of per-array `` | direct |
-| [name](name.md) | 1 <br/> [String](String.md) | NGFF axis or attribute name (e | direct |
-| [dtype](dtype.md) | 1 <br/> [String](String.md) | Numpy dtype string of the array's value type (e | direct |
-| [shape](shape.md) | 1..* <br/> [Integer](Integer.md) | Shape of a dense per-object/per-group array | direct |
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-## Identifier and Mapping Information
-
-
-
-
-
-### Schema Source
-
-
-* from schema: https://w3id.org/zarr-vectors/schema/0.5
-
-
-
-
-## Mappings
-
-| Mapping Type | Mapped Value |
-| ---  | ---  |
-| self | zv:ObjectAttributeMeta |
-| native | zv:ObjectAttributeMeta |
-
-
-
-
-
-
-## LinkML Source
-
-### Direct
-
-<details>
-```yaml
-name: ObjectAttributeMeta
-description: '``.zattrs`` for each ``object_attributes/<name>/`` array.'
-from_schema: https://w3id.org/zarr-vectors/schema/0.5
-rank: 1000
-slots:
-- zv_array
-- name
-- dtype
-- shape
-slot_usage:
-  zv_array:
-    name: zv_array
-    required: true
-    equals_string: object_attribute
-
-```
-</details>
-
-### Induced
-
-<details>
-```yaml
-name: ObjectAttributeMeta
-description: '``.zattrs`` for each ``object_attributes/<name>/`` array.'
-from_schema: https://w3id.org/zarr-vectors/schema/0.5
-rank: 1000
-slot_usage:
-  zv_array:
-    name: zv_array
-    required: true
-    equals_string: object_attribute
-attributes:
-  zv_array:
-    name: zv_array
-    description: 'Discriminator slot identifying the kind of per-array ``.zattrs``
-      block.  Each writer in ``core/arrays.py`` stamps the corresponding token from
-      :class:`ZvArrayTag`.
-
-      '
-    from_schema: https://w3id.org/zarr-vectors/schema/0.5
-    rank: 1000
-    owner: ObjectAttributeMeta
-    domain_of:
-    - VerticesMeta
-    - LinksFamilyMeta
-    - LinksMeta
-    - AttributeMeta
-    - FragmentAttributeMeta
-    - ObjectIndexMeta
-    - ObjectAttributeMeta
-    - GroupingsMeta
-    - GroupingsAttributeMeta
-    - LinkAttributeFamilyMeta
-    - LinkAttributeMeta
-    range: ZvArrayTag
-    required: true
-    equals_string: object_attribute
-  name:
-    name: name
-    description: NGFF axis or attribute name (e.g. "x", "intensity").
-    from_schema: https://w3id.org/zarr-vectors/schema/0.5
-    rank: 1000
-    slot_uri: schema:name
-    owner: ObjectAttributeMeta
-    domain_of:
-    - Axis
-    - AttributeMeta
-    - FragmentAttributeMeta
-    - ObjectAttributeMeta
-    - GroupingsAttributeMeta
-    - LinkAttributeFamilyMeta
-    - LinkAttributeMeta
-    range: string
-    required: true
-  dtype:
-    name: dtype
-    description: Numpy dtype string of the array's value type (e.g. "float32").
-    from_schema: https://w3id.org/zarr-vectors/schema/0.5
-    rank: 1000
-    owner: ObjectAttributeMeta
-    domain_of:
-    - VerticesMeta
-    - LinksMeta
-    - AttributeMeta
-    - FragmentAttributeMeta
-    - ObjectAttributeMeta
-    - GroupingsAttributeMeta
-    - LinkAttributeMeta
-    range: string
-    required: true
-  shape:
-    name: shape
-    description: Shape of a dense per-object/per-group array.
-    from_schema: https://w3id.org/zarr-vectors/schema/0.5
-    rank: 1000
-    owner: ObjectAttributeMeta
-    domain_of:
-    - ObjectAttributeMeta
-    - GroupingsAttributeMeta
-    range: integer
-    required: true
-    multivalued: true
-
-```
-</details></div>
-
-
----
-
----
-search:
-  boost: 1.0
----# Type: Objectidentifier 
-
-
-
-
-_A URI or CURIE that represents an object in the model._
-
-
-
-<div data-search-exclude markdown="1">
-
-URI: [shex:iri](http://www.w3.org/ns/shex#iri)
-
-## Type Properties
-
-| Property | Value |
-| --- | --- |
-| Base | `ElementIdentifier` |
-| Type URI | [shex:iri](http://www.w3.org/ns/shex#iri) |
-| Representation | `str` |
-
-
-
-
-
-
-## Comments
-
-* Used for inheritance and type checking
-
-## Notes
-
-* If you are authoring schemas in LinkML YAML, the type is referenced with the lower case "objectidentifier".
-
-
-
-## Identifier and Mapping Information
-
-
-
-
-
-### Schema Source
-
-
-* from schema: https://w3id.org/zarr-vectors/schema/0.5
-
-
-
-
-## Mappings
-
-| Mapping Type | Mapped Value |
-| ---  | ---  |
-| self | shex:iri |
-| native | zv:objectidentifier |
-
-
-
-
-</div>
-
-
----
-
----
-search:
-  boost: 2.0
----
-
-
-# Enum: ObjectIndexConvention 
-
-
-
-
-_How the object_id → fragment mapping is encoded._
-
-
-
-<div data-search-exclude markdown="1">
-
-URI: [zv:ObjectIndexConvention](https://w3id.org/zarr-vectors/schema/0.5/ObjectIndexConvention)
-
-## Permissible Values
-| Value | Meaning | Description |
-| --- | --- | --- |
-| standard | None | Full ``object_index`` array maps each object to its fragment refs |
-| identity | None | One object per vertex; only valid in single-chunk stores where the object_ind... |
-
-
-
-
-## Slots
-
-| Name | Description |
-| ---  | --- |
-| [object_index_convention](object_index_convention.md) |  |
-
-
-
-
-
-
-
-
-
-
-## Identifier and Mapping Information
-
-
-
-
-
-### Schema Source
-
-
-* from schema: https://w3id.org/zarr-vectors/schema/0.5
-
-
-
-
-
-
-## LinkML Source
-
-<details>
-```yaml
-name: ObjectIndexConvention
-description: How the object_id → fragment mapping is encoded.
-from_schema: https://w3id.org/zarr-vectors/schema/0.5
-rank: 1000
-permissible_values:
-  standard:
-    text: standard
-    description: Full ``object_index`` array maps each object to its fragment refs.
-  identity:
-    text: identity
-    description: 'One object per vertex; only valid in single-chunk stores where the
-      object_index would be redundant.
-
-      '
-
-```
-</details>
-
-</div>
-
-
----
-
----
-search:
-  boost: 10.0
----
-
-# Class: ObjectIndexMeta 
-
-
-_``.zattrs`` for ``object_index/``._
-
-
-
-<div data-search-exclude markdown="1">
-
-
-
-URI: [zv:ObjectIndexMeta](https://w3id.org/zarr-vectors/schema/0.5/ObjectIndexMeta)
-
-
-
-
-
-```mermaid
- classDiagram
-    class ObjectIndexMeta
-    click ObjectIndexMeta href "../ObjectIndexMeta/"
-      ObjectIndexMeta : num_objects
-        
-      ObjectIndexMeta : sid_ndim
-        
-      ObjectIndexMeta : zv_array
-        
-          
-    
-        
-        
-        ObjectIndexMeta --> "1" ZvArrayTag : zv_array
-        click ZvArrayTag href "../ZvArrayTag/"
-    
-
-        
-      
-```
-
-
-
-
-<!-- no inheritance hierarchy -->
-
-## Slots
-
-| Name | Cardinality and Range | Description | Inheritance |
-| ---  | --- | --- | --- |
-| [zv_array](zv_array.md) | 1 <br/> [ZvArrayTag](ZvArrayTag.md) | Discriminator slot identifying the kind of per-array `` | direct |
-| [num_objects](num_objects.md) | 1 <br/> [Integer](Integer.md) | Total object count this array carries | direct |
-| [sid_ndim](sid_ndim.md) | 1 <br/> [Integer](Integer.md) | Number of spatial-index dimensions encoded in chunk keys | direct |
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-## Identifier and Mapping Information
-
-
-
-
-
-### Schema Source
-
-
-* from schema: https://w3id.org/zarr-vectors/schema/0.5
-
-
-
-
-## Mappings
-
-| Mapping Type | Mapped Value |
-| ---  | ---  |
-| self | zv:ObjectIndexMeta |
-| native | zv:ObjectIndexMeta |
-
-
-
-
-
-
-## LinkML Source
-
-### Direct
-
-<details>
-```yaml
-name: ObjectIndexMeta
-description: '``.zattrs`` for ``object_index/``.'
-from_schema: https://w3id.org/zarr-vectors/schema/0.5
-rank: 1000
-slots:
-- zv_array
-- num_objects
-- sid_ndim
-slot_usage:
-  zv_array:
-    name: zv_array
-    required: true
-    equals_string: object_index
-
-```
-</details>
-
-### Induced
-
-<details>
-```yaml
-name: ObjectIndexMeta
-description: '``.zattrs`` for ``object_index/``.'
-from_schema: https://w3id.org/zarr-vectors/schema/0.5
-rank: 1000
-slot_usage:
-  zv_array:
-    name: zv_array
-    required: true
-    equals_string: object_index
-attributes:
-  zv_array:
-    name: zv_array
-    description: 'Discriminator slot identifying the kind of per-array ``.zattrs``
-      block.  Each writer in ``core/arrays.py`` stamps the corresponding token from
-      :class:`ZvArrayTag`.
-
-      '
-    from_schema: https://w3id.org/zarr-vectors/schema/0.5
-    rank: 1000
-    owner: ObjectIndexMeta
-    domain_of:
-    - VerticesMeta
-    - LinksFamilyMeta
-    - LinksMeta
-    - AttributeMeta
-    - FragmentAttributeMeta
-    - ObjectIndexMeta
-    - ObjectAttributeMeta
-    - GroupingsMeta
-    - GroupingsAttributeMeta
-    - LinkAttributeFamilyMeta
-    - LinkAttributeMeta
-    range: ZvArrayTag
-    required: true
-    equals_string: object_index
-  num_objects:
-    name: num_objects
-    description: Total object count this array carries.
-    from_schema: https://w3id.org/zarr-vectors/schema/0.5
-    rank: 1000
-    owner: ObjectIndexMeta
-    domain_of:
-    - ObjectIndexMeta
-    range: integer
-    required: true
-    minimum_value: 0
-  sid_ndim:
-    name: sid_ndim
-    description: Number of spatial-index dimensions encoded in chunk keys.
-    from_schema: https://w3id.org/zarr-vectors/schema/0.5
-    rank: 1000
-    owner: ObjectIndexMeta
-    domain_of:
-    - LinksFamilyMeta
-    - ObjectIndexMeta
-    range: integer
-    required: true
-    minimum_value: 1
-
-```
-</details></div>
-
-
----
-
----
-search:
   boost: 5.0
 ---
 
@@ -9381,459 +11364,6 @@ domain_of:
 - RootMetadata
 range: integer
 minimum_value: 2
-
-```
-</details></div>
-
-
----
-
----
-search:
-  boost: 10.0
----
-
-# Class: RootMetadata 
-
-
-_Root-level ``.zattrs`` payload, persisted under the key ``zarr_vectors``.  Validates the runtime :class:`zarr_vectors.core.metadata.RootMetadata` dataclass. Note: the canonical axis list lives in ``multiscales[0].axes`` at root level (NGFF-style), NOT under ``zarr_vectors`` — see ``MultiscalesMetadata``._
-
-__
-
-
-
-<div data-search-exclude markdown="1">
-
-
-
-URI: [zv:RootMetadata](https://w3id.org/zarr-vectors/schema/0.5/RootMetadata)
-
-
-
-
-
-```mermaid
- classDiagram
-    class RootMetadata
-    click RootMetadata href "../RootMetadata/"
-      RootMetadata : attribute_specs
-        
-          
-    
-        
-        
-        RootMetadata --> "0..1" AttributeSpecs : attribute_specs
-        click AttributeSpecs href "../AttributeSpecs/"
-    
-
-        
-      RootMetadata : base_bin_shape
-        
-      RootMetadata : bounds
-        
-          
-    
-        
-        
-        RootMetadata --> "1" BoundingBox : bounds
-        click BoundingBox href "../BoundingBox/"
-    
-
-        
-      RootMetadata : chunk_shape
-        
-      RootMetadata : cross_chunk_strategy
-        
-          
-    
-        
-        
-        RootMetadata --> "0..1" CrossChunkStrategy : cross_chunk_strategy
-        click CrossChunkStrategy href "../CrossChunkStrategy/"
-    
-
-        
-      RootMetadata : cross_level_depth
-        
-      RootMetadata : cross_level_storage
-        
-          
-    
-        
-        
-        RootMetadata --> "0..1" CrossLevelStorage : cross_level_storage
-        click CrossLevelStorage href "../CrossLevelStorage/"
-    
-
-        
-      RootMetadata : crs
-        
-          
-    
-        
-        
-        RootMetadata --> "0..1" CRS : crs
-        click CRS href "../CRS/"
-    
-
-        
-      RootMetadata : format_capabilities
-        
-          
-    
-        
-        
-        RootMetadata --> "*" FormatCapability : format_capabilities
-        click FormatCapability href "../FormatCapability/"
-    
-
-        
-      RootMetadata : geometry_types
-        
-          
-    
-        
-        
-        RootMetadata --> "1..*" GeometryType : geometry_types
-        click GeometryType href "../GeometryType/"
-    
-
-        
-      RootMetadata : links_convention
-        
-          
-    
-        
-        
-        RootMetadata --> "0..1" LinksConvention : links_convention
-        click LinksConvention href "../LinksConvention/"
-    
-
-        
-      RootMetadata : object_index_convention
-        
-          
-    
-        
-        
-        RootMetadata --> "0..1" ObjectIndexConvention : object_index_convention
-        click ObjectIndexConvention href "../ObjectIndexConvention/"
-    
-
-        
-      RootMetadata : reduction_factor
-        
-      RootMetadata : shard_shape
-        
-      RootMetadata : zv_version
-        
-      
-```
-
-
-
-
-<!-- no inheritance hierarchy -->
-
-## Slots
-
-| Name | Cardinality and Range | Description | Inheritance |
-| ---  | --- | --- | --- |
-| [zv_version](zv_version.md) | 1 <br/> [String](String.md) | ZV spec version this store was written against (e | direct |
-| [chunk_shape](chunk_shape.md) | 1..* <br/> [Float](Float.md) | Physical spatial chunk size per axis (all values > 0) | direct |
-| [bounds](bounds.md) | 1 <br/> [BoundingBox](BoundingBox.md) | Global vertex bounding box | direct |
-| [geometry_types](geometry_types.md) | 1..* <br/> [GeometryType](GeometryType.md) | One or more geometry kinds present in the store | direct |
-| [crs](crs.md) | 0..1 <br/> [CRS](CRS.md) | Optional coordinate reference system metadata (free-form dict matching whatev... | direct |
-| [links_convention](links_convention.md) | 0..1 <br/> [LinksConvention](LinksConvention.md) |  | direct |
-| [object_index_convention](object_index_convention.md) | 0..1 <br/> [ObjectIndexConvention](ObjectIndexConvention.md) |  | direct |
-| [cross_chunk_strategy](cross_chunk_strategy.md) | 0..1 <br/> [CrossChunkStrategy](CrossChunkStrategy.md) |  | direct |
-| [cross_level_depth](cross_level_depth.md) | 0..1 <br/> [Integer](Integer.md) | Maximum absolute level delta for which cross-pyramid-level link arrays are ma... | direct |
-| [cross_level_storage](cross_level_storage.md) | 0..1 <br/> [CrossLevelStorage](CrossLevelStorage.md) | Whether cross-level link arrays are written in both directions (``explicit``:... | direct |
-| [reduction_factor](reduction_factor.md) | 0..1 <br/> [Integer](Integer.md) | Multi-resolution coarsening factor (≥ 2) | direct |
-| [base_bin_shape](base_bin_shape.md) | * <br/> [Float](Float.md) | Supervoxel bin edge lengths at level 0 | direct |
-| [format_capabilities](format_capabilities.md) | * <br/> [FormatCapability](FormatCapability.md) | Optional 0 | direct |
-| [attribute_specs](attribute_specs.md) | 0..1 <br/> [AttributeSpecs](AttributeSpecs.md) | What the store declares its attributes to be, keyed by scope (``vertex`` / ``... | direct |
-| [shard_shape](shard_shape.md) | * <br/> [Integer](Integer.md) | Cells per shard per axis, or absent for one storage object per cell | direct |
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-## Identifier and Mapping Information
-
-
-
-
-
-### Schema Source
-
-
-* from schema: https://w3id.org/zarr-vectors/schema/0.5
-
-
-
-
-## Mappings
-
-| Mapping Type | Mapped Value |
-| ---  | ---  |
-| self | zv:RootMetadata |
-| native | zv:RootMetadata |
-
-
-
-
-
-
-## LinkML Source
-
-### Direct
-
-<details>
-```yaml
-name: RootMetadata
-description: 'Root-level ``.zattrs`` payload, persisted under the key ``zarr_vectors``.  Validates
-  the runtime :class:`zarr_vectors.core.metadata.RootMetadata` dataclass. Note: the
-  canonical axis list lives in ``multiscales[0].axes`` at root level (NGFF-style),
-  NOT under ``zarr_vectors`` — see ``MultiscalesMetadata``.
-
-  '
-from_schema: https://w3id.org/zarr-vectors/schema/0.5
-rank: 1000
-slots:
-- zv_version
-- chunk_shape
-- bounds
-- geometry_types
-- crs
-- links_convention
-- object_index_convention
-- cross_chunk_strategy
-- cross_level_depth
-- cross_level_storage
-- reduction_factor
-- base_bin_shape
-- format_capabilities
-- attribute_specs
-- shard_shape
-
-```
-</details>
-
-### Induced
-
-<details>
-```yaml
-name: RootMetadata
-description: 'Root-level ``.zattrs`` payload, persisted under the key ``zarr_vectors``.  Validates
-  the runtime :class:`zarr_vectors.core.metadata.RootMetadata` dataclass. Note: the
-  canonical axis list lives in ``multiscales[0].axes`` at root level (NGFF-style),
-  NOT under ``zarr_vectors`` — see ``MultiscalesMetadata``.
-
-  '
-from_schema: https://w3id.org/zarr-vectors/schema/0.5
-rank: 1000
-attributes:
-  zv_version:
-    name: zv_version
-    description: 'ZV spec version this store was written against (e.g. "0.5.0"). Renamed
-      from ``format_version`` in 0.5.0 to disambiguate from Zarr v3''s ``zarr_format``
-      field.
-
-      '
-    from_schema: https://w3id.org/zarr-vectors/schema/0.5
-    rank: 1000
-    slot_uri: schema:version
-    owner: RootMetadata
-    domain_of:
-    - RootMetadata
-    range: string
-    required: true
-    pattern: ^\d+\.\d+(\.\d+)?$
-  chunk_shape:
-    name: chunk_shape
-    description: Physical spatial chunk size per axis (all values > 0).
-    from_schema: https://w3id.org/zarr-vectors/schema/0.5
-    rank: 1000
-    owner: RootMetadata
-    domain_of:
-    - RootMetadata
-    - LevelMetadata
-    range: float
-    required: true
-    multivalued: true
-  bounds:
-    name: bounds
-    description: Global vertex bounding box.
-    from_schema: https://w3id.org/zarr-vectors/schema/0.5
-    rank: 1000
-    owner: RootMetadata
-    domain_of:
-    - RootMetadata
-    range: BoundingBox
-    required: true
-  geometry_types:
-    name: geometry_types
-    description: One or more geometry kinds present in the store.
-    from_schema: https://w3id.org/zarr-vectors/schema/0.5
-    rank: 1000
-    owner: RootMetadata
-    domain_of:
-    - RootMetadata
-    range: GeometryType
-    required: true
-    multivalued: true
-    minimum_cardinality: 1
-  crs:
-    name: crs
-    description: 'Optional coordinate reference system metadata (free-form dict matching
-      whatever CRS vocabulary the store uses, e.g. WKT, PROJ4, EPSG, CF conventions).
-
-      '
-    from_schema: https://w3id.org/zarr-vectors/schema/0.5
-    rank: 1000
-    slot_uri: schema:coordinateReferenceSystem
-    owner: RootMetadata
-    domain_of:
-    - RootMetadata
-    range: CRS
-    inlined: true
-  links_convention:
-    name: links_convention
-    from_schema: https://w3id.org/zarr-vectors/schema/0.5
-    rank: 1000
-    owner: RootMetadata
-    domain_of:
-    - RootMetadata
-    range: LinksConvention
-  object_index_convention:
-    name: object_index_convention
-    from_schema: https://w3id.org/zarr-vectors/schema/0.5
-    rank: 1000
-    owner: RootMetadata
-    domain_of:
-    - RootMetadata
-    range: ObjectIndexConvention
-  cross_chunk_strategy:
-    name: cross_chunk_strategy
-    from_schema: https://w3id.org/zarr-vectors/schema/0.5
-    rank: 1000
-    owner: RootMetadata
-    domain_of:
-    - RootMetadata
-    range: CrossChunkStrategy
-  cross_level_depth:
-    name: cross_level_depth
-    description: 'Maximum absolute level delta for which cross-pyramid-level link
-      arrays are materialized.  ``0`` = none (no ``+N`` or ``-N`` arrays), ``N`` =
-      generate up to ``±N`` (or ``+N`` only when ``cross_level_storage="implicit"``),
-      ``-1`` = all available pyramid levels.  Default ``1``.
-
-      '
-    from_schema: https://w3id.org/zarr-vectors/schema/0.5
-    rank: 1000
-    owner: RootMetadata
-    domain_of:
-    - RootMetadata
-    range: integer
-    minimum_value: -1
-  cross_level_storage:
-    name: cross_level_storage
-    description: 'Whether cross-level link arrays are written in both directions (``explicit``:
-      ``+N`` at the finer level AND ``-N`` at the coarser level) or only positive
-      deltas (``implicit``: only ``+N``, with ``-N`` reconstructed on read).  Default
-      ``explicit``.
-
-      '
-    from_schema: https://w3id.org/zarr-vectors/schema/0.5
-    rank: 1000
-    owner: RootMetadata
-    domain_of:
-    - RootMetadata
-    range: CrossLevelStorage
-  reduction_factor:
-    name: reduction_factor
-    description: Multi-resolution coarsening factor (≥ 2).
-    from_schema: https://w3id.org/zarr-vectors/schema/0.5
-    rank: 1000
-    owner: RootMetadata
-    domain_of:
-    - RootMetadata
-    range: integer
-    minimum_value: 2
-  base_bin_shape:
-    name: base_bin_shape
-    description: 'Supervoxel bin edge lengths at level 0.  When set, every value must
-      be > 0 and ``chunk_shape`` must be an integer multiple along every axis (enforced
-      runtime-side in ``RootMetadata.validate``).
-
-      '
-    from_schema: https://w3id.org/zarr-vectors/schema/0.5
-    rank: 1000
-    owner: RootMetadata
-    domain_of:
-    - RootMetadata
-    range: float
-    multivalued: true
-  format_capabilities:
-    name: format_capabilities
-    description: Optional 0.3+ feature tokens advertised by this store.
-    from_schema: https://w3id.org/zarr-vectors/schema/0.5
-    rank: 1000
-    owner: RootMetadata
-    domain_of:
-    - RootMetadata
-    range: FormatCapability
-    multivalued: true
-  attribute_specs:
-    name: attribute_specs
-    description: 'What the store declares its attributes to be, keyed by scope (``vertex``
-      / ``object`` / ``link``) and then by attribute name. Each entry carries ``dtype``
-      and optionally ``channels``, ``categorical``, ``unit`` and ``description``.  Optional
-      and backward-compatible from 0.9.1: absent means undeclared, which is every
-      store written before it.  A declaration is not a promise the array exists --
-      the array appears when data is written -- but it is what lets a Schema round-trip
-      and what ``open_or_create`` compares against.  ``unit`` and ``description``
-      are additionally stamped on the attribute array''s own metadata block.
-
-      '
-    from_schema: https://w3id.org/zarr-vectors/schema/0.5
-    rank: 1000
-    owner: RootMetadata
-    domain_of:
-    - RootMetadata
-    range: AttributeSpecs
-  shard_shape:
-    name: shard_shape
-    description: 'Cells per shard per axis, or absent for one storage object per cell.  The
-      store''s declared packing, read by every path that allocates a per-chunk array
-      -- including the ones that run long after creation, inside workers that never
-      saw the argument.  Units are grid cells, so one declaration is meaningful at
-      every level of a pyramid even though their grids differ.  A store where every
-      axis agrees writes the scalar edge; the multivalued form carries a per-axis
-      shape.  Optional and additive from 0.9.3: absent means unsharded, which is every
-      store written before it.  It is a writer default, not a claim about what is
-      on disk -- an array''s own ``zarr.json`` remains the truth about that array.
-
-      '
-    from_schema: https://w3id.org/zarr-vectors/schema/0.5
-    rank: 1000
-    owner: RootMetadata
-    domain_of:
-    - RootMetadata
-    range: integer
-    multivalued: true
-    minimum_value: 1
 
 ```
 </details></div>
@@ -10393,70 +11923,6 @@ minimum_value: 1
 
 ---
 search:
-  boost: 1.0
----# Type: Sparqlpath 
-
-
-
-
-_A string encoding a SPARQL Property Path. The value of the string MUST conform to SPARQL syntax and SHOULD dereference to zero or more valid objects within the current instance document when encoded as RDF._
-
-
-
-<div data-search-exclude markdown="1">
-
-URI: [xsd:string](http://www.w3.org/2001/XMLSchema#string)
-
-## Type Properties
-
-| Property | Value |
-| --- | --- |
-| Base | `str` |
-| Type URI | [xsd:string](http://www.w3.org/2001/XMLSchema#string) |
-| Representation | `str` |
-
-
-
-
-
-
-## Notes
-
-* If you are authoring schemas in LinkML YAML, the type is referenced with the lower case "sparqlpath".
-
-
-
-## Identifier and Mapping Information
-
-
-
-
-
-### Schema Source
-
-
-* from schema: https://w3id.org/zarr-vectors/schema/0.5
-
-
-
-
-## Mappings
-
-| Mapping Type | Mapped Value |
-| ---  | ---  |
-| self | xsd:string |
-| native | zv:sparqlpath |
-
-
-
-
-</div>
-
-
----
-
----
-search:
   boost: 5.0
 ---
 
@@ -10556,136 +12022,6 @@ required: false
 
 ```
 </details></div>
-
-
----
-
----
-search:
-  boost: 1.0
----# Type: String 
-
-
-
-
-_A character string_
-
-
-
-<div data-search-exclude markdown="1">
-
-URI: [xsd:string](http://www.w3.org/2001/XMLSchema#string)
-
-## Type Properties
-
-| Property | Value |
-| --- | --- |
-| Base | `str` |
-| Type URI | [xsd:string](http://www.w3.org/2001/XMLSchema#string) |
-
-
-
-
-
-
-## Notes
-
-* In RDF serializations, a slot with range of string is treated as a literal or type xsd:string. If you are authoring schemas in LinkML YAML, the type is referenced with the lower case "string".
-
-
-
-## Identifier and Mapping Information
-
-
-
-
-
-### Schema Source
-
-
-* from schema: https://w3id.org/zarr-vectors/schema/0.5
-
-
-
-
-## Mappings
-
-| Mapping Type | Mapped Value |
-| ---  | ---  |
-| self | xsd:string |
-| native | zv:string |
-| exact | schema:Text |
-
-
-
-
-</div>
-
-
----
-
----
-search:
-  boost: 1.0
----# Type: Time 
-
-
-
-
-_A time object represents a (local) time of day, independent of any particular day_
-
-
-
-<div data-search-exclude markdown="1">
-
-URI: [xsd:time](http://www.w3.org/2001/XMLSchema#time)
-
-## Type Properties
-
-| Property | Value |
-| --- | --- |
-| Base | `XSDTime` |
-| Type URI | [xsd:time](http://www.w3.org/2001/XMLSchema#time) |
-| Representation | `str` |
-
-
-
-
-
-
-## Notes
-
-* URI is dateTime because OWL reasoners do not work with straight date or time
-* If you are authoring schemas in LinkML YAML, the type is referenced with the lower case "time".
-
-
-
-## Identifier and Mapping Information
-
-
-
-
-
-### Schema Source
-
-
-* from schema: https://w3id.org/zarr-vectors/schema/0.5
-
-
-
-
-## Mappings
-
-| Mapping Type | Mapped Value |
-| ---  | ---  |
-| self | xsd:time |
-| native | zv:time |
-| exact | schema:Time |
-
-
-
-
-</div>
 
 
 ---
@@ -10892,139 +12228,6 @@ range: string
 
 ---
 search:
-  boost: 1.0
----# Type: Uri 
-
-
-
-
-_a complete URI_
-
-
-
-<div data-search-exclude markdown="1">
-
-URI: [xsd:anyURI](http://www.w3.org/2001/XMLSchema#anyURI)
-
-## Type Properties
-
-| Property | Value |
-| --- | --- |
-| Base | `URI` |
-| Type URI | [xsd:anyURI](http://www.w3.org/2001/XMLSchema#anyURI) |
-| Representation | `str` |
-
-
-
-
-
-
-## Comments
-
-* in RDF serializations a slot with range of uri is treated as a literal or type xsd:anyURI unless it is an identifier or a reference to an identifier, in which case it is translated directly to a node
-
-## Notes
-
-* If you are authoring schemas in LinkML YAML, the type is referenced with the lower case "uri".
-
-
-
-## Identifier and Mapping Information
-
-
-
-
-
-### Schema Source
-
-
-* from schema: https://w3id.org/zarr-vectors/schema/0.5
-
-
-
-
-## Mappings
-
-| Mapping Type | Mapped Value |
-| ---  | ---  |
-| self | xsd:anyURI |
-| native | zv:uri |
-| close | schema:URL |
-
-
-
-
-</div>
-
-
----
-
----
-search:
-  boost: 1.0
----# Type: Uriorcurie 
-
-
-
-
-_a URI or a CURIE_
-
-
-
-<div data-search-exclude markdown="1">
-
-URI: [xsd:anyURI](http://www.w3.org/2001/XMLSchema#anyURI)
-
-## Type Properties
-
-| Property | Value |
-| --- | --- |
-| Base | `URIorCURIE` |
-| Type URI | [xsd:anyURI](http://www.w3.org/2001/XMLSchema#anyURI) |
-| Representation | `str` |
-
-
-
-
-
-
-## Notes
-
-* If you are authoring schemas in LinkML YAML, the type is referenced with the lower case "uriorcurie".
-
-
-
-## Identifier and Mapping Information
-
-
-
-
-
-### Schema Source
-
-
-* from schema: https://w3id.org/zarr-vectors/schema/0.5
-
-
-
-
-## Mappings
-
-| Mapping Type | Mapped Value |
-| ---  | ---  |
-| self | xsd:anyURI |
-| native | zv:uriorcurie |
-
-
-
-
-</div>
-
-
----
-
----
-search:
   boost: 5.0
 ---
 
@@ -11125,206 +12328,6 @@ domain_of:
 range: integer
 required: true
 minimum_value: 0
-
-```
-</details></div>
-
-
----
-
----
-search:
-  boost: 10.0
----
-
-# Class: VerticesMeta 
-
-
-_``.zattrs`` for the ``vertices/`` array._
-
-
-
-<div data-search-exclude markdown="1">
-
-
-
-URI: [zv:VerticesMeta](https://w3id.org/zarr-vectors/schema/0.5/VerticesMeta)
-
-
-
-
-
-```mermaid
- classDiagram
-    class VerticesMeta
-    click VerticesMeta href "../VerticesMeta/"
-      VerticesMeta : dtype
-        
-      VerticesMeta : encoding
-        
-          
-    
-        
-        
-        VerticesMeta --> "0..1" Encoding : encoding
-        click Encoding href "../Encoding/"
-    
-
-        
-      VerticesMeta : zv_array
-        
-          
-    
-        
-        
-        VerticesMeta --> "1" ZvArrayTag : zv_array
-        click ZvArrayTag href "../ZvArrayTag/"
-    
-
-        
-      
-```
-
-
-
-
-<!-- no inheritance hierarchy -->
-
-## Slots
-
-| Name | Cardinality and Range | Description | Inheritance |
-| ---  | --- | --- | --- |
-| [zv_array](zv_array.md) | 1 <br/> [ZvArrayTag](ZvArrayTag.md) | Discriminator slot identifying the kind of per-array `` | direct |
-| [dtype](dtype.md) | 1 <br/> [String](String.md) | Numpy dtype string of the array's value type (e | direct |
-| [encoding](encoding.md) | 0..1 <br/> [Encoding](Encoding.md) | How the chunk bytes are encoded | direct |
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-## Identifier and Mapping Information
-
-
-
-
-
-### Schema Source
-
-
-* from schema: https://w3id.org/zarr-vectors/schema/0.5
-
-
-
-
-## Mappings
-
-| Mapping Type | Mapped Value |
-| ---  | ---  |
-| self | zv:VerticesMeta |
-| native | zv:VerticesMeta |
-
-
-
-
-
-
-## LinkML Source
-
-### Direct
-
-<details>
-```yaml
-name: VerticesMeta
-description: '``.zattrs`` for the ``vertices/`` array.'
-from_schema: https://w3id.org/zarr-vectors/schema/0.5
-rank: 1000
-slots:
-- zv_array
-- dtype
-- encoding
-slot_usage:
-  zv_array:
-    name: zv_array
-    required: true
-    equals_string: vertices
-
-```
-</details>
-
-### Induced
-
-<details>
-```yaml
-name: VerticesMeta
-description: '``.zattrs`` for the ``vertices/`` array.'
-from_schema: https://w3id.org/zarr-vectors/schema/0.5
-rank: 1000
-slot_usage:
-  zv_array:
-    name: zv_array
-    required: true
-    equals_string: vertices
-attributes:
-  zv_array:
-    name: zv_array
-    description: 'Discriminator slot identifying the kind of per-array ``.zattrs``
-      block.  Each writer in ``core/arrays.py`` stamps the corresponding token from
-      :class:`ZvArrayTag`.
-
-      '
-    from_schema: https://w3id.org/zarr-vectors/schema/0.5
-    rank: 1000
-    owner: VerticesMeta
-    domain_of:
-    - VerticesMeta
-    - LinksFamilyMeta
-    - LinksMeta
-    - AttributeMeta
-    - FragmentAttributeMeta
-    - ObjectIndexMeta
-    - ObjectAttributeMeta
-    - GroupingsMeta
-    - GroupingsAttributeMeta
-    - LinkAttributeFamilyMeta
-    - LinkAttributeMeta
-    range: ZvArrayTag
-    required: true
-    equals_string: vertices
-  dtype:
-    name: dtype
-    description: Numpy dtype string of the array's value type (e.g. "float32").
-    from_schema: https://w3id.org/zarr-vectors/schema/0.5
-    rank: 1000
-    owner: VerticesMeta
-    domain_of:
-    - VerticesMeta
-    - LinksMeta
-    - AttributeMeta
-    - FragmentAttributeMeta
-    - ObjectAttributeMeta
-    - GroupingsAttributeMeta
-    - LinkAttributeMeta
-    range: string
-    required: true
-  encoding:
-    name: encoding
-    description: How the chunk bytes are encoded.
-    from_schema: https://w3id.org/zarr-vectors/schema/0.5
-    rank: 1000
-    owner: VerticesMeta
-    domain_of:
-    - VerticesMeta
-    range: Encoding
 
 ```
 </details></div>
@@ -11581,155 +12584,3 @@ pattern: ^\d+\.\d+(\.\d+)?$
 
 ```
 </details></div>
-
-
----
-
----
-search:
-  boost: 2.0
----
-
-
-# Enum: ZvArrayTag 
-
-
-
-
-_Discriminator value for per-array ``.zattrs`` blocks (slot ``zv_array``).  Each writer in ``zarr_vectors/core/arrays.py`` stamps the corresponding tag._
-
-__
-
-
-
-<div data-search-exclude markdown="1">
-
-URI: [zv:ZvArrayTag](https://w3id.org/zarr-vectors/schema/0.5/ZvArrayTag)
-
-## Permissible Values
-| Value | Meaning | Description |
-| --- | --- | --- |
-| vertices | None |  |
-| vertex_fragments | None | Per-chunk fragment-index group for ``vertices/<chunk>`` (v0 |
-| link_fragments | None | Per-chunk fragment-index group for the intra-chunk link array at ``links/0/<a... |
-| links_family | None | The ``links/<delta>/`` group carrying family-wide policy for every offsets ar... |
-| links | None | One ``links/<delta>/<offsets>/`` array — a rank-D vlen array whose cell is th... |
-| attribute | None |  |
-| fragment_attribute | None | Per-fragment attribute array (``fragment_attributes/<name>/<chunk>``) |
-| object_index | None |  |
-| object_attribute | None |  |
-| groupings | None |  |
-| groupings_attribute | None |  |
-| link_attribute_family | None | The ``link_attributes/<name>/<delta>/`` group |
-| link_attribute | None | One ``link_attributes/<name>/<delta>/<offsets>/`` array, mirroring the matchi... |
-
-
-
-
-## Slots
-
-| Name | Description |
-| ---  | --- |
-| [zv_array](zv_array.md) | Discriminator slot identifying the kind of per-array `` |
-
-
-
-
-
-
-
-
-
-
-## Identifier and Mapping Information
-
-
-
-
-
-### Schema Source
-
-
-* from schema: https://w3id.org/zarr-vectors/schema/0.5
-
-
-
-
-
-
-## LinkML Source
-
-<details>
-```yaml
-name: ZvArrayTag
-description: 'Discriminator value for per-array ``.zattrs`` blocks (slot ``zv_array``).  Each
-  writer in ``zarr_vectors/core/arrays.py`` stamps the corresponding tag.
-
-  '
-from_schema: https://w3id.org/zarr-vectors/schema/0.5
-rank: 1000
-permissible_values:
-  vertices:
-    text: vertices
-  vertex_fragments:
-    text: vertex_fragments
-    description: 'Per-chunk fragment-index group for ``vertices/<chunk>`` (v0.6+).
-      Replaces the v0.5 ``vertex_group_offsets``.
-
-      '
-  link_fragments:
-    text: link_fragments
-    description: 'Per-chunk fragment-index group for the intra-chunk link array at
-      ``links/0/<all-zero offsets>/<chunk>``.  Keyed by chunk ALONE — it carries no
-      delta and no offsets segment — so exactly one array may write it.  Every other
-      offsets segment, and every ``delta != 0`` array, uses an inline self-describing
-      blob and has no sidecar.
-
-      '
-  links_family:
-    text: links_family
-    description: 'The ``links/<delta>/`` group carrying family-wide policy for every
-      offsets array beneath it.  See ``LinksFamilyMeta``.
-
-      '
-  links:
-    text: links
-    description: 'One ``links/<delta>/<offsets>/`` array — a rank-D vlen array whose
-      cell is the record''s SOURCE chunk.  See ``LinksMeta``.
-
-      '
-  attribute:
-    text: attribute
-  fragment_attribute:
-    text: fragment_attribute
-    description: 'Per-fragment attribute array (``fragment_attributes/<name>/<chunk>``).
-      Dense per-chunk byte blob with one row per fragment in that chunk; row count
-      is derived from ``vertex_fragments/<chunk>``. Optional; common opt-in use case
-      is materializing parent-IDs (e.g. the OID owning each fragment) as a fragment
-      attribute.
-
-      '
-  object_index:
-    text: object_index
-  object_attribute:
-    text: object_attribute
-  groupings:
-    text: groupings
-  groupings_attribute:
-    text: groupings_attribute
-  link_attribute_family:
-    text: link_attribute_family
-    description: 'The ``link_attributes/<name>/<delta>/`` group.  See ``LinkAttributeFamilyMeta``.
-
-      '
-  link_attribute:
-    text: link_attribute
-    description: 'One ``link_attributes/<name>/<delta>/<offsets>/`` array, mirroring
-      the matching links array cell-for-cell.  See ``LinkAttributeMeta``.
-
-      '
-
-```
-</details>
-
-</div>

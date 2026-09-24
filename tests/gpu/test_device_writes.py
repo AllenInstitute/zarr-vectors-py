@@ -126,3 +126,36 @@ def test_link_cells_from_the_device(tmp_path):
     for lg in (host, dev):
         finalize_links(lg, delta=0)
     assert_stores_identical(host_path, dev_path)
+
+
+def test_dense_manifests_from_the_device(tmp_path):
+    """A dense index takes device arrays as they are: one copy each, no blobs."""
+    from zarr_vectors.building import (
+        create_store,
+        get_resolution_level,
+        read_all_object_manifests_csr,
+        write_object_manifests,
+    )
+    from zarr_vectors.constants import OBJECT_INDEX
+
+    rng = np.random.default_rng(7)
+    counts = rng.integers(0, 4, 500)
+    offsets = np.concatenate([[0], np.cumsum(counts)]).astype(np.int64)
+    coords = rng.integers(0, 2, (int(offsets[-1]), 3)).astype(np.int64)
+    frags = rng.integers(0, 100, int(offsets[-1])).astype(np.int64)
+    lg = get_resolution_level(create_store(
+        tmp_path / "s.zarrvectors", bounds=([0.0] * 3, [100.0] * 3),
+        chunk_shape=(50.0,) * 3, manifest_layout="dense",
+    ), 0)
+    with _xp.count_transfers() as stats:
+        write_object_manifests(
+            lg, chunk_coords=cupy.asarray(coords), fragment_idx=cupy.asarray(frags),
+            manifest_offsets=cupy.asarray(offsets), mode="append",
+        )
+    assert stats.d2h_calls == 3
+    meta = lg.read_array_meta(OBJECT_INDEX)
+    lg.write_array_meta(OBJECT_INDEX, {**meta, "num_objects": 500, "num_present": 500})
+    csr = read_all_object_manifests_csr(lg, device="cuda")
+    np.testing.assert_array_equal(csr.offsets.get(), offsets)
+    np.testing.assert_array_equal(csr.chunk_coords.get(), coords)
+    np.testing.assert_array_equal(csr.fragment_idx.get(), frags)

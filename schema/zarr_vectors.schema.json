@@ -645,6 +645,15 @@
       "title": "LinksMeta",
       "type": "object"
     },
+    "ManifestLayout": {
+      "description": "Object-index layout a store creates new indexes in.",
+      "enum": [
+        "vlen",
+        "dense"
+      ],
+      "title": "ManifestLayout",
+      "type": "string"
+    },
     "ObjectAttributeMeta": {
       "additionalProperties": false,
       "description": "``.zattrs`` for each ``object_attributes/<name>/`` array.",
@@ -688,10 +697,24 @@
       "title": "ObjectIndexConvention",
       "type": "string"
     },
+    "ObjectIndexLayout": {
+      "description": "How one object index stores its manifests.",
+      "enum": [
+        "vlen_manifests_v1",
+        "vlen_manifests_v2",
+        "dense_manifests_v1"
+      ],
+      "title": "ObjectIndexLayout",
+      "type": "string"
+    },
     "ObjectIndexMeta": {
       "additionalProperties": false,
       "description": "``.zattrs`` for ``object_index/``.",
       "properties": {
+        "layout": {
+          "$ref": "#/$defs/ObjectIndexLayout",
+          "description": "The object index's storage layout: ``vlen_manifests_v1`` (vlen blobs, rows are ids), ``vlen_manifests_v2`` (vlen blobs, ids in ``object_ids``) or ``dense_manifests_v1`` (``manifest_spans`` into ``manifest_blocks``, ids in ``object_ids``; 0.9.4).\n"
+        },
         "num_objects": {
           "description": "Total object count this array carries.",
           "minimum": 0,
@@ -798,6 +821,10 @@
         },
         "links_convention": {
           "$ref": "#/$defs/LinksConvention"
+        },
+        "manifest_layout": {
+          "$ref": "#/$defs/ManifestLayout",
+          "description": "``dense`` when object indexes are created in the dense layout (``manifest_spans`` + ``manifest_blocks``: fixed-width integer arrays), absent for the vlen default of one blob per object. Optional and additive from 0.9.4. A default for indexes created later; an existing index's own ``layout`` is the truth about it.\n"
         },
         "object_index_convention": {
           "$ref": "#/$defs/ObjectIndexConvention"

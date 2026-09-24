@@ -448,6 +448,12 @@ class RootMetadata:
     store written before it. It is a writer default, not a claim about
     what is on disk; an array's own ``zarr.json`` remains the truth about
     that array, and ``sharding.get_shard_info`` reports it."""
+    manifest_layout: str | None = None
+    """``"dense"`` when object indexes are created in the dense layout
+    (``manifest_spans`` + ``manifest_blocks``), else ``None`` for the vlen
+    default. Optional (0.9.4): absent means vlen, which is every store
+    written before it. A default for indexes created later; an existing
+    index's own ``layout`` remains the truth about that index."""
 
     def validate(self) -> None:
         """Validate this metadata object.
@@ -579,6 +585,10 @@ class RootMetadata:
         # spatial dims here; a grid carrying an attribute-bin axis is
         # reconciled by ``normalise_shard_shape`` when it allocates,
         # because the declaration describes the spatial grid either way.
+        if self.manifest_layout not in (None, "vlen", "dense"):
+            raise MetadataError(
+                f"manifest_layout={self.manifest_layout!r}; expected 'vlen' or 'dense'"
+            )
         if self.shard_shape is not None:
             try:
                 normalise_shard_shape(self.shard_shape, sid_ndim)
@@ -630,6 +640,8 @@ class RootMetadata:
                 if isinstance(self.shard_shape, int)
                 else [int(x) for x in self.shard_shape]
             )
+        if self.manifest_layout == "dense":
+            d["zarr_vectors"]["manifest_layout"] = "dense"
         if self.format_capabilities:
             d["zarr_vectors"]["format_capabilities"] = list(self.format_capabilities)
         if self.attribute_specs:
@@ -717,6 +729,7 @@ class RootMetadata:
                 if (specs := zv.get("attribute_specs")) else None
             ),
             shard_shape=_read_shard_shape(zv.get("shard_shape")),
+            manifest_layout=zv.get("manifest_layout"),
         )
 
     def is_complete(self) -> bool:

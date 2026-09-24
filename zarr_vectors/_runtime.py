@@ -28,8 +28,8 @@ _STATIC: dict[str, bool] = {
     # Already true of this build.
     "defer_presence": True,
     "append_safe_sharding": True,
-    # Not yet: a dense manifest layout.
-    "dense_manifests": False,
+    # The dense object-index layout (create_store(manifest_layout="dense")).
+    "dense_manifests": True,
 }
 
 #: Keys that depend on what is installed alongside, filled in per call.

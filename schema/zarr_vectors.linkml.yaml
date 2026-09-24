@@ -50,6 +50,26 @@ enums:
           One object per vertex; only valid in single-chunk stores
           where the object_index would be redundant.
 
+  ManifestLayout:
+    description: Object-index layout a store creates new indexes in.
+    permissible_values:
+      vlen:
+        description: One vlen-bytes manifest blob per object (the default).
+      dense:
+        description: >
+          Fixed-width integer arrays, ``manifest_spans`` into
+          ``manifest_blocks`` (0.9.4).
+  ObjectIndexLayout:
+    description: How one object index stores its manifests.
+    permissible_values:
+      vlen_manifests_v1:
+        description: One vlen blob per object; rows are object ids.
+      vlen_manifests_v2:
+        description: One vlen blob per object; ids stored in ``object_ids``.
+      dense_manifests_v1:
+        description: >
+          ``manifest_spans`` (start, count) into ``manifest_blocks``
+          (chunk coords, fragment index); ids stored in ``object_ids``.
   CrossChunkStrategy:
     description: How connectivity that crosses chunk boundaries is represented.
     permissible_values:
@@ -284,6 +304,7 @@ classes:
       - format_capabilities
       - attribute_specs
       - shard_shape
+      - manifest_layout
 
   LevelMetadata:
     description: >
@@ -421,7 +442,7 @@ classes:
 
   ObjectIndexMeta:
     description: "``.zattrs`` for ``object_index/``."
-    slots: [zv_array, num_objects, sid_ndim]
+    slots: [zv_array, num_objects, sid_ndim, layout]
     slot_usage:
       zv_array:
         equals_string: object_index
@@ -606,6 +627,21 @@ slots:
     range: integer
     multivalued: true
     minimum_value: 1
+  manifest_layout:
+    description: >
+      ``dense`` when object indexes are created in the dense layout
+      (``manifest_spans`` + ``manifest_blocks``: fixed-width integer
+      arrays), absent for the vlen default of one blob per object.
+      Optional and additive from 0.9.4. A default for indexes created
+      later; an existing index's own ``layout`` is the truth about it.
+    range: ManifestLayout
+  layout:
+    description: >
+      The object index's storage layout: ``vlen_manifests_v1`` (vlen
+      blobs, rows are ids), ``vlen_manifests_v2`` (vlen blobs, ids in
+      ``object_ids``) or ``dense_manifests_v1`` (``manifest_spans`` into
+      ``manifest_blocks``, ids in ``object_ids``; 0.9.4).
+    range: ObjectIndexLayout
   format_capabilities:
     description: Optional 0.3+ feature tokens advertised by this store.
     range: FormatCapability
