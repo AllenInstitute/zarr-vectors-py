@@ -28,13 +28,13 @@ _STATIC: dict[str, bool] = {
     # Already true of this build.
     "defer_presence": True,
     "append_safe_sharding": True,
-    # Not yet: a dense manifest layout, and anything done on the device
-    # rather than copied to or from it.
+    # Not yet: a dense manifest layout, and encoding on the device.
     "dense_manifests": False,
     "gpu_encode": False,
-    "gpu_io": False,
-    "gpu_codecs": False,
 }
+
+#: Keys that depend on what is installed alongside, filled in per call.
+_DYNAMIC = ("device_arrays", "device_decode", "gpu_io", "gpu_codecs")
 
 
 @functools.cache
@@ -50,6 +50,17 @@ def _gpu_extension() -> bool:
 
 
 @functools.cache
+def _importable(module: str) -> bool:
+    import importlib
+
+    try:
+        importlib.import_module(module)
+    except Exception:
+        return False
+    return True
+
+
+@functools.cache
 def _device_count() -> int:
     import zarr_vectors.gpu as gpu
 
@@ -59,10 +70,20 @@ def _device_count() -> int:
 def runtime_capabilities(*, probe_device: bool = False) -> dict[str, bool]:
     """What this installation of zarr-vectors can do.
 
-    Every value is a bool, True only when usable in this process.
-    ``device_arrays`` is True when the optional GPU extension imports,
-    and with ``probe_device=True`` also only when a CUDA device is
-    visible. Probing initialises the CUDA driver, so a process that will
+    Every value is a bool, True only when usable in this process:
+
+    - ``device_arrays``: the optional GPU extension imports (and, with
+      ``probe_device=True``, a CUDA device is visible), so readers take
+      ``device="cuda"`` and writers take device arrays;
+    - ``device_decode``: ``read_cells`` can decode uncompressed cells on
+      the device rather than on the host (same condition);
+    - ``gpu_codecs``: nvCOMP is installed too, so ``read_cells(...,
+      decode="device")`` can decompress zstd cells on the device;
+    - ``gpu_io``: kvikio is installed too, so local files can be read
+      straight into device memory (GPUDirect Storage where the system
+      has it; see ``docs/how_to/gpu.md``).
+
+    Probing a device initialises the CUDA driver, so a process that will
     fork should probe in its children, not before forking.
 
     Returns:
@@ -73,4 +94,7 @@ def runtime_capabilities(*, probe_device: bool = False) -> dict[str, bool]:
     if usable and probe_device:
         usable = _device_count() > 0
     caps["device_arrays"] = usable
+    caps["device_decode"] = usable
+    caps["gpu_codecs"] = usable and _importable("nvidia.nvcomp")
+    caps["gpu_io"] = usable and _importable("kvikio")
     return caps

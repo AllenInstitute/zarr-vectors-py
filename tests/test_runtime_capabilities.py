@@ -13,7 +13,7 @@ _KEYS = {
     "object_attribute_columns", "array_link_cells", "read_cells",
     "read_neighbourhood", "batched_link_reads", "defer_presence",
     "append_safe_sharding", "dense_manifests", "gpu_encode", "gpu_io",
-    "gpu_codecs", "device_arrays",
+    "gpu_codecs", "device_arrays", "device_decode",
 }
 
 
@@ -53,3 +53,17 @@ def test_importing_the_package_loads_no_gpu_code():
     by_zarr, cupy_loaded, extension_loaded = out.stdout.split()
     assert extension_loaded == "False"
     assert cupy_loaded == by_zarr
+
+
+def test_device_keys_follow_what_is_installed(monkeypatch):
+    from zarr_vectors import _runtime
+
+    monkeypatch.setattr(_runtime, "_gpu_extension", lambda: False)
+    caps = zv.runtime_capabilities()
+    assert not any(caps[k] for k in ("device_arrays", "device_decode", "gpu_io", "gpu_codecs"))
+
+    monkeypatch.setattr(_runtime, "_gpu_extension", lambda: True)
+    monkeypatch.setattr(_runtime, "_importable", lambda m: m == "kvikio")
+    caps = zv.runtime_capabilities()
+    assert caps["device_arrays"] and caps["device_decode"] and caps["gpu_io"]
+    assert not caps["gpu_codecs"]
