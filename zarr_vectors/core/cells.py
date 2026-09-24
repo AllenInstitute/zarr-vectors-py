@@ -243,6 +243,7 @@ def read_cells(
     missing_arrays: Literal["raise", "skip"] = "raise",
     on_error: Literal["record", "raise"] = "record",
     device: str | None = None,
+    decode: Literal["auto", "host", "device"] = "auto",
 ) -> CellBatch:
     """Read the cells ``chunk_coords`` of every array in ``arrays`` at once.
 
@@ -262,6 +263,17 @@ def read_cells(
             ``errors`` and gives it no rows; ``"raise"`` re-raises.
         device: ``"cpu"``, ``"cuda"`` or ``None`` (where ``chunk_coords``
             lives). Each returned array crosses to the device once.
+        decode: Where a ``device="cuda"`` read decodes its cells; the
+            result is the same either way. ``"auto"`` decodes on the
+            device every uncompressed array (vlen-bytes cells, sharded or
+            not) and the rest on the host. ``"device"`` also decodes zstd
+            arrays there, through nvCOMP, and raises for an array it
+            cannot decode instead of falling back. nvCOMP trusts its
+            input: a zstd cell corrupted inside a block can return wrong
+            bytes, hang, or crash the CUDA context where the host decoder
+            raises, so use it only on stores you trust. ``"host"``
+            decodes everything on the host and uploads the result.
+            Ignored for a host read.
 
     Returns:
         A :class:`CellBatch`. A cell nobody wrote, or outside an array's
@@ -311,9 +323,14 @@ def read_cells(
     ]
 
     errors: list[CellReadError] = []
+    on_device = _device_payloads(
+        level_group, plan, layouts, keys, cc, decode if device == "cuda" else "host",
+        on_error, errors,
+    )
     raw: dict[tuple[str, str], bytes] = {}
-    with _prefetch(level_group, [p for p in plan if p[1]]):
-        for name, cell_keys in plan:
+    host_plan = [p for p in plan if p[0] not in on_device]
+    with _prefetch(level_group, [p for p in host_plan if p[1]]):
+        for name, cell_keys in host_plan:
             for key in cell_keys:
                 try:
                     raw[(name, key)] = level_group.read_bytes(name, key)
@@ -326,10 +343,21 @@ def read_cells(
     if needs_vertices:
         itemsize = np.dtype(_layout(level_group, VERTICES, "vertices", ndim).dtype).itemsize
         for key in keys:
-            vertex_rows[key] = len(raw.get((VERTICES, key), b"")) // (itemsize * ndim)
+            stored = (
+                on_device[VERTICES].length(key) if VERTICES in on_device
+                else len(raw.get((VERTICES, key), b""))
+            )
+            vertex_rows[key] = stored // (itemsize * ndim)
 
     columns: dict[str, CellColumn] = {}
     for name, lay in layouts.items():
+        if name in on_device:
+            from zarr_vectors.gpu import _read as device_read
+
+            columns[name] = device_read.column(
+                name, on_device[name], keys, lay, vertex_rows, on_error, errors,
+            )
+            continue
         parts: list[np.ndarray] = []
         for key in keys:
             try:
@@ -344,6 +372,57 @@ def read_cells(
     return CellBatch(
         chunk_coords=cc, columns=columns, errors=tuple(errors), device=device,
     )
+
+
+def _device_payloads(
+    level_group: Group,
+    plan: list[tuple[str, list[str]]],
+    layouts: dict[str, _Layout],
+    keys: list[str],
+    cc: np.ndarray,
+    decode: str,
+    on_error: str,
+    errors: list[CellReadError],
+) -> dict[str, Any]:
+    """Fetch and unframe on the device every array it can decode.
+
+    Returns ``{array: Payloads}`` for the arrays read there; the others
+    are left to the host path. Empty for a host read.
+    """
+    if decode == "host":
+        return {}
+    if decode not in ("auto", "device"):
+        raise ArrayError(f"decode={decode!r}; expected 'auto', 'host' or 'device'")
+    _xp._gpu()  # the extension, or the install hint
+    from zarr_vectors.gpu import _read as device_read
+
+    coords_of = dict(zip(keys, cc.tolist()))
+    items, names = [], []
+    for name, cell_keys in plan:
+        lay = layouts.get(name)
+        src = device_read.supports(level_group, name, lay, zstd=decode == "device")
+        if src is None:
+            if decode == "device":
+                raise ArrayError(
+                    f"{name!r} cannot be decoded on the device (its codecs or "
+                    f"store are not supported there, or nvCOMP is missing); "
+                    f"use decode='auto' to decode it on the host"
+                )
+            continue
+        items.append((
+            src, cell_keys,
+            np.asarray([coords_of[k] for k in cell_keys], dtype=np.int64),
+            lay is not None and lay.kind == "links" and not lay.flat,
+        ))
+        names.append(name)
+    out: dict[str, Any] = {}
+    for name, payloads in zip(names, device_read.fetch_payloads(items)):
+        for key, message in payloads.errors.items():
+            if on_error == "raise":
+                raise ArrayError(f"{name} cell {key}: {message}")
+            errors.append(CellReadError(name, key, f"ArrayError: {message}"))
+        out[name] = payloads
+    return out
 
 
 def _column(parts: list[np.ndarray | None], lay: _Layout, device: str) -> CellColumn:
