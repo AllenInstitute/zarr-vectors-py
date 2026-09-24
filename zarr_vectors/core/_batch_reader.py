@@ -33,6 +33,7 @@ import os
 import threading
 from typing import Any, NamedTuple
 
+import numpy as np
 import zarr
 from numcodecs.vlen import VLenBytes
 from zarr.core.array_spec import ArraySpec
@@ -536,13 +537,40 @@ def flush_prefetch(
             )
         if spec is not None:
             direct[array_name] = spec
-    gathered = [(name, keys) for name, keys in plan if name not in direct]
+    # Arrays the flat reader does not take may still be sharded local
+    # ones, which are read a shard index at a time rather than through
+    # zarr's per-cell sharding codec.
+    sharded: dict[str, _ShardedSpec] = {}
+    resolved = dict(nodes or {})
+    for array_name in seen - set(direct):
+        node = resolved.get(array_name)
+        if node is None:
+            if nodes is not None:
+                # The caller resolved what it has; anything else is the
+                # gather's to resolve, as it always was, not an extra lookup.
+                continue
+            try:
+                node = resolved[array_name] = zarr_group[array_name]
+            except KeyError:
+                continue
+        spec = _sharded_spec(node)
+        if spec is not None:
+            sharded[array_name] = spec
+    gathered = [
+        (name, keys) for name, keys in plan if name not in direct and name not in sharded
+    ]
 
     cache: dict[tuple[str, str], bytes] = {}
     if gathered:
         cache.update(sync(_gather_plan(
-            zarr_group._async_group, gathered, nodes, tolerant=tolerant,
+            zarr_group._async_group, gathered, resolved, tolerant=tolerant,
         )))
+    if sharded:
+        cache.update(_sharded_read_plan([
+            (array_name, sharded[array_name], list(chunk_keys))
+            for array_name, chunk_keys in plan
+            if array_name in sharded
+        ], tolerant=tolerant))
 
     cache.update(_direct_read_plan([
         (array_name, direct[array_name], list(chunk_keys))
@@ -550,6 +578,95 @@ def flush_prefetch(
         if array_name in direct
     ], tolerant=tolerant))
     return cache
+
+
+class _ShardedSpec(NamedTuple):
+    """Everything needed to read one sharded array's cells off the filesystem."""
+
+    source: Any                     # _cells_on_disk.CellSource
+    codecs: tuple[Any, ...]         # the inner cells' BytesBytes codecs
+    spec: Any                       # ArraySpec of one inner cell
+
+
+def _sharded_spec(node: Any) -> _ShardedSpec | None:
+    """A :class:`_ShardedSpec` for a sharded local vlen array, else None.
+
+    zarr reads a sharded cell through the sharding codec one cell at a
+    time -- the shard's index, then the cell's range, each a round trip
+    through the event loop. For 4,097 cells of a sharded store that was
+    5 s against 0.4 s for the same cells unsharded. Here each shard's
+    index is read once, every cell's range is read in one pooled pass
+    (each shard opened once per batch), and each cell is decoded by its
+    array's own codecs, so the bytes are zarr's.
+    """
+    from zarr_vectors.core._cells_on_disk import cell_source
+
+    if not isinstance(node, zarr.Array):
+        return None
+    src = cell_source("", node, any_codecs=True)
+    if src is None or src.shard_shape is None or src.local_root is None:
+        return None
+    meta = node.metadata
+    inner = tuple(meta.codecs[0].codecs[1:])
+    try:
+        spec = ArraySpec(
+            shape=(1,) * len(meta.shape),
+            dtype=meta.data_type,
+            fill_value=meta.fill_value,
+            config=node._async_array.config,
+            prototype=_BUFFER_PROTOTYPE,
+        )
+    except Exception:
+        return None
+    return _ShardedSpec(source=src, codecs=inner, spec=spec)
+
+
+def _sharded_read_plan(
+    entries: list[tuple[str, _ShardedSpec, list[str]]],
+    *,
+    tolerant: bool = False,
+) -> dict[tuple[str, str], bytes]:
+    """Read and decode the cells of several sharded arrays as one job.
+
+    The sharded twin of :func:`_direct_read_plan`: keys an array cannot
+    hold are omitted, a cell with nothing stored reads as ``b""``, and a
+    cell that cannot be read is omitted (``tolerant``) or raises.
+    """
+    from zarr_vectors.core._cells_on_disk import read_local
+
+    requests, wanted = [], []
+    for array_name, spec, chunk_keys in entries:
+        src = spec.source
+        cells, keys = [], []
+        for chunk_key in chunk_keys:
+            coords = _parse_coords(chunk_key)
+            if coords is None or len(coords) != len(src.shape):
+                continue
+            if src.origin is not None:
+                coords = tuple(c - o for c, o in zip(coords, src.origin))
+            if any(c < 0 or c >= n for c, n in zip(coords, src.shape)):
+                continue
+            cells.append(coords)
+            keys.append(chunk_key)
+        if keys:
+            requests.append((src, np.asarray(cells, dtype=np.int64)))
+            wanted.append((array_name, spec, keys))
+    if not requests:
+        return {}
+    out: dict[tuple[str, str], bytes] = {}
+    for (array_name, spec, keys), raws in zip(wanted, read_local(requests)):
+        for chunk_key, raw in zip(keys, raws):
+            try:
+                if isinstance(raw, Exception):
+                    raise raw
+                data = _decode_direct(spec, raw)
+            except Exception:
+                if not tolerant:
+                    raise
+                continue
+            if data is not None:
+                out[(array_name, chunk_key)] = data
+    return out
 
 
 def _sync_fallback(
