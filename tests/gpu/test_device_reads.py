@@ -31,7 +31,9 @@ def test_read_cells_on_the_device(tmp_path):
     cells = np.asarray(arrays.list_chunk_keys(lg), dtype=np.int64)
     host = read_cells(lg, cells, ["vertices", "vertex_attributes/i"])
     with _xp.count_transfers() as stats:
-        dev = read_cells(lg, cells, ["vertices", "vertex_attributes/i"], device="cuda")
+        dev = read_cells(
+            lg, cells, ["vertices", "vertex_attributes/i"], device="cuda", decode="host",
+        )
     assert stats.h2d_calls == 4  # data + offsets, per array
     for name in host:
         assert isinstance(dev[name].data, cupy.ndarray)

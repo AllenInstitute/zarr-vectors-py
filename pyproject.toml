@@ -75,6 +75,21 @@ cloud = [
 gpu = [
     "cupy-cuda12x>=13; sys_platform == 'linux'",
 ]
+# nvCOMP, for decompressing zstd cells on the device (read_cells with
+# decode="device"). Its wheel carries only its own library, so it is safe in
+# a conda environment too.
+gpu-codecs = [
+    "zarr-vectors[gpu]",
+    "nvidia-nvcomp-cu12>=4.2; sys_platform == 'linux'",
+]
+# kvikio, for reading local files straight into device memory (GPUDirect
+# Storage where the system has it). For pip environments only: its wheel
+# pins a pip cupy, which in a conda environment would sit beside the conda
+# one -- there, install kvikio from the rapidsai channel instead.
+gpu-io = [
+    "zarr-vectors[gpu]",
+    "kvikio-cu12>=25.8; sys_platform == 'linux'",
+]
 all = [
     "zarr-vectors[draco,obstore,fsspec,icechunk]",
 ]
