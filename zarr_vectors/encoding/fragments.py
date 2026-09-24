@@ -307,8 +307,14 @@ def classify_fragments_csr(
     count of steps that are not +1 is the same at its first and last
     index.
     """
-    idx = _as_int64(indices, "indices")
-    off = _as_int64(offsets, "offsets")
+    from zarr_vectors import _xp
+
+    if _xp.encode_on_device(indices, offsets):
+        from zarr_vectors.gpu import _encode
+
+        return _encode.classify_fragments_csr(indices, offsets, force_explicit=force_explicit)
+    idx = _as_int64(_xp.to_host(indices), "indices")
+    off = _as_int64(_xp.to_host(offsets), "offsets")
     if off.size == 0 or off[0] != 0 or off[-1] != idx.size:
         raise ArrayError(
             f"offsets must start at 0 and end at len(indices)={idx.size}; "
@@ -1022,6 +1028,18 @@ def encode_object_manifests_csr(
     Returns:
         An object array of ``bytes``, one per object, ready to store.
     """
+    from zarr_vectors import _xp
+
+    if _xp.encode_on_device(chunk_coords, fragment_idx, manifest_offsets):
+        from zarr_vectors.gpu import _encode
+
+        return _encode.encode_object_manifests_csr(
+            chunk_coords, fragment_idx, manifest_offsets,
+            sid_ndim=sid_ndim, mode_single=MANIFEST_MODE_SINGLE,
+        )
+    chunk_coords, fragment_idx = _xp.to_host(chunk_coords), _xp.to_host(fragment_idx)
+    if manifest_offsets is not None:
+        manifest_offsets = _xp.to_host(manifest_offsets)
     cc = np.asarray(chunk_coords)
     idx = np.asarray(fragment_idx)
     if idx.ndim != 1:

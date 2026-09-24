@@ -532,9 +532,7 @@ def write_object_manifests(
         except Exception:
             sid = None
         manifest_blobs = encode_object_manifests_csr(
-            _xp.to_host(chunk_coords), _xp.to_host(fragment_idx),
-            None if manifest_offsets is None else _xp.to_host(manifest_offsets),
-            sid_ndim=sid,
+            chunk_coords, fragment_idx, manifest_offsets, sid_ndim=sid,
         )
     first = _write_object_index_manifests(
         level_group, manifest_blobs, mode=mode, at=at,

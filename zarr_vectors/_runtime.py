@@ -28,13 +28,12 @@ _STATIC: dict[str, bool] = {
     # Already true of this build.
     "defer_presence": True,
     "append_safe_sharding": True,
-    # Not yet: a dense manifest layout, and encoding on the device.
+    # Not yet: a dense manifest layout.
     "dense_manifests": False,
-    "gpu_encode": False,
 }
 
 #: Keys that depend on what is installed alongside, filled in per call.
-_DYNAMIC = ("device_arrays", "device_decode", "gpu_io", "gpu_codecs")
+_DYNAMIC = ("device_arrays", "device_decode", "gpu_encode", "gpu_io", "gpu_codecs")
 
 
 @functools.cache
@@ -77,6 +76,9 @@ def runtime_capabilities(*, probe_device: bool = False) -> dict[str, bool]:
       ``device="cuda"`` and writers take device arrays;
     - ``device_decode``: ``read_cells`` can decode uncompressed cells on
       the device rather than on the host (same condition);
+    - ``gpu_encode``: writers handed device arrays encode fragments,
+      manifests and link partitions on the device, and download the
+      encoded form (same condition; the bytes written are unchanged);
     - ``gpu_codecs``: nvCOMP is installed too, so ``read_cells(...,
       decode="device")`` can decompress zstd cells on the device;
     - ``gpu_io``: kvikio is installed too, so local files can be read
@@ -95,6 +97,7 @@ def runtime_capabilities(*, probe_device: bool = False) -> dict[str, bool]:
         usable = _device_count() > 0
     caps["device_arrays"] = usable
     caps["device_decode"] = usable
+    caps["gpu_encode"] = usable
     caps["gpu_codecs"] = usable and _importable("nvidia.nvcomp")
     caps["gpu_io"] = usable and _importable("kvikio")
     return caps

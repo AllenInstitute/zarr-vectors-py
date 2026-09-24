@@ -1908,7 +1908,6 @@ def write_chunk_fragments(
         through :meth:`Group.read_bytes`, so it must not run inside an
         enclosing ``batched_reads`` block, whose cache would be stale.
     """
-    from zarr_vectors import _xp
 
     if target == "vertex":
         constant = VERTEX_FRAGMENTS
@@ -1933,7 +1932,7 @@ def write_chunk_fragments(
     if as_csr:
         indices, offsets = csr  # type: ignore[misc]
         new = classify_fragments_csr(
-            _xp.to_host(indices), _xp.to_host(offsets),
+            indices, offsets,
             force_explicit=force_explicit,
         )
     else:
@@ -4362,8 +4361,13 @@ def _write_link_cells_arrays(
         partition_link_arrays,
     )
 
-    cc = _xp.to_host(chunks, dtype=np.int64)
-    vi = _xp.to_host(vids, dtype=np.int64)
+    # Device records stay on the device through the partition, which
+    # returns them grouped; anything else is copied off once here.
+    if _xp.encode_on_device(chunks, vids):
+        cc, vi = chunks, vids
+    else:
+        cc = _xp.to_host(chunks, dtype=np.int64)
+        vi = _xp.to_host(vids, dtype=np.int64)
     attrs = {name: _xp.to_host(a) for name, a in attributes.items()}
     if cc.ndim != 3 or vi.shape != cc.shape[:2]:
         raise ArrayError(
@@ -4399,6 +4403,8 @@ def _write_link_cells_arrays(
             directed=directed, cross_level=delta != 0,
         )
     else:
+        cc = _xp.to_host(cc, dtype=np.int64)
+        vi = _xp.to_host(vi, dtype=np.int64)
         records = [
             [(tuple(cc[r, k].tolist()), int(vi[r, k])) for k in range(link_width)]
             for r in range(num)
