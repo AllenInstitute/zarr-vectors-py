@@ -70,36 +70,30 @@ or only in narrow cases; 4 is a recorded constraint; 5 is housekeeping.
 
 ---
 
-## 4. Device-side decode and GPU-direct reads
+## 4. What the GPU extension still leaves on the host
 
-**Severity: none today — the next step for the optional GPU extension.**
+**Severity: none today.** Done on `gpu-backend`:
+- `read_cells(device="cuda")` decodes cells on the device, uncompressed
+  by default and zstd through nvCOMP with `decode="device"`;
+- local files are read into pinned memory, or with kvikio;
+- writers encode fragments, manifests and link partitions on the device;
+- the dense manifest layout (0.9.4);
+- sharded stores read a shard index at a time on both paths.
 
-Device arrays in and out now work (`zarr_vectors.gpu`, the `[gpu]` extra):
-readers take `device="cuda"`, writers take cupy arrays, `read_cells` /
-`read_neighbourhood` read many cells in one prefetch, and
-`runtime_capabilities()` says which of it an install has. But the bytes
-still go through the host. A read fetches and decompresses each cell there
-and uploads the result once; a write downloads each argument once and
-encodes there. `runtime_capabilities()` reports what is missing as
-`gpu_encode`, `gpu_io` and `gpu_codecs`.
+What is left:
 
-Why not zarr's own GPU buffers: every per-chunk array is vlen bytes, and
-zarr's GPU buffer rejects the object dtype a vlen decode produces
-(`zarr/core/buffer/gpu.py`), while the sharding codec asserts the default
-host prototype. A configurable prototype would only help the numeric
-standalone arrays (object attributes, the object-id table).
-
-There is also no partial-cell read. `read_fragment` advertises a byte-slice
-fast path for range fragments but fetches the whole cell and slices it on the
-host. The only genuinely sub-cell read is row selection on 1-D standalone
-arrays (`Group.read_vlen_elements`).
-
-**If taken up:** decode fragment indices and vlen payloads with cupy
-(`encoding/fragments.py` is already array-shaped); nvCOMP for a zstd cell
-payload, so decompression moves too; kvikio for uncompressed, unsharded
-local cells (the direct reader already opens those files itself,
-`core/_batch_reader.py`); then byte-range reads for range fragments, which
-only exist for an uncompressed cell.
+- **Fragment indices on the device.** `read_cells` rejects
+  `vertex_fragments` / `link_fragments`; the ZVFG blob would decode to
+  CSR with one more kernel (header, bitmap, range table, explicit CSR).
+- **Safe device zstd.** nvCOMP can hang or kill the CUDA context on a
+  corrupt block, so zstd decode on the device is opt-in. A per-cell
+  content checksum written with the frame (zstd `checksum=True`) and
+  verified after decode would catch wrong bytes, but not the hangs.
+- **Byte-range reads for range fragments.** `read_fragment` still fetches
+  the whole cell; only an uncompressed cell can be read by range.
+- **The other `device=` readers.** `read_chunk_vertex_buffer`,
+  `read_link_arrays` and the rest still decode on the host and upload.
+  Routing them through `read_cells`' device path would move them too.
 
 ---
 

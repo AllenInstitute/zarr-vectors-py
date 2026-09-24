@@ -6,13 +6,21 @@ second, pip-built cupy). Nothing in the core imports this module at import
 time; it is loaded the first time a device array is involved, through
 ``device="cuda"`` on a reader or a device array passed to a writer.
 
-What it does today: moves arrays between host and device. Cells are still
-fetched and decoded on the host (they are compressed variable-length
-bytes, which zarr's GPU buffers cannot carry), so a device read is one
-host decode and one upload per returned array, and a device write is one
-download per argument and a host encode. The bytes on disk are the same
-either way. Device-side decode and GPUDirect Storage are future work;
-:func:`zarr_vectors.runtime_capabilities` reports what this install can do.
+What it does:
+
+- reads (:func:`zarr_vectors.core.cells.read_cells` with
+  ``device="cuda"``) fetch cells' stored bytes into device memory and
+  decode them there (:mod:`._read`, :mod:`._fetch`, :mod:`._kernels`),
+  with zstd through nvCOMP when asked (:mod:`._codecs`);
+- writers handed device arrays run the fragment, manifest and link
+  partition encoders on the device and download the encoded form
+  (:mod:`._encode`);
+- everything else moves arrays between host and device once per array.
+
+Compression and the write itself stay on the host, so the bytes on disk
+are the same whether the arrays came from numpy or from the device.
+:func:`zarr_vectors.runtime_capabilities` reports what this install can
+do (``device_decode``, ``gpu_encode``, ``gpu_codecs``, ``gpu_io``).
 
 Callers should reach this through ``device=`` and ``runtime_capabilities``
 rather than import it: its own surface is not yet promised.
