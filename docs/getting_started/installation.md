@@ -51,12 +51,25 @@ pip install "zarr-vectors[gpu]"
 
 Lets the array-form readers and writers take and return device (cupy)
 arrays: `device="cuda"` on a reader, or a cupy array passed to a writer.
-Linux only; it installs `cupy-cuda12x`. In a conda environment install
-cupy from conda-forge instead (`conda install -c conda-forge cupy`) —
-the extra would add a second, pip-built cupy. Nothing needs it: every
-call works with numpy, and a store written from device arrays is
-byte-identical to one written from numpy. See
-[GPU arrays](../how_to/gpu.md).
+With it, `read_cells` decodes uncompressed cells on the device, and
+writers encode device arrays there. Linux only; it installs
+`cupy-cuda12x`. In a conda environment install cupy from conda-forge
+instead (`conda install -c conda-forge cupy`): the extra would add a
+second, pip-built cupy.
+
+Two more extras build on it:
+
+- `[gpu-codecs]` adds nvCOMP, so `read_cells(..., decode="device")` can
+  decompress zstd cells on the device. Its wheel carries only nvCOMP, so
+  it is safe in a conda environment too.
+- `[gpu-io]` adds kvikio, for reading local files straight into device
+  memory where the system has GPUDirect Storage. It is for pip
+  environments only; its wheel pins its own cupy, so in conda install
+  kvikio from the `rapidsai` channel instead.
+
+Nothing needs any of them: every call works with numpy, and a store
+written from device arrays is byte-identical to one written from numpy.
+See [GPU arrays](../how_to/gpu.md).
 
 ### Everything
 
@@ -64,8 +77,9 @@ byte-identical to one written from numpy. See
 pip install "zarr-vectors[all]"
 ```
 
-Installs all optional extras in a single command, except `[gpu]`, which is
-tied to a CUDA version and so is always asked for explicitly.
+Installs all optional extras in a single command, except the GPU ones
+(`[gpu]`, `[gpu-codecs]`, `[gpu-io]`), which are tied to a CUDA version
+and so are always asked for explicitly.
 
 ## Development install
 
