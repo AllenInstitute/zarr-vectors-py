@@ -142,6 +142,31 @@ def namespace(*arrays: Any) -> Any:
     return np
 
 
+def encode_on_device(*arrays: Any) -> bool:
+    """Whether an encoder handed ``arrays`` should run on the device.
+
+    True when any of them is a device array that cupy can take as it is
+    (a cupy array, or one exporting DLPack, such as a torch tensor) and
+    the GPU extension imports, unless ``ZARR_VECTORS_GPU_ENCODE=0`` asks
+    for the host encoders -- a way to rule the device encoders out when
+    chasing a difference; the bytes are the same either way. Any other
+    device array is copied to the host once and encoded there.
+    """
+    import os
+
+    device = [a for a in arrays if is_device_array(a)]
+    if not device or os.environ.get("ZARR_VECTORS_GPU_ENCODE", "1") == "0":
+        return False
+    if not all(
+        type(a).__module__.partition(".")[0] == "cupy" or hasattr(type(a), "__dlpack__")
+        for a in device
+    ):
+        return False
+    from zarr_vectors._runtime import _gpu_extension
+
+    return _gpu_extension()
+
+
 def _gpu() -> Any:
     """The optional GPU extension, imported on first use."""
     try:

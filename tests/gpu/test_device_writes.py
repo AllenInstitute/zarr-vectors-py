@@ -1,4 +1,8 @@
-"""Writers fed device arrays: one download per argument, identical bytes."""
+"""Writers fed device arrays: identical bytes, encoded where the arrays are.
+
+Encoding runs on the device, so what is downloaded is the encoded form
+(fragment sections, grouped link rows), not each argument.
+"""
 
 from __future__ import annotations
 
@@ -39,7 +43,7 @@ def test_csr_fragments_from_the_device(tmp_path):
             dev, (1, 0, 1), csr=(cupy.asarray(indices), cupy.asarray(offsets)),
             mode="append",
         )
-    assert stats.d2h_calls == 2
+    assert stats.d2h_calls == 5  # checks, then the four sections
     assert_stores_identical(host_path, dev_path)
 
 
@@ -118,7 +122,7 @@ def test_link_cells_from_the_device(tmp_path):
             dev, chunks=cupy.asarray(chunks), vids=cupy.asarray(vids),
             attributes={k: cupy.asarray(v) for k, v in attrs.items()},
         )
-    assert stats.d2h_calls == 3
+    assert stats.d2h_calls == 6  # the grouped partition (5), the attribute (1)
     for lg in (host, dev):
         finalize_links(lg, delta=0)
     assert_stores_identical(host_path, dev_path)

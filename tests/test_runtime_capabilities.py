@@ -60,10 +60,13 @@ def test_device_keys_follow_what_is_installed(monkeypatch):
 
     monkeypatch.setattr(_runtime, "_gpu_extension", lambda: False)
     caps = zv.runtime_capabilities()
-    assert not any(caps[k] for k in ("device_arrays", "device_decode", "gpu_io", "gpu_codecs"))
+    assert not any(caps[k] for k in (
+        "device_arrays", "device_decode", "gpu_encode", "gpu_io", "gpu_codecs",
+    ))
 
     monkeypatch.setattr(_runtime, "_gpu_extension", lambda: True)
     monkeypatch.setattr(_runtime, "_importable", lambda m: m == "kvikio")
     caps = zv.runtime_capabilities()
-    assert caps["device_arrays"] and caps["device_decode"] and caps["gpu_io"]
+    assert caps["device_arrays"] and caps["device_decode"] and caps["gpu_encode"]
+    assert caps["gpu_io"]
     assert not caps["gpu_codecs"]
