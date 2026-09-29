@@ -126,7 +126,9 @@ host path does in one copy for all of them. kvikio's own compat-mode
 setting cannot tell the two apart; `KVIKIO_COMPAT_MODE=ON` does keep
 reads on the host path.
 
-`ZARR_VECTORS_GPU_IO=kvikio` or `=host` forces the choice. kvikio 25.x
+`read_cells(..., io="kvikio")` or `io="host"` forces the choice for one
+call (`read_neighbourhood` passes `io` on), and `ZARR_VECTORS_GPU_IO=kvikio`
+or `=host` for every call left at `io="auto"`. kvikio 25.x
 and 26.x both work, and anything unexpected from kvikio means the host
 path rather than an error. kvikio's default thread pool is one thread,
 which would read cells one after another, so reads through it run on up

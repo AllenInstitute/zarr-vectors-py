@@ -78,6 +78,9 @@ FEATURES: frozenset[str] = frozenset({
     "dense-manifests",
     # read_cells(device="cuda", decode=...): cells decoded on the device.
     "device-decode",
+    # read_cells(device="cuda", io=...): the local-file read path chosen
+    # per call, auto following cuFile's GPUDirect Storage verdict.
+    "device-io",
 })
 
 

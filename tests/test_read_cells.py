@@ -106,6 +106,13 @@ def test_a_fragment_index_is_refused(points):
         read_cells(_level(points), [(0, 0, 0)], ["vertex_fragments"])
 
 
+def test_an_unknown_io_is_refused(points):
+    with pytest.raises(ArrayError, match="io='gds'"):
+        read_cells(_level(points), [(0, 0, 0)], io="gds")
+    with pytest.raises(ArrayError, match="io='gds'"):
+        read_neighbourhood(_level(points), (0, 0, 0), io="gds")
+
+
 def test_one_bad_cell_is_recorded_and_the_rest_are_read(points):
     lg = _level(points)
     cells = _cells(lg)
