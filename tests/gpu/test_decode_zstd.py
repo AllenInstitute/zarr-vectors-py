@@ -97,6 +97,9 @@ def test_a_damaged_frame_is_an_error_and_the_rest_decode(damage):
 def test_it_runs_on_the_callers_stream():
     raw = _raw(3)
     frames = _frames(raw)
+    # The frames were copied up on the default stream, which a non-blocking
+    # stream does not wait for: order them first, as a caller must.
+    cupy.cuda.get_current_stream().synchronize()
     stream = cupy.cuda.Stream(non_blocking=True)
     out = [cupy.empty(len(r), dtype=cupy.uint8) for r in raw]
     outputs, errors = decode_zstd(frames, out=out, stream=stream)
