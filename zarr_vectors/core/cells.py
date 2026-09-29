@@ -146,9 +146,12 @@ class CellBatch(Mapping[str, CellColumn]):
     ``fragments`` is the vertices' fragment index when it was asked for
     (``read_cells(..., fragments=True)``), else None.
 
-    ``io`` says how each array read was served (:class:`ArrayRead`), and
-    ``io_seconds`` where the time went: ``fetch`` and ``decode`` for the
-    arrays decoded on the device, ``host`` for the rest (reading and
+    ``io`` says how each array read was served (:class:`ArrayRead`), one
+    entry per array actually read, which can be more than were asked for:
+    ``vertices``, when it was read only to size an attribute whose width
+    is not stamped, and ``vertex_fragments`` last, with ``fragments=True``.
+    ``io_seconds`` says where the time went: ``fetch`` and ``decode`` for
+    the arrays decoded on the device, ``host`` for the rest (reading and
     decoding together). Neither takes part in equality.
     """
 
