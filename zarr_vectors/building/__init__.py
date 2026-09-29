@@ -179,6 +179,11 @@ from zarr_vectors.core.multiscale import (
     upsert_level_transform,
     write_multiscale_metadata,
 )
+from zarr_vectors.core.object_rows import (
+    aligned_regions,
+    concurrency_contract,
+    reserve_object_rows,
+)
 from zarr_vectors.core.paths import (
     intra_offsets,
     is_intra,
@@ -689,6 +694,7 @@ def write_object_manifests(
     mode: str = "replace",
     at: int | None = None,
     layout: str | None = None,
+    block_at: int | None = None,
 ) -> tuple[int, int]:
     """Write object manifests to the level's object index.
 
@@ -725,11 +731,18 @@ def write_object_manifests(
         mode: ``"replace"`` rewrites every row.  ``"append"`` extends the
             existing array, touching only the zarr chunks the new rows fall
             in — the write a per-chunk emitter wants, since replacing costs
-            the whole index once per chunk.
+            the whole index once per chunk.  ``"place"`` writes rows
+            ``[at, at + n)`` of an index sized by
+            :func:`reserve_object_rows` and nothing else -- no resize, no
+            padding, no metadata -- so several processes may place
+            disjoint, aligned ranges at once (see
+            :func:`concurrency_contract`).
         at: Row index the appended blobs must start at (``mode="append"``
             only).  Pass the object-id being claimed so a torn previous
             flush cannot shift ids; ``None`` appends at the current end.
         layout: ``"vlen"`` or ``"dense"`` for an index this call creates.
+        block_at: ``mode="place"`` on a dense index: the first row of
+            ``manifest_blocks`` this call's fragments occupy.
 
     On an index that stores its object ids (layout V2), an append extends
     the id table with ``ids``, or with the rows when the table is simply
@@ -755,6 +768,28 @@ def write_object_manifests(
         raise ArrayError(
             "give manifest_blobs, or chunk_coords and fragment_idx "
             "(optionally with manifest_offsets), not both"
+        )
+    if mode == "place":
+        import numpy as np
+
+        from zarr_vectors.core.object_rows import place_manifests
+
+        if at is None:
+            raise ArrayError('mode="place" needs at=')
+        if not as_arrays:
+            return place_manifests(
+                level_group, at, manifest_blobs=manifest_blobs,
+                ids=None if ids is None else _xp.to_host(ids),
+            )
+        fi = _xp.to_host(fragment_idx, dtype=np.int64).reshape(-1)
+        off = (
+            np.arange(fi.size + 1, dtype=np.int64) if manifest_offsets is None
+            else _xp.to_host(manifest_offsets, dtype=np.int64)
+        )
+        return place_manifests(
+            level_group, at, offsets=off, frags=fi,
+            coords=_xp.to_host(chunk_coords, dtype=np.int64),
+            ids=None if ids is None else _xp.to_host(ids), block_at=block_at,
         )
     if as_arrays and _index_layout_for_write(level_group, layout) == "dense":
         import numpy as np
@@ -1173,6 +1208,7 @@ __all__ = [
     "VERTICES",
     "XLEVEL_EXPLICIT",
     "XLEVEL_NONE",
+    "aligned_regions",
     "apply_perm_inverse",
     "array_is_sharded",
     "assign_chunks",
@@ -1190,6 +1226,7 @@ __all__ = [
     "compute_bin_ratio",
     "compute_bin_shape",
     "compute_grid_shape",
+    "concurrency_contract",
     "create_attribute_array",
     "create_fragment_attribute_array",
     "create_groupings_array",
@@ -1294,6 +1331,7 @@ __all__ = [
     "register_selection_strategy",
     "remove_resolution_level",
     "reshard",
+    "reserve_object_rows",
     "session_for",
     "set_coordinate_offset",
     "set_presence",

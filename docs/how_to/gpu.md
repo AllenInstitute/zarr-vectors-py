@@ -74,6 +74,7 @@ driver, so a process that forks workers should probe in the workers.
 | `object_attribute_columns` | `write_object_attribute_columns` is available |
 | `array_link_cells` | `write_link_cells(chunks=, vids=, attributes=)` is available |
 | `defer_presence`, `append_safe_sharding` | presence can be deferred; appends into shared per-chunk shards keep what is there (not the object layer's `at=` writes) |
+| `concurrency_contract` | `zv.concurrency_contract()` states which writes may run at once; object-layer rows reserved with `reserve_object_rows` and written with `mode="place"` |
 | `link_cells_append` | a second write into a link cell appends records and attribute rows, mirrored seam records included; serial writes only |
 
 ## Reading

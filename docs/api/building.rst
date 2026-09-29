@@ -305,6 +305,12 @@ per-object attribute arrays beside it.
 
 .. autofunction:: zarr_vectors.building.commit_object_index
 
+.. autofunction:: zarr_vectors.building.reserve_object_rows
+
+.. autofunction:: zarr_vectors.building.concurrency_contract
+
+.. autofunction:: zarr_vectors.building.aligned_regions
+
 .. autofunction:: zarr_vectors.building.is_dense_index
 
 .. autofunction:: zarr_vectors.building.read_all_object_manifests

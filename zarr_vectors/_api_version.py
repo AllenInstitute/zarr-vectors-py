@@ -109,6 +109,10 @@ FEATURES: frozenset[str] = frozenset({
     # object layer sharded along rows, by zarr's own codec (no format key);
     # writers keep a sharded layer sharded.
     "object-layer-shards",
+    # zarr_vectors.concurrency_contract(), building.reserve_object_rows and
+    # mode="place" on the object-layer writers: disjoint row ranges filled
+    # by several processes at once.
+    "concurrency-contract",
 })
 
 
