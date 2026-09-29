@@ -258,6 +258,8 @@ def write(
         spans[start:, 1] = counts
         _create(level_group, SPANS_PATH, spans)
         _create(level_group, BLOCKS_PATH, new_blocks)
+        if not exists:
+            _declare_capability(level_group)
         return start
 
     n0 = num_rows(level_group)
@@ -279,6 +281,32 @@ def write(
     elif tail.size:
         level_group.extend_array(SPANS_PATH, tail)
     return start
+
+
+def _declare_capability(level_group: Group) -> None:
+    """Add ``dense_manifests`` to the root's ``format_capabilities``.
+
+    ``create_store(manifest_layout="dense")`` stamps it, but an index can
+    also become dense later -- ``write_object_manifests(layout="dense")``
+    on a store created without the choice -- and the store should say so
+    either way. A root without a zarr-vectors block (a bare group in a
+    test) is left alone.
+    """
+    import zarr
+
+    from zarr_vectors.constants import CAP_DENSE_MANIFESTS
+    from zarr_vectors.core.store import update_root_metadata
+
+    try:
+        root_zarr = zarr.open_group(level_group._zarr.store, path="/", mode="r+")
+    except Exception:  # noqa: BLE001 - nowhere to declare it
+        return
+    block = root_zarr.attrs.get("zarr_vectors")
+    if not block or CAP_DENSE_MANIFESTS in (block.get("format_capabilities") or []):
+        return
+    update_root_metadata(
+        type(level_group)._from_zarr(root_zarr), add_capabilities=[CAP_DENSE_MANIFESTS],
+    )
 
 
 def patch(
