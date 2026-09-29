@@ -13,7 +13,7 @@ _KEYS = {
     "object_attribute_columns", "array_link_cells", "read_cells",
     "read_neighbourhood", "batched_link_reads", "defer_presence",
     "append_safe_sharding", "dense_manifests", "gpu_encode", "gpu_io",
-    "gpu_codecs", "device_arrays", "device_decode",
+    "gpu_codecs", "device_arrays", "device_decode", "gds",
 }
 
 
@@ -61,7 +61,7 @@ def test_device_keys_follow_what_is_installed(monkeypatch):
     monkeypatch.setattr(_runtime, "_gpu_extension", lambda: False)
     caps = zv.runtime_capabilities()
     assert not any(caps[k] for k in (
-        "device_arrays", "device_decode", "gpu_encode", "gpu_io", "gpu_codecs",
+        "device_arrays", "device_decode", "gpu_encode", "gpu_io", "gpu_codecs", "gds",
     ))
 
     monkeypatch.setattr(_runtime, "_gpu_extension", lambda: True)
@@ -70,3 +70,21 @@ def test_device_keys_follow_what_is_installed(monkeypatch):
     assert caps["device_arrays"] and caps["device_decode"] and caps["gpu_encode"]
     assert caps["gpu_io"]
     assert not caps["gpu_codecs"]
+
+
+def test_gds_needs_the_probe_and_cufile(monkeypatch):
+    from zarr_vectors import _runtime
+
+    monkeypatch.setattr(_runtime, "_gpu_extension", lambda: True)
+    monkeypatch.setattr(_runtime, "_importable", lambda m: m == "kvikio")
+    monkeypatch.setattr(_runtime, "_device_count", lambda: 1)
+    monkeypatch.setattr(_runtime, "_gds_available", lambda: True)
+    assert not zv.runtime_capabilities()["gds"]
+    assert zv.runtime_capabilities(probe_device=True)["gds"]
+
+    monkeypatch.setattr(_runtime, "_gds_available", lambda: False)
+    assert not zv.runtime_capabilities(probe_device=True)["gds"]
+
+    monkeypatch.setattr(_runtime, "_gds_available", lambda: True)
+    monkeypatch.setattr(_runtime, "_importable", lambda m: False)
+    assert not zv.runtime_capabilities(probe_device=True)["gds"]

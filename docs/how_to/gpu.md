@@ -64,6 +64,7 @@ driver, so a process that forks workers should probe in the workers.
 | `device_decode` | `read_cells(device="cuda")` can decode uncompressed cells on the device |
 | `gpu_codecs` | nvCOMP imports too, so `decode="device"` can decompress zstd cells there |
 | `gpu_io` | kvikio imports too, so local files can be read straight into device memory |
+| `gds` | with `probe_device` only: cuFile reports GPUDirect Storage available, so `io="auto"` reads local files with it |
 | `gpu_encode` | writers handed device arrays encode on the device |
 | `read_cells`, `read_neighbourhood` | batched multi-cell reads are available |
 | `batched_link_reads` | `read_link_arrays` / `read_link_attributes` prefetch every cell at once |
@@ -135,6 +136,21 @@ which would read cells one after another, so reads through it run on up
 to 16 threads unless `KVIKIO_NTHREADS` or the process has set a count.
 Any other zarr store (fsspec, obstore, icechunk) is read through its own
 byte-range `get`, then copied up once.
+
+Every batch says how it was read, so a benchmark can tell which path it
+measured without asking the system separately:
+
+```python
+batch = read_cells(level, cells, ["vertices"], device="cuda")
+for r in batch.io:          # ArrayRead(array, path, cells, stored_bytes)
+    print(r.array, r.path, r.stored_bytes)
+batch.io_seconds            # {"fetch": ..., "decode": ...} and/or {"host": ...}
+```
+
+`path` is `gds`, `kvikio-compat` (kvikio through cuFile's bounce
+buffer), `pinned-host`, `store`, or `host` for an array read and decoded
+on the host. A read that decodes on the device waits for its last kernel
+before returning, so `decode` covers the whole decode.
 
 Measured on 4,097 cells (5 million points, vertices plus one attribute,
 warm cache, RTX A2000):

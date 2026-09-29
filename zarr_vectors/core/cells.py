@@ -16,6 +16,7 @@ up 1:1 with vertex rows.
 from __future__ import annotations
 
 import contextlib
+import time
 from collections.abc import Iterator, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from functools import cached_property
@@ -47,6 +48,31 @@ class CellReadError:
     array: str
     chunk_key: str
     message: str
+
+
+@dataclass(frozen=True)
+class ArrayRead:
+    """How one array's cells reached a :class:`CellBatch`.
+
+    ``path`` is one of:
+
+    - ``gds``: stored bytes read with kvikio, GPUDirect Storage on;
+    - ``kvikio-compat``: read with kvikio through cuFile's bounce buffer;
+    - ``pinned-host``: plain reads into pinned host memory, one copy up;
+    - ``store``: byte-range gets from a store that is not a local
+      directory, one copy up;
+    - ``host``: read and decoded on the host (a host read, or an array
+      a device read left to the host).
+
+    The first four decode on the device. ``stored_bytes`` is what they
+    read from storage, before decompression; ``None`` for ``host``, where
+    zarr does not say.
+    """
+
+    array: str
+    path: str
+    cells: int
+    stored_bytes: int | None
 
 
 @dataclass(frozen=True)
@@ -84,12 +110,19 @@ class CellBatch(Mapping[str, CellColumn]):
 
     ``chunk_coords`` is the requested cells in request order, always on
     the host; the columns are on ``device``.
+
+    ``io`` says how each array read was served (:class:`ArrayRead`), and
+    ``io_seconds`` where the time went: ``fetch`` and ``decode`` for the
+    arrays decoded on the device, ``host`` for the rest (reading and
+    decoding together). Neither takes part in equality.
     """
 
     chunk_coords: npt.NDArray[np.int64]
     columns: dict[str, CellColumn]
     errors: tuple[CellReadError, ...] = ()
     device: str = "cpu"
+    io: tuple[ArrayRead, ...] = field(default=(), compare=False)
+    io_seconds: dict[str, float] = field(default_factory=dict, compare=False)
 
     def __getitem__(self, name: str) -> CellColumn:
         return self.columns[name]
@@ -333,12 +366,14 @@ def read_cells(
     ]
 
     errors: list[CellReadError] = []
+    seconds: dict[str, float] = {}
     on_device = _device_payloads(
         level_group, plan, layouts, keys, cc, decode if device == "cuda" else "host",
-        on_error, errors, io,
+        on_error, errors, io, seconds,
     )
     raw: dict[tuple[str, str], bytes] = {}
     host_plan = [p for p in plan if p[0] not in on_device]
+    t_host = time.perf_counter()
     with _prefetch(level_group, [p for p in host_plan if p[1]]):
         for name, cell_keys in host_plan:
             for key in cell_keys:
@@ -359,15 +394,19 @@ def read_cells(
             )
             vertex_rows[key] = stored // (itemsize * ndim)
 
+    host_seconds = time.perf_counter() - t_host
     columns: dict[str, CellColumn] = {}
     for name, lay in layouts.items():
         if name in on_device:
             from zarr_vectors.gpu import _read as device_read
 
+            t0 = time.perf_counter()
             columns[name] = device_read.column(
                 name, on_device[name], keys, lay, vertex_rows, on_error, errors,
             )
+            seconds["decode"] = seconds.get("decode", 0.0) + time.perf_counter() - t0
             continue
+        t0 = time.perf_counter()
         parts: list[np.ndarray] = []
         for key in keys:
             try:
@@ -378,9 +417,23 @@ def read_cells(
                 errors.append(CellReadError(name, key, f"{type(exc).__name__}: {exc}"))
                 parts.append(None)  # type: ignore[arg-type]
         columns[name] = _column(parts, lay, device)
+        host_seconds += time.perf_counter() - t0
 
+    if on_device:
+        # The last gathers are still running; count them as decode time.
+        t0 = time.perf_counter()
+        _xp._gpu().xp.cuda.get_current_stream().synchronize()
+        seconds["decode"] = seconds.get("decode", 0.0) + time.perf_counter() - t0
+    if host_plan:
+        seconds["host"] = host_seconds
+    io_report = tuple(
+        ArrayRead(name, on_device[name].path, len(cell_keys), on_device[name].stored_bytes)
+        if name in on_device else ArrayRead(name, "host", len(cell_keys), None)
+        for name, cell_keys in plan
+    )
     return CellBatch(
         chunk_coords=cc, columns=columns, errors=tuple(errors), device=device,
+        io=io_report, io_seconds=seconds,
     )
 
 
@@ -394,6 +447,7 @@ def _device_payloads(
     on_error: str,
     errors: list[CellReadError],
     io: str = "auto",
+    seconds: dict[str, float] | None = None,
 ) -> dict[str, Any]:
     """Fetch and unframe on the device every array it can decode.
 
@@ -427,7 +481,9 @@ def _device_payloads(
         ))
         names.append(name)
     out: dict[str, Any] = {}
-    for name, payloads in zip(names, device_read.fetch_payloads(items, io=io)):
+    if not items:
+        return out
+    for name, payloads in zip(names, device_read.fetch_payloads(items, io=io, seconds=seconds)):
         for key, message in payloads.errors.items():
             if on_error == "raise":
                 raise ArrayError(f"{name} cell {key}: {message}")

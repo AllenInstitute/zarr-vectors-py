@@ -22,6 +22,7 @@ the way the host path reports it, and reads as empty.
 
 from __future__ import annotations
 
+import time
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
@@ -44,6 +45,8 @@ class Payloads:
     lengths: np.ndarray            # (U,) int64 payload bytes
     errors: dict[str, str]         # chunk key -> reason
     keepalive: list[Any] = field(default_factory=list)
+    path: str = ""                 # how the stored bytes were read (RawCells.path)
+    stored_bytes: int = 0          # stored bytes read, before decompression
 
     def length(self, key: str) -> int:
         i = self.index.get(key)
@@ -73,6 +76,7 @@ def fetch_payloads(
     items: list[tuple[_fetch.CellSource, list[str], np.ndarray, bool]],
     *,
     io: _fetch.IO = "auto",
+    seconds: dict[str, float] | None = None,
 ) -> list[Payloads]:
     """Fetch, decompress and unframe many arrays' cells as one job.
 
@@ -80,8 +84,10 @@ def fetch_payloads(
     ``ragged`` marks a ragged links array. Every array's files are read
     in one pooled pass, every zstd frame is checked in one kernel and
     decoded in one nvCOMP batch, and every frame is unframed in one
-    kernel, however many arrays there are.
+    kernel, however many arrays there are. ``seconds``, if given, gains
+    the time spent fetching (``fetch``) and decoding (``decode``).
     """
+    t0 = time.perf_counter()
     requests = []
     for src, keys, coords, _ in items:
         cells = np.asarray(coords, dtype=np.int64).reshape(len(keys), -1)
@@ -89,6 +95,7 @@ def fetch_payloads(
             cells = cells - np.asarray(src.origin, dtype=np.int64)
         requests.append((src, cells))
     raws = _fetch.fetch_many(requests, io=io)
+    t1 = time.perf_counter()
 
     # One flat table of every cell of every array.
     counts = [len(keys) for _, keys, _, _ in items]
@@ -150,7 +157,12 @@ def fetch_payloads(
             lengths=lengths[lo:hi],
             errors={keys[i - lo]: m for i, m in errors.items() if lo <= i < hi},
             keepalive=keepalive,
+            path=raws[r].path,
+            stored_bytes=int(raws[r].sizes.sum()),
         ))
+    if seconds is not None:
+        seconds["fetch"] = seconds.get("fetch", 0.0) + (t1 - t0)
+        seconds["decode"] = seconds.get("decode", 0.0) + (time.perf_counter() - t1)
     return out
 
 

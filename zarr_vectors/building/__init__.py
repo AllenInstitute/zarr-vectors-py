@@ -140,6 +140,7 @@ from zarr_vectors.core.arrays import (
     write_object_index,
 )
 from zarr_vectors.core.cells import (
+    ArrayRead,
     CellBatch,
     CellColumn,
     CellReadError,
@@ -778,6 +779,7 @@ def rebuild_presence(
 
 __all__ = [
     "CAP_FRAGMENT_INDEX",
+    "ArrayRead",
     "CellBatch",
     "CellColumn",
     "CellReadError",
