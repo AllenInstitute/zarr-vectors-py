@@ -450,6 +450,29 @@ VALID_ENCODINGS: frozenset[str] = frozenset({
     ENCODING_DRACO,
 })
 
+#: ``encoding`` stamped on a dictionary-encoded (categorical) attribute:
+#: integer codes, with ``categories[code]`` recovering the value.
+DICTIONARY_ENCODING: str = "dictionary"
+
+# ---------------------------------------------------------------------------
+# OME-Zarr root node (NGFF RFC 8)
+# ---------------------------------------------------------------------------
+
+#: Root-attribute key the ``ome`` block lives under.  Reserved by NGFF 0.5+.
+OME_ATTRS_KEY: str = "ome"
+
+OME_VERSION: str = "0.6"
+"""NGFF version stamped on the node.
+
+The one field here that cannot yet be got right.  RFC 8 is a proposal, so
+the version it lands under is not settled; ``"0.5"`` is the current NGFF
+release and the version RFC 8's own examples carry.  It is a single
+constant precisely so that correcting it is a one-line change.
+
+RFC 8 requires ``version`` on the root node of a document and forbids it
+on any other, so it appears here and nowhere else in the store.
+"""
+
 # ---------------------------------------------------------------------------
 # Multi-resolution defaults
 # ---------------------------------------------------------------------------

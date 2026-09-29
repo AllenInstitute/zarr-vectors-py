@@ -71,6 +71,10 @@ from __future__ import annotations
 from typing import TYPE_CHECKING, Any
 from urllib.parse import unquote, urlparse
 
+# The key and version are format names, so they live in ``constants``;
+# re-exported here, where this module's readers look for them.
+from zarr_vectors.constants import OME_ATTRS_KEY, OME_VERSION
+
 if TYPE_CHECKING:  # pragma: no cover - typing only
     from zarr_vectors.core.group import Group
 
@@ -86,20 +90,6 @@ __all__ = [
     "refresh_root_node",
 ]
 
-#: Root-attribute key the block lives under.  Reserved by NGFF 0.5+.
-OME_ATTRS_KEY: str = "ome"
-
-OME_VERSION: str = "0.6"
-"""NGFF version stamped on the node.
-
-The one field here that cannot yet be got right.  RFC 8 is a proposal, so
-the version it lands under is not settled; ``"0.5"`` is the current NGFF
-release and the version RFC 8's own examples carry.  It is a single
-constant precisely so that correcting it is a one-line change.
-
-RFC 8 requires ``version`` on the root node of a document and forbids it
-on any other, so it appears here and nowhere else in the store.
-"""
 
 #: Extension prefix registered for this format.  RFC 8 reserves unprefixed
 #: identifiers for the core spec and lets a third party use a prefixed one
