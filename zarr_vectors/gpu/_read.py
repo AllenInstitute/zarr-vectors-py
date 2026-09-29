@@ -122,22 +122,14 @@ def fetch_payloads(
 
     live = np.flatnonzero(zstd & (sizes > 0))
     if live.size:
-        declared, walked = _kernels.zstd_walk(cp.asarray(ptrs[live]), cp.asarray(sizes[live]))
-        bad = walked != 0
-        for j in np.flatnonzero(bad).tolist():
-            errors[int(live[j])] = _kernels.UNFRAME_ERRORS[int(walked[j])]
-        good = live[~bad]
-        want = declared[~bad]
-        frames = [_Frame(int(ptrs[i]), int(sizes[i])) for i in good.tolist()]
-        decoded = _codecs.zstd_decode(frames)
+        decoded, bad = _codecs.decode_frames(ptrs[live], sizes[live])
         keepalive.append(decoded)
-        for i, need, out in zip(good.tolist(), want.tolist(), decoded):
-            got = _codecs.device_nbytes(out)
-            if got != need:
-                errors[i] = f"zstd frame decoded to {got} bytes; its header declares {need}"
-                continue
-            ptrs[i] = _codecs.device_pointer(out)
-            sizes[i] = got
+        for j, message in bad.items():
+            errors[int(live[j])] = message
+        for j, out in enumerate(decoded):
+            if out is not None:
+                ptrs[live[j]] = _codecs.device_pointer(out)
+                sizes[live[j]] = _codecs.device_nbytes(out)
     for i in errors:
         ptrs[i], sizes[i] = 0, 0
 
@@ -164,18 +156,6 @@ def fetch_payloads(
         seconds["fetch"] = seconds.get("fetch", 0.0) + (t1 - t0)
         seconds["decode"] = seconds.get("decode", 0.0) + (time.perf_counter() - t1)
     return out
-
-
-class _Frame:
-    """A device byte range, as nvCOMP takes it (``__cuda_array_interface__``)."""
-
-    __slots__ = ("__cuda_array_interface__",)
-
-    def __init__(self, ptr: int, size: int) -> None:
-        self.__cuda_array_interface__ = {
-            "shape": (size,), "typestr": "|u1", "data": (ptr, True), "version": 3,
-            "strides": None,
-        }
 
 
 def column(

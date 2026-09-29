@@ -173,6 +173,29 @@ read a shard's index once on both paths.
 `read_link_attributes`), on `read_all_object_manifests_csr`, and on a
 query result through `ReadResult.to_device("cuda")`.
 
+
+### Decoding your own zstd bytes on the device
+
+A reader that fetches zstd-compressed bytes into device memory itself --
+say, the chunks of a sharded image array, read by byte range with kvikio
+-- can have them checked and decoded the same way `read_cells` does:
+
+```python
+from zarr_vectors.gpu import decode_zstd
+
+outputs, errors = decode_zstd(frames, chunk_nbytes, out=buffers, stream=stream)
+```
+
+Each frame's structure is walked on the device before nvCOMP sees it, so
+a truncated or malformed frame comes back in `errors` rather than
+hanging nvCOMP's kernel or killing the CUDA context, and an output is
+kept only when its length is what the frame declares. Damage inside a
+compressed block is still not caught; decode data you trust. `out=`
+decodes into your buffers (nvCOMP 5 writes there directly; 4.x decodes
+and copies), and everything runs on `stream`, which is synchronised
+before the call returns. The frames zarr and numcodecs write declare
+their content size, which the check needs.
+
 ## Writing from arrays
 
 Each array-form writer leaves the store its per-object counterpart leaves,

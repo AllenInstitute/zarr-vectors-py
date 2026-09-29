@@ -23,11 +23,16 @@ are the same whether the arrays came from numpy or from the device.
 do (``device_decode``, ``gpu_encode``, ``gpu_codecs``, ``gpu_io``).
 
 Callers should reach this through ``device=`` and ``runtime_capabilities``
-rather than import it: its own surface is not yet promised.
+rather than import it: its own surface is not yet promised. The one
+function meant to be imported is :func:`decode_zstd`, for callers that
+fetch zstd-compressed bytes into device memory themselves (a dense image
+reader, say) and want them checked before nvCOMP sees them; its presence
+is advertised in ``zarr_vectors.FEATURES`` as ``"decode-zstd"``.
 """
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from typing import Any
 
 import numpy as np
@@ -55,6 +60,89 @@ def to_host(a: Any) -> np.ndarray:
     return cupy.asarray(a).get()
 
 
+def decode_zstd(
+    frames: Sequence[Any],
+    expected_nbytes: int | Sequence[int] | None = None,
+    *,
+    out: Sequence[Any] | None = None,
+    stream: Any = None,
+) -> tuple[list[Any], dict[int, str]]:
+    """Decompress zstd frames in device memory, checking each one first.
+
+    nvCOMP does not validate its input: a truncated frame can hang its
+    kernel, and a damaged one can hit an illegal memory access, which
+    kills the process's CUDA context. So each frame's structure (header,
+    every block header, the exact end) is walked on the device before
+    nvCOMP sees it, and an output is kept only when its length is the
+    content size the frame declares. That catches truncation and broken
+    structure. It cannot catch damage inside a compressed block, which
+    only a content checksum would; decode only data you trust.
+
+    Args:
+        frames: One zstd frame per entry: C-contiguous device arrays (or
+            anything exposing ``__cuda_array_interface__``), read as bytes.
+            Frames must declare their content size, as zarr's and
+            numcodecs' zstd do.
+        expected_nbytes: The size every frame (an int) or each frame (a
+            sequence) must decode to; a frame declaring anything else is
+            reported, not decoded. ``None`` accepts what frames declare.
+        out: Optional device arrays to decode into, one per frame, each
+            exactly the size its frame declares.
+        stream: A cupy stream to run on; the current stream by default.
+            It is synchronised before returning.
+
+    Returns:
+        ``(outputs, errors)``: ``outputs[i]`` is frame ``i`` decoded, as a
+        cupy ``uint8`` array (a view of ``out[i]`` when ``out`` is given),
+        or None, with the reason in ``errors[i]``. Errors are reported,
+        never raised.
+    """
+    from zarr_vectors.gpu import _codecs
+
+    if _codecs.nvcomp() is None:
+        raise ImportError(
+            "decode_zstd needs nvCOMP. Install it with "
+            "pip install 'zarr-vectors[gpu-codecs]'."
+        )
+    frames = list(frames)
+    n = len(frames)
+    for i, f in enumerate(frames):
+        if not _is_contiguous(f):
+            raise ValueError(f"frame {i} is not C-contiguous")
+    ptrs = np.array([_codecs.device_pointer(f) for f in frames], dtype=np.uint64)
+    sizes = np.array([_codecs.device_nbytes(f) for f in frames], dtype=np.int64)
+    expected = None
+    if expected_nbytes is not None:
+        expected = np.broadcast_to(np.asarray(expected_nbytes, dtype=np.int64), (n,))
+    if out is not None:
+        out = list(out)
+        if len(out) != n:
+            raise ValueError(f"{len(out)} outputs for {n} frames")
+        for i, o in enumerate(out):
+            if not _is_contiguous(o):
+                raise ValueError(f"output {i} is not C-contiguous")
+    outputs, errors = _codecs.decode_frames(
+        ptrs, sizes, expected=expected, out=out, stream=stream,
+    )
+    return [
+        None if o is None else cupy.asarray(o).reshape(-1).view(cupy.uint8)
+        for o in outputs
+    ], errors
+
+
+def _is_contiguous(a: Any) -> bool:
+    iface = a.__cuda_array_interface__
+    strides = iface.get("strides")
+    if strides is None:
+        return True
+    step = np.dtype(iface["typestr"]).itemsize
+    for extent, stride in zip(reversed(iface["shape"]), reversed(strides)):
+        if extent > 1 and stride != step:
+            return False
+        step *= extent
+    return True
+
+
 def device_count() -> int:
     """How many CUDA devices are visible; 0 if the runtime cannot say.
 
@@ -67,4 +155,4 @@ def device_count() -> int:
         return 0
 
 
-__all__ = ["device_count", "to_host", "upload", "xp"]
+__all__ = ["decode_zstd", "device_count", "to_host", "upload", "xp"]

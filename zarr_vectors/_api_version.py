@@ -85,6 +85,9 @@ FEATURES: frozenset[str] = frozenset({
     # (gds, kvikio-compat, pinned-host, store, host) and where the time
     # went; runtime_capabilities(probe_device=True)["gds"].
     "read-io-report",
+    # zarr_vectors.gpu.decode_zstd: zstd frames a caller fetched into
+    # device memory, structure-checked before nvCOMP decodes them.
+    "decode-zstd",
 })
 
 
