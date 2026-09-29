@@ -89,7 +89,10 @@ def decode_zstd(
         out: Optional device arrays to decode into, one per frame, each
             exactly the size its frame declares.
         stream: A cupy stream to run on; the current stream by default.
-            It is synchronised before returning.
+            It is synchronised before returning. The frames must be ready
+            on it: work that produced them on another stream (a copy to
+            the device on the default stream, say) has to be ordered
+            before the call, as for any CUDA stream.
 
     Returns:
         ``(outputs, errors)``: ``outputs[i]`` is frame ``i`` decoded, as a
