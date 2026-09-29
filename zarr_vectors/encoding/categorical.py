@@ -24,7 +24,7 @@ from typing import Any
 import numpy as np
 import numpy.typing as npt
 
-DICTIONARY_ENCODING = "dictionary"
+from zarr_vectors.constants import DICTIONARY_ENCODING
 
 
 def _smallest_uint_dtype(n_categories: int, has_fill: bool) -> np.dtype:

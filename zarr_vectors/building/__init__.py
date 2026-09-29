@@ -65,7 +65,9 @@ from zarr_vectors.constants import (
     XLEVEL_NONE,
 )
 from zarr_vectors.core.arrays import (
+    OBJECT_INDEX_LAYOUT_DENSE,
     OBJECT_INDEX_LAYOUT_V1,
+    OBJECT_INDEX_LAYOUT_V2,
     OBJECT_INDEX_MANIFEST_BUCKET,
     ManifestCSR,
     attribute_layout,
@@ -78,6 +80,7 @@ from zarr_vectors.core.arrays import (
     create_groupings_array,
     create_groupings_attributes_array,
     create_link_attributes_array,
+    create_link_segments,
     create_links_array,
     create_links_family,
     create_object_attributes_array,
@@ -120,6 +123,7 @@ from zarr_vectors.core.arrays import (
     read_object_attribute_present_mask,
     read_object_attributes,
     read_object_manifests,
+    read_object_manifests_csr,
     read_object_vertices,
     read_vertex_fragment_index,
     # --- writing ---
@@ -288,6 +292,8 @@ GROUP_SUPPORTED_METHODS: frozenset[str] = frozenset({
     "read_vlen_element", "read_vlen_elements",
     # batching + presence
     "batched_reads", "batched_writes", "offline_reads", "chunk_array_codecs",
+    # a read-only node cache, and resolving several nodes into it at once
+    "cached_nodes", "prime_nodes",
     "derive_nonempty_chunks", "native_sharded_arrays",
     "collect_presence", "apply_presence", "presence_deferred",
     # identity
@@ -404,6 +410,48 @@ def array_is_sharded(level_group: Group, array_name: str) -> bool:
     except (StoreError, KeyError):
         return False
     return bool(node is not None and _is_native_sharded(node))
+
+
+def decode_fragment_index(blob: bytes) -> Any:
+    """Decode a ``vertex_fragments`` / ``link_fragments`` cell's bytes.
+
+    :func:`read_vertex_fragment_index` reads a cell and decodes it; this
+    is the decode alone, for bytes the caller already holds -- from a
+    prefetch, say, or a batched read. Returns the same
+    ``ChunkFragmentIndex``: ``len``, ``range(f)``, ``indices(f)`` and, for
+    every fragment at once, ``flat()``.
+    """
+    from zarr_vectors.encoding.fragments import decode_fragments
+
+    return decode_fragments(blob)
+
+
+def user_metadata(group: Group) -> Any:
+    """The user-metadata namespaces on ``group``.
+
+    The object :attr:`zarr_vectors.api.Dataset.metadata` and
+    ``Level.metadata`` return, for a :class:`Group` a builder already
+    holds. ``user_metadata(g)["bridge"]`` (or ``.namespace("bridge")``)
+    is one application's keys, a ``MutableMapping`` kept apart from the
+    format's own attributes; ``names()`` lists the namespaces.
+    """
+    from zarr_vectors.core.user_metadata import Metadata
+
+    return Metadata(group)
+
+
+def is_dense_index(level_group: Group) -> bool:
+    """Whether the level's object index uses the dense layout.
+
+    The ``layout`` stamp decides, and failing that the arrays on disk do:
+    the same test every reader of the index applies. A level with no
+    object index is not dense.
+    """
+    from zarr_vectors.core import dense_manifests as dense
+
+    if not level_group.array_exists(OBJECT_INDEX):
+        return False
+    return dense.is_dense(level_group)
 
 
 def is_sharded(level_group: Group, array_name: str) -> bool:
@@ -806,7 +854,9 @@ __all__ = [
     "LevelMetadata",
     "OBJECT_ATTRIBUTES",
     "OBJECT_INDEX",
+    "OBJECT_INDEX_LAYOUT_DENSE",
     "OBJECT_INDEX_LAYOUT_V1",
+    "OBJECT_INDEX_LAYOUT_V2",
     # Exported so a consumer can audit an existing store's manifest chunking
     # without importing from ``core``: the number is fixed at array-creation
     # time and cannot be changed afterwards, so "is this store chunked
@@ -841,6 +891,7 @@ __all__ = [
     "create_groupings_array",
     "create_groupings_attributes_array",
     "create_link_attributes_array",
+    "create_link_segments",
     "create_links_array",
     "create_links_family",
     "create_object_attributes_array",
@@ -848,6 +899,7 @@ __all__ = [
     "create_resolution_level",
     "create_store",
     "create_vertices_array",
+    "decode_fragment_index",
     "decode_object_manifest_blocks",
     "defer_presence",
     "decompose_tree_to_paths",
@@ -866,6 +918,7 @@ __all__ = [
     "get_shard_info",
     "init_skeleton_store",
     "intra_offsets",
+    "is_dense_index",
     "is_intra",
     "is_sharded",
     "iter_link_cells",
@@ -919,6 +972,7 @@ __all__ = [
     "read_object_attribute_present_mask",
     "read_object_attributes",
     "read_object_manifests",
+    "read_object_manifests_csr",
     "read_object_vertices",
     "read_root_metadata",
     "read_skeleton_by_segment_id",
@@ -941,6 +995,7 @@ __all__ = [
     "update_level_metadata",
     "update_root_metadata",
     "upsert_level_transform",
+    "user_metadata",
     "validate_bin_shape_divides_chunk",
     "validate_level_chunk_shape_against_root",
     "write_chunk_attributes",

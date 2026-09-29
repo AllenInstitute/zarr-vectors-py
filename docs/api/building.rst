@@ -39,7 +39,8 @@ The :doc:`constants` page documents the values of some but not all of them —
    * ``LINKS``
    * ``LINK_FRAGMENTS``
    * ``LINK_ATTRIBUTES``
-   * ``OBJECT_INDEX_LAYOUT_V1``
+   * ``OBJECT_INDEX_LAYOUT_V1``, ``OBJECT_INDEX_LAYOUT_V2``,
+     ``OBJECT_INDEX_LAYOUT_DENSE``
    * ``OBJECT_INDEX_MANIFEST_BUCKET``
    * ``LINKS_IMPLICIT_SEQUENTIAL``
    * ``LINKS_IMPLICIT_BRANCHES``
@@ -176,6 +177,8 @@ into them.
 
 .. autofunction:: zarr_vectors.building.create_link_attributes_array
 
+.. autofunction:: zarr_vectors.building.create_link_segments
+
 .. autofunction:: zarr_vectors.building.attribute_layout
 
 Chunk I/O: vertices, fragments and attributes
@@ -203,6 +206,8 @@ ingest worker runs in parallel.
 .. autofunction:: zarr_vectors.building.read_chunk_fragment_attributes
 
 .. autofunction:: zarr_vectors.building.read_vertex_fragment_index
+
+.. autofunction:: zarr_vectors.building.decode_fragment_index
 
 .. autofunction:: zarr_vectors.building.write_chunk_vertices
 
@@ -296,6 +301,10 @@ per-object attribute arrays beside it.
 
 .. autofunction:: zarr_vectors.building.read_object_manifests
 
+.. autofunction:: zarr_vectors.building.read_object_manifests_csr
+
+.. autofunction:: zarr_vectors.building.is_dense_index
+
 .. autofunction:: zarr_vectors.building.read_all_object_manifests
 
 .. autofunction:: zarr_vectors.building.read_object_vertices
@@ -357,6 +366,8 @@ consumers cannot ask the store and run before any coordinator pass -- see
 .. autofunction:: zarr_vectors.building.array_is_sharded
 
 .. autofunction:: zarr_vectors.building.is_sharded
+
+.. autofunction:: zarr_vectors.building.user_metadata
 
 .. autofunction:: zarr_vectors.building.observe_presence_writes
 

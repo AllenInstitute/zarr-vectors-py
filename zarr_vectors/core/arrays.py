@@ -12,6 +12,7 @@ the store or encoding modules directly.
 
 from __future__ import annotations
 
+import itertools
 import warnings
 from collections.abc import Iterator, Mapping, Sequence
 from contextlib import contextmanager
@@ -1621,6 +1622,108 @@ def create_link_attributes_array(
             "level_delta": int(delta),
         },
     )
+
+
+def _neighbour_offsets(sid_ndim: int, *, positive_only: bool) -> list[ChunkCoords]:
+    """The chunk offsets a delta-0 record between neighbours can take.
+
+    All ``3**sid_ndim - 1`` non-zero offsets, or with ``positive_only``
+    the lexicographically positive half, which is where canonical
+    placement files an undirected record (see
+    :func:`zarr_vectors.spatial.boundary.partition_records_by_offset`).
+    """
+    return [
+        tuple(d) for d in itertools.product((-1, 0, 1), repeat=int(sid_ndim))
+        if any(d) and not (positive_only and next(x for x in d if x) < 0)
+    ]
+
+
+def create_link_segments(
+    level_group: Group,
+    *,
+    sid_ndim: int,
+    directed: bool = False,
+    store: str = "canonical",
+    dtype: str = "int64",
+    include_intra: bool = True,
+    intra_dtype: str | None = None,
+    attributes: Mapping[str, Any] | None = None,
+    intra_attributes: Mapping[str, Any] | None = None,
+) -> list[str]:
+    """Allocate every segment a delta-0, two-endpoint link family writes.
+
+    For a coordinator to run before workers start, so that no worker
+    creates an array: creating one from several workers races on its
+    ``zarr.json``. What it allocates, all idempotent:
+
+    - the family, with its ``directed`` / ``store`` policy;
+    - one ``links/0/<offsets>`` array per neighbour offset -- the 13
+      lexicographically positive ones for an undirected canonical family
+      (``3**sid_ndim // 2`` in general), all 26 for a directed or
+      duplicate one -- at ``dtype``;
+    - with ``include_intra``, the intra-chunk segment at ``intra_dtype``
+      (default ``dtype``), and the fragment sidecar next to it;
+    - for each of ``attributes`` (``{name: dtype}`` or ``{name: (dtype,
+      row_shape)}``), the parallel ``link_attributes/<name>/0/<offsets>``
+      array of every cross-chunk segment, stamped as
+      :func:`create_link_attributes_array` stamps it, and likewise
+      ``intra_attributes`` for the intra segment.
+
+    New arrays are created in one gather per kind rather than one call
+    each; the store left is the one the per-segment calls leave.
+
+    Returns:
+        Every array path ensured: links first, then attributes.
+    """
+    if store not in ("canonical", "duplicate"):
+        raise ArrayError(f"store must be 'canonical' or 'duplicate'; got {store!r}")
+    nd = int(sid_ndim)
+    cross = [(o,) for o in _neighbour_offsets(
+        nd, positive_only=not directed and store == "canonical",
+    )]
+    intra = [intra_offsets(nd, 2)] if include_intra else []
+    policy = {"link_width": 2, "delta": 0, "sid_ndim": nd,
+              "directed": bool(directed), "store": str(store)}
+    _create_links_arrays(level_group, cross, dtype=str(np.dtype(dtype)), **policy)
+    if intra:
+        _create_links_arrays(
+            level_group, intra,
+            dtype=str(np.dtype(intra_dtype if intra_dtype is not None else dtype)),
+            **policy,
+        )
+    created = [links_path(0, o) for o in cross + intra]
+
+    wanted: list[tuple[str, dict[str, Any]]] = []
+    families: set[str] = set()
+    for segments, specs in ((cross, attributes), (intra, intra_attributes)):
+        for name, spec in (specs or {}).items():
+            attr_dtype, row_shape = spec if isinstance(spec, tuple) else (spec, None)
+            families.add(name)
+            for offsets in segments:
+                full_name = link_attributes_path(name, 0, offsets)
+                created.append(full_name)
+                if _short_circuit_existing(level_group, full_name, True):
+                    continue
+                meta: dict[str, Any] = {
+                    "zv_array": "link_attribute",
+                    "name": name,
+                    "dtype": str(np.dtype(attr_dtype)),
+                    "offsets": [list(int(c) for c in o) for o in offsets],
+                    "level_delta": 0,
+                }
+                if row_shape is not None:
+                    meta["row_shape"] = [int(d) for d in row_shape]
+                wanted.append((full_name, meta))
+    _ensure_chunk_arrays(level_group, wanted)
+    for name in sorted(families):
+        _write_array_meta_if_changed(
+            level_group, link_attributes_group_path(name, 0), {
+                "zv_array": "link_attribute_family",
+                "name": name,
+                "level_delta": 0,
+            },
+        )
+    return created
 
 
 def _write_array_meta_if_changed(
@@ -6538,6 +6641,44 @@ def read_object_manifests(
 
     return dict(zip(wanted, _decode_manifests(blobs, sid_ndim)))
 
+
+def read_object_manifests_csr(
+    level_group: Group, ids: Sequence[int],
+) -> ManifestCSR:
+    """The manifests of the objects ``ids``, as CSR arrays.
+
+    :func:`read_object_manifests` for a named subset, in the shape
+    :func:`read_all_object_manifests_csr` returns: no Python object per
+    object or per fragment. Row ``o`` of the result is the ``o``-th id
+    found, in the order asked; ``object_ids`` names them. Ids the level
+    does not hold are left out, as :func:`read_object_manifests` leaves
+    them out, so a caller may pass a superset.
+    """
+    meta = level_group.read_array_meta(OBJECT_INDEX)
+    _require_object_index_layout(meta)
+    sid_ndim = int(meta["sid_ndim"])
+    found, rows = object_rows_for_ids(level_group, list(ids))
+    if found.size == 0:
+        return ManifestCSR(
+            np.zeros(1, np.int64), np.empty((0, sid_ndim), np.int64),
+            np.empty(0, np.int64), found,
+        )
+
+    from zarr_vectors.core import dense_manifests as dense
+
+    if dense.is_dense(level_group, meta):
+        offsets, coords, frags = dense.read_csr(level_group, rows)
+        return ManifestCSR(offsets, coords, frags, found)
+    # Ascending rows, so the coordinate selection touches each zarr chunk
+    # once; then back to the order asked.
+    order = np.argsort(rows, kind="stable")
+    blobs = level_group.read_vlen_elements(
+        f"{OBJECT_INDEX}/manifests", rows[order].tolist(),
+    )
+    asked = np.empty(len(blobs), dtype=object)
+    asked[order] = blobs
+    offsets, coords, frags = decode_object_manifests_csr(list(asked), sid_ndim)
+    return ManifestCSR(offsets, coords, frags, found)
 
 
 def read_object_id_table(level_group: Group) -> npt.NDArray[np.int64] | None:
