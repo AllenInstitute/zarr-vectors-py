@@ -800,7 +800,9 @@ class Group:
             self._active_codecs = previous
 
     @contextmanager
-    def batched_writes(self, compressor: Any = None) -> Iterator[None]:
+    def batched_writes(
+        self, compressor: Any = None, *, durable: bool = False,
+    ) -> Iterator[None]:
         """Defer every :meth:`write_bytes` and :meth:`write_array_meta`
         call inside the block and flush them in a single
         :func:`asyncio.gather` on exit.
@@ -820,6 +822,12 @@ class Group:
                 # TODO: per-array-type codec dict (vertices vs fragments
                 # vs links) — future work; today every chunk gets the
                 # same codec.
+            durable: On a local store, have everything the block wrote
+                on disk when it returns: each cell object (a shard, when
+                sharded) is fsynced before its rename, then the metadata
+                documents written and every directory changed. For a
+                caller whose own record of "done" is durable. A no-op on
+                an object store, where a returned PUT already is.
 
         Nesting is not supported and raises :class:`StoreError`.  Reads
         inside the block are unaffected and execute synchronously.
@@ -871,6 +879,7 @@ class Group:
                     pending_writes,
                     array_metas=pending_metas,
                     codecs=codecs,
+                    durable=durable,
                 )
         finally:
             # On normal exit the queues are already None.  On an

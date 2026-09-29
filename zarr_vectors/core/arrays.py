@@ -778,6 +778,7 @@ def open_write_session(
     bounds: tuple[list[float], list[float]] | None = None,
     chunk_shape: tuple[float, ...] | None = None,
     bin_count: int | None = None,
+    durable: bool = False,
 ):
     """Open the write session used by every type writer.
 
@@ -818,6 +819,9 @@ def open_write_session(
             key gains a leading attr-bin axis; pass the number of bins
             so the vlen array grid gets that extra leading axis
             (origin 0, extent ``bin_count``).
+        durable: Forwarded to :meth:`Group.batched_writes`: on a local
+            store, everything the session wrote is fsynced -- each cell
+            object before its rename -- before the block returns.
     """
     from contextlib import ExitStack
 
@@ -849,7 +853,9 @@ def open_write_session(
 
     stack = ExitStack()
     with stack:
-        stack.enter_context(level_group.batched_writes(compressor=compressor))
+        stack.enter_context(
+            level_group.batched_writes(compressor=compressor, durable=durable),
+        )
         stack.enter_context(
             level_group.native_sharded_arrays(ss, grid_shape, origin=origin)
         )

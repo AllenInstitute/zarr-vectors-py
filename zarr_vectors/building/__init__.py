@@ -456,6 +456,54 @@ def is_dense_index(level_group: Group) -> bool:
     return dense.is_dense(level_group)
 
 
+def cell_objects(
+    level_group: Group, array_name: str, chunk_coords: Iterable[Any],
+) -> list[str]:
+    """The store key of the object holding each of these cells.
+
+    One key per cell, in order: the cell's own object for an unsharded
+    array, the shard holding it for a sharded one (so cells of one shard
+    share a key). Keys are relative to the store root; on a local store
+    the file is ``Path(store_root) / key``. For a caller that has to act
+    on the objects themselves -- fsync them, copy them, check they exist
+    -- without re-deriving zarr's addressing: the array's own grid origin
+    and shard shape, and its chunk-key encoding.
+
+    Args:
+        chunk_coords: Absolute chunk coordinates, as tuples or rows of a
+            ``(C, K)`` array.
+
+    Raises:
+        StoreError: ``array_name`` is not a per-chunk array here.
+        ArrayError: A cell lies outside the array's grid.
+    """
+    from zarr_vectors.core.group import _coord_to_index, _coords_in_bounds, _grid_origin
+
+    arr = level_group._sharded_chunk_array(array_name)
+    if arr is None:
+        raise StoreError(
+            f"cell_objects: {array_name!r} is not a per-chunk array of "
+            f"{level_group.zarr_group.path or '<root>'}"
+        )
+    origin = _grid_origin(arr)
+    shape = tuple(int(n) for n in arr.shape)
+    # The array's grid chunk is its shard when sharded, else one cell.
+    outer = tuple(int(n) for n in arr.metadata.chunk_grid.chunk_shape)
+    base = arr.path
+    keys = []
+    for coords in chunk_coords:
+        coords = tuple(int(c) for c in coords)
+        index = _coord_to_index(coords, origin)
+        if not _coords_in_bounds(index, shape):
+            raise ArrayError(
+                f"cell_objects: {coords} is not a cell of {array_name!r} "
+                f"(grid origin {origin or (0,) * len(shape)}, shape {shape})"
+            )
+        key = arr.metadata.encode_chunk_key(tuple(i // o for i, o in zip(index, outer)))
+        keys.append(f"{base}/{key}" if base else key)
+    return keys
+
+
 def is_sharded(level_group: Group, array_name: str) -> bool:
     """Deprecated alias for :func:`array_is_sharded`."""
     import warnings
@@ -1020,6 +1068,7 @@ __all__ = [
     "chunk_scale_from_root",
     "chunks_intersecting_bbox",
     "commit",
+    "cell_objects",
     "commit_object_index",
     "compute_bin_ratio",
     "compute_bin_shape",

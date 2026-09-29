@@ -1282,8 +1282,11 @@ def commit(group: Group, message: str = "zarr-vectors write") -> str | None:
     """Commit pending changes when the store is backed by a transactional
     backend (currently ``icechunk``).
 
-    For non-transactional backends this is a no-op and returns ``None``;
-    writes are durable as soon as they hit the store.
+    For non-transactional backends this is a no-op and returns ``None``:
+    each write is visible as soon as it lands. On an object store a
+    returned PUT is also durable; on a local filesystem it is atomic
+    (renamed into place) but not fsynced unless written inside
+    ``batched_writes(durable=True)`` / ``open_write_session(durable=True)``.
 
     For icechunk-backed stores this calls ``session.commit(message)``
     and returns the new snapshot id (a hex string).  The same session
