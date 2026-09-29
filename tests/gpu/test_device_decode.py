@@ -112,6 +112,33 @@ def test_points_decode_on_the_device(tmp_path, compressor, shard, io, monkeypatc
     _assert_same(read_cells(lg, cells, ["vertex_attributes/i"]), alone)
 
 
+@pytest.mark.parametrize(("env", "arg", "want"), [
+    ("kvikio", "host", False),
+    ("host", "kvikio", True),
+    ("kvikio", "auto", True),
+    ("host", "auto", False),
+])
+def test_io_argument_wins_over_the_environment(tmp_path, monkeypatch, env, arg, want):
+    if want or env == "kvikio":
+        pytest.importorskip("kvikio")
+    from zarr_vectors.gpu import _fetch
+
+    seen = []
+    real = _fetch._fetch_local
+
+    def spy(requests, *, kvikio):
+        seen.append(kvikio)
+        return real(requests, kvikio=kvikio)
+
+    monkeypatch.setattr(_fetch, "_fetch_local", spy)
+    monkeypatch.setenv("ZARR_VECTORS_GPU_IO", env)
+    lg = _points(tmp_path / "p.zarrvectors", None, (2, 2, 2))
+    cells = _cells(lg)
+    dev = read_cells(lg, cells, ["vertices"], device="cuda", io=arg)
+    assert seen == [want]
+    _assert_same(read_cells(lg, cells, ["vertices"]), dev)
+
+
 @pytest.mark.parametrize("compressor", _CODECS)
 @pytest.mark.parametrize("shard", _SHARDS)
 def test_links_decode_on_the_device(tmp_path, compressor, shard):

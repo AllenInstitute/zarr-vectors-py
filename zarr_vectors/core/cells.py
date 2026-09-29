@@ -244,6 +244,7 @@ def read_cells(
     on_error: Literal["record", "raise"] = "record",
     device: str | None = None,
     decode: Literal["auto", "host", "device"] = "auto",
+    io: Literal["auto", "kvikio", "host"] = "auto",
 ) -> CellBatch:
     """Read the cells ``chunk_coords`` of every array in ``arrays`` at once.
 
@@ -274,13 +275,22 @@ def read_cells(
             raises, so use it only on stores you trust. ``"host"``
             decodes everything on the host and uploads the result.
             Ignored for a host read.
+        io: How a device decode reads a local store's files:
+            ``"kvikio"`` straight into device memory, ``"host"`` into
+            pinned host memory and one copy up. ``"auto"`` takes
+            ``$ZARR_VECTORS_GPU_IO`` if set, else ``kvikio`` only where
+            cuFile reports GPUDirect Storage available
+            (:func:`zarr_vectors._gds.choose_io`). The result is the same
+            either way. Ignored for a host read and for other stores.
 
     Returns:
         A :class:`CellBatch`. A cell nobody wrote, or outside an array's
         grid, has no rows.
     """
+    from zarr_vectors._gds import check_io
     from zarr_vectors.core.arrays import _chunk_key, _infer_vert_ndim
 
+    check_io(io)
     device = _xp.resolve_device(device, chunk_coords)
     cc = _xp.to_host(chunk_coords, dtype=np.int64)
     if cc.ndim == 1 and cc.size == 0:
@@ -325,7 +335,7 @@ def read_cells(
     errors: list[CellReadError] = []
     on_device = _device_payloads(
         level_group, plan, layouts, keys, cc, decode if device == "cuda" else "host",
-        on_error, errors,
+        on_error, errors, io,
     )
     raw: dict[tuple[str, str], bytes] = {}
     host_plan = [p for p in plan if p[0] not in on_device]
@@ -383,6 +393,7 @@ def _device_payloads(
     decode: str,
     on_error: str,
     errors: list[CellReadError],
+    io: str = "auto",
 ) -> dict[str, Any]:
     """Fetch and unframe on the device every array it can decode.
 
@@ -416,7 +427,7 @@ def _device_payloads(
         ))
         names.append(name)
     out: dict[str, Any] = {}
-    for name, payloads in zip(names, device_read.fetch_payloads(items)):
+    for name, payloads in zip(names, device_read.fetch_payloads(items, io=io)):
         for key, message in payloads.errors.items():
             if on_error == "raise":
                 raise ArrayError(f"{name} cell {key}: {message}")
