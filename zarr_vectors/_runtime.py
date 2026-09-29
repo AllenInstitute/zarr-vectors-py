@@ -33,7 +33,7 @@ _STATIC: dict[str, bool] = {
 }
 
 #: Keys that depend on what is installed alongside, filled in per call.
-_DYNAMIC = ("device_arrays", "device_decode", "gpu_encode", "gpu_io", "gpu_codecs")
+_DYNAMIC = ("device_arrays", "device_decode", "gpu_encode", "gpu_io", "gpu_codecs", "gds")
 
 
 @functools.cache
@@ -66,6 +66,12 @@ def _device_count() -> int:
     return gpu.device_count()
 
 
+def _gds_available() -> bool:
+    from zarr_vectors._gds import gds_status
+
+    return gds_status().available
+
+
 def runtime_capabilities(*, probe_device: bool = False) -> dict[str, bool]:
     """What this installation of zarr-vectors can do.
 
@@ -83,7 +89,11 @@ def runtime_capabilities(*, probe_device: bool = False) -> dict[str, bool]:
       decode="device")`` can decompress zstd cells on the device;
     - ``gpu_io``: kvikio is installed too, so local files can be read
       straight into device memory (GPUDirect Storage where the system
-      has it; see ``docs/how_to/gpu.md``).
+      has it; see ``docs/how_to/gpu.md``);
+    - ``gds``: with ``probe_device=True`` only, cuFile reports GPUDirect
+      Storage available, so ``read_cells(device="cuda")`` on local files
+      reads them straight into device memory under ``io="auto"``. Without
+      the probe it is False: asking opens the cuFile driver.
 
     Probing a device initialises the CUDA driver, so a process that will
     fork should probe in its children, not before forking.
@@ -100,4 +110,5 @@ def runtime_capabilities(*, probe_device: bool = False) -> dict[str, bool]:
     caps["gpu_encode"] = usable
     caps["gpu_codecs"] = usable and _importable("nvidia.nvcomp")
     caps["gpu_io"] = usable and _importable("kvikio")
+    caps["gds"] = caps["gpu_io"] and probe_device and _gds_available()
     return caps

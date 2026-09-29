@@ -480,6 +480,8 @@ return them with ``device="cuda"``. See :doc:`../how_to/gpu`.
 
 .. autoclass:: zarr_vectors.building.CellReadError
 
+.. autoclass:: zarr_vectors.building.ArrayRead
+
 .. autofunction:: zarr_vectors.building.read_all_object_manifests_csr
 
 .. autoclass:: zarr_vectors.building.ManifestCSR

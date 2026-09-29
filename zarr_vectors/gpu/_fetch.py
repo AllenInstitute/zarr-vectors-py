@@ -57,13 +57,17 @@ class RawCells:
     """Stored bytes of many cells in one device buffer.
 
     Cell ``i`` is ``data[starts[i]:starts[i] + sizes[i]]``; a size of 0
-    means nothing is stored there, which reads as an empty cell.
+    means nothing is stored there, which reads as an empty cell. ``path``
+    is how the bytes were read: ``gds`` (kvikio with GPUDirect Storage),
+    ``kvikio-compat`` (kvikio through cuFile's bounce buffer),
+    ``pinned-host`` or ``store``.
     """
 
     data: Any
     starts: np.ndarray
     sizes: np.ndarray
     errors: dict[int, str]
+    path: str = ""
 
 
 # --------------------------------------------------------------------
@@ -91,10 +95,16 @@ def fetch_many(
     remote = [i for i, (src, _) in enumerate(requests) if src.local_root is None]
     if local:
         got = _fetch_local([requests[i] for i in local], kvikio=how == "kvikio")
+        if how == "host":
+            path = "pinned-host"
+        else:
+            path = "gds" if _gds.gds_status().available else "kvikio-compat"
         for i, raw in zip(local, got):
+            raw.path = path
             out[i] = raw
     for i in remote:
         out[i] = _fetch_store(*requests[i])
+        out[i].path = "store"  # type: ignore[union-attr]
     return out  # type: ignore[return-value]
 
 

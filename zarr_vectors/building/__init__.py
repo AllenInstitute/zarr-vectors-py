@@ -141,6 +141,7 @@ from zarr_vectors.core.arrays import (
     write_object_index,
 )
 from zarr_vectors.core.cells import (
+    ArrayRead,
     CellBatch,
     CellColumn,
     CellReadError,
@@ -783,6 +784,7 @@ __all__ = [
     "MeshChunkInfo",
     "MeshReader",
     "CAP_FRAGMENT_INDEX",
+    "ArrayRead",
     "CellBatch",
     "CellColumn",
     "CellReadError",

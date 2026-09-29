@@ -81,6 +81,10 @@ FEATURES: frozenset[str] = frozenset({
     # read_cells(device="cuda", io=...): the local-file read path chosen
     # per call, auto following cuFile's GPUDirect Storage verdict.
     "device-io",
+    # CellBatch.io / io_seconds: how each array of a read was served
+    # (gds, kvikio-compat, pinned-host, store, host) and where the time
+    # went; runtime_capabilities(probe_device=True)["gds"].
+    "read-io-report",
 })
 
 
