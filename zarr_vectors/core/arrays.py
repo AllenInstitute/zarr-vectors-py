@@ -170,6 +170,91 @@ _EMPTY_MANIFEST_BLOB = encode_object_manifest_blocks([], sid_ndim=1)
 OBJECT_ATTRIBUTE_ROW_BUCKET = 65_536
 
 
+#: Rows an object-layer shard holds a whole number of. Both row buckets
+#: (16,384 manifest rows, 65,536 attribute rows) tile it, so every
+#: object-layer array can share one shard size.
+OBJECT_SHARD_ROW_MULTIPLE = OBJECT_ATTRIBUTE_ROW_BUCKET
+
+#: Object-layer arrays whose sharding is the level's, probed in this order.
+_OBJECT_LAYER_PROBES = (
+    f"{OBJECT_INDEX}/manifests",
+    f"{OBJECT_INDEX}/manifest_spans",
+    f"{OBJECT_INDEX}/object_ids",
+    f"{OBJECT_INDEX}/manifest_blocks",
+)
+
+
+def check_object_shard_rows(rows: Any) -> int:
+    """``rows`` as an object-layer shard size, or :class:`ArrayError`."""
+    try:
+        n = int(rows)
+    except (TypeError, ValueError):
+        n = 0
+    if n <= 0 or n % OBJECT_SHARD_ROW_MULTIPLE:
+        raise ArrayError(
+            f"object-layer shard rows must be a positive multiple of "
+            f"{OBJECT_SHARD_ROW_MULTIPLE}; got {rows!r}"
+        )
+    return n
+
+
+def object_shard_rows(level_group: Group) -> int | None:
+    """Rows per shard of the level's object layer, or ``None`` if unsharded.
+
+    Read from the arrays themselves -- sharding lives in each array's own
+    ``zarr.json`` (zarr's ``sharding_indexed``, which any Zarr v3 reader
+    reads), so there is no zarr-vectors key for it and nothing for an
+    older reader to misread. Every writer that creates or rewrites an
+    object-layer array asks this first, so an array created later (a new
+    attribute column, an index rewritten in full) follows the layout the
+    level already has.
+    """
+    import zarr
+
+    def _rows(path: str) -> int | None:
+        node = level_group._lookup_node(path)
+        if isinstance(node, zarr.Array) and node.shards is not None:
+            return int(node.shards[0])
+        return None
+
+    for path in _OBJECT_LAYER_PROBES:
+        rows = _rows(path)
+        if rows is not None:
+            return rows
+    if level_group.array_exists(OBJECT_ATTRIBUTES):
+        for name in sorted(level_group[OBJECT_ATTRIBUTES].children()):
+            rows = _rows(f"{OBJECT_ATTRIBUTES}/{name}")
+            if rows is not None:
+                return rows
+    return None
+
+
+def object_layer_arrays(level_group: Group) -> list[str]:
+    """Every object-layer array the level holds: the object index's
+    arrays and each object attribute column (not the single-chunk
+    groupings)."""
+    import zarr
+
+    paths = [
+        p for p in _OBJECT_LAYER_PROBES
+        if isinstance(level_group._lookup_node(p), zarr.Array)
+    ]
+    if level_group.array_exists(OBJECT_ATTRIBUTES):
+        for name in sorted(level_group[OBJECT_ATTRIBUTES].children()):
+            path = f"{OBJECT_ATTRIBUTES}/{name}"
+            if isinstance(level_group._lookup_node(path), zarr.Array):
+                paths.append(path)
+    return paths
+
+
+def _object_shards(
+    level_group: Group, chunks: Sequence[int], shard_rows: int | None = None,
+) -> tuple[int, ...] | None:
+    """The ``shards=`` for an object-layer array chunked at ``chunks``."""
+    rows = shard_rows if shard_rows is not None else object_shard_rows(level_group)
+    return None if rows is None else (int(rows), *(int(c) for c in chunks[1:]))
+
+
 # ===================================================================
 # Helpers
 # ===================================================================
@@ -2491,6 +2576,7 @@ def _write_object_id_table(level_group: Group, row_ids: Sequence[int]) -> None:
     level_group.write_array(
         f"{OBJECT_INDEX}/{OBJECT_IDS_ARRAY}", ids,
         chunks=(OBJECT_INDEX_MANIFEST_BUCKET,),
+        shards=_object_shards(level_group, (OBJECT_INDEX_MANIFEST_BUCKET,)),
     )
 
 
@@ -2715,6 +2801,7 @@ def _extend_object_id_table(
         level_group.write_array(
             path, np.concatenate([head, new_ids]),
             chunks=(OBJECT_INDEX_MANIFEST_BUCKET,),
+            shards=_object_shards(level_group, (OBJECT_INDEX_MANIFEST_BUCKET,)),
         )
     meta = level_group.read_array_meta(OBJECT_INDEX) or {}
     ascending = bool(meta.get(OBJECT_IDS_SORTED_ATTR, False)) and bool(
@@ -2862,6 +2949,7 @@ def _write_dense_index(
             level_group.write_array(
                 f"{OBJECT_INDEX}/{OBJECT_IDS_ARRAY}", table,
                 chunks=(OBJECT_INDEX_MANIFEST_BUCKET,),
+                shards=_object_shards(level_group, (OBJECT_INDEX_MANIFEST_BUCKET,)),
             )
             level_group.write_array_meta(OBJECT_INDEX, {
                 OBJECT_IDS_SORTED_ATTR: bool(np.all(np.diff(table) > 0)),
@@ -2977,6 +3065,8 @@ def _write_object_index_manifests(
             _extend_object_id_table(level_group, start, new_ids)
         return start
 
+    # Asked before the old array goes, so a full rewrite keeps its shards.
+    shards = _object_shards(level_group, (OBJECT_INDEX_MANIFEST_BUCKET,))
     for legacy in ("manifests", "data", "offsets"):
         if legacy in oi_group:
             del oi_group[legacy]
@@ -3013,6 +3103,7 @@ def _write_object_index_manifests(
             "manifests",
             shape=(n,),
             chunks=(chunk_size,),
+            shards=shards,
             dtype="bytes",
             serializer=VLenBytesCodec(),
         )
@@ -3198,9 +3289,11 @@ def write_object_attributes(
     # flush of a per-spatial-chunk build is small, and sizing the chunk to it
     # would leave a 27M-row column split into hundreds of thousands of them.
     # Zarr allows a chunk larger than the array.
+    chunks = (OBJECT_ATTRIBUTE_ROW_BUCKET, *write_data.shape[1:])
     level_group.write_array(
         full_name, write_data,
-        chunks=(OBJECT_ATTRIBUTE_ROW_BUCKET, *write_data.shape[1:]),
+        chunks=chunks,
+        shards=_object_shards(level_group, chunks),
         fill_value=fill_value,
         attributes=_attrs(write_data.shape),
     )

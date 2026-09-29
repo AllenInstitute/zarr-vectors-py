@@ -214,6 +214,41 @@ of tiny files for the fragment indices alone. With sharding, many
 fragment-index chunks are packed into a single shard, and a viewer can
 fetch the entire spatial index for a region in a handful of requests.
 
+### Sharding the object layer
+
+The object layer -- `object_index/`'s arrays (`manifests`, or the dense
+`manifest_spans` / `manifest_blocks`, and `object_ids`) and every
+`object_attributes/<name>` column -- has no spatial grid: each array is 1-D
+along objects, chunked in fixed row buckets of 16,384 (index) or 65,536
+(attribute) rows, one storage object per bucket. At 10^9 objects that is
+about 61,000 objects per index array and 15,000 per attribute column.
+
+These arrays may be sharded along rows with the same `sharding_indexed`
+codec, the shard a whole number of buckets. zarr-vectors-py requires the
+shard to hold a multiple of 65,536 rows, so both buckets tile it and every
+array in the layer can share one shard size. This is not a format change:
+the sharding is recorded only in each array's own `zarr.json`, which any
+Zarr v3 reader already understands, and no zarr-vectors metadata key names
+it. A reader reads a sharded object layer exactly as an unsharded one.
+
+zarr-vectors-py keeps a level's object layer in one layout: a writer that
+creates or rewrites an object-layer array (a new attribute column, an index
+rewritten in full) takes the shard size the level's existing object arrays
+have.
+
+```python
+from zarr_vectors.building import shard_object_layer, shard_store
+
+shard_object_layer(level, 1_048_576)        # 16 attribute buckets per shard
+shard_object_layer(level, None)             # back to one object per bucket
+shard_store("scan.zv", shard_shape=8, object_shard_rows=1_048_576)
+```
+
+A write into part of a shard rewrites that shard, so a writer appending in
+small batches pays for the whole shard each time: batch appends in shard-
+sized blocks. For the same reason, the shard (not the bucket) is the unit of
+concurrency for writers that fill disjoint row ranges in parallel.
+
 ### Compatibility
 
 Sharding requires Zarr v3 ≥ 2.18 (where `sharding_indexed` is built in).

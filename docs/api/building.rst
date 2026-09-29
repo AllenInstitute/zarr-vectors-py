@@ -375,6 +375,10 @@ consumers cannot ask the store and run before any coordinator pass -- see
 
 .. autofunction:: zarr_vectors.building.cell_objects
 
+.. autofunction:: zarr_vectors.building.shard_object_layer
+
+.. autofunction:: zarr_vectors.building.object_shard_rows
+
 .. autofunction:: zarr_vectors.building.store_layout
 
 .. autoclass:: zarr_vectors.building.StoreLayout
