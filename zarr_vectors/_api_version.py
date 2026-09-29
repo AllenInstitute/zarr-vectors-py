@@ -102,6 +102,9 @@ FEATURES: frozenset[str] = frozenset({
     # fsynced before the block returns; building.cell_objects names the
     # object (or shard) holding each cell.
     "durable-writes",
+    # building.store_layout: a store's layout resolved from what it holds,
+    # with min_reader, the oldest zarr-vectors that reads all of it.
+    "store-layout",
 })
 
 
