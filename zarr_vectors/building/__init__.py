@@ -71,6 +71,7 @@ from zarr_vectors.core.arrays import (
     OBJECT_INDEX_LAYOUT_V1,
     OBJECT_INDEX_LAYOUT_V2,
     OBJECT_INDEX_MANIFEST_BUCKET,
+    OBJECT_SHARD_ROW_MULTIPLE,
     ManifestCSR,
     attribute_layout,
     # --- links ---
@@ -102,6 +103,7 @@ from zarr_vectors.core.arrays import (
     list_link_deltas,
     list_link_offsets,
     object_count,
+    object_shard_rows,
     # --- write sessions ---
     open_write_session,
     patch_object_manifests,
@@ -223,6 +225,7 @@ from zarr_vectors.rechunk import RechunkSpec, rechunk, rechunk_by_attribute
 from zarr_vectors.sharding.io import (
     get_shard_info,
     reshard,
+    shard_object_layer,
     shard_store,
     unshard_store,
 )
@@ -536,6 +539,10 @@ class StoreLayout:
         link_policy: ``{delta: (directed, store)}`` for each link family.
         presence_deferred: The level is under :func:`defer_presence`.
         min_reader: Oldest zarr-vectors format that reads this layout.
+        object_shard_rows: Rows per shard of the level's object layer, as
+            its arrays hold it (:func:`shard_object_layer`); ``None`` for
+            one object per row bucket. Zarr's own sharding, so it does
+            not move ``min_reader``.
     """
 
     created_by: str | None
@@ -545,6 +552,7 @@ class StoreLayout:
     link_policy: dict[int, tuple[bool, str]] = field(default_factory=dict)
     presence_deferred: bool = False
     min_reader: str = "0.9.0"
+    object_shard_rows: int | None = None
 
 
 def store_layout(root_or_level: Group, *, level: int = 0) -> StoreLayout:
@@ -579,7 +587,9 @@ def store_layout(root_or_level: Group, *, level: int = 0) -> StoreLayout:
     object_index = None
     links: dict[int, tuple[bool, str]] = {}
     deferred = False
+    object_rows = None
     if level_group is not None:
+        object_rows = object_shard_rows(level_group)
         if level_group.array_exists(OBJECT_INDEX):
             object_index = (
                 OBJECT_INDEX_LAYOUT_DENSE if is_dense_index(level_group)
@@ -605,6 +615,7 @@ def store_layout(root_or_level: Group, *, level: int = 0) -> StoreLayout:
         link_policy=links,
         presence_deferred=deferred,
         min_reader=min_reader,
+        object_shard_rows=object_rows,
     )
 
 
@@ -1152,6 +1163,7 @@ __all__ = [
     # correctly?" is a question only an outside reader can answer, and it needs
     # the reference value to answer it against.
     "OBJECT_INDEX_MANIFEST_BUCKET",
+    "OBJECT_SHARD_ROW_MULTIPLE",
     "ObjectIndexAppender",
     "RechunkSpec",
     "RootMetadata",
@@ -1234,6 +1246,7 @@ __all__ = [
     "list_resolution_levels",
     "neighbouring_chunk_keys",
     "object_count",
+    "object_shard_rows",
     "observe_presence_writes",
     "open_store",
     "open_write_session",
@@ -1284,6 +1297,7 @@ __all__ = [
     "session_for",
     "set_coordinate_offset",
     "set_presence",
+    "shard_object_layer",
     "shard_store",
     "split_polyline_at_boundaries",
     "unshard_store",

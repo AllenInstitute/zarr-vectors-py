@@ -214,7 +214,12 @@ def present_mask(level_group: Group, stop: int | None = None) -> npt.NDArray[np.
 
 
 def _create(level_group: Group, path: str, data: npt.NDArray[np.int64]) -> None:
-    level_group.write_array(path, data, chunks=(_BUCKET, *data.shape[1:]))
+    from zarr_vectors.core.arrays import _object_shards
+
+    chunks = (_BUCKET, *data.shape[1:])
+    level_group.write_array(
+        path, data, chunks=chunks, shards=_object_shards(level_group, chunks),
+    )
 
 
 def write(
