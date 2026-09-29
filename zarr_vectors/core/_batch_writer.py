@@ -48,6 +48,7 @@ import zarr
 from zarr.core.buffer import default_buffer_prototype
 from zarr.core.sync import sync
 from zarr.errors import UnstableSpecificationWarning
+from zarr.storage import LocalStore
 
 from zarr_vectors.exceptions import StoreError
 
@@ -169,6 +170,7 @@ def _flush_one_array(
     cells: dict[str, tuple[bytes, bool]],
     *,
     arr: zarr.Array | None = None,
+    touched: Any = None,
 ) -> None:
     """Write one array's queued cells and stamp its manifest.
 
@@ -185,6 +187,14 @@ def _flush_one_array(
 
     if arr is None:
         arr = zarr_group[array_name]
+    if touched is not None and isinstance(arr.store, LocalStore):
+        # Durable: the same array, written through a store that fsyncs
+        # each object (a shard, when sharded) before its rename.
+        from zarr_vectors.core._durable import DurableLocalStore
+
+        arr = zarr.open_array(
+            store=DurableLocalStore(arr.store, touched), path=arr.path, mode="r+",
+        )
     ndim = arr.ndim
     origin_raw = arr.attrs.get(_CHUNK_GRID_ORIGIN_ATTR)
     origin = (
@@ -333,6 +343,7 @@ _MADE_DIRS_LOCK = threading.Lock()
 
 def _direct_write_one(
     spec: _DirectWriteSpec, path: str, data: bytes, made: set[str],
+    touched: Any = None,
 ) -> None:
     """Encode and land one cell at ``path``.
 
@@ -340,14 +351,24 @@ def _direct_write_one(
     ``write_empty_chunks`` off (its default), *deletes* rather than
     writes -- so this does the same, and a cell that reads back ``b""``
     is one with no object behind it either way.
+
+    ``touched`` makes the write durable (see :mod:`._durable`): the file
+    is fsynced before its rename, and its directory is recorded there.
     """
     if not data and not spec.write_empty_chunks:
         try:
             os.remove(path)
         except FileNotFoundError:
-            pass
+            return
+        if touched is not None:
+            touched.add(os.path.dirname(path))
         return
     encoded = _encode_direct(spec, data)
+    if touched is not None:
+        from zarr_vectors.core._durable import write_file
+
+        write_file(path, encoded, touched)
+        return
     directory = os.path.dirname(path)
     if directory not in made:
         os.makedirs(directory, exist_ok=True)
@@ -392,6 +413,7 @@ def _write_pool() -> Any:
 
 def _direct_write_many(
     jobs: list[tuple[_DirectWriteSpec, str, bytes]],
+    touched: Any = None,
 ) -> None:
     """Write every ``(spec, path, data)`` job, in parallel when there are
     enough of them to be worth it.  Raises the first failure."""
@@ -400,10 +422,10 @@ def _direct_write_many(
     made: set[str] = set()
     if len(jobs) < _PARALLEL_WRITE_MIN or _NO_THREADS:
         for spec, path, data in jobs:
-            _direct_write_one(spec, path, data, made)
+            _direct_write_one(spec, path, data, made, touched)
         return
     futures = [
-        _write_pool().submit(_direct_write_one, spec, path, data, made)
+        _write_pool().submit(_direct_write_one, spec, path, data, made, touched)
         for spec, path, data in jobs
     ]
     for future in futures:
@@ -455,7 +477,8 @@ def _stamp_presence(
 def _flush_native_cells(
     zarr_group: zarr.Group,
     cells_in: list[tuple[str, str, bytes, bool]],
-) -> None:
+    touched: Any = None,
+) -> list[str]:
     """Flush queued cell writes into their vlen-bytes chunk arrays.
 
     Each ``array_name`` is a single multidim vlen-bytes Zarr array whose
@@ -478,6 +501,10 @@ def _flush_native_cells(
     ``nonempty_chunks`` is stamped once per array rather than once per
     cell, and only over the cells whose ``record_presence`` is True; see
     :func:`_presence_after`.
+
+    ``touched`` makes every cell write durable (see :mod:`._durable`).
+    Returns the arrays whose ``nonempty_chunks`` the direct path stamped,
+    so a durable caller can fsync their metadata.
     """
     by_array: dict[str, dict[str, tuple[bytes, bool]]] = defaultdict(dict)
     for array_name, chunk_key, data, record_presence in cells_in:
@@ -485,7 +512,7 @@ def _flush_native_cells(
         by_array[array_name][chunk_key] = (data, record_presence)
 
     if not by_array:
-        return
+        return []
 
     from zarr_vectors.core._batch_reader import _direct_path
     from zarr_vectors.core.aio import _resolve_nodes
@@ -524,29 +551,32 @@ def _flush_native_cells(
 
     # Suppressed out here, once: ``catch_warnings`` swaps global state and
     # is not safe to enter from the workers.
+    stamped = [arr.path for _name, arr, _present, _cells in stamps]
     with warnings.catch_warnings():
         warnings.simplefilter("ignore", UnstableSpecificationWarning)
-        _direct_write_many(direct_jobs)
+        _direct_write_many(direct_jobs, touched)
         _stamp_presence(stamps)
 
         if not general:
-            return
+            return stamped
         if len(general) == 1 or _NO_THREADS:
             for array_name, (arr, cells) in general.items():
-                _flush_one_array(zarr_group, array_name, cells, arr=arr)
-            return
+                _flush_one_array(zarr_group, array_name, cells, arr=arr, touched=touched)
+            return stamped
         with ThreadPoolExecutor(
             max_workers=min(_FLUSH_MAX_WORKERS, len(general)),
         ) as pool:
             futures = [
                 pool.submit(
                     _flush_one_array, zarr_group, array_name, cells, arr=arr,
+                    touched=touched,
                 )
                 for array_name, (arr, cells) in general.items()
             ]
             for future in futures:
                 # Re-raise the first failure, after every worker settles.
                 future.result()
+    return stamped
 
 
 def flush_batch(
@@ -555,6 +585,7 @@ def flush_batch(
     *,
     array_metas: dict[str, dict[str, Any]] | None = None,
     codecs: list[dict[str, Any]] | None = None,
+    durable: bool = False,
 ) -> None:
     """Flush a batch of cell writes + group-metadata writes.
 
@@ -578,6 +609,11 @@ def flush_batch(
     All PUTs go through one :func:`asyncio.gather`, then the function
     blocks until they complete (or the first error propagates).
     Idempotent on empty inputs.
+
+    ``durable`` (a local store only; elsewhere a returned PUT already is
+    durable): every cell object -- a shard, when sharded -- is fsynced
+    before its rename, and before returning so are the metadata documents
+    the batch wrote and every directory it changed. See :mod:`._durable`.
     """
     del codecs
     cells = list(cells)
@@ -586,11 +622,36 @@ def flush_batch(
     if not cells and not array_metas:
         return
 
+    touched = None
+    if durable and isinstance(zarr_group.store, LocalStore):
+        from zarr_vectors.core._durable import Touched
+
+        touched = Touched()
+
+    stamped: list[str] = []
     if cells:
-        _flush_native_cells(zarr_group, cells)
+        stamped = _flush_native_cells(zarr_group, cells, touched)
 
     if array_metas:
         _flush_group_metas(zarr_group, array_metas)
+
+    if touched is not None:
+        from zarr_vectors.core._durable import fsync_files
+
+        # Metadata documents land through zarr, already renamed into
+        # place: fsync them, then (below) the directories holding them.
+        root = str(zarr_group.store.root)
+        base = zarr_group.path.strip("/")
+        docs = [os.path.join(root, p, "zarr.json") for p in stamped]
+        docs += [
+            os.path.join(root, base, name, "zarr.json") if base
+            else os.path.join(root, name, "zarr.json")
+            for name in array_metas
+        ]
+        fsync_files(docs)
+        for doc in docs:
+            touched.add(os.path.dirname(doc))
+        touched.sync()
 
 
 def _flush_group_metas(

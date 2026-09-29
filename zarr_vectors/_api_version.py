@@ -98,6 +98,10 @@ FEATURES: frozenset[str] = frozenset({
     # building.commit_object_index: the object index's metadata committed
     # after manifest writes, num_present counted rather than carried.
     "commit-object-index",
+    # batched_writes / open_write_session(durable=True): local writes
+    # fsynced before the block returns; building.cell_objects names the
+    # object (or shard) holding each cell.
+    "durable-writes",
 })
 
 
