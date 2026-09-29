@@ -5056,8 +5056,17 @@ def _write_link_cells_arrays(
     if intra_keys:
         plan.append((LINK_FRAGMENTS, sorted(set(intra_keys))))
     cache = flush_prefetch(level_group._zarr, plan)
+    # The prefetch reads the store. Inside a shard transaction a cell the
+    # transaction holds -- written, or under "replace" not yet written --
+    # must come from it, as Group.read_bytes serves it: otherwise an append
+    # after a cleared cell keeps the store's old rows.
+    txn = level_group._shard_txn
 
     def raw(name: str, key: str) -> bytes:
+        if txn is not None:
+            staged = txn.lookup(name, key)
+            if staged is not None:
+                return staged
         return cache.get((name, key)) or b""
 
     physical = 0

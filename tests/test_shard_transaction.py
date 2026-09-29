@@ -163,6 +163,30 @@ def test_an_append_inside_starts_from_the_transaction_not_the_last_attempt(tmp_p
     ])
 
 
+@pytest.mark.parametrize("mode", ["replace", "merge"])
+def test_an_array_form_link_append_reads_the_transaction(tmp_path, mode):
+    """``write_link_cells(chunks=, vids=)`` prefetches the cells it appends to.
+
+    That prefetch reads the store; inside a transaction the cells the
+    transaction holds must win, or a cell cleared in the transaction (a
+    retried task's reset, under ``merge``) keeps the store's old rows.
+    """
+    level = _level(tmp_path / "s.zv")
+    zb.create_links_array(level, 2, delta=0, sid_ndim=3, offsets=((1, 0, 0),))
+    chunks = np.array([[[0, 0, 0], [1, 0, 0]]], dtype=np.int64)
+    zb.write_link_cells(level, chunks=chunks, vids=np.array([[7, 8]]), sid_ndim=3)
+    seam = zb.links_path(0, ((1, 0, 0),))
+    with zb.shard_transaction(level, (0, 0, 0), mode=mode):
+        if mode == "merge":
+            level.write_bytes(seam, "0.0.0", b"", record_presence=False)
+        zb.write_link_cells(level, chunks=chunks, vids=np.array([[1, 2]]), sid_ndim=3)
+        zb.write_link_cells(level, chunks=chunks, vids=np.array([[3, 4]]), sid_ndim=3)
+    zb.rebuild_presence(level)
+    zb.finalize_links(level, delta=0)
+    got = sorted((int(a[1]), int(b[1])) for a, b in zb.read_links(level, delta=0))
+    assert got == [(1, 2), (3, 4)]
+
+
 def test_what_was_written_is_the_presence(tmp_path):
     level = _level(tmp_path / "s.zv")
     written: dict[str, set[str]] = {}
