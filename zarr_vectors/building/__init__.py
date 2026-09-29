@@ -36,6 +36,7 @@ because a name used from ``core`` is a name nobody knows is load-bearing.
 from __future__ import annotations
 
 from collections.abc import Iterable, Mapping
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -502,6 +503,109 @@ def cell_objects(
         key = arr.metadata.encode_chunk_key(tuple(i // o for i, o in zip(index, outer)))
         keys.append(f"{base}/{key}" if base else key)
     return keys
+
+
+#: The oldest zarr-vectors that reads each layout feature a store can use.
+#: The single-array chunk layout (0.9.0) is the floor.
+_FIRST_READER: dict[str, str] = {
+    "single_array_chunks": "0.9.0",
+    OBJECT_INDEX_LAYOUT_V2: "0.9.2",
+    "presence_deferred": "0.9.3",
+    OBJECT_INDEX_LAYOUT_DENSE: "0.9.4",
+}
+
+
+@dataclass(frozen=True)
+class StoreLayout:
+    """How a store's bytes are laid out, resolved from what it holds.
+
+    Every field is read from the store, not assumed from the build that
+    reads it. ``created_by`` is the ``zv_version`` stamped when the store
+    was created -- never updated after, so it is not the layout. The
+    layout is the rest; ``min_reader`` sums it up as the oldest
+    zarr-vectors that can read all of it.
+
+    Attributes:
+        created_by: Format version of the build that created the store.
+        format_capabilities: Capability tokens the store declares.
+        shard_shape: The store's declared cells per shard (the default
+            for new arrays); ``None`` for one object per cell.
+        object_index: The level's object-index layout
+            (``vlen_manifests_v1``, ``vlen_manifests_v2``,
+            ``dense_manifests_v1``), or ``None`` when it has none.
+        link_policy: ``{delta: (directed, store)}`` for each link family.
+        presence_deferred: The level is under :func:`defer_presence`.
+        min_reader: Oldest zarr-vectors format that reads this layout.
+    """
+
+    created_by: str | None
+    format_capabilities: tuple[str, ...]
+    shard_shape: tuple[int, ...] | int | None
+    object_index: str | None
+    link_policy: dict[int, tuple[bool, str]] = field(default_factory=dict)
+    presence_deferred: bool = False
+    min_reader: str = "0.9.0"
+
+
+def store_layout(root_or_level: Group, *, level: int = 0) -> StoreLayout:
+    """The layout of a store, and of one of its levels, as one object.
+
+    Given a level group, describes that level; given the root, level
+    ``level`` (0 by default). Answers what ``FORMAT_VERSION`` and
+    ``zv_version`` cannot: a store's layout is recorded structure by
+    structure (the object index's ``layout`` stamp, each link family's
+    policy, the presence declaration, the shard declaration), some of it
+    added after the store was created, and not every layout change moved
+    the format version.
+    """
+    import zarr
+
+    from zarr_vectors._api_version import parse_version
+
+    group = root_or_level
+    if "zarr_vectors" in (group.attrs.to_dict() or {}):
+        root = group
+        try:
+            level_group = get_resolution_level(root, level)
+        except StoreError:
+            level_group = None
+    else:
+        level_group = group
+        root = type(group)._from_zarr(
+            zarr.open_group(group._zarr.store, path="/", mode="r"),
+        )
+    meta = read_root_metadata(root)
+    shard = meta.shard_shape
+    object_index = None
+    links: dict[int, tuple[bool, str]] = {}
+    deferred = False
+    if level_group is not None:
+        if level_group.array_exists(OBJECT_INDEX):
+            object_index = (
+                OBJECT_INDEX_LAYOUT_DENSE if is_dense_index(level_group)
+                else (level_group.read_array_meta(OBJECT_INDEX) or {}).get("layout")
+                or OBJECT_INDEX_LAYOUT_V1
+            )
+        for delta in list_link_deltas(level_group):
+            policy = link_family_policy(level_group, delta)
+            if policy is not None:
+                links[int(delta)] = (bool(policy[2]), str(policy[3]))
+        deferred = level_group.presence_deferred()
+    features = ["single_array_chunks"]
+    if object_index in _FIRST_READER:
+        features.append(object_index)
+    if deferred:
+        features.append("presence_deferred")
+    min_reader = max((_FIRST_READER[f] for f in features), key=parse_version)
+    return StoreLayout(
+        created_by=meta.zv_version,
+        format_capabilities=tuple(meta.format_capabilities or ()),
+        shard_shape=tuple(shard) if isinstance(shard, list) else shard,
+        object_index=object_index,
+        link_policy=links,
+        presence_deferred=deferred,
+        min_reader=min_reader,
+    )
 
 
 def is_sharded(level_group: Group, array_name: str) -> bool:
@@ -1051,6 +1155,7 @@ __all__ = [
     "ObjectIndexAppender",
     "RechunkSpec",
     "RootMetadata",
+    "StoreLayout",
     "VERTEX_ATTRIBUTES",
     "VERTEX_FRAGMENTS",
     "VERTICES",
@@ -1171,6 +1276,7 @@ __all__ = [
     "rechunk_by_attribute",
     "refresh_arrays_present",
     "stamp_ome_node",
+    "store_layout",
     "register_coarsen_strategy",
     "register_selection_strategy",
     "remove_resolution_level",
