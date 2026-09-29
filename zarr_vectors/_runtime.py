@@ -37,6 +37,10 @@ _STATIC: dict[str, bool] = {
     # Serial writes only: two processes writing one cell at once can
     # still lose rows.
     "link_cells_append": True,
+    # zarr_vectors.concurrency_contract(): which writes several processes
+    # may make at once -- per-chunk shards, and the object layer's
+    # reserved rows written with mode="place".
+    "concurrency_contract": True,
     # The dense object-index layout (create_store(manifest_layout="dense")).
     "dense_manifests": True,
 }

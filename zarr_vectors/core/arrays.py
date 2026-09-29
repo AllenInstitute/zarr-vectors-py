@@ -2527,9 +2527,13 @@ def commit_object_index(
             num_present = int(dense.present_mask(level_group, stop=n).sum())
         else:
             blobs = level_group.read_vlen_array_raw(manifests_path, stop=n)
-            num_present = sum(
-                1 for b in blobs if b and bytes(b) != _EMPTY_MANIFEST_BLOB
-            )
+            unwritten = sum(1 for b in blobs if not b)
+            if unwritten:
+                raise ArrayError(
+                    f"commit_object_index: {unwritten} of the {n} rows hold no "
+                    f"manifest at all -- reserved or padded rows nothing wrote"
+                )
+            num_present = sum(1 for b in blobs if bytes(b) != _EMPTY_MANIFEST_BLOB)
     elif not 0 <= int(num_present) <= n:
         raise ArrayError(f"num_present {num_present} is outside [0, {n}]")
     out: dict[str, Any] = {
@@ -2547,6 +2551,12 @@ def commit_object_index(
                 raise ArrayError(
                     f"commit_object_index: the id table holds {table.size} "
                     f"ids for {n} committed rows"
+                )
+            unwritten = int(np.count_nonzero(table < 0))
+            if unwritten:
+                raise ArrayError(
+                    f"commit_object_index: {unwritten} of the {n} rows have no "
+                    f"object id -- reserved rows nothing wrote"
                 )
             object_ids_sorted = bool(np.all(np.diff(table) > 0))
         out[OBJECT_IDS_SORTED_ATTR] = bool(object_ids_sorted)
@@ -3118,7 +3128,7 @@ def write_object_attributes(
     *,
     present_mask: npt.NDArray | None = None,
     fill_value: Any = None,
-    mode: Literal["replace", "append"] = "replace",
+    mode: Literal["replace", "append", "place"] = "replace",
     at: int | None = None,
 ) -> None:
     """Write dense O×C object attribute data as a single Zarr v3 array.
@@ -3161,7 +3171,9 @@ def write_object_attributes(
             padded with ``fill_value``; a column reaching past it (the
             residue of a flush killed before it committed, whose rows no
             reader can address) is truncated back to ``at``.  ``None``
-            appends at the current end.
+            appends at the current end.  With ``mode="place"``, the first
+            of the reserved rows ``[at, at + n)`` to write in place (see
+            :func:`write_object_attribute_columns`).
 
     Raises:
         ArrayError: If ``mode`` is invalid, ``at`` is negative or given
@@ -3176,9 +3188,26 @@ def write_object_attributes(
         ``at`` makes a serialised writer *idempotent* — a retry lands on
         the same rows — it does not make concurrent writers safe.
     """
+    if mode == "place":
+        if at is None:
+            raise ArrayError('mode="place" needs at=')
+        rows = np.asarray(data)
+        if present_mask is not None:
+            node = level_group.zarr_group[f"{OBJECT_ATTRIBUTES}/{attr_name}"]
+            mask = np.asarray(present_mask).astype(bool).reshape(-1)
+            if mask.size != rows.shape[0]:
+                raise ArrayError(
+                    f"present_mask has {mask.size} rows; data has {rows.shape[0]}"
+                )
+            rows = rows.astype(node.dtype, copy=True)
+            rows[~mask] = node.fill_value if fill_value is None else fill_value
+        from zarr_vectors.core.object_rows import place_attribute_columns
+
+        place_attribute_columns(level_group, {attr_name: rows}, at)
+        return
     if mode not in ("replace", "append"):
         raise ArrayError(
-            f"mode must be 'replace' or 'append', got {mode!r}"
+            f"mode must be 'replace', 'append' or 'place', got {mode!r}"
         )
     if at is not None:
         if mode != "append":
@@ -3303,7 +3332,7 @@ def write_object_attribute_columns(
     level_group: Group,
     columns: Mapping[str, Any],
     *,
-    mode: Literal["replace", "append"] = "append",
+    mode: Literal["replace", "append", "place"] = "append",
     at: int | None = None,
     fill_values: Any = None,
 ) -> None:
@@ -3320,7 +3349,11 @@ def write_object_attribute_columns(
     Args:
         level_group: Resolution level group.
         columns: ``{name: rows}``; device arrays are copied off once each.
-        mode: ``"append"`` (the default) or ``"replace"``.
+        mode: ``"append"`` (the default), ``"replace"``, or ``"place"``:
+            rows ``[at, at + n)`` of columns sized by
+            :func:`~zarr_vectors.core.object_rows.reserve_object_rows`,
+            and nothing else, for several processes writing disjoint,
+            aligned ranges at once.
         at: Row the new rows start at, as for :func:`write_object_attributes`.
         fill_values: The absent-row sentinel: one value for every column,
             or a mapping by name (missing names use the dtype default).
@@ -3337,6 +3370,13 @@ def write_object_attribute_columns(
         return fill_values
 
     host = {name: _xp.to_host(col) for name, col in columns.items()}
+    if mode == "place":
+        from zarr_vectors.core.object_rows import place_attribute_columns
+
+        if at is None:
+            raise ArrayError('mode="place" needs at=')
+        place_attribute_columns(level_group, host, at)
+        return
     if mode != "append":
         for name, data in host.items():
             write_object_attributes(

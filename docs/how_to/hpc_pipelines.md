@@ -462,13 +462,47 @@ writing back to racing.
 Two things are shared between workers here, unlike the cell writes in the
 patterns above:
 
-- **The object index and object attribute columns.** Pass the row with
-  `at=` on every append, and never let flush order choose it. Until the
-  concurrency contract is written down, append to them from one process at
-  a time, for example under the lock that guards the object count.
+- **The object index and object attribute columns.** An `at=` append is a
+  resume cursor for one writer: below the current length it truncates what
+  follows, above it pads, and every call resizes. Several processes must not
+  append at once. To fill the object layer in parallel, reserve it and place
+  rows instead (below).
 - **Seam link cells.** A seam is stored in the cell of its anchor chunk,
   which may belong to another worker's partition. Either route each seam to
   the worker that owns its anchor, or serialise these writes too.
+
+`zv.concurrency_contract()` states what may be written at once: cells or
+shards owned by one process each, and object-layer rows placed in disjoint,
+aligned ranges after one reservation.
+
+```python
+# Coordinator, before the workers:
+contract = zv.concurrency_contract(lg)       # at_alignment: 65,536 unsharded
+zb.reserve_object_rows(
+    lg, n_objects, sid_ndim=3,
+    n_blocks=block_starts[-1],               # dense index: see aligned_regions
+    columns={"length": "float32", "rgb": ("uint8", (3,))},
+    shard_rows=None,                         # or a multiple of 65,536
+)
+
+# Each worker, rows [lo, hi) with lo and hi multiples of at_alignment
+# (the last range may end at n_objects):
+zb.write_object_manifests(lg, chunk_coords=cc, fragment_idx=fi,
+                          manifest_offsets=off, mode="place", at=lo,
+                          block_at=block_starts[worker])   # dense only
+zb.write_object_attribute_columns(lg, {"length": lengths}, mode="place", at=lo)
+
+# Coordinator, once every worker has finished:
+zb.commit_object_index(lg, n_objects)
+```
+
+`mode="place"` writes only rows `[at, at + n)`: no resize, no padding, no
+metadata. A dense index also needs each worker's fragments at its own
+aligned block region: `zb.aligned_regions(counts, contract["block_alignment"])`
+turns per-worker fragment counts into region starts, and the last start is
+the `n_blocks` to reserve. Every reserved row must be written, an object with
+no fragments as an empty manifest; `commit_object_index` refuses rows nobody
+wrote where it can tell.
 
 A worker that needs a halo around its own chunk reads it in one prefetch
 with `zb.read_neighbourhood(lg, cc, arrays, halo=1)`. See

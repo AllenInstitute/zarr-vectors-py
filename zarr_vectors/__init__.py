@@ -83,6 +83,7 @@ from zarr_vectors.api import (
 # implementation detail that no annotation should name.
 from zarr_vectors.core.backends import detect_scheme  # noqa: F401
 from zarr_vectors.core.group import Group  # noqa: F401
+from zarr_vectors.core.object_rows import concurrency_contract  # noqa: F401
 from zarr_vectors.core.store import (  # noqa: F401
     FsGroup,
     create_store,
@@ -153,6 +154,7 @@ __all__ = [
     "FEATURES",
     "require_api",
     "runtime_capabilities",
+    "concurrency_contract",
     # --- the builder surface, as a module ---
     "building",
     "stability",
