@@ -116,12 +116,23 @@ each corrupted by one byte inside a block:
 Use `decode="device"` on stores you trust.
 
 Local files are read into pinned host memory and copied up once, or
-straight into device memory with kvikio. By default kvikio is used only
-when GPUDirect Storage is switched on (`KVIKIO_COMPAT_MODE=OFF`); in
-compatibility mode it reads through a bounce buffer, one copy per cell.
-`ZARR_VECTORS_GPU_IO=kvikio` or `=host` forces the choice. Any other
-zarr store (fsspec, obstore, icechunk) is read through its own byte-range
-`get`, then copied up once.
+straight into device memory with kvikio. "Local" means any store zarr
+opens as a `LocalStore`, network mounts included. By default kvikio is
+used only when cuFile reports GPUDirect Storage available
+(`kvikio.cufile_driver` properties, `is_gds_available`), which needs the
+nvidia-fs driver and a supported filesystem such as ext4 on NVMe. Without
+it cuFile reads through a bounce buffer, one copy per cell, which the
+host path does in one copy for all of them. kvikio's own compat-mode
+setting cannot tell the two apart; `KVIKIO_COMPAT_MODE=ON` does keep
+reads on the host path.
+
+`ZARR_VECTORS_GPU_IO=kvikio` or `=host` forces the choice. kvikio 25.x
+and 26.x both work, and anything unexpected from kvikio means the host
+path rather than an error. kvikio's default thread pool is one thread,
+which would read cells one after another, so reads through it run on up
+to 16 threads unless `KVIKIO_NTHREADS` or the process has set a count.
+Any other zarr store (fsspec, obstore, icechunk) is read through its own
+byte-range `get`, then copied up once.
 
 Measured on 4,097 cells (5 million points, vertices plus one attribute,
 warm cache, RTX A2000):
