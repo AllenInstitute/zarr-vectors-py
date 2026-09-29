@@ -272,6 +272,20 @@ declared, which is why `vertex_fragments` shows up even though `init_store.py`
 never listed it. Both it and `rebuild_presence` are coordinator verbs — never
 run either while tasks are still writing.
 
+`rebuild_presence` finds the cells by reading the store back: a listing and a
+read of every shard of every array. If your tasks already report the cells they
+wrote, the coordinator can record those instead and skip the read:
+
+```python
+set_presence(level, {"vertices": cells, "vertex_fragments": cells, ...},
+             end_deferral=True)
+```
+
+Each named array's manifest becomes exactly the cells given, so name every
+array the tasks wrote, and pass the union for a cell more than one task wrote.
+`end_presence_deferral` ends the declaration on its own, and refuses while any
+array is still without a manifest unless told `missing="derive"`.
+
 ### Stamping under your own lock
 
 A deferred level keeps every cell visible to current zarr-vectors readers, but
@@ -440,7 +454,10 @@ arrays as they are, with no blob per object, and a later
 
 When every worker has finished, the coordinator runs `zb.finalize_links(lg,
 delta=0)` once. It rebuilds presence for the link, link-attribute and
-link-fragment arrays, which the array-form link writer does not record.
+link-fragment arrays, which the array-form link writer does not record. In a
+deferred level it leaves presence alone, for the level's `rebuild_presence` or
+`set_presence`: a manifest written there would put the stamps of any task still
+writing back to racing.
 
 Two things are shared between workers here, unlike the cell writes in the
 patterns above:

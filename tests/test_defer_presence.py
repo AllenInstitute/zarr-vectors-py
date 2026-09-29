@@ -14,8 +14,11 @@ import pytest
 
 from zarr_vectors.building import (
     defer_presence,
+    end_presence_deferral,
     get_resolution_level,
+    per_chunk_array_paths,
     rebuild_presence,
+    set_presence,
     write_chunk_vertices,
 )
 from zarr_vectors.core.arrays import (
@@ -28,6 +31,7 @@ from zarr_vectors.core.arrays import (
 )
 from zarr_vectors.core.group import _NONEMPTY_CHUNKS_ATTR, _PRESENCE_DECL_ATTR
 from zarr_vectors.core.store import create_store, open_store
+from zarr_vectors.exceptions import ArrayError, StoreError
 
 CELLS = [(0, 0, 0), (1, 0, 0), (2, 3, 1), (4, 4, 4)]
 
@@ -240,3 +244,121 @@ def test_the_validator_warns_about_a_level_left_deferred(tmp_path):
 
     rebuild_presence(level)
     assert not any("deferred" in w for w in validate_metadata(str(path)).warnings)
+
+
+# --------------------------------------------------------------------
+# Presence the caller supplies, and ending a deferral on its own
+
+
+def _manifest(level, name):
+    return level.read_array_meta(name).get(_NONEMPTY_CHUNKS_ATTR)
+
+
+def test_supplied_presence_is_what_an_undeferred_build_records(tmp_path):
+    plain = _store(tmp_path / "plain.zv")
+    for cell in CELLS:
+        _write(plain, cell)
+
+    level = _store(tmp_path / "deferred.zv")
+    defer_presence(level)
+    for cell in CELLS:
+        _write(level, cell)
+    written = {name: list(CELLS) for name in ("vertices", "vertex_fragments")}
+    assert set_presence(level, written, end_deferral=True) == [
+        "vertex_fragments", "vertices",
+    ]
+    assert not level.presence_deferred()
+    for name in ("vertices", "vertex_fragments"):
+        assert _manifest(level, name) == _manifest(plain, name)
+    assert level.list_chunks("vertices") == sorted(_key(c) for c in CELLS)
+
+
+def test_supplied_presence_reads_nothing_back(tmp_path, monkeypatch):
+    from zarr_vectors.core.group import Group
+
+    level = _store(tmp_path / "s.zv")
+    defer_presence(level)
+    for cell in CELLS:
+        _write(level, cell)
+
+    def refuse(*a, **kw):
+        raise AssertionError("set_presence read the store back")
+
+    monkeypatch.setattr(Group, "derive_nonempty_chunks", refuse)
+    monkeypatch.setattr(Group, "read_bytes", refuse)
+    # Keys in either form, repeated and unordered.
+    set_presence(level, {"vertices": ["4.4.4", (0, 0, 0), "0.0.0"]})
+    assert _manifest(level, "vertices") == ["0.0.0", "4.4.4"]
+    assert level.presence_deferred()  # not asked to end it
+
+
+# The grid is 6 cells a side: a point on the upper bound (500) is storable.
+@pytest.mark.parametrize("bad", ["6.0.0", "-1.0.0", "0.0", "a.b.c"])
+def test_a_key_off_the_grid_writes_nothing(tmp_path, bad):
+    level = _store(tmp_path / "s.zv")
+    defer_presence(level)
+    _write(level, CELLS[0])
+    with pytest.raises(ArrayError, match="not a cell of"):
+        set_presence(level, {"vertex_fragments": ["0.0.0"], "vertices": ["0.0.0", bad]})
+    assert _manifest(level, "vertices") is None
+    assert _manifest(level, "vertex_fragments") is None
+
+
+def test_a_name_that_is_not_a_per_chunk_array_is_refused(tmp_path):
+    level = _store(tmp_path / "s.zv")
+    with pytest.raises(StoreError, match="not a per-chunk array"):
+        set_presence(level, {"object_index": []})
+    with pytest.raises(StoreError, match="not a per-chunk array"):
+        set_presence(level, {"no_such_array": []})
+
+
+def test_ending_refuses_while_an_array_has_no_manifest(tmp_path):
+    level = _store(tmp_path / "s.zv")
+    defer_presence(level)
+    for cell in CELLS:
+        _write(level, cell)
+    set_presence(level, {"vertices": CELLS})
+    with pytest.raises(StoreError, match="vertex_fragments"):
+        end_presence_deferral(level)
+    assert level.presence_deferred()
+
+    assert end_presence_deferral(level, missing="derive") == ["vertex_fragments"]
+    assert not level.presence_deferred()
+    assert _manifest(level, "vertex_fragments") == sorted(_key(c) for c in CELLS)
+    assert _PRESENCE_DECL_ATTR not in level.zarr_group.attrs
+
+
+def test_ending_after_every_array_is_supplied(tmp_path):
+    level = _store(tmp_path / "s.zv")
+    defer_presence(level)
+    for cell in CELLS[:2]:
+        _write(level, cell)
+    set_presence(level, {name: CELLS[:2] for name in per_chunk_array_paths(level)})
+    assert end_presence_deferral(level) == []
+    assert not level.presence_deferred()
+
+
+def test_supplied_presence_on_a_sharded_array(tmp_path):
+    level = _store(tmp_path / "s.zv", shard_shape=2)
+    defer_presence(level)
+    for cell in CELLS:
+        _write(level, cell)
+    set_presence(level, {"vertices": CELLS, "vertex_fragments": CELLS}, end_deferral=True)
+    assert _manifest(level, "vertices") == sorted(_key(c) for c in CELLS)
+    assert level.list_chunks("vertices") == sorted(_key(c) for c in CELLS)
+
+
+def test_finalizing_links_leaves_a_deferred_level_deferred(tmp_path):
+    level = _store(tmp_path / "s.zv")
+    defer_presence(level)
+    create_links_array(level, link_width=2, delta=0, sid_ndim=3)
+    write_link_cells(level, [[((0, 0, 0), 1), ((1, 0, 0), 2)]], sid_ndim=3)
+    write_link_cells(level, [[((0, 0, 0), 3), ((0, 0, 0), 4)]], sid_ndim=3)
+    partition = finalize_links(level, delta=0)
+    assert partition.num_links == 2  # counted from the store
+    # ...but no manifest came back for a worker's stamps to race on.
+    for name in per_chunk_array_paths(level):
+        if name.startswith(("links/", "link_fragments")):
+            assert _manifest(level, name) is None, name
+    rebuild_presence(level)
+    assert len(read_links(level, delta=0)) == 2
