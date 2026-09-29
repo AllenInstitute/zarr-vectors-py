@@ -16,6 +16,8 @@ from zarr_vectors.core.arrays import (
     list_link_offsets,
     read_chunk_attribute_rows,
     read_chunk_vertex_buffer,
+    read_vertex_fragment_index,
+    write_chunk_fragments,
 )
 from zarr_vectors.core.cells import read_cells, read_neighbourhood
 from zarr_vectors.core.group import Group
@@ -206,3 +208,81 @@ def test_it_replays_offline(points):
     want = read_cells(_level(points), cells, ["vertices"])
     assert not got.errors
     np.testing.assert_array_equal(got["vertices"].data, want["vertices"].data)
+
+
+def _fragments_of(batch, i):
+    """Cell ``i``'s fragments from ``batch.fragments``, as index arrays."""
+    fr = batch.fragments
+    out = []
+    for f in range(int(fr.cell_offsets[i]), int(fr.cell_offsets[i + 1])):
+        start, count = int(fr.starts[f]), int(fr.counts[f])
+        lo, hi = int(fr.index_offsets[f]), int(fr.index_offsets[f + 1])
+        if start >= 0:
+            assert lo == hi
+            out.append(np.arange(start, start + count))
+        else:
+            assert hi - lo == count
+            out.append(np.asarray(fr.indices[lo:hi]))
+    return out
+
+
+def _assert_fragments_match(lg, cells, batch):
+    present = {tuple(k) for k in list_chunk_keys(lg)}
+    assert len(batch.fragments.cell_offsets) == len(cells) + 1
+    for i, c in enumerate(cells.tolist()):
+        want = []
+        if tuple(c) in present:
+            fi = read_vertex_fragment_index(lg, tuple(c))
+            want = [fi.indices(f) for f in range(len(fi))]
+        got = _fragments_of(batch, i)
+        assert len(got) == len(want), c
+        for g, w in zip(got, want):
+            np.testing.assert_array_equal(g, w)
+
+
+def test_fragments_are_each_cells_fragment_index(points):
+    lg = _level(points)
+    cells = _cells(lg, extra=[(0, 0, 0), (0, 3, 3), (7, 7, 7), (-1, 0, 0)])
+    batch = read_cells(lg, cells, ["vertices"], fragments=True)
+    assert not batch.errors
+    _assert_fragments_match(lg, cells, batch)
+    # A bulk-written point cloud's fragments tile each cell's rows.
+    fr, v = batch.fragments, batch["vertices"]
+    for i in range(len(cells)):
+        a, b = int(fr.cell_offsets[i]), int(fr.cell_offsets[i + 1])
+        assert (fr.starts[a:b] >= 0).all()
+        assert int(fr.counts[a:b].sum()) == len(v.rows(i))
+    assert [r.array for r in batch.io] == ["vertices", "vertex_fragments"]
+
+
+def test_explicit_fragments_come_back_as_indices(points):
+    lg = get_resolution_level(open_store(points, mode="r+"), 0)
+    cells = _cells(lg)
+    cc = tuple(int(v) for v in cells[0])
+    n = len(read_cells(lg, cells[:1], ["vertices"])["vertices"].rows(0))
+    assert n >= 3
+    write_chunk_fragments(
+        lg, cc, csr=(np.array([n - 1, 0, 1, 2]), np.array([0, 2, 4])),
+        mode="append",
+    )
+    write_chunk_fragments(lg, cc, [np.array([1, 2])], mode="append", force_explicit=True)
+    batch = read_cells(lg, cells, ["vertices"], fragments=True)
+    fr = batch.fragments
+    assert (fr.starts < 0).sum() == 2
+    _assert_fragments_match(lg, cells, batch)
+
+
+def test_fragments_are_only_read_when_asked(points):
+    lg = _level(points)
+    batch = read_cells(lg, _cells(lg), ["vertices"])
+    assert batch.fragments is None
+    assert [r.array for r in batch.io] == ["vertices"]
+
+
+def test_fragments_follow_the_batch_to_a_device(points, monkeypatch):
+    lg = _level(points)
+    cells = _cells(lg)
+    host = read_cells(lg, cells, ["vertices"], fragments=True)
+    moved = host.to_device("cpu")
+    for name in ("cell_offsets", "starts", "counts", "index_offsets", "indices"):
+        np.testing.assert_array_equal(getattr(moved.fragments, name), getattr(host.fragments, name))

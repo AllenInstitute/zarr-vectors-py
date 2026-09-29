@@ -105,11 +105,46 @@ class CellColumn:
 
 
 @dataclass(frozen=True)
+class FragmentColumn:
+    """The vertex fragments of every requested cell, as flat arrays.
+
+    Cell ``i``'s fragments are ``cell_offsets[i]:cell_offsets[i + 1]``,
+    in the order its fragment index lists them. Fragment ``f`` holds
+    ``counts[f]`` of the cell's vertex rows, numbered from the cell's
+    first row in the ``vertices`` column: rows ``starts[f]`` to
+    ``starts[f] + counts[f]`` when it is a range, and otherwise
+    (``starts[f] == -1``) rows ``indices[index_offsets[f]:index_offsets[f + 1]]``.
+    Range fragments have no entries in ``indices``. All on the batch's
+    device.
+
+    A store written bin by bin (a point cloud, say) holds fragments that
+    tile each cell's rows in bin order, empty bins included, so cell
+    ``i``'s bin boundaries are ``0`` followed by the running sum of
+    ``counts[a:b]``, with ``a, b = cell_offsets[i], cell_offsets[i + 1]``.
+    """
+
+    cell_offsets: Any
+    starts: Any
+    counts: Any
+    index_offsets: Any
+    indices: Any
+
+    def to_device(self, device: str) -> FragmentColumn:
+        return FragmentColumn(**{
+            name: _xp.to_device(getattr(self, name), device)
+            for name in ("cell_offsets", "starts", "counts", "index_offsets", "indices")
+        })
+
+
+@dataclass(frozen=True)
 class CellBatch(Mapping[str, CellColumn]):
     """The result of :func:`read_cells`: one :class:`CellColumn` per array.
 
     ``chunk_coords`` is the requested cells in request order, always on
     the host; the columns are on ``device``.
+
+    ``fragments`` is the vertices' fragment index when it was asked for
+    (``read_cells(..., fragments=True)``), else None.
 
     ``io`` says how each array read was served (:class:`ArrayRead`), and
     ``io_seconds`` where the time went: ``fetch`` and ``decode`` for the
@@ -121,6 +156,7 @@ class CellBatch(Mapping[str, CellColumn]):
     columns: dict[str, CellColumn]
     errors: tuple[CellReadError, ...] = ()
     device: str = "cpu"
+    fragments: FragmentColumn | None = None
     io: tuple[ArrayRead, ...] = field(default=(), compare=False)
     io_seconds: dict[str, float] = field(default_factory=dict, compare=False)
 
@@ -144,7 +180,8 @@ class CellBatch(Mapping[str, CellColumn]):
             )
             for name, col in self.columns.items()
         }
-        return replace(self, columns=moved, device=device)
+        fragments = None if self.fragments is None else self.fragments.to_device(device)
+        return replace(self, columns=moved, fragments=fragments, device=device)
 
 
 # --------------------------------------------------------------------
@@ -278,6 +315,7 @@ def read_cells(
     device: str | None = None,
     decode: Literal["auto", "host", "device"] = "auto",
     io: Literal["auto", "kvikio", "host"] = "auto",
+    fragments: bool = False,
 ) -> CellBatch:
     """Read the cells ``chunk_coords`` of every array in ``arrays`` at once.
 
@@ -315,6 +353,12 @@ def read_cells(
             cuFile reports GPUDirect Storage available
             (:func:`zarr_vectors._gds.choose_io`). The result is the same
             either way. Ignored for a host read and for other stores.
+        fragments: Also return the vertices' fragment index, as
+            ``batch.fragments`` (:class:`FragmentColumn`): how each cell's
+            vertex rows split into fragments -- a point cloud's bins, for
+            instance, without working them out again from coordinates.
+            Read in the same prefetch and decoded on the host (a range
+            fragment is 16 bytes), then moved to ``device``.
 
     Returns:
         A :class:`CellBatch`. A cell nobody wrote, or outside an array's
@@ -364,6 +408,13 @@ def read_cells(
         (name, sorted({k for k, ok in zip(keys, in_grid[name]) if ok}))
         for name in read_names
     ]
+    fragment_plan: tuple[str, list[str]] | None = None
+    if fragments:
+        if level_group._sharded_chunk_array(VERTEX_FRAGMENTS) is not None:
+            ok = _in_grid(VERTEX_FRAGMENTS)
+            fragment_plan = (VERTEX_FRAGMENTS, sorted({k for k, o in zip(keys, ok) if o}))
+        elif missing_arrays != "skip":
+            raise ArrayError(f"{VERTEX_FRAGMENTS!r} does not exist at this level")
 
     errors: list[CellReadError] = []
     seconds: dict[str, float] = {}
@@ -373,6 +424,8 @@ def read_cells(
     )
     raw: dict[tuple[str, str], bytes] = {}
     host_plan = [p for p in plan if p[0] not in on_device]
+    if fragment_plan is not None:
+        host_plan.append(fragment_plan)
     t_host = time.perf_counter()
     with _prefetch(level_group, [p for p in host_plan if p[1]]):
         for name, cell_keys in host_plan:
@@ -418,6 +471,11 @@ def read_cells(
                 parts.append(None)  # type: ignore[arg-type]
         columns[name] = _column(parts, lay, device)
         host_seconds += time.perf_counter() - t0
+    fragment_column = None
+    if fragment_plan is not None:
+        t0 = time.perf_counter()
+        fragment_column = _fragment_column(keys, raw, on_error, errors, device)
+        host_seconds += time.perf_counter() - t0
 
     if on_device:
         # The last gathers are still running; count them as decode time.
@@ -429,12 +487,50 @@ def read_cells(
     io_report = tuple(
         ArrayRead(name, on_device[name].path, len(cell_keys), on_device[name].stored_bytes)
         if name in on_device else ArrayRead(name, "host", len(cell_keys), None)
-        for name, cell_keys in plan
+        for name, cell_keys in plan + ([fragment_plan] if fragment_plan else [])
     )
     return CellBatch(
         chunk_coords=cc, columns=columns, errors=tuple(errors), device=device,
-        io=io_report, io_seconds=seconds,
+        fragments=fragment_column, io=io_report, io_seconds=seconds,
     )
+
+
+def _fragment_column(
+    keys: list[str],
+    raw: dict[tuple[str, str], bytes],
+    on_error: str,
+    errors: list[CellReadError],
+    device: str,
+) -> FragmentColumn:
+    """The requested cells' fragment indices, decoded, as one column."""
+    from zarr_vectors.encoding.fragments import decode_fragments
+
+    empty = np.zeros(0, dtype=np.int64)
+    decoded: dict[str, tuple[np.ndarray, ...]] = {}
+    for key in dict.fromkeys(keys):
+        blob = raw.get((VERTEX_FRAGMENTS, key), b"")
+        if not blob:
+            decoded[key] = (empty,) * 4
+            continue
+        try:
+            decoded[key] = decode_fragments(blob).flat()
+        except Exception as exc:  # noqa: BLE001 - recorded or re-raised
+            if on_error == "raise":
+                raise
+            errors.append(CellReadError(VERTEX_FRAGMENTS, key, f"{type(exc).__name__}: {exc}"))
+            decoded[key] = (empty,) * 4
+    parts = [decoded[k] for k in keys]
+    per_cell = np.array([len(p[0]) for p in parts], dtype=np.int64)
+    starts, counts, index_counts, indices = (
+        np.concatenate([p[j] for p in parts]) if parts else empty for j in range(4)
+    )
+    return FragmentColumn(
+        cell_offsets=np.concatenate([[0], np.cumsum(per_cell)]).astype(np.int64),
+        starts=starts,
+        counts=counts,
+        index_offsets=np.concatenate([[0], np.cumsum(index_counts)]).astype(np.int64),
+        indices=indices,
+    ).to_device(device)
 
 
 def _device_payloads(

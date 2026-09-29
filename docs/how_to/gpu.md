@@ -94,6 +94,25 @@ col.cell      # the cell index of every row
 batch = zb.read_cells(lg, cells, ["vertices", "links/0/0.0.0_1.0.0"])
 ```
 
+`fragments=True` also returns each cell's vertex fragment index, read in
+the same prefetch, as `batch.fragments` (a `FragmentColumn` on the
+batch's device). A point cloud written bin by bin stores one range
+fragment per bin, so its bins come back without being worked out again
+from the coordinates:
+
+```python
+batch = zb.read_cells(lg, cells, ["vertices"], fragments=True)
+fr = batch.fragments
+a, b = int(fr.cell_offsets[i]), int(fr.cell_offsets[i + 1])
+bins = np.concatenate([[0], np.cumsum(fr.counts[a:b])])   # cell i's bin boundaries
+```
+
+That holds when the fragments tile the cell's rows in order, empty bins
+included, which is how a bin-by-bin writer leaves them.
+
+Explicit fragments (`starts == -1`) list their rows in `fr.indices`,
+`fr.index_offsets[f]` to `fr.index_offsets[f + 1]`.
+
 ### Decoding on the device
 
 `read_cells` (and so `read_neighbourhood`) takes `decode=`:

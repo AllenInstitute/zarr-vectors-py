@@ -545,6 +545,32 @@ class ChunkFragmentIndex:
             return None
         return self._range_table
 
+    def flat(
+        self,
+    ) -> tuple[
+        npt.NDArray[np.int64], npt.NDArray[np.int64],
+        npt.NDArray[np.int64], npt.NDArray[np.int64],
+    ]:
+        """Every fragment at once, as ``(starts, counts, index_counts, indices)``.
+
+        ``(F,)`` arrays in fragment order: a range fragment covers rows
+        ``starts[f]`` to ``starts[f] + counts[f]``; an explicit one has
+        ``starts[f] == -1`` and its ``counts[f]`` rows are the next
+        ``index_counts[f]`` (``== counts[f]``) entries of ``indices``,
+        which holds the explicit fragments' rows in order. Range
+        fragments have ``index_counts[f] == 0``. The whole-index form of
+        :meth:`range` and :meth:`indices`, built without a loop.
+        """
+        f = self.num_fragments
+        is_range = np.unpackbits(self._bitmap, bitorder="little")[:f].astype(bool)
+        starts = np.full(f, -1, dtype=np.int64)
+        counts = np.empty(f, dtype=np.int64)
+        starts[is_range] = self._range_table[:, 0]
+        counts[is_range] = self._range_table[:, 1]
+        counts[~is_range] = np.diff(self._csr_offsets.astype(np.int64))
+        index_counts = np.where(is_range, 0, counts)
+        return starts, counts, index_counts, self._csr_indices.astype(np.int64, copy=False)
+
     def is_range(self, f: int) -> bool:
         """Return True if fragment ``f`` is a contiguous range.
 
