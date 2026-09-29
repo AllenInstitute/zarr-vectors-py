@@ -144,6 +144,7 @@ from zarr_vectors.core.cells import (
     CellBatch,
     CellColumn,
     CellReadError,
+    FragmentColumn,
     read_cells,
     read_neighbourhood,
 )
@@ -783,6 +784,7 @@ __all__ = [
     "CellBatch",
     "CellColumn",
     "CellReadError",
+    "FragmentColumn",
     "ManifestCSR",
     "CAP_MULTISCALE_LINKS",
     "CAP_PRESERVED_OBJECT_IDS",

@@ -88,6 +88,9 @@ FEATURES: frozenset[str] = frozenset({
     # zarr_vectors.gpu.decode_zstd: zstd frames a caller fetched into
     # device memory, structure-checked before nvCOMP decodes them.
     "decode-zstd",
+    # read_cells(fragments=True): each cell's vertex fragment index as
+    # flat arrays (FragmentColumn), in the same prefetch.
+    "read-cells-fragments",
 })
 
 
