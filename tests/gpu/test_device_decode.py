@@ -287,6 +287,22 @@ def test_an_array_left_to_the_host_is_reported_as_host(tmp_path):
     assert set(dev.io_seconds) == {"host"}
 
 
+@pytest.mark.parametrize("compressor", _CODECS)
+@pytest.mark.parametrize("shard", _SHARDS)
+def test_fragments_come_to_the_device_with_the_batch(tmp_path, compressor, shard):
+    lg = _points(tmp_path / "p.zarrvectors", compressor, shard)
+    cells = _cells(lg)
+    host = read_cells(lg, cells, ["vertices"], fragments=True)
+    dev = read_cells(lg, cells, ["vertices"], device="cuda", fragments=True)
+    _assert_same(host, dev)
+    assert int(host.fragments.cell_offsets[-1]) > len(cells) // 2
+    for name in ("cell_offsets", "starts", "counts", "index_offsets", "indices"):
+        d, h = getattr(dev.fragments, name), getattr(host.fragments, name)
+        assert isinstance(d, cupy.ndarray), name
+        np.testing.assert_array_equal(d.get(), h, err_msg=name)
+    assert dev.io[-1].array == "vertex_fragments" and dev.io[-1].path == "host"
+
+
 def test_an_unsupported_codec_falls_back_or_raises(tmp_path):
     lg = _points(tmp_path / "p.zarrvectors", "blosc", None)
     cells = _cells(lg)

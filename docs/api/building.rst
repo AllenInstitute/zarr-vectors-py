@@ -482,6 +482,9 @@ return them with ``device="cuda"``. See :doc:`../how_to/gpu`.
 
 .. autoclass:: zarr_vectors.building.ArrayRead
 
+.. autoclass:: zarr_vectors.building.FragmentColumn
+   :members:
+
 .. autofunction:: zarr_vectors.building.read_all_object_manifests_csr
 
 .. autoclass:: zarr_vectors.building.ManifestCSR
