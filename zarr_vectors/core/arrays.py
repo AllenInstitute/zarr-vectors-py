@@ -4169,6 +4169,20 @@ def _stamped_link_dtype(level_group: Group, name: str, fallback: Any) -> np.dtyp
     return np.dtype(meta.get("dtype", fallback))
 
 
+def _stamp_is(stamped: Any, dtype: Any) -> bool:
+    """Whether a segment's stamped dtype is ``dtype`` already.
+
+    Then "does the segment hold data?" cannot change the answer, and the
+    listing that asks it -- in a deferred level, a read of every shard --
+    is skipped. Both sides go through ``np.dtype`` (``np.dtype('f8') ==
+    None`` is True), and a stamp that does not parse is not a match.
+    """
+    try:
+        return np.dtype(stamped) == np.dtype(dtype)
+    except TypeError:
+        return False
+
+
 def _link_attr_target_dtype(
     level_group: Group, full_name: str, keys: Sequence[str], new_dtype: Any,
 ) -> tuple[np.dtype, dict[str, bytes]]:
@@ -4186,7 +4200,9 @@ def _link_attr_target_dtype(
     blobs = {k: level_group.read_bytes(full_name, k) for k in keys}
     stamped = meta.get("dtype")
     holds = bool(stamped) and (
-        any(blobs.values()) or bool(level_group.list_chunks(full_name))
+        _stamp_is(stamped, new_dtype)
+        or any(blobs.values())
+        or bool(level_group.list_chunks(full_name))
     )
     return (np.dtype(stamped) if holds else np.dtype(new_dtype)), blobs
 
@@ -4724,7 +4740,9 @@ def _write_link_cells_arrays(
             olds = {_chunk_key(src): raw(attr_path, _chunk_key(src)) for src, _, _ in cells}
             stamped = meta.get("dtype")
             holds = bool(stamped) and (
-                any(olds.values()) or bool(level_group.list_chunks(attr_path))
+                _stamp_is(stamped, a.dtype)
+                or any(olds.values())
+                or bool(level_group.list_chunks(attr_path))
             )
             target = np.dtype(stamped) if holds else a.dtype
             for src, _rows, idx in cells:

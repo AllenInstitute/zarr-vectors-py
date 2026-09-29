@@ -137,3 +137,77 @@ def test_both_forms_at_once_is_an_error(tmp_path):
     with pytest.raises(ArrayError, match="not both"):
         write_link_cells(lg, [[((0, 0, 0), 1), ((0, 0, 0), 2)]], 3,
                          chunks=np.zeros((1, 2, 3)), vids=np.zeros((1, 2)))
+
+
+class TestAStampedDtypeSkipsTheListing:
+    """A segment already stamped with the incoming dtype is not listed.
+
+    "Does this segment hold data?" decides between the stamped dtype and
+    the data's, so when the two are equal the answer cannot matter. In a
+    deferred level the listing that asks it reads every shard, once per
+    attribute segment per seam write.
+    """
+
+    @staticmethod
+    def _listings(monkeypatch) -> list[str]:
+        from zarr_vectors.core.group import Group
+
+        asked: list[str] = []
+        real = Group.list_chunks
+
+        def spy(self, name, *a, **kw):
+            asked.append(name)
+            return real(self, name, *a, **kw)
+
+        monkeypatch.setattr(Group, "list_chunks", spy)
+        return asked
+
+    @staticmethod
+    def _one_intra_record(cell, vids):
+        return (
+            np.array([[cell, cell]], dtype=np.int64),
+            np.array([vids], dtype=np.int64),
+        )
+
+    def test_the_array_form_does_not_list_a_matching_segment(self, tmp_path, monkeypatch):
+        w = {"w": np.array([0.5], dtype=np.float32)}
+        first = self._one_intra_record((0, 0, 0), (1, 2))
+        # A cell of the same segment that holds nothing yet.
+        second = self._one_intra_record((1, 1, 1), (3, 4))
+
+        ref_path, ref = _level(tmp_path, "ref")
+        for chunks, vids in (first, second):
+            write_link_cells(ref, chunks=chunks, vids=vids, attributes=w)
+
+        path, lg = _level(tmp_path, "a")
+        write_link_cells(lg, chunks=first[0], vids=first[1], attributes=w)
+        asked = self._listings(monkeypatch)
+        write_link_cells(lg, chunks=second[0], vids=second[1], attributes=w)
+        assert not [n for n in asked if n.startswith("link_attributes/")]
+        assert_stores_identical(ref_path, path)
+
+    def test_the_list_form_does_not_list_a_matching_segment(self, tmp_path, monkeypatch):
+        _, lg = _level(tmp_path, "l")
+        create_links_array(lg, link_width=2, delta=0, sid_ndim=3)
+        p1 = write_link_cells(lg, [[((0, 0, 0), 1), ((0, 0, 0), 2)]], sid_ndim=3)
+        p2 = write_link_cells(lg, [[((1, 1, 1), 3), ((1, 1, 1), 4)]], sid_ndim=3)
+        write_link_attribute_cells(lg, "w", np.array([0.1], dtype=np.float32), partition=p1)
+        asked = self._listings(monkeypatch)
+        write_link_attribute_cells(lg, "w", np.array([0.2], dtype=np.float32), partition=p2)
+        assert not [n for n in asked if n.startswith("link_attributes/")]
+
+    def test_a_placeholder_of_another_dtype_still_asks_and_yields(self, tmp_path, monkeypatch):
+        from zarr_vectors.building import create_link_attributes_array
+
+        _, lg = _level(tmp_path, "p")
+        create_links_array(lg, link_width=2, delta=0, sid_ndim=3)
+        p = write_link_cells(lg, [[((0, 0, 0), 1), ((0, 0, 0), 2)]], sid_ndim=3)
+        # A pre-created, empty segment stamped float64: the data's float32 wins.
+        create_link_attributes_array(
+            lg, "w", "float64", delta=0, sid_ndim=3, offsets=intra_offsets(3, 2),
+        )
+        asked = self._listings(monkeypatch)
+        write_link_attribute_cells(lg, "w", np.array([0.25], dtype=np.float32), partition=p)
+        assert [n for n in asked if n.startswith("link_attributes/")]
+        meta = lg.read_array_meta(asked[-1])
+        assert np.dtype(meta["dtype"]) == np.float32
