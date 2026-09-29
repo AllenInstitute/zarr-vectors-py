@@ -58,10 +58,12 @@ INTERNAL: tuple[str, ...] = (
     "zarr_vectors._api_version",
     "zarr_vectors._stability",
     "zarr_vectors._version",
-    # Host/device array plumbing and the install probe; the probe's name
-    # is re-exported as ``zarr_vectors.runtime_capabilities``.
+    # Host/device array plumbing, the install probe and the GPUDirect
+    # Storage probe; the install probe's name is re-exported as
+    # ``zarr_vectors.runtime_capabilities``.
     "zarr_vectors._xp",
     "zarr_vectors._runtime",
+    "zarr_vectors._gds",
     "zarr_vectors.core",
     "zarr_vectors.encoding",
     "zarr_vectors.spatial",
