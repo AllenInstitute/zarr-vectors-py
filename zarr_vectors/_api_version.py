@@ -113,6 +113,9 @@ FEATURES: frozenset[str] = frozenset({
     # mode="place" on the object-layer writers: disjoint row ranges filled
     # by several processes at once.
     "concurrency-contract",
+    # building.shard_transaction / shard_of: one shard of every per-chunk
+    # array staged privately and published by rename on exit.
+    "shard-transaction",
 })
 
 

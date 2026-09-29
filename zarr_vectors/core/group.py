@@ -140,6 +140,9 @@ class Group:
     # without needing to remember to set the attributes.
     # Queued cell writes: (array_name, chunk_key, data, record_presence).
     _pending_writes: list[tuple[str, str, bytes, bool]] | None = None
+    # An open :meth:`shard_transaction`: cell writes are staged in it, and
+    # reads of the cells it owns see its view.
+    _shard_txn: Any = None
     # Collected presence stamps: (array_name, chunk_key, present).  Set by
     # :meth:`collect_presence`; while it is set the two stamp sites append
     # here instead of writing ``nonempty_chunks``, and the PAYLOADS still
@@ -415,6 +418,9 @@ class Group:
             )
         index = _coord_to_index(coords, _grid_origin(sharded_arr))
         _check_coords_in_bounds(index, sharded_arr.shape, array_name)
+        if self._shard_txn is not None:
+            self._shard_txn.write_cells(array_name, [(chunk_key, bytes(data))])
+            return
         # Batched mode: queue the cell write; the batch flush writes
         # every cell of an array in one concurrent
         # ``set_coordinate_selection`` and stamps ``nonempty_chunks``
@@ -462,6 +468,7 @@ class Group:
         origin = _grid_origin(sharded_arr)
         shape = sharded_arr.shape
         pending = self._pending_writes
+        txn = self._shard_txn
         n = 0
         for chunk_key, data in cells:
             coords = _parse_chunk_coords(chunk_key)
@@ -473,6 +480,9 @@ class Group:
             index = _coord_to_index(coords, origin)
             _check_coords_in_bounds(index, shape, array_name)
             n += 1
+            if txn is not None:
+                txn.write_cells(array_name, [(chunk_key, bytes(data))])
+                continue
             if pending is not None:
                 pending.append((array_name, chunk_key, bytes(data), record_presence))
                 continue
@@ -844,6 +854,11 @@ class Group:
         """
         if self._pending_writes is not None:
             raise StoreError("batched_writes() does not support nesting")
+        if self._shard_txn is not None:
+            raise StoreError(
+                "batched_writes() cannot run inside a shard transaction, "
+                "which stages every cell write itself"
+            )
         if self._pending_presence is not None:
             raise StoreError(
                 "batched_writes() cannot run inside collect_presence(): this "
@@ -892,6 +907,44 @@ class Group:
             # freshly-resolved nodes, so anything held here is stale the
             # moment the session ends.
             self._node_cache = None
+
+    @contextmanager
+    def shard_transaction(
+        self,
+        shard_coords: Sequence[int],
+        *,
+        arrays: Iterable[str] | None = None,
+        mode: Literal["replace", "merge"] = "replace",
+        durable: bool = True,
+    ) -> Iterator[Any]:
+        """Stage one shard's cell writes, and publish them on exit.
+
+        See :mod:`zarr_vectors.core.shard_txn` and
+        :func:`zarr_vectors.building.shard_transaction`.
+        """
+        from zarr_vectors.core.shard_txn import ShardTransaction
+
+        if self._shard_txn is not None:
+            raise StoreError("shard transactions do not nest")
+        if self._pending_writes is not None or self._pending_presence is not None:
+            raise StoreError(
+                "a shard transaction cannot run inside batched_writes() or "
+                "collect_presence(): it stages every cell write itself"
+            )
+        if not self.presence_deferred():
+            raise StoreError(
+                "a shard transaction needs the level's presence deferred "
+                "(defer_presence): nonempty_chunks is shared by every cell, so "
+                "stamping it would race with every other task"
+            )
+        txn = ShardTransaction(self, shard_coords, arrays=arrays, mode=mode, durable=durable)
+        txn.sweep_partials()
+        self._shard_txn = txn
+        try:
+            yield txn
+        finally:
+            self._shard_txn = None
+        txn.publish()
 
     @contextmanager
     def collect_presence(self) -> Iterator[list[tuple[str, str, bool]]]:
@@ -1100,6 +1153,12 @@ class Group:
             self._native_sharded_config = None
 
     def read_bytes(self, array_name: str, chunk_key: str) -> bytes:
+        # Inside a shard transaction its own cells come from it: written
+        # ones as written, and under "replace" unwritten ones as empty.
+        if self._shard_txn is not None:
+            staged = self._shard_txn.lookup(array_name, chunk_key)
+            if staged is not None:
+                return staged
         # Batched-read mode (see :meth:`batched_reads`): serve from the
         # prefetch cache when possible.  Cache misses fall through to
         # the sync path below — useful when a caller under-specifies
@@ -1143,6 +1202,10 @@ class Group:
         return _vlen_get_cell(sharded_arr, index)
 
     def chunk_exists(self, array_name: str, chunk_key: str) -> bool:
+        if self._shard_txn is not None:
+            staged = self._shard_txn.lookup(array_name, chunk_key)
+            if staged is not None:
+                return bool(staged)
         sharded_arr = self._sharded_chunk_array(array_name)
         if sharded_arr is None:
             return False

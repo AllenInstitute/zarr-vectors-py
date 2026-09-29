@@ -471,6 +471,30 @@ patterns above:
   which may belong to another worker's partition. Either route each seam to
   the worker that owns its anchor, or serialise these writes too.
 
+### One shard per task, published at the end
+
+When each task owns a shard of a sharded store, a retry should not start from
+its failed attempt's cells. Inside `zb.shard_transaction(level, shard)` every
+cell write -- through any writer -- is staged, and must fall inside the shard;
+reads of the task's cells see the staging (under the default `mode="replace"`
+a cell not yet written reads empty, so an append does not re-read old rows).
+On exit each changed shard object is written as a `.partial` file, fsynced,
+and renamed into place; an exception publishes nothing.
+
+```python
+shard = zb.shard_of(lg, first_chunk_of_task)       # the shard's grid index
+with zb.shard_transaction(lg, shard) as tx:        # presence must be deferred
+    for cc in task_chunks:
+        zb.write_chunk_vertices(lg, cc, groups)
+        zb.write_chunk_attributes(lg, "intensity", cc, values)
+report(tx.written)                                 # {array: [chunk_key, ...]}
+```
+
+The coordinator allocates every array beforehand, and afterwards records
+presence from the tasks' reports with `zb.set_presence(..., end_deferral=True)`.
+A crash while renaming leaves some of the task's shards new and some old;
+re-running the task converges, since the same cells encode to the same bytes.
+
 `zv.concurrency_contract()` states what may be written at once: cells or
 shards owned by one process each, and object-layer rows placed in disjoint,
 aligned ranges after one reservation.

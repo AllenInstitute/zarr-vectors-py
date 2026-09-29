@@ -32,6 +32,15 @@ class ShardedPresenceError(StoreError):
     """
 
 
+class ShardOwnershipError(StoreError):
+    """A shard transaction was asked to write a cell outside its shard.
+
+    Raised by :func:`zarr_vectors.building.shard_transaction`: the cell
+    belongs to another shard (another task's), or to an array the
+    transaction was not opened over.
+    """
+
+
 class MetadataError(ZVError):
     """Raised when metadata is missing, malformed, or fails schema validation."""
 

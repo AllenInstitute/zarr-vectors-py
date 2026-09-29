@@ -215,7 +215,7 @@ from zarr_vectors.encoding.fragments import (
     encode_object_manifest_blocks,
     encode_object_manifests_csr,
 )
-from zarr_vectors.exceptions import ArrayError, StoreError
+from zarr_vectors.exceptions import ArrayError, ShardOwnershipError, StoreError
 from zarr_vectors.multiresolution.registry import (
     register_coarsen_strategy,
     register_selection_strategy,
@@ -305,6 +305,8 @@ GROUP_SUPPORTED_METHODS: frozenset[str] = frozenset({
     "batched_reads", "batched_writes", "offline_reads", "chunk_array_codecs",
     # a read-only node cache, and resolving several nodes into it at once
     "cached_nodes", "prime_nodes",
+    # one shard written privately, published on exit
+    "shard_transaction",
     "derive_nonempty_chunks", "native_sharded_arrays",
     "collect_presence", "apply_presence", "presence_deferred",
     # identity
@@ -622,6 +624,79 @@ def store_layout(root_or_level: Group, *, level: int = 0) -> StoreLayout:
         min_reader=min_reader,
         object_shard_rows=object_rows,
     )
+
+
+def shard_transaction(
+    level_group: Group,
+    shard_coords: Iterable[int],
+    *,
+    arrays: Iterable[str] | None = None,
+    mode: str = "replace",
+    durable: bool = True,
+) -> Any:
+    """Write one shard of a level privately, and publish it at the end.
+
+    A context manager. Inside it every cell written to ``level_group`` --
+    by any zarr-vectors writer, or by ``tx.write_cells(array, [(key,
+    payload), ...])`` -- is staged in memory, and must lie in shard
+    ``shard_coords`` of one of ``arrays`` (default: every per-chunk array
+    of the level), else :class:`~zarr_vectors.exceptions.
+    ShardOwnershipError`. Reads of owned cells see the staged view; under
+    ``mode="replace"`` an owned cell not yet written reads empty, so a
+    retried task starts from nothing, not from a failed attempt's rows.
+
+    On a normal exit each changed shard object is encoded by zarr's own
+    sharding codec, written beside its target as
+    ``<object>.<token>.partial`` (fsynced when ``durable``), then renamed
+    into place, and the directories fsynced. Under ``replace`` an owned
+    shard is rebuilt from the transaction's cells alone, and an array in
+    scope that got none loses its shard. Under ``merge`` the cells are
+    merged into what the store holds. An exception inside the block
+    publishes nothing.
+
+    Guarantees and limits:
+
+    - atomic per object: a crash while renaming leaves some shards new and
+      some old, and re-running the task converges, since zarr encodes a
+      shard from its cells in a fixed order (same cells, same bytes, for
+      the same codecs and library versions);
+    - requires the level's presence deferred (:func:`defer_presence`) and
+      every array allocated and sharded beforehand;
+    - writes no metadata; ``tx.written`` (the non-empty cells per array,
+      after exit) feeds :func:`set_presence`;
+    - local stores publish by rename; any other store by one ``set`` per
+      object, each atomic on its own.
+
+    Args:
+        shard_coords: The shard's index in the arrays' shard grid (see
+            :func:`shard_of`), one entry per array axis, a bin axis
+            included on a level chunked by an attribute.
+        arrays: Per-chunk arrays the transaction covers.
+        mode: ``"replace"`` or ``"merge"``.
+        durable: Fsync before and after publishing (local stores).
+    """
+    return level_group.shard_transaction(
+        tuple(shard_coords), arrays=arrays, mode=mode, durable=durable,
+    )
+
+
+def shard_of(
+    level_group: Group, chunk_coords: Iterable[int], array_name: str = VERTICES,
+) -> tuple[int, ...]:
+    """The index of the shard holding cell ``chunk_coords`` of ``array_name``.
+
+    What :func:`shard_transaction` takes: the cell's index in the array
+    (its coordinates less the grid origin) divided by the shard shape.
+    Every array of a level normally shares both, so one answer serves them
+    all.
+    """
+    from zarr_vectors.core.group import _coord_to_index, _grid_origin
+
+    arr = level_group._sharded_chunk_array(array_name)
+    if arr is None or arr.shards is None:
+        raise ArrayError(f"shard_of: {array_name!r} is not a sharded per-chunk array")
+    index = _coord_to_index(tuple(int(c) for c in chunk_coords), _grid_origin(arr))
+    return tuple(int(i) // int(s) for i, s in zip(index, arr.shards))
 
 
 def is_sharded(level_group: Group, array_name: str) -> bool:
@@ -1200,6 +1275,7 @@ __all__ = [
     "OBJECT_INDEX_MANIFEST_BUCKET",
     "OBJECT_SHARD_ROW_MULTIPLE",
     "ObjectIndexAppender",
+    "ShardOwnershipError",
     "RechunkSpec",
     "RootMetadata",
     "StoreLayout",
@@ -1336,7 +1412,9 @@ __all__ = [
     "set_coordinate_offset",
     "set_presence",
     "shard_object_layer",
+    "shard_of",
     "shard_store",
+    "shard_transaction",
     "split_polyline_at_boundaries",
     "unshard_store",
     "update_level_metadata",
