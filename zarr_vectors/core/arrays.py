@@ -2479,9 +2479,18 @@ def _write_object_id_table(level_group: Group, row_ids: Sequence[int]) -> None:
     to an object, so row i means object i by position alone" -- was the
     statement of the problem; this array is the answer to it.
     """
+    # Chunked at the manifest bucket, as appends extend it: written as one
+    # chunk, a 10^9-object table was a single 8 GB object, rewritten whole
+    # by the first append. A range (the appender's identity table) becomes
+    # an arange, not a list of a billion Python ints.
+    ids = (
+        np.arange(row_ids.start, row_ids.stop, row_ids.step, dtype=np.int64)
+        if isinstance(row_ids, range)
+        else np.fromiter(row_ids, dtype=np.int64)
+    )
     level_group.write_array(
-        f"{OBJECT_INDEX}/{OBJECT_IDS_ARRAY}",
-        np.asarray(list(row_ids), dtype=np.int64),
+        f"{OBJECT_INDEX}/{OBJECT_IDS_ARRAY}", ids,
+        chunks=(OBJECT_INDEX_MANIFEST_BUCKET,),
     )
 
 
@@ -2686,10 +2695,10 @@ def _extend_object_id_table(
 ) -> None:
     """Keep the first ``keep`` rows of ``object_index/object_ids``, add ``new_ids``.
 
-    Appends in place once the table is chunked at the manifest bucket;
-    the first time (tables are written as one chunk) and on a truncation
-    it is rewritten with that chunking, so later appends touch only the
-    rows they add.
+    Appends in place once the table is chunked at the manifest bucket,
+    as every table written since is; a table written as one chunk (an
+    older store) and a truncation are rewritten with that chunking, so
+    later appends touch only the rows they add.
     """
     path = f"{OBJECT_INDEX}/{OBJECT_IDS_ARRAY}"
     node = level_group.zarr_group[path]

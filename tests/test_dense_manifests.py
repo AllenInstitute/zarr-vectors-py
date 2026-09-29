@@ -299,3 +299,16 @@ def test_validation_passes_a_dense_store_and_catches_a_bad_span(tmp_path):
     result = validate(str(path), level=3)
     assert not result.ok
     assert "manifest_blocks" in result.summary()
+
+
+@pytest.mark.parametrize("layout", ["vlen", "dense"])
+def test_the_id_table_is_chunked_at_the_bucket(tmp_path, layout):
+    """Written as one chunk, a 10^9-object id table was one 8 GB object."""
+    from zarr_vectors.building import OBJECT_INDEX_MANIFEST_BUCKET
+
+    _, lg = _level(tmp_path, layout, layout)
+    n = OBJECT_INDEX_MANIFEST_BUCKET + 5
+    write_object_index(lg, {2 * i: [((0, 0, 0), i)] for i in range(n)}, 3)
+    node = lg.zarr_group[f"{OBJECT_INDEX}/object_ids"]
+    assert node.chunks == (OBJECT_INDEX_MANIFEST_BUCKET,)
+    assert node.shape == (n,) and int(node[n - 1]) == 2 * (n - 1)
