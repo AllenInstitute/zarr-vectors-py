@@ -373,6 +373,8 @@ consumers cannot ask the store and run before any coordinator pass -- see
 
 .. autofunction:: zarr_vectors.building.is_sharded
 
+.. autofunction:: zarr_vectors.building.cell_objects
+
 .. autofunction:: zarr_vectors.building.user_metadata
 
 .. autofunction:: zarr_vectors.building.observe_presence_writes
