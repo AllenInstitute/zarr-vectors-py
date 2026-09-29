@@ -75,6 +75,7 @@ from zarr_vectors.core.arrays import (
     # --- links ---
     cell_endpoint_chunks,
     chunk_vertex_count,
+    commit_object_index,
     # --- allocation ---
     create_attribute_array,
     create_fragment_attribute_array,
@@ -548,7 +549,7 @@ def write_object_manifests(
 
     Only the manifests (and, on an index that stores ids, the id table)
     are written: committing the index's metadata (``num_objects`` and the
-    rest) stays the caller's step.
+    rest) stays the caller's step, which :func:`commit_object_index` is.
 
     Args:
         level_group: Resolution level group.
@@ -1019,6 +1020,7 @@ __all__ = [
     "chunk_scale_from_root",
     "chunks_intersecting_bbox",
     "commit",
+    "commit_object_index",
     "compute_bin_ratio",
     "compute_bin_shape",
     "compute_grid_shape",

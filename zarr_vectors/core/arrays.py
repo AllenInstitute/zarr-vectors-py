@@ -2362,6 +2362,109 @@ def write_object_index(
     })
 
 
+def commit_object_index(
+    level_group: Group,
+    num_objects: int,
+    *,
+    sid_ndim: int | None = None,
+    num_present: int | None = None,
+    object_ids_sorted: bool | None = None,
+) -> dict[str, Any]:
+    """Commit the object index's metadata after manifest writes.
+
+    :func:`write_object_manifests` (and the ``at=`` protocol built on it)
+    writes rows and leaves the commit to the caller, who knows when the
+    last row is in. This is that commit, the one every caller would
+    otherwise write by hand: it merges into the index's metadata, never
+    replacing it.
+
+    - ``num_objects`` becomes ``num_objects``: the committed prefix.
+      Rows past it are uncommitted residue, which a later append at
+      ``at=num_objects`` replaces. It may not exceed the rows written.
+    - ``layout`` is kept: dense stays dense, a stamped vlen layout stays,
+      and an unstamped vlen index -- what the array-form writer creates --
+      is stamped V1, without which no reader accepts it.
+    - ``sid_ndim``: the argument, else the stamp, else the level's.
+    - ``num_present`` is counted over the committed rows (a dense index
+      reads only its spans; a vlen one reads every blob, which a caller
+      that already knows the count can skip by passing it). So a
+      tombstone followed by an append no longer leaves it stale.
+    - ``object_ids_sorted`` is stamped on any index that stores ids (V2
+      or dense) from the committed ids, unless given.
+
+    Returns:
+        The metadata keys written.
+    """
+    from zarr_vectors.core import dense_manifests as dense
+
+    n = int(num_objects)
+    if n < 0:
+        raise ArrayError(f"num_objects {n} is negative")
+    if not level_group.array_exists(OBJECT_INDEX):
+        raise ArrayError("commit_object_index: this level has no object index")
+    meta = level_group.read_array_meta(OBJECT_INDEX) or {}
+    is_dense = dense.is_dense(level_group, meta)
+    manifests_path = f"{OBJECT_INDEX}/manifests"
+    if is_dense:
+        rows = dense.num_rows(level_group)
+    elif level_group.array_exists(manifests_path):
+        rows = int(level_group.zarr_group[manifests_path].shape[0])
+    else:
+        rows = 0
+    if n > rows:
+        raise ArrayError(
+            f"commit_object_index: num_objects {n} exceeds the {rows} "
+            f"manifest rows written"
+        )
+    if sid_ndim is None:
+        sid_ndim = meta.get("sid_ndim")
+    if sid_ndim is None:
+        try:
+            sid_ndim = _infer_vert_ndim(level_group)
+        except Exception as exc:  # noqa: BLE001 - reported as a missing argument
+            raise ArrayError(
+                "commit_object_index: the index has no sid_ndim; pass it"
+            ) from exc
+    layout = (
+        _LAYOUT_DENSE if is_dense
+        else meta.get("layout") or OBJECT_INDEX_LAYOUT_V1
+    )
+    if num_present is None:
+        if n == 0:
+            num_present = 0
+        elif is_dense:
+            num_present = int(dense.present_mask(level_group, stop=n).sum())
+        else:
+            blobs = level_group.read_vlen_array_raw(manifests_path, stop=n)
+            num_present = sum(
+                1 for b in blobs if b and bytes(b) != _EMPTY_MANIFEST_BLOB
+            )
+    elif not 0 <= int(num_present) <= n:
+        raise ArrayError(f"num_present {num_present} is outside [0, {n}]")
+    out: dict[str, Any] = {
+        "zv_array": "object_index",
+        "num_objects": n,
+        "num_present": int(num_present),
+        "sid_ndim": int(sid_ndim),
+        "layout": layout,
+    }
+    table_path = f"{OBJECT_INDEX}/{OBJECT_IDS_ARRAY}"
+    if layout in (OBJECT_INDEX_LAYOUT_V2, _LAYOUT_DENSE) and level_group.array_exists(table_path):
+        if object_ids_sorted is None:
+            table = np.asarray(level_group.zarr_group[table_path][:n], dtype=np.int64)
+            if table.size < n:
+                raise ArrayError(
+                    f"commit_object_index: the id table holds {table.size} "
+                    f"ids for {n} committed rows"
+                )
+            object_ids_sorted = bool(np.all(np.diff(table) > 0))
+        out[OBJECT_IDS_SORTED_ATTR] = bool(object_ids_sorted)
+    level_group.write_array_meta(OBJECT_INDEX, out)
+    # Also drops the id lookup, which keys on the sorted flag.
+    level_group._invalidate_node(OBJECT_INDEX)
+    return out
+
+
 def _write_object_id_table(level_group: Group, row_ids: Sequence[int]) -> None:
     """Write ``object_index/object_ids``: row → object id.
 

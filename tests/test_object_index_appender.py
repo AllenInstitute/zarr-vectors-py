@@ -191,3 +191,24 @@ def test_empty_append(tmp_path: Path):
     assert list(read_group_object_ids(store, 0)) == list(range(n))
     # Group 1 is the empty range [n, n).
     assert list(read_group_object_ids(store, 1)) == []
+
+
+def test_the_present_count_is_stamped_and_survives_a_patch(tmp_path: Path):
+    """A vlen close stamped no ``num_present``, so the first patch took
+    ``num_objects`` for it and counted every empty slot as present."""
+    from zarr_vectors.core.arrays import (
+        object_present_count,
+        object_present_mask,
+        patch_object_manifests,
+    )
+
+    store = create_store(str(tmp_path / "count.zarrvectors"))
+    base = 4
+    pre = {oid: (_manifest(oid) if oid != 1 else []) for oid in range(base)}
+    write_object_index(store, pre, SID_NDIM, total_objects=base)
+    app = ObjectIndexAppender(store, base, SID_NDIM, list(range(base)))
+    app.append([_manifest(10), [], _manifest(12)], [1, 2, 3])
+    app.close()
+    assert object_present_count(store) == int(object_present_mask(store).sum()) == 5
+    patch_object_manifests(store, {0: []}, SID_NDIM)
+    assert object_present_count(store) == int(object_present_mask(store).sum()) == 4
