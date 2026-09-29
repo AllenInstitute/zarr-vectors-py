@@ -13,7 +13,7 @@ _KEYS = {
     "object_attribute_columns", "array_link_cells", "read_cells",
     "read_neighbourhood", "batched_link_reads", "defer_presence",
     "append_safe_sharding", "dense_manifests", "gpu_encode", "gpu_io",
-    "gpu_codecs", "device_arrays", "device_decode", "gds",
+    "gpu_codecs", "device_arrays", "device_decode", "gds", "link_cells_append",
 }
 
 

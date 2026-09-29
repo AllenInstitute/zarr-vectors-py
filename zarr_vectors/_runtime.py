@@ -27,7 +27,16 @@ _STATIC: dict[str, bool] = {
     "batched_link_reads": True,
     # Already true of this build.
     "defer_presence": True,
+    # Appends into a shared per-chunk shard keep the cells already there.
+    # Per-chunk arrays only: the object layer's at= writes are not covered.
     "append_safe_sharding": True,
+    # A second write into a link cell appends its records (and their
+    # attribute rows) after the first, list form or array form, presence
+    # deferred or not -- mirrored records of a canonical seam included
+    # (tests/test_link_cell_writers.py::TestRepeatBatchesIntoOneCell).
+    # Serial writes only: two processes writing one cell at once can
+    # still lose rows.
+    "link_cells_append": True,
     # The dense object-index layout (create_store(manifest_layout="dense")).
     "dense_manifests": True,
 }
