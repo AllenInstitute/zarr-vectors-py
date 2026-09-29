@@ -94,6 +94,7 @@ class ObjectIndexAppender:
         self._manifest_buf: list[ObjectManifest] = []
         self._length_buf: list[int] = []
         self._total_appended = 0
+        self._present_appended = 0  # appended manifests with a fragment
         self._closed = False
 
         from zarr_vectors.core import dense_manifests as dense
@@ -114,6 +115,17 @@ class ObjectIndexAppender:
             self._arr = self._open_manifests_truncated()
         # Array length == next free OID; truncation leaves it at base_oid.
         self._len = self._base_oid
+
+    def _present_before_base(self) -> int:
+        """How many rows below ``base_oid`` hold a manifest (0 on a fresh run)."""
+        if self._base_oid == 0:
+            return 0
+        from zarr_vectors.core.arrays import _EMPTY_MANIFEST_BLOB
+
+        blobs = self._level_group.read_vlen_array_raw(
+            f"{OBJECT_INDEX}/manifests", stop=self._base_oid,
+        )
+        return sum(1 for b in blobs if b and bytes(b) != _EMPTY_MANIFEST_BLOB)
 
     def _open_manifests_truncated(self):
         """Open ``object_index/manifests`` resized to ``base_oid``.
@@ -169,6 +181,7 @@ class ObjectIndexAppender:
             )
 
         for manifest in manifests:
+            self._present_appended += bool(len(manifest))
             blocks = [
                 (tuple(int(c) for c in chunk_coords), int(fragment_index))
                 for chunk_coords, fragment_index in manifest
@@ -263,9 +276,12 @@ class ObjectIndexAppender:
                 OBJECT_IDS_SORTED_ATTR: True,
             })
         else:
+            # Counted as appended, plus whatever rows [0, base_oid) held:
+            # without it, the first patch took every slot for present.
             self._level_group.write_array_meta(OBJECT_INDEX, {
                 "zv_array": "object_index",
                 "num_objects": total,
+                "num_present": self._present_before_base() + self._present_appended,
                 "sid_ndim": self._sid_ndim,
                 "layout": OBJECT_INDEX_LAYOUT_V1,
             })

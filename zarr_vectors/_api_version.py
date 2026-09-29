@@ -95,6 +95,9 @@ FEATURES: frozenset[str] = frozenset({
     # from the cells a caller says it wrote, and a deferral ended without
     # a store-wide rebuild; finalize_links leaves a deferred level alone.
     "supplied-presence",
+    # building.commit_object_index: the object index's metadata committed
+    # after manifest writes, num_present counted rather than carried.
+    "commit-object-index",
 })
 
 
