@@ -172,10 +172,9 @@ def test_a_non_local_store_decodes_on_the_device(tmp_path, compressor, shard):
     lg = get_resolution_level(open_store(mem), 0)
     cells = _cells(lg)
     arrays = ["vertices", "vertex_attributes/rgb"]
-    _assert_same(
-        read_cells(lg, cells, arrays),
-        read_cells(lg, cells, arrays, device="cuda", decode="device"),
-    )
+    dev = read_cells(lg, cells, arrays, device="cuda", decode="device")
+    _assert_same(read_cells(lg, cells, arrays), dev)
+    assert {r.path for r in dev.io} == {"store"}
 
 
 def _one_cell_file(lg, name="vertices"):
@@ -242,6 +241,50 @@ def test_auto_decodes_uncompressed_on_the_device_and_zstd_on_the_host(tmp_path, 
             read_cells(lg, cells, ["vertices"], device="cuda"),
         )
     assert fetched == [("vertices", False)]
+
+
+def _cell_files_nbytes(lg, name):
+    root = lg._sharded_chunk_array(name).store_path
+    base = os.path.join(str(root.store.root), root.path, "c")
+    return sum(
+        os.path.getsize(os.path.join(d, f)) for d, _, files in os.walk(base) for f in files
+    )
+
+
+def test_the_batch_reports_how_each_array_was_read(tmp_path):
+    from zarr_vectors._gds import gds_status
+
+    lg = _points(tmp_path / "p.zarrvectors", None, None)
+    cells = _cells(lg)
+    in_grid = {tuple(c) for c in cells.tolist() if all(0 <= v < 4 for v in c)}
+    arrays = ["vertices", "vertex_attributes/i"]
+
+    host = read_cells(lg, cells, arrays)
+    assert [(r.array, r.path, r.cells, r.stored_bytes) for r in host.io] == [
+        (a, "host", len(in_grid), None) for a in arrays
+    ]
+    assert set(host.io_seconds) == {"host"}
+
+    routes = ["host"] + (["kvikio"] if gds_status().kvikio else [])
+    for io in routes:
+        dev = read_cells(lg, cells, arrays, device="cuda", io=io)
+        want = "pinned-host" if io == "host" else (
+            "gds" if gds_status().available else "kvikio-compat"
+        )
+        assert [(r.array, r.path, r.cells) for r in dev.io] == [
+            (a, want, len(in_grid)) for a in arrays
+        ]
+        for r in dev.io:
+            assert r.stored_bytes == _cell_files_nbytes(lg, r.array) > 0
+        assert set(dev.io_seconds) == {"fetch", "decode"}
+        assert all(t >= 0 for t in dev.io_seconds.values())
+
+
+def test_an_array_left_to_the_host_is_reported_as_host(tmp_path):
+    lg = _points(tmp_path / "p.zarrvectors", "zstd", None)
+    dev = read_cells(lg, _cells(lg), ["vertices"], device="cuda")
+    assert [r.path for r in dev.io] == ["host"]
+    assert set(dev.io_seconds) == {"host"}
 
 
 def test_an_unsupported_codec_falls_back_or_raises(tmp_path):
