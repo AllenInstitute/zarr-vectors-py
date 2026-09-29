@@ -73,7 +73,8 @@ driver, so a process that forks workers should probe in the workers.
 | `dense_manifests` | object indexes can use the dense layout (below) |
 | `object_attribute_columns` | `write_object_attribute_columns` is available |
 | `array_link_cells` | `write_link_cells(chunks=, vids=, attributes=)` is available |
-| `defer_presence`, `append_safe_sharding` | presence can be deferred; appends into shared shards are safe |
+| `defer_presence`, `append_safe_sharding` | presence can be deferred; appends into shared per-chunk shards keep what is there (not the object layer's `at=` writes) |
+| `link_cells_append` | a second write into a link cell appends records and attribute rows, mirrored seam records included; serial writes only |
 
 ## Reading
 

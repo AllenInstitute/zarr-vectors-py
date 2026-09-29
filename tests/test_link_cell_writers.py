@@ -273,6 +273,46 @@ class TestRepeatBatchesIntoOneCell:
             (((0, 0, 0), 3), ((0, 0, 0), 4)): 2.0,
         }
 
+    @pytest.mark.parametrize("form", ["list", "array"])
+    @pytest.mark.parametrize("deferred", [False, True], ids=["stamped", "deferred"])
+    def test_mirrored_records_both_survive_with_their_attributes(
+        self, tmp_path: Path, form: str, deferred: bool,
+    ) -> None:
+        """A seam's two chunks each write the record, in their own order.
+
+        Under canonical storage both land in one cell: this is the write
+        BRIDGE probes before a format-1 seam write, and what
+        ``runtime_capabilities()["link_cells_append"]`` promises.
+        """
+        from zarr_vectors.building import defer_presence, rebuild_presence
+
+        lg = _new_lg(tmp_path)
+        create_links_array(lg, link_width=2, delta=0, sid_ndim=3)
+        if deferred:
+            defer_presence(lg)
+        a, b = ((0, 0, 0), 1), ((1, 0, 0), 2)
+        for record, w in (([a, b], 1.0), ([b, a], 2.0)):
+            weight = np.array([w], dtype=np.float32)
+            if form == "list":
+                p = write_link_cells(lg, [record], sid_ndim=3)
+                write_link_attribute_cells(lg, "w", weight, partition=p)
+            else:
+                write_link_cells(
+                    lg,
+                    chunks=np.array([[c for c, _ in record]], dtype=np.int64),
+                    vids=np.array([[v for _, v in record]], dtype=np.int64),
+                    attributes={"w": weight},
+                )
+        if deferred:
+            rebuild_presence(lg)
+        finalize_links(lg, delta=0)
+        links = read_links(lg, delta=0)
+        attrs = read_link_attributes(lg, "w", delta=0)
+        assert dict(zip((tuple(r) for r in links), attrs.tolist())) == {
+            (a, b): 1.0,
+            (b, a): 2.0,
+        }
+
 
 class TestAttributeMetadataStamps:
     """The per-segment metadata stamp is written once, not per batch.
