@@ -92,7 +92,9 @@ UNDECIDED: dict[str, str] = {
         "The optional GPU extension (the `[gpu]` extra). Callers reach it "
         "through `device=` and `runtime_capabilities()`, not by importing "
         "it; its own surface stays unpromised until device-side decode and "
-        "GPUDirect I/O settle what it has to offer."
+        "GPUDirect I/O settle what it has to offer. The exception meant for "
+        "direct import is `decode_zstd` (FEATURES: decode-zstd), a checked "
+        "zstd decode for bytes a caller fetched to the device itself."
     ),
     "zarr_vectors.composite": (
         "Multi-geometry stores round-trip now — add_geometry allocates its "
