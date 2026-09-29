@@ -12,8 +12,9 @@ Three ways to read, chosen per call:
 - ``kvikio``: straight into device memory with kvikio, which uses
   GPUDirect Storage when the system has it. Local files only.
 - ``host``: into pinned host memory with plain reads on a thread pool,
-  then one host-to-device copy. Local files only; the default, because
-  without GPUDirect Storage kvikio does the same thing in smaller pieces.
+  then one host-to-device copy. Local files only; what ``auto`` picks
+  unless cuFile reports GPUDirect Storage available, because without it
+  kvikio does the same thing in smaller pieces (:mod:`zarr_vectors._gds`).
 - any other zarr store (fsspec, obstore, icechunk, memory) is read
   through the store's own async ``get`` with byte ranges, then copied up
   once.
@@ -28,11 +29,13 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass
-from typing import Any, Literal
+from typing import Any
 
 import cupy as cp
 import numpy as np
 
+from zarr_vectors import _gds
+from zarr_vectors._gds import IO
 from zarr_vectors.core._cells_on_disk import (  # noqa: F401  (re-exported)
     CellSource,
     _batched,
@@ -47,8 +50,6 @@ from zarr_vectors.core._cells_on_disk import (  # noqa: F401  (re-exported)
     cell_source,
     locate_local,
 )
-
-IO = Literal["auto", "kvikio", "host"]
 
 
 @dataclass
@@ -73,30 +74,6 @@ class RawCells:
 # Reading
 
 
-def _choose_io(io: IO) -> str:
-    if io == "auto":
-        io = os.environ.get("ZARR_VECTORS_GPU_IO", "auto")  # type: ignore[assignment]
-    if io in ("kvikio", "host"):
-        return io
-    kvikio = _kvikio()
-    if kvikio is None:
-        return "host"
-    import kvikio.defaults
-
-    # Only when GPUDirect Storage has been asked for: in compatibility
-    # mode kvikio reads through a bounce buffer, which the pinned host
-    # path does in one copy instead of one per cell.
-    return "kvikio" if int(kvikio.defaults.compat_mode()) == 0 else "host"
-
-
-def _kvikio() -> Any | None:
-    try:
-        import kvikio  # type: ignore[import-not-found]
-    except Exception:
-        return None
-    return kvikio
-
-
 def fetch_many(
     requests: list[tuple[CellSource, np.ndarray]], *, io: IO = "auto",
 ) -> list[RawCells]:
@@ -108,7 +85,7 @@ def fetch_many(
     through their stores. The result is one :class:`RawCells` per request,
     in order; they may share a device buffer.
     """
-    how = _choose_io(io)
+    how = _gds.choose_io(io)
     out: list[RawCells | None] = [None] * len(requests)
     local = [i for i, (src, _) in enumerate(requests) if src.local_root is not None]
     remote = [i for i, (src, _) in enumerate(requests) if src.local_root is None]
@@ -195,15 +172,16 @@ def _fetch_kvikio(
     handles: dict[str, Any] = {}
     futures = []
     try:
-        for r, i, path, offset, n, at in jobs:
-            fh = handles.get(path)
-            if fh is None:
-                fh = handles[path] = kv.CuFile(path, "r")
-            futures.append((r, i, n, fh.pread(data[at:at + n], n, offset)))
-        for r, i, n, fut in futures:
-            if fut.get() != n:
-                errors_of[r][i] = "short read"
-                sizes_of[r][i] = 0
+        with _gds.kvikio_threads():
+            for r, i, path, offset, n, at in jobs:
+                fh = handles.get(path)
+                if fh is None:
+                    fh = handles[path] = kv.CuFile(path, "r")
+                futures.append((r, i, n, fh.pread(data[at:at + n], n, offset)))
+            for r, i, n, fut in futures:
+                if fut.get() != n:
+                    errors_of[r][i] = "short read"
+                    sizes_of[r][i] = 0
     finally:
         for fh in handles.values():
             fh.close()
