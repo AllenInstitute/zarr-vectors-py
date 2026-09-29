@@ -144,12 +144,15 @@ class ObjectIndexAppender:
 
         # vlen-bytes lacks a finalised V3 spec — silence as
         # _write_object_index_manifests does.
+        from zarr_vectors.core.arrays import _object_shards
+
         with warnings.catch_warnings():
             warnings.simplefilter("ignore", UnstableSpecificationWarning)
             arr = oi_group.create_array(
                 "manifests",
                 shape=(self._base_oid,),
                 chunks=(OBJECT_INDEX_MANIFEST_BUCKET,),
+                shards=_object_shards(self._level_group, (OBJECT_INDEX_MANIFEST_BUCKET,)),
                 dtype="bytes",
                 serializer=VLenBytesCodec(),
             )

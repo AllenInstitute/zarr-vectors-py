@@ -1578,6 +1578,7 @@ class Group:
         fill_value: Any = None,
         attributes: dict[str, Any] | None = None,
         compressors: Any = None,
+        shards: tuple[int, ...] | None = None,
     ) -> None:
         """Write a chunked Zarr v3 array at ``path``.
 
@@ -1598,6 +1599,9 @@ class Group:
             compressors: Override the codec pipeline.  ``None`` uses the
                 active session codec (from :meth:`batched_writes`) or
                 zarr v3's default (``bytes`` + ``zstd``).
+            shards: Outer chunk (shard) shape, a multiple of ``chunks``;
+                ``None`` for one object per chunk.  Zarr's own
+                ``sharding_indexed``, so any Zarr v3 reader reads it.
         """
         arr_data = np.asarray(data)
         if chunks is None:
@@ -1617,6 +1621,8 @@ class Group:
         }
         if fill_value is not None:
             create_kwargs["fill_value"] = fill_value
+        if shards is not None:
+            create_kwargs["shards"] = tuple(int(s) for s in shards)
 
         resolved = self._resolve_codecs(compressors)
         if resolved is not None:

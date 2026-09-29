@@ -105,6 +105,10 @@ FEATURES: frozenset[str] = frozenset({
     # building.store_layout: a store's layout resolved from what it holds,
     # with min_reader, the oldest zarr-vectors that reads all of it.
     "store-layout",
+    # building.shard_object_layer / shard_store(object_shard_rows=): the
+    # object layer sharded along rows, by zarr's own codec (no format key);
+    # writers keep a sharded layer sharded.
+    "object-layer-shards",
 })
 
 
