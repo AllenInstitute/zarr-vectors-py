@@ -35,6 +35,7 @@ because a name used from ``core`` is a name nobody knows is load-bearing.
 
 from __future__ import annotations
 
+from collections.abc import Iterable, Mapping
 from pathlib import Path
 from typing import Any
 
@@ -817,13 +818,148 @@ def rebuild_presence(
         level_group.derive_nonempty_chunks(name, on_sharded=on_sharded)
         rebuilt.append(name)
 
-    from zarr_vectors.core.group import _PRESENCE_DECL_ATTR
-
     # Last, so a rebuild that fails part-way leaves the level still
     # declared -- and its remaining arrays still derived, not trusted.
+    _clear_deferral(level_group)
+    return rebuilt
+
+
+def _clear_deferral(level_group: Group) -> None:
+    """Remove the level's deferral declaration; the one place that does."""
+    from zarr_vectors.core.group import _PRESENCE_DECL_ATTR
+
     if level_group.presence_deferred():
         del level_group.zarr_group.attrs[_PRESENCE_DECL_ATTR]
-    return rebuilt
+
+
+def set_presence(
+    level_group: Group,
+    cells: Mapping[str, Iterable[Any]],
+    *,
+    end_deferral: bool = False,
+) -> list[str]:
+    """Record each named array's presence as exactly the cells given.
+
+    For a coordinator that already knows which cells its workers filled
+    -- they reported them -- and so need not read the store back to find
+    out, which is what :func:`rebuild_presence` does: a listing and a read
+    of every shard object of every array. Each named array's
+    ``nonempty_chunks`` becomes exactly ``cells[name]``, in canonical
+    ``"i.j.k"`` form; arrays not named are left alone. All the manifests
+    are written in one gather.
+
+    Keys may be ``"i.j.k"`` strings or coordinate tuples, in absolute
+    chunk coordinates (the array's grid origin is applied here). Every key
+    of every array is checked -- it must parse, and fall inside the
+    array's grid -- before anything is written, so a bad key writes
+    nothing.
+
+    "Exactly" means exactly: a cell written by more than one worker (a
+    canonical link cell, say) must appear in the union the caller passes,
+    and every array the workers wrote must be named, ``vertex_fragments``,
+    ``link_fragments`` and ``link_attributes/*`` included. Calling it
+    while workers are still writing brings back the races deferral
+    exists to avoid.
+
+    Args:
+        cells: ``{array_name: keys}``.
+        end_deferral: Then end the level's :func:`defer_presence`
+            declaration, as :func:`end_presence_deferral` does.
+
+    Returns:
+        The array names written, sorted.
+
+    Raises:
+        StoreError: A name is not a per-chunk array of this level.
+        ArrayError: A key does not parse or lies outside its array's grid.
+    """
+    from zarr_vectors.core._batch_writer import _stamp_presence
+    from zarr_vectors.core.arrays import _is_per_chunk_array
+    from zarr_vectors.core.group import (
+        _coord_to_index,
+        _coords_in_bounds,
+        _format_chunk_key,
+        _grid_origin,
+        _parse_chunk_coords,
+    )
+
+    stamps = []
+    for name in sorted(cells):
+        arr = level_group._sharded_chunk_array(name)
+        if arr is None or not _is_per_chunk_array(name):
+            raise StoreError(
+                f"set_presence: {name!r} is not a per-chunk array of "
+                f"{level_group.zarr_group.path or '<root>'}"
+            )
+        origin = _grid_origin(arr)
+        shape = tuple(int(n) for n in arr.shape)
+        keys: set[str] = set()
+        for key in cells[name]:
+            coords = (
+                _parse_chunk_coords(key) if isinstance(key, str)
+                else tuple(int(c) for c in key)
+            )
+            if coords is None or not _coords_in_bounds(_coord_to_index(coords, origin), shape):
+                raise ArrayError(
+                    f"set_presence: {key!r} is not a cell of {name!r} "
+                    f"(grid origin {origin or (0,) * len(shape)}, shape {shape})"
+                )
+            keys.add(_format_chunk_key(coords))
+        stamps.append((name, arr, sorted(keys), {}))
+    _stamp_presence(stamps)
+    if level_group._listing_cache:
+        for name, *_ in stamps:
+            level_group._listing_cache.pop(level_group._full_path(name), None)
+    if end_deferral:
+        end_presence_deferral(level_group)
+    return [name for name, *_ in stamps]
+
+
+def end_presence_deferral(
+    level_group: Group, *, missing: str = "raise",
+) -> list[str]:
+    """End the level's :func:`defer_presence` declaration.
+
+    What :func:`rebuild_presence` does last, on its own: for a coordinator
+    that recorded presence itself, with :func:`set_presence`, or rebuilt
+    it array by array across processes. Arrays allocated afterwards get a
+    manifest again, and stamps resume.
+
+    An array still without a manifest when the declaration goes would stay
+    store-derived for good -- its writes never stamp -- and would read as
+    empty to a zarr-vectors older than 0.9.3. So by default that refuses.
+
+    Args:
+        missing: What to do about per-chunk arrays with no manifest:
+            ``"raise"`` (the default) names them and changes nothing;
+            ``"derive"`` rebuilds each from the store first, as
+            :func:`rebuild_presence` would.
+
+    Returns:
+        The arrays derived under ``missing="derive"`` (empty otherwise).
+    """
+    from zarr_vectors.core.group import _NONEMPTY_CHUNKS_ATTR
+
+    if missing not in ("raise", "derive"):
+        raise ArrayError(f"missing={missing!r}; expected 'raise' or 'derive'")
+    lacking = []
+    for name in per_chunk_array_paths(level_group):
+        arr = level_group._sharded_chunk_array(name)
+        if arr is not None and _NONEMPTY_CHUNKS_ATTR not in arr.attrs:
+            lacking.append(name)
+    if lacking and missing == "raise":
+        raise StoreError(
+            f"Cannot end the presence deferral of "
+            f"{level_group.zarr_group.path or '<root>'}: {len(lacking)} per-chunk "
+            f"array(s) have no manifest ({', '.join(lacking[:5])}"
+            f"{', ...' if len(lacking) > 5 else ''}). Record them with "
+            f"set_presence, or pass missing='derive' to rebuild them "
+            f"from the store."
+        )
+    for name in lacking:
+        level_group.derive_nonempty_chunks(name)
+    _clear_deferral(level_group)
+    return lacking
 
 
 __all__ = [
@@ -902,6 +1038,7 @@ __all__ = [
     "decode_fragment_index",
     "decode_object_manifest_blocks",
     "defer_presence",
+    "end_presence_deferral",
     "decompose_tree_to_paths",
     "decode_object_manifests_csr",
     "encode_object_manifest_blocks",
@@ -989,6 +1126,7 @@ __all__ = [
     "reshard",
     "session_for",
     "set_coordinate_offset",
+    "set_presence",
     "shard_store",
     "split_polyline_at_boundaries",
     "unshard_store",

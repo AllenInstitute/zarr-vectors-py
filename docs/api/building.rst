@@ -361,6 +361,10 @@ consumers cannot ask the store and run before any coordinator pass -- see
 
 .. autofunction:: zarr_vectors.building.rebuild_presence
 
+.. autofunction:: zarr_vectors.building.set_presence
+
+.. autofunction:: zarr_vectors.building.end_presence_deferral
+
 .. autofunction:: zarr_vectors.building.per_chunk_array_paths
 
 .. autofunction:: zarr_vectors.building.array_is_sharded

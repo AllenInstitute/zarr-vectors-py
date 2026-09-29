@@ -5083,6 +5083,14 @@ def finalize_links(
                 ]
         if delta == 0:
             rebuild.append(LINK_FRAGMENTS)
+    if level_group.presence_deferred():
+        # A deferred level has no manifests to rebuild, and this is not
+        # the place to write them: tasks may still be writing, and a
+        # manifest written here would put their stamps back to racing.
+        # Its listings ask the store instead, so the enumeration below
+        # still finds every cell; the level's own rebuild_presence (or
+        # set_presence) records presence once, at the end.
+        rebuild = []
     for name in rebuild:
         if level_group._sharded_chunk_array(name) is None:
             # Not a chunk array: an already-stamped segment from the
