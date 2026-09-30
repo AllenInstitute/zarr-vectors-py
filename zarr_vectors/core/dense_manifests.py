@@ -222,6 +222,29 @@ def _create(level_group: Group, path: str, data: npt.NDArray[np.int64]) -> None:
     )
 
 
+def _truncate(level_group: Group, path: str, n: int) -> None:
+    """Shrink ``path`` to its first ``n`` rows, storing what writing only them would.
+
+    ``resize`` drops the storage objects wholly past the new end, but the
+    object holding row ``n`` keeps the old rows after it. They are cleared
+    to the fill value first -- up to the end of that object (the shard when
+    sharded) -- so its bytes are a fresh write's, and inner chunks left
+    holding only fill are not stored.
+    """
+    node = _node(level_group, path)
+    n0 = int(node.shape[0])
+    if n >= n0:
+        return
+    outer = int((node.shards or node.chunks)[0])
+    end = min(n0, -(-n // outer) * outer)
+    if end > n:
+        node[n:end] = node.fill_value
+    if "shape" in node.attrs:
+        node.metadata.attributes["shape"] = [n, *node.shape[1:]]
+    node.resize((n, *node.shape[1:]))
+    level_group._invalidate_node(path)
+
+
 def write(
     level_group: Group,
     offsets: npt.NDArray[np.int64],
@@ -272,6 +295,20 @@ def write(
     start = n0 if at is None else int(at)
     if start < 0:
         raise ArrayError(f"Append index {at} is negative")
+    head = None
+    if start < n0:
+        # Residue past the commit point: keep the rows before ``start`` and
+        # the blocks they use, and drop the rest of both -- the blocks too,
+        # or every rewrite from ``start`` leaves the old rows' blocks behind,
+        # unreferenced, and appends after them. Rows' blocks are laid out in
+        # the order written, so the kept rows use blocks below the highest
+        # end any of them names (a patch that moved a row's blocks past
+        # residue keeps that residue too: never less than is referenced).
+        head = _rows(level_group, SPANS_PATH, slice(0, start)).reshape(-1, 2)
+        keep = int((head[:, 0] + head[:, 1]).max()) if start else 0
+        if keep < b0:
+            _truncate(level_group, BLOCKS_PATH, keep)
+            b0 = keep
     tail = np.empty((max(start - n0, 0) + n, 2), dtype=np.int64)
     pad = max(start - n0, 0)
     tail[:pad] = (b0, 0)
@@ -279,9 +316,7 @@ def write(
     tail[pad:, 1] = counts
     if new_blocks.size:
         level_group.extend_array(BLOCKS_PATH, new_blocks)
-    if start < n0:
-        # Residue past the commit point: keep what precedes ``start``.
-        head = _rows(level_group, SPANS_PATH, slice(0, start)).reshape(-1, 2)
+    if head is not None:
         _create(level_group, SPANS_PATH, np.concatenate([head, tail]).astype(np.int64))
     elif tail.size:
         level_group.extend_array(SPANS_PATH, tail)

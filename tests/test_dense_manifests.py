@@ -198,6 +198,41 @@ def test_patches_touch_only_what_they_change(tmp_path):
     _same_reads(v, d, ids=[3, 50, 199, 500, 0])
 
 
+@pytest.mark.parametrize("at", [0, 5_000, 17_000])
+def test_a_rewrite_from_a_row_drops_the_residue_blocks(tmp_path, at):
+    """An append ``at`` below the row count truncates the blocks too.
+
+    The residue's blocks used to stay, unreferenced, with the rewrite's
+    appended after them: every resume from a row grew ``manifest_blocks``,
+    and its bytes stopped being those of a store written once. Crosses a
+    16,384-row bucket, so the object holding the new last row is rewritten.
+    """
+    def single(lo, hi, tag):
+        n = hi - lo
+        return dict(
+            chunk_coords=np.tile([[1, 0, 1]], (n, 1)),
+            fragment_idx=np.arange(lo, hi, dtype=np.int64) * 3 + tag,
+            manifest_offsets=np.arange(n + 1, dtype=np.int64),
+        )
+
+    rewritten, r = _level(tmp_path, "r", "dense")
+    write_object_manifests(r, **single(0, 20_000, 0), mode="append", at=0)
+    write_object_manifests(r, **single(at, 20_000, 1), mode="append", at=at)
+    once, o = _level(tmp_path, "o", "dense")
+    if at:
+        write_object_manifests(o, **single(0, at, 0), mode="append", at=0)
+    write_object_manifests(o, **single(at, 20_000, 1), mode="append", at=at)
+
+    assert dense.num_blocks(r) == dense.num_blocks(o) == 20_000
+    def files(store, path):
+        root = store / "0" / path
+        return {str(f.relative_to(root)): f.read_bytes() for f in root.rglob("*") if f.is_file()}
+
+    for path in (dense.BLOCKS_PATH, dense.SPANS_PATH):
+        got, want = files(rewritten, path), files(once, path)
+        assert got and got == want, path
+
+
 def test_a_rewrite_compacts_patched_away_blocks(tmp_path):
     _, d = _level(tmp_path, "d", "dense")
     write_object_index(d, {0: [((0, 0, 0), 1)], 1: [((1, 0, 0), 2)]}, 3)
