@@ -25,6 +25,8 @@ The package supports supervoxel-level spatial binning with separated chunk and b
 pip install zarr-vectors
 ```
 
+Requires Python 3.11 or later.
+
 ---
 
 ## Quick start
