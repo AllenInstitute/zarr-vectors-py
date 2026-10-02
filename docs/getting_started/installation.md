@@ -1,6 +1,6 @@
 # Installation
 
-`zarr-vectors` requires Python 3.10 or later and depends on `zarr>=3.0`,
+`zarr-vectors` requires Python 3.11 or later and depends on `zarr>=3.0`,
 `numpy>=1.24`, and `numcodecs`. All mandatory dependencies are installed
 automatically by `pip`.
 
