@@ -1794,10 +1794,11 @@ def write_chunk_links(
             record_presence=record_presence,
         )
         # Lets a later ``stamp_fragment_link_groups`` check these groups
-        # against the vertex fragments without reading the rows back.
-        from zarr_vectors.core.link_groups import group_bounds
+        # against the vertex fragments without reading the rows back.  After
+        # both writes: each of them drops the cell's previous record.
+        from zarr_vectors.core.link_groups import link_group_hint
 
-        level_group.note_link_group_bounds(key, group_bounds(link_groups))
+        level_group.note_link_group_bounds(key, link_group_hint(link_groups))
         del link_row_size  # silence unused-variable warning
         return link_byte_offsets
 
@@ -4402,7 +4403,9 @@ def stamp_fragments_tile(level_group: Group, ndim: int) -> bool:
     later read, and the cost of checking is one index read per chunk on a
     path that has just written far more than that.  So it checks.
 
-    Must run AFTER the chunk writes, never as part of the
+    Must run AFTER the chunk writes have reached the store -- it raises
+    :class:`StoreError` inside a :meth:`Group.batched_writes` block, whose
+    queued writes would land after the stamp -- and never as part of the
     :class:`LevelMetadata` a writer builds up front: creating the level
     first and then writing to ``vertices`` trips
     :meth:`Group._clear_fragments_tile`, which would wipe a claim stamped
@@ -4416,6 +4419,13 @@ def stamp_fragments_tile(level_group: Group, ndim: int) -> bool:
         ndim: Coordinate columns per vertex, so a buffer's row count
             can be derived from its byte length.
     """
+    if level_group._pending_writes is not None:
+        raise StoreError(
+            "stamp_fragments_tile must run after the writes have reached the "
+            "store, not inside batched_writes() or open_write_session(): it "
+            "checks the store, and writes still queued would land after the "
+            "claim without withdrawing it"
+        )
     keys = list_chunk_keys(level_group)
     if not keys:
         return False

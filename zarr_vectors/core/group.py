@@ -60,19 +60,29 @@ from zarr_vectors.core._vlen import (
 from zarr_vectors.core._vlen import (
     region_to_bytes as _vlen_region_to_bytes,
 )
+from zarr_vectors.core.paths import SELF_OFFSETS_SEGMENT as _SELF_OFFSETS_SEGMENT
 from zarr_vectors.exceptions import ShardedPresenceError, StoreError
 
 # Where ``LevelMetadata`` lives on a level group's attrs.  Duplicated
 # rather than imported because ``core.metadata`` imports this module.
 _LEVEL_META_KEY = "zarr_vectors_level"
 
+#: Level-metadata keys that are *claims*: stamped by a writer only after
+#: checking them against the store, and withdrawn by any later write to
+#: the arrays they describe.  Nothing else may set them -- see
+#: :func:`zarr_vectors.core.store.update_level_metadata`.
+_LEVEL_CLAIM_KEYS = ("fragments_tile", "fragment_link_groups")
+
 
 def _is_intra_links_array(array_name: str) -> bool:
     """``links/0/<offsets>`` with every offset zero: the intra-chunk array
-    whose rows ``link_fragments/`` describes."""
+    whose rows ``link_fragments/`` describes.  ``link_width == 1`` has no
+    offsets at all, and its intra array is ``links/0/self``."""
     parts = array_name.split("/")
     if len(parts) != 3 or parts[0] != "links" or parts[1] != "0":
         return False
+    if parts[2] == _SELF_OFFSETS_SEGMENT:
+        return True
     try:
         return all(int(t) == 0 for t in re.split(r"[._]", parts[2]))
     except ValueError:
@@ -185,10 +195,12 @@ class Group:
     # chunk key.  Written by ``write_chunk_vertices``, consumed by
     # ``stamp_fragments_tile``; see :meth:`note_vertex_rows`.
     _vertex_rows_written: dict[str, int] | None = None
-    # Per-group endpoint bounds of the intra-chunk link cells written this
-    # session, keyed by chunk key.  Written by ``write_chunk_links``,
-    # consumed by ``stamp_fragment_link_groups``.
-    _link_group_bounds: dict[str, list[tuple[int, int] | None]] | None = None
+    # What this handle last wrote into each intra-chunk link cell, keyed
+    # by chunk key: one ``(count, min endpoint, max endpoint)`` row per
+    # link group.  Written by ``write_chunk_links``, dropped by any other
+    # write to the cell or its ``link_fragments`` index, consumed by
+    # ``stamp_fragment_link_groups``.  See :meth:`note_link_group_bounds`.
+    _link_group_bounds: dict[str, np.ndarray] | None = None
     # object_index path -> (sorted ids, rows), built on first lookup.
     # Resolving an id to a row otherwise re-reads and re-sorts the id
     # table on every single-object read, which turns a point lookup into
@@ -433,6 +445,8 @@ class Group:
             self._clear_fragments_tile()
         if _breaks_link_groups(array_name):
             self._clear_fragment_link_groups()
+            if array_name != _VERTEX_FRAGMENTS_ARRAY:
+                self._forget_link_groups((chunk_key,))
         sharded_arr = self._sharded_chunk_array(array_name)
         if sharded_arr is None:
             raise StoreError(
@@ -485,8 +499,10 @@ class Group:
         """
         if array_name in (_VERTICES_ARRAY, _VERTEX_FRAGMENTS_ARRAY):
             self._clear_fragments_tile()
+        forget = False
         if _breaks_link_groups(array_name):
             self._clear_fragment_link_groups()
+            forget = array_name != _VERTEX_FRAGMENTS_ARRAY
         sharded_arr = self._sharded_chunk_array(array_name)
         if sharded_arr is None:
             raise StoreError(
@@ -509,6 +525,8 @@ class Group:
             index = _coord_to_index(coords, origin)
             _check_coords_in_bounds(index, shape, array_name)
             n += 1
+            if forget:
+                self._forget_link_groups((chunk_key,))
             if pending is not None:
                 pending.append((array_name, chunk_key, bytes(data), record_presence))
                 continue
@@ -1293,29 +1311,40 @@ class Group:
             self._vertex_rows_written = {}
         self._vertex_rows_written[chunk_key] = int(n_rows)
 
-    def note_link_group_bounds(
-        self, chunk_key: str, bounds: list[tuple[int, int] | None],
-    ) -> None:
-        """Record the smallest and largest endpoint of each intra-chunk link
-        group a cell was just given (``None`` for an empty group).
+    def note_link_group_bounds(self, chunk_key: str, hint: np.ndarray) -> None:
+        """Record what an intra-chunk link cell was just given: a
+        ``(G, 3)`` int64 array of ``(count, min endpoint, max endpoint)``
+        per link group, in group order (see
+        :func:`~zarr_vectors.core.link_groups.link_group_hint`).
 
         The ``fragment_link_groups`` counterpart of
         :meth:`note_vertex_rows`: lets
         :func:`~zarr_vectors.core.link_groups.stamp_fragment_link_groups`
         check each group against its vertex fragment without re-reading the
-        rows just written.  Only a hint -- a chunk without one is checked
-        against its stored rows.
+        rows just written.  Only a hint, and never trusted over the store:
+        it is used only while the ``link_fragments`` cell the check reads
+        anyway still holds exactly these groups as contiguous ranges, and
+        any other write to the cell or its index through this handle drops
+        it (:meth:`write_bytes`).  Must be recorded *after* those writes.
         """
         if self._link_group_bounds is None:
             self._link_group_bounds = {}
-        self._link_group_bounds[chunk_key] = list(bounds)
+        self._link_group_bounds[chunk_key] = np.asarray(hint, dtype=np.int64)
 
-    def take_link_group_bounds(self) -> dict[str, list[tuple[int, int] | None]]:
-        """Consume and clear the recorded bounds (see
+    def take_link_group_bounds(self) -> dict[str, np.ndarray]:
+        """Consume and clear the recorded hints (see
         :meth:`take_vertex_rows` for why they are cleared on read)."""
         recorded = self._link_group_bounds or {}
         self._link_group_bounds = None
         return recorded
+
+    def _forget_link_groups(self, chunk_keys: Iterable[str]) -> None:
+        """Drop the hints for cells about to be rewritten by something
+        other than the writer that recorded them."""
+        if not self._link_group_bounds:
+            return
+        for key in chunk_keys:
+            self._link_group_bounds.pop(key, None)
 
     def take_vertex_rows(self) -> dict[str, int]:
         """Consume and clear the recorded counts.
@@ -2078,22 +2107,116 @@ class Group:
         describes.  A writer that does not know about the claim (an edit,
         an append, a rechunk) therefore withdraws it rather than leaving it
         stale; a writer that keeps the grouping re-stamps it afterwards
-        with :func:`~zarr_vectors.core.arrays.stamp_fragment_link_groups`.
+        with :func:`~zarr_vectors.core.link_groups.stamp_fragment_link_groups`.
+
+        The decision is made against the level's attributes as the store
+        holds them now, not as this handle loaded them, so a claim another
+        handle stamped after this one was opened is still withdrawn.  It is
+        made once per handle (one ``zarr.json`` read per writer), which
+        leaves one gap, shared with ``fragments_tile``: a handle that has
+        already written -- and so settled -- before another handle stamps
+        the level does not withdraw that later stamp when it writes again.
+        Re-open the level after a stamp made elsewhere.
         """
         if self._link_groups_claim_settled:
             return
         self._link_groups_claim_settled = True
+        self._drop_level_claim("fragment_link_groups")
+
+    def _drop_level_claim(self, claim: str) -> bool:
+        """Remove one claim key from the level block as the store holds
+        it now.  Returns whether it was set."""
+
+        def drop(attrs: dict[str, Any]) -> dict[str, Any] | None:
+            level = attrs.get(_LEVEL_META_KEY)
+            if not isinstance(level, dict) or not level.get(claim):
+                return None
+            return {
+                _LEVEL_META_KEY: {k: v for k, v in level.items() if k != claim},
+            }
+
+        return self._update_attrs_fresh(drop)
+
+    def _set_level_claims(self, claims: dict[str, bool]) -> None:
+        """Set claim keys on the level block as the store holds it now.
+        Only for the writer that has just verified them, or one restoring
+        claims over bytes it rewrote unchanged."""
+
+        def put(attrs: dict[str, Any]) -> dict[str, Any] | None:
+            level = attrs.get(_LEVEL_META_KEY)
+            if not isinstance(level, dict):
+                return None
+            return {_LEVEL_META_KEY: {**level, **claims}}
+
+        self._update_attrs_fresh(put)
+
+    def level_claims(self) -> dict[str, bool]:
+        """The claims this level holds, as the store has them now:
+        ``{claim: True}`` for each of :data:`_LEVEL_CLAIM_KEYS` that is
+        set."""
+        attrs = self._fresh_attributes()
+        level = attrs.get(_LEVEL_META_KEY)
+        if not isinstance(level, dict):
+            return {}
+        return {k: True for k in _LEVEL_CLAIM_KEYS if level.get(k)}
+
+    def _fresh_node(self, mode: str) -> zarr.Group | None:
+        """This group re-opened from the store, bypassing the attributes
+        this handle (and any node cache) loaded.  ``None`` when that is
+        not possible -- an offline snapshot, or a node not in the store."""
+        if self._offline is not None:
+            return None
         try:
-            level = self._zarr.attrs.get(_LEVEL_META_KEY)
-        except Exception:
-            return
-        if not isinstance(level, dict) or not level.get("fragment_link_groups"):
-            return
-        self._zarr.attrs.update({
-            _LEVEL_META_KEY: {
-                k: v for k, v in level.items() if k != "fragment_link_groups"
-            },
-        })
+            node = zarr.open_group(
+                self._zarr.store, path=self._zarr.path, mode=mode,
+                zarr_format=self._zarr.metadata.zarr_format,
+            )
+        except Exception:  # noqa: BLE001 - fall back to the loaded copy
+            return None
+        return node if isinstance(node, zarr.Group) else None
+
+    def _fresh_attributes(self) -> dict[str, Any]:
+        """This group's attributes as the store holds them now."""
+        node = self._fresh_node("r")
+        source = node if node is not None else self._zarr
+        try:
+            return dict(source.attrs)
+        except Exception:  # noqa: BLE001 - a node with no readable attrs
+            return {}
+
+    def _update_attrs_fresh(
+        self, change: Callable[[dict[str, Any]], dict[str, Any] | None],
+    ) -> bool:
+        """Read-modify-write this group's attributes against the store.
+
+        ``change`` gets the attributes as the store holds them now and
+        returns the top-level keys to set (``None``: nothing to do).  The
+        write merges into that fresh copy, never into what this handle
+        loaded, so a stale handle cannot put back a key another handle
+        removed; this handle's own copy is then brought up to date.
+        Returns whether anything was written.
+        """
+        node = self._fresh_node("r+")
+        if node is None:
+            try:
+                current = dict(self._zarr.attrs)
+            except Exception:  # noqa: BLE001 - a node with no readable attrs
+                current = {}
+            updates = change(current)
+            if updates:
+                _merge_attributes(self._zarr, _json_safe(updates))
+            return bool(updates)
+        updates = change(dict(node.attrs))
+        if updates:
+            node.update_attributes(_json_safe(updates))
+        try:
+            cached = self._zarr.metadata.attributes
+            if cached is not node.metadata.attributes:
+                cached.clear()
+                cached.update(node.metadata.attributes)
+        except Exception:  # noqa: BLE001 - a copy we cannot refresh
+            pass
+        return bool(updates)
 
     def _invalidate_node(self, path: str) -> None:
         """Drop ``path`` and everything beneath it from the node cache.

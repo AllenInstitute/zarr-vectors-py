@@ -140,11 +140,12 @@ from zarr_vectors.core.arrays import (
 from zarr_vectors.core.group import Group, observe_presence_writes
 from zarr_vectors.core.link_groups import (
     fragment_of_rows,
-    group_bounds,
     index_fragment_link_groups,
+    link_group_hint,
     split_links_by_fragment,
     stamp_fragment_link_groups,
     verify_fragment_link_groups,
+    withdraw_fragment_link_groups,
     write_link_groups,
 )
 from zarr_vectors.core.metadata import (
@@ -774,7 +775,6 @@ __all__ = [
     "get_level_translation",
     "get_resolution_level",
     "get_shard_info",
-    "group_bounds",
     "index_fragment_link_groups",
     "init_skeleton_store",
     "intra_offsets",
@@ -789,6 +789,7 @@ __all__ = [
     "link_endpoint_scales",
     "link_endpoints_to_rows",
     "link_family_policy",
+    "link_group_hint",
     "links_group_path",
     "links_has_perm",
     "links_path",
@@ -855,6 +856,7 @@ __all__ = [
     "validate_bin_shape_divides_chunk",
     "validate_level_chunk_shape_against_root",
     "verify_fragment_link_groups",
+    "withdraw_fragment_link_groups",
     "write_chunk_attributes",
     "write_chunk_fragment_attributes",
     "write_chunk_fragments",

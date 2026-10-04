@@ -187,6 +187,24 @@ def _normalise_shard_shape(
 # ===================================================================
 
 
+def _restore_level_claims(level: Group, claims: dict[str, bool]) -> None:
+    """Put back the claims a level held before its cells were repacked.
+
+    Repacking rewrites every cell through :meth:`Group.write_bytes`, which
+    withdraws ``fragments_tile`` and ``fragment_link_groups`` -- the
+    chokepoint cannot tell a repack from an edit.  But a repack writes back
+    exactly the bytes it read, so whatever held before holds after.  Called
+    only once every array of the level has been repacked; an interrupted
+    repack leaves the claims withdrawn.
+    """
+    if not claims:
+        return
+    level._set_level_claims(claims)
+    # As after a stamp: this handle's next write must be able to clear them.
+    level._tiling_claim_settled = False
+    level._link_groups_claim_settled = False
+
+
 def shard_store(
     store_path: str | Path | Group,
     *,
@@ -228,6 +246,7 @@ def shard_store(
 
     for level_idx in list_resolution_levels(root):
         level = get_resolution_level(root, level_idx)
+        claims = level.level_claims()
         for array_name in _list_array_names(level, arrays):
             if not level.array_exists(array_name):
                 continue
@@ -316,6 +335,7 @@ def shard_store(
 
             arrays_sharded += 1
             chunks_packed += n_packed
+        _restore_level_claims(level, claims)
 
     return {
         "arrays_sharded": arrays_sharded,
@@ -347,6 +367,7 @@ def unshard_store(
 
     for level_idx in list_resolution_levels(root):
         level = get_resolution_level(root, level_idx)
+        claims = level.level_claims()
         for array_name in _list_array_names(level, arrays):
             if not level.standalone_array_exists(array_name):
                 continue
@@ -390,6 +411,7 @@ def unshard_store(
 
             arrays_unsharded += 1
             chunks_extracted += len(chunk_payloads)
+        _restore_level_claims(level, claims)
 
     return {
         "arrays_unsharded": arrays_unsharded,

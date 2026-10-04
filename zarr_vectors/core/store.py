@@ -1548,6 +1548,20 @@ _DERIVED_LEVEL_FIELDS: dict[str, str] = {
 }
 
 
+#: Level-metadata fields that are CLAIMS, and therefore refused by
+#: :func:`update_level_metadata`: each is stamped only by the writer that
+#: has just verified it against the store, and withdrawn by any later write
+#: to the arrays it describes.  Setting one by hand is exactly the
+#: unverified claim that hands readers a wrong answer.
+_CLAIM_LEVEL_FIELDS: dict[str, str] = {
+    "fragments_tile": "zarr_vectors.core.arrays.stamp_fragments_tile",
+    "fragment_link_groups": (
+        "zarr_vectors.core.link_groups.stamp_fragment_link_groups "
+        "(or index_fragment_link_groups for an existing level)"
+    ),
+}
+
+
 def update_level_metadata(
     level_group: Group,
     *,
@@ -1567,17 +1581,24 @@ def update_level_metadata(
     in it, so two concurrent callers race exactly the way ``nonempty_chunks``
     does.  Call it once, after a parallel phase, not from inside one.
 
+    The block is read from the store at the time of the call, not from what
+    ``level_group`` loaded when it was opened, and the change is merged into
+    that: a handle opened before another one withdrew a claim cannot put the
+    claim back by updating an unrelated field.
+
     Args:
         arrays_present: Replace the family list outright.
         add_arrays_present: Add one or more families, keeping the rest.
         **fields: Any other ``LevelMetadata`` field. Derived fields are
-            refused -- see :data:`_DERIVED_LEVEL_FIELDS`.
+            refused -- see :data:`_DERIVED_LEVEL_FIELDS` -- and so are
+            claims, which only their verifying stamp sets -- see
+            :data:`_CLAIM_LEVEL_FIELDS`.
 
     Returns:
         The level metadata as it now stands.
 
     Raises:
-        MetadataError: On an unknown field, or a derived one.
+        MetadataError: On an unknown field, a derived one, or a claim.
     """
     import dataclasses
 
@@ -1587,6 +1608,15 @@ def update_level_metadata(
         raise MetadataError(
             f"update_level_metadata() cannot set {bad}: {why}."
         )
+    claims = sorted(set(fields) & set(_CLAIM_LEVEL_FIELDS))
+    if claims:
+        why = "; ".join(
+            f"{k} is a claim stamped by {_CLAIM_LEVEL_FIELDS[k]} after "
+            f"checking it against the store" for k in claims
+        )
+        raise MetadataError(
+            f"update_level_metadata() cannot set {claims}: {why}."
+        )
     known = {f.name for f in dataclasses.fields(LevelMetadata)}
     unknown = sorted(set(fields) - known)
     if unknown:
@@ -1595,31 +1625,35 @@ def update_level_metadata(
             f"LevelMetadata has {sorted(known)}"
         )
 
-    attrs = level_group.attrs.to_dict()
-    block = dict(attrs.get("zarr_vectors_level", {}))
-
     if arrays_present is not None and add_arrays_present is not None:
         raise MetadataError(
             "pass arrays_present (replace) or add_arrays_present (extend), "
             "not both"
         )
-    if arrays_present is not None:
-        block["arrays_present"] = list(arrays_present)
-    if add_arrays_present is not None:
-        extra = (
-            [add_arrays_present] if isinstance(add_arrays_present, str)
-            else list(add_arrays_present)
-        )
-        current = list(block.get("arrays_present", []))
-        for name in extra:
-            if name not in current:
-                current.append(name)
-        block["arrays_present"] = current
 
-    for key, value in fields.items():
-        block[key] = value
+    written: dict[str, Any] = {}
 
-    level_group.attrs.update({"zarr_vectors_level": block})
+    def change(attrs: dict[str, Any]) -> dict[str, Any]:
+        block = dict(attrs.get("zarr_vectors_level", {}))
+        if arrays_present is not None:
+            block["arrays_present"] = list(arrays_present)
+        if add_arrays_present is not None:
+            extra = (
+                [add_arrays_present] if isinstance(add_arrays_present, str)
+                else list(add_arrays_present)
+            )
+            current = list(block.get("arrays_present", []))
+            for name in extra:
+                if name not in current:
+                    current.append(name)
+            block["arrays_present"] = current
+        for key, value in fields.items():
+            block[key] = value
+        written["block"] = block
+        return {"zarr_vectors_level": block}
+
+    level_group._update_attrs_fresh(change)
+    block = written["block"]
     # Built from the level block alone, so the derived fields come back
     # None -- they live in the root's NGFF transform, which is exactly why
     # they are refused above.  Use read_level_metadata(root, level) for a

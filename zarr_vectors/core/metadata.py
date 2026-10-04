@@ -857,7 +857,9 @@ class LevelMetadata:
     """True when, in EVERY chunk of this level, the intra-chunk link array
     ``links/0/<all-zero offsets>/`` holds exactly one link group per vertex
     fragment, in fragment order, and group ``k`` holds exactly the links
-    whose endpoints all lie in vertex fragment ``k``.
+    whose endpoints all lie in vertex fragment ``k``.  That includes the
+    chunk's vertex fragments being disjoint, and its link groups holding
+    every row of the cell exactly once.
 
     The format lets link groups be anything (see
     ``layout/fragment_index_arrays.md``), so without this claim a reader
@@ -868,9 +870,11 @@ class LevelMetadata:
 
     Like :attr:`fragments_tile` this is a claim about what has *not*
     happened since it was made.  It is stamped only by
-    :func:`~zarr_vectors.core.arrays.stamp_fragment_link_groups`, which
-    verifies it against the store after the writes; it is cleared by
-    :meth:`Group.write_bytes` on any later write to ``vertex_fragments``,
+    :func:`~zarr_vectors.core.link_groups.stamp_fragment_link_groups`, which
+    verifies it against the store after the writes (and
+    :func:`~zarr_vectors.core.store.update_level_metadata` refuses to set
+    it); it is cleared by :meth:`Group.write_bytes` and
+    :meth:`Group.write_cells` on any later write to ``vertex_fragments``,
     ``link_fragments`` or the intra-chunk link array; and
     ``validate_consistency`` checks it.  A stale True would hand a reader
     an incomplete object, so readers should also check each chunk they

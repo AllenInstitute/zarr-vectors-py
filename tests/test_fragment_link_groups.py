@@ -15,6 +15,11 @@ links alone.  Invariants under test:
 * **G5** ``index_fragment_link_groups`` brings an existing level into the
   layout with the least rewriting, refuses levels where a link joins two
   fragments, honours ``dry_run`` and re-checks with ``verify``.
+* **G6** The rule is the whole rule: link groups hold every row of the cell
+  exactly once, and vertex fragments are disjoint.
+* **G7** What a writer recorded is never trusted over the store, and a
+  claim is withdrawn (or never stamped) whatever handle, batch or helper is
+  involved.
 """
 
 from __future__ import annotations
@@ -27,9 +32,12 @@ from zarr_vectors.core.arrays import (
     list_chunk_keys,
     read_chunk_links,
     read_vertex_fragment_index,
+    stamp_fragments_tile,
     write_chunk_links,
 )
+from zarr_vectors.core.group import Group, _is_intra_links_array
 from zarr_vectors.core.link_groups import (
+    SHARED_ROW,
     fragment_of_rows,
     index_fragment_link_groups,
     intra_links_name,
@@ -44,7 +52,11 @@ from zarr_vectors.core.store import (
     open_store,
     read_level_metadata,
     read_root_metadata,
+    update_level_metadata,
 )
+from zarr_vectors.encoding.fragments import decode_fragments, encode_fragments
+from zarr_vectors.exceptions import MetadataError, StoreError
+from zarr_vectors.sharding.io import shard_store, unshard_store
 from zarr_vectors.types.meshes import read_mesh, write_mesh
 from zarr_vectors.validate.consistency import validate_consistency
 
@@ -100,6 +112,27 @@ def _level(path, level=0, mode="r"):
 def _face_set(vertices, faces):
     v = np.round(np.asarray(vertices, np.float64), 4)
     return {tuple(sorted(map(tuple, v[face]))) for face in np.asarray(faces)}
+
+
+def _claims(path, level=0):
+    meta = read_level_metadata(open_store(path), level)
+    return meta.fragment_link_groups, meta.fragments_tile
+
+
+def _claim_errors(path):
+    return [e for e in validate_consistency(path).errors
+            if "fragment_link_groups" in e]
+
+
+def _two_fragment_chunk(lg):
+    """A chunk with two vertex fragments that both have faces."""
+    name, width = intra_links_name(lg)
+    for cc in list_chunk_keys(lg, name):
+        fragments = read_vertex_fragment_index(lg, cc)
+        groups = read_chunk_links(lg, cc, link_width=width)
+        if fragments.num_fragments == 2 and all(len(g) for g in groups):
+            return cc, ".".join(map(str, cc)), groups, fragments, width
+    raise AssertionError("no chunk with two fragments that both have faces")
 
 
 def _flatten_to_single_groups(path):
@@ -225,16 +258,7 @@ def test_g5_dry_run_writes_nothing(tmp_path):
 
 
 def test_g5_a_link_joining_two_fragments_cannot_be_grouped():
-    class Fragments:
-        num_fragments = 2
-
-        def is_range(self, f):
-            return True
-
-        def range(self, f):
-            return (0, 3) if f == 0 else (3, 3)
-
-    owner = fragment_of_rows(Fragments())
+    owner = fragment_of_rows(decode_fragments(encode_fragments([(0, 3), (3, 3)])))
     assert owner.tolist() == [0, 0, 0, 1, 1, 1]
     rows = np.array([[3, 4, 5], [0, 1, 2], [2, 1, 0]])
     groups = split_links_by_fragment(rows, owner, 2)
@@ -251,3 +275,253 @@ def test_g1_draco_meshes_are_not_stamped(tmp_path):
     write_mesh(path, (v * 10 + 20).astype("float32"), f, chunk_shape=(16.0,) * 3,
                encoding="draco")
     assert not _flag(path)
+
+
+# --------------------------------------------------------------------- G5
+
+
+def test_g5_indexing_follows_the_stored_row_order(tmp_path):
+    """The old groups' concatenation is not the stored order: physical rows
+    [fragment 1's, fragment 0's], three ranges listing fragment 0's first.
+    A re-cut of the index alone would put fragment 1's rows in group 0."""
+    path, verts, faces = _spheres(tmp_path)
+    lg = _level(path, mode="r+")
+    cc, key, (a0, a1), _, width = _two_fragment_chunk(lg)
+    n0, n1 = len(a0), len(a1)
+    write_chunk_links(lg, cc, [a1, a0], delta=0, link_width=width)
+    lg.write_bytes("link_fragments", key, encode_fragments(
+        [(n1, n0 - 5), (n1 + n0 - 5, 5), (0, n1)],
+    ))
+    report = index_fragment_link_groups(path, levels=[0])[0]
+    assert report["stamped"] and report["reordered"] >= 1
+    assert _claim_errors(path) == []
+    groups = read_chunk_links(_level(path), cc, link_width=width)
+    np.testing.assert_array_equal(groups[0], a0)
+    np.testing.assert_array_equal(groups[1], a1)
+    mesh = read_mesh(path)
+    assert _face_set(mesh["vertices"], mesh["faces"]) == _face_set(verts, faces)
+
+
+def test_g5_indexing_recuts_only_contiguous_groups_over_ordered_rows(tmp_path):
+    """Rows already in fragment order under one contiguous group: only the
+    index is rewritten, and the stamp takes the recorded groups from the
+    stored rows, not from what was intended."""
+    path, _, _ = _spheres(tmp_path)
+    _flatten_to_single_groups(path)
+    lg = _level(path)
+    name, _ = intra_links_name(lg)
+    before = {k: lg.read_bytes(name, ".".join(map(str, k)))
+              for k in list_chunk_keys(lg, name)}
+    report = index_fragment_link_groups(path, levels=[0])[0]
+    assert report["stamped"] and report["regrouped"] > 0 and report["reordered"] == 0
+    after = _level(path)
+    for k, raw in before.items():
+        assert after.read_bytes(name, ".".join(map(str, k))) == raw
+    assert verify_fragment_link_groups(after) is None
+
+
+def test_g5_verify_withdraws_a_claim_it_cannot_repair(tmp_path):
+    path, _, _ = _spheres(tmp_path)
+    lg = _level(path, mode="r+")
+    cc, _, (g0, g1), _, width = _two_fragment_chunk(lg)
+    g0, g1 = g0.copy(), g1.copy()
+    g0[0, 0], g1[0, 0] = g1[0, 0], g0[0, 0]      # two faces now span both
+    write_chunk_links(lg, cc, [g0, g1], delta=0, link_width=width)
+    meta = dict(lg.attrs.get("zarr_vectors_level"))
+    meta["fragment_link_groups"] = True          # a stale claim
+    lg.attrs.update({"zarr_vectors_level": meta})
+    dry = index_fragment_link_groups(path, levels=[0], verify=True, dry_run=True)[0]
+    assert dry["would_withdraw"] and _flag(path)
+    report = index_fragment_link_groups(path, levels=[0], verify=True)[0]
+    assert "joins two vertex fragments" in report["skipped"]
+    assert report["withdrawn"] and not _flag(path)
+
+
+def test_g5_a_failed_stamp_withdraws_a_stale_claim(tmp_path):
+    path, _, _ = _spheres(tmp_path)
+    _flatten_to_single_groups(path)
+    lg = _level(path, mode="r+")
+    meta = dict(lg.attrs.get("zarr_vectors_level"))
+    meta["fragment_link_groups"] = True
+    lg.attrs.update({"zarr_vectors_level": meta})
+    assert not stamp_fragment_link_groups(_level(path, mode="r+"))
+    assert not _flag(path)
+
+
+# --------------------------------------------------------------------- G6
+
+
+def test_g6_groups_must_hold_every_row_of_the_cell(tmp_path):
+    """Rows in no group: a reader of the whole cell sees them, a reader of
+    one object's groups does not."""
+    path, _, _ = _spheres(tmp_path)
+    lg = _level(path, mode="r+")
+    cc, key, (g0, g1), _, _ = _two_fragment_chunk(lg)
+    lg.write_bytes("link_fragments", key, encode_fragments(
+        [(0, len(g0)), (len(g0), len(g1) - 10)],
+    ))
+    fresh = _level(path, mode="r+")
+    assert "exactly once" in verify_fragment_link_groups(fresh)
+    assert not stamp_fragment_link_groups(fresh)
+    report = index_fragment_link_groups(path, levels=[0])[0]
+    assert "exactly once" in report["skipped"] and not _flag(path)
+
+
+def test_g6_no_row_may_be_in_two_groups(tmp_path):
+    path, _, _ = _spheres(tmp_path)
+    lg = _level(path, mode="r+")
+    cc, key, (g0, g1), _, _ = _two_fragment_chunk(lg)
+    n0, n1 = len(g0), len(g1)
+    lg.write_bytes("link_fragments", key, encode_fragments(
+        [(0, n0), (n0 - 1, n1 + 1)],
+    ))
+    assert "exactly once" in verify_fragment_link_groups(_level(path))
+
+
+def test_g6_vertex_fragments_must_be_disjoint(tmp_path):
+    """Fragment 0 widened over fragment 1: fragment 1's faces lie in both,
+    and group 0 cannot hold them too."""
+    path, _, _ = _spheres(tmp_path)
+    lg = _level(path, mode="r+")
+    cc, key, _, fragments, _ = _two_fragment_chunk(lg)
+    (s0, n0), (s1, n1) = fragments.range(0), fragments.range(1)
+    shared = encode_fragments([(s0, n0 + n1), (s1, n1)])
+    assert (fragment_of_rows(decode_fragments(shared)) == SHARED_ROW).sum() == n1
+    lg.write_bytes("vertex_fragments", key, shared)
+    fresh = _level(path, mode="r+")
+    assert "overlap" in verify_fragment_link_groups(fresh)
+    assert not stamp_fragment_link_groups(fresh)
+    assert "overlap" in index_fragment_link_groups(path, levels=[0])[0]["skipped"]
+
+
+def test_g6_index_list_fragments_are_checked_row_by_row(tmp_path):
+    """Index-list fragments that swap one row: each group's endpoint range
+    still fits inside its fragment's span, but one of its rows does not."""
+    path, _, _ = _spheres(tmp_path)
+    lg = _level(path, mode="r+")
+    cc, key, (g0, g1), fragments, width = _two_fragment_chunk(lg)
+    (s0, n0), (s1, n1) = fragments.range(0), fragments.range(1)
+    a, b = int(g0[0, 0]), int(g1[0, 0])
+    rows0, rows1 = np.arange(s0, s0 + n0), np.arange(s1, s1 + n1)
+    f0 = np.where(rows0 == a, b, rows0)
+    f1 = np.where(rows1 == b, a, rows1)
+    write_chunk_links(lg, cc, [g0, g1], delta=0, link_width=width)
+    lg.write_bytes("vertex_fragments", key, encode_fragments([f0, f1]))
+    assert not stamp_fragment_link_groups(lg)
+    assert "leaves its fragment" in verify_fragment_link_groups(_level(path))
+
+
+# --------------------------------------------------------------------- G7
+
+
+def test_g7_a_stale_record_is_not_trusted_over_the_store(tmp_path):
+    """Recorded groups, then the index re-cut without new ones: the stamp
+    must look at what is stored."""
+    path, _, _ = _spheres(tmp_path)
+    lg = _level(path, mode="r+")
+    cc, key, (g0, g1), _, width = _two_fragment_chunk(lg)
+    write_chunk_links(lg, cc, [g0, g1], delta=0, link_width=width)
+    assert isinstance(lg._link_group_bounds[key], np.ndarray)
+    write_link_groups(lg, cc, [len(g0) + 1, len(g1) - 1])
+    assert key not in (lg._link_group_bounds or {})
+    assert not stamp_fragment_link_groups(lg) and not _flag(path)
+
+
+def test_g7_a_record_another_handle_made_stale_is_not_trusted(tmp_path):
+    path, _, _ = _spheres(tmp_path)
+    lg = _level(path, mode="r+")
+    cc, key, (g0, g1), _, width = _two_fragment_chunk(lg)
+    write_chunk_links(lg, cc, [g0, g1], delta=0, link_width=width)
+    write_link_groups(_level(path, mode="r+"), cc, [len(g0) + 1, len(g1) - 1])
+    assert not stamp_fragment_link_groups(lg) and not _flag(path)
+    assert _claim_errors(path) == []
+
+
+def test_g7_a_handle_opened_before_a_stamp_still_withdraws_it(tmp_path):
+    path, _, _ = _spheres(tmp_path)
+    _flatten_to_single_groups(path)
+    early = _level(path, mode="r+")              # opened before the stamp
+    assert index_fragment_link_groups(path, levels=[0])[0]["stamped"]
+    cc, _, groups, _, _ = _two_fragment_chunk(early)
+    write_link_groups(early, cc, [sum(len(g) for g in groups)])
+    assert not _flag(path)
+
+
+def test_g7_a_stale_handle_cannot_put_a_withdrawn_claim_back(tmp_path):
+    path, _, _ = _spheres(tmp_path)
+    stale = _level(path, mode="r+")              # loaded while stamped
+    assert stale.attrs.get("zarr_vectors_level")["fragment_link_groups"]
+    other = _level(path, mode="r+")
+    cc, _, groups, _, _ = _two_fragment_chunk(other)
+    write_link_groups(other, cc, [sum(len(g) for g in groups)])
+    assert not _flag(path)
+    update_level_metadata(stale, add_arrays_present="vertex_attributes")
+    assert not _flag(path)
+    assert "vertex_attributes" in read_level_metadata(open_store(path), 0).arrays_present
+    # ... and the stale handle's own copy caught up.
+    assert "fragment_link_groups" not in stale.attrs.get("zarr_vectors_level")
+
+
+def test_g7_claims_are_not_fields_to_set(tmp_path):
+    path, _, _ = _spheres(tmp_path)
+    _flatten_to_single_groups(path)
+    lg = _level(path, mode="r+")
+    for claim in ("fragment_link_groups", "fragments_tile"):
+        with pytest.raises(MetadataError, match="claim"):
+            update_level_metadata(lg, **{claim: True})
+    assert not _flag(path)
+
+
+def test_g7_stamps_refuse_to_run_with_writes_still_queued(tmp_path):
+    path, _, _ = _spheres(tmp_path)
+    lg = _level(path, mode="r+")
+    cc, _, groups, _, width = _two_fragment_chunk(lg)
+    with lg.batched_writes():
+        write_chunk_links(lg, cc, [np.concatenate(groups)], delta=0,
+                          link_width=width)
+        with pytest.raises(StoreError, match="batched_writes"):
+            stamp_fragment_link_groups(lg)
+        with pytest.raises(StoreError, match="batched_writes"):
+            stamp_fragments_tile(lg, 3)
+    assert not _flag(path)
+    assert _claim_errors(path) == []
+
+
+def test_g7_the_link_width_one_intra_array_is_the_intra_array():
+    assert _is_intra_links_array("links/0/self")
+    assert _is_intra_links_array("links/0/0.0.0_0.0.0")
+    assert not _is_intra_links_array("links/0/0.0.+1")
+    assert not _is_intra_links_array("links/+1/self")
+
+
+def test_g7_resharding_keeps_the_claims_it_does_not_change(tmp_path):
+    path, _, _ = _spheres(tmp_path)
+    assert _claims(path) == (True, True)
+    shard_store(path, shard_shape=2)
+    assert _claims(path) == (True, True)
+    assert verify_fragment_link_groups(_level(path)) is None
+    unshard_store(path)
+    assert _claims(path) == (True, True)
+    assert _claim_errors(path) == []
+    # A write after the repack still withdraws them.
+    lg = _level(path, mode="r+")
+    cc, _, groups, _, width = _two_fragment_chunk(lg)
+    write_chunk_links(lg, cc, groups, delta=0, link_width=width)
+    assert not _flag(path)
+
+
+def test_g7_an_interrupted_reshard_leaves_the_claims_withdrawn(tmp_path, monkeypatch):
+    path, _, _ = _spheres(tmp_path)
+    real = Group.create_sharded_chunk_array
+    calls = {"n": 0}
+
+    def flaky(self, *args, **kwargs):
+        calls["n"] += 1
+        if calls["n"] == 3:
+            raise RuntimeError("interrupted")
+        return real(self, *args, **kwargs)
+
+    monkeypatch.setattr(Group, "create_sharded_chunk_array", flaky)
+    with pytest.raises(RuntimeError, match="interrupted"):
+        shard_store(path, shard_shape=2)
+    assert _claims(path) == (False, False)

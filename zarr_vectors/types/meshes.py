@@ -294,15 +294,17 @@ def write_mesh(
     else:
         store_rows = np.arange(n_faces, dtype=np.int64)
 
-    # Records stay in face order, which the partitioner preserves within
-    # each cell.  Held as arrays -- ``(F, L, D)`` endpoint chunks and
-    # ``(F, L)`` local indices -- rather than one list of tuples per
-    # face: building those and taking them apart again was 3 s of a
-    # half-million-face write before anything was partitioned.
-    # In object order (stable, so faces keep their order within an object):
-    # each chunk's vertices are laid out object by object, one fragment per
-    # object, so every intra-chunk cell then holds its faces in fragment
-    # order and can be cut into one link group per fragment below.
+    # Records go to ``write_links`` in object order of their first corner,
+    # stable, so faces keep their input order within an object and the
+    # partitioner keeps that order within each cell.  Each chunk's vertices
+    # are laid out object by object, one fragment per object, so every
+    # intra-chunk cell holds its faces in fragment order and can be cut
+    # into one link group per fragment below.  (A cell therefore no longer
+    # holds its faces in input order when the mesh has several objects.)
+    # Held as arrays -- ``(F, L, D)`` endpoint chunks and ``(F, L)`` local
+    # indices -- rather than one list of tuples per face: building those
+    # and taking them apart again was 3 s of a half-million-face write
+    # before anything was partitioned.
     store_rows = store_rows[
         np.argsort(object_ids[faces[store_rows, 0]], kind="stable")
     ]
