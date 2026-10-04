@@ -42,7 +42,8 @@
 The `mesh` type stores triangulated surface meshes in the Zarr Vectors spatial
 chunking framework. Like other geometry types, the mesh is partitioned
 into spatial chunks; each chunk holds the vertices that fall within its
-spatial extent and the faces whose centroid falls within that extent.
+spatial extent and the faces whose vertices all lie within it; a face
+whose vertices span chunks is stored once, as a boundary face.
 
 Mesh chunking introduces a subtlety that does not arise for point clouds
 or streamlines: a face may reference vertices in multiple chunks (the face
@@ -123,51 +124,38 @@ Records stay in input face order within each cell, so a parallel
 
 ### Face encoding and boundary faces
 
-**Intra-chunk faces:** All three vertices are in the same chunk. Vertex
-indices are local to the chunk (0-indexed within the chunk's vertex slice).
+**Intra-chunk faces:** all vertices in one chunk. Stored in
+`links/0/<all-zero offsets>/`, each vertex index local to that chunk's
+vertex rows.
 
-**Boundary faces:** One or more vertices are in a different chunk. For
-boundary faces, vertex indices that refer to other chunks use a *negative
-sentinel* encoding:
+**Boundary faces:** vertices in more than one chunk. Filed by
+[`write_links`](../object_model/links.md) under the offsets array that
+names where the other vertices sit, with each endpoint's index local to
+its own chunk; the canonical sort's permutation is kept in `perm_idx`
+(see *Face policy and winding* above). There is no global vertex ID and
+no sentinel encoding.
 
-- Vertices in the current chunk: positive local index `[0, N_chunk)`.
-- Vertices in other chunks: stored as a negative value `-(global_vertex_id + 1)`,
-  where `global_vertex_id` is the vertex's position in the global vertex
-  ID space.
+### Per-object face groups
 
-At read time, the reader resolves negative indices by looking up the
-corresponding global vertex IDs and fetching those vertices from their
-respective chunks.
+`write_mesh` lays each chunk's vertices out object by object, one vertex
+fragment per object, and cuts the chunk's intra-chunk faces into one link
+group per fragment, in the same order. It then stamps
+`fragment_link_groups` on the level (and `CAP_FRAGMENT_LINK_GROUPS` on the
+root) after verifying it -- see [Links](../object_model/links.md#link-groups-that-follow-vertex-fragments).
+An object's manifest names its vertex fragments; on such a level the same
+indices name its face groups in `link_fragments/`, so a reader drawing one
+object can range-read its faces instead of every object's in the chunk.
+Boundary faces are not grouped; they stay in the offsets arrays.
 
-**Global vertex ID** for a vertex at local index `k` in chunk `(cx, cy, cz)`:
-
-```
-global_id = chunk_flat_index * N_max + k
-```
-
-where `chunk_flat_index = ravel_multi_index((cx, cy, cz), chunk_grid_shape)`
-and `N_max` is the maximum vertices per chunk declared in the Zarr array shape.
-
-### Face assignment to chunks
-
-Each triangular face is assigned to the chunk containing its centroid:
-
-```python
-centroid = (vertices[i] + vertices[j] + vertices[k]) / 3
-face_chunk = floor(centroid / chunk_shape).astype(int)
-```
-
-This ensures each face is stored exactly once. All three vertices of a face
-are guaranteed to be within at most one chunk-width of the face's chunk (faces
-cannot span more than two chunks in any dimension if all vertices are within
-the face's chunk neighbourhood).
+Draco levels are not stamped: their intra-chunk faces live in the Draco
+bitstream, not in the link family.
 
 ### Draco compression
 
-Pass `use_draco=True` and a `draco_quantization` value when writing a
-mesh (via `write_mesh()` or the format converters in
-`zarr-vectors-tools`). The `vertices/` and `links/<delta>/` arrays then
-use the `draco` codec.
+Pass `encoding="draco"` (and optionally `draco_quantization_bits`) to
+`write_mesh()`. Each chunk's vertices and intra-chunk faces are then one
+Draco bitstream; boundary faces stay in `links/0/<offsets>/` (see
+*Face storage and Draco* above).
 
 Reading requires `zarr-vectors[draco]`. See
 [Codec pipeline](../foundations/codec_pipeline.md) for quantisation
@@ -209,7 +197,7 @@ print(result["face_count"])      # int
 print(result["vertices"].shape)  # (N, 3)
 print(result["faces"].shape)     # (F, 3) global vertex indices
 
-# Spatial query — returns faces whose centroid is in bbox
+# Spatial query — reads the chunks the bbox touches
 result = read_mesh(
     "brain.zarrvectors",
     bbox=(np.array([0., 0., 0.]), np.array([500., 500., 500.])),
@@ -219,11 +207,11 @@ result = read_mesh(
 ### Multi-mesh stores
 
 A single `mesh` store may contain many distinct mesh objects (e.g. one per
-cell or organelle). Each object is one connected surface:
-
-```python
-result = read_mesh("cells.zarrvectors", object_ids=[42, 107])
-```
+cell or organelle), each with its own manifest. `read_mesh` does not filter
+by object yet (`object_ids=` raises `NotImplementedError` rather than
+silently returning the whole level); `read_object_vertices` reads one
+object's vertices, and on a level stamped `fragment_link_groups` its faces
+are the link groups its fragments name (see *Per-object face groups*).
 
 ### Validation
 
@@ -232,7 +220,8 @@ recorded when present but are **not** required at L1.
 
 L3: offsets segments parse; the family being undirected, canonical and
 intra-level, offsets are lex-non-negative and non-decreasing; every
-record's endpoint chunks exist at the level.
+record's endpoint chunks exist at the level; a level stamped
+`fragment_link_groups` keeps its link groups one per vertex fragment.
 
 L4 (mesh-specific): the `links/0/` family's `link_width` MUST be `>= 3`
 — a `link_width` between 1 and 2 is an error. A mesh store with no link

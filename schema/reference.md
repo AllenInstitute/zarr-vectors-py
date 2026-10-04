@@ -57,6 +57,7 @@ Name: zarr_vectors
 | [dtype](dtype.md) | Numpy dtype string of the array's value type (e |
 | [encoding](encoding.md) | How the chunk bytes are encoded |
 | [format_capabilities](format_capabilities.md) | Optional 0 |
+| [fragment_link_groups](fragment_link_groups.md) | True when, in every chunk of this level, the intra-chunk link array (delta 0, al... |
 | [fragments_tile](fragments_tile.md) | True when every chunk in this level has a vertex fragment index that tiles it... |
 | [geometry_types](geometry_types.md) | One or more geometry kinds present in the store |
 | [has_perm](has_perm.md) | Whether each row of this links array carries a leading ``perm_idx`` column — ... |
@@ -4051,6 +4052,117 @@ search:
   boost: 5.0
 ---
 
+# Slot: fragment_link_groups 
+
+
+_True when, in every chunk of this level, the intra-chunk link array (delta 0, all-zero offsets) holds exactly one link group per vertex fragment, in fragment order, and group ``k`` holds exactly the links whose endpoints all lie in vertex fragment ``k``.  An object's manifest then names its link groups as well as its vertex rows, so its links can be read alone.  Like ``fragments_tile`` this is a claim about what has NOT happened since: it is stamped by a writer after verifying it, and cleared by any later write to ``vertex_fragments``, ``link_fragments`` or the intra-chunk link array.  Readers MUST treat an absent value as False and SHOULD check each chunk they rely on._
+
+__
+
+
+
+<div data-search-exclude markdown="1">
+
+
+
+URI: [zv:fragment_link_groups](https://w3id.org/zarr-vectors/schema/0.5/fragment_link_groups)
+<!-- no inheritance hierarchy -->
+
+
+
+
+
+## Applicable Classes
+
+| Name | Description | Modifies Slot |
+| --- | --- | --- |
+| [LevelMetadata](LevelMetadata.md) | Per-resolution-level `` |  no  |
+
+
+
+
+
+
+## Properties
+
+### Type and Range
+
+| Property | Value |
+| --- | --- |
+| Range | [Boolean](Boolean.md) |
+| Domain Of | [LevelMetadata](LevelMetadata.md) |
+
+### Cardinality and Requirements
+
+| Property | Value |
+| --- | --- |
+
+
+
+
+
+
+
+
+
+
+## Identifier and Mapping Information
+
+
+
+
+
+### Schema Source
+
+
+* from schema: https://w3id.org/zarr-vectors/schema/0.5
+
+
+
+
+## Mappings
+
+| Mapping Type | Mapped Value |
+| ---  | ---  |
+| self | zv:fragment_link_groups |
+| native | zv:fragment_link_groups |
+
+
+
+
+## LinkML Source
+
+<details>
+```yaml
+name: fragment_link_groups
+description: 'True when, in every chunk of this level, the intra-chunk link array (delta
+  0, all-zero offsets) holds exactly one link group per vertex fragment, in fragment
+  order, and group ``k`` holds exactly the links whose endpoints all lie in vertex
+  fragment ``k``.  An object''s manifest then names its link groups as well as its vertex
+  rows, so its links can be read alone.  Like ``fragments_tile`` this is a claim about
+  what has NOT happened since: it is stamped by a writer after verifying it, and cleared
+  by any later write to ``vertex_fragments``, ``link_fragments`` or the intra-chunk link
+  array.  Readers MUST treat an absent value as False and SHOULD check each chunk they
+  rely on.
+
+  '
+from_schema: https://w3id.org/zarr-vectors/schema/0.5
+rank: 1000
+domain_of:
+- LevelMetadata
+range: boolean
+
+```
+</details></div>
+
+
+---
+
+---
+search:
+  boost: 5.0
+---
+
 # Slot: fragments_tile 
 
 
@@ -4123,7 +4235,9 @@ URI: [zv:fragments_tile](https://w3id.org/zarr-vectors/schema/0.5/fragments_tile
 
 | Mapping Type | Mapped Value |
 | ---  | ---  |
+| self | zv:fragment_link_groups |
 | self | zv:fragments_tile |
+| native | zv:fragment_link_groups |
 | native | zv:fragments_tile |
 
 
@@ -5424,6 +5538,7 @@ URI: [zv:LevelMetadata](https://w3id.org/zarr-vectors/schema/0.5/LevelMetadata)
         
       LevelMetadata : coarsening_method
         
+      LevelMetadata : fragment_link_groups
       LevelMetadata : fragments_tile
         
       LevelMetadata : inherited_num_objects
@@ -5467,6 +5582,7 @@ URI: [zv:LevelMetadata](https://w3id.org/zarr-vectors/schema/0.5/LevelMetadata)
 | [preserves_object_ids](preserves_object_ids.md) | 0..1 <br/> [Boolean](Boolean.md) | True for levels written by the per-object pyramid regime | direct |
 | [inherited_num_objects](inherited_num_objects.md) | 0..1 <br/> [Integer](Integer.md) | OID-space size inherited from the parent level (= ``parent_level | direct |
 | [shared_fragments](shared_fragments.md) | 0..1 <br/> [Boolean](Boolean.md) | True when per-chunk fragments may be referenced by multiple objects' manifest... | direct |
+| [fragment_link_groups](fragment_link_groups.md) | 0..1 <br/> [Boolean](Boolean.md) | True when, in every chunk of this level, the intra-chunk link array (delta 0, al... | direct |
 | [fragments_tile](fragments_tile.md) | 0..1 <br/> [Boolean](Boolean.md) | True when every chunk in this level has a vertex fragment index that tiles it... | direct |
 
 
@@ -5538,6 +5654,7 @@ slots:
 - preserves_object_ids
 - inherited_num_objects
 - shared_fragments
+- fragment_link_groups
 - fragments_tile
 slot_usage:
   chunk_shape:

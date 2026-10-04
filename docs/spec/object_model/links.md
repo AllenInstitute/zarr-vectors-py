@@ -216,12 +216,55 @@ other offsets array matches the old `cross_chunk_links/<delta>/` cells.
 
 The flat branch's per-group row ranges live in the sibling
 [`link_fragments/<chunk>`](../layout/fragment_index_arrays.md) index.
-Link groups need **not** be 1:1 with the chunk's vertex fragments.
+Link groups need **not** be 1:1 with the chunk's vertex fragments, unless
+the level says they are (see below).
 `link_fragments/<chunk>` is keyed by chunk **alone** — no delta, no
 offsets — which is why only this branch may write it; see
 [Fragment-index arrays](../layout/fragment_index_arrays.md) for why a
 second offsets array writing it would silently clobber the intra array's
 fragment index.
+
+### Link groups that follow vertex fragments
+
+A level MAY promise that its intra-chunk link groups follow its vertex
+fragments, by setting `fragment_link_groups: true` in its level metadata.
+The promise is, for **every** chunk of the level:
+
+1. `link_fragments/<chunk>` holds exactly as many groups as
+   `vertex_fragments/<chunk>` holds fragments, and
+2. group `k` holds exactly the intra-chunk links whose endpoints all lie in
+   vertex fragment `k` -- so no intra-chunk link joins two fragments.
+
+An object's manifest names vertex fragments; on such a level the same
+indices name the object's link groups, so a reader can fetch one object's
+intra-chunk links alone, by byte range, instead of the whole cell. Links
+in other offsets arrays are not covered: they have no sidecar.
+
+**Writer responsibility.** The flag is a claim about what has not happened
+since it was made, handled exactly as `fragments_tile`:
+
+- It is stamped only after the writes, by `stamp_fragment_link_groups`,
+  which verifies every chunk against the store (using per-group endpoint
+  bounds the writer recorded, so it need not re-read the rows).
+- Any later write to `vertex_fragments`, `link_fragments` or the
+  intra-chunk link array clears it (`Group.write_bytes` is the chokepoint).
+  A writer that does not know about the claim -- an edit, an append, a
+  rechunk -- therefore withdraws it rather than leaving it stale; a writer
+  that keeps the grouping re-stamps it.
+- The root's `format_capabilities` gains `CAP_FRAGMENT_LINK_GROUPS` when a
+  level is stamped. It is a hint; the level flag is authoritative.
+
+`write_mesh` stamps its raw levels.
+`index_fragment_link_groups` brings an existing level into the layout,
+re-cutting `link_fragments` alone where the rows are already in fragment
+order and reordering rows only where it must (and only when the level has
+no row-aligned intra-chunk link attributes).
+
+**Reader responsibility.** None for readers that concatenate groups: the
+rows are the same however they are grouped. A reader that relies on the
+claim SHOULD still check each chunk it uses (group count equals fragment
+count; the group's endpoints lie in its fragment) and fall back to the
+whole cell where it does not hold.
 
 ### `directed` and `store`
 

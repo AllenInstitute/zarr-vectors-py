@@ -315,4 +315,4 @@ The backend layer is independent of the
 [format capability tokens](../layout/root_metadata.md) stamped on
 `RootMetadata.format_capabilities` — backends carry data bytes, not
 format semantics. See the capability list for `CAP_MULTISCALE_LINKS`,
-`CAP_PRESERVED_OBJECT_IDS`, `CAP_SHARED_VERTEX_GROUPS`.
+`CAP_PRESERVED_OBJECT_IDS`, `CAP_SHARED_VERTEX_GROUPS`, `CAP_FRAGMENT_LINK_GROUPS`.

@@ -504,7 +504,9 @@ fragments. A chunk may legitimately have many vertex fragments but few link
 groups — BRIDGE, for instance, stores streamlines as vertex fragments and
 its node graph as link fragments. Readers derive per-group link ranges from
 `link_fragments/`, never from `vertex_fragments/`, so no write-time 1:1
-guard applies.
+guard applies. A level that does keep them 1:1 can say so with
+`fragment_link_groups`; see
+[Links](../object_model/links.md#link-groups-that-follow-vertex-fragments).
 
 ### Write-time invariants
 

@@ -155,6 +155,15 @@ For `delta != 0` only endpoint 0 is constrained here: the other
 endpoints live at level `owning + delta` and are validated against that
 level's own grid when the walker reaches it.
 
+#### Link group checks
+
+For a level that sets `fragment_link_groups`:
+
+| Rule | Failure type |
+|------|--------------|
+| Every chunk's `link_fragments` holds as many groups as its `vertex_fragments` holds fragments | Error |
+| Every intra-chunk link in group `k` has all its endpoints in vertex fragment `k` | Error |
+
 ### Example L3 report (abbreviated)
 
 ```

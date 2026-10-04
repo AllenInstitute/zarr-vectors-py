@@ -81,6 +81,16 @@ Full example for level 1, produced from a 3-D streamline store:
 | `object_count` | `integer` | Total object count at this level. |
 | `chunk_count` | `integer` | Number of non-empty chunks at this level. |
 
+#### Claims
+
+Optional flags a writer stamps after verifying them, and that any later
+write to the arrays they describe clears. Readers MUST treat an absent
+value as `false`.
+
+| Key | Type | Description |
+|-----|------|-------------|
+| `fragment_link_groups` | `boolean` | Every chunk's intra-chunk link groups follow its vertex fragments one to one, so one object's links can be read alone. See [Links](../object_model/links.md#link-groups-that-follow-vertex-fragments). |
+
 #### Build-time keys
 
 Carried only while a level is being written, and absent from a finished

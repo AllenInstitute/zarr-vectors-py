@@ -366,6 +366,13 @@
             "null"
           ]
         },
+        "fragment_link_groups": {
+          "description": "True when, in every chunk of this level, the intra-chunk link array (delta 0, all-zero offsets) holds exactly one link group per vertex fragment, in fragment order, and group ``k`` holds exactly the links whose endpoints all lie in vertex fragment ``k``.  An object's manifest then names its link groups as well as its vertex rows, so its links can be read alone.  Like ``fragments_tile`` this is a claim about what has NOT happened since: it is stamped by a writer after verifying it, and cleared by any later write to ``vertex_fragments``, ``link_fragments`` or the intra-chunk link array.  Readers MUST treat an absent value as False and SHOULD check each chunk they rely on.\n",
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
         "fragments_tile": {
           "description": "True when every chunk in this level has a vertex fragment index that tiles its buffer, so the concatenation of a chunk's fragments IS its vertex buffer and a bulk read may skip ``vertex_fragments`` entirely.  Unlike the other flags here this is a claim about what has NOT happened since: it is stamped by a bulk writer and cleared by any later write to ``vertices`` or ``vertex_fragments``. Readers MUST treat an absent value as False.\n",
           "type": [
