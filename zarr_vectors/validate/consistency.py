@@ -205,6 +205,21 @@ def validate_consistency(store_path: str | Path | Group) -> ValidationResult:
             f"{prefix}: {len(chunk_keys)} chunks decoded, {total_verts} vertices"
         )
 
+        # A level claiming ``fragment_link_groups`` is telling readers that
+        # one object's links are the link groups its vertex fragments name.
+        # A claim that does not hold hands readers incomplete objects, so it
+        # is checked against every chunk's stored groups.
+        if getattr(level_meta_obj, "fragment_link_groups", False):
+            from zarr_vectors.core.link_groups import verify_fragment_link_groups
+
+            reason = verify_fragment_link_groups(lg)
+            if reason is None:
+                result.add_pass(f"{prefix}: fragment_link_groups holds")
+            else:
+                result.add_error(
+                    f"{prefix}: fragment_link_groups is set but {reason}"
+                )
+
         try:
             la = lg.attrs
             evc = la.get("vertex_count")

@@ -55,6 +55,7 @@ from zarr_vectors.core.attr_chunking import (
     assign_attribute_bins,
     compute_chunk_dim_names,
 )
+from zarr_vectors.core.link_groups import stamp_fragment_link_groups
 from zarr_vectors.core.metadata import (
     LevelMetadata,
     get_level_chunk_shape,
@@ -298,8 +299,27 @@ def write_mesh(
     # ``(F, L)`` local indices -- rather than one list of tuples per
     # face: building those and taking them apart again was 3 s of a
     # half-million-face write before anything was partitioned.
+    # In object order (stable, so faces keep their order within an object):
+    # each chunk's vertices are laid out object by object, one fragment per
+    # object, so every intra-chunk cell then holds its faces in fragment
+    # order and can be cut into one link group per fragment below.
+    store_rows = store_rows[
+        np.argsort(object_ids[faces[store_rows, 0]], kind="stable")
+    ]
     link_chunks = np.asarray(chunk_list, dtype=np.int64)[f_chunk[store_rows]]
     link_vi = f_local[store_rows]
+    # Each chunk's fragment start rows, filled in as its vertices are
+    # written; read when its intra-chunk faces are cut into groups.
+    fragment_starts: dict[tuple[int, ...], npt.NDArray[np.int64]] = {}
+
+    def intra_group_sizes(chunk, rows):
+        starts = fragment_starts.get(tuple(int(c) for c in chunk))
+        if starts is None or rows.shape[0] == 0:
+            return None
+        frag = np.searchsorted(starts, rows[:, 0], side="right") - 1
+        if (np.diff(frag) < 0).any():
+            return None
+        return np.bincount(frag, minlength=len(starts)).tolist()
 
     # Write vertices per chunk (one fragment per chunk for simplicity)
     object_manifests: dict[int, ObjectManifest] = {}
@@ -361,6 +381,7 @@ def write_mesh(
                     level_group, chunk_coords,
                     np.split(chunk_verts, split_at), dtype=np_dtype,
                 )
+                fragment_starts[tuple(int(c) for c in chunk_coords)] = frag_starts
                 # One fragment per object, in the order just written; the
                 # fragments still tile [0, N) so the bulk-read fast path
                 # (stamp_fragments_tile) keeps its claim.
@@ -388,6 +409,9 @@ def write_mesh(
             write_links(
                 level_group, [], idx_ndim, delta=0,
                 link_width=link_width, _arrays=(link_chunks, link_vi),
+                # One link group per vertex fragment (per object), so a
+                # reader can fetch one object's faces alone; stamped below.
+                intra_group_sizes=None if is_draco else intra_group_sizes,
             )
         # Backstop: `arrays_present` advertises the family, and the
         # per-cell editors in ops/ write into an array that must already
@@ -412,6 +436,9 @@ def write_mesh(
     # index.  Verified against what is on disk, and stamped after
     # the chunk writes -- see stamp_fragments_tile.
     stamp_fragments_tile(level_group, ndim)
+    # Likewise for the face groups just cut per fragment: verified against
+    # the store before it is claimed (see stamp_fragment_link_groups).
+    stamp_fragment_link_groups(level_group, root)
     _finalize_write(root, "write_mesh")
     return {
         "vertex_count": n_verts,

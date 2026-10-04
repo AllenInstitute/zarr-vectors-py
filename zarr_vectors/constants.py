@@ -44,6 +44,14 @@ Also in 0.9.3, both additive in the same sense:
   caught mid-build is not: that reader treats the missing manifest as an
   empty array.
 
+Proposed for 0.9.3 (additive, pending RFC): an optional level flag
+``fragment_link_groups`` and the root token ``CAP_FRAGMENT_LINK_GROUPS``.
+The flag says each chunk's intra-chunk link groups follow its vertex
+fragments one to one, so one object's links can be read alone.  It is a
+claim stamped after verification and cleared by any later write to the
+arrays it describes, exactly like ``fragments_tile``; the link rows are
+unchanged, so a reader ignoring it reads the store correctly.
+
 0.9.2: optional, backward-compatible ``ome`` block on the root (absent ⇒
 the prior behaviour, so 0.9.0 and 0.9.1 stores read unchanged).  It is an
 OME-Zarr RFC 8 **node** — ``version``, ``type: "collection"``, ``name``,
@@ -224,6 +232,13 @@ CAP_FRAGMENT_INDEX: str = "fragment_index"
 """The store uses the v0.6 fragment-index encoding for ``vertex_fragments``
 and ``link_fragments`` (single uint8 blob per chunk; see
 :mod:`zarr_vectors.encoding.fragments`)."""
+
+CAP_FRAGMENT_LINK_GROUPS: str = "fragment_link_groups"
+"""At least one resolution level has been stamped
+``fragment_link_groups=True``: its intra-chunk links are grouped one
+group per vertex fragment, so one object's links can be read alone.  A
+hint only -- the level's own flag is authoritative, and it can have been
+cleared by a later write without this token being withdrawn."""
 
 CAP_MULTISCALE_LINKS: str = "multiscale_links"
 """Store uses the multiscale links layout (``links/<delta>/<offsets>/``

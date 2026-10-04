@@ -41,6 +41,7 @@ from typing import Any
 # --- array names and layout sentinels --------------------------------
 from zarr_vectors.constants import (
     CAP_FRAGMENT_INDEX,
+    CAP_FRAGMENT_LINK_GROUPS,
     CAP_MULTISCALE_LINKS,
     CAP_PRESERVED_OBJECT_IDS,
     CAP_SHARED_FRAGMENTS,
@@ -137,6 +138,15 @@ from zarr_vectors.core.arrays import (
     write_object_index,
 )
 from zarr_vectors.core.group import Group, observe_presence_writes
+from zarr_vectors.core.link_groups import (
+    fragment_of_rows,
+    group_bounds,
+    index_fragment_link_groups,
+    split_links_by_fragment,
+    stamp_fragment_link_groups,
+    verify_fragment_link_groups,
+    write_link_groups,
+)
 from zarr_vectors.core.metadata import (
     LevelMetadata,
     RootMetadata,
@@ -686,6 +696,7 @@ def rebuild_presence(
 
 __all__ = [
     "CAP_FRAGMENT_INDEX",
+    "CAP_FRAGMENT_LINK_GROUPS",
     "CAP_MULTISCALE_LINKS",
     "CAP_PRESERVED_OBJECT_IDS",
     "CAP_SHARED_FRAGMENTS",
@@ -755,6 +766,7 @@ __all__ = [
     "expand_manifest_blocks",
     "finalize_links",
     "finalize_skeleton_store",
+    "fragment_of_rows",
     "get_coordinate_offset",
     "get_level_bin_shape",
     "get_level_chunk_shape",
@@ -762,6 +774,8 @@ __all__ = [
     "get_level_translation",
     "get_resolution_level",
     "get_shard_info",
+    "group_bounds",
+    "index_fragment_link_groups",
     "init_skeleton_store",
     "intra_offsets",
     "is_intra",
@@ -823,6 +837,8 @@ __all__ = [
     "rechunk",
     "rechunk_by_attribute",
     "refresh_arrays_present",
+    "split_links_by_fragment",
+    "stamp_fragment_link_groups",
     "stamp_ome_node",
     "register_coarsen_strategy",
     "register_selection_strategy",
@@ -838,6 +854,7 @@ __all__ = [
     "upsert_level_transform",
     "validate_bin_shape_divides_chunk",
     "validate_level_chunk_shape_against_root",
+    "verify_fragment_link_groups",
     "write_chunk_attributes",
     "write_chunk_fragment_attributes",
     "write_chunk_fragments",
@@ -851,6 +868,7 @@ __all__ = [
     "write_link_attribute_cells",
     "write_link_attributes",
     "write_link_cells",
+    "write_link_groups",
     "write_links",
     "write_mesh",
     "write_multiscale_metadata",

@@ -32,6 +32,7 @@ Public surface mirrors the legacy :class:`FsGroup` for back-compat:
 
 from __future__ import annotations
 
+import re
 import warnings
 from collections.abc import Callable, Iterable, Iterator, Sequence
 from contextlib import contextmanager
@@ -44,6 +45,9 @@ from zarr.codecs import VLenBytesCodec
 from zarr.errors import UnstableSpecificationWarning
 from zarr.storage import LocalStore
 
+from zarr_vectors.constants import (
+    LINK_FRAGMENTS as _LINK_FRAGMENTS_ARRAY,
+)
 from zarr_vectors.constants import (
     VERTEX_FRAGMENTS as _VERTEX_FRAGMENTS_ARRAY,
 )
@@ -61,6 +65,27 @@ from zarr_vectors.exceptions import ShardedPresenceError, StoreError
 # Where ``LevelMetadata`` lives on a level group's attrs.  Duplicated
 # rather than imported because ``core.metadata`` imports this module.
 _LEVEL_META_KEY = "zarr_vectors_level"
+
+
+def _is_intra_links_array(array_name: str) -> bool:
+    """``links/0/<offsets>`` with every offset zero: the intra-chunk array
+    whose rows ``link_fragments/`` describes."""
+    parts = array_name.split("/")
+    if len(parts) != 3 or parts[0] != "links" or parts[1] != "0":
+        return False
+    try:
+        return all(int(t) == 0 for t in re.split(r"[._]", parts[2]))
+    except ValueError:
+        return False
+
+
+def _breaks_link_groups(array_name: str) -> bool:
+    """Whether a write to ``array_name`` can break ``fragment_link_groups``:
+    the fragments the groups follow, the groups, or the grouped rows."""
+    return (
+        array_name in (_VERTEX_FRAGMENTS_ARRAY, _LINK_FRAGMENTS_ARRAY)
+        or _is_intra_links_array(array_name)
+    )
 
 # Node-cache sentinel for "this path was probed and is genuinely absent",
 # as distinct from "this path was never prefetched".  Only the async
@@ -160,6 +185,10 @@ class Group:
     # chunk key.  Written by ``write_chunk_vertices``, consumed by
     # ``stamp_fragments_tile``; see :meth:`note_vertex_rows`.
     _vertex_rows_written: dict[str, int] | None = None
+    # Per-group endpoint bounds of the intra-chunk link cells written this
+    # session, keyed by chunk key.  Written by ``write_chunk_links``,
+    # consumed by ``stamp_fragment_link_groups``.
+    _link_group_bounds: dict[str, list[tuple[int, int] | None]] | None = None
     # object_index path -> (sorted ids, rows), built on first lookup.
     # Resolving an id to a row otherwise re-reads and re-sorts the id
     # table on every single-object read, which turns a point lookup into
@@ -188,6 +217,9 @@ class Group:
     # ``fragments_tile`` claim, so a bulk write of N chunks checks it
     # once rather than N times.  See :meth:`_clear_fragments_tile`.
     _tiling_claim_settled: bool = False
+    # The same, for the level's ``fragment_link_groups`` claim.  See
+    # :meth:`_clear_fragment_link_groups`.
+    _link_groups_claim_settled: bool = False
     # Per-array presence manifests, cached for the same read-only session
     # as ``_node_cache`` and keyed the same way.  See
     # :meth:`_chunk_listing` and :class:`_ChunkListing`.
@@ -399,6 +431,8 @@ class Group:
             # Either write can break the tiling a level may be claiming:
             # the index directly, the buffer by changing its row count.
             self._clear_fragments_tile()
+        if _breaks_link_groups(array_name):
+            self._clear_fragment_link_groups()
         sharded_arr = self._sharded_chunk_array(array_name)
         if sharded_arr is None:
             raise StoreError(
@@ -451,6 +485,8 @@ class Group:
         """
         if array_name in (_VERTICES_ARRAY, _VERTEX_FRAGMENTS_ARRAY):
             self._clear_fragments_tile()
+        if _breaks_link_groups(array_name):
+            self._clear_fragment_link_groups()
         sharded_arr = self._sharded_chunk_array(array_name)
         if sharded_arr is None:
             raise StoreError(
@@ -1257,6 +1293,30 @@ class Group:
             self._vertex_rows_written = {}
         self._vertex_rows_written[chunk_key] = int(n_rows)
 
+    def note_link_group_bounds(
+        self, chunk_key: str, bounds: list[tuple[int, int] | None],
+    ) -> None:
+        """Record the smallest and largest endpoint of each intra-chunk link
+        group a cell was just given (``None`` for an empty group).
+
+        The ``fragment_link_groups`` counterpart of
+        :meth:`note_vertex_rows`: lets
+        :func:`~zarr_vectors.core.link_groups.stamp_fragment_link_groups`
+        check each group against its vertex fragment without re-reading the
+        rows just written.  Only a hint -- a chunk without one is checked
+        against its stored rows.
+        """
+        if self._link_group_bounds is None:
+            self._link_group_bounds = {}
+        self._link_group_bounds[chunk_key] = list(bounds)
+
+    def take_link_group_bounds(self) -> dict[str, list[tuple[int, int] | None]]:
+        """Consume and clear the recorded bounds (see
+        :meth:`take_vertex_rows` for why they are cleared on read)."""
+        recorded = self._link_group_bounds or {}
+        self._link_group_bounds = None
+        return recorded
+
     def take_vertex_rows(self) -> dict[str, int]:
         """Consume and clear the recorded counts.
 
@@ -2005,6 +2065,33 @@ class Group:
         self._zarr.attrs.update({
             _LEVEL_META_KEY: {
                 k: v for k, v in level.items() if k != "fragments_tile"
+            },
+        })
+
+    def _clear_fragment_link_groups(self) -> None:
+        """Drop this level's ``fragment_link_groups`` claim, if it holds one.
+
+        Called from :meth:`write_bytes` and :meth:`write_cells` for every
+        array the claim is about -- ``vertex_fragments``, ``link_fragments``
+        and the intra-chunk link array -- so, exactly as for
+        ``fragments_tile``, a claim cannot outlive the grouping it
+        describes.  A writer that does not know about the claim (an edit,
+        an append, a rechunk) therefore withdraws it rather than leaving it
+        stale; a writer that keeps the grouping re-stamps it afterwards
+        with :func:`~zarr_vectors.core.arrays.stamp_fragment_link_groups`.
+        """
+        if self._link_groups_claim_settled:
+            return
+        self._link_groups_claim_settled = True
+        try:
+            level = self._zarr.attrs.get(_LEVEL_META_KEY)
+        except Exception:
+            return
+        if not isinstance(level, dict) or not level.get("fragment_link_groups"):
+            return
+        self._zarr.attrs.update({
+            _LEVEL_META_KEY: {
+                k: v for k, v in level.items() if k != "fragment_link_groups"
             },
         })
 

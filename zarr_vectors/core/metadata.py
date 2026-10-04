@@ -853,6 +853,28 @@ class LevelMetadata:
     Absent (the default) means "unknown", which is what every store
     written before this field says, and costs only the read it would
     otherwise have saved."""
+    fragment_link_groups: bool = False
+    """True when, in EVERY chunk of this level, the intra-chunk link array
+    ``links/0/<all-zero offsets>/`` holds exactly one link group per vertex
+    fragment, in fragment order, and group ``k`` holds exactly the links
+    whose endpoints all lie in vertex fragment ``k``.
+
+    The format lets link groups be anything (see
+    ``layout/fragment_index_arrays.md``), so without this claim a reader
+    cannot find one object's links without reading the whole cell.  With
+    it, the object's manifest names its vertex fragments, and the same
+    indices name its link groups in ``link_fragments/``: its links can be
+    fetched alone, by byte range.
+
+    Like :attr:`fragments_tile` this is a claim about what has *not*
+    happened since it was made.  It is stamped only by
+    :func:`~zarr_vectors.core.arrays.stamp_fragment_link_groups`, which
+    verifies it against the store after the writes; it is cleared by
+    :meth:`Group.write_bytes` on any later write to ``vertex_fragments``,
+    ``link_fragments`` or the intra-chunk link array; and
+    ``validate_consistency`` checks it.  A stale True would hand a reader
+    an incomplete object, so readers should also check each chunk they
+    use.  Absent (the default) means "unknown"."""
 
     def to_dict(self) -> dict[str, Any]:
         """Serialise to a JSON-compatible dict."""
@@ -885,6 +907,8 @@ class LevelMetadata:
             d["shared_fragments"] = True
         if self.fragments_tile:
             d["fragments_tile"] = True
+        if self.fragment_link_groups:
+            d["fragment_link_groups"] = True
         return {"zarr_vectors_level": d}
 
     @classmethod
@@ -931,6 +955,7 @@ class LevelMetadata:
             inherited_num_objects=lv.get("inherited_num_objects"),
             shared_fragments=bool(lv.get("shared_fragments", False)),
             fragments_tile=bool(lv.get("fragments_tile", False)),
+            fragment_link_groups=bool(lv.get("fragment_link_groups", False)),
         )
 
     def validate(self) -> None:

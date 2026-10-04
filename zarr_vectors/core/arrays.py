@@ -13,7 +13,7 @@ the store or encoding modules directly.
 from __future__ import annotations
 
 import warnings
-from collections.abc import Iterator, Mapping, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import Any, Literal
@@ -1793,6 +1793,11 @@ def write_chunk_links(
             LINK_FRAGMENTS, key, encode_fragments(link_fragments),
             record_presence=record_presence,
         )
+        # Lets a later ``stamp_fragment_link_groups`` check these groups
+        # against the vertex fragments without reading the rows back.
+        from zarr_vectors.core.link_groups import group_bounds
+
+        level_group.note_link_group_bounds(key, group_bounds(link_groups))
         del link_row_size  # silence unused-variable warning
         return link_byte_offsets
 
@@ -2999,6 +3004,10 @@ def write_links(
     _link_width: int | None = None,
     _num_records: int | None = None,
     _arrays: tuple[npt.NDArray[np.integer], npt.NDArray[np.integer]] | None = None,
+    intra_group_sizes: (
+        Callable[[ChunkCoords, npt.NDArray[np.integer]], Sequence[int] | None]
+        | None
+    ) = None,
 ) -> LinkPartition:
     """Write whole link records into ``links/<delta>/<offsets>/``.
 
@@ -3051,6 +3060,15 @@ def write_links(
             Duplicated records are returned once per copy by
             :func:`read_links`; the parallel attribute family replicates
             identically via the returned partition.
+        intra_group_sizes: How to cut a freshly written intra-chunk cell
+            (delta 0, all-zero offsets) into link groups: called with the
+            source chunk and the cell's rows, in input order, it returns
+            the size of each group (summing to the row count), or ``None``
+            for the default single group.  It only *cuts* -- rows are never
+            reordered, so the returned partition stays row-exact; a writer
+            that wants one group per vertex fragment passes its records in
+            fragment order (see :func:`~zarr_vectors.types.meshes.write_mesh`).
+            Not applied to ``mode="append"``.
 
     Returns:
         :class:`LinkPartition` describing where each input record landed.
@@ -3275,7 +3293,24 @@ def write_links(
                     dtype=dtype, width=rows.shape[1], default=[],
                     trust_presence=False,
                 ))
-            groups.append(rows)
+            sizes = (
+                intra_group_sizes(tuple(int(c) for c in src_chunk), rows)
+                if intra_group_sizes is not None
+                and mode != "append"
+                and delta == 0
+                and is_intra(offsets)
+                else None
+            )
+            if sizes is None:
+                groups.append(rows)
+            else:
+                if sum(int(n) for n in sizes) != rows.shape[0]:
+                    raise ArrayError(
+                        f"intra_group_sizes for chunk {src_chunk} sums to "
+                        f"{sum(int(n) for n in sizes)}, not {rows.shape[0]} rows"
+                    )
+                cuts = np.cumsum([int(n) for n in sizes])[:-1]
+                groups.extend(np.split(rows, cuts))
             # Route through the per-cell writer so the flat+sidecar vs
             # inline-blob choice has exactly one definition.
             write_chunk_links(
