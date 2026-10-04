@@ -231,8 +231,13 @@ fragments, by setting `fragment_link_groups: true` in its level metadata.
 The promise is, for **every** chunk of the level:
 
 1. `link_fragments/<chunk>` holds exactly as many groups as
-   `vertex_fragments/<chunk>` holds fragments, and
-2. group `k` holds exactly the intra-chunk links whose endpoints all lie in
+   `vertex_fragments/<chunk>` holds fragments;
+2. the chunk's vertex fragments are disjoint: no vertex row belongs to two
+   of them (a link inside both could not be in both groups);
+3. the link groups hold every row of the chunk's intra-chunk link cell
+   exactly once: no row in two groups, none in no group (a row outside
+   every group is a link a reader of one object's groups never sees); and
+4. group `k` holds exactly the intra-chunk links whose endpoints all lie in
    vertex fragment `k` -- so no intra-chunk link joins two fragments.
 
 An object's manifest names vertex fragments; on such a level the same
@@ -243,22 +248,49 @@ in other offsets arrays are not covered: they have no sidecar.
 **Writer responsibility.** The flag is a claim about what has not happened
 since it was made, handled exactly as `fragments_tile`:
 
-- It is stamped only after the writes, by `stamp_fragment_link_groups`,
-  which verifies every chunk against the store (using per-group endpoint
-  bounds the writer recorded, so it need not re-read the rows).
+- It is stamped only after the writes have reached the store, by
+  `stamp_fragment_link_groups`, which verifies every chunk against the
+  store and refuses to run while writes are still queued (inside
+  `batched_writes` or `open_write_session`). For a cell it has just
+  written, the writer records each group's row count and smallest and
+  largest endpoint, so the rows need not be read back; that record is used
+  only while the stored `link_fragments` cell still holds exactly those
+  groups as consecutive ranges from row 0, and any other write to the cell
+  or its index drops it. Every other chunk is checked against its stored
+  rows. A stamp whose verification fails leaves the level unstamped,
+  withdrawing an earlier claim.
 - Any later write to `vertex_fragments`, `link_fragments` or the
-  intra-chunk link array clears it (`Group.write_bytes` is the chokepoint).
-  A writer that does not know about the claim -- an edit, an append, a
-  rechunk -- therefore withdraws it rather than leaving it stale; a writer
-  that keeps the grouping re-stamps it.
+  intra-chunk link array clears it (`Group.write_bytes` and
+  `Group.write_cells` are the chokepoint). A writer that does not know
+  about the claim -- an edit, an append, a rechunk -- therefore withdraws
+  it rather than leaving it stale; a writer that keeps the grouping
+  re-stamps it. The writer decides against the level metadata as the store
+  holds it at its first write, not as it was when the writer opened the
+  level, so a claim stamped elsewhere after that is still withdrawn. The
+  one gap, shared with `fragments_tile`: a handle that has already written
+  before another handle stamps the level does not withdraw that later
+  stamp. Re-open the level after a stamp made elsewhere.
+- Nothing else sets it: `update_level_metadata` refuses claim fields, and
+  merges every change into the level metadata as the store holds it, so a
+  stale handle cannot put back a claim another one withdrew.
+- Repacking cells into or out of shards (`shard_store`, `unshard_store`)
+  rewrites the same bytes, so it restores the claims a level held once
+  every array of the level is repacked; an interrupted repack leaves them
+  withdrawn.
 - The root's `format_capabilities` gains `CAP_FRAGMENT_LINK_GROUPS` when a
   level is stamped. It is a hint; the level flag is authoritative.
 
 `write_mesh` stamps its raw levels.
 `index_fragment_link_groups` brings an existing level into the layout,
-re-cutting `link_fragments` alone where the rows are already in fragment
-order and reordering rows only where it must (and only when the level has
-no row-aligned intra-chunk link attributes).
+re-cutting `link_fragments` alone where the stored rows are already in
+fragment order under groups that are consecutive ranges over all of them,
+and reordering rows only where it must (and only when the level has no
+row-aligned intra-chunk link attributes). It leaves a level unstamped where
+a link joins two fragments, the vertex fragments overlap, or the existing
+groups do not hold every row exactly once -- readers that concatenate the
+groups and readers of the whole cell then already disagree about which
+links exist. With `verify` it re-checks stamped levels and withdraws the
+claim from one it cannot repair.
 
 **Reader responsibility.** None for readers that concatenate groups: the
 rows are the same however they are grouped. A reader that relies on the

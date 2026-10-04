@@ -162,6 +162,8 @@ For a level that sets `fragment_link_groups`:
 | Rule | Failure type |
 |------|--------------|
 | Every chunk's `link_fragments` holds as many groups as its `vertex_fragments` holds fragments | Error |
+| No vertex row of a chunk belongs to two of its vertex fragments | Error |
+| A chunk's link groups hold every row of its intra-chunk link cell exactly once (none twice, none left out) | Error |
 | Every intra-chunk link in group `k` has all its endpoints in vertex fragment `k` | Error |
 
 ### Example L3 report (abbreviated)

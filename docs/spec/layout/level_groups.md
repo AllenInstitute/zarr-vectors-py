@@ -89,7 +89,12 @@ value as `false`.
 
 | Key | Type | Description |
 |-----|------|-------------|
-| `fragment_link_groups` | `boolean` | Every chunk's intra-chunk link groups follow its vertex fragments one to one, so one object's links can be read alone. See [Links](../object_model/links.md#link-groups-that-follow-vertex-fragments). |
+| `fragments_tile` | `boolean` | Every chunk's vertex fragments are ranges that tile its vertex buffer in order, so a reader wanting the whole chunk can skip the fragment index. Cleared by any later write to `vertices` or `vertex_fragments`. |
+| `fragment_link_groups` | `boolean` | Every chunk's intra-chunk link groups follow its vertex fragments one to one, so one object's links can be read alone. Cleared by any later write to `vertex_fragments`, `link_fragments` or the intra-chunk link array. See [Links](../object_model/links.md#link-groups-that-follow-vertex-fragments). |
+
+`update_level_metadata` refuses both: only the writer that has just checked
+a claim against the store stamps it. Repacking a level's cells into or out
+of shards restores the claims it held, since the bytes are unchanged.
 
 #### Build-time keys
 

@@ -29,7 +29,9 @@ small sidecar rewrite away from the layout; what is missing is a way to
 1. **Level metadata flag** `fragment_link_groups: bool` (absent ⇒ `false`).
    It promises, for every chunk of the level:
    - `link_fragments/<chunk>` has exactly as many groups as
-     `vertex_fragments/<chunk>` has fragments, and
+     `vertex_fragments/<chunk>` has fragments,
+   - the vertex fragments are disjoint, and the link groups hold every
+     row of the intra-chunk link cell exactly once, and
    - group `k` holds exactly the intra-chunk links whose endpoints all lie
      in vertex fragment `k` (so no intra-chunk link joins two fragments).
 
@@ -42,13 +44,22 @@ small sidecar rewrite away from the layout; what is missing is a way to
    flag is authoritative.
 
 3. **A claim, handled exactly like `fragments_tile`:**
-   - stamped only after the writes, by `stamp_fragment_link_groups`, which
-     verifies every chunk (using per-group endpoint bounds the writer
-     records, so the rows just written are not re-read);
+   - stamped only after the writes have reached the store, by
+     `stamp_fragment_link_groups`, which verifies every chunk against the
+     store. A writer records each group's row count and endpoint range for
+     the cells it has just written, so those rows are not re-read, but
+     that record is used only while the stored `link_fragments` cell still
+     says exactly the same groups; anything else is read and checked;
    - cleared by `Group.write_bytes` / `write_cells` on any later write to
      `vertex_fragments`, `link_fragments` or the intra-chunk link array, so
      a writer that does not know about it (edits, appends, rechunking)
-     withdraws it rather than leaving it stale;
+     withdraws it rather than leaving it stale. The writer checks the level
+     metadata as the store holds it at its first write; a handle that has
+     already written before another handle stamps does not see that stamp
+     (the same gap as `fragments_tile`);
+   - never set by hand: `update_level_metadata` refuses it;
+   - kept across `shard_store` / `unshard_store`, which rewrite the same
+     bytes;
    - checked by `validate_consistency` (L3).
 
 4. **Writers.** `write_mesh` lays out one fragment per object (as it
@@ -62,7 +73,9 @@ small sidecar rewrite away from the layout; what is missing is a way to
    where groups already follow fragments, a new `link_fragments` cell where
    rows are already in fragment order, and row reordering only where needed
    and only when the level has no row-aligned intra-chunk link attributes.
-   A level where some link joins two fragments is left unstamped.
+   A level where some link joins two fragments, whose vertex fragments
+   overlap, or whose groups do not hold every row exactly once is left
+   unstamped; with `verify`, a stamped level that fails loses its stamp.
 
 Spec pages touched: `layout/level_groups.md` (new *Claims* table),
 `object_model/links.md` (new section), `layout/fragment_index_arrays.md`,
