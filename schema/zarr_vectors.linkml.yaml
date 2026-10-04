@@ -144,6 +144,17 @@ enums:
           ``vertex_fragments`` and ``link_fragments`` (a single uint8
           blob per chunk with a tagged-bitmap header + range table +
           explicit CSR; see :mod:`zarr_vectors.encoding.fragments`).
+      fragment_link_groups:
+        description: >
+          At least one level is stamped ``fragment_link_groups``: its
+          intra-chunk link groups follow its vertex fragments one to one.
+          A hint; the level flag is authoritative.
+      additive_levels:
+        description: >
+          At least one level is ``refinement: "add"``: its complete content
+          is its own data plus the complete content of the next coarser
+          level.  Changes what a level's data means, so a store using it
+          also lists it in ``required_capabilities``.
       multiscale_links:
         description: >
           Store uses the multiscale links layout
@@ -153,6 +164,20 @@ enums:
           is no separate cross-chunk family — a cross-chunk link is a
           link with a non-zero offsets segment — so this token now marks
           only the presence of ``delta != 0`` arrays.
+
+  Refinement:
+    description: >
+      How a resolution level relates to the next coarser one.
+    permissible_values:
+      replace:
+        description: >
+          The level's own data is its complete content (the default, and
+          the meaning of every level written before the field existed).
+      add:
+        description: >
+          The level's complete content is its own data together with the
+          complete content of level ``level + 1``.  The coarsest level
+          cannot be ``add``.
 
   ZvArrayTag:
     description: >
@@ -282,6 +307,7 @@ classes:
       - reduction_factor
       - base_bin_shape
       - format_capabilities
+      - required_capabilities
       - attribute_specs
       - shard_shape
 
@@ -308,6 +334,7 @@ classes:
       - shared_fragments
       - fragments_tile
       - fragment_link_groups
+      - refinement
     slot_usage:
       chunk_shape:
         required: false
@@ -611,6 +638,15 @@ slots:
     description: Optional 0.3+ feature tokens advertised by this store.
     range: FormatCapability
     multivalued: true
+  required_capabilities:
+    description: >
+      Capabilities a reader MUST implement to read this store correctly;
+      a reader that does not implement one of them MUST refuse to open the
+      store.  Optional, default empty.  A store with additive levels lists
+      ``additive_levels``.  Readers written before this list existed do
+      not check it.
+    range: FormatCapability
+    multivalued: true
   attribute_specs:
     description: >
       What the store declares its attributes to be, keyed by scope
@@ -735,6 +771,16 @@ slots:
       ``link_fragments`` or the intra-chunk link array.  Readers MUST treat
       an absent value as False and SHOULD check each chunk they rely on.
     range: boolean
+  refinement:
+    description: >
+      ``replace`` (default when absent): the level's own data is its
+      complete content.  ``add``: its complete content is its own data
+      plus the complete content of level ``level + 1``, so each object is
+      stored at one level of the chain.  ``vertex_count`` counts the
+      level's own vertices either way.  The coarsest level cannot be
+      ``add``, and a store with an ``add`` level lists ``additive_levels``
+      in ``required_capabilities``.
+    range: Refinement
 
   # -- per-array .zattrs ------------------------------------------------
 

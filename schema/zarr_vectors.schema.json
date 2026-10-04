@@ -169,6 +169,8 @@
         "preserved_object_ids",
         "shared_fragments",
         "fragment_index",
+        "fragment_link_groups",
+        "additive_levels",
         "multiscale_links"
       ],
       "title": "FormatCapability",
@@ -416,6 +418,10 @@
             "boolean",
             "null"
           ]
+        },
+        "refinement": {
+          "$ref": "#/$defs/Refinement",
+          "description": "``replace`` (default when absent): the level's own data is its complete content.  ``add``: its complete content is its own data plus the complete content of level ``level + 1``, so each object is stored at one level of the chain.  ``vertex_count`` counts the level's own vertices either way.  The coarsest level cannot be ``add``, and a store with an ``add`` level lists ``additive_levels`` in ``required_capabilities``.\n"
         },
         "shared_fragments": {
           "description": "True when per-chunk fragments may be referenced by multiple objects' manifests (shared metavertices in the per-object pyramid regime).  v0.6 successor to ``shared_vertex_groups``.  Readers MAY use this to short-circuit dedup work.\n",
@@ -723,6 +729,15 @@
       "title": "ObjectIndexMeta",
       "type": "object"
     },
+    "Refinement": {
+      "description": "How a resolution level relates to the next coarser one.",
+      "enum": [
+        "replace",
+        "add"
+      ],
+      "title": "Refinement",
+      "type": "string"
+    },
     "RootMetadata": {
       "additionalProperties": false,
       "description": "Root-level ``.zattrs`` payload, persisted under the key ``zarr_vectors``.  Validates the runtime :class:`zarr_vectors.core.metadata.RootMetadata` dataclass. Note: the canonical axis list lives in ``multiscales[0].axes`` at root level (NGFF-style), NOT under ``zarr_vectors`` \u2014 see ``MultiscalesMetadata``.",
@@ -814,6 +829,16 @@
           "minimum": 2,
           "type": [
             "integer",
+            "null"
+          ]
+        },
+        "required_capabilities": {
+          "description": "Capabilities a reader MUST implement to read this store correctly; a reader that does not implement one of them MUST refuse to open the store.  Optional, default empty.  A store with additive levels lists ``additive_levels``.  Readers written before this list existed do not check it.\n",
+          "items": {
+            "$ref": "#/$defs/FormatCapability"
+          },
+          "type": [
+            "array",
             "null"
           ]
         },

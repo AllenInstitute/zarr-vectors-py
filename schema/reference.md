@@ -79,6 +79,8 @@ Name: zarr_vectors
 | [parent_level](parent_level.md) | Source level index (None for level 0) |
 | [preserves_object_ids](preserves_object_ids.md) | True for levels written by the per-object pyramid regime |
 | [reduction_factor](reduction_factor.md) | Multi-resolution coarsening factor (≥ 2) |
+| [refinement](refinement.md) | ``replace`` (default when absent): the level's own data is its complete conte... |
+| [required_capabilities](required_capabilities.md) | Capabilities a reader MUST implement to read this store correctly; a reader t... |
 | [row_shape](row_shape.md) | Tail dimensions of one attribute row (``[]`` for a 1-D per-link attribute), l... |
 | [shape](shape.md) | Shape of a dense per-object/per-group array |
 | [shard_shape](shard_shape.md) | Cells per shard per axis, or absent for one storage object per cell |
@@ -104,6 +106,7 @@ Name: zarr_vectors
 | [GeometryType](GeometryType.md) | The kind of geometry a store (or one of its sub-types) holds |
 | [LinksConvention](LinksConvention.md) | How intra-chunk links are represented for a polyline/graph/mesh |
 | [ObjectIndexConvention](ObjectIndexConvention.md) | How the object_id → fragment mapping is encoded |
+| [Refinement](Refinement.md) | How a resolution level relates to the next coarser one |
 | [ZvArrayTag](ZvArrayTag.md) | Discriminator value for per-array `` |
 
 
@@ -9503,6 +9506,208 @@ minimum_value: 2
 </details></div>
 
 
+---
+
+# Slot: refinement 
+
+
+_``replace`` (default when absent): the level's own data is its complete content.  ``add``: its complete content is its own data plus the complete content of level ``level + 1``, so each object is stored at one level of the chain.  ``vertex_count`` counts the level's own vertices either way.  The coarsest level cannot be ``add``, and a store with an ``add`` level lists ``additive_levels`` in ``required_capabilities``._
+
+__
+
+
+
+<div data-search-exclude markdown="1">
+
+
+
+URI: [zv:refinement](https://w3id.org/zarr-vectors/schema/0.5/refinement)
+<!-- no inheritance hierarchy -->
+
+
+
+
+
+## Applicable Classes
+
+| Name | Description | Modifies Slot |
+| --- | --- | --- |
+| [LevelMetadata](LevelMetadata.md) | Per-resolution-level `` |  no  |
+
+
+
+
+
+
+## Properties
+
+### Type and Range
+
+| Property | Value |
+| --- | --- |
+| Range | [Refinement](Refinement.md) |
+| Domain Of | [LevelMetadata](LevelMetadata.md) |
+
+### Cardinality and Requirements
+
+| Property | Value |
+| --- | --- |
+
+
+
+
+
+
+
+
+
+
+## Identifier and Mapping Information
+
+
+
+
+
+### Schema Source
+
+
+* from schema: https://w3id.org/zarr-vectors/schema/0.5
+
+
+
+
+## Mappings
+
+| Mapping Type | Mapped Value |
+| ---  | ---  |
+| self | zv:refinement |
+| native | zv:refinement |
+
+
+
+
+## LinkML Source
+
+<details>
+```yaml
+name: refinement
+description: '``replace`` (default when absent): the level''s own data is its complete content.  ``add``: its complete content is its own data plus the complete content of level ``level + 1``, so each object is stored at one level of the chain.  ``vertex_count`` counts the level''s own vertices either way.  The coarsest level cannot be ``add``, and a store with an ``add`` level lists ``additive_levels`` in ``required_capabilities``.'
+from_schema: https://w3id.org/zarr-vectors/schema/0.5
+rank: 1000
+domain_of:
+- LevelMetadata
+range: Refinement
+
+```
+</details></div>
+
+
+---
+
+---
+search:
+  boost: 5.0
+---
+
+# Slot: required_capabilities 
+
+
+_Capabilities a reader MUST implement to read this store correctly; a reader that does not implement one of them MUST refuse to open the store.  Optional, default empty.  A store with additive levels lists ``additive_levels``.  Readers written before this list existed do not check it._
+
+__
+
+
+
+<div data-search-exclude markdown="1">
+
+
+
+URI: [zv:required_capabilities](https://w3id.org/zarr-vectors/schema/0.5/required_capabilities)
+<!-- no inheritance hierarchy -->
+
+
+
+
+
+## Applicable Classes
+
+| Name | Description | Modifies Slot |
+| --- | --- | --- |
+| [RootMetadata](RootMetadata.md) | Root-level `` |  no  |
+
+
+
+
+
+
+## Properties
+
+### Type and Range
+
+| Property | Value |
+| --- | --- |
+| Range | [FormatCapability](FormatCapability.md) |
+| Domain Of | [RootMetadata](RootMetadata.md) |
+
+### Cardinality and Requirements
+
+| Property | Value |
+| --- | --- |
+| Multivalued | Yes |
+
+
+
+
+
+
+
+
+
+## Identifier and Mapping Information
+
+
+
+
+
+### Schema Source
+
+
+* from schema: https://w3id.org/zarr-vectors/schema/0.5
+
+
+
+
+## Mappings
+
+| Mapping Type | Mapped Value |
+| ---  | ---  |
+| self | zv:required_capabilities |
+| native | zv:required_capabilities |
+
+
+
+
+## LinkML Source
+
+<details>
+```yaml
+name: required_capabilities
+description: 'Capabilities a reader MUST implement to read this store correctly; a reader that does not implement one of them MUST refuse to open the store.  Optional, default empty.  A store with additive levels lists ``additive_levels``.  Readers written before this list existed do not check it.'
+from_schema: https://w3id.org/zarr-vectors/schema/0.5
+rank: 1000
+domain_of:
+- RootMetadata
+range: FormatCapability
+multivalued: true
+```
+</details></div>
+
+
+---
+
+---
+search:
+  boost: 5.0
 ---
 
 ---

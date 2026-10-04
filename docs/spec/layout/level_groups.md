@@ -77,9 +77,15 @@ Full example for level 1, produced from a 3-D streamline store:
 |-----|------|-------------|
 | `object_sparsity` | `float` | Fraction of objects retained. Defaults to `1.0` if absent. Must be in `(0.0, 1.0]`. |
 | `sparsity_strategy` | `string` | One of `"spatial_coverage"`, `"length"`, `"attribute"`, `"random"`. |
-| `vertex_count` | `integer` | Total vertex count across all chunks at this level. |
+| `vertex_count` | `integer` | Total vertex count across all chunks at this level -- the level's OWN vertices, also on an additive level. |
 | `object_count` | `integer` | Total object count at this level. |
 | `chunk_count` | `integer` | Number of non-empty chunks at this level. |
+
+#### Refinement
+
+| Key | Type | Description |
+|-----|------|-------------|
+| `refinement` | `string` | `"replace"` (the default when absent): the level's own data is its complete content. `"add"`: its complete content is its own data together with level `N + 1`'s complete content, so each object is stored at one level. The coarsest level cannot be `"add"`, and a store with an `"add"` level lists `"additive_levels"` in the root's `required_capabilities`. See [Additive refinement](../multiscale/additive_refinement.md). |
 
 #### Claims
 

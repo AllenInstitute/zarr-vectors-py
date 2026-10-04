@@ -488,6 +488,20 @@ for a walkthrough that builds a 3-level pyramid, inspects the
 resulting `<delta>` subdirs, and reads both intra- and cross-level
 edges.
 
+### Additive pyramids
+
+A pyramid may store each object (or point) once instead of once per level
+that keeps it: every level but the coarsest is marked `refinement: "add"`
+and holds only what the next coarser level lacks, and a level's complete
+content is the union over its chain.  `zarr-vectors-tools` builds one with
+`build_pyramid(..., refinement="add")` (and `zvtools pyramid --refinement
+add`): the pyramid is built as usual and then converted, finest level
+first, by `zarr_vectors.multiresolution.additive.make_levels_additive`,
+which rewrites level 0 in place.  It is exact for object sparsity with
+unchanged geometry and for nested point subsets; for meshes and spatially
+coarsened levels the union mixes resolutions, and the builder warns.  See
+[Additive refinement](additive_refinement.md).
+
 ### Validation
 
 `build_pyramid` rejects, before writing anything:

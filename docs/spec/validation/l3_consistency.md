@@ -155,6 +155,15 @@ For `delta != 0` only endpoint 0 is constrained here: the other
 endpoints live at level `owning + delta` and are validated against that
 level's own grid when the walker reaches it.
 
+#### Additive level checks
+
+For each level marked `refinement: "add"` that tracks objects (see
+[Additive refinement](../multiscale/additive_refinement.md)):
+
+| Rule | Failure type |
+|------|--------------|
+| None of the level's objects (non-empty manifests) is also in level `L + 1`'s complete content -- an object lives at one level of a chain | Error |
+
 #### Link group checks
 
 For a level that sets `fragment_link_groups`:

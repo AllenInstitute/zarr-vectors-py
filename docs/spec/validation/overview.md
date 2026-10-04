@@ -66,12 +66,13 @@ The validator is designed to be useful in several contexts:
 | 2 | Metadata | Group-attribute validity ([`metadata.py`](../../../zarr_vectors/validate/metadata.py)): `sid_ndim` agreement, vocabulary tokens, bin/chunk divisibility. **No** array `zarr.json`, **no** link families | 1–5 s |
 | 3 | Consistency | Chunk decode, manifest integrity, link offsets-segment and record validity ([`consistency.py`](../../../zarr_vectors/validate/consistency.py)) | 10 s – 10 min (reads all chunks) |
 | 4 | Geometry | `links_convention` valid for each declared geometry type; mesh `link_width >= 3`; point clouds carry no links ([`conformance.py`](../../../zarr_vectors/validate/conformance.py)) | < 1 s |
-| 5 | Pyramid | Levels contiguous from 0; `vertex_count` non-increasing across levels; `bin_ratio` volume non-decreasing; `object_sparsity` in `(0, 1]` | adds per-level cost |
+| 5 | Pyramid | Levels contiguous from 0; vertex count, and object count where objects are tracked, non-increasing across levels -- counted over each level's complete content, so an additive level counts its whole chain; `bin_ratio` volume non-decreasing; `object_sparsity` in `(0, 1]` | adds per-level cost |
 
 The level names are historical. **L4 does not verify topology or
 geometry**: it checks metadata conventions, not tree structure,
-watertightness, or polyline gaps. **L5 does not check object counts**,
-`bin_shape` consistency, or cross-level vertex correspondence.
+watertightness, or polyline gaps. **L5 checks object counts only where
+levels track objects**, and does not check `bin_shape` consistency or
+cross-level vertex correspondence.
 
 L5 falls back to decoding every chunk to count vertices when a level
 omits its `vertex_count` attribute, so its cost is only per-level-

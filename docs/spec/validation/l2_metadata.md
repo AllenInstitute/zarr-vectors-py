@@ -99,6 +99,22 @@ For every resolution level:
 | Every `bin_ratio[i] >= 1` | Error |
 | `object_sparsity` (default `1.0`) is in `(0, 1]` | Error |
 | The level does not declare its presence deferred (`zarr_vectors_presence`) | Warning |
+| `refinement`, if present, is `"replace"` or `"add"` | Error |
+
+### Refinement checks
+
+See [Additive refinement](../multiscale/additive_refinement.md).
+
+| Rule | Failure type |
+|------|--------------|
+| An `"add"` level `L` has a level `L + 1` (the coarsest level is never `"add"`) | Error |
+| A store with an `"add"` level lists `additive_levels` in `required_capabilities` | Error |
+| ... and in `format_capabilities` | Warning |
+| `required_capabilities` lists `additive_levels` but no level is `"add"` | Warning |
+
+A store whose `required_capabilities` names a capability the validator's
+implementation does not support cannot be opened at all, and L2 reports
+that as its first error.
 
 ### What L2 does *not* check
 

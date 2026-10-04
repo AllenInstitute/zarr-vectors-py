@@ -224,6 +224,15 @@ cloud.  The same strategy is selectable through
 `apply_sparsity(..., strategy="point_thinning",
 representative_points=, bin_shape=)`.
 
+### Storing each object once
+
+A sparsity pyramid stores the objects kept at level `L + 1` again at every
+finer level.  With [additive refinement](additive_refinement.md) each is
+stored only at the coarsest level that keeps it, and a level's complete
+content is read as the union over its chain -- about 1x the storage of
+level 0 instead of 1.14-1.33x, and nothing already drawn is fetched again
+when a viewer zooms in.
+
 ### Validation
 
 L2 checks:

@@ -140,6 +140,13 @@ optional keys.
 | `custom_metadata` | `object` | Application-specific metadata. `zarr-vectors-py` does not read or validate this field. |
 | `draco_compressed` | `boolean` | Set to `true` if any array uses the Draco codec. Informational. |
 
+### Capability keys
+
+| Key | Type | Description |
+|-----|------|-------------|
+| `format_capabilities` | `[string, …]` | Optional features the store uses (`preserved_object_ids`, `shared_fragments`, `fragment_index`, `fragment_link_groups`, `additive_levels`, `multiscale_links`). Informational: a reader may ignore a token it does not know. |
+| `required_capabilities` | `[string, …]` | Optional, default empty. Capabilities a reader MUST implement to read the store correctly; a reader that does not implement one of them MUST refuse to open the store. A store with [additive levels](../multiscale/additive_refinement.md) lists `additive_levels`. Readers that predate this key do not check it. |
+
 ### Validation rules
 
 The L1 validator checks that `zarr_vectors_version`, `geometry_type`,
