@@ -358,4 +358,51 @@ def validate_consistency(store_path: str | Path | Group) -> ValidationResult:
                 f"({len(links)} links across {len(segments)} offset arrays)"
             )
 
+    _check_additive_objects(root, levels, result)
     return result
+
+
+def _check_additive_objects(root: Group, levels: list[int], result: ValidationResult) -> None:
+    """An object of an additive level lives at exactly one level of its
+    chain: none of level ``L``'s own objects may also be in level
+    ``L + 1``'s complete content, or a reader of the union draws it twice
+    (once at each resolution)."""
+    from zarr_vectors.constants import REFINEMENT_ADD
+    from zarr_vectors.core.refinement import (
+        level_chain,
+        level_refinement,
+        stored_object_ids,
+    )
+
+    present = set(levels)
+    for li in levels:
+        try:
+            lg = get_resolution_level(root, li)
+            if level_refinement(lg) != REFINEMENT_ADD or li + 1 not in present:
+                continue
+            own = stored_object_ids(lg)
+            if own is None:
+                continue
+            coarser: list[np.ndarray] = []
+            for lv in level_chain(root, li + 1):
+                ids = stored_object_ids(get_resolution_level(root, lv))
+                if ids is not None:
+                    coarser.append(ids)
+            if not coarser:
+                continue
+            both = np.intersect1d(own, np.concatenate(coarser))
+        except Exception as e:  # noqa: BLE001
+            result.add_error(f"resolution_{li}: additive objects not checked: {e}")
+            continue
+        if both.size:
+            result.add_error(
+                f"resolution_{li}: additive, but {both.size} of its objects "
+                f"are also in level {li + 1}'s complete content (e.g. "
+                f"{both[:5].tolist()}); an object must live at one level of "
+                f"a chain"
+            )
+        else:
+            result.add_pass(
+                f"resolution_{li}: additive objects disjoint from level "
+                f"{li + 1}'s complete content"
+            )

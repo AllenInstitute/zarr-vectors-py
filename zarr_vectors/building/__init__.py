@@ -40,6 +40,7 @@ from typing import Any
 
 # --- array names and layout sentinels --------------------------------
 from zarr_vectors.constants import (
+    CAP_ADDITIVE_LEVELS,
     CAP_FRAGMENT_INDEX,
     CAP_FRAGMENT_LINK_GROUPS,
     CAP_MULTISCALE_LINKS,
@@ -59,6 +60,8 @@ from zarr_vectors.constants import (
     LINKS_IMPLICIT_SEQUENTIAL,
     OBJECT_ATTRIBUTES,
     OBJECT_INDEX,
+    REFINEMENT_ADD,
+    REFINEMENT_REPLACE,
     VERTEX_ATTRIBUTES,
     VERTEX_FRAGMENTS,
     VERTICES,
@@ -178,7 +181,20 @@ from zarr_vectors.core.paths import (
     links_path,
     parse_offsets,
 )
+from zarr_vectors.core.refinement import (
+    additive_levels,
+    declare_additive_levels,
+    declare_required_capability,
+    is_additive,
+    level_chain,
+    level_refinement,
+    map_cells,
+    merge_level_reads,
+    refuse_additive,
+    stored_object_ids,
+)
 from zarr_vectors.core.store import (
+    check_required_capabilities,
     commit,
     create_resolution_level,
     create_store,
@@ -696,6 +712,7 @@ def rebuild_presence(
 
 
 __all__ = [
+    "CAP_ADDITIVE_LEVELS",
     "CAP_FRAGMENT_INDEX",
     "CAP_FRAGMENT_LINK_GROUPS",
     "CAP_MULTISCALE_LINKS",
@@ -719,13 +736,10 @@ __all__ = [
     "OBJECT_ATTRIBUTES",
     "OBJECT_INDEX",
     "OBJECT_INDEX_LAYOUT_V1",
-    # Exported so a consumer can audit an existing store's manifest chunking
-    # without importing from ``core``: the number is fixed at array-creation
-    # time and cannot be changed afterwards, so "is this store chunked
-    # correctly?" is a question only an outside reader can answer, and it needs
-    # the reference value to answer it against.
     "OBJECT_INDEX_MANIFEST_BUCKET",
     "ObjectIndexAppender",
+    "REFINEMENT_ADD",
+    "REFINEMENT_REPLACE",
     "RechunkSpec",
     "RootMetadata",
     "VERTEX_ATTRIBUTES",
@@ -733,12 +747,14 @@ __all__ = [
     "VERTICES",
     "XLEVEL_EXPLICIT",
     "XLEVEL_NONE",
+    "additive_levels",
     "apply_perm_inverse",
     "array_is_sharded",
     "assign_chunks",
     "attribute_layout",
     "build_vertex_chunk_mapping",
     "cell_endpoint_chunks",
+    "check_required_capabilities",
     "chunk_local_to_global_offsets",
     "chunk_vertex_count",
     "chunk_scale_factor",
@@ -760,6 +776,8 @@ __all__ = [
     "create_resolution_level",
     "create_store",
     "create_vertices_array",
+    "declare_additive_levels",
+    "declare_required_capability",
     "decode_object_manifest_blocks",
     "defer_presence",
     "decompose_tree_to_paths",
@@ -778,12 +796,15 @@ __all__ = [
     "index_fragment_link_groups",
     "init_skeleton_store",
     "intra_offsets",
+    "is_additive",
     "is_intra",
     "is_sharded",
     "iter_link_cells",
+    "level_chain",
     "level_chunk_scale",
     "level_factor",
     "level_grid_layout",
+    "level_refinement",
     "link_attributes_group_path",
     "link_attributes_path",
     "link_endpoint_scales",
@@ -799,6 +820,8 @@ __all__ = [
     "list_link_deltas",
     "list_link_offsets",
     "list_resolution_levels",
+    "map_cells",
+    "merge_level_reads",
     "neighbouring_chunk_keys",
     "object_count",
     "observe_presence_writes",
@@ -838,6 +861,7 @@ __all__ = [
     "rechunk",
     "rechunk_by_attribute",
     "refresh_arrays_present",
+    "refuse_additive",
     "split_links_by_fragment",
     "stamp_fragment_link_groups",
     "stamp_ome_node",
@@ -849,6 +873,7 @@ __all__ = [
     "set_coordinate_offset",
     "shard_store",
     "split_polyline_at_boundaries",
+    "stored_object_ids",
     "unshard_store",
     "update_level_metadata",
     "update_root_metadata",

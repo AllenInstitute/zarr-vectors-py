@@ -41,6 +41,7 @@ def rebuild_pyramid_from_level(
     Returns the list of per-level coarsening summaries.
     """
     from zarr_vectors.core.metadata import compute_bin_ratio
+    from zarr_vectors.core.refinement import refuse_additive
     from zarr_vectors.core.store import (
         commit,
         list_resolution_levels,
@@ -51,6 +52,9 @@ def rebuild_pyramid_from_level(
     )
     from zarr_vectors.multiresolution.coarsen import coarsen_level
 
+    # An additive level holds only what the next coarser level does not,
+    # so re-coarsening one from another would duplicate or lose objects.
+    refuse_additive(root, "rebuild_pyramid_from_level")
     levels = list_resolution_levels(root)
     above = [lv for lv in levels if lv > source_level]
     if not above:

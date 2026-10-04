@@ -30,6 +30,8 @@ from zarr_vectors.constants import (
     FORMAT_VERSION,
     LINKS_IMPLICIT_SEQUENTIAL,
     OBJIDX_STANDARD,
+    REFINEMENT_REPLACE,
+    REFINEMENT_VALUES,
     VALID_CROSS_CHUNK_STRATEGIES,
     VALID_ENCODINGS,
     VALID_GEOMETRY_TYPES,
@@ -418,6 +420,16 @@ class RootMetadata:
     """Optional capability tokens this store uses.  See
     :mod:`zarr_vectors.constants` for the canonical token names
     (``CAP_*``).  Empty list by default."""
+    required_capabilities: list[str] = field(default_factory=list)
+    """Capabilities a reader MUST implement to read this store correctly.
+
+    A reader that does not implement one of them MUST refuse to open the
+    store rather than read it as something it is not:
+    :func:`zarr_vectors.core.store.open_store` raises
+    :class:`~zarr_vectors.exceptions.UnsupportedCapabilityError`.  A store
+    with additive levels lists ``CAP_ADDITIVE_LEVELS`` here.  Optional and
+    empty by default; readers written before the list existed do not check
+    it."""
     attribute_specs: dict[str, dict[str, Any]] | None = None
     """What the store declares its attributes to be, by scope.
 
@@ -632,6 +644,10 @@ class RootMetadata:
             )
         if self.format_capabilities:
             d["zarr_vectors"]["format_capabilities"] = list(self.format_capabilities)
+        if self.required_capabilities:
+            d["zarr_vectors"]["required_capabilities"] = list(
+                self.required_capabilities,
+            )
         if self.attribute_specs:
             d["zarr_vectors"]["attribute_specs"] = {
                 scope: {n: dict(spec) for n, spec in named.items()}
@@ -709,6 +725,7 @@ class RootMetadata:
             reduction_factor=zv.get("reduction_factor", DEFAULT_REDUCTION_FACTOR),
             base_bin_shape=tuple(bbs) if bbs else None,
             format_capabilities=list(caps),
+            required_capabilities=list(zv.get("required_capabilities") or []),
             attribute_specs=(
                 {
                     scope: {n: dict(spec) for n, spec in named.items()}
@@ -853,6 +870,16 @@ class LevelMetadata:
     Absent (the default) means "unknown", which is what every store
     written before this field says, and costs only the read it would
     otherwise have saved."""
+    refinement: str = REFINEMENT_REPLACE
+    """``"replace"`` (the default): the level's own data is its complete
+    content.  ``"add"``: its complete content is its own data together
+    with the complete content of level ``level + 1``, so level ``L``'s
+    complete content is the union over
+    :func:`~zarr_vectors.core.refinement.level_chain` ``(L)``.  The
+    coarsest level cannot be ``"add"``.  ``vertex_count`` and the object
+    index describe the level's OWN data either way.  Written only when
+    ``"add"``; a store using it lists ``CAP_ADDITIVE_LEVELS`` in the root's
+    ``required_capabilities``."""
     fragment_link_groups: bool = False
     """True when, in EVERY chunk of this level, the intra-chunk link array
     ``links/0/<all-zero offsets>/`` holds exactly one link group per vertex
@@ -913,6 +940,8 @@ class LevelMetadata:
             d["fragments_tile"] = True
         if self.fragment_link_groups:
             d["fragment_link_groups"] = True
+        if self.refinement != REFINEMENT_REPLACE:
+            d["refinement"] = self.refinement
         return {"zarr_vectors_level": d}
 
     @classmethod
@@ -960,6 +989,7 @@ class LevelMetadata:
             shared_fragments=bool(lv.get("shared_fragments", False)),
             fragments_tile=bool(lv.get("fragments_tile", False)),
             fragment_link_groups=bool(lv.get("fragment_link_groups", False)),
+            refinement=str(lv.get("refinement") or REFINEMENT_REPLACE),
         )
 
     def validate(self) -> None:
@@ -977,6 +1007,11 @@ class LevelMetadata:
         if not (0.0 < self.object_sparsity <= 1.0):
             raise MetadataError(
                 f"object_sparsity must be in (0, 1], got {self.object_sparsity}"
+            )
+        if self.refinement not in REFINEMENT_VALUES:
+            raise MetadataError(
+                f"refinement must be one of {list(REFINEMENT_VALUES)}, "
+                f"got {self.refinement!r}"
             )
         if self.level == 0:
             # Level 0 inherits bin_shape from root — must not set its own

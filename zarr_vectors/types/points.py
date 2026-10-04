@@ -559,6 +559,7 @@ def read_points(
     chunks: list[ChunkCoords] | None = None,
     attribute_names: list[str] | None = None,
     attribute_filter: dict[str, Any] | None = None,
+    own_level_only: bool = False,
     backend: str | None = None,
 ) -> dict[str, Any]:
     """Read point cloud data from a ZV store.
@@ -582,6 +583,14 @@ def read_points(
             ``Level.read()`` resolves ``attributes="all"`` into an
             explicit list before calling this.
 
+        own_level_only: Read only the data stored at ``level``.  By
+            default a level's complete content is returned: on an additive
+            level (``refinement: "add"``) that is the union over
+            :func:`~zarr_vectors.core.refinement.level_chain`, each
+            object coming from the one level that stores it.  A caller
+            that must see one level's stored data -- a writer rewriting
+            it, a validator -- passes ``True``.
+
     Returns:
         Dict with keys:
         - ``positions``: ``(M, D)`` array of vertex positions
@@ -590,6 +599,20 @@ def read_points(
         - ``vertex_count``: total vertices returned
     """
     root = open_store(store_path, backend=backend)
+    if not own_level_only:
+        from zarr_vectors.core.refinement import level_chain, read_level_chain
+
+        chain = level_chain(root, level)
+        if len(chain) > 1:
+            return read_level_chain(
+                read_points, root, chain,
+                bbox=bbox,
+                object_ids=object_ids,
+                group_ids=group_ids,
+                attribute_names=attribute_names,
+                attribute_filter=attribute_filter,
+                chunks=chunks,
+            )
     # One node-resolution pass for the whole read.  Everything below
     # resolves the same handful of nodes repeatedly -- the level group,
     # ``vertices``, ``vertex_fragments``, one array per attribute -- and

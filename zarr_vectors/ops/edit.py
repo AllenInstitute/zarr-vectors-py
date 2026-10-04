@@ -98,6 +98,12 @@ class EditSession:
                 f"refresh_pyramid must be one of True / False / 'batch'; "
                 f"got {refresh_pyramid!r}"
             )
+        if refresh_pyramid:
+            # Refused up front rather than at flush, after the edits have
+            # been written: see rebuild_pyramid_from_level.
+            from zarr_vectors.core.refinement import refuse_additive
+
+            refuse_additive(root, "an edit session that refreshes the pyramid")
         self.root = root
         self.atomic = bool(atomic)
         self.refresh_pyramid: RefreshPolicy = refresh_pyramid

@@ -506,6 +506,7 @@ def read_polylines(
     bbox: BoundingBox | None = None,
     chunks: list[ChunkCoords] | None = None,
     attribute_filter: dict[str, Any] | None = None,
+    own_level_only: bool = False,
     backend: str | None = None,
 ) -> dict[str, Any]:
     """Read polylines/streamlines from a zarr vectors store.
@@ -531,6 +532,14 @@ def read_polylines(
             chunk sets). ``chunks=[]`` yields an empty result;
             ``chunks=None`` (default) applies no chunk filter.
 
+        own_level_only: Read only the data stored at ``level``.  By
+            default a level's complete content is returned: on an additive
+            level (``refinement: "add"``) that is the union over
+            :func:`~zarr_vectors.core.refinement.level_chain`, each
+            object coming from the one level that stores it.  A caller
+            that must see one level's stored data -- a writer rewriting
+            it, a validator -- passes ``True``.
+
     Returns:
         Dict with:
         - ``polylines``: list of lists of arrays. ``polylines[i]`` is
@@ -546,6 +555,19 @@ def read_polylines(
         - ``vertex_count``: total vertices across all returned polylines.
     """
     root = open_store(store_path, backend=backend)
+    if not own_level_only:
+        from zarr_vectors.core.refinement import level_chain, read_level_chain
+
+        chain = level_chain(root, level)
+        if len(chain) > 1:
+            return read_level_chain(
+                read_polylines, root, chain,
+                object_ids=object_ids,
+                group_ids=group_ids,
+                bbox=bbox,
+                attribute_filter=attribute_filter,
+                chunks=chunks,
+            )
     with root.cached_nodes():
         # One node-resolution pass for the whole read, and every
         # node it needs asked for in a single gather rather than

@@ -448,6 +448,7 @@ def read_lines(
     object_ids: list[int] | None = None,
     bbox: BoundingBox | None = None,
     attribute_filter: dict[str, Any] | None = None,
+    own_level_only: bool = False,
     backend: str | None = None,
 ) -> dict[str, Any]:
     """Read finite lines from a zarr vectors store.
@@ -460,12 +461,31 @@ def read_lines(
         bbox: Optional bounding box filter (lines with any endpoint
             inside the box are returned).
 
+        own_level_only: Read only the data stored at ``level``.  By
+            default a level's complete content is returned: on an additive
+            level (``refinement: "add"``) that is the union over
+            :func:`~zarr_vectors.core.refinement.level_chain`, each
+            object coming from the one level that stores it.  A caller
+            that must see one level's stored data -- a writer rewriting
+            it, a validator -- passes ``True``.
+
     Returns:
         Dict with:
         - ``endpoints``: ``(M, 2, D)`` array of line endpoints
         - ``line_count``: number of lines returned
     """
     root = open_store(store_path, backend=backend)
+    if not own_level_only:
+        from zarr_vectors.core.refinement import level_chain, read_level_chain
+
+        chain = level_chain(root, level)
+        if len(chain) > 1:
+            return read_level_chain(
+                read_lines, root, chain,
+                object_ids=object_ids,
+                bbox=bbox,
+                attribute_filter=attribute_filter,
+            )
     with root.cached_nodes():
         # One node-resolution pass for the whole read, and every
         # node it needs asked for in a single gather rather than

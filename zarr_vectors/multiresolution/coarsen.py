@@ -160,7 +160,13 @@ def coarsen_level(
     Returns:
         Summary dict.  Always includes ``method``,
         ``preserves_object_ids``, ``vertex_count``.
+
+    Raises:
+        StoreError: On a store with additive levels, whose levels are not
+            each complete and so cannot be coarsened one from another.
     """
+    from zarr_vectors.core.refinement import refuse_additive
+
     kwargs = dict(
         store_path=store_path,
         source_level=source_level,
@@ -179,10 +185,16 @@ def coarsen_level(
                 f"{sorted(options)}. Those keywords belong to a registered "
                 f"strategy — pass method= as well."
             )
+        refuse_additive(store_path, "coarsen_level")
         return _per_object_coarsen(**kwargs)
     # Advanced coarsening methods live in zarr-vectors-tools.
     from zarr_vectors.multiresolution.registry import require_coarsen_strategy
-    return require_coarsen_strategy(method)(**kwargs, **(options or {}))
+
+    # Resolved before the store is touched, so an unknown method is the
+    # error a caller sees.
+    strategy = require_coarsen_strategy(method)
+    refuse_additive(store_path, "coarsen_level")
+    return strategy(**kwargs, **(options or {}))
 
 
 def _per_object_coarsen(
@@ -1313,7 +1325,13 @@ def build_pyramid(
 
     Returns:
         Summary dict.
+
+    Raises:
+        StoreError: On a store with additive levels.
     """
+    from zarr_vectors.core.refinement import refuse_additive
+
+    refuse_additive(store_path, "build_pyramid")
     if cross_level_storage not in VALID_XLEVEL_STORAGE:
         raise ValueError(
             f"cross_level_storage={cross_level_storage!r} not in "

@@ -463,6 +463,7 @@ def read_mesh(
     object_ids: list[int] | None = None,
     chunks: list[ChunkCoords] | None = None,
     attribute_filter: dict[str, Any] | None = None,
+    own_level_only: bool = False,
     backend: str | None = None,
 ) -> dict[str, Any]:
     """Read a mesh from a zarr vectors store.
@@ -477,6 +478,14 @@ def read_mesh(
             in those chunks is returned. AND-ed with ``bbox`` and
             ``object_ids``. ``chunks=[]`` yields an empty result;
             ``chunks=None`` (default) applies no chunk filter.
+
+        own_level_only: Read only the data stored at ``level``.  By
+            default a level's complete content is returned: on an additive
+            level (``refinement: "add"``) that is the union over
+            :func:`~zarr_vectors.core.refinement.level_chain`, each
+            object coming from the one level that stores it.  A caller
+            that must see one level's stored data -- a writer rewriting
+            it, a validator -- passes ``True``.
 
     Returns:
         Dict with:
@@ -497,6 +506,18 @@ def read_mesh(
             "which does implement object_ids."
         )
     root = open_store(store_path, backend=backend)
+    if not own_level_only:
+        from zarr_vectors.core.refinement import level_chain, read_level_chain
+
+        chain = level_chain(root, level)
+        if len(chain) > 1:
+            return read_level_chain(
+                read_mesh, root, chain,
+                bbox=bbox,
+                object_ids=object_ids,
+                attribute_filter=attribute_filter,
+                chunks=chunks,
+            )
     with root.cached_nodes():
         # One node-resolution pass for the whole read, and every
         # node it needs asked for in a single gather rather than

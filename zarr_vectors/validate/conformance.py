@@ -5,6 +5,8 @@ from __future__ import annotations
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+import numpy as np
+
 from zarr_vectors.constants import (
     GEOM_GRAPH,
     GEOM_LINE,
@@ -155,13 +157,17 @@ def validate_multiresolution(store_path: str | Path | Group) -> ValidationResult
     else:
         result.add_pass(f"Levels {levels} contiguous")
 
-    prev_count: int | None = None
-    prev_ratio_product: int = 1
+    # Counts are of each level's COMPLETE content: on an additive level
+    # (refinement "add") that is the sum over its chain, so the
+    # non-increasing rule compares what a reader of each level sees.
+    from zarr_vectors.core.refinement import level_chain, stored_object_ids
+
+    own_counts: dict[int, int] = {}
+    own_objects: dict[int, object] = {}
     for li in levels:
         try:
             lg = get_resolution_level(root, li)
-            attrs = lg.attrs
-            vc = attrs.get("vertex_count")
+            vc = lg.attrs.get("vertex_count")
             if vc is None:
                 vc = 0
                 for ck in list_chunk_keys(lg):
@@ -170,6 +176,36 @@ def validate_multiresolution(store_path: str | Path | Group) -> ValidationResult
                         vc += sum(len(g) for g in gs)
                     except Exception:
                         pass
+            own_counts[li] = int(vc)
+            own_objects[li] = stored_object_ids(lg)
+        except Exception as e:
+            result.add_error(f"resolution_{li}: {e}")
+
+    prev_count: int | None = None
+    prev_objects: int | None = None
+    prev_ratio_product: int = 1
+    for li in levels:
+        if li not in own_counts:
+            continue
+        try:
+            lg = get_resolution_level(root, li)
+            attrs = lg.attrs
+            chain = level_chain(root, li)
+            vc = sum(own_counts.get(lv, 0) for lv in chain)
+            id_sets = [own_objects.get(lv) for lv in chain]
+            n_objects = (
+                None if any(ids is None for ids in id_sets)
+                else int(np.unique(np.concatenate(id_sets)).size)
+                if id_sets else 0
+            )
+            if prev_objects is not None and n_objects is not None:
+                if n_objects > prev_objects:
+                    result.add_error(
+                        f"resolution_{li}: {n_objects} objects > "
+                        f"resolution_{li-1} ({prev_objects})"
+                    )
+            if n_objects is not None:
+                prev_objects = n_objects
             if prev_count is not None:
                 if vc > prev_count:
                     result.add_error(f"resolution_{li}: {vc} > resolution_{li-1} ({prev_count})")

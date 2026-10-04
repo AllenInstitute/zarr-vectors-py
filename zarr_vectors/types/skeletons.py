@@ -475,6 +475,7 @@ def read_skeleton_by_segment_id(
     segment_id: int,
     *,
     level: int = 0,
+    own_level_only: bool = False,
     backend: str | None = None,
     attributes: list[str] | None = None,
 ) -> dict[str, Any] | None:
@@ -488,8 +489,22 @@ def read_skeleton_by_segment_id(
     with ``positions`` ``(N, D)``, ``edges`` ``(M, 2)`` ``[child,
     parent]``, ``attributes`` ``{name: (N, ...)}``, and
     ``fragment_count``.
+
+    On an additive level (``refinement: "add"``) the skeleton is looked
+    up across :func:`~zarr_vectors.core.refinement.level_chain` -- it is
+    stored at exactly one of those levels -- unless ``own_level_only``.
     """
     root = open_store(store_path, backend=backend)
+    if not own_level_only:
+        from zarr_vectors.core.refinement import level_chain, read_level_chain
+
+        chain = level_chain(root, level)
+        if len(chain) > 1:
+            return read_level_chain(
+                read_skeleton_by_segment_id, root, chain,
+                segment_id=segment_id,
+                attributes=attributes,
+            )
     root_meta = read_root_metadata(root)
     ndim = root_meta.sid_ndim
     level_group = get_resolution_level(root, level)

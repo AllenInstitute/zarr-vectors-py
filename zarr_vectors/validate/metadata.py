@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from zarr_vectors.constants import (
     CROSS_CHUNK_BOTH,
@@ -220,4 +220,52 @@ def validate_metadata(store_path: str | Path | Group) -> ValidationResult:
         except Exception as e:
             result.add_error(f"resolution_{li}: cannot read metadata: {e}")
 
+    _check_refinement(root, meta, levels, result)
     return result
+
+
+def _check_refinement(
+    root: Group, meta: Any, levels: list[int], result: ValidationResult,
+) -> None:
+    """``refinement`` values, and what an additive level needs around it:
+    a coarser level to complete it, and a root that requires the
+    capability so a reader that cannot follow the chain refuses the
+    store rather than misreads it."""
+    from zarr_vectors.constants import CAP_ADDITIVE_LEVELS, REFINEMENT_ADD
+    from zarr_vectors.core.refinement import level_refinement
+    from zarr_vectors.exceptions import MetadataError
+
+    additive: list[int] = []
+    for li in levels:
+        try:
+            if level_refinement(get_resolution_level(root, li)) == REFINEMENT_ADD:
+                additive.append(li)
+        except MetadataError as e:
+            result.add_error(f"resolution_{li}: {e}")
+    present = set(levels)
+    for li in additive:
+        if li + 1 not in present:
+            result.add_error(
+                f"resolution_{li}: refinement is \"add\" but there is no "
+                f"level {li + 1} to complete it (the coarsest level must be "
+                f"\"replace\")"
+            )
+    if additive:
+        result.add_pass(f"additive levels: {additive}")
+        if CAP_ADDITIVE_LEVELS not in (meta.required_capabilities or []):
+            result.add_error(
+                f"levels {additive} are additive but the root's "
+                f"required_capabilities does not list "
+                f"{CAP_ADDITIVE_LEVELS!r}: a reader that cannot follow the "
+                f"chain would read those levels as complete"
+            )
+        if CAP_ADDITIVE_LEVELS not in (meta.format_capabilities or []):
+            result.add_warning(
+                f"levels {additive} are additive but format_capabilities "
+                f"does not list {CAP_ADDITIVE_LEVELS!r}"
+            )
+    elif CAP_ADDITIVE_LEVELS in (meta.required_capabilities or []):
+        result.add_warning(
+            f"required_capabilities lists {CAP_ADDITIVE_LEVELS!r} but no "
+            f"level is additive"
+        )

@@ -1228,8 +1228,35 @@ def open_store(
         )
     # Permissive parse: a freshly-warmed store has no dims/bounds/chunk_
     # _shape yet.  The required `format_version` key is still enforced.
-    RootMetadata.from_dict(attrs, strict=False)
+    meta = RootMetadata.from_dict(attrs, strict=False)
+    check_required_capabilities(meta.required_capabilities, where=root.url)
     return root
+
+
+def check_required_capabilities(
+    required: Sequence[str], *, where: str = "this store",
+) -> None:
+    """Refuse a store that needs a capability this implementation lacks.
+
+    ``required_capabilities`` lists what a reader MUST understand to read
+    the store correctly -- additive pyramid levels, for one, whose data is
+    not their complete content.  Reading such a store as if it were
+    something else gives wrong answers without an error, so the only safe
+    response to an unknown entry is to stop.
+
+    Raises:
+        UnsupportedCapabilityError: Naming each unknown capability.
+    """
+    from zarr_vectors.constants import SUPPORTED_CAPABILITIES
+    from zarr_vectors.exceptions import UnsupportedCapabilityError
+
+    unknown = sorted(set(required) - SUPPORTED_CAPABILITIES)
+    if unknown:
+        raise UnsupportedCapabilityError(
+            f"{where} requires capabilities this zarr-vectors does not "
+            f"implement: {unknown}. Reading it anyway would misread it; "
+            f"upgrade zarr-vectors to a version that supports them."
+        )
 
 
 # ===================================================================
@@ -1891,10 +1918,13 @@ def add_resolution_level(
 def remove_resolution_level(root: Group, level_index: int) -> None:
     """Remove a resolution level from the store.
 
-    Level 0 cannot be removed.
+    Level 0 cannot be removed, and neither can a level that an additive
+    level below it is completed by: that would delete data the finer
+    level's complete content includes.
 
     Raises:
-        StoreError: If the level does not exist or is level 0.
+        StoreError: If the level does not exist, is level 0, or completes
+            an additive level.
     """
     if level_index == 0:
         raise StoreError("Cannot remove level 0 (full resolution)")
@@ -1902,6 +1932,17 @@ def remove_resolution_level(root: Group, level_index: int) -> None:
     group_name = f"{RESOLUTION_PREFIX}{level_index}"
     if group_name not in root:
         raise StoreError(f"Resolution level {level_index} not found")
+    below = f"{RESOLUTION_PREFIX}{level_index - 1}"
+    if below in root:
+        from zarr_vectors.core.refinement import REFINEMENT_ADD, level_refinement
+
+        if level_refinement(root[below]) == REFINEMENT_ADD:
+            raise StoreError(
+                f"Cannot remove level {level_index}: level {level_index - 1} "
+                f"is additive, so level {level_index} holds part of its "
+                f"complete content (objects stored once, at the coarsest "
+                f"level that has them)"
+            )
 
     root.delete_subtree(group_name)
 

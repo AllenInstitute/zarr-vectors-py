@@ -52,6 +52,18 @@ claim stamped after verification and cleared by any later write to the
 arrays it describes, exactly like ``fragments_tile``; the link rows are
 unchanged, so a reader ignoring it reads the store correctly.
 
+Proposed for 0.9.3 (pending RFC, NOT additive for old readers): an
+optional level field ``refinement`` (``"replace"`` -- the default and the
+meaning of every level written before it -- or ``"add"``), the root token
+``CAP_ADDITIVE_LEVELS`` and a root list ``required_capabilities``.  On an
+``"add"`` level the complete content is the level's own data together with
+the complete content of the next coarser level, so a pyramid stores each
+object (or point) once.  A reader that ignores the field reads such a
+level as if its own data were all of it, which is wrong; that is what
+``required_capabilities`` exists for -- a reader must refuse a store
+listing a capability it does not implement.  Readers that predate the
+list do not check it, which is the RFC's stated hazard.
+
 0.9.2: optional, backward-compatible ``ome`` block on the root (absent ⇒
 the prior behaviour, so 0.9.0 and 0.9.1 stores read unchanged).  It is an
 OME-Zarr RFC 8 **node** — ``version``, ``type: "collection"``, ``name``,
@@ -240,6 +252,22 @@ group per vertex fragment, so one object's links can be read alone.  A
 hint only -- the level's own flag is authoritative, and it can have been
 cleared by a later write without this token being withdrawn."""
 
+CAP_ADDITIVE_LEVELS: str = "additive_levels"
+"""At least one resolution level is ``refinement: "add"``: its complete
+content is its own data together with the complete content of the next
+coarser level (see :func:`zarr_vectors.core.refinement.level_chain`).
+Unlike the other tokens this one changes what a level's data MEANS, so a
+store using it also lists it in ``required_capabilities``."""
+
+REFINEMENT_REPLACE: str = "replace"
+"""A level's own data is its complete content (the default)."""
+
+REFINEMENT_ADD: str = "add"
+"""A level's complete content is its own data plus the complete content
+of the next coarser level."""
+
+REFINEMENT_VALUES: tuple[str, ...] = (REFINEMENT_REPLACE, REFINEMENT_ADD)
+
 CAP_MULTISCALE_LINKS: str = "multiscale_links"
 """Store uses the multiscale links layout (``links/<delta>/<offsets>/``
 and ``link_attributes/<name>/<delta>/<offsets>/``) and may contain
@@ -247,6 +275,17 @@ cross-pyramid-level edges (``delta != 0``).  Since 0.9.0 there is no
 separate cross-chunk family — a cross-chunk link is a link with a
 non-zero offsets segment — so this token now marks only the presence of
 ``delta != 0`` arrays."""
+
+SUPPORTED_CAPABILITIES: frozenset[str] = frozenset({
+    CAP_PRESERVED_OBJECT_IDS,
+    CAP_SHARED_FRAGMENTS,
+    CAP_FRAGMENT_INDEX,
+    CAP_FRAGMENT_LINK_GROUPS,
+    CAP_ADDITIVE_LEVELS,
+    CAP_MULTISCALE_LINKS,
+})
+"""Every capability token this implementation understands.  A store whose
+``required_capabilities`` names anything else is refused on open."""
 
 DEFAULT_AXES_NAMES: tuple[str, ...] = ("x", "y", "z", "w")
 """Default axis names used when ``create_store`` is called without an

@@ -94,6 +94,15 @@ class Selection:
     """
     attributes: Sequence[str] | str = "all"
     limit: int | None = None
+    own_level_only: bool = False
+    """Read only the data stored at this level.
+
+    By default a read returns the level's complete content, which on an
+    additive level (``refinement: "add"``) is the union over its
+    :func:`~zarr_vectors.core.refinement.level_chain`.  ``True`` asks for
+    the level's stored data alone.  Narrowing, so it survives
+    :meth:`intersect`.
+    """
 
     def intersect(self, other: Selection) -> Selection:
         """Narrow by ``other``.
@@ -125,6 +134,7 @@ class Selection:
                 min(x for x in (self.limit, other.limit) if x is not None)
                 if self.limit is not None or other.limit is not None else None
             ),
+            own_level_only=self.own_level_only or other.own_level_only,
         )
 
     def to_reader_kwargs(self, *, supports: Sequence[str]) -> dict[str, Any]:
@@ -286,6 +296,8 @@ class Query:
             bits.append(f"where {dict(sel.where)}")
         if sel.limit is not None:
             bits.append(f"limit {sel.limit}")
+        if sel.own_level_only:
+            bits.append("own level only")
         how = self._level._explain_execution(sel)
         kind = self._level.dataset.kind_of(sel.level)
         return f"{kind} read: " + ", ".join(bits) + f"\n  via {how}"

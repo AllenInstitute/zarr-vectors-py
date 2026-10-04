@@ -17,6 +17,11 @@ class StoreError(ZVError):
     """Raised when a ZV store cannot be created, opened, or is structurally invalid."""
 
 
+class UnsupportedCapabilityError(StoreError):
+    """The store lists a ``required_capabilities`` entry this reader does
+    not implement, so reading it as if it did would give wrong answers."""
+
+
 class ShardedPresenceError(StoreError):
     """Presence was asked to be derived for a natively-sharded array.
 

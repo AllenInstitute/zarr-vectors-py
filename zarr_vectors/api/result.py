@@ -354,6 +354,80 @@ class ReadResult:
             errors=self.errors,
         )
 
+    @classmethod
+    def concat(cls, results: Sequence[ReadResult]) -> ReadResult:
+        """One result holding every vertex of ``results``, in order.
+
+        How an additive level's complete content is assembled from the
+        levels of its chain.  Parts, edges and faces are offset by the
+        vertices before them.  An attribute survives only where every
+        result that has vertices carries it -- a level without a column
+        has no value to give its vertices -- and ``attributes_read`` only
+        if every such result read attributes.
+        """
+        results = list(results)
+        if not results:
+            raise ValueError("concat() needs at least one result")
+        if len(results) == 1:
+            return results[0]
+        with_rows = [r for r in results if r.vertex_count] or results[:1]
+        ndim = next((r.ndim for r in with_rows if r.ndim), results[0].ndim)
+        positions = np.concatenate(
+            [np.asarray(r.positions).reshape(-1, ndim) for r in results], axis=0,
+        ) if ndim else results[0].positions
+
+        offsets = np.cumsum([0] + [r.vertex_count for r in results])
+        parts: list[slice] = []
+        for r, base in zip(results, offsets):
+            parts.extend(slice(sl.start + base, sl.stop + base) for sl in r.parts)
+
+        def _ids(field_name: str) -> npt.NDArray[Any] | None:
+            values = [getattr(r, field_name) for r in results]
+            needed = [v for r, v in zip(results, values) if r.vertex_count]
+            if not needed or any(v is None for v in needed):
+                return None
+            return np.concatenate([np.asarray(v) for v in needed], axis=0)
+
+        def _index(field_name: str) -> npt.NDArray[Any] | None:
+            tables = [
+                np.asarray(getattr(r, field_name)) + base
+                for r, base in zip(results, offsets)
+                if getattr(r, field_name) is not None
+                and np.asarray(getattr(r, field_name)).size
+            ]
+            if tables:
+                return np.concatenate(tables, axis=0)
+            return next(
+                (getattr(r, field_name) for r in results
+                 if getattr(r, field_name) is not None),
+                None,
+            )
+
+        names = set(with_rows[0].attributes)
+        for r in with_rows[1:]:
+            names &= set(r.attributes)
+        attributes = Attributes({
+            name: np.concatenate(
+                [np.asarray(r.attributes[name]) for r in results
+                 if r.vertex_count and name in r.attributes],
+                axis=0,
+            )
+            for name in sorted(names)
+        })
+        return ReadResult(
+            kind=results[0].kind,
+            positions=positions,
+            parts=tuple(parts),
+            part_objects=_ids("part_objects"),
+            object_ids=_ids("object_ids"),
+            edges=_index("edges"),
+            faces=_index("faces"),
+            attributes=attributes,
+            attributes_read=all(r.attributes_read for r in with_rows),
+            truncated=any(r.truncated for r in results),
+            errors=tuple(e for r in results for e in r.errors),
+        )
+
     # ---------------- adapters from the legacy readers ----------------
     #
     # Each of these is total over the corresponding reader's return

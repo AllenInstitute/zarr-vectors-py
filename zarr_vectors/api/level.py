@@ -198,8 +198,28 @@ class Level:
 
     @property
     def vertex_count(self) -> int:
-        """Vertices at this level, from metadata — no data is read."""
+        """Vertices STORED at this level, from metadata — no data is read.
+
+        On an additive level that is its own data only; see
+        :attr:`chain` for the levels its complete content spans, and
+        ``select().count()`` for the complete count.
+        """
         return int(getattr(self._metadata(), "vertex_count", 0) or 0)
+
+    @property
+    def refinement(self) -> str:
+        """``"replace"`` (the level is complete) or ``"add"`` (its
+        complete content also includes the next coarser level's)."""
+        return str(getattr(self._metadata(), "refinement", "replace") or "replace")
+
+    @property
+    def chain(self) -> tuple[int, ...]:
+        """The levels whose stored data make up this level's complete
+        content, finest first -- ``(index,)`` unless the level is additive.
+        Reads return their union unless ``own_level_only=True``."""
+        from zarr_vectors.core.refinement import level_chain
+
+        return tuple(level_chain(self._dataset._group, self._index))
 
     @property
     def scale(self) -> tuple[float, ...]:
@@ -420,6 +440,10 @@ class Level:
         # the level this query is actually bound to.
         if kwargs.get("level") is None:
             kwargs["level"] = self._index
+        # One level per reader call: an additive level's chain is read
+        # level by level and joined here (see ``_execute``), so each read
+        # stays inside the plan the engine prefetched for it.
+        kwargs["own_level_only"] = True
         if (
             selection.attributes == "all"
             and "attribute_names" in supports
@@ -560,10 +584,17 @@ class Level:
             else self._dataset.level(selection.level)
         )
         try:
-            count = getattr(target._metadata(), "vertex_count", None)
+            levels = self._chain(selection)
+            total = 0
+            for lv in levels:
+                level = target if lv == target.index else self._dataset.level(lv)
+                count = getattr(level._metadata(), "vertex_count", None)
+                if count is None:
+                    return None
+                total += int(count)
         except (ArrayError, StoreError, MetadataError, KeyError):
             return None
-        return None if count is None else int(count)
+        return total
 
     def plan(self, selection: Selection) -> Any:
         """The I/O this selection implies, before any of it is performed.
@@ -578,7 +609,75 @@ class Level:
 
         return resolve(selection, context_from_level(self))
 
+    def _chain(self, selection: Selection) -> list[int]:
+        """The levels this selection reads: the target level, plus the
+        rest of its chain when it is additive and the selection did not
+        ask for ``own_level_only``."""
+        target = self._index if selection.level is None else int(selection.level)
+        if selection.own_level_only:
+            return [target]
+        from zarr_vectors.core.refinement import level_chain
+
+        return level_chain(self._dataset._group, target)
+
+    def _chain_parts(
+        self, selection: Selection, chain: Sequence[int],
+    ) -> list[tuple[Level, Selection]]:
+        """One own-level selection per level of ``chain``.
+
+        ``limit`` is applied once, to the joined result; ``cells`` name
+        cells of the first level's grid and become the overlapping cells
+        of each coarser level's.
+        """
+        from dataclasses import replace as _replace
+
+        from zarr_vectors.api.grid import CellRef
+        from zarr_vectors.core.refinement import map_cells
+
+        first = self._dataset.level(chain[0])
+        out: list[tuple[Level, Selection]] = []
+        for lv in chain:
+            level = self if lv == self._index else self._dataset.level(lv)
+            cells = selection.cells
+            if cells is not None:
+                coords = [tuple(int(c) for c in getattr(r, "coords", r)) for r in cells]
+                cells = [
+                    CellRef(c) for c in map_cells(coords, first.scale, level.scale)
+                ]
+            out.append((level, _replace(
+                selection, level=lv, own_level_only=True, limit=None, cells=cells,
+            )))
+        return out
+
+    def _join_chain(self, selection: Selection, parts: Sequence[ReadResult]) -> ReadResult:
+        result = ReadResult.concat(parts)
+        if selection.limit is not None and result.vertex_count > int(selection.limit):
+            keep = np.zeros(result.vertex_count, dtype=bool)
+            keep[: int(selection.limit)] = True
+            result = result.restrict(keep, truncated=True)
+        return result
+
     def _execute(self, selection: Selection) -> ReadResult:
+        """A level's complete content: its own data, or on an additive
+        level the union over its chain, one level read at a time."""
+        chain = self._chain(selection)
+        if len(chain) == 1:
+            return self._execute_one(selection)
+        return self._join_chain(selection, [
+            level._execute_one(sub) for level, sub in self._chain_parts(selection, chain)
+        ])
+
+    async def _aexecute(self, selection: Selection) -> ReadResult:
+        """The async twin of :meth:`_execute`."""
+        chain = self._chain(selection)
+        if len(chain) == 1:
+            return await self._aexecute_one(selection)
+        return self._join_chain(selection, [
+            await level._aexecute_one(sub)
+            for level, sub in self._chain_parts(selection, chain)
+        ])
+
+    def _execute_one(self, selection: Selection) -> ReadResult:
         """Fetch in batches, then decode.
 
         The plan is prefetched through the engine and the ordinary
@@ -634,7 +733,7 @@ class Level:
             raw = reader(group, **kwargs)
         return self._finish(raw, adapter, selection)
 
-    async def _aexecute(self, selection: Selection) -> ReadResult:
+    async def _aexecute_one(self, selection: Selection) -> ReadResult:
         """The same read, with its I/O awaited.
 
         Reuses :func:`zarr_vectors.core.aio.read_async`, which supplies
