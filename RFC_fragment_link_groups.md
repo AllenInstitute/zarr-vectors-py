@@ -111,3 +111,10 @@ valid and simply lack the flag; `index_fragment_link_groups` adds it.
   should that write path skip an unchanged fragment index?
 - Should `read_mesh(object_ids=...)` be implemented on top of this? It
   currently raises `NotImplementedError`.
+- Skeletons stored one path per fragment cannot be stamped: each path's
+  first vertex is linked to a parent in another fragment. A relaxed
+  variant -- group `k` holds the links whose child lies in fragment `k` and
+  whose parent lies in the same object -- would cover them, and is what
+  `write_skeleton_chunk` already writes; edits would then have to file new
+  links under the child's fragment. The saving is small for skeletons
+  (their links are a few percent of a cell's bytes), so it is left out.

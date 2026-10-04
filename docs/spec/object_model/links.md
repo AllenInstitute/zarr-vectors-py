@@ -245,6 +245,11 @@ indices name the object's link groups, so a reader can fetch one object's
 intra-chunk links alone, by byte range, instead of the whole cell. Links
 in other offsets arrays are not covered: they have no sidecar.
 
+The rule fits meshes, whose faces lie within one object's fragment. It does
+not fit skeletons stored one path per fragment (as `write_skeleton_chunk`
+and the precomputed ingests write them): each path's first vertex is linked
+to a parent in another fragment, so such a level cannot be stamped.
+
 **Writer responsibility.** The flag is a claim about what has not happened
 since it was made, handled exactly as `fragments_tile`:
 
