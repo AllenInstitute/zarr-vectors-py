@@ -429,6 +429,23 @@ def _write_pool() -> Any:
     return _WRITE_POOL
 
 
+def _reset_write_pool_after_fork() -> None:
+    """A forked child inherits the pool object but none of its threads.
+
+    Its first pooled write would queue work no thread takes, and wait for
+    it forever. The child builds a fresh pool on first use instead, as a
+    new process would. The lock is replaced too: a parent thread may have
+    held it at the fork.
+    """
+    global _WRITE_POOL, _WRITE_POOL_LOCK
+    _WRITE_POOL = None
+    _WRITE_POOL_LOCK = threading.Lock()
+
+
+if hasattr(os, "register_at_fork"):
+    os.register_at_fork(after_in_child=_reset_write_pool_after_fork)
+
+
 def _direct_write_many(
     jobs: list[tuple[_DirectWriteSpec, str, bytes]],
     touched: Any = None,
