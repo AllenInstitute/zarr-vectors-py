@@ -340,7 +340,6 @@ def write(
     start = n0 if at is None else int(at)
     if start < 0:
         raise ArrayError(f"Append index {at} is negative")
-    head = None
     if start < n0:
         # Residue past the commit point: keep the rows before ``start`` and
         # the blocks they use, and drop the rest of both -- the blocks too,
@@ -349,11 +348,15 @@ def write(
         # the order written, so the kept rows use blocks below the highest
         # end any of them names (a patch that moved a row's blocks past
         # residue keeps that residue too: never less than is referenced).
-        head = _rows(level_group, SPANS_PATH, slice(0, start)).reshape(-1, 2)
-        keep = int((head[:, 0] + head[:, 1]).max()) if start else 0
+        keep = _kept_block_end(level_group, start, n0, b0)
         if keep < b0:
             _truncate(level_group, BLOCKS_PATH, keep)
             b0 = keep
+        # The kept rows stay where they are: cut the spans at ``start`` --
+        # clearing the rest of the object holding the new last row, as a
+        # fresh write stores it -- and append, never read them back to
+        # rewrite them.
+        _truncate(level_group, SPANS_PATH, start)
     tail = np.empty((max(start - n0, 0) + n, 2), dtype=np.int64)
     pad = max(start - n0, 0)
     tail[:pad] = (b0, 0)
@@ -361,11 +364,69 @@ def write(
     tail[pad:, 1] = counts
     if new_blocks.size:
         level_group.extend_array(BLOCKS_PATH, new_blocks)
-    if head is not None:
-        _create(level_group, SPANS_PATH, np.concatenate([head, tail]).astype(np.int64))
-    elif tail.size:
+    if tail.size:
         level_group.extend_array(SPANS_PATH, tail)
     return start
+
+
+#: Span rows read per piece when a resume has to scan the kept rows.
+_SCAN_ROWS = 1 << 20
+
+
+def _span_pieces(level_group: Group, lo: int, hi: int) -> Any:
+    """Span rows ``[lo, hi)`` as ``(n, 2)`` int64 pieces of bounded size."""
+    for a in range(lo, hi, _SCAN_ROWS):
+        b = min(a + _SCAN_ROWS, hi)
+        yield _rows(level_group, SPANS_PATH, slice(a, b)).astype(
+            np.int64, copy=False,
+        ).reshape(-1, 2)
+
+
+def _kept_block_end(level_group: Group, start: int, n0: int, b0: int) -> int:
+    """The highest block end any of rows ``[0, start)`` names (0 for none).
+
+    What an append at ``start < n0`` truncates ``manifest_blocks`` to.
+    Usually proved from the residue alone, without reading the rows
+    kept: when every row from ``start - 1`` on begins where the row
+    before it ended and the last ends at the block count -- the layout
+    appends leave -- the residue's blocks are exactly ``[E, b0)``, with
+    ``E`` the end of row ``start - 1``, and no kept row's blocks can lie
+    in them (no two rows share blocks; every writer gives each row its
+    own), so the answer is ``E``. That reads ``n0 - start + 1`` rows, the
+    ones being replaced.
+
+    Otherwise -- a patch or a placed range moved blocks out of row order,
+    or reserved blocks sit past the last row -- the kept rows are scanned,
+    in pieces of :data:`_SCAN_ROWS`, so memory stays bounded.
+
+    The proof does not see a kept row a patch emptied after the residue
+    was written: such a row's (empty) span starts at the block count of
+    that time, which the scan counts, keeping the residue's blocks
+    unreferenced behind it; the proof drops them. Every row reads the
+    same either way.
+    """
+    if start <= 0:
+        return 0
+    consecutive = True
+    prev_end: int | None = None
+    first_end = 0
+    for piece in _span_pieces(level_group, start - 1, n0):
+        ends = piece[:, 0] + piece[:, 1]
+        if prev_end is None:
+            first_end = int(ends[0])
+        elif int(piece[0, 0]) != prev_end:
+            consecutive = False
+            break
+        if not np.array_equal(piece[1:, 0], ends[:-1]):
+            consecutive = False
+            break
+        prev_end = int(ends[-1])
+    if consecutive and prev_end == b0:
+        return first_end
+    keep = 0
+    for piece in _span_pieces(level_group, 0, start):
+        keep = max(keep, int((piece[:, 0] + piece[:, 1]).max()))
+    return keep
 
 
 def _declare_capability(level_group: Group) -> None:
