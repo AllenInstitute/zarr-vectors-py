@@ -78,6 +78,26 @@ def _is_icechunk_store(store: Any) -> bool:
     return cls.__name__ == "IcechunkStore" or cls.__module__.startswith("icechunk")
 
 
+def _array_on(arr: zarr.Array, store: Any) -> zarr.Array:
+    """``arr`` read and written through ``store``, from the metadata it holds.
+
+    ``zarr.open_array(store=..., path=...)`` re-reads the metadata the
+    handle already carries, and without ``zarr_format`` it asks for
+    ``zarr.json``, ``.zarray`` and ``.zattrs`` at once: three round trips
+    on a network filesystem, two of them failing, per array per flush. A
+    wrapper store over the same keys sees the same document, so build the
+    handle from the one in hand.
+    """
+    from zarr.core.array import AsyncArray
+    from zarr.storage import StorePath
+
+    return zarr.Array(AsyncArray(
+        metadata=arr.metadata,
+        store_path=StorePath(store, arr.path),
+        config=arr._async_array.config,
+    ))
+
+
 # ---------------------------------------------------------------------------
 # Async gather
 # ---------------------------------------------------------------------------
@@ -192,9 +212,7 @@ def _flush_one_array(
         # each object (a shard, when sharded) before its rename.
         from zarr_vectors.core._durable import DurableLocalStore
 
-        arr = zarr.open_array(
-            store=DurableLocalStore(arr.store, touched), path=arr.path, mode="r+",
-        )
+        arr = _array_on(arr, DurableLocalStore(arr.store, touched))
     ndim = arr.ndim
     origin_raw = arr.attrs.get(_CHUNK_GRID_ORIGIN_ATTR)
     origin = (

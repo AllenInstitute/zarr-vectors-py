@@ -24,7 +24,9 @@ A shard transaction replaces all of that with staging:
   codec against a staging store, written beside its target as
   ``<object>.<token>.partial`` (fsynced when ``durable``), then renamed
   into place, and the directories fsynced. An exception before that
-  publishes nothing.
+  publishes nothing. With ``io_threads`` the encode, write and fsync of
+  each object run on a pool, and only the renames wait for all of them:
+  the same bytes, each object still durable before its rename.
 
 Atomic per object, not per set: a crash while renaming leaves some
 arrays' shards new and others old. Re-running the task converges: under
@@ -40,12 +42,14 @@ a race this cannot fix.
 
 from __future__ import annotations
 
+import asyncio
 import os
+import threading
 import uuid
-from collections.abc import Iterable, Sequence
+from collections.abc import Callable, Iterable, Sequence
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Literal
+from typing import TYPE_CHECKING, Any, Literal, TypeVar
 
 import numpy as np
 from zarr.storage import LocalStore, WrapperStore
@@ -54,6 +58,13 @@ from zarr_vectors.exceptions import ArrayError, ShardOwnershipError, StoreError
 
 if TYPE_CHECKING:  # pragma: no cover
     from zarr_vectors.core.group import Group
+
+_T = TypeVar("_T")
+_R = TypeVar("_R")
+
+# What an owned shard publishes when zarr found nothing in it to change
+# (merge mode): nothing.
+_UNCHANGED: Any = object()
 
 
 @dataclass
@@ -152,15 +163,22 @@ class ShardTransaction:
         arrays: Iterable[str] | None,
         mode: Literal["replace", "merge"],
         durable: bool,
+        io_threads: int | None = None,
     ) -> None:
         from zarr_vectors.core.group import _grid_origin
 
         if mode not in ("replace", "merge"):
             raise ArrayError(f"mode={mode!r}; expected 'replace' or 'merge'")
+        if io_threads is not None and (
+            isinstance(io_threads, bool) or not isinstance(io_threads, int)
+            or io_threads < 1
+        ):
+            raise ArrayError(f"io_threads={io_threads!r}; expected None or an int >= 1")
         self.level_group = level_group
         self.shard_coords = tuple(int(s) for s in shard_coords)
         self.mode = mode
         self.durable = bool(durable)
+        self.io_threads = io_threads
         self.written: dict[str, list[str]] = {}
         self.published: list[str] = []
         self._cells: dict[str, dict[str, bytes]] = {}
@@ -252,64 +270,143 @@ class ShardTransaction:
     # ---------------------------------------------------------------
     # On exit
 
-    def _encode(self) -> dict[str, bytes | None]:
-        """Every owned shard object this transaction changes: bytes, or None to remove."""
+    def _encode_one(self, name: str) -> tuple[str, Any, list[str] | None]:
+        """One owned shard object: ``(key, value, written)``.
+
+        ``value`` is the object's new bytes, ``None`` to remove it, or
+        :data:`_UNCHANGED`; ``written`` is the array's non-empty cells, or
+        None when the transaction gave it none. Touches no shared state,
+        so arrays encode concurrently.
+        """
         import warnings
 
-        import zarr
         from zarr.errors import UnstableSpecificationWarning
 
-        out: dict[str, bytes | None] = {}
+        from zarr_vectors.core._batch_writer import _array_on
+
+        owned = self._owned[name]
+        cells = self._cells.get(name, {})
+        if not cells:
+            return owned.key, (None if self.mode == "replace" else _UNCHANGED), None
         store = self.level_group.zarr_group.store
-        for name, owned in self._owned.items():
-            cells = self._cells.get(name, {})
-            if not cells:
-                if self.mode == "replace":
-                    out[owned.key] = None
-                continue
-            staging = _StagingStore(store, [owned.key] if self.mode == "replace" else [])
-            with warnings.catch_warnings():
-                warnings.simplefilter("ignore", UnstableSpecificationWarning)
-                arr = zarr.open_array(store=staging, path=owned.arr.path, mode="r+")
-                selection = tuple(
-                    np.asarray(axis, dtype=np.intp)
-                    for axis in zip(*(self._index(owned, k) for k in cells))
-                )
-                values = np.empty(len(cells), dtype=object)
-                values[:] = list(cells.values())
-                arr.set_coordinate_selection(selection, values)
-            stray = set(staging.captured) - {owned.key}
-            if stray:
-                raise StoreError(
-                    f"shard_transaction: writing {name!r} touched {sorted(stray)} "
-                    f"besides its shard {owned.key!r}"
-                )
-            # Nothing captured means zarr found nothing to change.
-            if owned.key in staging.captured:
-                out[owned.key] = staging.captured[owned.key]
-            elif self.mode == "replace":
-                out[owned.key] = None
-            self.written[name] = sorted(k for k, v in cells.items() if v)
+        staging = _StagingStore(store, [owned.key] if self.mode == "replace" else [])
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", UnstableSpecificationWarning)
+            # From the metadata the handle holds: opening by path re-reads
+            # zarr.json, and probes .zarray and .zattrs besides.
+            arr = _array_on(owned.arr, staging)
+            selection = tuple(
+                np.asarray(axis, dtype=np.intp)
+                for axis in zip(*(self._index(owned, k) for k in cells))
+            )
+            values = np.empty(len(cells), dtype=object)
+            values[:] = list(cells.values())
+            arr.set_coordinate_selection(selection, values)
+        stray = set(staging.captured) - {owned.key}
+        if stray:
+            raise StoreError(
+                f"shard_transaction: writing {name!r} touched {sorted(stray)} "
+                f"besides its shard {owned.key!r}"
+            )
+        # Nothing captured means zarr found nothing to change.
+        if owned.key in staging.captured:
+            value = staging.captured[owned.key]
+        elif self.mode == "replace":
+            value = None
+        else:
+            value = _UNCHANGED
+        return owned.key, value, sorted(k for k, v in cells.items() if v)
+
+    def _encode(self) -> dict[str, bytes | None]:
+        """Every owned shard object this transaction changes: bytes, or None to remove."""
+        return self._collect(
+            _map_lanes(self._encode_one, list(self._owned), self._threads()),
+        )
+
+    def _collect(
+        self, encoded: Iterable[tuple[str, Any, list[str] | None]],
+    ) -> dict[str, bytes | None]:
+        """``{key: bytes | None}`` from :meth:`_encode_one`'s results, in
+        array order, recording :attr:`written` as it goes."""
+        out: dict[str, bytes | None] = {}
+        for name, (key, value, written) in zip(self._owned, encoded):
+            if value is not _UNCHANGED:
+                out[key] = value
+            if written is not None:
+                self.written[name] = written
         return out
 
+    def _threads(self) -> int:
+        """Lanes to publish on: 1 unless asked, and always 1 on icechunk,
+        whose session must see the writes made through it one at a time."""
+        from zarr_vectors.core._batch_writer import _NO_THREADS, _is_icechunk_store
+
+        if (
+            self.io_threads is None or self.io_threads <= 1 or _NO_THREADS
+            or _is_icechunk_store(self.level_group.zarr_group.store)
+            # A job on the shared pool that waits on the pool can deadlock it.
+            or threading.current_thread().name.startswith(_POOL_PREFIX)
+        ):
+            return 1
+        return int(self.io_threads)
+
     def publish(self) -> None:
-        objects = self._encode()
         store = self.level_group.zarr_group.store
         if isinstance(store, LocalStore):
-            _publish_local(Path(store.root), objects, durable=self.durable)
-        else:
-            from zarr.core.buffer import default_buffer_prototype
-            from zarr.core.sync import sync
+            self._publish_local(Path(store.root))
+            return
+        objects = self._encode()
+        from zarr.core.buffer import default_buffer_prototype
+        from zarr.core.sync import sync
 
-            async def _put() -> None:
-                proto = default_buffer_prototype()
+        together = self._threads() > 1
+
+        async def _put() -> None:
+            proto = default_buffer_prototype()
+
+            async def one(key: str, value: bytes | None) -> None:
+                if value is None:
+                    await store.delete(key)
+                else:
+                    await store.set(key, proto.buffer.from_bytes(value))
+
+            if together:
+                await asyncio.gather(*(one(k, v) for k, v in objects.items()))
+            else:
                 for key, value in objects.items():
-                    if value is None:
-                        await store.delete(key)
-                    else:
-                        await store.set(key, proto.buffer.from_bytes(value))
+                    await one(key, value)
 
-            sync(_put())
+        sync(_put())
+        self.published = sorted(objects)
+
+    def _publish_local(self, root: Path) -> None:
+        """Encode, write and fsync each object beside its target (on the
+        pool when asked), then rename them all into place."""
+        from zarr_vectors.core._durable import Touched
+
+        touched = Touched()
+        partials: list[str] = []      # appended to from the lanes
+
+        def stage(name: str) -> tuple[tuple[str, Any, list[str] | None], str | None]:
+            key, value, written = self._encode_one(name)
+            tmp = None
+            if isinstance(value, bytes):
+                tmp = _write_partial(
+                    str(root / key), value,
+                    durable=self.durable, touched=touched, partials=partials,
+                )
+            return (key, value, written), tmp
+
+        try:
+            staged = _map_lanes(stage, list(self._owned), self._threads())
+        except BaseException:
+            _remove_all(partials)
+            raise
+        objects = self._collect(encoded for encoded, _tmp in staged)
+        renames = [
+            (tmp, str(root / key)) for (key, _value, _written), tmp in staged if tmp
+        ]
+        _publish_renames(root, objects, renames, touched, durable=self.durable)
         self.published = sorted(objects)
 
     def sweep_partials(self) -> None:
@@ -318,52 +415,115 @@ class ShardTransaction:
         if not isinstance(store, LocalStore):
             return
         root = Path(store.root)
-        for owned in self._owned.values():
-            target = root / owned.key
+
+        def sweep(target: Path) -> None:
             if target.parent.is_dir():
                 for stale in target.parent.glob(f"{target.name}.*.partial"):
                     stale.unlink(missing_ok=True)
 
+        _map_lanes(sweep, [root / o.key for o in self._owned.values()], self._threads())
 
-def _publish_local(root: Path, objects: dict[str, bytes | None], *, durable: bool) -> None:
-    """Write every object beside its target, then rename them all into place."""
-    from zarr_vectors.core._durable import Touched
 
-    touched = Touched()
-    staged: list[tuple[str, str]] = []
-    try:
-        for key, value in objects.items():
-            if value is None:
-                continue
-            path = str(root / key)
-            touched.makedirs(os.path.dirname(path))
-            tmp = f"{path}.{uuid.uuid4().hex}.partial"
-            with open(tmp, "wb") as fh:
-                fh.write(value)
-                if durable:
-                    fh.flush()
-                    os.fsync(fh.fileno())
-            staged.append((tmp, path))
-    except BaseException:
-        for tmp, _ in staged:
+#: Thread-name prefix of zarr-vectors' shared writer pool.
+_POOL_PREFIX = "zv-write"
+
+
+def _map_lanes(fn: Callable[[_T], _R], items: list[_T], lanes: int) -> list[_R]:
+    """``[fn(x) for x in items]``, on up to ``lanes`` threads of the shared
+    writer pool (:func:`~zarr_vectors.core._batch_writer._write_pool`).
+
+    Item ``i`` runs on lane ``i % lanes``, each lane in order. Every lane
+    is waited for before this returns or raises, so nothing it started is
+    still running when a caller cleans up after it; after a failure each
+    lane stops before its next item, and the failing item that comes
+    first is the one raised.
+    """
+    lanes = min(int(lanes), len(items))
+    if lanes <= 1:
+        return [fn(x) for x in items]
+    from concurrent.futures import wait
+
+    from zarr_vectors.core._batch_writer import _write_pool
+
+    results: list[Any] = [None] * len(items)
+    errors: dict[int, BaseException] = {}
+    stop = threading.Event()
+
+    def lane(first: int) -> None:
+        for i in range(first, len(items), lanes):
+            if stop.is_set():
+                return
             try:
-                os.remove(tmp)
-            except OSError:
-                pass
+                results[i] = fn(items[i])
+            except BaseException as exc:  # noqa: BLE001 - raised below
+                errors[i] = exc
+                stop.set()
+                return
+
+    pool = _write_pool()
+    futures = [pool.submit(lane, k) for k in range(lanes)]
+    try:
+        wait(futures)
+    except BaseException:
+        stop.set()
+        wait(futures)
         raise
-    # The publish: renames and removals only, each atomic on its own. A
-    # failure part-way leaves some objects new and some old (a re-run
-    # converges); the temporaries not yet renamed go with it, and a crash
-    # that leaves them is swept by the next attempt.
-    for i, (tmp, path) in enumerate(staged):
+    if errors:
+        raise errors[min(errors)]
+    return results
+
+
+def _write_partial(
+    path: str, value: bytes, *, durable: bool, touched: Any, partials: list[str],
+) -> str:
+    """Write ``value`` beside ``path`` as ``<path>.<token>.partial``,
+    fsynced when ``durable``, and return its path. It is recorded in
+    ``partials`` before it is opened, so a caller can remove it whatever
+    happens, and a write that fails removes it itself."""
+    touched.makedirs(os.path.dirname(path))
+    tmp = f"{path}.{uuid.uuid4().hex}.partial"
+    partials.append(tmp)
+    try:
+        with open(tmp, "wb") as fh:
+            fh.write(value)
+            if durable:
+                fh.flush()
+                os.fsync(fh.fileno())
+    except BaseException:
+        _remove_all([tmp])
+        raise
+    return tmp
+
+
+def _remove_all(paths: Iterable[str]) -> None:
+    for path in paths:
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+
+
+def _publish_renames(
+    root: Path,
+    objects: dict[str, bytes | None],
+    renames: list[tuple[str, str]],
+    touched: Any,
+    *,
+    durable: bool,
+) -> None:
+    """The publish: rename each ``(partial, target)`` into place, remove
+    the objects mapped to None, then fsync each touched directory once.
+
+    Renames and removals only, each atomic on its own, made one after
+    another. A failure part-way leaves some objects new and some old (a
+    re-run converges); the partials not yet renamed go with it, and a
+    crash that leaves them is swept by the next attempt.
+    """
+    for i, (tmp, path) in enumerate(renames):
         try:
             os.replace(tmp, path)
         except BaseException:
-            for left, _ in staged[i:]:
-                try:
-                    os.remove(left)
-                except OSError:
-                    pass
+            _remove_all(left for left, _ in renames[i:])
             raise
         touched.add(os.path.dirname(path))
     for key, value in objects.items():
