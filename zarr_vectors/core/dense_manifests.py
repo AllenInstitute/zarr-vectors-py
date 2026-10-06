@@ -338,7 +338,9 @@ def _declare_capability(level_group: Group) -> None:
     from zarr_vectors.core.store import update_root_metadata
 
     try:
-        root_zarr = zarr.open_group(level_group._zarr.store, path="/", mode="r+")
+        root_zarr = zarr.open_group(
+            level_group._zarr.store, path="/", mode="r+", zarr_format=3,
+        )
     except Exception:  # noqa: BLE001 - nowhere to declare it
         return
     block = root_zarr.attrs.get("zarr_vectors")

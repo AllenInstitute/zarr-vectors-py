@@ -510,7 +510,7 @@ def _derive_native_config(level_group: Group) -> dict[str, Any] | None:
         from zarr_vectors.core.store import read_root_metadata
 
         store = level_group._zarr.store
-        root_zarr = zarr.open_group(store, path="/", mode="r")
+        root_zarr = zarr.open_group(store, path="/", mode="r", zarr_format=3)
         root_group = type(level_group)._from_zarr(root_zarr)
         root_meta = read_root_metadata(root_group)
         try:
@@ -592,7 +592,7 @@ def _derive_level_scales(
         from zarr_vectors.core.store import read_root_metadata
 
         store = level_group._zarr.store
-        root_zarr = zarr.open_group(store, path="/", mode="r")
+        root_zarr = zarr.open_group(store, path="/", mode="r", zarr_format=3)
         root_group = type(level_group)._from_zarr(root_zarr)
         root_meta = read_root_metadata(root_group)
         ndim_fallback = tuple(1 for _ in root_meta.chunk_shape)

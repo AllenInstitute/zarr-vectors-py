@@ -495,6 +495,14 @@ presence from the tasks' reports with `zb.set_presence(..., end_deferral=True)`.
 A crash while renaming leaves some of the task's shards new and some old;
 re-running the task converges, since the same cells encode to the same bytes.
 
+On a network filesystem every create, fsync and rename is a round trip, and a
+task touching a hundred arrays publishes a hundred objects. Pass
+`io_threads=16` to encode, write and fsync them from a pool; the renames still
+wait for every object to be on disk, and a failure on any thread publishes
+nothing. On entry the transaction removes the `.partial` files a failed
+attempt left, which lists each owned shard's directory; a task that knows the
+shard's last transaction completed can pass `sweep=False`.
+
 `zv.concurrency_contract()` states what may be written at once: cells or
 shards owned by one process each, and object-layer rows placed in disjoint,
 aligned ranges after one reservation.
