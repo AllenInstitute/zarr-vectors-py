@@ -97,6 +97,10 @@ FEATURES: frozenset[str] = frozenset({
     # ChunkFragmentIndex.gather(frags) -> (rows, lengths): many fragments'
     # vertex rows in one vectorised pass.
     "fragment-gather",
+    # The shared reader and writer pools are dropped in a forked child,
+    # which builds fresh ones on first use: a child of a process that had
+    # used them no longer hangs on its first pooled read or write.
+    "fork-safe-pools",
     # building.set_presence / end_presence_deferral: presence recorded
     # from the cells a caller says it wrote, and a deferral ended without
     # a store-wide rebuild; finalize_links leaves a deferred level alone.
