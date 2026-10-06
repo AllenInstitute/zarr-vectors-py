@@ -571,6 +571,64 @@ class ChunkFragmentIndex:
         index_counts = np.where(is_range, 0, counts)
         return starts, counts, index_counts, self._csr_indices.astype(np.int64, copy=False)
 
+    def gather(
+        self, frags: Any,
+    ) -> tuple[npt.NDArray[np.int64], npt.NDArray[np.int64]]:
+        """The rows of several fragments at once, as ``(rows, lengths)``.
+
+        For fragments ``frags`` -- in any order, repeated or not --
+        ``rows`` is ``np.concatenate([self.indices(f) for f in frags])``
+        and ``lengths[i]`` is ``len(self.indices(frags[i]))``, so fragment
+        ``frags[i]``'s rows are ``rows[o[i]:o[i + 1]]`` with ``o`` the
+        cumulative sum of ``lengths`` from 0. Built with one repeat and one
+        cumulative sum over the request, never a call per fragment: a
+        range fragment is ``start + (0 .. count)``, an explicit one the
+        same over the CSR slice it owns, then looked up in its indices.
+
+        Raises:
+            IndexError: A fragment outside ``[0, len(self))``, as
+                :meth:`indices` raises.
+        """
+        f = np.asarray(frags, dtype=np.int64).reshape(-1)
+        if f.size == 0:
+            return np.empty(0, dtype=np.int64), np.empty(0, dtype=np.int64)
+        bad = (f < 0) | (f >= self.num_fragments)
+        if bad.any():
+            raise IndexError(
+                f"Fragment index {int(f[bad][0])} out of range "
+                f"[0, {self.num_fragments})",
+            )
+        bits = np.unpackbits(self._bitmap, bitorder="little")[: self.num_fragments]
+        is_range = bits[f].astype(bool)
+        # Row of the fragment in its own table: ranges count the set bits
+        # before it, explicit fragments the clear ones.
+        prefix = self._popcount_prefix().astype(np.int64, copy=False)
+        slot = np.where(is_range, prefix[f], f - prefix[f])
+        starts = np.empty(f.size, dtype=np.int64)
+        lengths = np.empty(f.size, dtype=np.int64)
+        if is_range.any():
+            table = np.asarray(self._range_table, dtype=np.int64)
+            starts[is_range] = table[slot[is_range], 0]
+            lengths[is_range] = table[slot[is_range], 1]
+        explicit = ~is_range
+        if explicit.any():
+            csr = np.asarray(self._csr_offsets, dtype=np.int64)
+            starts[explicit] = csr[slot[explicit]]
+            lengths[explicit] = csr[slot[explicit] + 1] - csr[slot[explicit]]
+        # What ``arange(a, a + n)`` and ``indices[a:b]`` give a corrupt
+        # (negative) count: nothing.
+        np.maximum(lengths, 0, out=lengths)
+        total = int(lengths.sum())
+        if total == 0:
+            return np.empty(0, dtype=np.int64), lengths
+        ends = np.cumsum(lengths)
+        within = np.arange(total, dtype=np.int64) - np.repeat(ends - lengths, lengths)
+        rows = np.repeat(starts, lengths) + within
+        if explicit.any():
+            mask = np.repeat(explicit, lengths)
+            rows[mask] = np.asarray(self._csr_indices, dtype=np.int64)[rows[mask]]
+        return rows, lengths
+
     def is_range(self, f: int) -> bool:
         """Return True if fragment ``f`` is a contiguous range.
 

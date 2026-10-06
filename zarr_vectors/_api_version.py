@@ -91,6 +91,9 @@ FEATURES: frozenset[str] = frozenset({
     # read_cells(fragments=True): each cell's vertex fragment index as
     # flat arrays (FragmentColumn), in the same prefetch.
     "read-cells-fragments",
+    # ChunkFragmentIndex.gather(frags) -> (rows, lengths): many fragments'
+    # vertex rows in one vectorised pass.
+    "fragment-gather",
     # building.set_presence / end_presence_deferral: presence recorded
     # from the cells a caller says it wrote, and a deferral ended without
     # a store-wide rebuild; finalize_links leaves a deferred level alone.
