@@ -208,6 +208,7 @@ from zarr_vectors.core.store import (
     update_level_metadata,
     update_root_metadata,
 )
+from zarr_vectors.core.manifest_writer import ObjectManifestWriter, object_manifest_writer
 from zarr_vectors.core.streaming import ObjectIndexAppender
 from zarr_vectors.encoding.fragments import (
     decode_object_manifest_blocks,
@@ -1295,6 +1296,7 @@ __all__ = [
     "OBJECT_INDEX_MANIFEST_BUCKET",
     "OBJECT_SHARD_ROW_MULTIPLE",
     "ObjectIndexAppender",
+    "ObjectManifestWriter",
     "ShardOwnershipError",
     "RechunkSpec",
     "RootMetadata",
@@ -1379,6 +1381,7 @@ __all__ = [
     "list_resolution_levels",
     "neighbouring_chunk_keys",
     "object_count",
+    "object_manifest_writer",
     "object_shard_rows",
     "observe_presence_writes",
     "open_store",
