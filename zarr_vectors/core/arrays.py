@@ -137,21 +137,23 @@ OBJECT_IDS_SORTED_ATTR = "object_ids_sorted"
 # of the store; see ``_write_object_index_manifests``.
 OBJECT_INDEX_MANIFEST_BUCKET = 16_384
 
-#: Largest ``object_index/manifests`` array the writers will allocate.
+#: Most empty rows a declared id space may add to ``object_index``.
 #:
-#: An object id is the **row index** of its manifest, so the index is as
-#: long as the largest id plus one, not as long as the number of objects.
-#: One object with id 20,000,000 therefore allocates twenty million rows
-#: (measured: 20s to write, and every whole-index operation --
-#: ``num_objects``, ``ids()``, ``object_present_mask``,
-#: ``read_all_object_manifests`` -- then scales with that, not with the
-#: one object present).  Segmentation-style 64-bit ids do not fit at all.
+#: This was a ceiling on the index's length, from when an object id was
+#: the **row index** of its manifest: one object with id 20,000,000
+#: allocated twenty million rows, and every whole-index operation then
+#: scaled with the ids rather than the objects. Ids are stored now
+#: (``object_index/object_ids``) and rows are dense, so an id sets no
+#: row count, and every writer adds one row per object it is handed --
+#: a ceiling on rows had become a ceiling on objects, which a whole-brain
+#: build (~1.5e9) crosses with nothing wrong.
 #:
-#: 2**26 rows is far past any dense id space a real dataset carries and
-#: well short of the sizes that turn a write into a hang, so crossing it
-#: means the ids are addresses from somewhere else rather than a dense
-#: sequence.  Refusing is better than the silent alternative: today the
-#: symptom is a store that takes minutes to write and gigabytes to open.
+#: One writer still lets an id set the row count: ``write_object_index``
+#: with ``total_objects=``, which declares ``0..total_objects-1`` all
+#: present, empty or not. Rows that declaration adds with no object
+#: behind them are what this bounds, checked before any of them is
+#: materialised: a count past 2**26 means a label or hash was passed as
+#: a slot count, and building that range would hang instead of fail.
 OBJECT_INDEX_MAX_ROWS = 1 << 26
 
 #: Emit a sparsity warning once an index is this long and this empty.
@@ -2320,25 +2322,29 @@ def write_chunk_link_attributes(
 
 
 def _check_object_index_size(size: int, n_present: int) -> None:
-    """Refuse an object index that the ids have made absurdly long.
+    """Refuse an id space declared far past the objects written into it.
 
-    Object ids index the manifests array directly, so the id space --
-    not the object count -- sets its length.  See
-    :data:`OBJECT_INDEX_MAX_ROWS`.
+    ``size`` is the rows an index will hold and ``n_present`` the rows a
+    caller named an object for; the difference is rows a declared id
+    space (``write_object_index(total_objects=)``) adds with nothing in
+    them. Only that padding is bounded, by
+    :data:`OBJECT_INDEX_MAX_ROWS`: rows that hold objects are dense
+    and cost what the objects do, however many there are.
 
     Raises:
-        ArrayError: When the largest id would allocate more than
+        ArrayError: When the padding would exceed
             :data:`OBJECT_INDEX_MAX_ROWS` rows.
     """
-    if size > OBJECT_INDEX_MAX_ROWS:
+    padding = size - n_present
+    if padding > OBJECT_INDEX_MAX_ROWS:
         raise ArrayError(
-            f"Object ids index the object index directly, so writing an id "
-            f"of {size - 1} allocates {size:,} manifest rows for "
-            f"{n_present:,} object(s) -- past the "
-            f"{OBJECT_INDEX_MAX_ROWS:,}-row ceiling. Ids that large are "
-            f"usually addresses from elsewhere (segmentation labels, "
-            f"hashes). Remap them to a dense 0..n-1 range and keep the "
-            f"originals as an object attribute."
+            f"A declared id space of {size:,} rows holds {n_present:,} "
+            f"object(s), so {padding:,} rows would be empty padding -- past "
+            f"the {OBJECT_INDEX_MAX_ROWS:,}-row ceiling on padding. A slot "
+            f"count that large is usually an address from elsewhere (a "
+            f"segmentation label, a hash). Ids are stored beside their "
+            f"rows, so write the objects without total_objects and their "
+            f"ids may be anything."
         )
     if (
         size >= _OBJECT_INDEX_SPARSE_FLOOR
@@ -2349,8 +2355,9 @@ def _check_object_index_size(size: int, n_present: int) -> None:
             f"Object index allocates {size:,} manifest rows for "
             f"{n_present:,} object(s): {100 * (1 - n_present / size):.1f}% of "
             f"it is empty padding, and every whole-index read pays for it. "
-            f"Ids are row indices, so a dense 0..n-1 id space is what keeps "
-            f"the index proportional to the data.",
+            f"The padding is the slots total_objects declares with no "
+            f"object; ids are stored beside their rows, so leaving it out "
+            f"keeps the index proportional to the data.",
             RuntimeWarning,
             stacklevel=3,
         )
@@ -2376,12 +2383,15 @@ def write_object_index(
             if the largest OID present is smaller — used by the
             ID-preserving pyramid regime, where surviving OIDs are a
             sparse subset of the parent's OID space.  When ``None``
-            (default), the size is ``max(manifests.keys()) + 1``
-            (legacy behaviour).
+            (default), there is one row per id in ``manifests``.
         layout: ``"vlen"`` or ``"dense"`` (see
             :mod:`zarr_vectors.core.dense_manifests`). ``None`` keeps the
             index's current layout, or takes the store's
             ``manifest_layout`` for a new one.
+
+    Raises:
+        ArrayError: When ``total_objects`` would add more than
+            :data:`OBJECT_INDEX_MAX_ROWS` rows with no object in them.
     """
     if not manifests and total_objects is None:
         return
@@ -2395,10 +2405,14 @@ def write_object_index(
     row_ids = sorted(int(o) for o in manifests)
     if total_objects is not None:
         # Preserve the historical contract: a caller declaring a slot
-        # count means ids 0..total-1 all exist, empty or not.
-        declared = set(range(int(total_objects)))
+        # count means ids 0..total-1 all exist, empty or not. The rows
+        # that adds are counted before the range is built, so a count
+        # that is really an address fails here instead of hanging.
+        total = int(total_objects)
+        outside = sum(1 for o in row_ids if not 0 <= o < total)
+        _check_object_index_size(max(total, 0) + outside, len(manifests))
+        declared = set(range(total))
         row_ids = sorted(declared.union(row_ids))
-    _check_object_index_size(len(row_ids), len(manifests))
     manifest_list: list[list[tuple[tuple[int, ...], int]]] = [
         manifests.get(oid, []) for oid in row_ids
     ]
@@ -2653,7 +2667,6 @@ def patch_object_manifests(
     row_of = dict(zip(known.tolist(), known_rows.tolist()))
     fresh = [o for o in ids if o not in row_of]
     size = n0 + len(fresh)
-    _check_object_index_size(size, size)
     for offset, oid in enumerate(fresh):
         row_of[oid] = n0 + offset
 
@@ -2727,7 +2740,6 @@ def _patch_dense_manifests(
     known, known_rows = object_rows_for_ids(level_group, ids)
     row_of = dict(zip(known.tolist(), known_rows.tolist()))
     fresh = [o for o in ids if o not in row_of]
-    _check_object_index_size(n0 + len(fresh), n0 + len(fresh))
     for offset, oid in enumerate(fresh):
         row_of[oid] = n0 + offset
     offsets, coords, frags = dense.csr_from_manifests(
