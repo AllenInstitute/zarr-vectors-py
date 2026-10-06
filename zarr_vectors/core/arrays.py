@@ -6937,7 +6937,7 @@ def read_object_manifests_csr(
     meta = level_group.read_array_meta(OBJECT_INDEX)
     _require_object_index_layout(meta)
     sid_ndim = int(meta["sid_ndim"])
-    found, rows = object_rows_for_ids(level_group, list(ids))
+    found, rows = object_rows_for_ids(level_group, ids)
     if found.size == 0:
         return ManifestCSR(
             np.zeros(1, np.int64), np.empty((0, sid_ndim), np.int64),
@@ -7023,7 +7023,12 @@ def object_rows_for_ids(
     :func:`read_object_manifests` already offers for an out-of-range id,
     so a caller may pass a superset without pre-filtering.
     """
-    wanted = np.asarray(list(ids), dtype=np.int64)
+    # An array stays an array: list() of 1.45M numpy ints is 1.45M
+    # Python objects, built only to be converted straight back.
+    wanted = (
+        ids.astype(np.int64, copy=False).reshape(-1) if isinstance(ids, np.ndarray)
+        else np.asarray(list(ids), dtype=np.int64)
+    )
     if wanted.size == 0:
         return wanted, wanted
     lookup = _object_id_lookup(level_group)

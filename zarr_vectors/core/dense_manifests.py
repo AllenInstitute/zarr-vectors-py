@@ -139,8 +139,19 @@ def _node(level_group: Group, path: str) -> Any:
     return level_group._require_array_node(path)
 
 
+#: An index array is read as slices of its runs of consecutive rows when
+#: there are at most this many runs, or when they average at least a zarr
+#: chunk; otherwise by one orthogonal selection. zarr's orthogonal indexer
+#: costs per index (6.3 s for the 147.6M block rows of a 100 um export),
+#: but a slice decodes every chunk it touches, so short runs decode the
+#: same chunk again and again: 75k runs of ~200 rows took 115 s as slices
+#: against 1.0 s through the indexer.
+_SLICE_RUNS_MAX = 64
+
+
 def _rows(level_group: Group, path: str, rows: npt.NDArray[np.int64] | slice) -> np.ndarray:
-    """Rows of a numeric array, through the offline snapshot when one is active."""
+    """Rows of a numeric array, in the order asked, through the offline
+    snapshot when one is active."""
     if level_group._offline is not None:
         return np.asarray(level_group.read_array(path))[rows]
     node = _node(level_group, path)
@@ -148,7 +159,38 @@ def _rows(level_group: Group, path: str, rows: npt.NDArray[np.int64] | slice) ->
         return np.asarray(node[rows])
     if rows.size == 0:
         return np.empty((0, *node.shape[1:]), dtype=node.dtype)
-    return np.asarray(node.get_orthogonal_selection((rows,)))
+    rows = np.asarray(rows, dtype=np.int64).reshape(-1)
+    if int(rows.min()) < 0 or int(rows.max()) >= int(node.shape[0]):
+        # zarr's bounds checks and negative indices, not a slice's clipping.
+        return np.asarray(node.get_orthogonal_selection((rows,)))
+    if rows.size > 1 and not bool(np.all(rows[1:] > rows[:-1])):
+        uniq, inverse = np.unique(rows, return_inverse=True)
+        return _rows_increasing(node, uniq)[inverse.reshape(-1)]
+    return _rows_increasing(node, rows)
+
+
+def _rows_increasing(node: Any, rows: npt.NDArray[np.int64]) -> np.ndarray:
+    """``node[rows]`` for strictly increasing, in-bounds ``rows``: each run
+    of consecutive rows read as a slice, all runs in one gather."""
+    breaks = np.flatnonzero(np.diff(rows) != 1) + 1
+    n_runs = int(breaks.size) + 1
+    if n_runs > _SLICE_RUNS_MAX and rows.size < int(node.chunks[0]) * n_runs:
+        return np.asarray(node.get_orthogonal_selection((rows,)))
+    starts = rows[np.concatenate([[0], breaks])]
+    stops = rows[np.concatenate([breaks - 1, [rows.size - 1]])] + 1
+    if n_runs == 1:
+        return np.asarray(node[int(starts[0]):int(stops[0])])
+    import asyncio
+
+    from zarr.core.sync import sync
+
+    async def _all() -> list[Any]:
+        return await asyncio.gather(*(
+            node._async_array.getitem(slice(int(a), int(b)))
+            for a, b in zip(starts, stops)
+        ))
+
+    return np.concatenate([np.asarray(part) for part in sync(_all())], axis=0)
 
 
 def num_rows(level_group: Group) -> int:
@@ -160,36 +202,39 @@ def num_rows(level_group: Group) -> int:
 def read_csr(
     level_group: Group, rows: npt.NDArray[np.int64] | None = None, *, stop: int | None = None,
 ) -> tuple[npt.NDArray[np.int64], npt.NDArray[np.int64], npt.NDArray[np.int64]]:
-    """``(offsets, coords, frags)`` for ``rows`` (all rows ``[0, stop)`` when None)."""
+    """``(offsets, coords, frags)`` for ``rows`` (all rows ``[0, stop)`` when None).
+
+    Ascending object rows written in order -- what ascending ids give --
+    own ascending block rows, so those are read as they are: no
+    ``unique``, no ``searchsorted``, and a run of them as a slice. Rows
+    in any other order cost one ``unique``.
+    """
     sel: Any = slice(0, stop) if rows is None else np.asarray(rows, dtype=np.int64)
     spans = _rows(level_group, SPANS_PATH, sel).astype(np.int64, copy=False).reshape(-1, 2)
     offsets, block_rows = _gather(spans)
+    if block_rows.size == 0:
+        sid = _sid(level_group)
+        return offsets, np.empty((0, sid), np.int64), np.empty(0, np.int64)
     n_blocks = num_blocks(level_group)
-    if block_rows.size and (block_rows.min() < 0 or block_rows.max() >= n_blocks):
+    increasing = bool(np.all(block_rows[1:] > block_rows[:-1]))
+    lo, hi = (
+        (int(block_rows[0]), int(block_rows[-1])) if increasing
+        else (int(block_rows.min()), int(block_rows.max()))
+    )
+    if lo < 0 or hi >= n_blocks:
         raise ArrayError(
             f"object_index/{SPANS_ARRAY} refers to block rows outside "
             f"{BLOCKS_ARRAY} ({n_blocks} rows)"
         )
-    contiguous = (
-        rows is None and block_rows.size == n_blocks
-        and np.array_equal(block_rows, np.arange(n_blocks))
-    )
-    blocks = (
-        _rows(level_group, BLOCKS_PATH, slice(None)) if contiguous
-        else _rows(level_group, BLOCKS_PATH, _unique_sorted(block_rows))
-    )
+    if increasing and hi - lo + 1 == block_rows.size:
+        blocks = _rows(level_group, BLOCKS_PATH, slice(lo, hi + 1))
+    elif increasing:
+        blocks = _rows(level_group, BLOCKS_PATH, block_rows)
+    else:
+        uniq, inverse = np.unique(block_rows, return_inverse=True)
+        blocks = np.asarray(_rows(level_group, BLOCKS_PATH, uniq))[inverse.reshape(-1)]
     blocks = np.asarray(blocks, dtype=np.int64)
-    if not contiguous and block_rows.size:
-        uniq = _unique_sorted(block_rows)
-        blocks = blocks[np.searchsorted(uniq, block_rows)]
-    if blocks.size == 0:
-        sid = _sid(level_group)
-        return offsets, np.empty((0, sid), np.int64), np.empty(0, np.int64)
     return offsets, blocks[:, :-1], blocks[:, -1]
-
-
-def _unique_sorted(a: npt.NDArray[np.int64]) -> npt.NDArray[np.int64]:
-    return np.unique(a)
 
 
 def num_blocks(level_group: Group) -> int:
