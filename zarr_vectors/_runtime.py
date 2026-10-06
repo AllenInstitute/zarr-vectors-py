@@ -43,6 +43,15 @@ _STATIC: dict[str, bool] = {
     "concurrency_contract": True,
     # The dense object-index layout (create_store(manifest_layout="dense")).
     "dense_manifests": True,
+    # shard_transaction(io_threads=, sweep=): the publish from a pool, and
+    # the partial sweep on entry made optional.
+    "shard_transaction_io_threads": True,
+    "transaction_sweep": True,
+    # An object index may hold more than 2**26 objects; only the empty
+    # rows total_objects= declares are bounded.
+    "object_count_unbounded": True,
+    # batched_reads inside cached_nodes derives no presence.
+    "spec_without_presence": True,
 }
 
 #: Keys that depend on what is installed alongside, filled in per call.
