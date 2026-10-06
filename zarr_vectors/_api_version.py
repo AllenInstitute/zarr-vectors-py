@@ -101,6 +101,11 @@ FEATURES: frozenset[str] = frozenset({
     # from the cells a caller says it wrote, and a deferral ended without
     # a store-wide rebuild; finalize_links leaves a deferred level alone.
     "supplied-presence",
+    # set_presence(verify="objects"|"index", on_mismatch=) and
+    # building.stored_objects: supplied presence checked against the
+    # store's listing and shard indexes, on any store that lists; a
+    # sharded array's presence derived from its shard indexes.
+    "verified-presence",
     # building.commit_object_index: the object index's metadata committed
     # after manifest writes, num_present counted rather than carried.
     "commit-object-index",
