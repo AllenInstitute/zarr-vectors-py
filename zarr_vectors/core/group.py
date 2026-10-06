@@ -195,6 +195,11 @@ class Group:
     # as ``_node_cache`` and keyed the same way.  See
     # :meth:`_chunk_listing` and :class:`_ChunkListing`.
     _listing_cache: dict[str, _ChunkListing] | None = None
+    # Per-array direct-read specs, for the same session and keyed the same
+    # way, but apart from the listings: a spec depends only on the array's
+    # metadata, and building a listing to hold one derives presence, which
+    # on a deferred level reads every shard.  See :meth:`_direct_spec_cached`.
+    _spec_cache: dict[str, Any] | None = None
     # ``chunk_exists`` membership sets, keyed by array path and tied to
     # the exact manifest list they were built from.  See
     # :meth:`_presence_contains`.
@@ -226,6 +231,7 @@ class Group:
         self._node_cache = None
         self._node_cache_readonly = False
         self._listing_cache = None
+        self._spec_cache = None
         self._tiling_claim_settled = False
         self._vertex_rows_written = None
         self._object_id_lookup_cache = None
@@ -261,6 +267,7 @@ class Group:
         instance._node_cache = _parent._node_cache if share else None
         instance._node_cache_readonly = share
         instance._listing_cache = _parent._listing_cache if share else None
+        instance._spec_cache = _parent._spec_cache if share else None
         return instance
 
     @classmethod
@@ -668,12 +675,14 @@ class Group:
         self._node_cache = {}
         self._node_cache_readonly = True
         self._listing_cache = {}
+        self._spec_cache = {}
         try:
             yield
         finally:
             self._node_cache = None
             self._node_cache_readonly = False
             self._listing_cache = None
+            self._spec_cache = None
 
     def prime_nodes(self, paths: Sequence[str]) -> None:
         """Resolve several nodes in one round-trip, into the active cache.
@@ -1386,24 +1395,29 @@ class Group:
         one-point read, paid again on every read of a session even though
         the node it describes was resolved once.
 
-        Outside a :meth:`cached_nodes` block it is derived per call, as
-        before; caching there would mean building a throwaway listing
-        record to hold it.
+        Inside a :meth:`cached_nodes` block it is kept in its own cache,
+        never on the array's listing: building a listing while presence
+        is deferred derives it from the store, which for a sharded array
+        reads every shard, and ``batched_reads`` asks for the spec of
+        every array in its plan.  (BRIDGE's graph tasks prefetched their
+        cells that way, and each task read every shard written so far:
+        a 50 um graph stage went from minutes to 9 h.)  Outside a block
+        it is derived per call.  ``None`` -- not direct-readable -- is
+        cached like any other answer.
         """
         from zarr_vectors.core._batch_reader import _direct_spec
 
-        cache = self._listing_cache
+        cache = self._spec_cache
         if cache is None:
             return _direct_spec(
                 self._zarr, array_name, self._sharded_chunk_array(array_name),
             )
-        listing = self._chunk_listing(array_name)
-        if not listing.spec_known:
-            listing.set_spec(_direct_spec(
-                self._zarr, array_name,
-                self._sharded_chunk_array(array_name),
-            ))
-        return listing.spec
+        key = self._full_path(array_name)
+        if key not in cache:
+            cache[key] = _direct_spec(
+                self._zarr, array_name, self._sharded_chunk_array(array_name),
+            )
+        return cache[key]
 
     def chunk_grid_bounds(
         self, array_name: str,
@@ -2124,7 +2138,7 @@ class Group:
         # The id table is a node like any other, so a write that
         # replaces it must drop the lookup built from it.
         self._object_id_lookup_cache = None
-        for cache in (self._node_cache, self._listing_cache):
+        for cache in (self._node_cache, self._listing_cache, self._spec_cache):
             if not cache:
                 continue
             for key in [
@@ -2772,10 +2786,7 @@ class _ChunkListing:
     resolves a bounding box never builds the spatial index.
     """
 
-    __slots__ = (
-        "keys", "_coords", "_present", "_by_spatial", "_by_spatial_nd",
-        "_spec", "_spec_known",
-    )
+    __slots__ = ("keys", "_coords", "_present", "_by_spatial", "_by_spatial_nd")
 
     def __init__(self, keys: list[str]) -> None:
         self.keys = keys
@@ -2783,24 +2794,6 @@ class _ChunkListing:
         self._present: frozenset[tuple[int, ...]] | None = None
         self._by_spatial: dict[tuple[int, ...], list[tuple[int, ...]]] | None = None
         self._by_spatial_nd: int | None = None
-        # The direct-read spec rides along: it is per-array, has the same
-        # lifetime, and is dropped by the same invalidation.  Tracked with
-        # a separate flag because ``None`` is a real answer -- it means
-        # "this array is not direct-readable", which is worth caching too.
-        self._spec: Any = None
-        self._spec_known = False
-
-    @property
-    def spec_known(self) -> bool:
-        return self._spec_known
-
-    @property
-    def spec(self) -> Any:
-        return self._spec
-
-    def set_spec(self, spec: Any) -> None:
-        self._spec = spec
-        self._spec_known = True
 
     def coords(self) -> list[tuple[int, ...]]:
         """The keys parsed to coordinate tuples, in numeric order.
