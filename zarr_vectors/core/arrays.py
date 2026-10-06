@@ -2560,19 +2560,30 @@ def commit_object_index(
     table_path = f"{OBJECT_INDEX}/{OBJECT_IDS_ARRAY}"
     if layout in (OBJECT_INDEX_LAYOUT_V2, _LAYOUT_DENSE) and level_group.array_exists(table_path):
         if object_ids_sorted is None:
-            table = np.asarray(level_group.zarr_group[table_path][:n], dtype=np.int64)
-            if table.size < n:
+            # In pieces: the committed ids are 8 bytes a row, 12 GB at
+            # 1.5e9 objects, and only a count and an order are wanted.
+            node = level_group.zarr_group[table_path]
+            held = min(int(node.shape[0]), n)
+            if held < n:
                 raise ArrayError(
-                    f"commit_object_index: the id table holds {table.size} "
+                    f"commit_object_index: the id table holds {held} "
                     f"ids for {n} committed rows"
                 )
-            unwritten = int(np.count_nonzero(table < 0))
+            unwritten, ascending, last = 0, True, None
+            for _a, piece in _id_table_pieces(node, 0, n):
+                unwritten += int(np.count_nonzero(piece < 0))
+                if ascending and piece.size:
+                    ascending = bool(np.all(np.diff(piece) > 0)) and (
+                        last is None or int(piece[0]) > last
+                    )
+                if piece.size:
+                    last = int(piece[-1])
             if unwritten:
                 raise ArrayError(
                     f"commit_object_index: {unwritten} of the {n} rows have no "
                     f"object id -- reserved rows nothing wrote"
                 )
-            object_ids_sorted = bool(np.all(np.diff(table) > 0))
+            object_ids_sorted = ascending
         out[OBJECT_IDS_SORTED_ATTR] = bool(object_ids_sorted)
     level_group.write_array_meta(OBJECT_INDEX, out)
     # Also drops the id lookup, which keys on the sorted flag.
@@ -6981,32 +6992,86 @@ def read_object_id_table(level_group: Group) -> npt.NDArray[np.int64] | None:
     return np.asarray(table, dtype=np.int64)
 
 
-def _object_id_lookup(
-    level_group: Group,
-) -> tuple[npt.NDArray[np.int64], npt.NDArray[np.int64]] | None:
-    """``(sorted_ids, rows_for_sorted_ids)``, or ``None`` for identity.
+#: Id-table rows read per piece when a lookup proves the table is the
+#: identity, or a commit checks the ids it commits.
+_ID_SCAN_ROWS = 1 << 20
 
-    Sorting is skipped when the writer stamped
-    :data:`OBJECT_IDS_SORTED_ATTR`, which bulk writers do because they
-    emit ids in order.
+
+def _id_table_pieces(node: Any, lo: int, hi: int) -> Any:
+    """``node[lo:hi]`` as int64 pieces of at most :data:`_ID_SCAN_ROWS`."""
+    for a in range(lo, hi, _ID_SCAN_ROWS):
+        b = min(a + _ID_SCAN_ROWS, hi)
+        yield a, np.asarray(node[a:b], dtype=np.int64)
+
+
+def _id_table_is_identity(level_group: Group, meta: dict[str, Any], node: Any) -> bool:
+    """Whether the id table holds exactly ``0 .. len - 1``, row for row.
+
+    With the sorted stamp, two ids prove it for the stamped rows --
+    strictly increasing integers from 0 to ``m - 1`` in ``m`` rows can
+    only be ``0 .. m - 1`` -- and only the rows past the committed count,
+    which a commit's stamp does not speak for, are read. Without it, the
+    table is read in pieces, stopping at the first that is not the
+    identity, so a table that is never needs more than one piece of
+    memory.
+    """
+    n = int(node.shape[0])
+    if n == 0:
+        return True
+    if meta.get(OBJECT_IDS_SORTED_ATTR):
+        committed = meta.get("num_objects")
+        m = n if committed is None else max(0, min(int(committed), n))
+        if m and (int(node[0]) != 0 or int(node[m - 1]) != m - 1):
+            return False
+        lo = m
+    else:
+        lo = 0
+    for a, piece in _id_table_pieces(node, lo, n):
+        if not np.array_equal(piece, np.arange(a, a + piece.size, dtype=np.int64)):
+            return False
+    return True
+
+
+def _object_id_lookup(level_group: Group) -> tuple[Any, ...] | None:
+    """How ids resolve to rows on this level, or ``None`` for V1 identity.
+
+    One of:
+
+    - ``("identity", n)``: the stored table is ``0 .. n - 1``, so an id
+      is its row. Proved without holding the table (see
+      :func:`_id_table_is_identity`): at 1.5e9 objects the table alone is
+      12 GB, and sorting it as many again.
+    - ``("sorted", table)``: ascending ids; an id's row is its position.
+      The writer's stamp says so (bulk writers emit ids in order).
+    - ``("permuted", sorted_ids, rows)``: anything else, sorted once.
     """
     cache = level_group._object_id_lookup_cache
     key = level_group._full_path(OBJECT_INDEX)
     if cache is not None and key in cache:
         return cache[key]
-    table = read_object_id_table(level_group)
-    if table is None:
-        result = None
-    else:
+    result: tuple[Any, ...] | None = None
+    try:
+        meta = level_group.read_array_meta(OBJECT_INDEX)
+    except Exception:
+        meta = {}
+    node = None
+    if level_group._offline is None and (meta or {}).get("layout") in (
+        OBJECT_INDEX_LAYOUT_V2, _LAYOUT_DENSE,
+    ):
         try:
-            meta = level_group.read_array_meta(OBJECT_INDEX)
+            node = level_group._require_array_node(f"{OBJECT_INDEX}/{OBJECT_IDS_ARRAY}")
         except Exception:
-            meta = {}
-        if meta.get(OBJECT_IDS_SORTED_ATTR):
-            result = (table, np.arange(table.size, dtype=np.int64))
-        else:
-            order = np.argsort(table, kind="stable")
-            result = (table[order], order)
+            node = None
+    if node is not None and _id_table_is_identity(level_group, meta, node):
+        result = ("identity", int(node.shape[0]))
+    else:
+        table = read_object_id_table(level_group)
+        if table is not None:
+            if meta.get(OBJECT_IDS_SORTED_ATTR):
+                result = ("sorted", table)
+            else:
+                order = np.argsort(table, kind="stable")
+                result = ("permuted", table[order], order)
     if cache is None:
         cache = level_group._object_id_lookup_cache = {}
     cache[key] = result
@@ -7032,17 +7097,21 @@ def object_rows_for_ids(
     if wanted.size == 0:
         return wanted, wanted
     lookup = _object_id_lookup(level_group)
-    if lookup is None:
-        # Identity: the id is the row, bounded by the row count.
-        n_rows = object_row_count(level_group)
+    if lookup is None or lookup[0] == "identity":
+        # Identity: the id is the row, bounded by the row count (V1) or
+        # by the table's length (a stored identity table).
+        n_rows = object_row_count(level_group) if lookup is None else int(lookup[1])
         keep = (wanted >= 0) & (wanted < n_rows)
         return wanted[keep], wanted[keep]
-    sorted_ids, rows = lookup
+    if lookup[0] == "sorted":
+        sorted_ids, rows = lookup[1], None
+    else:
+        sorted_ids, rows = lookup[1], lookup[2]
     pos = np.searchsorted(sorted_ids, wanted)
     np.clip(pos, 0, max(sorted_ids.size - 1, 0), out=pos)
     hit = sorted_ids.size > 0
     found = (sorted_ids[pos] == wanted) if hit else np.zeros_like(wanted, bool)
-    return wanted[found], rows[pos[found]]
+    return wanted[found], (pos[found] if rows is None else rows[pos[found]])
 
 
 def object_ids_for_rows(
@@ -7054,6 +7123,19 @@ def object_ids_for_rows(
     scanning manifests positionally needs in order to say which object
     each row belongs to.
     """
+    if rows is not None:
+        lookup = _object_id_lookup(level_group)
+        if lookup is not None and lookup[0] == "identity":
+            # The table is its rows: index it without reading it, as
+            # numpy would index it (negative from the end, past it raises).
+            n = int(lookup[1])
+            r = np.asarray(list(rows), dtype=np.int64)
+            bad = (r >= n) | (r < -n)
+            if bad.any():
+                raise IndexError(
+                    f"index {int(r[bad][0])} is out of bounds for axis 0 with size {n}"
+                )
+            return np.where(r < 0, r + n, r)
     table = read_object_id_table(level_group)
     if table is None:
         n_rows = object_row_count(level_group)
