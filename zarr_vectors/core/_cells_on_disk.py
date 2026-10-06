@@ -331,3 +331,167 @@ def read_local(
     for (r, i, *_), blob in zip(flat, blobs):
         out[r][i] = blob
     return out
+
+
+# --------------------------------------------------------------------
+# Presence from shard indexes
+
+
+#: A stored inner cell this size or smaller is read and decoded before it
+#: counts as present: an empty payload can be stored (a writer with
+#: ``write_empty_chunks`` on), and encodes in tens of bytes under every
+#: codec chain zarr-vectors writes. Anything larger holds a payload.
+SMALL_CELL_BYTES = 128
+
+
+def _store_get_many(store: Any, items: list[tuple[str, Any]]) -> list[bytes | None | Exception]:
+    """``store.get(key, byte_range=...)`` for each item, gathered."""
+    import asyncio
+
+    from zarr.core.buffer import default_buffer_prototype
+    from zarr.core.sync import sync
+
+    prototype = default_buffer_prototype()
+
+    async def one(key: str, request: Any) -> bytes | None | Exception:
+        try:
+            buf = await store.get(key, prototype=prototype, byte_range=request)
+        except Exception as exc:  # noqa: BLE001 - reported per object
+            return exc
+        return None if buf is None else buf.to_bytes()
+
+    async def run() -> list[Any]:
+        return list(await asyncio.gather(*(one(k, r) for k, r in items)))
+
+    return sync(run())
+
+
+def read_indexes(src: CellSource, keys: list[str]) -> list[np.ndarray | None | Exception]:
+    """Each shard's index alone, by one byte-range read of the object.
+
+    The last (or first) ``16 * cells + 4`` bytes, never the cells: from
+    the file on a local store (pooled), else through the store's own
+    ranged ``get`` -- a suffix request -- gathered. ``None`` for an object
+    that is not there; an exception for one too short for its index, or
+    failing its checksum.
+    """
+    if src.local_root is not None:
+        return _batched(_read_index, [(src, _file(src, k)) for k in keys])
+    from zarr.abc.store import RangeByteRequest, SuffixByteRequest
+
+    n = _index_nbytes(src)
+    request = SuffixByteRequest(n) if src.index_at_end else RangeByteRequest(0, n)
+    out: list[np.ndarray | None | Exception] = []
+    for raw in _store_get_many(src.store, [(k, request) for k in keys]):
+        if raw is None or isinstance(raw, Exception):
+            out.append(raw)
+            continue
+        try:
+            out.append(_parse_index(src, raw))
+        except Exception as exc:  # noqa: BLE001 - reported per object
+            out.append(exc)
+    return out
+
+
+def _read_cell_ranges(src: CellSource, items: list[tuple[str, int, int]]) -> list[Any]:
+    """The stored bytes at ``(key, offset, size)`` for each item."""
+    if src.local_root is not None:
+        return _batched_groups(_read_ranges, [(_file(src, k), off, size) for k, off, size in items])
+    from zarr.abc.store import RangeByteRequest
+
+    return _store_get_many(src.store, [
+        (k, RangeByteRequest(off, off + size)) for k, off, size in items
+    ])
+
+
+def shard_cells(
+    node: Any, shard_indices: list[tuple[int, ...]],
+) -> dict[tuple[int, ...], np.ndarray | None] | None:
+    """The cells each shard holds with a payload, from the shard indexes.
+
+    For a sharded per-chunk array: ``{shard_index: (C, K) cell indices}``
+    -- array indices, not absolute coordinates -- read from each shard's
+    index rather than its cells, so a shard costs ``16 * cells + 4``
+    bytes however much it holds. A cell the index says is stored counts
+    when it is larger than :data:`SMALL_CELL_BYTES`; a smaller one is
+    read and decoded, so an empty payload stored as such does not.
+
+    A shard maps to ``None`` when its index could not be read (truncated,
+    a failed checksum): the caller reads that shard whole. Returns
+    ``None`` for an array whose layout this does not recognise.
+    """
+    from zarr_vectors.core._batch_reader import _decode_direct, _is_icechunk_store
+
+    src = cell_source("", node, any_codecs=True)
+    if src is None or src.shard_shape is None or _is_icechunk_store(src.store):
+        return None
+    try:
+        decoder = _inner_decoder(node)
+    except Exception:  # noqa: BLE001 - not a layout this can decode
+        return None
+    ndim = len(src.shape)
+    shard_shape = np.asarray(src.shard_shape, dtype=np.int64)
+    shape = np.asarray(src.shape, dtype=np.int64)
+    keys = [_key(src, s) for s in shard_indices]
+    out: dict[tuple[int, ...], np.ndarray | None] = {}
+    large: dict[tuple[int, ...], np.ndarray] = {}
+    small: list[tuple[tuple[int, ...], list[int], str, int, int]] = []
+    for s, key, index in zip(shard_indices, keys, read_indexes(src, keys)):
+        if isinstance(index, Exception):
+            out[s] = None
+            continue
+        if index is None:  # gone since it was listed: nothing in it
+            out[s] = np.empty((0, ndim), dtype=np.int64)
+            continue
+        flat = np.nonzero(~((index[:, 0] == _EMPTY) & (index[:, 1] == _EMPTY)))[0]
+        cells = np.asarray(s, dtype=np.int64) * shard_shape + np.stack(
+            np.unravel_index(flat, src.shard_shape), axis=1,
+        ).reshape(-1, ndim)
+        inside = np.all(cells < shape, axis=1)
+        flat, cells = flat[inside], cells[inside]
+        is_small = index[flat, 1].astype(np.int64) <= SMALL_CELL_BYTES
+        large[s] = cells[~is_small]
+        for cell, j in zip(cells[is_small].tolist(), flat[is_small].tolist()):
+            small.append((s, cell, key, int(index[j, 0]), int(index[j, 1])))
+    raws = _read_cell_ranges(src, [(k, off, size) for *_c, k, off, size in small]) if small else []
+    found: dict[tuple[int, ...], list[list[int]]] = {}
+    failed: set[tuple[int, ...]] = set()
+    for (s, cell, *_rest), raw in zip(small, raws):
+        try:
+            if isinstance(raw, Exception):
+                raise raw
+            data = _decode_direct(decoder, raw)
+        except Exception:  # noqa: BLE001 - that shard is read whole instead
+            failed.add(s)
+            continue
+        if data:
+            found.setdefault(s, []).append(cell)
+    for s, cells in large.items():
+        if s in failed:
+            out[s] = None
+        elif s in found:
+            out[s] = np.concatenate([cells, np.asarray(found[s], dtype=np.int64)])
+        else:
+            out[s] = cells
+    return out
+
+
+def _inner_decoder(node: Any) -> Any:
+    """What :func:`~zarr_vectors.core._batch_reader._decode_direct` needs
+    to decode one inner cell of ``node``."""
+    from zarr.core.array_spec import ArraySpec
+
+    from zarr_vectors.core._batch_reader import _BUFFER_PROTOTYPE, _ShardedSpec
+
+    meta = node.metadata
+    return _ShardedSpec(
+        source=None,
+        codecs=tuple(meta.codecs[0].codecs[1:]),
+        spec=ArraySpec(
+            shape=(1,) * len(meta.shape),
+            dtype=meta.data_type,
+            fill_value=meta.fill_value,
+            config=node._async_array.config,
+            prototype=_BUFFER_PROTOTYPE,
+        ),
+    )
