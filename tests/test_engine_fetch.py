@@ -42,13 +42,29 @@ def _with_chunk_array(root: Group, name: str, keys: dict[str, bytes]) -> Group:
     return root
 
 
+def _protocol_members(proto: type) -> set[str]:
+    """The public members a class must have to satisfy ``proto``.
+
+    ``__protocol_attrs__`` is Python 3.12's; 3.11 computes the same set
+    on each isinstance check without keeping it, so walk the protocol's
+    own bases the way it does: every name a class body defines or
+    annotates, Protocol and Generic's bookkeeping aside.
+    """
+    attrs = getattr(proto, "__protocol_attrs__", None)
+    if attrs is None:
+        attrs = set()
+        for base in proto.__mro__[:-1]:
+            if base.__name__ in {"Protocol", "Generic"}:
+                continue
+            attrs |= set(vars(base)) | set(vars(base).get("__annotations__", {}))
+    return {m for m in attrs if not m.startswith("_")}
+
+
 class TestProtocol:
     def test_the_port_is_one_method(self):
         # If this grows, every fake grows with it -- which is exactly how
         # zarr's StorageTransformer became untestable.
-        assert {
-            m for m in Fetcher.__protocol_attrs__ if not m.startswith("_")
-        } == {"capabilities", "fetch"}
+        assert _protocol_members(Fetcher) == {"capabilities", "fetch"}
 
     def test_dict_fetcher_satisfies_it(self):
         assert isinstance(DictFetcher(), Fetcher)
