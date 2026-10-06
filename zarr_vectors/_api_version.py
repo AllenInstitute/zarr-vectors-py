@@ -31,7 +31,7 @@ from __future__ import annotations
 #: Version of the Python API surface.  Bump the minor when a supported
 #: name is added, the major when one is removed or changes meaning.
 #: Independent of both ``__version__`` and the on-disk format.
-__api_version__ = (1, 2)
+__api_version__ = (1, 3)
 
 #: Capabilities a caller may branch on, each True only when usable.
 FEATURES: frozenset[str] = frozenset({
@@ -116,6 +116,24 @@ FEATURES: frozenset[str] = frozenset({
     # building.shard_transaction / shard_of: one shard of every per-chunk
     # array staged privately and published by rename on exit.
     "shard-transaction",
+    # shard_transaction(io_threads=N): objects encoded, written and fsynced
+    # on N lanes, renamed once all are on disk; the publish reopens no
+    # array by path, and stores open without v2 metadata probes.
+    "shard-transaction-io-threads",
+    # shard_transaction(sweep=False): no listing of the owned shards'
+    # directories for a failed attempt's partials on entry.
+    "transaction-sweep",
+    # No ceiling on an object index's rows: OBJECT_INDEX_MAX_ROWS bounds
+    # only the empty rows write_object_index(total_objects=) declares, so
+    # patch_object_manifests and the writers take indexes past 2**26.
+    "object-count-unbounded",
+    # Group.cached_nodes keeps direct-read specs apart from presence, so
+    # batched_reads inside it on a deferred level reads its plan's cells
+    # and derives no presence (no whole-shard reads).
+    "spec-without-presence",
+    # read_object_manifests_csr on a dense index reads ascending ids'
+    # blocks as slices, with no unique or searchsorted.
+    "manifests-csr-ascending",
 })
 
 
