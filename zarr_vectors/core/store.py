@@ -344,7 +344,7 @@ class FsGroup(Group):
         store = LocalStore(root)
         # Use mode="a" so the store is read-write but does not clobber
         # any existing root group.
-        zg = zarr.open_group(store, mode="a")
+        zg = zarr.open_group(store, mode="a", zarr_format=3)
         super().__init__(zg)
 
 
@@ -1230,7 +1230,9 @@ def open_store(
         store._zv_icechunk_session = session
     zarr_open_mode = "r" if mode == "r" else "r+"
     try:
-        zg = zarr.open_group(store, mode=zarr_open_mode)
+        # zarr-vectors stores are Zarr v3 only; without the format zarr
+        # also asks for .zgroup and .zattrs, two failed round trips.
+        zg = zarr.open_group(store, mode=zarr_open_mode, zarr_format=3)
     except zarr.errors.GroupNotFoundError as e:
         raise StoreError(f"Not a valid ZV store at {path}: {e}") from None
     root = FsGroup.__new__(FsGroup) if isinstance(store, LocalStore) else Group.__new__(Group)

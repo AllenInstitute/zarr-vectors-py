@@ -633,6 +633,8 @@ def shard_transaction(
     arrays: Iterable[str] | None = None,
     mode: str = "replace",
     durable: bool = True,
+    io_threads: int | None = None,
+    sweep: bool = True,
 ) -> Any:
     """Write one shard of a level privately, and publish it at the end.
 
@@ -654,6 +656,14 @@ def shard_transaction(
     merged into what the store holds. An exception inside the block
     publishes nothing.
 
+    With ``io_threads`` the objects are encoded, written and fsynced from
+    that many threads at once, and renamed only once all of them are
+    written: the same bytes and the same ``published``, each object
+    durable before its rename. On a network filesystem, where every
+    create, fsync and rename is a round trip to the server, that is most
+    of a transaction's commit. A failure on any thread publishes nothing
+    and leaves no ``.partial`` behind.
+
     Guarantees and limits:
 
     - atomic per object: a crash while renaming leaves some shards new and
@@ -665,7 +675,8 @@ def shard_transaction(
     - writes no metadata; ``tx.written`` (the non-empty cells per array,
       after exit) feeds :func:`set_presence`;
     - local stores publish by rename; any other store by one ``set`` per
-      object, each atomic on its own.
+      object, each atomic on its own (issued together under
+      ``io_threads``; one at a time on icechunk, whatever is asked).
 
     Args:
         shard_coords: The shard's index in the arrays' shard grid (see
@@ -674,9 +685,18 @@ def shard_transaction(
         arrays: Per-chunk arrays the transaction covers.
         mode: ``"replace"`` or ``"merge"``.
         durable: Fsync before and after publishing (local stores).
+        io_threads: Threads to publish from (``None`` or 1: one at a
+            time). Drawn from zarr-vectors' shared writer pool, which
+            caps how many run at once (16 at most).
+        sweep: Remove the ``.partial`` files a failed attempt left beside
+            the owned shards, on entry (local stores). Each is a listing
+            of a shard directory; a caller that knows the shard's last
+            transaction completed may pass False. A partial left in place
+            is never read, only taking up space until a later sweep.
     """
     return level_group.shard_transaction(
         tuple(shard_coords), arrays=arrays, mode=mode, durable=durable,
+        io_threads=io_threads, sweep=sweep,
     )
 
 

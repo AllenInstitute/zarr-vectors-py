@@ -925,6 +925,8 @@ class Group:
         arrays: Iterable[str] | None = None,
         mode: Literal["replace", "merge"] = "replace",
         durable: bool = True,
+        io_threads: int | None = None,
+        sweep: bool = True,
     ) -> Iterator[Any]:
         """Stage one shard's cell writes, and publish them on exit.
 
@@ -946,8 +948,12 @@ class Group:
                 "(defer_presence): nonempty_chunks is shared by every cell, so "
                 "stamping it would race with every other task"
             )
-        txn = ShardTransaction(self, shard_coords, arrays=arrays, mode=mode, durable=durable)
-        txn.sweep_partials()
+        txn = ShardTransaction(
+            self, shard_coords, arrays=arrays, mode=mode, durable=durable,
+            io_threads=io_threads,
+        )
+        if sweep:
+            txn.sweep_partials()
         self._shard_txn = txn
         try:
             yield txn
