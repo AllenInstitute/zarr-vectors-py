@@ -216,7 +216,12 @@ from zarr_vectors.encoding.fragments import (
     encode_object_manifest_blocks,
     encode_object_manifests_csr,
 )
-from zarr_vectors.exceptions import ArrayError, ShardOwnershipError, StoreError
+from zarr_vectors.exceptions import (
+    ArrayError,
+    PresenceMismatchError,
+    ShardOwnershipError,
+    StoreError,
+)
 from zarr_vectors.multiresolution.registry import (
     register_coarsen_strategy,
     register_selection_strategy,
@@ -1127,11 +1132,137 @@ def _clear_deferral(level_group: Group) -> None:
         del level_group.zarr_group.attrs[_PRESENCE_DECL_ATTR]
 
 
+def _array_objects(level_group: Group, arr: Any) -> dict[tuple[int, ...], str]:
+    """``{grid index: store key}`` of every object ``arr`` stores.
+
+    The grid is zarr's: cells for an unsharded array, shards for a
+    sharded one. One prefix listing; keys that are not chunk keys of the
+    array (its ``zarr.json``, a ``.partial`` a shard transaction left) are
+    not objects of it.
+    """
+    from zarr.core.sync import sync
+
+    from zarr_vectors.core.group import _list_store_prefix
+
+    store = level_group.zarr_group.store
+    base = arr.path
+    head = f"{base}/" if base else ""
+    encoding = arr.metadata.chunk_key_encoding.to_dict()
+    name = encoding.get("name")
+    sep = (encoding.get("configuration") or {}).get(
+        "separator", "/" if name == "default" else ".",
+    )
+    if name == "default" and sep == "/":
+        keys = _list_store_prefix(store, f"{head}c/")
+    else:
+        async def _all() -> list[str]:
+            return [k async for k in store.list_prefix(head)]
+
+        keys = sync(_all())
+    out: dict[tuple[int, ...], str] = {}
+    for key in keys:
+        rel = key[len(head):]
+        if name == "default":
+            if not rel.startswith(f"c{sep}"):
+                continue
+            rel = rel[2:]
+        parts = rel.split(sep)
+        if len(parts) != arr.ndim:
+            continue
+        try:
+            out[tuple(int(p) for p in parts)] = key
+        except ValueError:
+            continue
+    return out
+
+
+def stored_objects(level_group: Group, array_name: str) -> list[str]:
+    """The store keys of the objects a per-chunk array holds, sorted.
+
+    One per stored cell, or per shard when the array is sharded: what the
+    store itself lists, through zarr's prefix listing, so it works on any
+    store that lists (a local directory, memory, an object store) and
+    reads no object. The keys are relative to the store root and are the
+    keys :func:`cell_objects` names, so a caller can compare the two
+    directly -- which cells' objects are missing, which objects nobody
+    claimed.
+
+    Raises:
+        StoreError: ``array_name`` is not a per-chunk array here.
+    """
+    from zarr_vectors.core.arrays import _is_per_chunk_array
+
+    arr = level_group._sharded_chunk_array(array_name)
+    if arr is None or not _is_per_chunk_array(array_name):
+        raise StoreError(
+            f"stored_objects: {array_name!r} is not a per-chunk array of "
+            f"{level_group.zarr_group.path or '<root>'}"
+        )
+    return sorted(_array_objects(level_group, arr).values())
+
+
+def _presence_mismatch(
+    level_group: Group, arr: Any, keys: list[str], mode: str,
+) -> dict[str, list[str]] | None:
+    """What the store holds against the claimed ``keys``, or ``None`` if
+    they agree under ``mode`` (see :func:`set_presence`)."""
+    import numpy as np
+
+    from zarr_vectors.core.group import (
+        _coord_to_index,
+        _format_chunk_key,
+        _grid_origin,
+        _parse_chunk_coords,
+    )
+
+    origin = _grid_origin(arr)
+    shape = tuple(int(n) for n in arr.shape)
+    outer = tuple(int(n) for n in arr.metadata.chunk_grid.chunk_shape)
+    sharded = getattr(arr, "shards", None) is not None
+
+    def key_of(index: tuple[int, ...]) -> str:
+        return _format_chunk_key(
+            index if origin is None else tuple(i + o for i, o in zip(index, origin))
+        )
+
+    claimed: dict[tuple[int, ...], set[tuple[int, ...]]] = {}
+    for key in keys:
+        index = _coord_to_index(_parse_chunk_coords(key), origin)
+        claimed.setdefault(tuple(i // o for i, o in zip(index, outer)), set()).add(index)
+    stored = _array_objects(level_group, arr)
+    missing = [key_of(c) for obj, cs in claimed.items() if obj not in stored for c in cs]
+    unclaimed = [obj for obj in stored if obj not in claimed]
+    # Unsharded, an object is a cell: name it by its chunk key.
+    extra_objects = sorted(stored[obj] for obj in unclaimed) if sharded else []
+    extra: list[str] = [] if sharded else [key_of(obj) for obj in unclaimed]
+    if sharded:
+        def capacity(obj: tuple[int, ...]) -> int:
+            return int(np.prod([
+                min(o * s + s, dim) - o * s for o, s, dim in zip(obj, outer, shape)
+            ]))
+
+        check = [
+            obj for obj, cs in claimed.items()
+            if obj in stored and (mode == "index" or len(cs) < capacity(obj))
+        ]
+        held = level_group._shard_presence(arr, outer, check) if check else {}
+        for obj in check:
+            present = set(held.get(obj, ()))
+            extra.extend(key_of(c) for c in present - claimed[obj])
+            if mode == "index":
+                missing.extend(key_of(c) for c in claimed[obj] - present)
+    if not (missing or extra or extra_objects):
+        return None
+    return {"missing": sorted(missing), "extra": sorted(extra), "extra_objects": extra_objects}
+
+
 def set_presence(
     level_group: Group,
     cells: Mapping[str, Iterable[Any]],
     *,
     end_deferral: bool = False,
+    verify: str | None = None,
+    on_mismatch: str = "raise",
 ) -> list[str]:
     """Record each named array's presence as exactly the cells given.
 
@@ -1156,10 +1287,30 @@ def set_presence(
     while workers are still writing brings back the races deferral
     exists to avoid.
 
+    ``verify`` checks the claims against the store first, for a caller
+    whose record of what its workers wrote may be incomplete (a lost
+    report, a retried task), on any store that lists:
+
+    - ``"objects"``: one listing per array (:func:`stored_objects`).
+      Every claimed cell's object -- the cell, or the shard holding it --
+      must be stored, and every stored object must hold a claimed cell.
+      A shard only partly claimed has its index read (one ranged read of
+      its last bytes), and none of its unclaimed cells may hold a payload.
+    - ``"index"``: as ``"objects"``, and the index of every claimed shard
+      is read, so each claimed cell must itself hold a payload. For an
+      unsharded array the two are the same: the object is the cell.
+
     Args:
         cells: ``{array_name: keys}``.
         end_deferral: Then end the level's :func:`defer_presence`
             declaration, as :func:`end_presence_deferral` does.
+        verify: ``None`` (trust the claims), ``"objects"`` or ``"index"``.
+        on_mismatch: When a claim fails ``verify``: ``"raise"``
+            :class:`~zarr_vectors.exceptions.PresenceMismatchError`, naming
+            every failing array and what was found, before anything is
+            written; or ``"derive"`` each failing array's presence from
+            the store instead (as :func:`rebuild_presence` would) and write
+            the rest as claimed.
 
     Returns:
         The array names written, sorted.
@@ -1167,6 +1318,8 @@ def set_presence(
     Raises:
         StoreError: A name is not a per-chunk array of this level.
         ArrayError: A key does not parse or lies outside its array's grid.
+        PresenceMismatchError: ``verify`` found a claim the store does not
+            bear out, under ``on_mismatch="raise"``.
     """
     from zarr_vectors.core._batch_writer import _stamp_presence
     from zarr_vectors.core.arrays import _is_per_chunk_array
@@ -1178,6 +1331,10 @@ def set_presence(
         _parse_chunk_coords,
     )
 
+    if verify not in (None, "objects", "index"):
+        raise ArrayError(f"verify={verify!r}; expected None, 'objects' or 'index'")
+    if on_mismatch not in ("raise", "derive"):
+        raise ArrayError(f"on_mismatch={on_mismatch!r}; expected 'raise' or 'derive'")
     stamps = []
     for name in sorted(cells):
         arr = level_group._sharded_chunk_array(name)
@@ -1201,6 +1358,21 @@ def set_presence(
                 )
             keys.add(_format_chunk_key(coords))
         stamps.append((name, arr, sorted(keys), {}))
+    if verify is not None:
+        from zarr_vectors.exceptions import PresenceMismatchError
+
+        mismatches = {}
+        for name, arr, keys, _extra in stamps:
+            found = _presence_mismatch(level_group, arr, keys, verify)
+            if found is not None:
+                mismatches[name] = found
+        if mismatches and on_mismatch == "raise":
+            raise PresenceMismatchError(mismatches)
+        stamps = [
+            (name, arr, level_group._presence_from_store(name, arr, verify=True), extra)
+            if name in mismatches else (name, arr, keys, extra)
+            for name, arr, keys, extra in stamps
+        ]
     _stamp_presence(stamps)
     if level_group._listing_cache:
         for name, *_ in stamps:
@@ -1297,6 +1469,7 @@ __all__ = [
     "OBJECT_SHARD_ROW_MULTIPLE",
     "ObjectIndexAppender",
     "ObjectManifestWriter",
+    "PresenceMismatchError",
     "ShardOwnershipError",
     "RechunkSpec",
     "RootMetadata",
@@ -1434,6 +1607,7 @@ __all__ = [
     "session_for",
     "set_coordinate_offset",
     "set_presence",
+    "stored_objects",
     "shard_object_layer",
     "shard_of",
     "shard_store",

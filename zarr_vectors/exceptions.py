@@ -32,6 +32,28 @@ class ShardedPresenceError(StoreError):
     """
 
 
+class PresenceMismatchError(StoreError):
+    """Supplied presence does not match what the store holds.
+
+    Raised by ``set_presence(..., verify=...)`` before anything is
+    written. ``mismatches`` maps each array that failed to what was found:
+    ``{"missing": [...], "extra": [...], "extra_objects": [...]}`` --
+    claimed cells the store does not hold, held cells no claim names
+    (chunk keys), and stored objects holding no claimed cell (store keys).
+    """
+
+    def __init__(self, mismatches: dict) -> None:
+        self.mismatches = mismatches
+        parts = []
+        for name, found in sorted(mismatches.items()):
+            counts = ", ".join(f"{len(v)} {k}" for k, v in found.items() if v)
+            parts.append(f"{name} ({counts})")
+        super().__init__(
+            f"set_presence: the claims of {len(mismatches)} array(s) do not match "
+            f"the store: {'; '.join(parts[:5])}{'; ...' if len(parts) > 5 else ''}"
+        )
+
+
 class ShardOwnershipError(StoreError):
     """A shard transaction was asked to write a cell outside its shard.
 

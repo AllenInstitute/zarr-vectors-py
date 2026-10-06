@@ -2362,32 +2362,66 @@ class Group:
 
         Zarr builds a sharded array's chunk grid from the SHARD shape
         (``chunks_out = shard_shape`` when ``shards=`` is given), so a
-        stored key ``c/i/j/k`` names a shard, not a cell.  Each one is
-        expanded to the cell region it covers and read whole: unwritten
-        cells come back as ``b""``, which is exactly the emptiness test
-        the unsharded branch applies to its per-cell reads.
+        stored key ``c/i/j/k`` names a shard, not a cell.
 
-        Deliberately not routed through ``flush_prefetch``: its direct
-        path already declines sharded arrays, and its gather path would
-        issue one request per CELL — a thousand reads for an 8³ shard
-        that one slice satisfies.  Reading region by region also keeps
-        peak memory at one shard, where the unsharded branch holds every
-        cell payload at once.
+        Each listed shard is answered from its INDEX alone -- one ranged
+        read of its last ``16 * cells + 4`` bytes, which say which inner
+        cells are stored and how large -- rather than by reading and
+        decoding every cell it holds: a finalize deriving the presence of
+        the level-0 vertices otherwise re-reads all of them. A stored cell
+        small enough to be an empty payload is read and decoded, so the
+        answer is the one the cells give (see
+        :func:`~zarr_vectors.core._cells_on_disk.shard_cells`).
+
+        A shard whose index cannot be read, and every shard of an array
+        whose layout the index reader does not recognise (or an icechunk
+        store), is expanded to the cell region it covers and read whole:
+        unwritten cells come back as ``b""``, the emptiness test the
+        unsharded branch applies to its per-cell reads.
         """
         base = self._zarr.path.strip("/")
         prefix = f"{base}/{array_name}/c/" if base else f"{array_name}/c/"
         origin = _grid_origin(arr)
-        shape = arr.shape
         ndim = arr.ndim
 
-        keys: set[str] = set()
+        listed: list[tuple[int, ...]] = []
         for stored in _list_store_prefix(self._zarr.store, prefix):
             parts = stored[len(prefix):].split("/")
             if len(parts) != ndim:
                 continue
             try:
-                shard_index = tuple(int(p) for p in parts)
+                listed.append(tuple(int(p) for p in parts))
             except ValueError:
+                continue
+
+        keys: set[str] = set()
+        for cells in self._shard_presence(arr, shards, listed).values():
+            for index in cells:
+                coords = (
+                    index if origin is None
+                    else tuple(i + o for i, o in zip(index, origin))
+                )
+                keys.add(_format_chunk_key(coords))
+        return keys
+
+    def _shard_presence(
+        self, arr: zarr.Array, shards: tuple[int, ...], shard_indices: list[tuple[int, ...]],
+    ) -> dict[tuple[int, ...], list[tuple[int, ...]]]:
+        """The cells (array indices) each shard holds with a payload.
+
+        From the shard's index where it can be read
+        (:func:`~zarr_vectors.core._cells_on_disk.shard_cells`), else by
+        reading the shard's cell region whole.
+        """
+        from zarr_vectors.core._cells_on_disk import shard_cells
+
+        shape = arr.shape
+        by_index = shard_cells(arr, shard_indices) if shard_indices else {}
+        out: dict[tuple[int, ...], list[tuple[int, ...]]] = {}
+        for shard_index in shard_indices:
+            cells = None if by_index is None else by_index.get(shard_index)
+            if cells is not None:
+                out[shard_index] = [tuple(c) for c in cells.tolist()]
                 continue
             # The cell region this shard covers, clipped to the array: a
             # shard at the edge of the grid is only partly in bounds, and
@@ -2397,6 +2431,8 @@ class Group:
                 min(start + s, dim)
                 for start, s, dim in zip(starts, shards, shape)
             )
+            found: list[tuple[int, ...]] = []
+            out[shard_index] = found
             if any(stop <= start for start, stop in zip(starts, stops)):
                 continue
             with warnings.catch_warnings():
@@ -2405,17 +2441,11 @@ class Group:
                     arr[tuple(slice(a, b) for a, b in zip(starts, stops))]
                 )
             for offset in np.ndindex(block.shape):
-                if not block[offset]:
-                    continue
-                index = tuple(a + o for a, o in zip(starts, offset))
-                coords = (
-                    index if origin is None
-                    else tuple(i + o for i, o in zip(index, origin))
-                )
-                keys.add(_format_chunk_key(coords))
+                if block[offset]:
+                    found.append(tuple(a + o for a, o in zip(starts, offset)))
             # Dropped before the next shard: only truthiness was wanted.
             del block
-        return keys
+        return out
 
     def read_array_attrs(self, path: str) -> dict[str, Any]:
         """Read the ``attributes`` block of a Zarr array at ``path``.

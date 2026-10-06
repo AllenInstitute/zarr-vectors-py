@@ -7560,8 +7560,11 @@ def read_links(
     # with a differently-ranked scale would silently anchor elsewhere.
     scale_src, scale_trg = _link_scales(level_group, delta, sid_ndim)
 
-    out: list[tuple[tuple[ChunkCoords, int], ...]] = []
-    base = 0  # index of the next row this call returns, for ``select``
+    # Two passes, as read_link_arrays does: every segment's layout and
+    # cells first, then one batched prefetch of all of them rather than a
+    # read per cell -- on an object store, one round trip instead of one
+    # per cell.
+    segments: list[tuple[Any, ...]] = []
     for seg in list_link_offsets(level_group, delta):
         arr_name = f"{family}/{seg}"
         try:
@@ -7593,10 +7596,26 @@ def read_links(
         # element width (BRIDGE's intra node graph is int32 while its seam
         # segments are int64), so this must be read inside the segment loop.
         cell_dtype = np.dtype(arr_meta.get("dtype", "int64"))
-        chunks_cache: dict[ChunkCoords, tuple[ChunkCoords, ...]] = {}
+        segments.append((
+            arr_name, offsets, has_perm, ncols, flat, cell_dtype,
+            sorted(level_group.list_chunks(arr_name)),
+        ))
 
-        for cell_key in sorted(level_group.list_chunks(arr_name)):
-            blob = level_group.read_bytes(arr_name, cell_key)
+    with _maybe_batched_reads(level_group, [
+        (seg_info[0], seg_info[6]) for seg_info in segments if seg_info[6]
+    ]):
+        segment_blobs = [
+            [level_group.read_bytes(seg_info[0], k) for k in seg_info[6]]
+            for seg_info in segments
+        ]
+
+    out: list[tuple[tuple[ChunkCoords, int], ...]] = []
+    base = 0  # index of the next row this call returns, for ``select``
+    for (arr_name, offsets, has_perm, ncols, flat, cell_dtype, cell_keys), blobs in zip(
+        segments, segment_blobs,
+    ):
+        chunks_cache: dict[ChunkCoords, tuple[ChunkCoords, ...]] = {}
+        for cell_key, blob in zip(cell_keys, blobs):
             if not blob:
                 continue
             src = _parse_chunk_key(cell_key)
