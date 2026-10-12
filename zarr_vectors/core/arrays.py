@@ -2525,7 +2525,7 @@ def commit_object_index(
         sid_ndim = meta.get("sid_ndim")
     if sid_ndim is None:
         try:
-            sid_ndim = _infer_vert_ndim(level_group)
+            sid_ndim = _index_sid_ndim(level_group)
         except Exception as exc:  # noqa: BLE001 - reported as a missing argument
             raise ArrayError(
                 "commit_object_index: the index has no sid_ndim; pass it"
@@ -2927,6 +2927,13 @@ def _index_sid_ndim(level_group: Group) -> int:
         meta = {}
     if meta.get("sid_ndim") is not None:
         return int(meta["sid_ndim"])
+    # A composite level's manifests carry the source first (chunk_sources).
+    from zarr_vectors.core.sources import chunk_sources
+
+    if chunk_sources(level_group) is not None:
+        dims = (level_group.attrs.get("zarr_vectors_level") or {}).get("chunk_dims") or []
+        if dims:
+            return len(dims)
     return _infer_vert_ndim(level_group)
 
 
@@ -8204,6 +8211,11 @@ def _chunks_in_box(
 ) -> set[ChunkCoords]:
     """Chunk coords present in the level that ``bbox`` touches.
 
+    Refused on a composite level (:mod:`zarr_vectors.core.sources`): a
+    source's cells are in the source's grid, so this level's grid says
+    nothing about where they are. Read a composite's objects through their
+    manifests.
+
     Resolved from whichever side is smaller.  Asking the box which of its
     cells exist costs one probe per cell it names; asking the level which
     of its cells are in the box costs one test per cell present.  Taking
@@ -8228,6 +8240,13 @@ def _chunks_in_box(
     resolution has always been an intersection with that manifest, and
     only the direction of the intersection changes here.
     """
+    from zarr_vectors.core.sources import is_composite
+
+    if is_composite(level_group):
+        raise ArrayError(
+            "a spatial box query over a composite level (chunk sources) is not "
+            "supported: its sources' cells are in their own grids; read its "
+            "objects through their manifests")
     from bisect import bisect_left
     from itertools import product
 

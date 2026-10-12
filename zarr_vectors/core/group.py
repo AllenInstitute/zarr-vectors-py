@@ -56,7 +56,7 @@ from zarr_vectors.core._vlen import (
 from zarr_vectors.core._vlen import (
     region_to_bytes as _vlen_region_to_bytes,
 )
-from zarr_vectors.exceptions import ShardedPresenceError, StoreError
+from zarr_vectors.exceptions import ArrayError, ShardedPresenceError, StoreError
 
 # Where ``LevelMetadata`` lives on a level group's attrs.  Duplicated
 # rather than imported because ``core.metadata`` imports this module.
@@ -235,6 +235,9 @@ class Group:
         self._tiling_claim_settled = False
         self._vertex_rows_written = None
         self._object_id_lookup_cache = None
+        # A composite level's source resolver (zarr_vectors.core.sources):
+        # None until first asked, False for an ordinary group.
+        self._chunk_sources_state = None
 
     @classmethod
     def _from_zarr(
@@ -384,6 +387,9 @@ class Group:
     ) -> None:
         """Write one spatial chunk's payload into ``array_name``'s cell.
 
+        A composite level (:mod:`zarr_vectors.core.sources`) writes only its
+        own cells, source ``0``: a source is never written through it.
+
         ``array_name`` must already hold the multidim vlen-bytes Zarr
         array whose shape is the level's chunk grid — every ZV
         per-spatial-chunk array (vertices, fragments, ``links/<delta>/
@@ -405,6 +411,10 @@ class Group:
                 finish.  Cell payloads themselves are independent objects
                 and never race.
         """
+        if self._source_cell(chunk_key) is not None:
+            raise ArrayError(
+                f"{array_name}/{chunk_key}: a composite level writes only its own "
+                f"cells (source 0); a source is never written through it")
         if array_name in (_VERTICES_ARRAY, _VERTEX_FRAGMENTS_ARRAY):
             # Either write can break the tiling a level may be claiming:
             # the index directly, the buffer by changing its row count.
@@ -1167,7 +1177,35 @@ class Group:
         finally:
             self._native_sharded_config = None
 
+    def _source_cell(self, chunk_key: str):
+        """``(resolver, source, spatial key)`` when *chunk_key* is a composite level's
+        cell of another store, else ``None`` (cheap after the first call)."""
+        # getattr: groups built without __init__ (FsGroup, _from_zarr) start
+        # with no cache attribute at all.
+        state = getattr(self, "_chunk_sources_state", None)
+        if state is False:
+            return None
+        if state is None:
+            from zarr_vectors.core.sources import resolver_for
+
+            state = resolver_for(self)
+            if state is None:
+                return None
+        from zarr_vectors.core.sources import split_source_key
+
+        split = split_source_key(chunk_key)
+        if split is None or split[0] == 0:
+            return None
+        return state, split[0], split[1]
+
     def read_bytes(self, array_name: str, chunk_key: str) -> bytes:
+        # A composite level's cell of another store (zarr_vectors.core.sources)
+        # is that store's cell, read through its transform: never this
+        # store's transaction, prefetch or offline snapshot.
+        source = self._source_cell(chunk_key)
+        if source is not None:
+            resolver, s, spatial = source
+            return resolver.read_bytes(s, array_name, spatial)
         # Inside a shard transaction its own cells come from it: written
         # ones as written, and under "replace" unwritten ones as empty.
         if self._shard_txn is not None:

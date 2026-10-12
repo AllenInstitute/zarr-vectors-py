@@ -802,6 +802,14 @@ class LevelMetadata:
             by edges is labelled by its lower edge, and a group bin by
             its group index (``-1`` for ungrouped objects, the last bin).
             ``None`` for spatial-only.
+        chunk_sources: Where each value of a leading ``"source"`` chunk
+            axis lives, for a *composite* level whose objects reference
+            fragments of other stores (see :mod:`zarr_vectors.core.sources`).
+            Entry 0 is ``{"self": true}``: this store's own cells.  Every
+            other entry names a source -- ``{"ref": {"path", "id"}, "level",
+            "transform", "fingerprint"}`` -- and a cell ``(s, *spatial)`` is
+            the source's cell ``spatial`` read through its transform.
+            ``None`` for an ordinary level.
     """
 
     level: int
@@ -822,6 +830,7 @@ class LevelMetadata:
     chunk_dims: list[str] | None = None
     chunk_attribute_name: str | None = None
     chunk_attribute_values: list[Any] | None = None
+    chunk_sources: list[dict[str, Any]] | None = None
     preserves_object_ids: bool = False
     """True for levels written by the per-object pyramid regime.
 
@@ -890,6 +899,8 @@ class LevelMetadata:
             d["chunk_attribute_values"] = [
                 _to_python_scalar(v) for v in self.chunk_attribute_values
             ]
+        if self.chunk_sources is not None:
+            d["chunk_sources"] = [dict(s) for s in self.chunk_sources]
         if self.preserves_object_ids:
             d["preserves_object_ids"] = True
         if self.inherited_num_objects is not None:
@@ -940,6 +951,8 @@ class LevelMetadata:
             chunk_dims=list(cd) if cd else None,
             chunk_attribute_name=lv.get("chunk_attribute_name"),
             chunk_attribute_values=list(cav) if cav is not None else None,
+            chunk_sources=(list(lv["chunk_sources"])
+                           if lv.get("chunk_sources") is not None else None),
             preserves_object_ids=bool(lv.get("preserves_object_ids", False)),
             inherited_num_objects=lv.get("inherited_num_objects"),
             shared_fragments=bool(lv.get("shared_fragments", False)),
@@ -995,6 +1008,17 @@ class LevelMetadata:
                 raise MetadataError(
                     f"Level {self.level} chunk_shape values must be > 0, "
                     f"got {self.chunk_shape}"
+                )
+
+        # A composite level's leading axis is its sources, and nothing else.
+        if self.chunk_sources is not None:
+            from zarr_vectors.core.sources import validate_chunk_sources
+
+            validate_chunk_sources(self.chunk_sources, self.chunk_dims)
+            if self.chunk_attribute_name is not None:
+                raise MetadataError(
+                    "a composite level (chunk_sources) cannot also be chunked by "
+                    "an attribute: its leading chunk axis is the source"
                 )
 
         # Attribute-chunking fields must be coherent.

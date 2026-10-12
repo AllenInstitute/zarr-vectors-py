@@ -158,6 +158,14 @@ from zarr_vectors.core.cells import (
     read_neighbourhood,
 )
 from zarr_vectors.core.group import Group, observe_presence_writes
+from zarr_vectors.core.sources import (
+    SOURCE_AXIS,
+    chunk_sources,
+    is_composite,
+    set_chunk_sources,
+    source_fingerprint,
+    verify_chunk_sources,
+)
 from zarr_vectors.core.metadata import (
     LevelMetadata,
     RootMetadata,
@@ -1639,6 +1647,13 @@ __all__ = [
     "write_object_attribute_columns",
     "write_object_attributes",
     "write_object_index",
+    # Composite levels: a leading "source" chunk axis naming other stores.
+    "SOURCE_AXIS",
+    "chunk_sources",
+    "is_composite",
+    "set_chunk_sources",
+    "source_fingerprint",
+    "verify_chunk_sources",
     "write_object_manifests",
     "write_points",
     "write_polylines",
