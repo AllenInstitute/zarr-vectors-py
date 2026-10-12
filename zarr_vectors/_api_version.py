@@ -31,7 +31,7 @@ from __future__ import annotations
 #: Version of the Python API surface.  Bump the minor when a supported
 #: name is added, the major when one is removed or changes meaning.
 #: Independent of both ``__version__`` and the on-disk format.
-__api_version__ = (1, 3)
+__api_version__ = (1, 4)
 
 #: Capabilities a caller may branch on, each True only when usable.
 FEATURES: frozenset[str] = frozenset({
@@ -101,6 +101,11 @@ FEATURES: frozenset[str] = frozenset({
     # which builds fresh ones on first use: a child of a process that had
     # used them no longer hangs on its first pooled read or write.
     "fork-safe-pools",
+    # LevelMetadata.chunk_sources: a composite level whose leading "source"
+    # chunk axis names other stores; their cells are read through
+    # Group.read_bytes (vertices transformed), never written; a rebuilt
+    # source is refused by its fingerprint (zarr_vectors.core.sources).
+    "chunk-sources",
     # building.set_presence / end_presence_deferral: presence recorded
     # from the cells a caller says it wrote, and a deferral ended without
     # a store-wide rebuild; finalize_links leaves a deferred level alone.

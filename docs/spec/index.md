@@ -78,6 +78,7 @@ chunking/bin_shape
 chunking/chunk_vs_bin
 chunking/rechunking
 chunking/sharding
+chunking/chunk_sources
 multiscale/multiscale_metadata
 multiscale/pyramid_construction
 multiscale/sparsity
