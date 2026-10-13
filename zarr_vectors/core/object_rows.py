@@ -185,6 +185,7 @@ def reserve_object_rows(
     n_blocks: int | None = None,
     columns: Mapping[str, Any] | None = None,
     shard_rows: int | None = None,
+    block_dtype: Any = None,
 ) -> dict[str, Any]:
     """Size the object layer for ``n_objects`` rows, once, before workers write.
 
@@ -218,6 +219,10 @@ def reserve_object_rows(
         shard_rows: Create new arrays sharded at this many rows (a
             multiple of 65,536). ``None`` follows the layer's existing
             layout. Refused if the layer already has another.
+        block_dtype: Dense only: ``"int64"`` or ``"int32"`` for a new
+            ``manifest_blocks`` (default: the store's
+            ``manifest_block_dtype``). Blocks that exist keep theirs, and
+            another value is refused. Ignored for a vlen index.
 
     Returns:
         ``{"rows", "layout", "arrays", "at_alignment", "block_alignment"}``.
@@ -245,6 +250,7 @@ def reserve_object_rows(
     n = int(n_objects)
     if n < 0:
         raise ArrayError(f"n_objects {n} is negative")
+    dense.check_block_dtype(block_dtype)
     existing_rows = object_shard_rows(level_group)
     if shard_rows is not None:
         rows = check_object_shard_rows(shard_rows)
@@ -282,9 +288,11 @@ def reserve_object_rows(
 
     if kind == "dense":
         fresh = not level_group.array_exists(dense.SPANS_PATH)
-        for path, width, count in (
-            (dense.SPANS_PATH, 2, n),
-            (dense.BLOCKS_PATH, sid + 1, n_blocks),
+        # Refuses a block_dtype other than the one existing blocks have.
+        blocks_dtype = dense.resolve_block_dtype(level_group, block_dtype)
+        for path, width, count, dtype in (
+            (dense.SPANS_PATH, 2, n, np.dtype(np.int64)),
+            (dense.BLOCKS_PATH, sid + 1, n_blocks, blocks_dtype),
         ):
             if level_group.array_exists(path):
                 if count is not None and _grow(level_group, path, int(count)):
@@ -292,11 +300,13 @@ def reserve_object_rows(
             else:
                 chunks = (dense.bucket(path), width)
                 _create_empty(
-                    level_group, path, (int(count or 0), width), np.int64, chunks,
+                    level_group, path, (int(count or 0), width), dtype, chunks,
                     shards=_shards(chunks), fill_value=0,
                     compressors=dense.manifest_codecs(level_group),
                 )
                 touched.append(path)
+                if path == dense.BLOCKS_PATH:
+                    dense._stamp_block_dtype(level_group, dtype)
         _id_table()
         level_group.write_array_meta(OBJECT_INDEX, {
             "zv_array": "object_index", "sid_ndim": sid, "layout": _LAYOUT_DENSE,
@@ -414,6 +424,7 @@ def place_manifests(
     frags: npt.NDArray[np.int64] | None = None,
     ids: Any = None,
     block_at: int | None = None,
+    block_dtype: Any = None,
 ) -> tuple[int, int]:
     """Write manifests into reserved rows ``[at, at + n)``, and nothing else.
 
@@ -423,7 +434,10 @@ def place_manifests(
     (either layout). A dense index also needs ``block_at``: the first row
     of ``manifest_blocks`` this call's fragments occupy, inside the
     reservation and aligned like ``at``. Where the layout stores ids,
-    ``ids`` names the rows' objects (default: the rows themselves).
+    ``ids`` names the rows' objects (default: the rows themselves). The
+    blocks are checked against the reserved array's dtype (an ``int32``
+    index refuses a value that does not fit), and ``block_dtype``, if
+    given, must be that dtype.
 
     Returns:
         ``(at, n)``.
@@ -440,6 +454,7 @@ def place_manifests(
     at = int(at)
     if at < 0:
         raise ArrayError(f"at must be >= 0, got {at}")
+    dense.check_block_dtype(block_dtype)
     meta = level_group.read_array_meta(OBJECT_INDEX) or {}
     layout = meta.get("layout")
     sid = _index_sid_ndim(level_group)
@@ -455,10 +470,14 @@ def place_manifests(
         b0 = int(block_at or 0)
         spans = _reserved(level_group, dense.SPANS_PATH, at + n, "place_manifests")
         blocks = _reserved(level_group, dense.BLOCKS_PATH, b0 + k, "place_manifests")
+        dense.resolve_block_dtype(level_group, block_dtype)
+        new_blocks = dense.fit_blocks(
+            np.concatenate([coords, frags[:, None]], axis=1), blocks.dtype, "place_manifests",
+        )
         counts = np.diff(offsets)
         spans[at:at + n] = np.stack([b0 + offsets[:-1], counts], axis=1)
         if k:
-            blocks[b0:b0 + k] = np.concatenate([coords, frags[:, None]], axis=1)
+            blocks[b0:b0 + k] = new_blocks
         stores_ids = True
     else:
         if manifest_blobs is None:

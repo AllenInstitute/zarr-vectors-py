@@ -165,7 +165,7 @@ arrays, with no blob per object (`layout: "dense_manifests_v1"`):
 | Key | Type | Contents |
 |-----|------|----------|
 | `manifest_spans` | `int64`, shape `(num_objects, 2)`, chunked at 16,384 rows | Row `o` is `(start, count)`: object row `o` owns rows `start .. start + count` of `manifest_blocks` |
-| `manifest_blocks` | `int64`, shape `(n_blocks, sid_ndim + 1)`, chunked at 65,536 rows (16,384 in an index created before) | One row per fragment reference: `sid_ndim` chunk coordinates, then the fragment index |
+| `manifest_blocks` | `int64` or `int32`, shape `(n_blocks, sid_ndim + 1)`, chunked at 65,536 rows (16,384 in an index created before) | One row per fragment reference: `sid_ndim` chunk coordinates, then the fragment index |
 | `object_ids` | `int64`, shape `(num_objects,)` | Row `o`'s object id, as in the `vlen_manifests_v2` layout |
 
 An object's blocks are its manifest, in order. Each block names exactly
@@ -185,6 +185,29 @@ a write session that compresses with `zstd` at a lower level is raised
 to 9 for them, one that compresses with another codec keeps it, and one
 that does not compress gets the default. An index keeps the chunking and
 codecs it was created with; a full rewrite creates its arrays afresh.
+
+`manifest_blocks` is `int64` unless the index was created `int32`, for
+a store whose chunk coordinates and fragment indices all fit in it. The
+array's `zarr.json` `data_type` is the truth about it; a reader widens
+the blocks to `int64` and returns them exactly as an `int64` index would
+(every reader of 0.9.4 already does, so an `int32` index needs no newer
+reader and no capability). Spans and ids are always `int64`: a span's
+`start` passes `2**31` at a few billion fragments.
+
+- The root's `manifest_block_dtype: "int32"` makes it the default for
+  dense indexes created later (absent means `int64`, and only the
+  non-default value is written), as `manifest_layout` is for the layout.
+- A narrow index states it on `object_index` as `block_dtype: "int32"`,
+  for information only; an index without the key is `int64` or, if its
+  `zarr.json` says so, whatever that says.
+- An index keeps its dtype for its life: an append, a patch or a placed
+  range writes into the dtype it has. zarr casts a write into a narrower
+  array without a check, wrapping a value that does not fit, so a writer
+  must check every value it writes into an `int32` index and refuse one
+  outside `[-2**31, 2**31 - 1]`; zarr-vectors-py raises `ArrayError`
+  before anything of that write is stored. (A zarr-vectors-py older than
+  the `manifest-block-dtype` feature reads such an index correctly but
+  appends to it unchecked.)
 
 The layout is chosen per store by the root's `manifest_layout: "dense"`
 (absent means vlen), which also stamps the `dense_manifests`
@@ -434,8 +457,10 @@ uniform shape (always an array of indices) can map over the result.
 - New layout: `manifests.shape == (num_objects,)` and `manifests.dtype
   == object` (vlen-bytes).
 - Dense layout: `manifest_spans.shape == (num_objects, 2)`,
-  `manifest_blocks.shape[1] == sid_ndim + 1`, both `int64`; every span
-  has `count >= 0`, and a span with `count > 0` lies inside
+  `manifest_blocks.shape[1] == sid_ndim + 1`; `manifest_spans` is
+  `int64` and `manifest_blocks` `int64` or `int32`, matching
+  `object_index`'s `block_dtype` where it states one; every span has
+  `count >= 0`, and a span with `count > 0` lies inside
   `manifest_blocks`.
 - Legacy layout: `len(offsets) == num_objects`; `offsets` is
   monotonically non-decreasing; `offsets[0] == 0` when `num_objects >

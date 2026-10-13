@@ -146,12 +146,16 @@ class ObjectManifestWriter:
         *,
         layout: str | None = None,
         commit: bool = False,
+        block_dtype: Any = None,
     ) -> None:
+        from zarr_vectors.core.dense_manifests import check_block_dtype
+
         if at is not None and int(at) < 0:
             raise ArrayError(f"at must be >= 0, got {at}")
         self._lg = level_group
         self._at = None if at is None else int(at)
         self._layout = layout
+        self._block_dtype = check_block_dtype(block_dtype)
         self._commit = bool(commit)
         self._first: int | None = None
         self._cursor = 0
@@ -249,7 +253,7 @@ class ObjectManifestWriter:
 
         return write_object_manifests(
             self._lg, blobs, chunk_coords=cc, fragment_idx=fi, manifest_offsets=off,
-            ids=ids, mode="append", at=at, layout=layout,
+            ids=ids, mode="append", at=at, layout=layout, block_dtype=self._block_dtype,
         )
 
     def _write_first(self, blobs: Any, cc: Any, fi: Any, off: Any, ids: Any) -> tuple[int, int]:
@@ -339,6 +343,7 @@ class ObjectManifestWriter:
 
     def _write_dense(self, blobs: Any, cc: Any, fi: Any, off: Any, ids: Any) -> tuple[int, int]:
         from zarr_vectors import _xp
+        from zarr_vectors.core import dense_manifests as dense
         from zarr_vectors.core.arrays import _object_array
         from zarr_vectors.encoding.fragments import decode_object_manifests_csr
 
@@ -371,13 +376,21 @@ class ObjectManifestWriter:
             )
         if fi.size and int(fi.min()) < 0:
             raise ArrayError(f"fragment_index must be >= 0, got {int(fi.min())}")
+        # Checked as the write is taken, before any of it is held: the
+        # error belongs to this call, as it would on the per-call path.
+        blocks = (
+            dense.fit_blocks(
+                np.concatenate([cc, fi[:, None]], axis=1), self._blocks.dtype,
+                "object_manifest_writer",
+            ) if fi.size else None
+        )
         if n:
             spans = np.empty((n, 2), dtype=np.int64)
             spans[:, 0] = self._blocks_end + off[:-1]
             spans[:, 1] = counts
             self._span_buf.append(spans)
-        if fi.size:
-            self._block_buf.append(np.concatenate([cc, fi[:, None]], axis=1))
+        if blocks is not None:
+            self._block_buf.append(blocks)
         self._blocks_end += int(fi.size)
         self._cursor += n
         if self._commit:
@@ -520,6 +533,7 @@ def object_manifest_writer(
     *,
     layout: str | None = None,
     commit: bool = False,
+    block_dtype: Any = None,
 ) -> ObjectManifestWriter:
     """A context that writes object manifests as a stream.
 
@@ -543,12 +557,19 @@ def object_manifest_writer(
             :func:`~zarr_vectors.core.arrays.commit_object_index`,
             counting ``num_present`` from what was written when the index
             was committed at ``at`` before.
+        block_dtype: ``"int64"`` or ``"int32"``, as
+            ``write_object_manifests`` takes it: for a dense index the
+            first write creates, and refused against one that exists in
+            another. Every write's blocks are checked against the index's
+            dtype as the write is taken.
 
     Returns:
         An :class:`ObjectManifestWriter`; its ``write`` takes what
         ``write_object_manifests`` takes, less ``mode``/``at``/``layout``.
     """
-    return ObjectManifestWriter(level_group, at, layout=layout, commit=commit)
+    return ObjectManifestWriter(
+        level_group, at, layout=layout, commit=commit, block_dtype=block_dtype,
+    )
 
 
 __all__ = ["FLUSH_BLOCKS", "FLUSH_ROWS", "ObjectManifestWriter", "object_manifest_writer"]

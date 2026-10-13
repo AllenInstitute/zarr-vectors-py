@@ -114,6 +114,14 @@ def test_root_metadata_round_trip_validates(schema):
     _validate(schema, "RootMetadata", _to_linkml_logical_form(wire))
 
 
+def test_root_metadata_with_dense_int32_manifests_validates(schema):
+    rm = _minimal_root_md()
+    rm.manifest_layout, rm.manifest_block_dtype = "dense", "int32"
+    wire = rm.to_dict()["zarr_vectors"]
+    assert wire["manifest_block_dtype"] == "int32"
+    _validate(schema, "RootMetadata", _to_linkml_logical_form(wire))
+
+
 def test_level_metadata_minimal_validates(schema):
     lm = LevelMetadata(level=0, vertex_count=0, arrays_present=[])
     wire = lm.to_dict()["zarr_vectors_level"]

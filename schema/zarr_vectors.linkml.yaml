@@ -59,6 +59,16 @@ enums:
         description: >
           Fixed-width integer arrays, ``manifest_spans`` into
           ``manifest_blocks`` (0.9.4).
+  ManifestBlockDtype:
+    description: Integer dtype a store creates new dense indexes' ``manifest_blocks`` in.
+    permissible_values:
+      int64:
+        description: The default.
+      int32:
+        description: >
+          Half the bytes a chunk decodes to, for a store whose chunk
+          coordinates and fragment indices all fit; every write
+          range-checked.
   ObjectIndexLayout:
     description: How one object index stores its manifests.
     permissible_values:
@@ -305,6 +315,7 @@ classes:
       - attribute_specs
       - shard_shape
       - manifest_layout
+      - manifest_block_dtype
 
   LevelMetadata:
     description: >
@@ -635,6 +646,14 @@ slots:
       Optional and additive from 0.9.4. A default for indexes created
       later; an existing index's own ``layout`` is the truth about it.
     range: ManifestLayout
+  manifest_block_dtype:
+    description: >
+      ``int32`` when dense object indexes are created with ``int32``
+      ``manifest_blocks``, absent for the ``int64`` default. A default for
+      indexes created later; each index's ``manifest_blocks`` dtype (its
+      ``zarr.json``) is the truth about it, and every reader widens the
+      blocks to ``int64``. Optional and additive.
+    range: ManifestBlockDtype
   layout:
     description: >
       The object index's storage layout: ``vlen_manifests_v1`` (vlen
