@@ -120,11 +120,13 @@ def _create_empty(
     fill_value: Any,
     attributes: dict[str, Any] | None = None,
     serializer: Any = None,
+    compressors: list[dict[str, Any]] | None = None,
 ) -> None:
     """Create an array of ``shape`` without writing a byte of it.
 
     Every row reads as ``fill_value`` until written, which is what makes
-    reserving a billion rows cost one ``zarr.json``.
+    reserving a billion rows cost one ``zarr.json``. ``compressors``: a
+    codecs list for this array, else the write session's.
     """
     from zarr.errors import UnstableSpecificationWarning
 
@@ -142,7 +144,7 @@ def _create_empty(
         kwargs["shards"] = shards
     if serializer is not None:
         kwargs["serializer"] = serializer
-    resolved = level_group._resolve_codecs(None)
+    resolved = level_group._resolve_codecs(compressors)
     if resolved is not None:
         from zarr_vectors.encoding.compression import codecs_for_create_array
 
@@ -268,6 +270,7 @@ def reserve_object_rows(
             _create_empty(
                 level_group, path, (n,), np.int64, chunks,
                 shards=_shards(chunks), fill_value=UNWRITTEN_ID,
+                compressors=dense.manifest_codecs(level_group),
             )
             touched.append(path)
 
@@ -285,6 +288,7 @@ def reserve_object_rows(
                 _create_empty(
                     level_group, path, (int(count or 0), width), np.int64, chunks,
                     shards=_shards(chunks), fill_value=0,
+                    compressors=dense.manifest_codecs(level_group),
                 )
                 touched.append(path)
         _id_table()

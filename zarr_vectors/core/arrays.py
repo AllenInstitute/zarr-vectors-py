@@ -2591,27 +2591,41 @@ def commit_object_index(
     return out
 
 
-def _write_object_id_table(level_group: Group, row_ids: Sequence[int]) -> None:
+def _write_object_id_table(
+    level_group: Group, row_ids: Sequence[int], *, keep_codecs: bool = False,
+) -> None:
     """Write ``object_index/object_ids``: row → object id.
 
     This is the tie that used to be positional only. The comment on
     ``write_object_attributes``' ``at=`` -- "nothing on disk ties a row
     to an object, so row i means object i by position alone" -- was the
     statement of the problem; this array is the answer to it.
+
+    ``keep_codecs``: a table that exists is rewritten with its own codecs
+    (an index that exists keeps them); otherwise, and for a new table,
+    :func:`~zarr_vectors.core.dense_manifests.manifest_codecs`.
     """
     # Chunked at the manifest bucket, as appends extend it: written as one
     # chunk, a 10^9-object table was a single 8 GB object, rewritten whole
     # by the first append. A range (the appender's identity table) becomes
     # an arange, not a list of a billion Python ints.
+    from zarr_vectors.core.dense_manifests import existing_codecs, manifest_codecs
+
+    path = f"{OBJECT_INDEX}/{OBJECT_IDS_ARRAY}"
+    codecs = (
+        existing_codecs(level_group.zarr_group[path])
+        if keep_codecs and level_group.array_exists(path) else manifest_codecs(level_group)
+    )
     ids = (
         np.arange(row_ids.start, row_ids.stop, row_ids.step, dtype=np.int64)
         if isinstance(row_ids, range)
         else np.fromiter(row_ids, dtype=np.int64)
     )
     level_group.write_array(
-        f"{OBJECT_INDEX}/{OBJECT_IDS_ARRAY}", ids,
+        path, ids,
         chunks=(OBJECT_INDEX_MANIFEST_BUCKET,),
         shards=_object_shards(level_group, (OBJECT_INDEX_MANIFEST_BUCKET,)),
+        compressors=codecs,
     )
 
 
@@ -2713,6 +2727,7 @@ def patch_object_manifests(
         _write_object_id_table(
             level_group,
             np.concatenate([table, np.asarray(fresh, dtype=np.int64)]).tolist(),
+            keep_codecs=True,
         )
 
     was_present = sum(
@@ -2766,6 +2781,7 @@ def _patch_dense_manifests(
             table = np.arange(n0, dtype=np.int64)
         _write_object_id_table(
             level_group, np.concatenate([table, np.asarray(fresh, dtype=np.int64)]).tolist(),
+            keep_codecs=True,
         )
     now = int(np.count_nonzero(np.diff(offsets)))
     prior_present = int(meta.get("num_present", meta.get("num_objects", n0)))
@@ -2830,11 +2846,15 @@ def _extend_object_id_table(
     if keep == n0 and int(node.chunks[0]) >= OBJECT_INDEX_MANIFEST_BUCKET:
         level_group.extend_array(path, new_ids)
     else:
+        from zarr_vectors.core.dense_manifests import existing_codecs
+
+        # Rewritten, not recreated: the table keeps its codecs.
         head = np.asarray(node[:keep], dtype=np.int64)
         level_group.write_array(
             path, np.concatenate([head, new_ids]),
             chunks=(OBJECT_INDEX_MANIFEST_BUCKET,),
             shards=_object_shards(level_group, (OBJECT_INDEX_MANIFEST_BUCKET,)),
+            compressors=existing_codecs(node),
         )
     meta = level_group.read_array_meta(OBJECT_INDEX) or {}
     ascending = bool(meta.get(OBJECT_IDS_SORTED_ATTR, False)) and bool(
@@ -2990,6 +3010,7 @@ def _write_dense_index(
                 f"{OBJECT_INDEX}/{OBJECT_IDS_ARRAY}", table,
                 chunks=(OBJECT_INDEX_MANIFEST_BUCKET,),
                 shards=_object_shards(level_group, (OBJECT_INDEX_MANIFEST_BUCKET,)),
+                compressors=dense.manifest_codecs(level_group),
             )
             level_group.write_array_meta(OBJECT_INDEX, {
                 OBJECT_IDS_SORTED_ATTR: bool(np.all(np.diff(table) > 0)),
