@@ -71,6 +71,7 @@ def _manifest(rng):
 @pytest.fixture(params=["written", "patched"])
 def level(request, tmp_path, monkeypatch):
     monkeypatch.setattr(dense, "_BUCKET", BUCKET)
+    monkeypatch.setattr(dense, "BLOCKS_BUCKET", BUCKET)
     rng = np.random.default_rng(7)
     root = create_store(
         tmp_path / "s.zarrvectors", bounds=([0.0] * 3, [150.0] * 3),
@@ -142,6 +143,7 @@ def test_out_of_bounds_rows_still_raise(level):
 
 def test_ascending_ids_never_reach_the_orthogonal_indexer(tmp_path, monkeypatch):
     monkeypatch.setattr(dense, "_BUCKET", BUCKET)
+    monkeypatch.setattr(dense, "BLOCKS_BUCKET", BUCKET)
     rng = np.random.default_rng(11)
     root = create_store(
         tmp_path / "s.zarrvectors", bounds=([0.0] * 3, [150.0] * 3),

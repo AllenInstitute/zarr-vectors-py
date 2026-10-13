@@ -219,9 +219,11 @@ fetch the entire spatial index for a region in a handful of requests.
 The object layer -- `object_index/`'s arrays (`manifests`, or the dense
 `manifest_spans` / `manifest_blocks`, and `object_ids`) and every
 `object_attributes/<name>` column -- has no spatial grid: each array is 1-D
-along objects, chunked in fixed row buckets of 16,384 (index) or 65,536
-(attribute) rows, one storage object per bucket. At 10^9 objects that is
-about 61,000 objects per index array and 15,000 per attribute column.
+along objects, chunked in fixed row buckets of 16,384 (index: `manifests`,
+`manifest_spans`, `object_ids`) or 65,536 (a dense index's `manifest_blocks`
+as created now, and attribute columns) rows, one storage object per bucket.
+At 10^9 objects that is about 61,000 objects per index array and 15,000 per
+attribute column.
 
 These arrays may be sharded along rows with the same `sharding_indexed`
 codec, the shard a whole number of buckets. zarr-vectors-py requires the

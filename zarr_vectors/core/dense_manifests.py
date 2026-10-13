@@ -46,10 +46,20 @@ OBJECT_INDEX_LAYOUT_DENSE = "dense_manifests_v1"
 SPANS_ARRAY = "manifest_spans"
 BLOCKS_ARRAY = "manifest_blocks"
 
-#: Rows per zarr chunk, for spans and blocks alike: the same bucket the
-#: vlen manifests use, for the same reason (a fixed chunk, set by the
+#: Rows per zarr chunk of the spans (and the id table): the same bucket
+#: the vlen manifests use, for the same reason (a fixed chunk, set by the
 #: creating write, never clamped to that write's size).
 _BUCKET = 16_384
+
+#: Rows per zarr chunk of the blocks, in an index created now (16,384 in
+#: one created before; an index keeps its chunking, which zarr.json
+#: holds). Blocks outnumber objects ~10-100 to one and are read in long
+#: runs, so the larger chunk costs a point read little and buys bytes and
+#: files: on two BRIDGE indexes at zstd 9, 0.58-0.61x the bytes of 16,384
+#: rows, and a quarter of the files on an unsharded layer. Equal to the
+#: attribute bucket, so the object layer's shard (a multiple of 65,536
+#: rows) tiles it, and a placed range aligned for rows is for blocks.
+BLOCKS_BUCKET = 65_536
 
 SPANS_PATH = f"{OBJECT_INDEX}/{SPANS_ARRAY}"
 BLOCKS_PATH = f"{OBJECT_INDEX}/{BLOCKS_ARRAY}"
@@ -310,10 +320,15 @@ def present_mask(level_group: Group, stop: int | None = None) -> npt.NDArray[np.
 # Writing
 
 
+def bucket(path: str) -> int:
+    """Rows per zarr chunk ``path`` (spans or blocks) is created with."""
+    return BLOCKS_BUCKET if path == BLOCKS_PATH else _BUCKET
+
+
 def _create(level_group: Group, path: str, data: npt.NDArray[np.int64]) -> None:
     from zarr_vectors.core.arrays import _object_shards
 
-    chunks = (_BUCKET, *data.shape[1:])
+    chunks = (bucket(path), *data.shape[1:])
     level_group.write_array(
         path, data, chunks=chunks, shards=_object_shards(level_group, chunks),
         compressors=manifest_codecs(level_group),
