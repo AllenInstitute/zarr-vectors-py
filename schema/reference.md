@@ -67,6 +67,7 @@ Name: zarr_vectors
 | [level_delta](level_delta.md) | Pyramid-level delta between the source side (the level that owns this array) ... |
 | [link_width](link_width.md) | Width of a links row (1 for parent→child metanode references, 2 for edges, 3 ... |
 | [links_convention](links_convention.md) |  |
+| [manifest_block_dtype](manifest_block_dtype.md) | ``int32`` when dense object indexes are created with ``int32`` ``manifest_blo... |
 | [manifest_layout](manifest_layout.md) | ``dense`` when object indexes are created in the dense layout (``manifest_spa... |
 | [max_corner](max_corner.md) | Per-axis maxima |
 | [min_corner](min_corner.md) | Per-axis minima |
@@ -105,6 +106,7 @@ Name: zarr_vectors
 | [FormatCapability](FormatCapability.md) | Optional feature tokens a store advertises in :attr:`RootMetadata |
 | [GeometryType](GeometryType.md) | The kind of geometry a store (or one of its sub-types) holds |
 | [LinksConvention](LinksConvention.md) | How intra-chunk links are represented for a polyline/graph/mesh |
+| [ManifestBlockDtype](ManifestBlockDtype.md) | Integer dtype a store creates new dense indexes' ``manifest_blocks`` in |
 | [ManifestLayout](ManifestLayout.md) | Object-index layout a store creates new indexes in |
 | [ObjectIndexConvention](ObjectIndexConvention.md) | How the object_id → fragment mapping is encoded |
 | [ObjectIndexLayout](ObjectIndexLayout.md) | How one object index stores its manifests |
@@ -4733,6 +4735,93 @@ search:
 ---
 
 
+# Enum: ManifestBlockDtype 
+
+
+
+
+_Integer dtype a store creates new dense indexes' ``manifest_blocks`` in._
+
+
+
+<div data-search-exclude markdown="1">
+
+URI: [zv:ManifestBlockDtype](https://w3id.org/zarr-vectors/schema/0.5/ManifestBlockDtype)
+
+## Permissible Values
+| Value | Meaning | Description |
+| --- | --- | --- |
+| int64 | None | The default |
+| int32 | None | Half the bytes a chunk decodes to, for a store whose chunk coordinates and fr... |
+
+
+
+
+## Slots
+
+| Name | Description |
+| ---  | --- |
+| [manifest_block_dtype](manifest_block_dtype.md) | ``int32`` when dense object indexes are created with ``int32`` ``manifest_blo... |
+
+
+
+
+
+
+
+
+
+
+## Identifier and Mapping Information
+
+
+
+
+
+### Schema Source
+
+
+* from schema: https://w3id.org/zarr-vectors/schema/0.5
+
+
+
+
+
+
+## LinkML Source
+
+<details>
+```yaml
+name: ManifestBlockDtype
+description: Integer dtype a store creates new dense indexes' ``manifest_blocks``
+  in.
+from_schema: https://w3id.org/zarr-vectors/schema/0.5
+rank: 1000
+permissible_values:
+  int64:
+    text: int64
+    description: The default.
+  int32:
+    text: int32
+    description: 'Half the bytes a chunk decodes to, for a store whose chunk coordinates
+      and fragment indices all fit; every write range-checked.
+
+      '
+
+```
+</details>
+
+</div>
+
+
+---
+
+---
+search:
+  boost: 2.0
+---
+
+
 # Enum: ManifestLayout 
 
 
@@ -5738,6 +5827,17 @@ URI: [zv:RootMetadata](https://w3id.org/zarr-vectors/schema/0.5/RootMetadata)
     
 
         
+      RootMetadata : manifest_block_dtype
+        
+          
+    
+        
+        
+        RootMetadata --> "0..1" ManifestBlockDtype : manifest_block_dtype
+        click ManifestBlockDtype href "../ManifestBlockDtype/"
+    
+
+        
       RootMetadata : manifest_layout
         
           
@@ -5794,6 +5894,7 @@ URI: [zv:RootMetadata](https://w3id.org/zarr-vectors/schema/0.5/RootMetadata)
 | [attribute_specs](attribute_specs.md) | 0..1 <br/> [AttributeSpecs](AttributeSpecs.md) | What the store declares its attributes to be, keyed by scope (``vertex`` / ``... | direct |
 | [shard_shape](shard_shape.md) | * <br/> [Integer](Integer.md) | Cells per shard per axis, or absent for one storage object per cell | direct |
 | [manifest_layout](manifest_layout.md) | 0..1 <br/> [ManifestLayout](ManifestLayout.md) | ``dense`` when object indexes are created in the dense layout (``manifest_spa... | direct |
+| [manifest_block_dtype](manifest_block_dtype.md) | 0..1 <br/> [ManifestBlockDtype](ManifestBlockDtype.md) | ``int32`` when dense object indexes are created with ``int32`` ``manifest_blo... | direct |
 
 
 
@@ -5867,6 +5968,7 @@ slots:
 - attribute_specs
 - shard_shape
 - manifest_layout
+- manifest_block_dtype
 
 ```
 </details>
@@ -6089,6 +6191,20 @@ attributes:
     domain_of:
     - RootMetadata
     range: ManifestLayout
+  manifest_block_dtype:
+    name: manifest_block_dtype
+    description: '``int32`` when dense object indexes are created with ``int32`` ``manifest_blocks``,
+      absent for the ``int64`` default. A default for indexes created later; each
+      index''s ``manifest_blocks`` dtype (its ``zarr.json``) is the truth about it,
+      and every reader widens the blocks to ``int64``. Optional and additive.
+
+      '
+    from_schema: https://w3id.org/zarr-vectors/schema/0.5
+    rank: 1000
+    owner: RootMetadata
+    domain_of:
+    - RootMetadata
+    range: ManifestBlockDtype
 
 ```
 </details></div>
@@ -9843,6 +9959,112 @@ rank: 1000
 domain_of:
 - RootMetadata
 range: LinksConvention
+
+```
+</details></div>
+
+
+---
+
+---
+search:
+  boost: 5.0
+---
+
+# Slot: manifest_block_dtype 
+
+
+_``int32`` when dense object indexes are created with ``int32`` ``manifest_blocks``, absent for the ``int64`` default. A default for indexes created later; each index's ``manifest_blocks`` dtype (its ``zarr.json``) is the truth about it, and every reader widens the blocks to ``int64``. Optional and additive._
+
+__
+
+
+
+<div data-search-exclude markdown="1">
+
+
+
+URI: [zv:manifest_block_dtype](https://w3id.org/zarr-vectors/schema/0.5/manifest_block_dtype)
+<!-- no inheritance hierarchy -->
+
+
+
+
+
+## Applicable Classes
+
+| Name | Description | Modifies Slot |
+| --- | --- | --- |
+| [RootMetadata](RootMetadata.md) | Root-level `` |  no  |
+
+
+
+
+
+
+## Properties
+
+### Type and Range
+
+| Property | Value |
+| --- | --- |
+| Range | [ManifestBlockDtype](ManifestBlockDtype.md) |
+| Domain Of | [RootMetadata](RootMetadata.md) |
+
+### Cardinality and Requirements
+
+| Property | Value |
+| --- | --- |
+
+
+
+
+
+
+
+
+
+
+## Identifier and Mapping Information
+
+
+
+
+
+### Schema Source
+
+
+* from schema: https://w3id.org/zarr-vectors/schema/0.5
+
+
+
+
+## Mappings
+
+| Mapping Type | Mapped Value |
+| ---  | ---  |
+| self | zv:manifest_block_dtype |
+| native | zv:manifest_block_dtype |
+
+
+
+
+## LinkML Source
+
+<details>
+```yaml
+name: manifest_block_dtype
+description: '``int32`` when dense object indexes are created with ``int32`` ``manifest_blocks``,
+  absent for the ``int64`` default. A default for indexes created later; each index''s
+  ``manifest_blocks`` dtype (its ``zarr.json``) is the truth about it, and every reader
+  widens the blocks to ``int64``. Optional and additive.
+
+  '
+from_schema: https://w3id.org/zarr-vectors/schema/0.5
+rank: 1000
+domain_of:
+- RootMetadata
+range: ManifestBlockDtype
 
 ```
 </details></div>

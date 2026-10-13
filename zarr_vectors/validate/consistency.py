@@ -368,7 +368,22 @@ def _dense_index_problems(lg: Any) -> list[str]:
     if problems:
         return problems
     spans = np.asarray(lg.read_array(dense.SPANS_PATH))
-    blocks_shape = lg.zarr_group[dense.BLOCKS_PATH].shape
+    blocks_node = lg.zarr_group[dense.BLOCKS_PATH]
+    blocks_shape = blocks_node.shape
+    blocks_dtype = np.dtype(blocks_node.dtype)
+    if spans.dtype != np.int64:
+        problems.append(f"manifest_spans is {spans.dtype}; expected int64")
+    if blocks_dtype.name not in dense.BLOCK_DTYPES:
+        problems.append(
+            f"manifest_blocks is {blocks_dtype}; expected one of "
+            f"{', '.join(dense.BLOCK_DTYPES)}"
+        )
+    stamped = meta.get(dense.BLOCK_DTYPE_ATTR)
+    if stamped is not None and stamped != blocks_dtype.name:
+        problems.append(
+            f"object_index says {dense.BLOCK_DTYPE_ATTR}={stamped!r}, but "
+            f"manifest_blocks is {blocks_dtype}"
+        )
     n, sid = int(meta.get("num_objects", spans.shape[0])), int(meta.get("sid_ndim", 0))
     if spans.ndim != 2 or spans.shape[1] != 2 or spans.shape[0] < n:
         problems.append(f"manifest_spans has shape {spans.shape}; expected ({n}, 2)")

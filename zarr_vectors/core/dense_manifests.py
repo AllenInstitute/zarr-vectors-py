@@ -10,6 +10,9 @@ same manifests as two numeric arrays::
                                           chunk coords..., fragment index
     object_index/object_ids        int64 (n_objects,)     as in V2
 
+``manifest_blocks`` may instead be ``int32``, chosen when the index is
+created (see :func:`resolve_block_dtype`); every reader widens it to ``int64``.
+
 Object row ``o`` owns blocks ``start .. start + count``, one row per
 fragment it references, in manifest order. An object with no fragments
 has ``count == 0``. Range and explicit-list blocks of the vlen encoding
@@ -149,6 +152,123 @@ def store_default(level_group: Group) -> str:
     except Exception:
         return "vlen"
     return "dense" if zv.get("manifest_layout") == "dense" else "vlen"
+
+
+# --------------------------------------------------------------------
+# The blocks' dtype
+
+#: What ``manifest_blocks`` may be stored as. ``int64`` is the default;
+#: ``int32`` halves the bytes a chunk decodes to, for an index whose chunk
+#: coordinates and fragment indices all fit in it -- the writer's promise
+#: to keep: every write into a narrow index checks its values, and raises
+#: rather than wrapping. Stored, it gains less than the raw halving: zstd
+#: at level 9 over 65,536 rows already drops most of the zero high bytes
+#: (0.93-0.97x of int64 on two BRIDGE indexes; 0.8x at zstd 5 over 16,384
+#: rows). Spans and ids stay int64 (block offsets pass 2**31 at a few
+#: billion fragments).
+BLOCK_DTYPES = ("int64", "int32")
+
+#: ``object_index`` metadata key naming a narrow index's block dtype. For
+#: information: the array's ``zarr.json`` is the truth, and an index
+#: without the key is read from it like any other.
+BLOCK_DTYPE_ATTR = "block_dtype"
+
+
+def check_block_dtype(value: Any) -> np.dtype | None:
+    """``value`` as a block dtype (``None`` stays ``None``), or :class:`ArrayError`."""
+    if value is None:
+        return None
+    try:
+        dt = np.dtype(value)
+    except TypeError:
+        dt = None
+    if dt is None or dt.name not in BLOCK_DTYPES:
+        raise ArrayError(
+            f"block dtype {value!r}; expected one of {', '.join(BLOCK_DTYPES)}"
+        )
+    return dt
+
+
+def store_block_dtype(level_group: Group) -> np.dtype:
+    """The store's ``manifest_block_dtype`` (``int64`` unless it says ``int32``)."""
+    from zarr_vectors.core.group import Group
+
+    try:
+        root = Group._from_backend(level_group._backend, "")
+        zv = root.attrs.to_dict().get("zarr_vectors") or {}
+    except Exception:
+        return np.dtype(np.int64)
+    dt = check_block_dtype(zv.get("manifest_block_dtype"))
+    return np.dtype(np.int64) if dt is None else dt
+
+
+def resolve_block_dtype(
+    level_group: Group, requested: Any = None, *, recreate: bool = False,
+) -> np.dtype:
+    """The dtype the blocks a write makes are stored as.
+
+    An index keeps the dtype it was created with: ``requested`` must
+    agree with blocks that exist (:class:`ArrayError` otherwise), unless
+    the write recreates them (``recreate``) -- a full rewrite, which takes
+    ``requested`` when given and the existing dtype when not. New blocks
+    take ``requested``, else the store's ``manifest_block_dtype``.
+    """
+    import zarr
+
+    want = check_block_dtype(requested)
+    node = level_group._lookup_node(BLOCKS_PATH)
+    if isinstance(node, zarr.Array):
+        have = np.dtype(node.dtype)
+        if want is None or want == have:
+            return have
+        if not recreate:
+            raise ArrayError(
+                f"object_index/{BLOCKS_ARRAY} is {have}; an index keeps the dtype "
+                f"it was created with, so block_dtype={want.name!r} cannot "
+                f"write into it (rewrite it in full to change it)"
+            )
+        return want
+    return store_block_dtype(level_group) if want is None else want
+
+
+def fit_blocks(blocks: npt.NDArray[np.int64], dtype: Any, what: str) -> np.ndarray:
+    """``blocks`` as ``dtype``, or :class:`ArrayError` naming a value that does not fit.
+
+    zarr casts a write into an array of a narrower dtype without a check,
+    wrapping what does not fit (2**40 + 5 is stored as 5): every write of
+    blocks into an index goes through this first.
+    """
+    dtype = np.dtype(dtype)
+    blocks = np.asarray(blocks)
+    if blocks.size == 0 or np.can_cast(blocks.dtype, dtype, "safe"):
+        return blocks.astype(dtype, copy=False)
+    info = np.iinfo(dtype)
+    if int(blocks.min()) < info.min or int(blocks.max()) > info.max:
+        bad = np.argwhere((blocks < info.min) | (blocks > info.max))[0]
+        row, col = (int(bad[0]), int(bad[1])) if bad.size > 1 else (int(bad[0]), 0)
+        value = int(blocks[row, col]) if blocks.ndim == 2 else int(blocks[row])
+        kind = (
+            "fragment index" if blocks.ndim == 2 and col == blocks.shape[1] - 1
+            else f"chunk coordinate {col}"
+        )
+        raise ArrayError(
+            f"{what}: {kind} {value} does not fit object_index/{BLOCKS_ARRAY}, "
+            f"which is {dtype.name} ([{info.min}, {info.max}]); an index keeps "
+            f"its dtype, so rewrite it in full as int64 to store this"
+        )
+    return blocks.astype(dtype)
+
+
+def _stamp_block_dtype(level_group: Group, dtype: np.dtype) -> None:
+    """Record a new index's block dtype in its metadata: a narrow one
+    always, ``int64`` only over a stamp a previous index left."""
+    if dtype == np.int64:
+        meta = level_group.read_array_meta(OBJECT_INDEX) if level_group.array_exists(
+            OBJECT_INDEX,
+        ) else {}
+        if BLOCK_DTYPE_ATTR not in (meta or {}):
+            return
+    level_group.write_array_meta(OBJECT_INDEX, {BLOCK_DTYPE_ATTR: np.dtype(dtype).name})
 
 
 # --------------------------------------------------------------------
@@ -367,6 +487,7 @@ def write(
     sid_ndim: int,
     mode: str = "replace",
     at: int | None = None,
+    block_dtype: Any = None,
 ) -> int:
     """Write manifests given as CSR arrays; returns the row they start at.
 
@@ -374,7 +495,11 @@ def write(
     (default: the end), padding a gap with empty objects; an ``at`` before
     the end (a torn flush's residue) truncates the spans there first. The
     object id table and the index metadata are the caller's, as they are
-    for the vlen writer.
+    for the vlen writer -- apart from the ``block_dtype`` stamp of an index
+    this call creates narrow.
+
+    ``block_dtype``: see :func:`resolve_block_dtype`; the blocks written are
+    checked against the dtype they are stored as (:func:`fit_blocks`).
     """
     offsets = np.asarray(offsets, dtype=np.int64)
     coords = np.asarray(coords, dtype=np.int64).reshape(-1, sid_ndim)
@@ -390,6 +515,10 @@ def write(
         raise ArrayError(f"fragment_index must be >= 0, got {int(frags.min())}")
     new_blocks = np.concatenate([coords, frags[:, None]], axis=1)
     exists = level_group.array_exists(SPANS_PATH) and level_group.array_exists(BLOCKS_PATH)
+    dtype = resolve_block_dtype(
+        level_group, block_dtype, recreate=mode == "replace" or not exists,
+    )
+    new_blocks = fit_blocks(new_blocks, dtype, "writing object manifests")
 
     if mode == "replace" or not exists:
         start = 0 if mode == "replace" else int(at or 0)
@@ -399,6 +528,7 @@ def write(
         spans[start:, 1] = counts
         _create(level_group, SPANS_PATH, spans)
         _create(level_group, BLOCKS_PATH, new_blocks)
+        _stamp_block_dtype(level_group, dtype)
         if not exists:
             _declare_capability(level_group)
         return start
@@ -546,10 +676,10 @@ def patch(
     if old.any():
         held[old] = _rows(level_group, SPANS_PATH, rows[old]).reshape(-1, 2)[:, 1] > 0
     b0 = num_blocks(level_group)
-    new_blocks = np.concatenate(
+    new_blocks = fit_blocks(np.concatenate(
         [np.asarray(coords, np.int64).reshape(-1, sid_ndim), np.asarray(frags, np.int64)[:, None]],
         axis=1,
-    )
+    ), _node(level_group, BLOCKS_PATH).dtype, "patch_object_manifests")
     if new_blocks.size:
         level_group.extend_array(BLOCKS_PATH, new_blocks)
     counts = np.diff(np.asarray(offsets, np.int64))

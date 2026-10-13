@@ -376,6 +376,7 @@ def create_store(
     attribute_specs: dict[str, dict[str, Any]] | None = None,
     shard_shape: int | Sequence[int] | None = None,
     manifest_layout: str | None = None,
+    manifest_block_dtype: str | None = None,
     name: str | None = None,
     unit: str | None = None,
     backend: str | None = None,
@@ -477,6 +478,17 @@ def create_store(
             the root as the default for every index created later; an
             index that exists keeps its layout. See
             :mod:`zarr_vectors.core.dense_manifests`.
+        manifest_block_dtype: ``"int32"`` to create dense indexes'
+            ``manifest_blocks`` as int32, which halves the bytes a chunk
+            decodes to (stored, under zstd, a few percent less), for a
+            store whose chunk coordinates and fragment indices all fit
+            in it; ``None`` or ``"int64"`` (the default) for int64.
+            Recorded on the root as the default for every dense index
+            created later (``block_dtype=`` on a writer overrides it); an
+            index keeps the dtype it was created with, and every write
+            into an int32 one raises :class:`ArrayError` on a value that
+            does not fit rather than wrapping it. Spans and ids stay
+            int64, and every reader returns int64.
         name: Human-readable store name, recorded on the RFC 8 ``ome``
             node so an OME collection can present it.  Defaults to the
             store path's last segment with its extension stripped.  Not an
@@ -584,6 +596,7 @@ def create_store(
         attribute_specs=attribute_specs,
         shard_shape=shard_shape,
         manifest_layout=manifest_layout,
+        manifest_block_dtype=manifest_block_dtype,
         name=name,
     )
 
@@ -667,6 +680,7 @@ def _write_root_attrs(
     attribute_specs: dict[str, dict[str, Any]] | None = None,
     shard_shape: int | Sequence[int] | None = None,
     manifest_layout: str | None = None,
+    manifest_block_dtype: str | None = None,
     name: str | None = None,
 ) -> None:
     """Write the ``zarr_vectors`` root-attrs block plus the eager NGFF
@@ -728,6 +742,14 @@ def _write_root_attrs(
         caps = list(zv.get("format_capabilities") or [])
         if CAP_DENSE_MANIFESTS not in caps:
             zv["format_capabilities"] = [*caps, CAP_DENSE_MANIFESTS]
+    if manifest_block_dtype not in (None, "int64", "int32"):
+        raise MetadataError(
+            f"manifest_block_dtype={manifest_block_dtype!r}; expected 'int64' or 'int32'"
+        )
+    if manifest_block_dtype == "int32":
+        # Absent means int64, as absent manifest_layout means vlen. No
+        # capability: every reader already widens the blocks to int64.
+        zv["manifest_block_dtype"] = "int32"
     if attribute_specs:
         # Only non-empty scopes, so a store that declares nothing carries
         # no key at all rather than three empty dicts.

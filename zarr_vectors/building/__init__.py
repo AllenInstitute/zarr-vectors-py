@@ -804,6 +804,7 @@ def write_object_manifests(
     at: int | None = None,
     layout: str | None = None,
     block_at: int | None = None,
+    block_dtype: Any = None,
 ) -> tuple[int, int]:
     """Write object manifests to the level's object index.
 
@@ -852,6 +853,15 @@ def write_object_manifests(
         layout: ``"vlen"`` or ``"dense"`` for an index this call creates.
         block_at: ``mode="place"`` on a dense index: the first row of
             ``manifest_blocks`` this call's fragments occupy.
+        block_dtype: Dense only: ``"int64"`` or ``"int32"``, the dtype of
+            the ``manifest_blocks`` this call creates (default: the
+            store's ``manifest_block_dtype``, else int64). An index keeps
+            the dtype it was created with: an append or a placement into
+            it refuses another value, ``mode="replace"`` rewrites it in
+            the one given (else the one it had). Every block written into
+            an int32 index is checked, and one that does not fit raises
+            :class:`ArrayError` before anything is written. Ignored for a
+            vlen index.
 
     On an index that stores its object ids (layout V2), an append extends
     the id table with ``ids``, or with the rows when the table is simply
@@ -868,8 +878,10 @@ def write_object_manifests(
         _write_dense_index,
         _write_object_index_manifests,
     )
+    from zarr_vectors.core.dense_manifests import check_block_dtype
     from zarr_vectors.encoding.fragments import encode_object_manifests_csr
 
+    check_block_dtype(block_dtype)
     as_arrays = chunk_coords is not None or fragment_idx is not None
     if as_arrays == (manifest_blobs is not None) or (
         as_arrays and (chunk_coords is None or fragment_idx is None)
@@ -888,7 +900,7 @@ def write_object_manifests(
         if not as_arrays:
             return place_manifests(
                 level_group, at, manifest_blobs=manifest_blobs,
-                ids=None if ids is None else _xp.to_host(ids),
+                ids=None if ids is None else _xp.to_host(ids), block_dtype=block_dtype,
             )
         fi = _xp.to_host(fragment_idx, dtype=np.int64).reshape(-1)
         off = (
@@ -899,6 +911,7 @@ def write_object_manifests(
             level_group, at, offsets=off, frags=fi,
             coords=_xp.to_host(chunk_coords, dtype=np.int64),
             ids=None if ids is None else _xp.to_host(ids), block_at=block_at,
+            block_dtype=block_dtype,
         )
     if as_arrays and _index_layout_for_write(level_group, layout) == "dense":
         import numpy as np
@@ -918,6 +931,7 @@ def write_object_manifests(
         first = _write_dense_index(
             level_group, off, cc, fi, mode=mode, at=at,
             ids=None if ids is None else _xp.to_host(ids), sid_ndim=sid,
+            block_dtype=block_dtype,
         )
         return int(first), int(off.size - 1)
     if as_arrays:
@@ -931,6 +945,7 @@ def write_object_manifests(
     first = _write_object_index_manifests(
         level_group, manifest_blobs, mode=mode, at=at,
         ids=None if ids is None else _xp.to_host(ids), layout=layout,
+        block_dtype=block_dtype,
     )
     return int(first), len(manifest_blobs)
 
