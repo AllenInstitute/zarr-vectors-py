@@ -28,8 +28,10 @@ from ._store_compare import assert_stores_identical
 pytestmark = pytest.mark.vlen_only  # dense throughout, chosen here
 
 
-def _old_write(level_group, offsets, coords, frags, *, sid_ndim, mode="replace", at=None):
-    """``dense_manifests.write`` as of 218c633 (read back, rewrite)."""
+def _old_write(level_group, offsets, coords, frags, *, sid_ndim, mode="replace", at=None,
+               block_dtype=None):
+    """``dense_manifests.write`` as of 218c633 (read back, rewrite); it
+    predates ``block_dtype``, which these int64 stores never pass."""
     offsets = np.asarray(offsets, dtype=np.int64)
     coords = np.asarray(coords, dtype=np.int64).reshape(-1, sid_ndim)
     frags = np.asarray(frags, dtype=np.int64).reshape(-1)

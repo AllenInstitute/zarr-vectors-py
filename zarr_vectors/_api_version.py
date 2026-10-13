@@ -31,7 +31,7 @@ from __future__ import annotations
 #: Version of the Python API surface.  Bump the minor when a supported
 #: name is added, the major when one is removed or changes meaning.
 #: Independent of both ``__version__`` and the on-disk format.
-__api_version__ = (1, 4)
+__api_version__ = (1, 5)
 
 #: Capabilities a caller may branch on, each True only when usable.
 FEATURES: frozenset[str] = frozenset({
@@ -162,6 +162,12 @@ FEATURES: frozenset[str] = frozenset({
     # ids keep 16,384); concurrency_contract's block_alignment is the
     # index's own chunk, 16,384 on an index created before.
     "manifest-blocks-64k",
+    # create_store(manifest_block_dtype="int32") and block_dtype= on
+    # write_object_manifests / write_object_index / reserve_object_rows /
+    # object_manifest_writer: a dense index's manifest_blocks as int32,
+    # kept for its life, every write into it range-checked (ArrayError,
+    # never a wrapped value); readers return int64 either way.
+    "manifest-block-dtype",
 })
 
 

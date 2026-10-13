@@ -645,6 +645,15 @@
       "title": "LinksMeta",
       "type": "object"
     },
+    "ManifestBlockDtype": {
+      "description": "Integer dtype a store creates new dense indexes' ``manifest_blocks`` in.",
+      "enum": [
+        "int64",
+        "int32"
+      ],
+      "title": "ManifestBlockDtype",
+      "type": "string"
+    },
     "ManifestLayout": {
       "description": "Object-index layout a store creates new indexes in.",
       "enum": [
@@ -821,6 +830,10 @@
         },
         "links_convention": {
           "$ref": "#/$defs/LinksConvention"
+        },
+        "manifest_block_dtype": {
+          "$ref": "#/$defs/ManifestBlockDtype",
+          "description": "``int32`` when dense object indexes are created with ``int32`` ``manifest_blocks``, absent for the ``int64`` default. A default for indexes created later; each index's ``manifest_blocks`` dtype (its ``zarr.json``) is the truth about it, and every reader widens the blocks to ``int64``. Optional and additive.\n"
         },
         "manifest_layout": {
           "$ref": "#/$defs/ManifestLayout",

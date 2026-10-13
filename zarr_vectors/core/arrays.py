@@ -2370,6 +2370,7 @@ def write_object_index(
     *,
     total_objects: int | None = None,
     layout: str | None = None,
+    block_dtype: Any = None,
 ) -> None:
     """Write object index: object_id → ordered fragment references.
 
@@ -2388,11 +2389,19 @@ def write_object_index(
             :mod:`zarr_vectors.core.dense_manifests`). ``None`` keeps the
             index's current layout, or takes the store's
             ``manifest_layout`` for a new one.
+        block_dtype: Dense only: ``"int64"`` or ``"int32"`` for
+            ``manifest_blocks``. ``None`` keeps a dense index's current
+            dtype, or takes the store's ``manifest_block_dtype``. This
+            rewrites every array, so it may change it.
 
     Raises:
         ArrayError: When ``total_objects`` would add more than
-            :data:`OBJECT_INDEX_MAX_ROWS` rows with no object in them.
+            :data:`OBJECT_INDEX_MAX_ROWS` rows with no object in them, or
+            a block does not fit an ``int32`` index.
     """
+    from zarr_vectors.core.dense_manifests import check_block_dtype
+
+    check_block_dtype(block_dtype)
     if not manifests and total_objects is None:
         return
 
@@ -2422,7 +2431,7 @@ def write_object_index(
         offsets, coords, frags = dense.csr_from_manifests(manifest_list, sid_ndim)
         _write_dense_index(
             level_group, offsets, coords, frags,
-            mode="replace", at=None, ids=None, sid_ndim=sid_ndim,
+            mode="replace", at=None, ids=None, sid_ndim=sid_ndim, block_dtype=block_dtype,
         )
         _write_object_id_table(level_group, row_ids)
         level_group.write_array_meta(OBJECT_INDEX, {
@@ -2557,6 +2566,13 @@ def commit_object_index(
         "sid_ndim": int(sid_ndim),
         "layout": layout,
     }
+    if is_dense and level_group.array_exists(dense.BLOCKS_PATH):
+        # Restated from the array, which is the truth about it: a commit
+        # inside a batched session replaces the document with what it
+        # queued, and a narrow index should keep saying so.
+        dt = np.dtype(level_group._require_array_node(dense.BLOCKS_PATH).dtype)
+        if dt != np.int64 or dense.BLOCK_DTYPE_ATTR in meta:
+            out[dense.BLOCK_DTYPE_ATTR] = dt.name
     table_path = f"{OBJECT_INDEX}/{OBJECT_IDS_ARRAY}"
     if layout in (OBJECT_INDEX_LAYOUT_V2, _LAYOUT_DENSE) and level_group.array_exists(table_path):
         if object_ids_sorted is None:
@@ -2967,13 +2983,25 @@ def _write_dense_index(
     at: int | None,
     ids: Any,
     sid_ndim: int,
+    block_dtype: Any = None,
 ) -> int:
     """Write manifests as CSR arrays to a dense index (see
     :mod:`zarr_vectors.core.dense_manifests`), keeping its id table and
     ``layout`` stamp in step. Returns the first row written."""
     from zarr_vectors.core import dense_manifests as dense
 
+    # The block dtype first, so a refused one (or a block that does not
+    # fit it) fails before anything changes -- the vlen arrays below
+    # included, which a rewrite as dense would otherwise have dropped.
+    recreate = mode == "replace" or not level_group.array_exists(dense.BLOCKS_PATH)
+    dtype = dense.resolve_block_dtype(level_group, block_dtype, recreate=recreate)
     if mode == "replace" and level_group.array_exists(f"{OBJECT_INDEX}/manifests"):
+        dense.fit_blocks(
+            np.concatenate([
+                np.asarray(coords, np.int64).reshape(-1, sid_ndim),
+                np.asarray(frags, np.int64).reshape(-1, 1),
+            ], axis=1), dtype, "writing object manifests",
+        )
         oi = level_group.zarr_group.require_group(OBJECT_INDEX)
         for legacy in ("manifests", "data", "offsets"):
             if legacy in oi:
@@ -2988,6 +3016,7 @@ def _write_dense_index(
         new_ids = _ids_for_append(level_group, start, n0, n, ids)
     first = dense.write(
         level_group, offsets, coords, frags, sid_ndim=sid_ndim, mode=mode, at=at,
+        block_dtype=dtype,
     )
     meta = level_group.read_array_meta(OBJECT_INDEX) or {}
     level_group.write_array_meta(OBJECT_INDEX, {
@@ -3034,6 +3063,7 @@ def _write_object_index_manifests(
     at: int | None = None,
     ids: Any = None,
     layout: str | None = None,
+    block_dtype: Any = None,
 ) -> int:
     """Write ``object_index/manifests`` as a single ragged vlen-bytes array.
 
@@ -3066,7 +3096,7 @@ def _write_object_index_manifests(
 
     On a dense index (see :mod:`zarr_vectors.core.dense_manifests`) the
     blobs are decoded to arrays and written there instead; ``layout``
-    chooses for an index this call creates.
+    (and ``block_dtype``) chooses for an index this call creates.
 
     Returns:
         The row the written blobs start at.
@@ -3077,7 +3107,7 @@ def _write_object_index_manifests(
         offsets, coords, frags = decode_object_manifests_csr(list(manifest_blobs), sid)
         return _write_dense_index(
             level_group, offsets, coords, frags,
-            mode=mode, at=at, ids=ids, sid_ndim=sid,
+            mode=mode, at=at, ids=ids, sid_ndim=sid, block_dtype=block_dtype,
         )
     from zarr_vectors.core import dense_manifests as dense
 

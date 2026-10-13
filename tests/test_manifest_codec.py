@@ -104,7 +104,8 @@ def test_every_writer_creates_the_index_at_level_9(tmp_path, writer):
 def test_a_zstd_session_is_raised_to_level_9(tmp_path, writer):
     """BRIDGE writes inside a session compressing its cells at zstd 5."""
     lg = _level(tmp_path)
-    with lg.chunk_array_codecs([{"name": "zstd", "configuration": {"level": 5, "checksum": False}}]):
+    zstd5 = [{"name": "zstd", "configuration": {"level": 5, "checksum": False}}]
+    with lg.chunk_array_codecs(zstd5):
         WRITERS[writer](lg)
     for name in INDEX_ARRAYS:
         assert _zstd_level(lg, name) == 9, name
@@ -120,7 +121,8 @@ def test_inside_batched_writes_too(tmp_path):
 
 def test_a_session_level_above_9_is_kept(tmp_path):
     lg = _level(tmp_path)
-    with lg.chunk_array_codecs([{"name": "zstd", "configuration": {"level": 15, "checksum": True}}]):
+    zstd15 = [{"name": "zstd", "configuration": {"level": 15, "checksum": True}}]
+    with lg.chunk_array_codecs(zstd15):
         _append(lg)
     zstd = [c for c in _codecs(lg, "manifest_blocks") if c["name"] == "zstd"][0]
     assert zstd["configuration"] == {"level": 15, "checksum": True}

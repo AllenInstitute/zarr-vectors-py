@@ -454,6 +454,13 @@ class RootMetadata:
     default. Optional (0.9.4): absent means vlen, which is every store
     written before it. A default for indexes created later; an existing
     index's own ``layout`` remains the truth about that index."""
+    manifest_block_dtype: str | None = None
+    """``"int32"`` when dense indexes are created with ``int32``
+    ``manifest_blocks``, else ``None`` for the ``int64`` default. A
+    default for indexes created later, like ``manifest_layout``; each
+    index's ``manifest_blocks`` dtype (its ``zarr.json``) is the truth
+    about that index. Optional and additive: every reader widens the
+    blocks to int64, so no reader needs to know it."""
 
     def validate(self) -> None:
         """Validate this metadata object.
@@ -589,6 +596,11 @@ class RootMetadata:
             raise MetadataError(
                 f"manifest_layout={self.manifest_layout!r}; expected 'vlen' or 'dense'"
             )
+        if self.manifest_block_dtype not in (None, "int64", "int32"):
+            raise MetadataError(
+                f"manifest_block_dtype={self.manifest_block_dtype!r}; "
+                f"expected 'int64' or 'int32'"
+            )
         if self.shard_shape is not None:
             try:
                 normalise_shard_shape(self.shard_shape, sid_ndim)
@@ -642,6 +654,8 @@ class RootMetadata:
             )
         if self.manifest_layout == "dense":
             d["zarr_vectors"]["manifest_layout"] = "dense"
+        if self.manifest_block_dtype == "int32":
+            d["zarr_vectors"]["manifest_block_dtype"] = "int32"
         if self.format_capabilities:
             d["zarr_vectors"]["format_capabilities"] = list(self.format_capabilities)
         if self.attribute_specs:
@@ -730,6 +744,7 @@ class RootMetadata:
             ),
             shard_shape=_read_shard_shape(zv.get("shard_shape")),
             manifest_layout=zv.get("manifest_layout"),
+            manifest_block_dtype=zv.get("manifest_block_dtype"),
         )
 
     def is_complete(self) -> bool:
