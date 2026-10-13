@@ -59,19 +59,25 @@ def row_alignment(level_group: Group | None = None) -> tuple[int, int]:
 
     A range must start at a multiple and end at one (or at the reserved
     end), so no two writers touch one storage object: the object layer's
-    shard when it is sharded, else the largest row bucket (65,536
-    attribute rows; a dense index's blocks chunk at 16,384).
+    shard when it is sharded, else the largest row bucket -- 65,536
+    attribute rows, and a dense index's blocks as their array is chunked
+    (65,536 rows when created now, 16,384 in an index created before; a
+    new index's without ``level_group``).
     """
-    from zarr_vectors.core.arrays import (
-        OBJECT_ATTRIBUTE_ROW_BUCKET,
-        OBJECT_INDEX_MANIFEST_BUCKET,
-        object_shard_rows,
-    )
+    import zarr
+
+    from zarr_vectors.core import dense_manifests as dense
+    from zarr_vectors.core.arrays import OBJECT_ATTRIBUTE_ROW_BUCKET, object_shard_rows
 
     rows = object_shard_rows(level_group) if level_group is not None else None
     if rows:
         return int(rows), int(rows)
-    return OBJECT_ATTRIBUTE_ROW_BUCKET, OBJECT_INDEX_MANIFEST_BUCKET
+    blocks = dense.BLOCKS_BUCKET
+    if level_group is not None:
+        node = level_group._lookup_node(dense.BLOCKS_PATH)
+        if isinstance(node, zarr.Array):
+            blocks = int(node.chunks[0])
+    return OBJECT_ATTRIBUTE_ROW_BUCKET, blocks
 
 
 def concurrency_contract(level_group: Group | None = None) -> dict[str, Any]:
@@ -89,7 +95,7 @@ def concurrency_contract(level_group: Group | None = None) -> dict[str, Any]:
       at the reserved end). Then one ``commit_object_index``.
     - ``at_alignment`` / ``block_alignment``: those multiples, for rows
       and (dense index) for ``block_at``; for ``level_group`` if given,
-      else for an unsharded object layer.
+      else for a new, unsharded object layer (65,536 both).
 
     Not covered: the ``at=`` append mode (a resume cursor, one writer at
     a time), metadata writes (one coordinator), and two processes writing
@@ -284,7 +290,7 @@ def reserve_object_rows(
                 if count is not None and _grow(level_group, path, int(count)):
                     touched.append(path)
             else:
-                chunks = (dense._BUCKET, width)
+                chunks = (dense.bucket(path), width)
                 _create_empty(
                     level_group, path, (int(count or 0), width), np.int64, chunks,
                     shards=_shards(chunks), fill_value=0,

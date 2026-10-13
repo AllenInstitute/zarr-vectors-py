@@ -165,7 +165,7 @@ arrays, with no blob per object (`layout: "dense_manifests_v1"`):
 | Key | Type | Contents |
 |-----|------|----------|
 | `manifest_spans` | `int64`, shape `(num_objects, 2)`, chunked at 16,384 rows | Row `o` is `(start, count)`: object row `o` owns rows `start .. start + count` of `manifest_blocks` |
-| `manifest_blocks` | `int64`, shape `(n_blocks, sid_ndim + 1)`, chunked at 16,384 rows | One row per fragment reference: `sid_ndim` chunk coordinates, then the fragment index |
+| `manifest_blocks` | `int64`, shape `(n_blocks, sid_ndim + 1)`, chunked at 65,536 rows (16,384 in an index created before) | One row per fragment reference: `sid_ndim` chunk coordinates, then the fragment index |
 | `object_ids` | `int64`, shape `(num_objects,)` | Row `o`'s object id, as in the `vlen_manifests_v2` layout |
 
 An object's blocks are its manifest, in order. Each block names exactly
@@ -177,12 +177,14 @@ and a patch appends an object's new blocks and rewrites only its span,
 so blocks a patch replaced stay in `manifest_blocks` unreferenced until
 the index is next rewritten in full.
 
-The codecs are each array's own (its `zarr.json`), not part of the
-layout. zarr-vectors-py creates the three arrays with `zstd` at level 9:
+The chunking and the codecs are each array's own (its `zarr.json`), not
+part of the layout: a reader takes both from there. zarr-vectors-py
+chunks the blocks at 65,536 rows, since they outnumber objects and are
+read in long runs, and creates the three arrays with `zstd` at level 9:
 a write session that compresses with `zstd` at a lower level is raised
 to 9 for them, one that compresses with another codec keeps it, and one
-that does not compress gets the default. An index keeps the codecs it
-was created with; a full rewrite creates its arrays afresh.
+that does not compress gets the default. An index keeps the chunking and
+codecs it was created with; a full rewrite creates its arrays afresh.
 
 The layout is chosen per store by the root's `manifest_layout: "dense"`
 (absent means vlen), which also stamps the `dense_manifests`

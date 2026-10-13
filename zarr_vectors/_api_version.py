@@ -158,6 +158,10 @@ FEATURES: frozenset[str] = frozenset({
     # object_ids) are created at zstd level 9, a write session's lower zstd
     # level raised to it; an index that exists keeps its codecs.
     "manifest-codec",
+    # A new dense index chunks manifest_blocks at 65,536 rows (spans and
+    # ids keep 16,384); concurrency_contract's block_alignment is the
+    # index's own chunk, 16,384 on an index created before.
+    "manifest-blocks-64k",
 })
 
 

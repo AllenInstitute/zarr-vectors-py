@@ -218,7 +218,7 @@ def test_the_contract_says_what_is_safe():
 
     c = zv.concurrency_contract()
     assert c["shard_is_unit"] and c["concurrent_at_ranges"]
-    assert c["at_alignment"] == 65_536 and c["block_alignment"] == 16_384
+    assert c["at_alignment"] == 65_536 and c["block_alignment"] == 65_536
     assert zv.runtime_capabilities()["concurrency_contract"]
 
 
