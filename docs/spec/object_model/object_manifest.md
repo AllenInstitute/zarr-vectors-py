@@ -177,6 +177,13 @@ and a patch appends an object's new blocks and rewrites only its span,
 so blocks a patch replaced stay in `manifest_blocks` unreferenced until
 the index is next rewritten in full.
 
+The codecs are each array's own (its `zarr.json`), not part of the
+layout. zarr-vectors-py creates the three arrays with `zstd` at level 9:
+a write session that compresses with `zstd` at a lower level is raised
+to 9 for them, one that compresses with another codec keeps it, and one
+that does not compress gets the default. An index keeps the codecs it
+was created with; a full rewrite creates its arrays afresh.
+
 The layout is chosen per store by the root's `manifest_layout: "dense"`
 (absent means vlen), which also stamps the `dense_manifests`
 capability. That is a default for indexes created later: an index keeps

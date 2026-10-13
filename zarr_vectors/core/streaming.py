@@ -269,7 +269,7 @@ class ObjectIndexAppender:
             )
 
             # Rows are ids here, as in the vlen layout this writes (V1).
-            _write_object_id_table(self._level_group, range(total))
+            _write_object_id_table(self._level_group, range(total), keep_codecs=True)
             self._level_group.write_array_meta(OBJECT_INDEX, {
                 "zv_array": "object_index",
                 "num_objects": total,

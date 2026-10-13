@@ -154,6 +154,10 @@ FEATURES: frozenset[str] = frozenset({
     # read_object_manifests_csr on a dense index reads ascending ids'
     # blocks as slices, with no unique or searchsorted.
     "manifests-csr-ascending",
+    # A new object index's integer arrays (manifest_spans, manifest_blocks,
+    # object_ids) are created at zstd level 9, a write session's lower zstd
+    # level raised to it; an index that exists keeps its codecs.
+    "manifest-codec",
 })
 
 

@@ -54,6 +54,58 @@ _BUCKET = 16_384
 SPANS_PATH = f"{OBJECT_INDEX}/{SPANS_ARRAY}"
 BLOCKS_PATH = f"{OBJECT_INDEX}/{BLOCKS_ARRAY}"
 
+#: zstd level an object index's integer arrays (spans, blocks, the id
+#: table) are created with. They are long, repetitive integer tables --
+#: ascending spans and ids, coordinates that repeat for every fragment of
+#: a cell -- written in bulk and read in long runs, where zstd keeps
+#: gaining well past the level a cell write can afford: on two BRIDGE
+#: indexes' blocks, level 9 stores 0.71-0.77x the bytes of level 5 at the
+#: same chunk, still encoding at ~250 MB/s.
+MANIFEST_ZSTD_LEVEL = 9
+
+
+def manifest_codecs(level_group: Group) -> list[dict[str, Any]]:
+    """The codec pipeline a new object-index integer array is created with.
+
+    The write session's codec (``batched_writes`` / ``chunk_array_codecs``
+    / ``open_write_session``) is chosen for the chunk arrays it writes,
+    cells written in a hot loop, so it decides the codec here but not
+    always the level:
+
+    - a session compressing with zstd: its pipeline, at level
+      :data:`MANIFEST_ZSTD_LEVEL` when it asks for less;
+    - a session compressing with anything else (blosc, ...): its
+      pipeline as it is;
+    - no session, or one that does not compress (what ``compressor=None``
+      resolves to): ``bytes`` + zstd at :data:`MANIFEST_ZSTD_LEVEL`.
+
+    Only creation reads it: an array that exists keeps its codecs. A
+    caller that wants another pipeline creates the array itself
+    (``Group.write_array(compressors=)``), and the writers append to it.
+    """
+    session = list(level_group._active_codecs or ())
+    if not any(c.get("name") != "bytes" for c in session):
+        return [
+            {"name": "bytes"},
+            {"name": "zstd", "configuration": {"level": MANIFEST_ZSTD_LEVEL, "checksum": False}},
+        ]
+    out = []
+    for codec in session:
+        codec = dict(codec)
+        if codec.get("name") == "zstd":
+            cfg = dict(codec.get("configuration") or {})
+            cfg["level"] = max(int(cfg.get("level", 0)), MANIFEST_ZSTD_LEVEL)
+            cfg.setdefault("checksum", False)
+            codec["configuration"] = cfg
+        out.append(codec)
+    return out
+
+
+def existing_codecs(node: Any) -> list[dict[str, Any]]:
+    """``node``'s own pipeline, as a codecs list: for rewriting an array
+    of an index that exists, which keeps the codecs it was created with."""
+    return [{"name": "bytes"}, *(c.to_dict() for c in node.compressors)]
+
 
 def is_dense(level_group: Group, meta: dict[str, Any] | None = None) -> bool:
     """Whether ``level_group``'s object index uses this layout.
@@ -264,6 +316,7 @@ def _create(level_group: Group, path: str, data: npt.NDArray[np.int64]) -> None:
     chunks = (_BUCKET, *data.shape[1:])
     level_group.write_array(
         path, data, chunks=chunks, shards=_object_shards(level_group, chunks),
+        compressors=manifest_codecs(level_group),
     )
 
 
