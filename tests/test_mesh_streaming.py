@@ -145,3 +145,39 @@ def test_metadata_snapshot_is_reused_but_geometry_is_read_again(store):
         np.testing.assert_array_equal(first["vertices"], second["vertices"])
     with pytest.raises(RuntimeError, match="closed"):
         reader.read([(0, 0, 0)])
+
+
+def test_budget_boundary_includes_all_dependency_vertices_and_faces(store):
+    # Three chunks, each holding one float32 XYZ vertex, plus one int64 face.
+    with MeshReader(store[0]) as reader:
+        result = reader.read([(0, 0, 0)], max_bytes=3 * 3 * 4 + 3 * 8)
+        assert result["face_count"] == 1
+        with pytest.raises(MemoryError, match="limit"):
+            reader.read([(0, 0, 0)], max_bytes=3 * 3 * 4 + 3 * 8 - 1)
+
+
+def test_failed_initialization_exits_metadata_scope(store, monkeypatch):
+    active = 0
+    cached_nodes = Group.cached_nodes
+    read_meta = Group.read_array_meta
+
+    @contextmanager
+    def track_scope(group):
+        nonlocal active
+        with cached_nodes(group):
+            active += 1
+            try:
+                yield
+            finally:
+                active -= 1
+
+    def fail_vertices(group, name):
+        if name == "vertices":
+            raise RuntimeError("fixture metadata failure")
+        return read_meta(group, name)
+
+    monkeypatch.setattr(Group, "cached_nodes", track_scope)
+    monkeypatch.setattr(Group, "read_array_meta", fail_vertices)
+    with pytest.raises(RuntimeError, match="fixture metadata failure"):
+        MeshReader(store[0])
+    assert active == 0
