@@ -34,6 +34,12 @@ It compares the actual oriented triangle coordinates, counts buffers returned
 by a real Zarr Store wrapper (including batched range reads), and records
 metadata discovery separately from query reads.
 
+Without a checkout, the same pinned script can be run remotely:
+
+```text
+uv run https://raw.githubusercontent.com/kephale/zarr-vectors-py/refs/heads/feat/bounded-mesh-reads/examples/mesh_read_reproducer.py
+```
+
 Recorded local result:
 
 | Query | Returned faces | Encoded payload bytes | Metadata bytes |
