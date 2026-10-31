@@ -5928,6 +5928,7 @@ def read_link_arrays(
     *,
     delta: int = 0,
     include_intra: bool = True,
+    source_chunks: Sequence[ChunkCoords] | None = None,
 ) -> tuple[npt.NDArray[np.int64], npt.NDArray[np.int64]]:
     """Every link record under ``links/<delta>/`` as two arrays.
 
@@ -5944,6 +5945,11 @@ def read_link_arrays(
     plus a local index -- that is one gather over these arrays.  A
     ``store="duplicate"`` family returns each record once per copy,
     like :func:`read_links`.
+
+    ``source_chunks`` restricts ownership cells, not endpoint chunks. All
+    endpoints of an owned record are returned, including those outside the
+    selection. This lets streaming clients resolve boundary dependencies
+    without reading connectivity belonging to the rest of the level.
 
     Returns empty ``(0, 0, 0)`` / ``(0, 0)`` arrays when the family is
     absent or holds no rows.
@@ -5995,7 +6001,11 @@ def read_link_arrays(
 
         cell_rows: list[npt.NDArray[np.int64]] = []
         cell_chunks: list[tuple[ChunkCoords, ...]] = []
-        for cell_key in sorted(level_group.list_chunks(arr_name)):
+        available_cells = set(level_group.list_chunks(arr_name))
+        selected_cells = available_cells if source_chunks is None else (
+            available_cells & {_chunk_key(tuple(cc)) for cc in source_chunks}
+        )
+        for cell_key in sorted(selected_cells):
             blob = level_group.read_bytes(arr_name, cell_key)
             if not blob:
                 continue

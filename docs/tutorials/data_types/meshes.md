@@ -161,6 +161,10 @@ clearly when distributing stores.
 
 ## Reading a mesh
 
+For out-of-core rendering that must preserve faces crossing chunk boundaries,
+see [ownership-based mesh streaming](mesh_streaming.md). Its additive raw-mesh
+reader selects face ownership cells and resolves their vertex dependencies.
+
 ### Read all data
 
 ```python
