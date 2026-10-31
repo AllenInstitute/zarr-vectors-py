@@ -251,16 +251,19 @@ so rather than mis-pairing values with positions: it comes back with
 
 ### Spatial bbox query
 
-A bbox query returns faces whose centroid is within the bounding box, plus
-all vertices referenced by those faces (which may lie slightly outside the
-bbox):
+The existing `read_mesh` bbox query filters vertices to the bounding box and
+keeps only faces whose endpoints survive. A face crossing the boundary can
+therefore disappear. It is not centroid selection or geometric clipping.
+For complete boundary faces in an out-of-core renderer, use the additive
+[ownership-based mesh reader](mesh_streaming.md), which selects stored face
+owners and fetches their referenced vertices.
 
 ```python
 result = read_mesh(
     "brain.zarrvectors",
     bbox=(np.array([0., 0., 0.]), np.array([50., 50., 50.])),
 )
-print(result["face_count"])      # faces with centroid in the bbox region
+print(result["face_count"])      # faces whose vertices survived the filter
 ```
 
 ---
@@ -461,7 +464,8 @@ point inward, fix it at ingest time (the OBJ/STL/PLY converters in
 the normals post-hoc.
 
 **Boundary face resolution requires fetching extra chunks.**
-A face whose centroid is in chunk A but one vertex is in chunk B requires
-fetching chunk B to resolve the vertex position. The reader does this
-automatically, but it means a bbox query may issue slightly more chunk
-reads than the number of chunks in the bbox. This is expected behaviour.
+A face owned by source cell A can reference a vertex in chunk B. The
+ownership-based `MeshReader` resolves these dependencies automatically, so it
+can fetch vertex chunks outside the selected owners. The existing `read_mesh`
+vertex-filtering API has a different contract and does not guarantee complete
+boundary triangles.

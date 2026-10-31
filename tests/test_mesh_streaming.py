@@ -115,3 +115,33 @@ def test_draco_is_explicitly_rejected(tmp_path):
     )
     with pytest.raises(NotImplementedError, match="Draco"):
         MeshReader(path)
+
+
+def test_metadata_snapshot_is_reused_but_geometry_is_read_again(store):
+    from zarr.storage import LocalStore, WrapperStore
+
+    class Counter(WrapperStore):
+        def __init__(self, path):
+            super().__init__(LocalStore(path, read_only=True))
+            self.metadata_reads = 0
+            self.payload_reads = 0
+
+        async def get(self, key, prototype, byte_range=None):
+            result = await self._store.get(key, prototype, byte_range)
+            if result is not None:
+                if key.endswith("zarr.json"):
+                    self.metadata_reads += 1
+                else:
+                    self.payload_reads += 1
+            return result
+
+    counter = Counter(store[0])
+    with MeshReader(counter) as reader:
+        first = reader.read([(0, 0, 0)])
+        metadata_before, payload_before = counter.metadata_reads, counter.payload_reads
+        second = reader.read([(0, 0, 0)])
+        assert counter.metadata_reads == metadata_before
+        assert counter.payload_reads > payload_before
+        np.testing.assert_array_equal(first["vertices"], second["vertices"])
+    with pytest.raises(RuntimeError, match="closed"):
+        reader.read([(0, 0, 0)])

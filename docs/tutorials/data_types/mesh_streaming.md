@@ -11,6 +11,7 @@ for chunk in reader.chunks:
     print(chunk.key, chunk.bounds)
     mesh = reader.read([chunk.key], max_bytes=128 << 20)
     # mesh["vertices"] and mesh["faces"] are self-contained.
+reader.close()
 ```
 
 Each chunk key names a **stored canonical face source cell**, not a centroid
@@ -36,6 +37,12 @@ Missing referenced vertices and invalid face indices raise; incomplete surfaces
 are not returned as successful reads. No object-ID selection or mesh attributes
 are promised. Construct independent readers for concurrent reads, or serialize
 calls to one reader.
+
+Metadata is snapshotted for the reader lifetime. It reuses the root-relative
+node and cell-listing caches and passes pre-resolved offsets families into the
+link reader. Construct a fresh reader after mutations. Use `with MeshReader(...)`
+or `close()` to end the read-only metadata scope. A repeated query still reads
+geometry payloads; this is metadata reuse, not an unbounded decoded-mesh cache.
 
 The accompanying Lodstone branch uses one reader for each explicitly selected
 surface level. A coarse metavertex pyramid without triangle connectivity is

@@ -7,6 +7,7 @@ The existing data API's bbox/vertex filtering remains unchanged.
 
 from __future__ import annotations
 
+from contextlib import ExitStack
 from dataclasses import dataclass
 from typing import Any
 
@@ -50,10 +51,24 @@ class MeshReader:
     Draco is explicitly unsupported: its intra-cell faces require a separate
     decode path and boundary indices need validation against decoder ordering.
     A reader is not thread safe; serialize calls or construct independent ones.
+    Metadata is a read-only snapshot for the lifetime of this reader. Construct
+    a fresh reader after any store mutation, and close it when finished.
     """
 
     def __init__(self, source: Any, *, level: int = 0) -> None:
+        self._contexts = ExitStack()
+        self._closed = False
+        try:
+            self._initialize(source, level)
+        except BaseException:
+            self.close()
+            raise
+
+    def _initialize(self, source: Any, level: int) -> None:
         self.root = open_store(source)
+        # Derive the level INSIDE this scope so it shares the root-relative
+        # cache. Starting a root scope later leaves an existing group uncached.
+        self._contexts.enter_context(self.root.cached_nodes())
         self.group = get_resolution_level(self.root, level)
         root_meta = read_root_metadata(self.root)
         if root_meta.sid_ndim != 3:
@@ -113,6 +128,8 @@ class MeshReader:
         connectivity and fragment indices are read to discover that size;
         their I/O/decode scratch is additional to the limit.
         """
+        if self._closed:
+            raise RuntimeError("MeshReader is closed")
         if max_bytes is not None and max_bytes <= 0:
             raise ValueError("max_bytes must be positive")
         owners = sorted(set(tuple(c) for c in chunks))
@@ -121,7 +138,12 @@ class MeshReader:
         owner_keys = {".".join(str(c) for c in owner) for owner in owners}
         plan = [(path, sorted(keys & owner_keys)) for path, keys in self._cells.items()]
         with self.root.cached_nodes(), self.group.batched_reads(plan):
-            face_chunks, face_vi = read_link_arrays(self.group, source_chunks=owners)
+            segments = [path.removeprefix("links/0/") for path in self._cells]
+            face_chunks, face_vi = read_link_arrays(
+                self.group,
+                source_chunks=owners,
+                offset_segments=segments,
+            )
         if face_vi.size == 0:
             return {
                 "vertices": np.empty((0, 3), dtype=self.dtype),
@@ -171,3 +193,16 @@ class MeshReader:
             "vertex_count": len(vertices),
             "face_count": len(faces),
         }
+
+    def close(self) -> None:
+        if not self._closed:
+            self._closed = True
+            self._contexts.close()
+
+    def __enter__(self) -> MeshReader:
+        if self._closed:
+            raise RuntimeError("MeshReader is closed")
+        return self
+
+    def __exit__(self, *args: Any) -> None:
+        self.close()
