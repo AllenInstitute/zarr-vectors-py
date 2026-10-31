@@ -1,3 +1,7 @@
+---
+orphan: true
+---
+
 # Complete boundary faces without a global connectivity read
 
 Selecting one vertex chunk with `read_mesh(chunks=...)` can drop a triangle
