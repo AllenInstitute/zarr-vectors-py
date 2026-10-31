@@ -227,7 +227,7 @@ The repository uses GitHub Actions with two jobs:
 - Coverage report.
 - Runs in < 15 minutes.
 
-Both jobs run on Python 3.10, 3.11, and 3.12.
+Both jobs run on Python 3.11 and 3.12.
 
 ### Adding a fixture for a new geometry type
 
