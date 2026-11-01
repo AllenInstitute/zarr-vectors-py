@@ -161,6 +161,9 @@ clearly when distributing stores.
 
 ## Reading a mesh
 
+For complete faces across chunk boundaries, use the
+[ownership-based mesh reader](mesh_streaming.md).
+
 ### Read all data
 
 ```python
@@ -247,16 +250,16 @@ so rather than mis-pairing values with positions: it comes back with
 
 ### Spatial bbox query
 
-A bbox query returns faces whose centroid is within the bounding box, plus
-all vertices referenced by those faces (which may lie slightly outside the
-bbox):
+`read_mesh` keeps vertices inside the bbox and faces whose endpoints all
+survive. Boundary-crossing faces can disappear. For complete faces, use
+[ownership-based reads](mesh_streaming.md).
 
 ```python
 result = read_mesh(
     "brain.zarrvectors",
     bbox=(np.array([0., 0., 0.]), np.array([50., 50., 50.])),
 )
-print(result["face_count"])      # faces with centroid in the bbox region
+print(result["face_count"])      # faces whose vertices survived the filter
 ```
 
 ---
@@ -457,7 +460,5 @@ point inward, fix it at ingest time (the OBJ/STL/PLY converters in
 the normals post-hoc.
 
 **Boundary face resolution requires fetching extra chunks.**
-A face whose centroid is in chunk A but one vertex is in chunk B requires
-fetching chunk B to resolve the vertex position. The reader does this
-automatically, but it means a bbox query may issue slightly more chunk
-reads than the number of chunks in the bbox. This is expected behaviour.
+`MeshReader` fetches vertices outside the selected face owners when needed.
+`read_mesh` vertex filtering can discard boundary-crossing faces.

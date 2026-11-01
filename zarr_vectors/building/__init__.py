@@ -246,6 +246,8 @@ from zarr_vectors.types.skeletons import (
     write_skeleton_cross_chunk_links,
 )
 
+from .mesh_reader import MeshChunkInfo, MeshReader
+
 #: The subset of :class:`Group`'s methods this module promises.
 #:
 #: ``Group`` is re-exported here, but it carries ~40 public methods and a
@@ -602,6 +604,8 @@ def rebuild_presence(
 
 
 __all__ = [
+    "MeshChunkInfo",
+    "MeshReader",
     "CAP_FRAGMENT_INDEX",
     "CAP_MULTISCALE_LINKS",
     "CAP_PRESERVED_OBJECT_IDS",

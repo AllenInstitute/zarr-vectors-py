@@ -5928,6 +5928,8 @@ def read_link_arrays(
     *,
     delta: int = 0,
     include_intra: bool = True,
+    source_chunks: Sequence[ChunkCoords] | None = None,
+    offset_segments: Sequence[str] | None = None,
 ) -> tuple[npt.NDArray[np.int64], npt.NDArray[np.int64]]:
     """Every link record under ``links/<delta>/`` as two arrays.
 
@@ -5945,6 +5947,14 @@ def read_link_arrays(
     ``store="duplicate"`` family returns each record once per copy,
     like :func:`read_links`.
 
+    ``source_chunks`` restricts ownership cells, not endpoint chunks. All
+    endpoints of an owned record are returned, including those outside the
+    selection. This lets streaming clients resolve boundary dependencies
+    without reading connectivity belonging to the rest of the level.
+
+    A read-only metadata snapshot may supply ``offset_segments`` to avoid
+    enumerating and resolving every family child again on each fragment read.
+
     Returns empty ``(0, 0, 0)`` / ``(0, 0)`` arrays when the family is
     absent or holds no rows.
     """
@@ -5961,7 +5971,12 @@ def read_link_arrays(
     sid_ndim = int(fam_meta["sid_ndim"])
     directed = bool(fam_meta.get("directed", False))
     store = str(fam_meta.get("store", "canonical"))
-    scale_src, scale_trg = _link_scales(level_group, delta, sid_ndim)
+    # Same-level anchoring is identity at any chunk scale. Reading the root
+    # again to derive two equal scales adds metadata I/O but no information.
+    if delta == 0:
+        scale_src = scale_trg = (1,) * sid_ndim
+    else:
+        scale_src, scale_trg = _link_scales(level_group, delta, sid_ndim)
 
     # inverse[p] gathers a placed row back into input order: the
     # ``out[sigma[i]] = placed[i]`` of apply_perm_inverse, as one index.
@@ -5969,7 +5984,11 @@ def read_link_arrays(
 
     chunk_parts: list[npt.NDArray[np.int64]] = []
     vi_parts: list[npt.NDArray[np.int64]] = []
-    for seg in list_link_offsets(level_group, delta):
+    segments = (
+        list_link_offsets(level_group, delta)
+        if offset_segments is None else sorted(set(offset_segments))
+    )
+    for seg in segments:
         arr_name = f"{family}/{seg}"
         try:
             offsets = parse_offsets(
@@ -5995,7 +6014,11 @@ def read_link_arrays(
 
         cell_rows: list[npt.NDArray[np.int64]] = []
         cell_chunks: list[tuple[ChunkCoords, ...]] = []
-        for cell_key in sorted(level_group.list_chunks(arr_name)):
+        available_cells = set(level_group.list_chunks(arr_name))
+        selected_cells = available_cells if source_chunks is None else (
+            available_cells & {_chunk_key(tuple(cc)) for cc in source_chunks}
+        )
+        for cell_key in sorted(selected_cells):
             blob = level_group.read_bytes(arr_name, cell_key)
             if not blob:
                 continue
