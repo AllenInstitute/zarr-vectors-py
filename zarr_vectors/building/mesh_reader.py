@@ -20,6 +20,7 @@ from zarr_vectors.core.arrays import (
     list_link_offsets,
     read_link_arrays,
 )
+from zarr_vectors.core.group import Group
 from zarr_vectors.core.metadata import get_level_chunk_shape
 from zarr_vectors.core.paths import links_group_path, parse_offsets
 from zarr_vectors.core.store import (
@@ -65,7 +66,13 @@ class MeshReader:
             raise
 
     def _initialize(self, source: Any, level: int) -> None:
-        self.root = open_store(source)
+        opened = open_store(source)
+        # Own the snapshot lifetime even when the caller lends us a Group.
+        # Preserve offline-read state, but detach from the caller's caches.
+        self.root = Group._from_zarr(opened._zarr, _parent=opened)
+        self.root._node_cache = None
+        self.root._node_cache_readonly = False
+        self.root._listing_cache = None
         # Derive the level INSIDE this scope so it shares the root-relative
         # cache. Starting a root scope later leaves an existing group uncached.
         self._contexts.enter_context(self.root.cached_nodes())
@@ -73,6 +80,12 @@ class MeshReader:
         root_meta = read_root_metadata(self.root)
         if root_meta.sid_ndim != 3:
             raise NotImplementedError("MeshReader currently supports spatial 3-D meshes")
+        level_meta = read_level_metadata(self.root, level)
+        if level_meta.chunk_attribute_name is not None or (
+            level_meta.chunk_dims is not None and len(level_meta.chunk_dims) != 3
+        ):
+            raise NotImplementedError("MeshReader does not support attribute-chunked meshes")
+        self._fragments_tile = level_meta.fragments_tile
         vertex_meta = self.group.read_array_meta("vertices")
         if vertex_meta.get("encoding", "raw") != "raw":
             raise NotImplementedError("MeshReader currently supports raw meshes, not Draco")
@@ -88,7 +101,7 @@ class MeshReader:
         shape = np.asarray(
             get_level_chunk_shape(
                 root_meta,
-                read_level_metadata(self.root, level),
+                level_meta,
             ),
             dtype=float,
         )
@@ -127,6 +140,8 @@ class MeshReader:
         output faces exceed the limit, before fetching vertex payloads. Owned
         connectivity and fragment indices are read to discover that size;
         their I/O/decode scratch is additional to the limit.
+        Budgeted reads require a verified ``fragments_tile`` level claim;
+        otherwise the index cannot bound unused physical rows in the buffer.
         """
         if self._closed:
             raise RuntimeError("MeshReader is closed")
@@ -154,6 +169,11 @@ class MeshReader:
         dependencies = sorted(set(map(tuple, face_chunks.reshape(-1, 3))))
         vertex_keys = [".".join(str(c) for c in cc) for cc in dependencies]
         if max_bytes is not None:
+            if not self._fragments_tile:
+                raise NotImplementedError(
+                    "max_bytes requires a verified fragments_tile level; "
+                    "fragment indices alone cannot bound the stored vertex buffers"
+                )
             with self.group.batched_reads([("vertex_fragments", vertex_keys)]):
                 counts = [chunk_vertex_count(self.group, cc, default=-1) for cc in dependencies]
             if any(count < 0 for count in counts):
@@ -173,6 +193,8 @@ class MeshReader:
                 # Indices address physical rows, not concatenated fragment views:
                 # explicit/shared fragments may overlap or reorder those rows.
                 block = np.frombuffer(blob, dtype=self.dtype).reshape(-1, 3)
+                if max_bytes is not None and len(block) != counts[len(positions)]:
+                    raise ArrayError("vertex buffer contradicts the fragments_tile level claim")
                 offsets[cc] = count
                 sizes[cc] = len(block)
                 count += len(block)
@@ -197,7 +219,19 @@ class MeshReader:
     def close(self) -> None:
         if not self._closed:
             self._closed = True
-            self._contexts.close()
+            try:
+                self._contexts.close()
+            finally:
+                # Derived Groups retain the cache dictionaries even after the
+                # root context exits. Drop our handles and discovery index;
+                # never clear dictionaries another handle might still use.
+                self._cells = {}
+                self._keys = set()
+                self.chunks = ()
+                if hasattr(self, "group"):
+                    del self.group
+                if hasattr(self, "root"):
+                    del self.root
 
     def __enter__(self) -> MeshReader:
         if self._closed:

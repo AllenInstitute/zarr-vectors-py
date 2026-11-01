@@ -21,14 +21,20 @@ several results. Bounds conservatively cover the owner's endpoint chunks.
 
 ## Limits
 
-- Raw spatial 3-D meshes only; Draco and duplicate ownership are rejected.
+- Raw spatial 3-D meshes only; Draco, attribute chunking and duplicate ownership
+  are rejected explicitly.
 - Each requested level must store surface connectivity. A pyramid of coarse
   vertices alone is not a mesh LOD. The reader does not generate simpler meshes.
 - `max_bytes` checks dependency vertex and output face-index sizes before
   loading vertices. Selected connectivity and fragment indices are read first;
   metadata and decode/remapping scratch are additional. This is not an RSS cap.
+  Budgeted reads require a verified `fragments_tile` level flag, which bulk mesh
+  writers set after checking the layout. Without it,
+  unused buffer rows cannot be sized from fragment indices, so the reader
+  rejects the budgeted query before loading vertices. Unbudgeted reads still work.
 - Discovery lists all connectivity cells. Metadata stays cached until `close()`;
-  geometry is read again on each query. Use a fresh reader after store changes.
+  geometry is read again on each query. Closing releases the reader's snapshot
+  and index without clearing a caller's caches. Use a fresh reader after store changes.
 - Serialize calls to one reader, or use independent readers. Missing vertices
   and invalid face indices raise errors. Object selection and attributes are unsupported.
 

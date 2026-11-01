@@ -181,3 +181,90 @@ def test_failed_initialization_exits_metadata_scope(store, monkeypatch):
     with pytest.raises(RuntimeError, match="fixture metadata failure"):
         MeshReader(store[0])
     assert active == 0
+
+
+def test_budget_rejects_unindexed_tail_before_fetching_vertices(store, monkeypatch):
+    from zarr_vectors.building import get_resolution_level, open_store
+    from zarr_vectors.validate import validate
+
+    path, _, _ = store
+    group = get_resolution_level(open_store(path, mode="r+"), 0)
+    blob = group.read_bytes("vertices", "0.0.0")
+    group.write_bytes("vertices", "0.0.0", blob + np.ones((3000, 3), np.float32).tobytes())
+    assert validate(path, level=3).ok
+    vertex_reads = []
+    original_batch = Group.batched_reads
+
+    @contextmanager
+    def track(group, plan):
+        plan = list(plan)
+        vertex_reads.extend(keys for name, keys in plan if name == "vertices")
+        with original_batch(group, plan):
+            yield
+
+    monkeypatch.setattr(Group, "batched_reads", track)
+    with MeshReader(path) as reader:
+        with pytest.raises(NotImplementedError, match="fragments_tile"):
+            reader.read([(0, 0, 0)], max_bytes=60)
+        assert vertex_reads == []
+        # No budget: the physical-row decoder still supports this valid layout.
+        assert reader.read([(0, 0, 0)])["face_count"] == 1
+
+
+def test_attribute_chunking_is_rejected_explicitly(tmp_path):
+    path = tmp_path / "attribute.zv"
+    write_mesh(
+        path,
+        np.array([[1., 1., 1.], [2., 1., 1.], [1., 2., 1.]], np.float32),
+        np.array([[0, 1, 2]]),
+        chunk_shape=(10., 10., 10.),
+        vertex_attributes={"kind": np.ones(3, dtype=np.int64)},
+        chunk_by_attribute="kind",
+    )
+    with pytest.raises(NotImplementedError, match="attribute"):
+        MeshReader(path)
+
+
+def test_close_releases_reader_owned_snapshot_and_discovery(store):
+    import weakref
+
+    reader = MeshReader(store[0])
+    root, group = weakref.ref(reader.root), weakref.ref(reader.group)
+    reader.close()
+    reader.close()
+    assert root() is None
+    assert group() is None
+    assert reader.chunks == ()
+    assert not reader._cells
+    assert not reader._keys
+
+
+def test_readers_do_not_change_borrowed_cache_lifetimes(store):
+    from zarr_vectors.building import open_store
+
+    root = open_store(store[0])
+    with root.cached_nodes():
+        nodes, listings = root._node_cache, root._listing_cache
+        first, second = MeshReader(root), MeshReader(root)
+        first.close()
+        assert root._node_cache is nodes
+        assert root._listing_cache is listings
+        assert second.read([(0, 0, 0)])["face_count"] == 1
+        second.close()
+        assert root._node_cache is nodes
+        assert root._listing_cache is listings
+    assert root._node_cache is None
+
+
+def test_readers_own_snapshots_even_without_a_caller_cache(store):
+    from zarr_vectors.building import open_store
+
+    root = open_store(store[0])
+    first, second = MeshReader(root), MeshReader(root)
+    assert root._node_cache is None
+    assert first.root._node_cache is not second.root._node_cache
+    first.close()
+    assert root._node_cache is None
+    assert second.read([(0, 0, 0)])["face_count"] == 1
+    second.close()
+    assert root._node_cache is None
