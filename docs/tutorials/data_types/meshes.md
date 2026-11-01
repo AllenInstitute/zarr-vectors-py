@@ -161,9 +161,8 @@ clearly when distributing stores.
 
 ## Reading a mesh
 
-For out-of-core rendering that must preserve faces crossing chunk boundaries,
-see [ownership-based mesh streaming](mesh_streaming.md). Its additive raw-mesh
-reader selects face ownership cells and resolves their vertex dependencies.
+For complete faces across chunk boundaries, use the
+[ownership-based mesh reader](mesh_streaming.md).
 
 ### Read all data
 
@@ -251,12 +250,9 @@ so rather than mis-pairing values with positions: it comes back with
 
 ### Spatial bbox query
 
-The existing `read_mesh` bbox query filters vertices to the bounding box and
-keeps only faces whose endpoints survive. A face crossing the boundary can
-therefore disappear. It is not centroid selection or geometric clipping.
-For complete boundary faces in an out-of-core renderer, use the additive
-[ownership-based mesh reader](mesh_streaming.md), which selects stored face
-owners and fetches their referenced vertices.
+`read_mesh` keeps vertices inside the bbox and faces whose endpoints all
+survive. Boundary-crossing faces can disappear. For complete faces, use
+[ownership-based reads](mesh_streaming.md).
 
 ```python
 result = read_mesh(
@@ -464,8 +460,5 @@ point inward, fix it at ingest time (the OBJ/STL/PLY converters in
 the normals post-hoc.
 
 **Boundary face resolution requires fetching extra chunks.**
-A face owned by source cell A can reference a vertex in chunk B. The
-ownership-based `MeshReader` resolves these dependencies automatically, so it
-can fetch vertex chunks outside the selected owners. The existing `read_mesh`
-vertex-filtering API has a different contract and does not guarantee complete
-boundary triangles.
+`MeshReader` fetches vertices outside the selected face owners when needed.
+`read_mesh` vertex filtering can discard boundary-crossing faces.
