@@ -1,6 +1,6 @@
 # /// script
 # requires-python = ">=3.11"
-# dependencies = ["zarr-vectors @ git+https://github.com/kephale/zarr-vectors-py@c2c16dcf3e0b475369b01be4f39484427888a628"]
+# dependencies = ["zarr-vectors @ git+https://github.com/kephale/zarr-vectors-py@ca77de173c2ed973b3e70522c68e85680685e6b5"]
 # ///
 """Independent boundary-face and encoded-store I/O reproducer. No Lodstone needed."""
 
