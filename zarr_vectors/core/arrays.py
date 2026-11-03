@@ -4544,8 +4544,11 @@ def read_fragment(
     """Read a single vertex fragment from a chunk.
 
     Dispatches on the ``vertex_fragments/<chunk>`` index: range fragments
-    use a byte-slice fast path; explicit fragments reshape the full chunk
-    buffer and gather rows via ``fi.indices(fragment_index)``.
+    use a byte-slice fast path -- on an uncompressed array a byte-range
+    read of just the fragment's rows (:meth:`Group.read_cell_range`),
+    otherwise a slice of the whole chunk buffer; explicit fragments
+    reshape the full chunk buffer and gather rows via
+    ``fi.indices(fragment_index)``.
 
     Args:
         level_group: Resolution level group.
@@ -4567,6 +4570,18 @@ def read_fragment(
     dtype = np.dtype(dtype)
 
     try:
+        if level_group.range_readable(VERTICES):
+            # Uncompressed: the index says where the rows are, and only
+            # those bytes are read -- the rest of the chunk never is.
+            fi = read_vertex_fragment_index(level_group, chunk_coords)
+            if 0 <= fragment_index < fi.num_fragments:
+                span = fragment_byte_range(
+                    fi, fragment_index, dtype.itemsize * int(ndim),
+                )
+                if span is not None:
+                    raw = level_group.read_cell_range(VERTICES, key, *span)
+                    _, count = fi.range(fragment_index)
+                    return _slice_vertex_range(raw, 0, count, dtype, ndim)
         with _maybe_batched_reads(level_group, [
             (VERTICES, [key]),
             (VERTEX_FRAGMENTS, [key]),
@@ -6282,15 +6297,17 @@ def read_link_arrays(
             level_group.list_chunks(arr_name) if cells is None else cells[seg]
         )
         for cell_key in sorted(cell_keys):
-            blob = level_group.read_bytes(arr_name, cell_key)
-            if not blob:
-                continue
-            rows_arr = _link_cell_rows(
-                blob, ncols=ncols, flat=flat, dtype=cell_dtype,
-            )
             if flat and link_fragments is not None and cell_key in link_fragments:
                 rows_arr = _link_fragment_rows(
-                    level_group, cell_key, rows_arr, link_fragments[cell_key],
+                    level_group, arr_name, cell_key, link_fragments[cell_key],
+                    ncols=ncols, dtype=cell_dtype,
+                )
+            else:
+                blob = level_group.read_bytes(arr_name, cell_key)
+                if not blob:
+                    continue
+                rows_arr = _link_cell_rows(
+                    blob, ncols=ncols, flat=flat, dtype=cell_dtype,
                 )
             if rows_arr.size == 0:
                 continue
@@ -6336,28 +6353,125 @@ def read_link_arrays(
 
 def _link_fragment_rows(
     level_group: Group,
+    arr_name: str,
     cell_key: str,
-    rows: npt.NDArray[np.int64],
     fragments: Sequence[int],
+    *,
+    ncols: int,
+    dtype: np.dtype,
 ) -> npt.NDArray[np.int64]:
     """The rows of the named link fragments of one intra-chunk cell.
+
+    Each range fragment is fetched as its own byte range where the array
+    allows it (:meth:`Group.read_cell_range`), so on an uncompressed
+    store the rest of the cell is never read; otherwise the cell is read
+    whole, once, and the fragments sliced out of it.
 
     Raises:
         ArrayError: If a named fragment is not in the cell's index -- a
             claim of alignment that the store does not bear out.
     """
     fi = read_link_fragment_index(level_group, _parse_chunk_key(cell_key))
-    parts: list[npt.NDArray[np.int64]] = []
     for f in fragments:
         if f < 0 or f >= fi.num_fragments:
             raise ArrayError(
                 f"link fragment {f} of chunk {cell_key} requested, but the "
                 f"cell has {fi.num_fragments}"
             )
-        parts.append(fragment_rows(rows, fi, int(f)))
+    row_bytes = int(dtype.itemsize) * int(ncols)
+    spans = [fragment_byte_range(fi, int(f), row_bytes) for f in fragments]
+    if level_group.range_readable(arr_name) and all(sp is not None for sp in spans):
+        parts = [
+            np.frombuffer(
+                level_group.read_cell_range(arr_name, cell_key, a, b), dtype=dtype,
+            ).reshape(-1, ncols)
+            for a, b in spans
+        ]
+        if not parts:
+            return np.empty((0, ncols), dtype=np.int64)
+        return np.concatenate(parts, axis=0).astype(np.int64, copy=False)
+    blob = level_group.read_bytes(arr_name, cell_key)
+    rows = _link_cell_rows(blob, ncols=ncols, flat=True, dtype=dtype)
+    parts = [fragment_rows(rows, fi, int(f)) for f in fragments]
     if not parts:
         return rows[:0]
     return np.concatenate(parts, axis=0)
+
+
+def fragment_byte_range(
+    fi: ChunkFragmentIndex, fragment: int, row_bytes: int,
+) -> tuple[int, int] | None:
+    """Payload bytes of a range fragment's rows, or ``None`` for an
+    explicit (gathered) fragment, which has no single span."""
+    if not fi.is_range(fragment):
+        return None
+    start, count = fi.range(fragment)
+    return int(start) * row_bytes, (int(start) + int(count)) * row_bytes
+
+
+def vertex_range_requests(
+    level_group: Group,
+    fragments: Iterable[tuple[ChunkCoords, int]],
+    *,
+    dtype: np.dtype | str,
+    ndim: int,
+) -> list[tuple[str, str, int, int]]:
+    """The ``batched_range_reads`` requests :func:`read_fragment` will make
+    for ``(chunk, fragment)`` pairs, so a caller can prefetch them in one
+    gather.  Explicit fragments, and arrays that cannot be range-read,
+    contribute nothing: those reads go whole-cell either way."""
+    if not level_group.range_readable(VERTICES):
+        return []
+    row_bytes = np.dtype(dtype).itemsize * int(ndim)
+    out: list[tuple[str, str, int, int]] = []
+    for cc, f in fragments:
+        try:
+            fi = read_vertex_fragment_index(level_group, cc)
+        except (ArrayError, StoreError):
+            continue
+        if not 0 <= f < fi.num_fragments:
+            continue
+        span = fragment_byte_range(fi, int(f), row_bytes)
+        if span is not None:
+            out.append((VERTICES, _chunk_key(cc), *span))
+    return out
+
+
+def link_range_requests(
+    level_group: Group,
+    link_fragments: Mapping[str, Sequence[int]],
+) -> list[tuple[str, str, int, int]]:
+    """The requests ``read_link_arrays(link_fragments=...)`` will make
+    against the intra-chunk array at delta 0, for prefetching -- see
+    :func:`vertex_range_requests`."""
+    policy = link_family_policy(level_group, 0)
+    if policy is None or policy[1] is None:
+        return []
+    link_width, sid_ndim, directed, store = policy
+    offsets = intra_offsets(sid_ndim, link_width)
+    arr_name = links_path(0, offsets)
+    if not level_group.range_readable(arr_name):
+        return []
+    arr_meta = level_group.read_array_meta(arr_name) or {}
+    has_perm = bool(arr_meta.get(
+        "has_perm",
+        links_has_perm(offsets, delta=0, directed=directed, store=store),
+    ))
+    ncols = (1 + link_width) if has_perm else link_width
+    row_bytes = np.dtype(arr_meta.get("dtype", "int64")).itemsize * ncols
+    out: list[tuple[str, str, int, int]] = []
+    for cell_key, frags in link_fragments.items():
+        try:
+            fi = read_link_fragment_index(level_group, _parse_chunk_key(cell_key))
+        except (ArrayError, StoreError):
+            continue
+        for f in frags:
+            if not 0 <= f < fi.num_fragments:
+                continue
+            span = fragment_byte_range(fi, int(f), row_bytes)
+            if span is not None:
+                out.append((arr_name, cell_key, *span))
+    return out
 
 
 def link_endpoints_to_rows(

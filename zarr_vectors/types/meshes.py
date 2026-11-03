@@ -35,6 +35,7 @@ from zarr_vectors.constants import (
     VERTICES,
 )
 from zarr_vectors.core.arrays import (
+    chunk_vertex_count,
     create_attribute_array,
     create_links_array,
     create_object_attributes_array,
@@ -42,15 +43,17 @@ from zarr_vectors.core.arrays import (
     create_vertices_array,
     link_cells_within,
     link_endpoints_to_rows,
+    link_range_requests,
     list_link_offsets,
-    read_chunk_vertex_buffer,
     read_chunk_vertices,
+    read_fragment,
     read_link_arrays,
     read_object_manifests,
     read_vertex_fragment_index,
     resolve_chunk_keys,
     stamp_fragments_tile,
     stamp_link_fragments_aligned,
+    vertex_range_requests,
     write_chunk_attributes,
     write_chunk_vertices,
     write_links,
@@ -65,7 +68,7 @@ from zarr_vectors.core.metadata import (
     LevelMetadata,
     get_level_chunk_shape,
 )
-from zarr_vectors.core.paths import links_group_path
+from zarr_vectors.core.paths import format_offsets, intra_offsets, links_group_path
 from zarr_vectors.core.store import (
     FsGroup,
     _apply_out_of_bounds_policy,
@@ -734,16 +737,37 @@ def _read_mesh_objects(
     obj_chunks = sorted({cc for _, cc, _ in entries})
     link_cells = link_cells_within(level_group, obj_chunks)
     key_strs = [".".join(str(c) for c in cc) for cc in obj_chunks]
-    plan: list[tuple[str, list[str]]] = [
-        (VERTICES, key_strs),
-        (VERTEX_FRAGMENTS, key_strs),
-        *_link_plan(level_group, link_cells),
-    ]
+    intra_seg = format_offsets(intra_offsets(len(obj_chunks[0]), link_width))
     link_fragments: dict[str, list[int]] | None = None
     if aligned:
+        intra_keys = set(link_cells.get(intra_seg, ()))
         link_fragments = {}
         for _, cc, frag in entries:
-            link_fragments.setdefault(".".join(str(c) for c in cc), []).append(frag)
+            key = ".".join(str(c) for c in cc)
+            if key in intra_keys:
+                link_fragments.setdefault(key, []).append(frag)
+
+    # Two rounds.  The first reads indices -- vertex and link fragment
+    # indices, and the cross-chunk face cells, which have none -- whole.
+    # The second reads the objects' own rows: as byte ranges where the
+    # arrays are uncompressed, in which case the vertex cells and the
+    # intra-chunk face cells are left out of the first round entirely;
+    # otherwise from whole cells the first round fetched.
+    vertex_ranged = level_group.range_readable(VERTICES)
+    intra_ranged = link_fragments is not None and level_group.range_readable(
+        f"{links_group_path(0)}/{intra_seg}",
+    )
+    plan_cells = (
+        {seg: keys for seg, keys in link_cells.items() if seg != intra_seg}
+        if intra_ranged else link_cells
+    )
+    plan: list[tuple[str, list[str]]] = [
+        (VERTEX_FRAGMENTS, key_strs),
+        *_link_plan(level_group, plan_cells),
+    ]
+    if not vertex_ranged:
+        plan.append((VERTICES, key_strs))
+    if link_fragments is not None:
         plan.append((LINK_FRAGMENTS, key_strs))
 
     positions: list[npt.NDArray] = []
@@ -751,39 +775,44 @@ def _read_mesh_objects(
     # Chunk-local row -> output row, -1 where the row is not ours.  This
     # is the whole face filter: a face survives when every endpoint maps.
     row_maps: dict[ChunkCoords, npt.NDArray[np.int64]] = {}
-    chunk_state: dict[ChunkCoords, tuple[Any, npt.NDArray]] = {}
     running = 0
     with level_group.batched_reads(plan):
-        for oid, cc, frag in entries:
-            state = chunk_state.get(cc)
-            if state is None:
-                fi = read_vertex_fragment_index(level_group, cc)
-                full = read_chunk_vertex_buffer(
-                    level_group, cc, dtype=dtype, ndim=ndim,
-                )
-                state = chunk_state[cc] = (fi, full)
-                row_maps[cc] = np.full(len(full), -1, dtype=np.int64)
-            fi, full = state
-            if frag >= fi.num_fragments:
-                raise ArrayError(
-                    f"object {oid}'s manifest names fragment {frag} of chunk "
-                    f"{cc}, which has {fi.num_fragments}"
-                )
-            if fi.is_range(frag):
-                start, count = fi.range(frag)
-                rows = np.arange(start, start + count, dtype=np.int64)
-            else:
-                rows = np.asarray(fi.indices(frag), dtype=np.int64)
-            row_maps[cc][rows] = np.arange(
-                running, running + len(rows), dtype=np.int64,
-            )
-            positions.append(full[rows])
-            owners.append(np.full(len(rows), oid, dtype=np.int64))
-            running += len(rows)
-
-        face_chunks, face_vi = read_link_arrays(
-            level_group, delta=0, cells=link_cells, link_fragments=link_fragments,
+        ranges = vertex_range_requests(
+            level_group, [(cc, frag) for _, cc, frag in entries],
+            dtype=dtype, ndim=ndim,
         )
+        if link_fragments:
+            ranges += link_range_requests(level_group, link_fragments)
+        with level_group.batched_range_reads(ranges):
+            for oid, cc, frag in entries:
+                fi = read_vertex_fragment_index(level_group, cc)
+                if frag >= fi.num_fragments:
+                    raise ArrayError(
+                        f"object {oid}'s manifest names fragment {frag} of "
+                        f"chunk {cc}, which has {fi.num_fragments}"
+                    )
+                if cc not in row_maps:
+                    row_maps[cc] = np.full(
+                        chunk_vertex_count(level_group, cc), -1, dtype=np.int64,
+                    )
+                if fi.is_range(frag):
+                    start, count = fi.range(frag)
+                    rows = np.arange(start, start + count, dtype=np.int64)
+                else:
+                    rows = np.asarray(fi.indices(frag), dtype=np.int64)
+                row_maps[cc][rows] = np.arange(
+                    running, running + len(rows), dtype=np.int64,
+                )
+                positions.append(
+                    read_fragment(level_group, cc, frag, dtype=dtype, ndim=ndim),
+                )
+                owners.append(np.full(len(rows), oid, dtype=np.int64))
+                running += len(rows)
+
+            face_chunks, face_vi = read_link_arrays(
+                level_group, delta=0, cells=link_cells,
+                link_fragments=link_fragments,
+            )
 
     positions_out = np.concatenate(positions, axis=0)
     owners_out = np.concatenate(owners)

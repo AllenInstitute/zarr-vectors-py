@@ -145,6 +145,9 @@ class Group:
     _pending_writes: list[tuple[str, str, bytes, bool]] | None = None
     _pending_array_metas: dict[str, dict[str, Any]] | None = None
     _prefetch_cache: dict[tuple[str, str], bytes] | None = None
+    # ``{RangeRequest: bytes}`` while a :meth:`batched_range_reads` block
+    # is open; see :meth:`read_cell_range`.
+    _range_cache: dict[Any, bytes] | None = None
     # Active codec spec for chunk-array writes, set by
     # :meth:`batched_writes(compressor=...)`.  ``None`` means callers fall
     # back to zarr v3's default codec pipeline (``bytes`` + ``zstd``).
@@ -213,6 +216,8 @@ class Group:
         # Prefetch cache activated by :meth:`batched_reads`.  When set,
         # :meth:`read_bytes` looks here first before hitting the store.
         self._prefetch_cache = None
+        # Range cache activated by :meth:`batched_range_reads`.
+        self._range_cache = None
         self._active_codecs = None
         self._native_sharded_config = None
         self._node_cache = None
@@ -232,6 +237,7 @@ class Group:
         instance._pending_writes = None
         instance._pending_array_metas = None
         instance._prefetch_cache = None
+        instance._range_cache = None
         instance._active_codecs = None
         # An offline snapshot covers the whole tree, so a Group derived
         # from one stays offline; without this a level group would fall
@@ -990,6 +996,114 @@ class Group:
                 f"{self._zarr.path or '<root>'}"
             )
         return _vlen_get_cell(sharded_arr, index)
+
+    def read_cell_range(
+        self, array_name: str, chunk_key: str, start: int, stop: int,
+    ) -> bytes:
+        """Payload bytes ``[start, stop)`` of one cell.
+
+        ``read_bytes(array_name, chunk_key)[start:stop]``, without
+        fetching the rest of the cell where the array allows it: an
+        uncompressed cell is read as just those bytes (see
+        :func:`~zarr_vectors.core._batch_reader.fetch_ranges`).  Anything
+        else -- a compressed array, an offline read, a range the store
+        cannot serve -- reads the whole cell and slices it, so the
+        answer is the same either way and only its cost differs.
+
+        Served from :meth:`batched_reads` (whole cells) or
+        :meth:`batched_range_reads` (this range) when either holds it.
+        """
+        start, stop = int(start), int(stop)
+        if stop <= start:
+            return b""
+        if self._offline is None:
+            if self._prefetch_cache is not None:
+                cell = self._prefetch_cache.get((array_name, chunk_key))
+                if cell is not None:
+                    return cell[start:stop]
+            from zarr_vectors.core._batch_reader import RangeRequest
+
+            req = RangeRequest(array_name, chunk_key, start, stop)
+            if self._range_cache is not None:
+                hit = self._range_cache.get(req)
+                if hit is not None:
+                    return hit
+            got = self._fetch_ranges([req]).get(req)
+            if got is not None:
+                return got
+        return self.read_bytes(array_name, chunk_key)[start:stop]
+
+    @contextmanager
+    def batched_range_reads(
+        self, requests: Sequence[tuple[str, str, int, int]],
+    ) -> Iterator[None]:
+        """Fetch every ``(array_name, chunk_key, start, stop)`` range in
+        one go and serve :meth:`read_cell_range` from the result.
+
+        :meth:`batched_reads` for ranges: a reader that has read its
+        fragment indices knows every row it needs, and asking for them
+        together costs one gather rather than a round-trip each.  A
+        range the store cannot serve on its own is simply not cached;
+        :meth:`read_cell_range` then reads its whole cell, as it would
+        have outside the block.
+
+        Offline, every planned range is recorded as a miss of its whole
+        cell -- the snapshot is cell-granular -- exactly as
+        :meth:`batched_reads` records its plan.
+
+        Nesting is not supported and raises :class:`StoreError`.
+        """
+        if self._range_cache is not None:
+            raise StoreError("batched_range_reads() does not support nesting")
+        if self._offline is not None:
+            plan: dict[str, list[str]] = {}
+            for array_name, chunk_key, _start, _stop in requests:
+                plan.setdefault(array_name, []).append(chunk_key)
+            self._record_planned_misses(list(plan.items()))
+            yield
+            return
+        from zarr_vectors.core._batch_reader import RangeRequest
+
+        self._range_cache = self._fetch_ranges([
+            RangeRequest(a, k, int(s), int(e)) for a, k, s, e in requests
+        ])
+        try:
+            yield
+        finally:
+            self._range_cache = None
+
+    def range_readable(self, array_name: str) -> bool:
+        """Can :meth:`read_cell_range` fetch part of a cell of
+        ``array_name`` without reading all of it?
+
+        True for an uncompressed vlen-bytes array, sharded or not, on a
+        store that serves byte ranges; False offline and on icechunk,
+        whose reads are cell-granular.  A reader uses it to decide
+        whether reading an index first and the rows second is worth the
+        extra round-trip over reading both whole in one gather.
+        """
+        if self._offline is not None:
+            return False
+        from zarr_vectors.core._batch_reader import (
+            _is_icechunk_store,
+            _range_layout,
+        )
+
+        if _is_icechunk_store(self._zarr.store):
+            return False
+        return _range_layout(self._sharded_chunk_array(array_name)) is not None
+
+    def _fetch_ranges(self, requests: list[Any]) -> dict[Any, bytes]:
+        """:func:`~zarr_vectors.core._batch_reader.fetch_ranges` with this
+        handle's resolved arrays and direct-read specs."""
+        from zarr_vectors.core._batch_reader import fetch_ranges
+
+        names = {r.array_name for r in requests}
+        return fetch_ranges(
+            self._zarr, requests,
+            {name: self._sharded_chunk_array(name) for name in names},
+            specs={name: self._direct_spec_cached(name) for name in names},
+        )
 
     def chunk_exists(self, array_name: str, chunk_key: str) -> bool:
         sharded_arr = self._sharded_chunk_array(array_name)
