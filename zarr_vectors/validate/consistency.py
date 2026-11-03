@@ -9,6 +9,7 @@ import numpy as np
 
 from zarr_vectors.core.arrays import (
     chunk_fragments_tile,
+    chunk_link_fragments_aligned,
     list_chunk_keys,
     read_chunk_vertex_buffer,
     read_chunk_vertices,
@@ -133,6 +134,12 @@ def validate_consistency(store_path: str | Path | Group) -> ValidationResult:
         claims_tiling = bool(
             getattr(level_meta_obj, "fragments_tile", False),
         )
+        # Likewise ``link_fragments_aligned``: an object read takes only
+        # its own link fragments, so a misfiled record is a face that
+        # silently goes missing.
+        claims_alignment = bool(
+            getattr(level_meta_obj, "link_fragments_aligned", False),
+        )
 
         for ck in chunk_keys:
             try:
@@ -155,6 +162,13 @@ def validate_consistency(store_path: str | Path | Group) -> ValidationResult:
                         f"does not tile its buffer"
                     )
                     claims_tiling = False   # one report per level is enough
+
+            if claims_alignment and not chunk_link_fragments_aligned(lg, ck):
+                result.add_error(
+                    f"{prefix}: link_fragments_aligned is set but chunk {ck}'s "
+                    f"intra-chunk links are not filed by vertex fragment"
+                )
+                claims_alignment = False
 
             # Check fragment count doesn't exceed bins_per_chunk
             # (only for undifferentiated point clouds with explicit bins)

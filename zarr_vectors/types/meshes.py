@@ -50,6 +50,7 @@ from zarr_vectors.core.arrays import (
     read_vertex_fragment_index,
     resolve_chunk_keys,
     stamp_fragments_tile,
+    stamp_link_fragments_aligned,
     write_chunk_attributes,
     write_chunk_vertices,
     write_links,
@@ -302,8 +303,11 @@ def write_mesh(
     link_chunks = np.asarray(chunk_list, dtype=np.int64)[f_chunk[store_rows]]
     link_vi = f_local[store_rows]
 
-    # Write vertices per chunk (one fragment per chunk for simplicity)
+    # Write vertices per chunk, one fragment per object in the chunk.
     object_manifests: dict[int, ObjectManifest] = {}
+    # First row of each chunk's vertex fragments, so write_links can file
+    # each chunk's intra-chunk faces one link fragment per vertex fragment.
+    fragment_starts: dict[ChunkCoords, npt.NDArray[np.int64]] = {}
     idx_ndim = ndim + 1 if vertex_attr_bins is not None else ndim
 
     # Collapse all per-array zarr.json + per-chunk byte writes into one
@@ -362,6 +366,7 @@ def write_mesh(
                     level_group, chunk_coords,
                     np.split(chunk_verts, split_at), dtype=np_dtype,
                 )
+                fragment_starts[chunk_coords] = frag_starts
                 # One fragment per object, in the order just written; the
                 # fragments still tile [0, N) so the bulk-read fast path
                 # (stamp_fragments_tile) keeps its claim.
@@ -385,10 +390,14 @@ def write_mesh(
         # local_vertex_idx)`` endpoints, and ``write_links`` routes it to
         # the offsets array naming where those endpoints sit.  Winding is
         # recovered on read from ``perm_idx``, so the family is undirected.
+        # Intra-chunk faces are filed one link fragment per vertex
+        # fragment -- i.e. per object -- so an object read can take its
+        # own faces without decoding its neighbours'.
         if len(link_vi):
             write_links(
                 level_group, [], idx_ndim, delta=0,
                 link_width=link_width, _arrays=(link_chunks, link_vi),
+                fragment_starts=fragment_starts or None,
             )
         # Backstop: `arrays_present` advertises the family, and the
         # per-cell editors in ops/ write into an array that must already
@@ -413,6 +422,8 @@ def write_mesh(
     # index.  Verified against what is on disk, and stamped after
     # the chunk writes -- see stamp_fragments_tile.
     stamp_fragments_tile(level_group, ndim)
+    if fragment_starts:
+        stamp_link_fragments_aligned(level_group)
     _finalize_write(root, "write_mesh")
     return {
         "vertex_count": n_verts,
@@ -594,6 +605,7 @@ def _read_mesh(
             dtype=dtype,
             ndim=ndim,
             link_width=link_width,
+            aligned=bool(level_meta and level_meta.link_fragments_aligned),
         )
     assert chunk_keys is not None
 
@@ -684,6 +696,7 @@ def _read_mesh_objects(
     dtype: np.dtype,
     ndim: int,
     link_width: int,
+    aligned: bool = False,
 ) -> dict[str, Any]:
     """:func:`read_mesh` for ``object_ids=``: the named objects and nothing else.
 
@@ -696,6 +709,13 @@ def _read_mesh_objects(
 
     ``scope`` is the chunk set a ``bbox`` / ``chunks`` / attribute filter
     narrowed the read to, or ``None``; fragments outside it are dropped.
+
+    ``aligned`` is the level's ``link_fragments_aligned`` claim.  Under
+    it a chunk's intra-chunk faces are filed one link fragment per vertex
+    fragment, so only the objects' own link fragments are taken from
+    each cell; without it the whole cell is taken and filtered.  The
+    filter runs either way, so a face shared with an object not asked
+    for is dropped on both paths.
     """
     wanted: list[int] = list(dict.fromkeys(int(o) for o in object_ids))
     manifests = read_object_manifests(level_group, ids=wanted) if wanted else {}
@@ -719,6 +739,12 @@ def _read_mesh_objects(
         (VERTEX_FRAGMENTS, key_strs),
         *_link_plan(level_group, link_cells),
     ]
+    link_fragments: dict[str, list[int]] | None = None
+    if aligned:
+        link_fragments = {}
+        for _, cc, frag in entries:
+            link_fragments.setdefault(".".join(str(c) for c in cc), []).append(frag)
+        plan.append((LINK_FRAGMENTS, key_strs))
 
     positions: list[npt.NDArray] = []
     owners: list[npt.NDArray[np.int64]] = []
@@ -756,7 +782,7 @@ def _read_mesh_objects(
             running += len(rows)
 
         face_chunks, face_vi = read_link_arrays(
-            level_group, delta=0, cells=link_cells,
+            level_group, delta=0, cells=link_cells, link_fragments=link_fragments,
         )
 
     positions_out = np.concatenate(positions, axis=0)

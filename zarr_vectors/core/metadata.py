@@ -672,6 +672,25 @@ class LevelMetadata:
     Absent (the default) means "unknown", which is what every store
     written before this field says, and costs only the read it would
     otherwise have saved."""
+    link_fragments_aligned: bool = False
+    """True when, in EVERY chunk of this level, the intra-chunk link
+    array at delta 0 carries one link fragment per vertex fragment, and
+    link fragment ``k`` holds exactly the records whose first stored
+    endpoint lies in vertex fragment ``k``.
+
+    That is the partition §7.5 describes ("each link fragment is the set
+    of link rows belonging to one vertex fragment"), and it is what lets
+    an object read take its faces or edges from its own link fragments
+    instead of decoding and filtering every record in the chunk -- and,
+    on an uncompressed store, fetch only those rows.
+
+    A claim about what has not happened since, like ``fragments_tile``:
+    stamped by a bulk writer after its chunk writes, and cleared by
+    :meth:`Group.write_bytes` on any later write to ``vertex_fragments``,
+    ``link_fragments`` or the intra-chunk link array.  A stale True loses
+    records silently, so absent (the default, and what every earlier
+    store says) means "unknown" and readers fall back to filtering the
+    whole cell."""
 
     def to_dict(self) -> dict[str, Any]:
         """Serialise to a JSON-compatible dict."""
@@ -704,6 +723,8 @@ class LevelMetadata:
             d["shared_fragments"] = True
         if self.fragments_tile:
             d["fragments_tile"] = True
+        if self.link_fragments_aligned:
+            d["link_fragments_aligned"] = True
         return {"zarr_vectors_level": d}
 
     @classmethod
@@ -750,6 +771,7 @@ class LevelMetadata:
             inherited_num_objects=lv.get("inherited_num_objects"),
             shared_fragments=bool(lv.get("shared_fragments", False)),
             fragments_tile=bool(lv.get("fragments_tile", False)),
+            link_fragments_aligned=bool(lv.get("link_fragments_aligned", False)),
         )
 
     def validate(self) -> None:

@@ -2800,6 +2800,7 @@ def write_links(
     mode: Literal["replace", "append"] = "replace",
     directed: bool = False,
     store: Literal["canonical", "duplicate"] = "canonical",
+    fragment_starts: Mapping[ChunkCoords, npt.NDArray[np.integer]] | None = None,
     _prepartitioned: dict[tuple[str, ChunkCoords], Any] | None = None,
     _link_width: int | None = None,
     _num_records: int | None = None,
@@ -2856,6 +2857,17 @@ def write_links(
             Duplicated records are returned once per copy by
             :func:`read_links`; the parallel attribute family replicates
             identically via the returned partition.
+        fragment_starts: Per chunk, the first row of each of its vertex
+            fragments, for a writer whose fragments are contiguous row
+            ranges tiling the chunk.  Each intra-chunk cell is then
+            written as one link fragment per vertex fragment -- fragment
+            ``k`` holding the records whose first stored endpoint is a
+            row of vertex fragment ``k``, empty ones included -- which
+            is the partition spec §7.5 gives ``link_fragments``.  Rows
+            keep their input order within a fragment, and the returned
+            partition follows the reordering, so link attributes still
+            align.  ``delta=0`` and ``mode="replace"`` only.  ``None``
+            (default) writes each cell as a single fragment.
 
     Returns:
         :class:`LinkPartition` describing where each input record landed.
@@ -2882,6 +2894,12 @@ def write_links(
     if store not in ("canonical", "duplicate"):
         raise ArrayError(
             f"store must be 'canonical' or 'duplicate', got {store!r}"
+        )
+    if fragment_starts is not None and (delta != 0 or mode != "replace"):
+        raise ArrayError(
+            "fragment_starts= groups intra-chunk links by vertex fragment, "
+            f"which applies to delta=0 replace writes only (got delta={delta}, "
+            f"mode={mode!r})"
         )
     if _arrays is not None and int(np.asarray(_arrays[1]).shape[0]) == 0:
         _arrays = None
@@ -2971,6 +2989,15 @@ def write_links(
             )
     family = links_group_path(delta)
     fam_meta = level_group.read_array_meta(family) or {}
+
+    # Intra-chunk cells regrouped one link fragment per vertex fragment;
+    # ``intra_split`` holds each regrouped cell's fragment sizes.
+    intra_split: dict[tuple[str, ChunkCoords], npt.NDArray[np.int64]] = {}
+    if fragment_starts is not None:
+        buckets, intra_split = _group_intra_by_fragment(
+            buckets, fragment_starts,
+            sid_ndim=sid_ndim, link_width=link_width,
+        )
 
     # Grouped once. The write loop below used to rescan every bucket for
     # each targeted segment, which is quadratic in the number of distinct
@@ -3079,7 +3106,11 @@ def write_links(
                     level_group, src_chunk, delta=delta, offsets=offsets,
                     dtype=dtype, width=rows.shape[1], default=[],
                 ))
-            groups.append(rows)
+            sizes = intra_split.get((seg, src_chunk))
+            if sizes is not None:
+                groups.extend(np.split(rows, np.cumsum(sizes)[:-1]))
+            else:
+                groups.append(rows)
             # Route through the per-cell writer so the flat+sidecar vs
             # inline-blob choice has exactly one definition.
             write_chunk_links(
@@ -3113,6 +3144,58 @@ def write_links(
         num_physical_records=new_physical_total,
         first_new=first_new,
     )
+
+
+def _group_intra_by_fragment(
+    buckets: dict[tuple[str, ChunkCoords], Any],
+    fragment_starts: Mapping[ChunkCoords, npt.NDArray[np.integer]],
+    *,
+    sid_ndim: int,
+    link_width: int,
+) -> tuple[
+    dict[tuple[str, ChunkCoords], Any],
+    dict[tuple[str, ChunkCoords], npt.NDArray[np.int64]],
+]:
+    """Reorder each intra-chunk bucket so its rows run vertex fragment by
+    vertex fragment, for :func:`write_links` ``fragment_starts=``.
+
+    Returns the reordered buckets -- input indices permuted with the rows,
+    so the partition built from them still names the record each stored
+    row came from -- and, per regrouped bucket, the row count of every
+    fragment (one per vertex fragment, zeros included).
+    """
+    intra_seg = format_offsets(intra_offsets(sid_ndim, link_width))
+    out = dict(buckets)
+    sizes: dict[tuple[str, ChunkCoords], npt.NDArray[np.int64]] = {}
+    for (seg, src), entries in buckets.items():
+        if seg != intra_seg:
+            continue
+        starts = fragment_starts.get(tuple(src))
+        if starts is None:
+            continue
+        starts = np.asarray(starts, dtype=np.int64)
+        if isinstance(entries, tuple):
+            rows, idx = np.asarray(entries[0]), np.asarray(entries[1])
+            first = rows[:, 0]
+        else:
+            first = np.fromiter(
+                (vi[0] for vi, _, _ in entries), dtype=np.int64, count=len(entries),
+            )
+        # Intra-chunk rows carry no perm_idx (links_has_perm), so column
+        # 0 is the first stored endpoint.
+        owner = np.searchsorted(starts, first, side="right") - 1
+        if owner.size and int(owner.min()) < 0:
+            raise ArrayError(
+                f"links in chunk {src} reference rows before the chunk's "
+                f"first vertex fragment (starts at {int(starts[0])})"
+            )
+        order = np.argsort(owner, kind="stable")
+        if isinstance(entries, tuple):
+            out[(seg, src)] = (rows[order], idx[order])
+        else:
+            out[(seg, src)] = [entries[i] for i in order.tolist()]
+        sizes[(seg, src)] = np.bincount(owner, minlength=len(starts)).astype(np.int64)
+    return out, sizes
 
 
 def _stamp_link_family_meta(
@@ -4200,6 +4283,92 @@ def stamp_fragments_tile(level_group: Group, ndim: int) -> bool:
     # The stamp is this handle's last word; a later chunk write must be
     # able to clear it again.
     level_group._tiling_claim_settled = False
+    return True
+
+
+def stamp_link_fragments_aligned(level_group: Group) -> bool:
+    """Record that every intra-chunk link cell is grouped by vertex fragment.
+
+    Called by a bulk writer that passed ``fragment_starts=`` to
+    :func:`write_links`, once its chunk writes are done -- after, for the
+    reason :func:`stamp_fragments_tile` gives.  Returns what it stamped.
+
+    Checked as far as the indices allow: every chunk holding an
+    intra-chunk link cell must have exactly as many link fragments as
+    vertex fragments.  That is two small index reads per chunk and
+    catches a writer that did not group at all.  Which record went to
+    which fragment is the writer's construction and is not re-derived
+    here; ``validate_consistency`` does that, at the cost of decoding
+    every cell.
+    """
+    policy = link_family_policy(level_group, 0)
+    if policy is None:
+        return False
+    link_width, sid_ndim, _directed, _store = policy
+    if sid_ndim is None:
+        return False
+    intra_path = links_path(0, intra_offsets(sid_ndim, link_width))
+    if not level_group.array_exists(intra_path):
+        return False
+    keys = level_group.list_chunks(intra_path)
+    if not keys:
+        return False
+    with _maybe_batched_reads(level_group, [
+        (VERTEX_FRAGMENTS, keys),
+        (LINK_FRAGMENTS, keys),
+    ]):
+        for key in keys:
+            cc = _parse_chunk_key(key)
+            try:
+                n_vertex = read_vertex_fragment_index(level_group, cc).num_fragments
+                n_link = read_link_fragment_index(level_group, cc).num_fragments
+            except (ArrayError, StoreError):
+                return False
+            if n_vertex != n_link:
+                return False
+
+    level = level_group.attrs.get(_LEVEL_META_KEY)
+    if not isinstance(level, dict):
+        return False
+    level_group.attrs.update({
+        _LEVEL_META_KEY: {**level, "link_fragments_aligned": True},
+    })
+    level_group._alignment_claim_settled = False
+    return True
+
+
+def chunk_link_fragments_aligned(
+    level_group: Group,
+    chunk_coords: ChunkCoords,
+) -> bool:
+    """Does this chunk bear out the ``link_fragments_aligned`` claim?
+
+    The full check :func:`stamp_link_fragments_aligned` leaves to the
+    validator: the intra-chunk cell has one link fragment per vertex
+    fragment, and every record in link fragment ``k`` has its first
+    stored endpoint among vertex fragment ``k``'s rows.  Decodes the
+    cell.  A chunk with no intra-chunk records holds trivially.
+    """
+    try:
+        fi = read_vertex_fragment_index(level_group, chunk_coords)
+        groups = read_chunk_links(level_group, chunk_coords)
+    except (ArrayError, StoreError):
+        return False
+    if not groups:
+        return True
+    if len(groups) != fi.num_fragments:
+        return False
+    for k, rows in enumerate(groups):
+        rows = np.asarray(rows)
+        if rows.size == 0:
+            continue
+        first = rows[:, 0] if rows.ndim == 2 else rows
+        if fi.is_range(k):
+            start, count = fi.range(k)
+            if not np.all((first >= start) & (first < start + count)):
+                return False
+        elif not np.all(np.isin(first, fi.indices(k))):
+            return False
     return True
 
 
@@ -6026,6 +6195,7 @@ def read_link_arrays(
     delta: int = 0,
     include_intra: bool = True,
     cells: Mapping[str, Sequence[str]] | None = None,
+    link_fragments: Mapping[str, Sequence[int]] | None = None,
 ) -> tuple[npt.NDArray[np.int64], npt.NDArray[np.int64]]:
     """Every link record under ``links/<delta>/`` as two arrays.
 
@@ -6047,6 +6217,13 @@ def read_link_arrays(
     ...]}`` -- typically :func:`link_cells_within` -- and is what lets a
     scoped reader touch only the cells its chunks can reach.  ``None``
     (the default) reads every cell of every segment.
+
+    ``link_fragments`` narrows the intra-chunk cell at delta 0 further:
+    ``{cell_key: [fragment, ...]}`` keeps only those link fragments of
+    that cell, in the order given; cells it does not name are read whole.
+    Only meaningful where the fragments partition the cell usefully --
+    one per vertex fragment, on a level claiming
+    ``link_fragments_aligned`` -- which is the caller's to check.
 
     Returns empty ``(0, 0, 0)`` / ``(0, 0)`` arrays when the family is
     absent or holds no rows.
@@ -6111,6 +6288,10 @@ def read_link_arrays(
             rows_arr = _link_cell_rows(
                 blob, ncols=ncols, flat=flat, dtype=cell_dtype,
             )
+            if flat and link_fragments is not None and cell_key in link_fragments:
+                rows_arr = _link_fragment_rows(
+                    level_group, cell_key, rows_arr, link_fragments[cell_key],
+                )
             if rows_arr.size == 0:
                 continue
             cell_rows.append(rows_arr)
@@ -6151,6 +6332,32 @@ def read_link_arrays(
         np.concatenate(chunk_parts, axis=0),
         np.concatenate(vi_parts, axis=0),
     )
+
+
+def _link_fragment_rows(
+    level_group: Group,
+    cell_key: str,
+    rows: npt.NDArray[np.int64],
+    fragments: Sequence[int],
+) -> npt.NDArray[np.int64]:
+    """The rows of the named link fragments of one intra-chunk cell.
+
+    Raises:
+        ArrayError: If a named fragment is not in the cell's index -- a
+            claim of alignment that the store does not bear out.
+    """
+    fi = read_link_fragment_index(level_group, _parse_chunk_key(cell_key))
+    parts: list[npt.NDArray[np.int64]] = []
+    for f in fragments:
+        if f < 0 or f >= fi.num_fragments:
+            raise ArrayError(
+                f"link fragment {f} of chunk {cell_key} requested, but the "
+                f"cell has {fi.num_fragments}"
+            )
+        parts.append(fragment_rows(rows, fi, int(f)))
+    if not parts:
+        return rows[:0]
+    return np.concatenate(parts, axis=0)
 
 
 def link_endpoints_to_rows(

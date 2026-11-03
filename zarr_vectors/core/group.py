@@ -45,6 +45,9 @@ from zarr.errors import UnstableSpecificationWarning
 from zarr.storage import LocalStore
 
 from zarr_vectors.constants import (
+    LINK_FRAGMENTS as _LINK_FRAGMENTS_ARRAY,
+)
+from zarr_vectors.constants import (
     VERTEX_FRAGMENTS as _VERTEX_FRAGMENTS_ARRAY,
 )
 from zarr_vectors.constants import (
@@ -180,6 +183,11 @@ class Group:
     # ``fragments_tile`` claim, so a bulk write of N chunks checks it
     # once rather than N times.  See :meth:`_clear_fragments_tile`.
     _tiling_claim_settled: bool = False
+    # The same, for the level's ``link_fragments_aligned`` claim.  Kept
+    # apart from the tiling flag because the two are broken by different
+    # writes: a links edit must not cost a level its tiling claim.  See
+    # :meth:`_clear_link_fragments_aligned`.
+    _alignment_claim_settled: bool = False
     # Per-array presence manifests, cached for the same read-only session
     # as ``_node_cache`` and keyed the same way.  See
     # :meth:`_chunk_listing` and :class:`_ChunkListing`.
@@ -211,6 +219,7 @@ class Group:
         self._node_cache_readonly = False
         self._listing_cache = None
         self._tiling_claim_settled = False
+        self._alignment_claim_settled = False
         self._vertex_rows_written = None
         self._object_id_lookup_cache = None
 
@@ -418,6 +427,8 @@ class Group:
             # Either write can break the tiling a level may be claiming:
             # the index directly, the buffer by changing its row count.
             self._clear_fragments_tile()
+        if _breaks_link_alignment(array_name):
+            self._clear_link_fragments_aligned()
         sharded_arr = self._sharded_chunk_array(array_name)
         if sharded_arr is None:
             raise StoreError(
@@ -465,6 +476,8 @@ class Group:
         """
         if array_name in (_VERTICES_ARRAY, _VERTEX_FRAGMENTS_ARRAY):
             self._clear_fragments_tile()
+        if _breaks_link_alignment(array_name):
+            self._clear_link_fragments_aligned()
         sharded_arr = self._sharded_chunk_array(array_name)
         if sharded_arr is None:
             raise StoreError(
@@ -1777,16 +1790,32 @@ class Group:
         if self._tiling_claim_settled:
             return
         self._tiling_claim_settled = True
+        self._drop_level_claim("fragments_tile")
+
+    def _clear_link_fragments_aligned(self) -> None:
+        """Drop this level's ``link_fragments_aligned`` claim, if it holds one.
+
+        :meth:`_clear_fragments_tile` for the claim that link fragment
+        ``k`` of a chunk's intra-chunk link cell is exactly the records
+        owned by vertex fragment ``k``.  Called from the same chokepoint,
+        for the writes that can break it -- see
+        :func:`_breaks_link_alignment`.
+        """
+        if self._alignment_claim_settled:
+            return
+        self._alignment_claim_settled = True
+        self._drop_level_claim("link_fragments_aligned")
+
+    def _drop_level_claim(self, key: str) -> None:
+        """Remove ``key`` from this level's metadata when it is set."""
         try:
             level = self._zarr.attrs.get(_LEVEL_META_KEY)
         except Exception:
             return
-        if not isinstance(level, dict) or not level.get("fragments_tile"):
+        if not isinstance(level, dict) or not level.get(key):
             return
         self._zarr.attrs.update({
-            _LEVEL_META_KEY: {
-                k: v for k, v in level.items() if k != "fragments_tile"
-            },
+            _LEVEL_META_KEY: {k: v for k, v in level.items() if k != key},
         })
 
     def _invalidate_node(self, path: str) -> None:
@@ -2258,6 +2287,27 @@ def _check_coords_in_bounds(
             f"Chunk coords {coords} out of grid {shape} for "
             f"array {array_name!r}"
         )
+
+
+def _breaks_link_alignment(array_name: str) -> bool:
+    """Can a write to ``array_name`` break ``link_fragments_aligned``?
+
+    The claim relates three things -- the vertex fragment index, the link
+    fragment index, and the intra-chunk link array at delta 0 (offsets all
+    zero: ``links/0/0.0.0`` for edges, ``links/0/0.0.0_0.0.0`` for
+    triangles) -- so a write to any of them may.  Cross-chunk offset
+    arrays and the ``vertices`` buffer cannot: neither changes which
+    intra-chunk record belongs to which vertex fragment.
+    """
+    if array_name in (_VERTEX_FRAGMENTS_ARRAY, _LINK_FRAGMENTS_ARRAY):
+        return True
+    prefix = "links/0/"
+    if not array_name.startswith(prefix):
+        return False
+    segment = array_name[len(prefix):]
+    # ``self`` is the segment of a one-endpoint family, which has no
+    # offsets and is therefore intra-chunk too.
+    return segment == "self" or (bool(segment) and set(segment) <= {"0", ".", "_"})
 
 
 def _vlen_get_cell(
