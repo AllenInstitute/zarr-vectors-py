@@ -36,27 +36,52 @@ def mesh_store(tmp_path):
     return path
 
 
-class TestUnsupportedTermsSaySo:
-    """``read_mesh`` / ``read_graph`` raise for ``object_ids=``.
+@pytest.fixture
+def graph_store(tmp_path):
+    from zarr_vectors.types.graphs import write_graph
 
-    That is right -- silently returning the whole level is the worst
-    outcome, and neither result carries per-vertex object ids for a
-    post-filter to use -- but the message named a parameter of a function
-    the caller never called.
+    rng = np.random.default_rng(2)
+    path = tmp_path / "g.zarrvectors"
+    write_graph(
+        path, _verts(), rng.integers(0, 60, (30, 2)),
+        chunk_shape=CHUNK, bin_shape=BIN,
+    )
+    return path
+
+
+class TestMeshObjectSelection:
+    """``select(objects=...)`` on a mesh is served by ``read_mesh(object_ids=)``."""
+
+    def test_selecting_objects_on_a_mesh_reads_that_object(self, mesh_store):
+        level = zv.open(mesh_store).level(0)
+        # Written without object ids, so the whole mesh is object 0.
+        got = level.select(objects=[0]).read()
+        assert got.vertex_count == 60
+        assert len(got.faces) == 30
+        assert np.array_equal(got.object_ids, np.zeros(60, dtype=np.int64))
+
+    def test_an_absent_object_reads_nothing(self, mesh_store):
+        """Not the whole level -- the failure mode the old refusal guarded."""
+        level = zv.open(mesh_store).level(0)
+        got = level.select(objects=[5]).read()
+        assert got.vertex_count == 0
+        assert len(got.faces) == 0
+        assert level.read().vertex_count == 60
+
+
+class TestUnsupportedTermsSaySo:
+    """``read_graph`` cannot scope by object, and ``read_mesh`` has no
+    ``group_ids=``.
+
+    Refusing is right -- silently returning the whole level is the worst
+    outcome -- but the message named a parameter of a function the
+    caller never called.
     """
 
-    def test_selecting_objects_on_a_mesh_explains_itself(self, mesh_store):
-        level = zv.open(mesh_store).level(0)
+    def test_selecting_objects_on_a_graph_explains_itself(self, graph_store):
+        level = zv.open(graph_store).level(0)
         with pytest.raises(ZVError, match=r"select\(objects=\.\.\.\)"):
             level.select(objects=[0]).read()
-
-    def test_it_does_not_silently_return_the_whole_level(self, mesh_store):
-        """The failure mode the raise exists to prevent."""
-        level = zv.open(mesh_store).level(0)
-        with pytest.raises(ZVError):
-            level.select(objects=[0]).read()
-        # ...while an unnarrowed read is unaffected.
-        assert level.read().vertex_count == 60
 
     def test_groups_too(self, mesh_store):
         level = zv.open(mesh_store).level(0)

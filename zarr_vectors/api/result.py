@@ -464,12 +464,15 @@ class ReadResult:
     @classmethod
     def from_mesh(cls, raw: Mapping[str, Any], *, kind: str) -> ReadResult:
         """``{vertices, faces, vertex_count, face_count}`` — note
-        ``vertices``, not ``positions``."""
+        ``vertices``, not ``positions`` — plus a per-vertex ``object_ids``
+        on the ``object_ids=`` path."""
         positions = np.asarray(raw["vertices"])
+        object_ids = raw.get("object_ids")
         return cls(
             kind=kind,
             positions=positions,
             parts=(slice(0, len(positions)),) if len(positions) else (),
+            object_ids=None if object_ids is None else np.asarray(object_ids),
             faces=np.asarray(raw["faces"]),
             attributes_read=False,
         )

@@ -13,7 +13,7 @@ the store or encoding modules directly.
 from __future__ import annotations
 
 import warnings
-from collections.abc import Iterator, Mapping, Sequence
+from collections.abc import Iterable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import Any, Literal
@@ -3373,14 +3373,16 @@ def list_link_offsets(level_group: Group, delta: int = 0) -> list[str]:
     family — the all-zero (intra-chunk) array included, since it is not
     a separate family any more.
 
-    Uses :meth:`FsGroup.children`, not iteration: ``__iter__`` yields
-    sub-*groups* only and these children are arrays.
+    Uses :meth:`FsGroup.child_names`, not iteration: ``__iter__`` yields
+    sub-*groups* only and these children are arrays -- and not
+    :meth:`FsGroup.children`, which reads every segment array's metadata
+    to return names a store listing already has.
     """
     group_path = links_group_path(delta)
     if not level_group.array_exists(group_path):
         return []
     try:
-        return sorted(level_group[group_path].children())
+        return sorted(level_group[group_path].child_names())
     except Exception:
         return []
 
@@ -3397,7 +3399,7 @@ def list_link_attribute_offsets(
     if not level_group.array_exists(group_path):
         return []
     try:
-        return sorted(level_group[group_path].children())
+        return sorted(level_group[group_path].child_names())
     except Exception:
         return []
 
@@ -5923,11 +5925,107 @@ def read_links(
     return out
 
 
+def link_cells_within(
+    level_group: Group,
+    within: Iterable[ChunkCoords],
+    *,
+    delta: int = 0,
+) -> dict[str, list[str]]:
+    """The cells of ``links/<delta>/`` whose records lie wholly in ``within``.
+
+    A reader scoped to some chunks -- a bbox, a ``chunks=`` whitelist,
+    the chunks one object's manifest names -- keeps a record only if
+    every endpoint is in a chunk it read, so a cell is worth fetching
+    only when *all* of its endpoint chunks are in ``within``.  Which
+    cells those are follows from the cell's source chunk and its
+    offsets segment alone (:func:`cell_endpoint_chunks`), so the answer
+    costs no reads beyond the family listing and the presence manifest
+    of each segment that survives.
+
+    Without this a scoped read had nothing to go on but the whole
+    family: one mesh patch at 10^6 vertices read every face in the level
+    and spent 2.5 s of a 2.6 s read deduplicating their endpoints, to
+    keep 242 of them.
+
+    Args:
+        level_group: Resolution level group.
+        within: Chunk coordinates, in the family's ``sid_ndim`` arity.
+        delta: Level delta.  Only ``0``: a cross-level record's endpoints
+            sit on two different chunk grids, and one set of chunk
+            coordinates cannot scope both.
+
+    Returns:
+        ``{offsets_segment: [cell_key, ...]}`` naming only cells that are
+        present, cell keys sorted as :func:`read_link_arrays` visits
+        them.  Pass it to ``read_link_arrays(cells=...)`` and use it to
+        build the prefetch plan, so the two agree on what is read.
+    """
+    if delta != 0:
+        raise ArrayError(
+            f"link_cells_within supports delta=0 only, got delta={delta}: "
+            "cross-level endpoints are not on the grid `within` is in"
+        )
+    family = links_group_path(delta)
+    if not level_group.array_exists(family):
+        return {}
+    fam_meta = level_group.read_array_meta(family) or {}
+    if "link_width" not in fam_meta or "sid_ndim" not in fam_meta:
+        return {}
+    link_width = int(fam_meta["link_width"])
+    sid_ndim = int(fam_meta["sid_ndim"])
+
+    src = np.asarray(
+        sorted({tuple(int(c) for c in cc) for cc in within}), dtype=np.int64,
+    ).reshape(-1, sid_ndim)
+    if src.shape[0] == 0:
+        return {}
+    # Membership as a 1-D isin over raveled coords: no Python object per
+    # chunk, and no dense table over a bounding box that two far-apart
+    # chunks would make arbitrarily large.
+    lo = src.min(axis=0)
+    ext = src.max(axis=0) - lo + 1
+    src_keys = np.ravel_multi_index((src - lo).T, ext)
+
+    out: dict[str, list[str]] = {}
+    for seg in list_link_offsets(level_group, delta):
+        try:
+            offsets = parse_offsets(seg, sid_ndim=sid_ndim, link_width=link_width)
+        except ValueError as e:
+            raise ArrayError(
+                f"{family}/{seg}: offsets segment {seg!r} does not match the "
+                f"family's sid_ndim={sid_ndim} link_width={link_width}: {e}"
+            ) from e
+        # Endpoint 0 is the source itself; at delta 0 the anchor is the
+        # identity, so endpoint k is ``src + o_k``.
+        ok = np.ones(src.shape[0], dtype=bool)
+        for off in offsets:
+            if not any(off):
+                continue
+            rel = src + np.asarray(off, dtype=np.int64) - lo
+            inside = np.all((rel >= 0) & (rel < ext), axis=1)
+            keys = np.ravel_multi_index(np.where(inside[:, None], rel, 0).T, ext)
+            ok &= inside & np.isin(keys, src_keys)
+            if not ok.any():
+                break
+        if not ok.any():
+            continue
+        seg_path = f"{family}/{seg}"
+        present = set(level_group.list_chunks(seg_path))
+        keys = sorted(
+            k for k in (_chunk_key(tuple(c)) for c in src[ok].tolist())
+            if k in present
+        )
+        if keys:
+            out[seg] = keys
+    return out
+
+
 def read_link_arrays(
     level_group: Group,
     *,
     delta: int = 0,
     include_intra: bool = True,
+    cells: Mapping[str, Sequence[str]] | None = None,
 ) -> tuple[npt.NDArray[np.int64], npt.NDArray[np.int64]]:
     """Every link record under ``links/<delta>/`` as two arrays.
 
@@ -5944,6 +6042,11 @@ def read_link_arrays(
     plus a local index -- that is one gather over these arrays.  A
     ``store="duplicate"`` family returns each record once per copy,
     like :func:`read_links`.
+
+    ``cells`` restricts the read to ``{offsets_segment: [cell_key,
+    ...]}`` -- typically :func:`link_cells_within` -- and is what lets a
+    scoped reader touch only the cells its chunks can reach.  ``None``
+    (the default) reads every cell of every segment.
 
     Returns empty ``(0, 0, 0)`` / ``(0, 0)`` arrays when the family is
     absent or holds no rows.
@@ -5969,7 +6072,10 @@ def read_link_arrays(
 
     chunk_parts: list[npt.NDArray[np.int64]] = []
     vi_parts: list[npt.NDArray[np.int64]] = []
-    for seg in list_link_offsets(level_group, delta):
+    segments = (
+        list_link_offsets(level_group, delta) if cells is None else sorted(cells)
+    )
+    for seg in segments:
         arr_name = f"{family}/{seg}"
         try:
             offsets = parse_offsets(
@@ -5995,7 +6101,10 @@ def read_link_arrays(
 
         cell_rows: list[npt.NDArray[np.int64]] = []
         cell_chunks: list[tuple[ChunkCoords, ...]] = []
-        for cell_key in sorted(level_group.list_chunks(arr_name)):
+        cell_keys = (
+            level_group.list_chunks(arr_name) if cells is None else cells[seg]
+        )
+        for cell_key in sorted(cell_keys):
             blob = level_group.read_bytes(arr_name, cell_key)
             if not blob:
                 continue

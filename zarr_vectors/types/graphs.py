@@ -45,6 +45,7 @@ from zarr_vectors.core.arrays import (
     create_object_attributes_array,
     create_object_index_array,
     create_vertices_array,
+    link_cells_within,
     link_endpoints_to_rows,
     list_link_offsets,
     read_chunk_vertices,
@@ -720,21 +721,30 @@ def _read_graph(
             return _empty_graph_result(ndim)
         chunk_keys = [k for k in chunk_keys if k and k[0] == filter_bin]
 
-    # Prefetch every chunk (vertices, offsets) and the whole links family
-    # in one async gather.  Subsequent ``read_bytes`` calls below hit the
-    # cache instead of paying one round-trip per chunk.  ``links/0`` is a
-    # group of one array per offsets segment, so the plan enumerates them
-    # — and each array's cells are keyed by *source* chunk, which for the
-    # non-zero offsets is not the ``chunk_keys`` set.
+    # A read narrowed to some chunks keeps only edges wholly inside them,
+    # so it reads only the link cells those chunks can reach; an
+    # unscoped one wants the whole family.
+    scoped = bbox is not None or chunks is not None or bool(attribute_filter)
+    link_cells = link_cells_within(level_group, chunk_keys) if scoped else None
+    if link_cells is None:
+        link_cells = {
+            seg: level_group.list_chunks(f"{links_group_path(0)}/{seg}")
+            for seg in list_link_offsets(level_group, 0)
+        }
+
+    # Prefetch every chunk (vertices, offsets) and the link cells in one
+    # async gather.  Subsequent ``read_bytes`` calls below hit the cache
+    # instead of paying one round-trip per chunk.  ``links/0`` is a group
+    # of one array per offsets segment, and each array's cells are keyed
+    # by *source* chunk, which for the non-zero offsets is not the
+    # ``chunk_keys`` set.
     _chunk_key_strs = [".".join(str(c) for c in cc) for cc in chunk_keys]
     _prefetch_plan: list[tuple[str, list[str]]] = [
         (VERTICES, _chunk_key_strs),
         (VERTEX_FRAGMENTS, _chunk_key_strs),
         (LINK_FRAGMENTS, _chunk_key_strs),
+        *((f"{links_group_path(0)}/{seg}", keys) for seg, keys in link_cells.items()),
     ]
-    for _seg in list_link_offsets(level_group, 0):
-        _seg_path = f"{links_group_path(0)}/{_seg}"
-        _prefetch_plan.append((_seg_path, level_group.list_chunks(_seg_path)))
     _batched_reads_cm = level_group.batched_reads(_prefetch_plan)
     _batched_reads_cm.__enter__()
     try:
@@ -777,7 +787,9 @@ def _read_graph(
         # dropped, which is what applies the bbox/chunks filter to edges.
         all_edges: list[npt.NDArray] = []
         # As arrays, not one tuple per edge: the remap is a gather.
-        edge_chunks, edge_vi = read_link_arrays(level_group, delta=0)
+        edge_chunks, edge_vi = read_link_arrays(
+            level_group, delta=0, cells=link_cells,
+        )
         if edge_vi.shape[0] and edge_vi.shape[1] == 2:
             rows = link_endpoints_to_rows(edge_chunks, edge_vi, chunk_offsets)
             keep = (rows >= 0).all(axis=1)

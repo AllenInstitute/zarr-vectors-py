@@ -28,6 +28,7 @@ from zarr_vectors.constants import (
     GEOM_MESH,
     LINK_FRAGMENTS,
     LINKS_EXPLICIT,
+    OBJECT_INDEX,
     OBJIDX_STANDARD,
     RESOLUTION_PREFIX,
     VERTEX_FRAGMENTS,
@@ -39,10 +40,14 @@ from zarr_vectors.core.arrays import (
     create_object_attributes_array,
     create_object_index_array,
     create_vertices_array,
+    link_cells_within,
     link_endpoints_to_rows,
     list_link_offsets,
+    read_chunk_vertex_buffer,
     read_chunk_vertices,
     read_link_arrays,
+    read_object_manifests,
+    read_vertex_fragment_index,
     resolve_chunk_keys,
     stamp_fragments_tile,
     write_chunk_attributes,
@@ -439,7 +444,12 @@ def read_mesh(
             or an already-open Group.
         level: Resolution level.
         bbox: Optional bounding box filter.
-        object_ids: Optional object ID filter.
+        object_ids: Optional object ID filter.  Only the named objects'
+            vertex fragments are read -- found through the object index,
+            not by scanning chunks -- and only the faces whose every
+            vertex belongs to one of them.  Ids not in the store are
+            ignored.  Not available on Draco-encoded stores, where a
+            chunk is one bitstream shared by every object in it.
         chunks: Optional whitelist of chunk coordinate tuples; only data
             in those chunks is returned. AND-ed with ``bbox`` and
             ``object_ids``. ``chunks=[]`` yields an empty result;
@@ -450,31 +460,25 @@ def read_mesh(
         - ``vertices``: ``(V, D)`` positions
         - ``faces``: ``(F, L)`` face indices (remapped to output vertex order)
         - ``vertex_count``, ``face_count``
+        - ``object_ids``: ``(V,)`` owning object of each vertex -- only
+          when ``object_ids=`` was given.  Vertices come back grouped by
+          object, in the order the ids were asked for.
     """
-    if object_ids is not None:
-        # Declared and documented, but never applied — the filter was
-        # never implemented here (``read_polylines`` does implement it).
-        # Silently returning the unfiltered store is the worst outcome:
-        # the caller believes they scoped the read.  Fail loudly until
-        # someone implements it.
-        raise NotImplementedError(
-            "read_mesh(object_ids=...) is not implemented: the filter would be "
-            "silently ignored and you would get the whole level back. "
-            "Filter the returned arrays yourself, or use read_polylines, "
-            "which does implement object_ids."
-        )
     root = open_store(store_path, backend=backend)
     with root.cached_nodes():
         # One node-resolution pass for the whole read, and every
         # node it needs asked for in a single gather rather than
         # resolved one at a time as the code reaches them.
         prefix = f"{RESOLUTION_PREFIX}{level}"
-        root.prime_nodes([
+        nodes = [
             prefix,
             f"{prefix}/{VERTICES}",
             f"{prefix}/{VERTEX_FRAGMENTS}",
             f"{prefix}/{LINK_FRAGMENTS}",
-        ])
+        ]
+        if object_ids is not None:
+            nodes.append(f"{prefix}/{OBJECT_INDEX}")
+        root.prime_nodes(nodes)
         return _read_mesh(
             root,
             level=level,
@@ -512,11 +516,20 @@ def _read_mesh(
     level_chunk_shape = get_level_chunk_shape(root_meta, level_meta)
 
     dtype = np.float32
+    encoding = ENCODING_RAW
     try:
         vmeta = level_group.read_array_meta(VERTICES)
         dtype = np.dtype(vmeta.get("dtype", "float32"))
+        encoding = vmeta.get("encoding", ENCODING_RAW)
     except Exception:
         pass
+
+    if object_ids is not None and encoding == ENCODING_DRACO:
+        raise ArrayError(
+            "read_mesh(object_ids=...) is not available on a Draco-encoded "
+            "store: each chunk is a single bitstream shared by every object "
+            "in it, so no object's vertices can be read on their own"
+        )
 
     # Face arity is family-wide policy, stamped on the ``links/<delta>/``
     # group rather than on the per-offsets arrays under it.
@@ -527,11 +540,21 @@ def _read_mesh(
     except Exception:
         pass
 
-    # Determine chunks to read (intersection of physical keys, bbox-implied
-    # set, and explicit chunks whitelist).
-    chunk_keys = resolve_chunk_keys(
-        level_group, level_chunk_shape, bbox=bbox, chunks=chunks,
-    )
+    # Is the read narrowed to some chunks?  If so, faces are read only
+    # from the link cells those chunks can reach (link_cells_within);
+    # if not, the whole family is wanted and listing it is cheaper than
+    # proving every cell qualifies.
+    scoped = bbox is not None or chunks is not None or bool(attribute_filter)
+
+    # An object read finds its chunks through the object index, so an
+    # unscoped one needs no chunk listing at all.
+    chunk_keys: list[ChunkCoords] | None = None
+    if object_ids is None or scoped:
+        # Intersection of physical keys, bbox-implied set, and explicit
+        # chunks whitelist.
+        chunk_keys = resolve_chunk_keys(
+            level_group, level_chunk_shape, bbox=bbox, chunks=chunks,
+        )
 
     if attribute_filter:
         try:
@@ -562,21 +585,35 @@ def _read_mesh(
             return _empty_mesh_result(ndim, link_width)
         chunk_keys = [k for k in chunk_keys if k and k[0] == filter_bin]
 
-    # Prefetch every chunk (vertices, offsets) and the whole links family
-    # in one async gather.  Subsequent ``read_bytes`` calls below hit the
-    # cache instead of paying one round-trip per chunk.  ``links/0`` is a
-    # group of one array per offsets segment, so the plan enumerates them
-    # — and each array's cells are keyed by *source* chunk, which for the
-    # non-zero offsets is not the ``chunk_keys`` set.
+    if object_ids is not None:
+        return _read_mesh_objects(
+            level_group,
+            object_ids,
+            scope=None if chunk_keys is None else set(chunk_keys),
+            bbox=bbox,
+            dtype=dtype,
+            ndim=ndim,
+            link_width=link_width,
+        )
+    assert chunk_keys is not None
+
+    # Faces come only from the link cells whose every endpoint chunk is
+    # being read; ``None`` (unscoped) reads the whole family.
+    link_cells = link_cells_within(level_group, chunk_keys) if scoped else None
+
+    # Prefetch every chunk (vertices, offsets) and the face cells in one
+    # async gather.  Subsequent ``read_bytes`` calls below hit the cache
+    # instead of paying one round-trip per chunk.  ``links/0`` is a group
+    # of one array per offsets segment, and each array's cells are keyed
+    # by *source* chunk, which for the non-zero offsets is not the
+    # ``chunk_keys`` set.
     chunk_key_strs = [".".join(str(c) for c in cc) for cc in chunk_keys]
     _prefetch_plan: list[tuple[str, list[str]]] = [
         (VERTICES, chunk_key_strs),
         (VERTEX_FRAGMENTS, chunk_key_strs),
         (LINK_FRAGMENTS, chunk_key_strs),
+        *_link_plan(level_group, link_cells),
     ]
-    for _seg in list_link_offsets(level_group, 0):
-        _seg_path = f"{links_group_path(0)}/{_seg}"
-        _prefetch_plan.append((_seg_path, level_group.list_chunks(_seg_path)))
     _batched_reads_cm = level_group.batched_reads(_prefetch_plan)
     _batched_reads_cm.__enter__()
     try:
@@ -609,7 +646,9 @@ def _read_mesh(
         # dropped, which is what applies the bbox/chunks filter to faces.
         all_faces: list[npt.NDArray] = []
         # As arrays, not one tuple per face: the remap is a gather.
-        face_chunks, face_vi = read_link_arrays(level_group, delta=0)
+        face_chunks, face_vi = read_link_arrays(
+            level_group, delta=0, cells=link_cells,
+        )
         if face_vi.shape[0] and face_vi.shape[1] == link_width:
             rows = link_endpoints_to_rows(face_chunks, face_vi, chunk_offsets)
             keep = (rows >= 0).all(axis=1)
@@ -621,29 +660,10 @@ def _read_mesh(
         else:
             faces_out = np.zeros((0, link_width), dtype=np.int64)
 
-        # Apply bbox filter on vertices
         if bbox is not None:
-            bbox_min, bbox_max = np.asarray(bbox[0]), np.asarray(bbox[1])
-            node_mask = np.all(
-                (positions_out >= bbox_min) & (positions_out <= bbox_max),
-                axis=1,
+            positions_out, faces_out, _ = _bbox_filter(
+                positions_out, faces_out, bbox, link_width,
             )
-            if not np.all(node_mask):
-                n_total = len(positions_out)
-                keep = np.flatnonzero(node_mask)
-                positions_out = positions_out[keep]
-
-                # Vectorized remap via a lookup table (mirrors read_graph):
-                # dropped vertices map to -1; a face survives only if every
-                # endpoint survives.
-                if len(faces_out) > 0:
-                    remap = np.full(n_total, -1, dtype=np.int64)
-                    remap[keep] = np.arange(len(keep), dtype=np.int64)
-                    new_faces = remap[faces_out]
-                    keep_mask = (new_faces >= 0).all(axis=1)
-                    faces_out = new_faces[keep_mask].astype(np.int64, copy=False)
-                else:
-                    faces_out = np.zeros((0, link_width), dtype=np.int64)
 
         return {
             "vertices": positions_out,
@@ -653,6 +673,197 @@ def _read_mesh(
         }
     finally:
         _batched_reads_cm.__exit__(None, None, None)
+
+
+def _read_mesh_objects(
+    level_group: FsGroup,
+    object_ids: list[int],
+    *,
+    scope: set[ChunkCoords] | None,
+    bbox: BoundingBox | None,
+    dtype: np.dtype,
+    ndim: int,
+    link_width: int,
+) -> dict[str, Any]:
+    """:func:`read_mesh` for ``object_ids=``: the named objects and nothing else.
+
+    The object index names each object's ``(chunk, fragment)`` pairs, and
+    ``write_mesh`` writes one fragment per object per chunk, so the
+    vertices are exactly those fragments' rows.  Faces come from the
+    link cells wholly inside the objects' chunks
+    (:func:`link_cells_within`) and are kept only when every endpoint is
+    one of those rows.  Nothing outside the objects' chunks is read.
+
+    ``scope`` is the chunk set a ``bbox`` / ``chunks`` / attribute filter
+    narrowed the read to, or ``None``; fragments outside it are dropped.
+    """
+    wanted: list[int] = list(dict.fromkeys(int(o) for o in object_ids))
+    manifests = read_object_manifests(level_group, ids=wanted) if wanted else {}
+
+    entries: list[tuple[int, ChunkCoords, int]] = []
+    for oid in wanted:
+        for cc, frag in manifests.get(oid, ()):
+            cc = tuple(int(c) for c in cc)
+            if scope is None or cc in scope:
+                entries.append((oid, cc, int(frag)))
+    if not entries:
+        result = _empty_mesh_result(ndim, link_width)
+        result["object_ids"] = np.zeros(0, dtype=np.int64)
+        return result
+
+    obj_chunks = sorted({cc for _, cc, _ in entries})
+    link_cells = link_cells_within(level_group, obj_chunks)
+    key_strs = [".".join(str(c) for c in cc) for cc in obj_chunks]
+    plan: list[tuple[str, list[str]]] = [
+        (VERTICES, key_strs),
+        (VERTEX_FRAGMENTS, key_strs),
+        *_link_plan(level_group, link_cells),
+    ]
+
+    positions: list[npt.NDArray] = []
+    owners: list[npt.NDArray[np.int64]] = []
+    # Chunk-local row -> output row, -1 where the row is not ours.  This
+    # is the whole face filter: a face survives when every endpoint maps.
+    row_maps: dict[ChunkCoords, npt.NDArray[np.int64]] = {}
+    chunk_state: dict[ChunkCoords, tuple[Any, npt.NDArray]] = {}
+    running = 0
+    with level_group.batched_reads(plan):
+        for oid, cc, frag in entries:
+            state = chunk_state.get(cc)
+            if state is None:
+                fi = read_vertex_fragment_index(level_group, cc)
+                full = read_chunk_vertex_buffer(
+                    level_group, cc, dtype=dtype, ndim=ndim,
+                )
+                state = chunk_state[cc] = (fi, full)
+                row_maps[cc] = np.full(len(full), -1, dtype=np.int64)
+            fi, full = state
+            if frag >= fi.num_fragments:
+                raise ArrayError(
+                    f"object {oid}'s manifest names fragment {frag} of chunk "
+                    f"{cc}, which has {fi.num_fragments}"
+                )
+            if fi.is_range(frag):
+                start, count = fi.range(frag)
+                rows = np.arange(start, start + count, dtype=np.int64)
+            else:
+                rows = np.asarray(fi.indices(frag), dtype=np.int64)
+            row_maps[cc][rows] = np.arange(
+                running, running + len(rows), dtype=np.int64,
+            )
+            positions.append(full[rows])
+            owners.append(np.full(len(rows), oid, dtype=np.int64))
+            running += len(rows)
+
+        face_chunks, face_vi = read_link_arrays(
+            level_group, delta=0, cells=link_cells,
+        )
+
+    positions_out = np.concatenate(positions, axis=0)
+    owners_out = np.concatenate(owners)
+    faces_out = np.zeros((0, link_width), dtype=np.int64)
+    if face_vi.shape[0] and face_vi.shape[1] == link_width:
+        rows = _endpoints_through_row_maps(face_chunks, face_vi, row_maps)
+        faces_out = rows[(rows >= 0).all(axis=1)]
+
+    if bbox is not None:
+        positions_out, faces_out, keep = _bbox_filter(
+            positions_out, faces_out, bbox, link_width,
+        )
+        if keep is not None:
+            owners_out = owners_out[keep]
+
+    return {
+        "vertices": positions_out,
+        "faces": faces_out,
+        "vertex_count": len(positions_out),
+        "face_count": len(faces_out),
+        "object_ids": owners_out,
+    }
+
+
+def _link_plan(
+    level_group: FsGroup, link_cells: dict[str, list[str]] | None,
+) -> list[tuple[str, list[str]]]:
+    """Prefetch-plan entries for the face cells a read will touch --
+    ``link_cells`` from :func:`link_cells_within`, or, for ``None``,
+    every cell of every offsets array."""
+    family = links_group_path(0)
+    if link_cells is None:
+        link_cells = {
+            seg: level_group.list_chunks(f"{family}/{seg}")
+            for seg in list_link_offsets(level_group, 0)
+        }
+    return [(f"{family}/{seg}", keys) for seg, keys in link_cells.items()]
+
+
+def _endpoints_through_row_maps(
+    chunks: npt.NDArray[np.int64],
+    vi: npt.NDArray[np.int64],
+    row_maps: dict[ChunkCoords, npt.NDArray[np.int64]],
+) -> npt.NDArray[np.int64]:
+    """Output row of every endpoint, ``-1`` where it is not a row we took.
+
+    :func:`link_endpoints_to_rows` for a read that takes *some* rows of a
+    chunk rather than all of them, so a chunk offset is not enough: each
+    chunk carries its own row map.  The maps are laid end to end so the
+    whole remap is one gather; chunks are matched by raveled coordinate
+    against a sorted key list rather than by ``np.unique(axis=0)``, which
+    was half of a one-object read.
+    """
+    m, width, sid_ndim = chunks.shape
+    if m == 0 or not row_maps:
+        return np.full((m, width), -1, dtype=np.int64)
+    known = np.asarray(list(row_maps), dtype=np.int64).reshape(-1, sid_ndim)
+    tables = list(row_maps.values())
+    lengths = np.fromiter((len(t) for t in tables), dtype=np.int64, count=len(tables))
+    base = np.concatenate(([0], np.cumsum(lengths)[:-1]))
+    table = np.concatenate(tables) if tables else np.zeros(0, dtype=np.int64)
+
+    flat = chunks.reshape(-1, sid_ndim)
+    flat_vi = vi.reshape(-1)
+    lo = np.minimum(known.min(axis=0), flat.min(axis=0))
+    ext = np.maximum(known.max(axis=0), flat.max(axis=0)) - lo + 1
+    known_keys = np.ravel_multi_index((known - lo).T, ext)
+    order = np.argsort(known_keys)
+    sorted_keys = known_keys[order]
+    keys = np.ravel_multi_index((flat - lo).T, ext)
+    pos = np.minimum(np.searchsorted(sorted_keys, keys), len(sorted_keys) - 1)
+    which = order[pos]
+    ok = (sorted_keys[pos] == keys) & (flat_vi >= 0) & (flat_vi < lengths[which])
+    out = np.full(flat_vi.shape, -1, dtype=np.int64)
+    out[ok] = table[base[which[ok]] + flat_vi[ok]]
+    return out.reshape(m, width)
+
+
+def _bbox_filter(
+    positions: npt.NDArray,
+    faces: npt.NDArray[np.int64],
+    bbox: BoundingBox,
+    link_width: int,
+) -> tuple[npt.NDArray, npt.NDArray[np.int64], npt.NDArray[np.int64] | None]:
+    """Keep the vertices inside ``bbox`` and the faces wholly on them.
+
+    Returns ``(positions, faces, keep)``, ``keep`` being the surviving
+    input rows -- or ``None`` when every vertex survived and nothing was
+    reindexed.
+    """
+    bbox_min, bbox_max = np.asarray(bbox[0]), np.asarray(bbox[1])
+    node_mask = np.all((positions >= bbox_min) & (positions <= bbox_max), axis=1)
+    if np.all(node_mask):
+        return positions, faces, None
+    n_total = len(positions)
+    keep = np.flatnonzero(node_mask)
+    # Vectorized remap via a lookup table (mirrors read_graph): dropped
+    # vertices map to -1; a face survives only if every endpoint survives.
+    if len(faces) > 0:
+        remap = np.full(n_total, -1, dtype=np.int64)
+        remap[keep] = np.arange(len(keep), dtype=np.int64)
+        new_faces = remap[faces]
+        faces = new_faces[(new_faces >= 0).all(axis=1)].astype(np.int64, copy=False)
+    else:
+        faces = np.zeros((0, link_width), dtype=np.int64)
+    return positions[keep], faces, keep
 
 
 def _empty_mesh_result(ndim: int, link_width: int) -> dict[str, Any]:

@@ -334,6 +334,39 @@ class Group:
             set(self._zarr.group_keys()) | set(self._zarr.array_keys())
         )
 
+    def child_names(self) -> list[str]:
+        """:meth:`children` from one store listing, reading no child's metadata.
+
+        :meth:`children` resolves every child node to sort arrays from
+        groups -- one ``zarr.json`` read per child, twice over -- and a
+        caller that only wants the names pays for all of it.  The links
+        family is that caller: a mesh at 10^6 vertices has ~170 offsets
+        arrays, and listing them that way was 24 ms of a 34 ms one-object
+        read.  Every directory under a node is a node in Zarr v3, so the
+        listing is the answer.
+
+        Falls back to :meth:`children` offline (the snapshot carries the
+        listing, not the store) and on any store that cannot list.
+        """
+        if self._offline is not None:
+            return self.children()
+        from zarr.core.sync import sync
+
+        store_path = self._zarr.store_path
+        prefix = f"{store_path.path}/" if store_path.path else ""
+
+        async def _collect() -> list[str]:
+            return [name async for name in store_path.store.list_dir(prefix)]
+
+        try:
+            names = sync(_collect())
+        except Exception:
+            return self.children()
+        return sorted({
+            n.rstrip("/") for n in names
+            if n.rstrip("/") and n.rstrip("/") != "zarr.json"
+        })
+
     # ---------------- chunk I/O ------------------------------------------
     #
     # ``<array_name>`` is always a single multidim vlen-bytes Zarr array

@@ -211,3 +211,32 @@ class TestBboxFilter:
         write_graph(str(tmp_path / "g.zv"), pos, edges, chunk_shape=(200.,200.,200.))
         r = read_graph(str(tmp_path / "g.zv"), bbox=(np.array([0,0,0]), np.array([100,100,100])))
         assert r["node_count"] == 2
+
+
+class TestChunkScopedEdges:
+    """A ``chunks=`` read reads only the link cells inside those chunks
+    (``link_cells_within``) and must return the edges a full read would
+    have kept."""
+
+    def test_chunks_read_matches_filtered_full_read(self, tmp_path: Path) -> None:
+        rng = np.random.default_rng(5)
+        pos = rng.uniform(0, 200, (400, 3)).astype(np.float32)
+        edges = rng.integers(0, 400, (800, 2)).astype(np.int64)
+        edges = edges[edges[:, 0] != edges[:, 1]]
+        path = str(tmp_path / "g.zv")
+        write_graph(path, pos, edges, chunk_shape=(50., 50., 50.),
+                    bounds=([0., 0., 0.], [200., 200., 200.]))
+        chunk = np.floor(pos / 50.0).astype(int)
+        cells = [tuple(int(c) for c in cc) for cc in np.unique(chunk, axis=0)[:12]]
+        got = read_graph(path, chunks=cells)
+
+        inside = np.zeros(len(pos), dtype=bool)
+        for cc in cells:
+            inside |= np.all(chunk == cc, axis=1)
+        want = edges[inside[edges].all(axis=1)]
+
+        def as_set(p, e):
+            return {tuple(sorted(map(tuple, p[x].tolist()))) for x in e}
+
+        assert len(got["positions"]) == int(inside.sum())
+        assert as_set(got["positions"], got["edges"]) == as_set(pos, want)
