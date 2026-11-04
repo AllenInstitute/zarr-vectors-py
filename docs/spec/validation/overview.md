@@ -24,7 +24,8 @@
 **Warning**
 : A non-fatal issue that indicates the store may behave unexpectedly in
   some tools but is not technically invalid. Example: a store without
-  consolidated metadata will be slow to open on object stores.
+  the optional RFC 8 `ome` root node is fully readable but cannot be
+  resolved as a member of an OME collection.
 
 **Error**
 : A fatal issue that indicates the store does not conform to the Zarr Vectors specification
@@ -62,9 +63,9 @@ The validator is designed to be useful in several contexts:
 
 | Level | Name | What it checks | Typical runtime |
 |-------|------|----------------|-----------------|
-| 1 | Structural | Required paths exist ([`structure.py`](../../../zarr_vectors/validate/structure.py)). Filesystem presence only — **no** Zarr node-type inspection | < 1 s |
-| 2 | Metadata | Group-attribute validity ([`metadata.py`](../../../zarr_vectors/validate/metadata.py)): `sid_ndim` agreement, vocabulary tokens, bin/chunk divisibility. **No** array `zarr.json`, **no** link families | 1–5 s |
-| 3 | Consistency | Chunk decode, manifest integrity, link offsets-segment and record validity ([`consistency.py`](../../../zarr_vectors/validate/consistency.py)) | 10 s – 10 min (reads all chunks) |
+| 1 | Structural | Store opens; `zarr_vectors` root block, level groups and `vertices/` exist; `ome` node (warning) ([`structure.py`](../../../zarr_vectors/validate/structure.py)). Presence only — **no** Zarr node-type inspection | < 1 s |
+| 2 | Metadata | Group-attribute validity ([`metadata.py`](../../../zarr_vectors/validate/metadata.py)): `sid_ndim` agreement, vocabulary tokens, bin/chunk divisibility, per-level `chunk_shape` nesting. **No** array `zarr.json`, **no** link families | 1–5 s |
+| 3 | Consistency | Chunk decode, manifest integrity, `fragments_tile` claim, link offsets-segment and record validity ([`consistency.py`](../../../zarr_vectors/validate/consistency.py)) | 10 s – 10 min (reads all chunks) |
 | 4 | Geometry | `links_convention` valid for each declared geometry type; mesh `link_width >= 3`; point clouds carry no links ([`conformance.py`](../../../zarr_vectors/validate/conformance.py)) | < 1 s |
 | 5 | Pyramid | Levels contiguous from 0; `vertex_count` non-increasing across levels; `bin_ratio` volume non-decreasing; `object_sparsity` in `(0, 1]` | adds per-level cost |
 
@@ -73,11 +74,20 @@ geometry**: it checks metadata conventions, not tree structure,
 watertightness, or polyline gaps. **L5 does not check object counts**,
 `bin_shape` consistency, or cross-level vertex correspondence.
 
-L5 falls back to decoding every chunk to count vertices when a level
-omits its `vertex_count` attribute, so its cost is only per-level-
-metadata-sized on stores that record that attribute.
+L5 reads `vertex_count`, `bin_ratio` and `object_sparsity` as flat keys
+on the level group; current writers nest level metadata under
+`zarr_vectors_level`, so on stores written by this package those
+lookups find nothing. In particular L5 then falls back to **decoding
+every chunk** to count vertices, and the `bin_ratio` and
+`object_sparsity` checks do not fire. The same flat-key lookup affects
+the per-level rows of L2 and the `vertex_count` row of L3 (see the
+"Known gap" notes there).
 
 ### Python API
+
+`validate()` accepts a path or URL (any backend `open_store` supports)
+or an open `Group`. From a dataset handle, `Dataset.validate()` runs the
+same checks.
 
 ```python
 from zarr_vectors.validate import validate

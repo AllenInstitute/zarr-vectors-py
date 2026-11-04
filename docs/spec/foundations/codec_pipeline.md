@@ -22,8 +22,8 @@
 : A high-performance meta-compressor that internally uses one of several
   compression algorithms (zstd, lz4, blosclz, zlib). Blosc also performs
   byte-shuffling before compression, which improves compression ratios on
-  typed numeric arrays. It is the default byte-to-byte codec in
-  `zarr-vectors-py`.
+  typed numeric arrays. In `zarr-vectors-py` it is available as
+  `compressor="blosc"` but is **not** the default.
 
 **Sharding codec** (`sharding_indexed`)
 : A Zarr v3 codec that packs multiple logical chunks into a single storage
@@ -32,15 +32,20 @@
 
 **Draco**
 : Google's geometry compression library, optimised for 3-D mesh data.
-  `zarr-vectors-py` registers a custom Zarr codec (`draco`) that applies
-  Draco encoding to the `links/<delta>` and `vertices/` arrays of mesh-type
-  stores. Requires `zarr-vectors[draco]`.
+  `write_mesh(encoding="draco")` encodes each chunk's vertices and
+  intra-chunk faces into one Draco bitstream (via DracoPy, or the
+  `draco_encoder` / `draco_decoder` command-line tools as a fallback).
+  It is applied by the mesh writer, **not** registered as a Zarr codec.
+  Requires `zarr-vectors[draco]`.
 
 **Fill value**
-: The value written to a chunk position that is not explicitly stored. In
-  Zarr v3, the fill value is declared per array in `zarr.json`. Zarr Vectors uses
-  `0.0` for floating-point position arrays and `-1` for integer index
-  arrays.
+: The value a chunk position reads back as when it was never written. In
+  Zarr v3 it is declared per array in `zarr.json`. The per-spatial-chunk
+  arrays (`vertices`, `vertex_fragments`, `links/...`,
+  `vertex_attributes/...`) are vlen-bytes arrays, so an unwritten cell
+  reads as empty bytes. Dense object-level arrays such as
+  `object_attributes/<name>` use NaN for float dtypes and a sentinel for
+  integer dtypes to mark absent rows.
 
 ---
 
@@ -48,9 +53,8 @@
 
 A Zarr v3 codec pipeline controls how chunk data is serialised to bytes and
 compressed before storage. Zarr Vectors does not mandate a specific codec; any Zarr
-v3-compatible pipeline is valid. However, `zarr-vectors-py` ships with
-sensible defaults and provides helper functions to configure specialised
-pipelines for specific geometry types (e.g. Draco for meshes).
+v3-compatible pipeline is valid. `zarr-vectors-py` exposes one knob,
+`compressor=`, and one geometry-specific encoding (Draco for meshes).
 
 Understanding the codec pipeline matters for contributors adding new
 geometry types and for users who want to tune compression ratios or
@@ -60,166 +64,129 @@ compatibility with downstream tools.
 
 ## Technical reference
 
-### Default pipeline
+### Defaults depend on the entry point
 
-The default codec pipeline used by `zarr-vectors-py` for all position and
-attribute arrays is:
+| Entry point | Default compression |
+|-------------|---------------------|
+| Type-level writers (`write_points`, `write_lines`, `write_polylines`, `write_graph`, `write_mesh`) | **None**: `bytes` only |
+| Dataset API (`zarr_vectors.create` / `Dataset.add_*`) | `zstd` (`Layout(compression="auto")`), or the value of `$ZARR_VECTORS_COMPRESSION` when set |
 
-```json
-[
-  { "name": "bytes",  "configuration": { "endian": "little" } },
-  { "name": "blosc",  "configuration": { "cname": "zstd", "clevel": 5,
-                                          "shuffle": "bitshuffle",
-                                          "blocksize": 0, "nthreads": 1 } }
-]
-```
-
-- `bytes` (array-to-bytes): serialises the array in C-order, little-endian.
-- `blosc` with `zstd` at level 5: good compression ratio with fast decode.
-  `bitshuffle` is used instead of `byteshuffle` for floating-point arrays;
-  it typically achieves better compression on 32-bit floats.
-
-To override the default pipeline, pass `codec_config` to the write function:
-
-```python
-import numcodecs
-from zarr_vectors.types.points import write_points
-
-write_points(
-    "scan.zarrvectors",
-    positions,
-    chunk_shape=(200., 200., 200.),
-    codec_config={
-        "positions": [
-            {"name": "bytes", "configuration": {"endian": "little"}},
-            {"name": "zstd",  "configuration": {"level": 3}},
-        ]
-    },
-)
-```
+Both can be overridden: `compressor=` on a type-level writer, and
+`zv.Layout(compression=...)` on the schema for the dataset API.
+There is no `codec_config=` argument.
 
 ### Per-array codec configuration
 
 `zarr-vectors-py` writes every chunk array with the **same codec
-pipeline**, set per-write via the `compressor=` kwarg on the public
+pipeline**, set per-write via the `compressor=` kwarg on the type-level
 write functions (`write_points`, `write_graph`, `write_polylines`,
-`write_lines`, `write_mesh`). The **default is `BytesCodec`-only — no
-compression**. This keeps the fast async PUT path active, which is
-the original cloud-write design point of the batched writer
-(compression CPU is typically 10×+ smaller than cloud PUT latency, so
-the wins are negligible against object stores). Opt into compression
-explicitly when disk size matters more than throughput.
+`write_lines`, `write_mesh`), or via `create_store(compressor=...)`. The
+type-level default is `bytes`-only — no compression. This keeps the fast
+async PUT path active (compression CPU is typically much smaller than
+cloud PUT latency, so the win is negligible against object stores). Opt
+into compression explicitly when disk size matters more than throughput.
 
-Accepted `compressor=` values:
+Because a store's chunk arrays are created once and reused, the codec
+chosen when an array is first created applies for the life of that array
+(`create_store(compressor=...)` fixes it for `vertices` /
+`vertex_fragments`).
+
+Accepted `compressor=` values (see
+[`resolve_compressor`](../../../zarr_vectors/encoding/compression.py)):
 
 | Value | Resulting `codecs` list |
 |-------|-------------------------|
 | `None` *(default)*, `"none"`, or `False` | `[{"name": "bytes"}]` — uncompressed; fast async PUT path. |
 | `"zstd"` | `[{"name": "bytes"}, {"name": "zstd", "configuration": {"level": 0, "checksum": false}}]` — zarr v3's own default compressor.  Triggers the sync codec-encoding path. |
-| `"blosc"` | Blosc(Zstd, BitShuffle, l5) — what this spec historically recommended for `vertices/`.  Best ratio for float32 positions. |
-| `list[dict]` | Caller-supplied Zarr V3 codec specs, passed through verbatim. |
+| `"blosc"` | `bytes` + Blosc (`cname=zstd`, `clevel=5`, `shuffle=bitshuffle`, `typesize=4`, `blocksize=0`). |
+| `list[dict]` | Caller-supplied Zarr V3 codec specs, passed through; a leading `bytes` codec is added if absent. |
+
+Any other value raises `ValueError`.
+
+```python
+import numpy as np
+from zarr_vectors.types.points import write_points
+
+positions = np.random.default_rng(0).uniform(0, 100, (10_000, 3)).astype(np.float32)
+write_points(
+    "scan.zarrvectors",
+    positions,
+    chunk_shape=(50., 50., 50.),
+    compressor="blosc",
+)
+```
 
 Per-array-type codec selection (different codecs for `vertices/`
-vs `vertex_fragments/` vs `links/`) is **future work** — today every
-chunk array in a single `write_*` call gets the same codec.
+vs `vertex_fragments/` vs `links/`) is **not supported**: every chunk
+array in a single `write_*` call gets the same codec.
 
 ```{note}
 **`vertex_fragments/` and `link_fragments/`** are pre-packed binary
-layouts (header + bitmap + dense range table + uint32/int64 CSR)
-with little redundancy for a general-purpose compressor to exploit.
-The chunk arrays still go through whatever `compressor=` was passed,
-but in practice these payloads gain little from compression and
-suffer the per-chunk codec overhead on hot decode paths. The arrays'
-group metadata carries `encoding: "fragment_index_v1"` to identify
-the on-disk format independently of any outer compression.
+layouts with little redundancy for a general-purpose compressor to
+exploit. They still go through whatever `compressor=` was passed. See
+[Fragment-index arrays](../layout/fragment_index_arrays.md) for the byte
+layout and [Object manifest](../object_model/object_manifest.md) for the
+manifest-blob format.
 
-**`object_index/manifests`** uses the `vlen-bytes` codec (variable-
-length byte array). Each entry is one object's encoded manifest blob;
-per-object random access reads only the zarr chunk containing the
-requested OID (~16K objects per chunk).
+**`object_index/manifests`** is a vlen-bytes array (variable-length byte
+array). Each entry is one object's encoded manifest blob; per-object
+random access reads only the zarr chunk containing the requested OID.
 
 The Zarr V3 specification for variable-length byte arrays is still
 in development (tracked at
 [zarr-extensions](https://github.com/zarr-developers/zarr-extensions/tree/main/data-types));
-Zarr Vectors 0.x stores written with `vlen-bytes` may need to be re-encoded if
-the eventual spec lands incompatibly.
-
-Legacy stores written before this layout change have
-`object_index/data` and `object_index/offsets` byte-blob children
-instead of `object_index/manifests`; readers in `zarr_vectors`
-auto-detect and handle both layouts.
-
-See [Fragment-index arrays](../layout/fragment_index_arrays.md) for the
-fragment-index byte layout and
-[Object manifest](../object_model/object_manifest.md) for the
-manifest-blob format.
+stores written with `vlen-bytes` may need to be re-encoded if the
+eventual spec lands incompatibly. `zarr-vectors-py` silences zarr's
+`UnstableSpecificationWarning` for this reason on import.
 ```
 
-### Draco codec (mesh geometry)
+### Draco encoding (mesh geometry)
 
-When `zarr-vectors[draco]` is installed, the `links/<delta>` and `vertices/`
-arrays of mesh-type stores can use Draco compression. Enable it by
-passing `use_draco=True` and `draco_quantization=<bits>` to `write_mesh()`
-(or to the OBJ/STL/PLY converters in `zarr-vectors-tools`).
+`write_mesh(..., encoding="draco", draco_quantization_bits=11)` replaces
+each chunk's vertices and intra-chunk faces with one Draco bitstream. It
+applies only to 3-D stores and requires `zarr-vectors[draco]`; boundary
+faces stay in `links/`. The encoder's compression level is fixed at 7
+(`draco_encode_mesh` defaults). There is no `use_draco=` or
+`draco_quantization=` keyword.
 
-The custom codec is registered with Zarr as:
-
-```json
-{
-  "name": "draco",
-  "configuration": {
-    "quantization_bits": 11,
-    "compression_level": 7
-  }
-}
-```
-
-Draco-compressed stores are **not readable** by tools that do not have the
-`draco` codec registered. `zarr-vectors-py` will raise `ValueError` when
-attempting to read a Draco-compressed store without the extra installed.
+A Draco-encoded store cannot be decoded without DracoPy (or the Draco CLI
+tools); the decoder raises `DracoError`. Generic Zarr tools can open the
+arrays but cannot interpret the Draco payload.
 
 #### Quantisation and precision
 
-Draco uses integer quantisation of vertex positions. The quantisation level
-controls the trade-off between compression ratio and positional precision:
-
-| `quantization_bits` | Precision (relative to bounding box) | Typical ratio |
-|--------------------|------------------------------------|---------------|
-| 8 | 1 / 256 of bbox per axis | 10–15× |
-| 11 | 1 / 2048 of bbox per axis | 6–10× |
-| 14 | 1 / 16384 of bbox per axis | 3–6× |
-
-For neuroscience mesh data (brain surfaces, cell boundaries) quantised to
-nanometre scale, 11 bits is a common choice that preserves sub-micrometre
-precision while achieving 6–10× compression over float32.
+Draco uses integer quantisation of vertex positions: the more
+`quantization_bits`, the higher the positional precision (relative to the
+chunk's bounding box, roughly `1 / 2^bits` per axis) and the lower the
+compression ratio. The default is 11 bits. Compression ratios depend on
+the mesh; this documentation does not promise specific figures.
 
 ### Choosing a codec
 
-| Scenario | Recommended codec |
-|----------|------------------|
-| Default / general purpose | `blosc(zstd, bitshuffle, level 5)` |
-| Fastest possible read (RAM-limited) | `blosc(lz4, byteshuffle, level 1)` |
-| Maximum compression (archival) | `blosc(zstd, bitshuffle, level 9)` |
-| Mesh geometry with size budget | `draco(quantization=11)` |
-| Compatibility with non-Zarr tools | `bytes` (no compression) |
-| Cloud with many small chunks | Consider sharding codec first |
+| Scenario | Recommended |
+|----------|-------------|
+| Default / general purpose, local | `compressor=None` or `"zstd"` |
+| Float-heavy data where disk size matters | `compressor="blosc"` |
+| Custom pipeline | `compressor=[{...}, ...]` of Zarr v3 codec specs |
+| Mesh geometry with size budget (3-D) | `encoding="draco"` |
+| Compatibility with non-Zarr tools | `compressor=None` (`bytes` only) |
+| Cloud with many small chunks | Consider [sharding](../chunking/sharding.md) first |
 
 ### Codec availability and compatibility
 
-The following codecs are available without extra dependencies:
-
-- `bytes` (array-to-bytes)
-- `gzip` (standard library)
-- `zstd` (via `numcodecs`)
-- `blosc` (via `numcodecs`)
-- `lz4` (via `numcodecs`)
+Compression codecs are provided by the installed `zarr` (v3) and
+`numcodecs` packages; `zarr-vectors-py` passes the specs through. The
+named shorthands above (`bytes`, `zstd`, `blosc`) are always accepted.
+Beyond that, anything a custom `list[dict]` names must be available to
+every consumer.
 
 Codecs requiring extras:
 
-- `draco` — requires `zarr-vectors[draco]`
-- `sharding_indexed` — built into Zarr v3 ≥ 2.18; no extra required
+- Draco encoding — requires `zarr-vectors[draco]`.
+- `sharding_indexed` — built into Zarr v3; selected via `shard_shape=`,
+  no extra required.
 
-When distributing Zarr Vectors stores, prefer the default Blosc pipeline for
-maximum compatibility. Document any use of non-default codecs prominently
-(e.g. in the store's `.zattrs` `"notes"` field) so consumers know what
-is required.
+When distributing Zarr Vectors stores, prefer `bytes` or `zstd` for
+maximum compatibility, and say so wherever you document the data if you
+use anything else. There is no format-defined `notes` field; you can use
+`Dataset.metadata` (user metadata) for such notes.

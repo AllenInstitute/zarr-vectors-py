@@ -25,11 +25,21 @@ The package supports supervoxel-level spatial binning with separated chunk and b
 pip install zarr-vectors
 ```
 
-Requires Python 3.11 or later.
+Requires Python 3.11 or later. Optional extras: `zarr-vectors[draco]` (Draco mesh
+compression), `[obstore]` or `[fsspec]` (S3/GCS/Azure; `[cloud]` aliases
+`[obstore]`), `[icechunk]` (transactional stores, Python 3.12+), `[all]` (every
+extra). File-format converters (LAS, PLY, TRK, SWC, OBJ, ...) and the
+`zarr-vectors` command-line tool are in the companion package
+`zarr-vectors-tools`; this package installs no console scripts.
 
 ---
 
 ## Quick start
+
+Run this from an empty directory — `zv.create` refuses to overwrite an existing
+store. It writes 10 000 random points, adds one coarser level, and reads back
+the points inside a box. The [documentation quickstart](https://zarr-vectors-py.readthedocs.io/en/latest/getting_started/quickstart.html)
+walks through the same steps one at a time.
 
 ```python
 import numpy as np

@@ -88,13 +88,23 @@ Applied only when `base_bin_shape` is not `None`:
 
 For every resolution level:
 
+> **Known gap.** The `vertex_count`, `bin_shape` / `bin_size`,
+> `bin_ratio` and `object_sparsity` rows below read **flat keys** from
+> the level group's attributes. A current writer nests level metadata
+> under `zarr_vectors_level` and keeps `bin_shape` / `bin_ratio` only in
+> the `multiscales` transforms, so on a store written by this package
+> those four lookups find nothing and those checks do not fire. They
+> only take effect on a store that happens to carry the flat keys. The
+> `chunk_shape` nesting row uses the parsed level metadata and does run.
+
 | Rule | Failure type |
 |------|--------------|
 | The level's attributes can be read | Error |
 | `vertex_count`, if present, is an `int >= 0` | Error |
+| A per-level `chunk_shape` override nests inside the root `chunk_shape` (`validate_level_chunk_shape_against_root`) | Error |
 | `bin_shape` (or legacy `bin_size`), if present, has length `sid_ndim` | Error |
 | Every `bin_shape[i] > 0` | Error |
-| `chunk_shape[i] / bin_shape[i]` is an integer (tolerance `1e-9`) | Error |
+| `chunk_shape[i] / bin_shape[i]` is an integer (tolerance `1e-9`), where `chunk_shape` is the level's *effective* chunk shape (its override if set, else root's) | Error |
 | `bin_ratio`, if present, has length `sid_ndim` | Error |
 | Every `bin_ratio[i] >= 1` | Error |
 | `object_sparsity` (default `1.0`) is in `(0, 1]` | Error |
@@ -117,16 +127,6 @@ at L2:
 - **No `multiscales` / `coordinateTransformations` checks.** Scale and
   translation values, axis counts, and level-to-group correspondence
   are not validated.
-- **No per-level `chunk_shape` override validation.** A level may carry
-  a `chunk_shape` override (see
-  [Pyramid construction](../multiscale/pyramid_construction.md#per-level-chunk-grids-chunk_scale_factor)).
-  `zarr_vectors.core.metadata` provides
-  `validate_level_chunk_shape_against_root` to check that it nests
-  inside root, but **the L2 validator never calls it**. Note also that
-  L2's per-level `bin_shape` divisibility check above divides the
-  **root** `chunk_shape`, not the level's effective one — so on a store
-  built with `chunk_scale_factor > 1` that check is testing the wrong
-  quantity.
 - **No cross-level `level` / ordering checks**, no `level_key_matches_name`,
   no monotone `bin_ratio` across levels, and no geometry-type-specific
   metadata rules (those are L4).

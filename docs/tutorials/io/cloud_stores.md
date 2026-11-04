@@ -6,6 +6,15 @@ public HTTP are reached through the **backend layer** described in the
 read/write API is identical to local stores — only the URL changes, and
 `zarr_vectors.api` is the surface either way.
 
+**You will learn:** how to open, create and write stores on S3, GCS, Azure or
+HTTP, how the backend is chosen, how to pass credentials, and how to keep the
+number of stored objects (and so your request bill) down.
+**Prerequisite:** the [Quickstart](../../getting_started/quickstart.md) — every
+call here is the local-store call from there with a URL in place of a path. The
+bucket names (`my-bucket`, `open-neuro-data`) are placeholders; substitute your
+own. Nothing on this page can run without a cloud extra installed (below) and,
+for anything but public buckets, credentials.
+
 ---
 
 ## Installation
@@ -17,8 +26,10 @@ reads), and the library auto-prefers it when both are installed.
 ```bash
 pip install "zarr-vectors[obstore]"    # preferred
 # OR
-pip install "zarr-vectors[cloud]"      # fsspec + s3fs/gcsfs/adlfs (fallback)
+pip install "zarr-vectors[fsspec]"     # fsspec + s3fs/gcsfs/adlfs (fallback)
 ```
+
+(`zarr-vectors[cloud]` is an alias for `[obstore]`, not for the fsspec set.)
 
 You can also install both — the library will pick `obstore` and fall back
 to `fsspec` for any URL scheme it can't handle.
@@ -200,14 +211,15 @@ print(zv.Layout(cell_size=(500.0, 500.0, 500.0)).resolve(schema).chunk_shape)
 ```
 
 Aim for chunks of at least 100 KB compressed. For typical synchrotron
-point clouds at ~100 000 vertices per chunk (float32, Blosc-compressed)
+point clouds at ~100 000 vertices per chunk (float32, zstd-compressed by default)
 that is roughly 200–500 µm per axis, so `cells=2`…`cells=5` over a
 1 000 µm volume. `Layout.cell_size` is the escape hatch when the grid is
 fixed from outside — a pipeline whose chunks must line up with an image
 volume, say.
 
 `Layout.compression` defaults to `"auto"`, which means "whatever
-`$ZARR_VECTORS_COMPRESSION` says, and no compressor if it says nothing".
+`$ZARR_VECTORS_COMPRESSION` says, and `zstd` if it says nothing"; pass
+`compression=None` for no compression.
 
 ### Packing is already on for object stores
 

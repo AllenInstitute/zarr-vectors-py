@@ -221,9 +221,9 @@ See [Neuroglancer integration](../tutorials/neuroglancer/overview.md).
 ### Is Zarr Vectors compatible with the Neuroglancer precomputed format?
 
 Zarr Vectors and Neuroglancer precomputed are distinct formats that share some
-design goals (spatial chunking, multiscale support). `zv-ngtools` includes
-a precomputed export tool that converts a Zarr Vectors store to the Neuroglancer
-precomputed annotation or skeleton format for static hosting.
+design goals (spatial chunking, multiscale support). the companion package
+`zarr-vectors-tools` provides the export that converts a Zarr Vectors store to
+the Neuroglancer precomputed annotation or skeleton format for static hosting.
 See [Format comparisons](../spec/comparisons/neuroglancer_precomputed.md)
 for a detailed comparison.
 
@@ -301,8 +301,11 @@ zv.stability("zarr_vectors.validate")     # 'undecided'
 
 See the {doc}`API reference <../api/index>` for what each surface covers.
 
-Stores written with the current version will be readable by future versions;
-no store format migration is planned for the 0.x series. The three version
+There is no backward-compatible reader: a store written by an older on-disk
+format must be rewritten from source, and a store from a newer format needs a
+newer `zarr-vectors` (`zv.require_format(ds, ">=0.9")` turns either mismatch
+into a clear `FormatError`). The package is Alpha, so expect the format to
+keep moving. The three version
 numbers move independently — `zv.__version__` (the package),
 `zv.__api_version__` (the API surface) and `ds.format_version` (the on-disk
 format of one store) — and `zv.require_api(...)` / `zv.require_format(ds, ...)`

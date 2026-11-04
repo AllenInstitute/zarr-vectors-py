@@ -19,6 +19,11 @@ the one documented there.
 What is left below is the handful of names that exist only at the top level:
 they answer questions about the installed package rather than about a store.
 
+Also available at the top level: ``zarr_vectors.__version__`` (the package
+version) and ``zarr_vectors.__api_version__`` (the ``(major, minor)`` tuple of
+the supported API contract, which is what :func:`zarr_vectors.require_api`
+checks against).
+
 .. autofunction:: zarr_vectors.stability
 
 .. autofunction:: zarr_vectors.require_api

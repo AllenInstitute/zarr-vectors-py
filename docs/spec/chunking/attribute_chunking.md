@@ -65,8 +65,9 @@ attribute-chunked stores because the chunk-key parser is arity-agnostic
 
 ### Chunk key layout
 
-When attribute chunking is in use, chunk keys for every per-vertex array
-(`vertices/`, `attributes/<name>/`, etc.) take the form:
+When attribute chunking is in use, chunk keys for every per-chunk array
+(`vertices/`, `vertex_attributes/<name>/`, `vertex_fragments/`, `links/…`, etc.)
+take the form:
 
 ```
 <attr_bin>.<spatial_0>.<spatial_1>.<spatial_2>
@@ -74,8 +75,15 @@ When attribute chunking is in use, chunk keys for every per-vertex array
 
 `attr_bin` is an integer in `[0, K)`. Spatial coordinates follow in the
 existing dot-separated order. Object index entries store the same
-extended tuple — `sid_ndim` on the `object_index` `.zattrs` is `ndim +
-1` for attribute-chunked stores.
+extended tuple — `sid_ndim` in the `object_index` attributes is `ndim + 1` for
+attribute-chunked stores.
+
+The arrays themselves gain a **leading axis**: every per-chunk vlen array has
+rank `ndim + 1`, with shape `(K, *spatial_grid_shape)` and an origin of `0` on
+the bin axis (`open_write_session(..., bin_count=K)`). So a 3-D store with 4
+genes and a `(5, 5, 5)` spatial grid has `vertices` of shape `(4, 5, 5, 5)`,
+and the chunk for gene bin 2 at spatial cell `(1, 0, 3)` is the file
+`vertices/c/2/1/0/3`.
 
 `fragment_attributes/<name>/` follows the **same** extended key scheme:
 each per-chunk blob is keyed by the same combined coords the type-writer
@@ -86,7 +94,7 @@ the raw spatial coords.
 
 ### Level metadata fields
 
-Three new keys on the level `.zattrs`:
+Three keys in the level's `zarr_vectors_level` attribute block:
 
 | Field                     | Type       | Meaning                                                                                   |
 |---------------------------|------------|-------------------------------------------------------------------------------------------|
@@ -94,8 +102,11 @@ Three new keys on the level `.zattrs`:
 | `chunk_attribute_name`    | `str`      | Name of the per-vertex attribute used as the leading axis.                                |
 | `chunk_attribute_values`  | `list`     | Ordered list mapping `attr_bin` → original attribute value. `[i]` is the value for bin `i`. |
 
-When `chunk_dims` is absent (legacy stores), readers default to a
-spatial-only layout with `sid_ndim` axes.
+When `chunk_dims` is absent, readers default to a spatial-only layout with
+`sid_ndim` axes. `chunk_attribute_name` and `chunk_attribute_values` must be
+both set or both absent, and the values list must not be empty. `chunk_dims`
+is `[attribute_name, *spatial_axis_names]` (`compute_chunk_dim_names`), so the
+spatial names come from the axes in `multiscales[0].axes`.
 
 The chunk-by attribute is **not** also stored as a per-chunk attribute
 array; its value is implicit in the leading axis and recoverable from
@@ -137,14 +148,15 @@ write_points(
     "genes.zarrvectors",
     positions,
     chunk_shape=(50.0, 50.0, 50.0),
-    attributes={"gene": gene_labels},
+    vertex_attributes={"gene": gene_labels},
     chunk_by_attribute="gene",
 )
 ```
 
-The named attribute must appear in the writer's per-vertex / per-object
-dict (`attributes`, `vertex_attributes`, `node_attributes`, or
-`line_attributes` depending on the type).
+The named attribute must appear in the writer's per-vertex attribute dict,
+`vertex_attributes`. (`attributes`, `node_attributes` and `line_attributes` are
+deprecated aliases of it on `write_points`, `write_graph` and `write_lines`
+respectively; examples elsewhere that pass `attributes=` use the alias.)
 
 ### Read API
 
@@ -189,6 +201,12 @@ prefix_dim_name="bundle_label")` and runs the standard rechunk engine.
 `categorical=True` disables the legacy quartile fallback in
 `DimensionMapper._map_by_attribute`, which would otherwise collapse
 high-cardinality attributes (>10 unique values) to 4 quartile bins.
+
+Note the difference in scope: `chunk_by_attribute` at write time bins a
+**per-vertex** attribute, whereas `rechunk_by_attribute` bins a **per-object**
+one (`object_attributes/<name>`). Also `rechunk` runs the narrow dimension
+engine described in [Rechunking](rechunking.md): level 0 only, no `links/`
+family, and objects are renumbered.
 
 ### Atomicity and writes
 

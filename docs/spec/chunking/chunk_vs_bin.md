@@ -70,6 +70,14 @@ of all vertices in the chunk is required. See
 [Fragment-index arrays](../layout/fragment_index_arrays.md) for the on-disk
 layout.
 
+```{note}
+The bin ↔ fragment correspondence drawn above holds for **undifferentiated
+point clouds**. Every other geometry type (and point clouds written with
+objects) stores one fragment per object per chunk and queries at chunk
+granularity; for them `bin_shape` drives the coarsening grid only. See
+[Bin shape](bin_shape.md#where-bins-are-used).
+```
+
 ### Worked example: query amplification
 
 Suppose a 3-D point cloud store with:
@@ -126,9 +134,11 @@ A secondary motivation was multi-resolution correctness. In the pre-
 separation design, adding a coarser level required changing `chunk_shape`
 at the coarser level — which would have required a different file layout
 per level, complicating readers and cache strategies. With the separation,
-`chunk_shape` is fixed across all levels and only `bin_shape` changes via
-`bin_ratio`. The file layout is identical at every level; only the spatial
-index granularity changes.
+`chunk_shape` is by default shared by all levels and only `bin_shape` changes
+via `bin_ratio`, so the file layout is identical at every level. A level *may*
+opt into a larger chunk (an integer multiple of the root's, via the per-level
+`chunk_shape`) when coarse data is sparse enough that the default grid would be
+too fine; that is the exception, not the rule.
 
 ### When to use one bin per chunk
 
@@ -144,7 +154,7 @@ is appropriate when:
 
 One-bin-per-chunk mode is the default when `bin_shape` is omitted. It is
 fully supported and incurs no overhead beyond storing a trivial fragment index
-(one entry per chunk with `offset=0, count=N_chunk`).
+(one 16-byte range entry per chunk, `start=0, count=N_chunk`).
 
 ### When to use many bins per chunk
 
@@ -155,9 +165,10 @@ Fine binning (`B_per_chunk` of 64–512) is appropriate when:
 - The data is dense and not all vertices in a chunk are relevant to a
   given query.
 
-The overhead of a fine fragment index is modest: `B_per_chunk × 2 × 8 bytes` per
-chunk (two int64 values per bin). For `B_per_chunk = 64`, this is
-1 024 bytes per chunk — negligible compared to the vertex data itself.
+The overhead of a fine fragment index is modest: 16 bytes per bin (two int64
+values), plus a small constant header — and **empty bins pay too**, since a
+point-cloud chunk has one fragment for every bin. For `B_per_chunk = 64`, this
+is about 1 050 bytes per chunk — negligible compared to the vertex data itself.
 
 ### Relationship to multiscale pyramids
 
@@ -172,8 +183,10 @@ Level 2: chunk_shape=(200,200,200), bin_shape=(200,200,200) → 1 bin/chunk
 ```
 
 At level 2, each chunk has exactly one bin covering the full chunk volume.
-All vertices in the chunk are merged into one coarse metanode. The chunk
-file layout is identical to level 0; only the bin grid has changed.
+Each object's vertices in the chunk are merged into one coarse metavertex (a
+metavertex may be shared between objects). The chunk file layout is identical
+to level 0; only the bin grid has changed. (A coarse level's bin may also be
+*larger* than its chunk; nothing requires bins to tile chunks above level 0.)
 
 This uniformity means a Neuroglancer-style viewer can use exactly the same
 chunk-fetching logic at all levels, with no special cases for coarse vs
@@ -184,8 +197,8 @@ fine resolution.
 | Property | `chunk_shape` | `bin_shape` |
 |----------|--------------|-------------|
 | Controls | File layout, I/O unit | Spatial index granularity, query unit |
-| Changes across levels | Never | Yes (scales with `bin_ratio`) |
+| Changes across levels | Not by default; a level may override it with an integer multiple of the root's | Yes (scales with `bin_ratio`) |
 | Affects file count | Yes | No |
 | Affects query precision | Indirectly | Directly |
-| Can be changed post-write | Only by rechunking | In principle (re-index only) |
+| Can be changed post-write | Only by rechunking (`rechunk_spatial`) | Point clouds only, in place (`rebin_level`); other types need a rechunk |
 | Typical value (3-D, 200µm chunk) | (200, 200, 200) | (25, 25, 25) – (100, 100, 100) |

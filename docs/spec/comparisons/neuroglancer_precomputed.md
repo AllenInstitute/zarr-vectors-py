@@ -28,7 +28,7 @@
 **`info` file**
 : The JSON metadata file at the root of a Neuroglancer precomputed layer
   that declares the data type, scales, voxel resolution, chunk sizes, and
-  layer-specific configuration. Analogous to Zarr Vectors' root `.zattrs`.
+  layer-specific configuration. Analogous to the `zarr_vectors` and `multiscales` attribute blocks in a Zarr Vectors root `zarr.json`.
 
 ---
 
@@ -127,7 +127,7 @@ Attribute support: precomputed skeletons support per-vertex `vertex_attributes`
 | Multi-resolution | Yes | No |
 | Per-vertex attributes | Yes (arbitrary dtypes) | Yes (float32 only) |
 | Per-object attributes | Yes | No |
-| SWC compatibility | Yes (`swc_type`, `radius`) | No |
+| SWC compatibility | Can carry SWC-style per-vertex attributes (e.g. `radius`, `swc_type`; names are a convention, not enforced) | No |
 | Cloud efficiency | Chunk-level parallelism | Shard-level parallelism |
 | Write API | Yes | No (static format) |
 | Viewer support | Via zv-ngtools | Native Neuroglancer |
@@ -167,7 +167,8 @@ fragment shards contain each object.
 | Write API | Yes | No |
 | Viewer support | Via zv-ngtools | Native Neuroglancer |
 
-The Zarr Vectors mesh fragment model (faces assigned to chunks by centroid) is
+The Zarr Vectors mesh fragment model (vertices assigned to chunks by position;
+each face filed under the chunk of its lexicographically smallest endpoint) is
 intentionally similar to the Neuroglancer sharded fragment model. The
 `precomputed_export` tool in `zv-ngtools` exploits this similarity to
 produce precomputed shard files directly from Zarr Vectors chunk data with minimal

@@ -279,7 +279,7 @@ scale factors.
 
 **A naive `o = c_trg - c_src` is wrong across levels.**
 `LevelMetadata.chunk_shape` is an optional per-level override
-([`coarsen`](../../../zarr_vectors/multiresolution/coarsen.py) sets it to
+([`coarsen_level`](../../../zarr_vectors/multiresolution/coarsen.py) sets it to
 `source × chunk_scale_factor`; the default factor is 1), so two levels
 may have different chunk grids. Their chunk coords then index cells of
 different sizes and are **not commensurable** — differencing them
@@ -310,7 +310,9 @@ o      = c_trg - anchor              # decode: c_trg = anchor + o
 
 where `r_L` is level `L`'s `chunk_shape` as an integer multiple of the
 root `chunk_shape` (see
-[`chunk_scale_factor`](../../../zarr_vectors/core/metadata.py)).
+[`chunk_scale_from_root`](../../../zarr_vectors/core/metadata.py); this `r` is
+root-relative, whereas `coarsen_level`'s `chunk_scale_factor=` argument is
+parent-relative).
 
 This is a **strict generalisation, not a branch**: when `r_src == r_trg`
 — same level, or any pyramid built with the default

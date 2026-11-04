@@ -1,5 +1,12 @@
 # HPC pipelines
 
+**You will learn:** the three-phase pattern for writing one store from many
+processes (SLURM arrays or MPI ranks) and for splitting reads across ranks.
+**Prerequisite:** [Memory-efficient writes](memory_efficient_writes.md), which
+explains each per-chunk call used here in a single process, and the
+[Quickstart](../getting_started/quickstart.md). Functions such as
+`load_slab_positions` below are stand-ins for your own data loader.
+
 This guide covers writing Zarr Vectors stores from HPC (High Performance Computing)
 environments: SLURM job arrays, MPI parallel writes, Lustre/GPFS file system
 optimisation, and sharding read work across ranks.
@@ -205,11 +212,19 @@ bin-level equivalent. That is a gap to report rather than a reason to treat
 
 ```bash
 #!/bin/bash
-#SBATCH --dependency=afterok:${ARRAY_JOB_ID}
 #SBATCH --ntasks=1
 #SBATCH --mem=8G
 
 python finalise_store.py --output /scratch/scan.zarrvectors --vertices 80000000
+```
+
+`#SBATCH` lines are not shell-expanded, so the dependency on the array job goes
+on the `sbatch` command line, using the job id that the array submission
+printed:
+
+```bash
+ARRAY_JOB_ID=$(sbatch --parsable submit_array.sh)
+sbatch --dependency=afterok:${ARRAY_JOB_ID} finalise.sh
 ```
 
 ```python

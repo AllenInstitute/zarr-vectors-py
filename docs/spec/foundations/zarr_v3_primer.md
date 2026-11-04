@@ -6,18 +6,20 @@
 : The root container of a Zarr hierarchy. A store maps string keys to bytes
   and can be backed by a local file system, a cloud object store, a ZIP
   archive, or an in-memory dictionary. In Zarr Vectors, a store corresponds to the
-  `.zarrvectors` directory (or prefix).
+  `.zarrvectors` directory (or prefix); the extension is a convention, not
+  read by the library.
 
 **Group**
 : A Zarr node that contains other groups and/or arrays. Analogous to a
-  directory. Groups may carry metadata in a `.zattrs` file (Zarr v3:
-  `zarr.json` under the group key). Zarr Vectors uses groups to represent the store
-  root, each resolution level, and each array sub-group (e.g. `vertices/`,
-  `attributes/`).
+  directory. In Zarr v3, a group's metadata and attributes are both in
+  its `zarr.json`. Zarr Vectors uses groups for the store root, each
+  resolution level, and namespace groups such as `links/<delta>/` and
+  `vertex_attributes/` (whose children are the arrays).
 
 **Array**
-: A Zarr node that stores an n-dimensional typed numeric array, divided into
-  chunks. Each chunk is stored as one key in the underlying store (or, with
+: A Zarr node that stores an n-dimensional typed array, divided into
+  chunks. In Zarr Vectors the per-spatial-chunk arrays are variable-length
+  byte (vlen-bytes) arrays: one array element per spatial chunk. Each chunk is stored as one key in the underlying store (or, with
   the sharding codec, multiple logical chunks per storage key).
 
 **Chunk**
@@ -32,14 +34,18 @@
   codecs (e.g. `blosc`, `zstd`), and the `sharding_indexed` codec for
   sub-chunk addressing.
 
-**`.zattrs`**
-: A JSON file at a group path that stores arbitrary user-defined metadata.
-  Zarr Vectors makes extensive use of `.zattrs` at the store root and at each
-  resolution level group.
+**Attributes**
+: The JSON object in a node's `zarr.json` under `"attributes"` that stores
+  arbitrary user-defined metadata (what Zarr v2 kept in `.zattrs`). Zarr
+  Vectors uses the root attributes for the `zarr_vectors`, `multiscales`
+  and `ome` blocks and each level group's attributes for
+  `zarr_vectors_level`. Older ZV documentation and some code comments
+  still say "`.zattrs`"; in a Zarr v3 store there is no such file.
 
 **`zarr.json`**
-: In Zarr v3, the per-node metadata file (replaces `.zarray` and `.zgroup`
-  from Zarr v2). Stores array shape, dtype, chunk shape, and codec pipeline.
+: In Zarr v3, the per-node metadata file (replaces `.zarray`, `.zgroup`
+  and `.zattrs` from Zarr v2). Stores array shape, dtype, chunk grid and
+  codec pipeline, plus the node's attributes.
 
 ---
 
@@ -76,74 +82,82 @@ mapping is implemented by a *store backend*; Zarr Vectors supports the following
 backends (see [Store types](store_types.md) for detail):
 
 - Local file system (`zarr.storage.LocalStore`)
-- ZIP file (`zarr.storage.ZipStore`)
-- In-memory (`zarr.storage.MemoryStore`)
-- S3 via `s3fs` (requires `zarr-vectors[cloud]`)
-- GCS via `gcsfs` (requires `zarr-vectors[cloud]`)
+- Object stores via `obstore` (requires `zarr-vectors[obstore]`)
+- S3 / GCS / Azure and other `fsspec` filesystems (requires
+  `zarr-vectors[fsspec]`)
+- `icechunk` transactional repositories (requires `zarr-vectors[icechunk]`)
+- Any pre-built `zarr.abc.store.Store` passed directly, such as
+  `zarr.storage.MemoryStore`
 
 The store root of a Zarr Vectors store is identified by the path to the
 `.zarrvectors` directory (or equivalent prefix in object storage).
 
 ### Groups and the hierarchy
 
-A Zarr v3 group is represented in the store by:
-
-- `<path>/zarr.json` — group metadata: `{"zarr_format": 3, "node_type": "group"}`
-- `<path>/.zattrs` — optional user metadata (JSON object)
+A Zarr v3 group is represented in the store by a single
+`<path>/zarr.json`:
+`{"zarr_format": 3, "node_type": "group", "attributes": {...}}`.
 
 Zarr Vectors uses the following group hierarchy (abbreviated):
 
 ```
-zarr.json                   ← store root group
-.zattrs                     ← Zarr Vectors root metadata
+zarr.json                   ← store root group; attributes: zarr_vectors, multiscales, ome
 0/
-    zarr.json               ← resolution level group
-    .zattrs                 ← per-level metadata (bin_ratio, object_sparsity)
+    zarr.json               ← resolution level group; attributes: zarr_vectors_level
     vertices/
-        zarr.json           ← array metadata (shape, dtype, chunks, codecs)
-        c/0/0/0             ← chunk (0,0,0) data bytes
-        c/0/0/1             ← chunk (0,0,1) data bytes
+        zarr.json           ← array metadata (shape = chunk grid, vlen-bytes, codecs)
+        c/0/0/0             ← cell (0,0,0): the vertex payload of spatial chunk (0,0,0)
+        c/0/0/1
         …
     vertex_fragments/
         zarr.json
-        c/0/0/0             ← uint8 fragment-index blob for chunk (0,0,0)
+        c/0/0/0             ← fragment-index blob for chunk (0,0,0)
         c/0/0/1
         …
 ```
 
-All paths are relative to the store root.
+All paths are relative to the store root. With the sharding codec
+(`shard_shape=`), several cells share one storage key.
 
 ### Array metadata (`zarr.json`)
 
-Each Zarr v3 array carries a `zarr.json` file with at minimum:
+Each per-spatial-chunk array is a Zarr v3 array of rank `D` whose **shape
+is the level's chunk grid** (one array element per spatial chunk), with a
+variable-length bytes data type. For a 3-D level with a 4 × 4 × 4 chunk
+grid:
 
 ```json
 {
   "zarr_format": 3,
   "node_type": "array",
-  "shape": [N, 3],
-  "data_type": "float32",
+  "shape": [4, 4, 4],
+  "data_type": "bytes",
   "chunk_grid": {
     "name": "regular",
-    "configuration": { "chunk_shape": [65536, 3] }
+    "configuration": { "chunk_shape": [1, 1, 1] }
   },
   "chunk_key_encoding": {
     "name": "default",
     "configuration": { "separator": "/" }
   },
-  "codecs": [
-    { "name": "bytes", "configuration": { "endian": "little" } },
-    { "name": "blosc", "configuration": { "cname": "zstd", "clevel": 5 } }
-  ],
-  "fill_value": 0.0,
-  "dimension_names": ["vertex", "spatial_dim"]
+  "codecs": [ { "name": "vlen-bytes" } ],
+  "attributes": { "chunk_grid_origin": [0, 0, 0], "nonempty_chunks": [...] }
 }
 ```
 
-Zarr Vectors does not mandate a specific codec; any Zarr v3-compatible codec
-pipeline is acceptable. The default pipeline used by `zarr-vectors-py` is
-`bytes → blosc(zstd, level 5)`. Draco compression for mesh arrays uses a
-custom codec registered with Zarr; see [Codec pipeline](codec_pipeline.md).
+(Illustrative: the exact `data_type` / codec spelling and the extra array
+attributes come from the installed `zarr` version and from ZV; consult an
+actual store's `zarr.json`. Without `shard_shape=` each cell is its own
+chunk; with it the cells are wrapped in a `sharding_indexed` codec.) A
+spatial chunk at absolute coordinate `c` lands in array cell
+`c - chunk_grid_origin`; `nonempty_chunks` lists the cells that have been
+written.
+
+Zarr Vectors does not mandate a specific codec; any Zarr v3-compatible
+codec pipeline is acceptable. The **type-level writers default to no
+compression** (`bytes` only) and the dataset API defaults to `zstd`; see
+[Codec pipeline](codec_pipeline.md). Draco mesh encoding is applied by the
+mesh writer to the chunk payload and is not a Zarr codec.
 
 ### Chunk key encoding
 
@@ -165,18 +179,21 @@ All Zarr v3 metadata rules apply within Zarr Vectors stores:
   Chunks at the boundary of the array may be smaller than `chunk_shape` in
   one or more dimensions; Zarr v3 handles this transparently.
 - Missing chunks (chunks that contain only the fill value) need not be
-  stored. Zarr Vectors exploits this for sparse levels: chunks with no objects at a
-  given resolution simply have no chunk keys in the store.
-- The fill value for position arrays is `0.0`; for index arrays it is `-1`
-  (indicating "no entry"). Readers must treat missing chunks as filled with
-  the declared fill value.
+  stored. Zarr Vectors exploits this for sparse levels: cells with no data
+  simply have no chunk key in the store, and read back as empty bytes
+  (the vlen fill value).
+- Dense object-level arrays (`object_attributes/<name>`) carry their
+  absent-row marker in the array's `fill_value` (NaN for floats, a sentinel
+  for integers); there is no sibling presence-mask array. Readers must treat
+  missing chunks as filled with the declared fill value.
 
 ### Zarr v2 compatibility
 
 Zarr Vectors targets Zarr v3 exclusively. Zarr v2 stores use a different metadata
-format (`.zarray`, `.zgroup`, Fortran vs C order ambiguity) and a different
-chunk key scheme. `zarr-vectors-py` will raise `ValueError` if asked to open
-a Zarr v2 store.
+format (`.zarray`, `.zgroup`, `.zattrs`, Fortran vs C order ambiguity) and a different
+chunk key scheme. A v2 store will fail to open as a Zarr Vectors store (a
+missing `zarr_vectors` root block is reported by `open_store` as a
+`StoreError`).
 
 If you have data in a Zarr v2 store, migrate it with the `zarr` library's
 conversion utilities before ingesting into Zarr Vectors.

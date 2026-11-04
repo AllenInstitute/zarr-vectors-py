@@ -25,27 +25,30 @@
   Bare paths (no scheme) and `file://` resolve to the local backend.
 
 **ZIP store**
-: A Zarr store that packages all chunk files into a single ZIP archive.
-  Read-only via `zarr.storage.ZipStore`; useful for archiving or
-  transferring a complete store as a single file. Not produced by
-  `zarr-vectors` writers directly.
+: A Zarr store that packages all chunk files into a single ZIP archive,
+  via `zarr.storage.ZipStore`. Useful for archiving or transferring a
+  complete store as a single file. Not produced by `zarr-vectors`
+  writers directly, and not exercised by this library's own tests as far
+  as the source shows; treat as untested.
 
 **In-memory store**
-: Backed by a Python dict. Useful for unit tests and intermediate
-  processing pipelines that do not need disk persistence.
+: A `zarr.storage.MemoryStore` passed directly as the store argument.
+  Useful for unit tests and intermediate processing pipelines that do not
+  need disk persistence.
 
 **Consolidated metadata**
-: An optional `.zmetadata` file at the store root that caches every
-  `zarr.json` / `.zattrs` file in the hierarchy. Avoids many small
-  metadata reads on high-latency stores (S3/GCS).
+: A Zarr feature that caches the hierarchy's metadata in the root
+  `zarr.json`. `zarr-vectors-py` neither writes nor depends on it (see
+  below).
 
 ---
 
 ## Introduction
 
 ZV stores are backend-agnostic: the same `create_store` / `open_store` /
-`open_zv` calls work whether the data lives on a local SSD, a ZIP
-archive, an in-memory dict, or a cloud object store. The backing store
+`open_zv` calls (and the `zarr_vectors.open` / `zarr_vectors.create`
+dataset API on top of them) work whether the data lives on a local SSD,
+an in-memory store, or a cloud object store. The backing store
 type affects performance characteristics (latency, throughput, cost per
 request) but not the data model or the semantics of any operation.
 
@@ -57,14 +60,15 @@ constructor — no custom adapter classes:
 | `local`      | `zarr.storage.LocalStore` | `LocalStore(path)` | none (always available) |
 | `obstore`    | `zarr.storage.ObjectStore` | `ObjectStore(obstore.store.from_url(url, **opts))` | `obstore` (Rust object-store bindings; preferred for cloud) |
 | `fsspec`     | `zarr.storage.FsspecStore` | `FsspecStore.from_url(url, storage_options=…)` | `fsspec` + scheme driver (`s3fs`, `gcsfs`, `adlfs`) |
-| `icechunk`   | `icechunk` session store | `Repository.open(...).session().store` | `icechunk` (transactional/versioned) |
+| `icechunk`   | `icechunk` session store | `make_icechunk_session` (opens or creates a repository, then a session on a branch or snapshot) | `icechunk` (transactional/versioned) |
 
 For most users the relevant choice is between **local** (development,
 HPC analysis) and **cloud** (sharing, Neuroglancer serving). The two
 cloud byte backends are interchangeable from the caller's perspective —
 the library picks `obstore` automatically when it's installed and falls
 back to `fsspec` otherwise. Use `backend="icechunk"` for transactional,
-commit-versioned storage on top of any of these.
+commit-versioned storage (local path, `memory://`, or `s3` / `gs` / `gcs` /
+`az` / `azure` / `abfs` URLs); it is never auto-detected.
 
 ---
 
@@ -84,13 +88,34 @@ open_store(path, mode="r", *, backend=None, storage_options=None, **backend_kwar
 open_zv(path, *, backend=None, storage_options=None, **backend_kwargs) -> ZVStore
 ```
 
+(`create_store` and `open_store` return a `Group`, the library's own
+wrapper around a Zarr group; `open_store` also accepts a `Group` or any
+pre-built `zarr.abc.store.Store` in place of `path`.)
+
 `backend` is one of `"local"` / `"obstore"` / `"fsspec"` / `"icechunk"`
 or `None` for auto-detect. `storage_options` is a dict of credentials /
 options forwarded verbatim to the store constructor (fsspec
 `storage_options`, obstore `from_url` kwargs, or icechunk `*_storage`
-kwargs). Loose `**backend_kwargs` are merged into `storage_options` for
-back-compat, so `key=...`, `region=...`, `anon=True` also work as bare
-kwargs.
+kwargs). Loose `**backend_kwargs` are merged into `storage_options`, so
+`key=...`, `region=...`, `anon=True` also work as bare kwargs on these three
+functions.
+
+**The type-level `write_*` / `read_*` functions take only `backend=`**, not
+`storage_options=` or loose kwargs. To pass credentials or other options
+with them, open or create the store first and pass the handle (they accept a
+`Group`), or use the dataset API:
+
+```python
+import zarr_vectors as zv
+
+# Dataset API: options are forwarded verbatim to the backend constructor
+storage = zv.StorageOptions(backend="obstore", options={"region": "us-east-1"})
+ds = zv.open("s3://my-bucket/scan.zarrvectors", storage=storage)
+```
+
+`StorageOptions` fields: `backend`, `options` (the `storage_options` dict)
+and `branch`. If `backend` is unset, `$ZARR_VECTORS_BACKEND` and then the
+URL scheme decide.
 
 ### URL scheme dispatch
 
@@ -122,17 +147,16 @@ write_points("scan.zarrvectors", positions, chunk_shape=(200., 200., 200.))
 result = read_points("scan.zarrvectors")
 ```
 
-Internally the local backend uses `zarr.storage.LocalStore`. Each chunk
+Internally the local backend uses `zarr.storage.LocalStore`. Attributes
+live inside each node's `zarr.json` (Zarr v3 has no `.zattrs`). Each chunk
 is one file; directories correspond to group and array paths. A typical
 tree:
 
 ```
 scan.zarrvectors/
-├── zarr.json
-├── .zattrs
+├── zarr.json              # group metadata + attributes (zarr_vectors, multiscales, ome)
 ├── 0/
-│   ├── zarr.json
-│   ├── .zattrs
+│   ├── zarr.json          # level metadata (zarr_vectors_level)
 │   ├── vertices/
 │   │   ├── zarr.json
 │   │   └── c/
@@ -160,12 +184,12 @@ The preferred cloud backend is `obstore` (Rust bindings, parallel
 range reads). It's enabled automatically when installed:
 
 ```bash
-pip install "zarr-vectors[obstore]"     # preferred
+pip install "zarr-vectors[obstore]"     # preferred ([cloud] is an alias)
 # OR
-pip install "zarr-vectors[cloud]"       # fsspec + scheme drivers (fallback)
+pip install "zarr-vectors[fsspec]"      # fsspec + s3fs/gcsfs/adlfs (fallback)
 ```
 
-**S3 (read):**
+**S3 (read), ambient credentials:**
 
 ```python
 from zarr_vectors.types.points import read_points
@@ -180,11 +204,7 @@ If `obstore` is installed, the URL scheme auto-routes to it; otherwise
 `fsspec` is used. Force a specific backend with `backend=`:
 
 ```python
-read_points(
-    "s3://my-bucket/scan.zarrvectors",
-    backend="obstore",
-    region="us-west-2",
-)
+read_points("s3://my-bucket/scan.zarrvectors", backend="obstore")
 ```
 
 **GCS / Azure (read):**
@@ -194,30 +214,38 @@ read_points("gs://my-bucket/scan.zarrvectors")        # obstore or fsspec
 read_points("az://account/container/scan.zarrvectors")
 ```
 
-**Authenticated writes:** pass credentials via `storage_options=`
-(or loose `**backend_kwargs`, which merge into it) — they are forwarded
-to the store constructor — or rely on standard ambient credentials
-(`~/.aws/credentials`, `gcloud auth application-default`, environment
-variables).
+**Authenticated or non-default options:** rely on standard ambient
+credentials (`~/.aws/credentials`, `gcloud auth application-default`,
+environment variables), or pass `storage_options` through
+`open_store` / `create_store` / `open_zv` or the dataset API's
+`StorageOptions`, as shown under *Public entry points*. The option names
+are those of the chosen backend (obstore `from_url` kwargs or fsspec
+`storage_options`).
 
 ```python
-from zarr_vectors.types.points import write_points
+import numpy as np
+import zarr_vectors as zv
 
-write_points(
+schema = zv.Schema(ndim=3, bounds=([0, 0, 0], [1000, 1000, 1000]),
+                   kind="point_cloud")
+ds = zv.create(
     "s3://my-bucket/scan.zarrvectors",
-    positions,
-    chunk_shape=(500., 500., 500.),   # larger chunks = fewer S3 objects
-    backend="obstore",
-    region="us-east-1",
+    schema=schema,
+    storage=zv.StorageOptions(backend="obstore", options={"region": "us-east-1"}),
 )
+ds.add_points(np.random.default_rng(0).uniform(0, 1000, (1000, 3)))
 ```
+
+The dataset API sizes chunks from the schema's bounds and, on an object
+store, packs chunks into shards by default (see `Layout`).
 
 **Performance notes for object stores:**
 - Each ZV chunk is one object on cloud. Minimise the per-chunk
   count by increasing `chunk_shape` relative to your typical query
   bbox (target ≥ 100 KB compressed per chunk).
-- Enable **consolidated metadata** (below) to collapse store-open
-  latency on stores with many resolution levels / attribute arrays.
+- `zarr-vectors-py` already batches its own metadata lookups for a read
+  (one gather of the nodes a read needs), so store-open latency does not
+  depend on consolidated metadata.
 - For Neuroglancer serving, use `zv-ngtools` which implements its
   own request batching on top of the same backend layer.
 
@@ -244,16 +272,15 @@ the override for the whole process.
 
 ### ZIP store
 
-ZIP stores are read-only at the Zarr layer and not produced by
-`zarr-vectors` writers directly. To distribute a store as a single
-file, write to a local store and then archive:
+ZIP stores are not produced by `zarr-vectors` writers directly. To
+distribute a store as a single file, write to a local store and then
+archive:
 
 ```bash
 zip -r scan.zarrvectors.zip scan.zarrvectors/
 ```
 
-Open the archive via `zarr.storage.ZipStore` directly (not through
-`open_store`):
+Open the archive via `zarr.storage.ZipStore` at the Zarr layer:
 
 ```python
 import zarr
@@ -261,42 +288,46 @@ store = zarr.storage.ZipStore("scan.zarrvectors.zip", mode="r")
 root  = zarr.open_group(store, mode="r")
 ```
 
+`open_store` and the readers accept any pre-built
+`zarr.abc.store.Store`, so a `ZipStore` can in principle be passed to them
+directly; this page does not claim that path has been exercised.
+
 ### In-memory store
 
 Useful for tests and one-off pipelines. Pass a `zarr.storage.MemoryStore`
-through to the Zarr layer directly:
+as the store argument (a pre-built `Store` is passed through untouched):
 
 ```python
+import numpy as np
 import zarr
 from zarr_vectors.types.points import write_points, read_points
 
+positions = np.random.default_rng(0).uniform(0, 100, (1000, 3)).astype(np.float32)
+
 store = zarr.storage.MemoryStore()
-write_points(store, positions, chunk_shape=(200., 200., 200.))
+write_points(store, positions, chunk_shape=(50., 50., 50.))
 result = read_points(store)
 ```
 
-In-memory stores are discarded when the Python process exits.
+In-memory stores are discarded when the Python process exits. (With
+`backend="icechunk"`, a `memory://` URL gives an in-memory repository.)
 
 ### Consolidated metadata
 
-On stores with many groups (large pyramids, many attribute arrays),
-opening the store issues one metadata request per Zarr group and array.
-On S3 with ~50 ms per request, this adds noticeable latency.
+Zarr's `consolidate_metadata` is a Zarr-level feature (it stores the
+hierarchy's metadata in the root `zarr.json`). `zarr-vectors-py` does not
+call it and its readers do not rely on it; nothing in this library
+verifies that consolidating a ZV store speeds up `open_store`. The
+library instead resolves the handful of nodes a read needs in a single
+batched gather.
 
-Consolidate after writing:
+### Transactions (icechunk)
 
-```python
-import zarr
-from zarr_vectors.core.store import open_store
-
-root = open_store("scan.zarrvectors", mode="r+")
-zarr.consolidate_metadata(root.zarr_group.store)
-```
-
-This writes a single `.zmetadata` file at the store root; subsequent
-`open_store()` calls read from it instead of issuing individual
-metadata requests. Regenerate after any structural change (e.g. adding
-a resolution level).
+With `backend="icechunk"`, writes accumulate in a session and become
+durable on `zarr_vectors.core.store.commit(group, message)`, which returns
+the new snapshot id (`None` on non-transactional backends, where it is a
+no-op). `Dataset.commit(message)` wraps it. `session_for(group)` returns the
+underlying `icechunk.Session`.
 
 ### Choosing a store type
 
@@ -305,7 +336,8 @@ a resolution level).
 | Local analysis / development | Local backend (default) |
 | HPC batch processing         | Local backend on Lustre/GPFS with striping |
 | Archiving a completed dataset | Local write, then `zip -r` |
-| Cloud sharing / Neuroglancer serving | `obstore` (or `fsspec` fallback) + consolidated metadata |
+| Versioned / transactional edits | `backend="icechunk"` |
+| Cloud sharing / Neuroglancer serving | `obstore` (or `fsspec` fallback) + the [sharding codec](../chunking/sharding.md) |
 | Unit tests | In-memory store via `zarr.storage.MemoryStore` |
 | Very large stores with many small chunks | Local or cloud + the [sharding codec](../chunking/sharding.md) |
 
@@ -315,4 +347,4 @@ The backend layer is independent of the
 [format capability tokens](../layout/root_metadata.md) stamped on
 `RootMetadata.format_capabilities` — backends carry data bytes, not
 format semantics. See the capability list for `CAP_MULTISCALE_LINKS`,
-`CAP_PRESERVED_OBJECT_IDS`, `CAP_SHARED_VERTEX_GROUPS`.
+`CAP_PRESERVED_OBJECT_IDS`, `CAP_SHARED_FRAGMENTS`, `CAP_FRAGMENT_INDEX`.

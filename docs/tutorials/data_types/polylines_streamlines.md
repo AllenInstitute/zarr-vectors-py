@@ -18,8 +18,14 @@ are covered by the compatibility promise; `zv.stability("zarr_vectors.api")`
 says so at runtime. TRK/TCK/TRX converters live in the companion package
 **`zarr-vectors-tools`**.
 
+**You will learn:** how to write streamlines with per-vertex and per-streamline
+attributes and groups, read them back whole, by id, by group and by region, and
+build a pyramid. **Prerequisite:** the
+[Quickstart](../../getting_started/quickstart.md) (the first-store walkthrough
+is enough).
+
 The page is one continuous session — later blocks reuse the stores earlier
-blocks create.
+blocks create (and the `streamlines` list defined in the second write example).
 
 ---
 
@@ -156,8 +162,9 @@ Three things to note:
   members are contiguous may be passed as a `range` object, which is stored
   compactly.
 - The declarations in the `Schema` (`vertex_attributes=`, `object_attributes=`)
-  document the store and size its arrays. They are not enforced at write time,
-  and the values are always passed to the write call.
+  are checked at write time: a declared `dtype` or `channels` that disagrees
+  with the array you pass raises `SchemaConflict` before anything is written.
+  The values themselves are always passed to the write call.
 
 ### Acquisition metadata
 

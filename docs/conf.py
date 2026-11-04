@@ -10,7 +10,7 @@ sys.path.insert(0, os.path.abspath(".."))
 
 # -- Project information ------------------------------------------------------
 project = "zarr-vectors"
-copyright = "2024, BRIDGE Neuroscience. Aligned to the Zarr Vectors specification by Forest Collman, Allen Institute for Brain Sciences."
+copyright = "2024, BRIDGE Neuroscience. Aligned to the Zarr Vectors specification by Forrest Collman, Allen Institute for Brain Sciences."
 author = "BRIDGE Neuroscience"
 # From the installed package, not a literal: the version comes from the
 # git tag via setuptools-scm and moves with every commit, so a hard-coded
@@ -84,8 +84,11 @@ source_suffix = {
 }
 master_doc = "index"
 
-templates_path = ["_templates"]
-exclude_patterns = ["_build", "Thumbs.db", ".DS_Store"]
+# No custom templates: docs/_templates does not exist, so do not point at it.
+templates_path: list[str] = []
+# upstream/ holds internal findings notes for downstream consumers; they are
+# not part of the published documentation and are in no toctree.
+exclude_patterns = ["_build", "Thumbs.db", ".DS_Store", "upstream"]
 
 # -- HTML output --------------------------------------------------------------
 html_theme = "furo"

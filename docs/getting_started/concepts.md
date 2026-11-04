@@ -8,7 +8,28 @@ pyramids before writing your first large dataset. The
 each concept.
 
 The [Quickstart](quickstart.md) shows the calls; this page explains what
-they are doing to the store.
+they are doing to the store. **Prerequisite:** none beyond having skimmed the
+quickstart's first-store walkthrough; the snippets that open `scan.zarrvectors`
+or `tracts.zarrvectors` assume you built those stores there.
+
+### The terms, in one place
+
+Each is explained properly below; this is the map.
+
+- **Store** — the directory holding everything. **Dataset** — the Python
+  handle you get from `zv.create` / `zv.open`.
+- **Schema** — what the data *is* (extent, axes, geometry kind, attributes).
+  **Layout** — how it is *cut up* on disk. They are separate on purpose.
+- **Chunk** (also called a **cell** in the api) — the unit of I/O; one stored
+  cell per occupied region of space. **Bin** (**subcell**) — a finer division
+  inside a chunk, the unit of spatial lookup.
+- **Fragment** — one entry in a chunk's index: the rows of the chunk's vertices
+  that belong to one bin (or one object).
+- **Object** — a discrete thing in the store (a streamline, a neuron, a mesh);
+  its **manifest** lists the (chunk, fragment) pairs that hold it. **Group** —
+  a named set of objects.
+- **Level** — one resolution of the data; level 0 is full resolution, and
+  **build_pyramid** adds coarser ones.
 
 ---
 
@@ -123,7 +144,12 @@ links, fragments and objects map onto these arrays across a multi-level
 store.
 
 Each sub-directory is a Zarr group. Arrays within a group are themselves
-directories containing one file per chunk (or shard). Nothing is binary-
+directories containing one file per chunk (or shard). Because every chunk
+holds a different number of vertices, the per-chunk arrays are **ragged**: each
+array's shape is the chunk grid, and each occupied grid position holds one
+variable-length bytes cell (Zarr v3's vlen-bytes codec) — not a padded dense
+array. Attribute arrays use the same grid and hold one cell per chunk, row-aligned
+with the vertices cell. Nothing is binary-
 proprietary; the entire store can be inspected with `zarr` or a plain file
 browser. Sharding does not change the tree — the keys stay `c/i/j/k`, and
 each file just becomes a shard covering several cells.

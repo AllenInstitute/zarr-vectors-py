@@ -11,10 +11,17 @@ The coarsening itself lives in `zarr_vectors.multiresolution`, which is
 internal and changes without notice; nothing on this page imports from it
 except the one section that documents a gap.
 
-This tutorial covers pyramid construction for point clouds, streamlines and
-graphs; cross-pyramid-level link materialisation; and level bookkeeping. See
-the [Pyramid construction](../../spec/multiscale/pyramid_construction.md)
+This tutorial covers pyramid construction for point clouds and
+streamlines/polylines; cross-pyramid-level link materialisation; and level
+bookkeeping. See the
+[Pyramid construction](../../spec/multiscale/pyramid_construction.md)
 spec page for the algorithm and on-disk layout.
+
+**Prerequisite:** you can create a store and write geometry into it — the
+[Quickstart](../../getting_started/quickstart.md) covers that. Each section
+below builds its own store from scratch (`synchrotron.zarrvectors`,
+`bundle.zarrvectors`, and so on), but later sections reuse the stores earlier
+ones create, so work through the page in order.
 
 ---
 
@@ -165,6 +172,15 @@ viewer relies on has nothing to distinguish levels by:
 
 ```python
 # the same 500 000 points, built with factors= but no chunk_scale_factors
+flat_ds = zv.create("no_chunk_scale.zarrvectors", schema=zv.Schema(
+    bounds=((0.0, 0.0, 0.0), (2000.0, 2000.0, 2000.0)),
+    kind="point_cloud",
+    expected=zv.SizeHints(n_vertices=500_000),
+    layout=zv.Layout(cells=10),
+))
+flat_ds.add_points(positions)
+flat_ds.build_pyramid(factors=[(2.0, 1.0), (2.0, 1.0), (2.0, 1.0)])
+
 flat = zv.open("no_chunk_scale.zarrvectors")
 for index in flat.levels:
     level = flat.level(index)
@@ -536,7 +552,9 @@ it, and `chunk_scale_factors` already accepts a per-axis tuple per level, so
 anisotropic *chunking* needs no internal import:
 
 ```python
-ds.build_pyramid(
+# on a store that has no pyramid yet (build_pyramid rebuilds every level above 0)
+fresh = zv.open("fresh.zarrvectors", mode="r+")
+fresh.build_pyramid(
     factors=[(2.0, 1.0), (2.0, 1.0)],
     chunk_scale_factors=[(2, 2, 1), (2, 2, 1)],   # per-axis, per level
 )
