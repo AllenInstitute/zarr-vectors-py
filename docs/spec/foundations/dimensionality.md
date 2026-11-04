@@ -175,7 +175,7 @@ Axis names and units live in `multiscales[0].axes` (see
 [Multiscale metadata](../multiscale/multiscale_metadata.md)). Example for a
 3-D store in micrometres:
 
-```json
+```javascript
 {
   "multiscales": [
     {

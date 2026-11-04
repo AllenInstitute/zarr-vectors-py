@@ -3,6 +3,7 @@ zarr\_vectors
 
 .. automodule:: zarr_vectors
    :no-members:
+   :no-special-members:
 
 The flat top-level namespace. Importing ``zarr_vectors`` re-exports the whole
 :doc:`api` surface — ``Dataset``, ``Level``, ``Query``, ``Selection``,

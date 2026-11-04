@@ -65,7 +65,7 @@ link arrays on the [Links](links.md) page.
 
 ### Per-vertex attributes (`vertex_attributes/<name>/`)
 
-#### Array schema
+#### Per-vertex array schema
 
 | Property | Value |
 |----------|-------|
@@ -221,7 +221,7 @@ manifests change.
 
 ### Per-object attributes (`object_attributes/<name>`)
 
-#### Array schema
+#### Per-object array schema
 
 ```
 path:        <N>/object_attributes/<name>        (a plain Zarr array, not a group)

@@ -123,6 +123,10 @@ object_model/object_manifest
 object_model/links
 object_model/object_attributes
 validation/overview
+validation/l1_structural
+validation/l2_metadata
+validation/l3_consistency
+schema
 comparisons/neuroglancer_precomputed
 comparisons/trx_format
 comparisons/ome_zarr

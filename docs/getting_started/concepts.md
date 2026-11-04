@@ -12,7 +12,7 @@ they are doing to the store. **Prerequisite:** none beyond having skimmed the
 quickstart's first-store walkthrough; the snippets that open `scan.zarrvectors`
 or `tracts.zarrvectors` assume you built those stores there.
 
-### The terms, in one place
+## The terms, in one place
 
 Each is explained properly below; this is the map.
 
