@@ -1,0 +1,61 @@
+{
+  "far_triangles": 64,
+  "legacy_one_vertex_chunk_faces": 0,
+  "legacy_complete_endpoint_query": {
+    "faces": 1,
+    "store_reads": 21,
+    "encoded_bytes": 10895,
+    "metadata_bytes": 10623,
+    "payload_bytes": 272,
+    "payload_keys": [
+      "0/links/0/0.+1.0_+1.0.0/c/0/0/0",
+      "0/vertex_fragments/c/0/0/0",
+      "0/vertex_fragments/c/0/1/0",
+      "0/vertex_fragments/c/1/0/0",
+      "0/vertices/c/0/0/0",
+      "0/vertices/c/0/1/0",
+      "0/vertices/c/1/0/0"
+    ]
+  },
+  "ownership_index_discovery": {
+    "store_reads": 9,
+    "encoded_bytes": 7232,
+    "metadata_bytes": 7232,
+    "payload_bytes": 0,
+    "payload_keys": []
+  },
+  "ownership_first_query": {
+    "faces": 1,
+    "store_reads": 8,
+    "encoded_bytes": 1991,
+    "metadata_bytes": 1719,
+    "payload_bytes": 272,
+    "payload_keys": [
+      "0/links/0/0.+1.0_+1.0.0/c/0/0/0",
+      "0/vertex_fragments/c/0/0/0",
+      "0/vertex_fragments/c/0/1/0",
+      "0/vertex_fragments/c/1/0/0",
+      "0/vertices/c/0/0/0",
+      "0/vertices/c/0/1/0",
+      "0/vertices/c/1/0/0"
+    ]
+  },
+  "ownership_repeated_query": {
+    "faces": 1,
+    "store_reads": 7,
+    "encoded_bytes": 272,
+    "metadata_bytes": 0,
+    "payload_bytes": 272,
+    "payload_keys": [
+      "0/links/0/0.+1.0_+1.0.0/c/0/0/0",
+      "0/vertex_fragments/c/0/0/0",
+      "0/vertex_fragments/c/0/1/0",
+      "0/vertex_fragments/c/1/0/0",
+      "0/vertices/c/0/0/0",
+      "0/vertices/c/0/1/0",
+      "0/vertices/c/1/0/0"
+    ]
+  },
+  "payload_ratio_legacy_to_owned": 1.0,
+  "scope": "Local encoded store buffers, not latency or HTTP wire bytes. Discovery is separate. Queries have different contracts but return identical geometry on this fixture. No decoded mesh cache is used in the reader repeat."
+}

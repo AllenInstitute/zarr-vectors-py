@@ -107,6 +107,7 @@ Where to start
    tutorials/data_types/polylines_streamlines
    tutorials/data_types/graphs_skeletons
    tutorials/data_types/meshes
+   tutorials/data_types/mesh_streaming
    tutorials/multiscale/building_pyramids
    tutorials/multiscale/lazy_loading
    tutorials/io/cloud_stores
