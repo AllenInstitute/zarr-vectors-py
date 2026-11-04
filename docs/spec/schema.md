@@ -36,10 +36,10 @@ For details on coverage, vocabulary mappings (OME-Zarr / Schema.org),
 and the build-time regeneration workflow, see
 [`schema/README.md`].
 
-[`schema/`]:                            ../../schema/
-[`schema/zarr_vectors.linkml.yaml`]:    ../../schema/zarr_vectors.linkml.yaml
-[`schema/zarr_vectors.schema.json`]:    ../../schema/zarr_vectors.schema.json
-[`schema/reference.md`]:                ../../schema/reference.md
-[`schema/README.md`]:                   ../../schema/README.md
+[`schema/`]:                            https://github.com/AllenInstitute/zarr-vectors-py/tree/main/schema
+[`schema/zarr_vectors.linkml.yaml`]:    https://github.com/AllenInstitute/zarr-vectors-py/blob/main/schema/zarr_vectors.linkml.yaml
+[`schema/zarr_vectors.schema.json`]:    https://github.com/AllenInstitute/zarr-vectors-py/blob/main/schema/zarr_vectors.schema.json
+[`schema/reference.md`]:                https://github.com/AllenInstitute/zarr-vectors-py/blob/main/schema/reference.md
+[`schema/README.md`]:                   https://github.com/AllenInstitute/zarr-vectors-py/blob/main/schema/README.md
 [`zarr_vectors/core/metadata.py`]:      ../../zarr_vectors/core/metadata.py
 [LinkML]:                               https://linkml.io/

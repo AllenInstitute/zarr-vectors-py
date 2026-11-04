@@ -14,6 +14,7 @@ that is a gap to report rather than a reason to import from ``core``.
 
 .. automodule:: zarr_vectors.building
    :no-members:
+   :no-special-members:
 
 Format constants and array names
 --------------------------------

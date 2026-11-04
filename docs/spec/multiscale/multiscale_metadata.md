@@ -170,7 +170,7 @@ physical_position = metanode_position × scale + translation
 
 **Scale:** encodes the bin ratio (a float; fractional coarsen factors round-trip). For level `N` with `bin_ratio = [r_0, …, r_{D-1}]`:
 
-```json
+```javascript
 {"type": "scale", "scale": [r_0, r_1, ..., r_{D-1}]}
 ```
 
@@ -180,7 +180,7 @@ coordinates.
 **Translation:** encodes the bin centroid offset. Level 0 uses `base_bin_shape / 2`; level `N` with
 `bin_shape = [b_0, …, b_{D-1}]`:
 
-```json
+```javascript
 {"type": "translation", "translation": [b_0/2, b_1/2, ..., b_{D-1}/2]}
 ```
 

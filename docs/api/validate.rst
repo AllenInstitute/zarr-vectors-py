@@ -30,6 +30,7 @@ Individual validation modules
 .. automodule:: zarr_vectors.validate.structure
    :members:
    :undoc-members:
+   :exclude-members: ValidationResult
 
 .. automodule:: zarr_vectors.validate.metadata
    :members:

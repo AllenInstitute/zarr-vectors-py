@@ -356,7 +356,7 @@ records.
 **`links/<delta>/` — family group.** Policy every offsets array under it
 must agree on:
 
-```jsonc
+```javascript
 {
   "zv_array":    "links_family",
   "level_delta": 0,
@@ -374,7 +374,7 @@ must agree on:
 **`links/<delta>/<offsets>/` — array.** Only what decodes this array's
 own cells:
 
-```jsonc
+```javascript
 {
   "zv_array":    "links",
   "dtype":       "int64",
@@ -393,13 +393,13 @@ segment agree; the field is preferred because decoding it needs no
 
 **`link_attributes/<name>/<delta>/` — family group:**
 
-```jsonc
+```json
 { "zv_array": "link_attribute_family", "name": "weight", "level_delta": 0 }
 ```
 
 **`link_attributes/<name>/<delta>/<offsets>/` — array:**
 
-```jsonc
+```json
 {
   "zv_array":    "link_attribute",
   "name":        "weight",

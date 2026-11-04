@@ -85,7 +85,7 @@ Zarr Vectors uses `scale` and `translation` to encode the physical meaning of co
 resolution metanodes. For a level with `bin_ratio = [r_0, r_1, r_2]` and
 `bin_shape = [b_0, b_1, b_2]`:
 
-```json
+```javascript
 "coordinateTransformations": [
   {"type": "scale",       "scale":       [r_0, r_1, r_2]},
   {"type": "translation", "translation": [b_0/2, b_1/2, b_2/2]}

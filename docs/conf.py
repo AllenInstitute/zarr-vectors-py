@@ -48,7 +48,7 @@ myst_enable_extensions = [
     "tasklist",         # - [ ] checkboxes
     "attrs_inline",     # inline attribute syntax
 ]
-myst_heading_anchors = 3
+myst_heading_anchors = 4
 
 # Napoleon (Google / NumPy docstrings)
 napoleon_google_docstring = True

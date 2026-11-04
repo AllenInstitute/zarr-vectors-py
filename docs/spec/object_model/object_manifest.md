@@ -123,7 +123,7 @@ attributes:
 
 Group attributes:
 
-```json
+```javascript
 {
   "zv_array":         "object_index",
   "num_objects":      <int>,      // number of ROWS (slots), present or not

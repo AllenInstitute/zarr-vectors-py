@@ -3,6 +3,7 @@ Data API
 
 .. automodule:: zarr_vectors.api
    :no-members:
+   :no-special-members:
 
 The sections below follow the order you meet them in: open a dataset, say what
 you want stored or what you want back, read it, then work with the objects,

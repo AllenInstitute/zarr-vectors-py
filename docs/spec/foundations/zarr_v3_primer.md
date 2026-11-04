@@ -126,7 +126,7 @@ is the level's chunk grid** (one array element per spatial chunk), with a
 variable-length bytes data type. For a 3-D level with a 4 × 4 × 4 chunk
 grid:
 
-```json
+```javascript
 {
   "zarr_format": 3,
   "node_type": "array",
