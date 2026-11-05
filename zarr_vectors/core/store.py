@@ -42,6 +42,7 @@ if TYPE_CHECKING:
     WriteTarget = StoreLike | Group
 
 from zarr_vectors.constants import (
+    CAP_DENSE_MANIFESTS,
     DEFAULT_AXES_NAMES,
     DEFAULT_BOUNDS_SIDE,
     FORMAT_VERSION,  # noqa: F401  (re-exported for callers)
@@ -56,7 +57,9 @@ from zarr_vectors.core.metadata import (
     NgffAxis,
     ParametricTypeDef,
     RootMetadata,
+    axes_with_unit,
     deserialise_parametric_types,
+    normalise_shard_shape,
     serialise_parametric_types,
 )
 from zarr_vectors.exceptions import MetadataError, StoreError
@@ -159,6 +162,36 @@ def _make_fsspec_zarr_store(
     )
 
 
+def _reject_unused_backend_kwargs(
+    kwargs: dict[str, Any], *, backend: str,
+) -> None:
+    """Raise ``TypeError`` for loose kwargs this backend cannot use.
+
+    Only for the branches that discard them ENTIRELY -- a local store, or
+    one the caller built themselves.  The remote backends genuinely take
+    open-ended options (obstore's ``from_url`` and fsspec's per-filesystem
+    ``storage_options`` are both ``**kwargs``), so there is nothing
+    honest to validate them against and they stay permissive.
+
+    Explicit ``storage_options=`` is never rejected, here or anywhere: a
+    caller passing one options dict across several backends means it, and
+    a key that is meaningless for the local one is not a typo.  The loose
+    ``**backend_kwargs`` channel is the one where a misspelling lands,
+    which is how ``create_store(path, shard_shape=8)`` came to be accepted
+    and silently dropped for the whole life of the feature.
+    """
+    if not kwargs:
+        return
+    names = ", ".join(repr(k) for k in sorted(kwargs))
+    raise TypeError(
+        f"unexpected keyword argument(s) {names}: the {backend!r} backend "
+        f"takes no backend options, so these would be silently ignored. "
+        f"If you meant a store option, pass storage_options={{...}}; if you "
+        f"meant a zarr-vectors argument, check its spelling against the "
+        f"function signature."
+    )
+
+
 def _make_zarr_store_with_session(
     path: StoreLike,
     *,
@@ -179,6 +212,15 @@ def _make_zarr_store_with_session(
     constructor — fsspec ``storage_options``, obstore ``from_url`` kwargs,
     or icechunk ``*_storage`` kwargs.
 
+    The three branches that cannot use options at all — a pre-built
+    store, a pre-built obstore object, and ``local`` — raise
+    :class:`TypeError` on loose ``**backend_kwargs`` rather than
+    discarding them.  Explicit ``storage_options=`` is always accepted,
+    including there: a caller passing one options dict across several
+    backends means it, whereas a loose keyword that fits nothing is a
+    misspelling.  The remote backends stay permissive because their
+    constructors are genuinely open-ended.
+
     Dispatch order:
 
     1. Pre-built :class:`zarr.abc.store.Store` → pass through (honoring
@@ -198,6 +240,8 @@ def _make_zarr_store_with_session(
 
     # 1. Pre-built Zarr store: pass through.
     if isinstance(path, _ZStore):
+        # Nothing here can act on options -- the store is already built.
+        _reject_unused_backend_kwargs(backend_kwargs, backend="pre-built store")
         if mode == "r" and not path.read_only and hasattr(path, "with_read_only"):
             path = path.with_read_only(True)
         return path, None
@@ -210,6 +254,9 @@ def _make_zarr_store_with_session(
     if _obs_store_mod is not None and isinstance(path, _obs_store_mod.ObjectStore):
         from zarr.storage import ObjectStore as _ZarrObjStore
 
+        _reject_unused_backend_kwargs(
+            backend_kwargs, backend="pre-built obstore store",
+        )
         return _ZarrObjStore(path, read_only=(mode == "r")), None
 
     # 3. icechunk — transactional, explicit only.
@@ -235,6 +282,11 @@ def _make_zarr_store_with_session(
 
     name = resolve_backend_name(str(path), backend)
     if name == "local":
+        # ``LocalStore`` takes a path and nothing else, so ``opts`` is
+        # dropped here. That silent drop is the whole bug: a store-level
+        # argument with no parameter to land in was collected by
+        # ``**backend_kwargs``, carried this far, and discarded.
+        _reject_unused_backend_kwargs(backend_kwargs, backend="local")
         return LocalStore(_resolve_local_path(path)), None
     if name == "obstore":
         return _make_obstore_zarr_store(str(path), mode=mode, storage_options=opts)
@@ -292,7 +344,7 @@ class FsGroup(Group):
         store = LocalStore(root)
         # Use mode="a" so the store is read-write but does not clobber
         # any existing root group.
-        zg = zarr.open_group(store, mode="a")
+        zg = zarr.open_group(store, mode="a", zarr_format=3)
         super().__init__(zg)
 
 
@@ -322,7 +374,11 @@ def create_store(
     base_bin_shape: tuple[float, ...] | None = None,
     format_capabilities: list[str] | None = None,
     attribute_specs: dict[str, dict[str, Any]] | None = None,
+    shard_shape: int | Sequence[int] | None = None,
+    manifest_layout: str | None = None,
+    manifest_block_dtype: str | None = None,
     name: str | None = None,
+    unit: str | None = None,
     backend: str | None = None,
     storage_options: dict[str, Any] | None = None,
     **backend_kwargs: Any,
@@ -398,13 +454,64 @@ def create_store(
             "link": ...}``.  Optional and additive; a reader that does
             not know about it is unaffected.  Declaring an attribute does
             not create it.
+        shard_shape: Cells per shard per axis, or ``None`` (the default)
+            for one storage object per cell.  An ``int`` broadcasts to
+            every axis; a per-axis sequence must have one entry per
+            spatial dimension.
+
+            Recorded on the root, which is what makes it reach the arrays
+            nobody passes it to -- an attribute array or links segment
+            allocated on first write, in a worker that never saw this
+            call.  Per-call ``shard_shape=`` on a writer reaches only the
+            arrays that writer creates, which is how a store ends up
+            sharded in some arrays and flat in the rest.
+
+            The units are grid cells, not coordinates, so one declaration
+            stays meaningful at every level of a pyramid even though
+            their grids differ.  It is a writer default rather than a
+            claim about what is on disk: each array's own ``zarr.json``
+            remains the truth about that array.
+        manifest_layout: ``"dense"`` to write object indexes as
+            fixed-width integer arrays (``manifest_spans`` +
+            ``manifest_blocks``) rather than one vlen blob per object;
+            ``None`` or ``"vlen"`` (the default) for blobs. Recorded on
+            the root as the default for every index created later; an
+            index that exists keeps its layout. See
+            :mod:`zarr_vectors.core.dense_manifests`.
+        manifest_block_dtype: ``"int32"`` to create dense indexes'
+            ``manifest_blocks`` as int32, which halves the bytes a chunk
+            decodes to (stored, under zstd, a few percent less), for a
+            store whose chunk coordinates and fragment indices all fit
+            in it; ``None`` or ``"int64"`` (the default) for int64.
+            Recorded on the root as the default for every dense index
+            created later (``block_dtype=`` on a writer overrides it); an
+            index keeps the dtype it was created with, and every write
+            into an int32 one raises :class:`ArrayError` on a value that
+            does not fit rather than wrapping it. Spans and ids stay
+            int64, and every reader returns int64.
         name: Human-readable store name, recorded on the RFC 8 ``ome``
             node so an OME collection can present it.  Defaults to the
             store path's last segment with its extension stripped.  Not an
             identifier: a collection referencing this store supplies its
             own name for the node, which is what addresses it there.
+        unit: What vertex coordinates are measured in -- an NGFF space
+            unit such as ``"micrometer"``.  Declared on every space axis
+            (``axes`` as given, or the generated defaults), so it is
+            recorded in ``multiscales[0].axes`` and written into the
+            ``world`` coordinate system of the root ``ome`` scene.
+            ``None`` (the default) declares nothing and writes exactly
+            what a store created without it always has: a unit is a
+            claim, and a store that does not know one must not make it.
+            Raises :class:`MetadataError` for a non-NGFF spelling or a
+            conflict with a unit already on ``axes``; see
+            :func:`zarr_vectors.core.metadata.axes_with_unit`.
         backend: Force a particular backend (``"local"`` / ``"icechunk"``).
-        **backend_kwargs: Forwarded to the backend constructor.
+        **backend_kwargs: Forwarded to the backend constructor.  A
+            backend that takes no options -- ``local``, or a store you
+            built yourself -- raises :class:`TypeError` rather than
+            discarding them, so a misspelled parameter fails here instead
+            of being silently ignored.  Structured ``storage_options=``
+            is always accepted.
 
     Returns:
         The root :class:`Group`.
@@ -416,6 +523,13 @@ def create_store(
     resolved_ndim = _resolve_ndim(
         ndim=ndim, axes=axes, chunk_shape=chunk_shape, bounds=bounds,
     )
+    # Checked here rather than at first use: a bad shape should fail at
+    # the call that declared it, not inside whichever worker later
+    # allocates an array from the declaration.
+    try:
+        normalise_shard_shape(shard_shape, resolved_ndim)
+    except ValueError as exc:
+        raise MetadataError(f"Invalid shard_shape: {exc}") from exc
     if axes is None:
         if resolved_ndim > len(DEFAULT_AXES_NAMES):
             raise MetadataError(
@@ -426,6 +540,8 @@ def create_store(
             {"name": n, "type": "space"}
             for n in DEFAULT_AXES_NAMES[:resolved_ndim]
         ]
+    if unit is not None:
+        axes = axes_with_unit(axes, unit)
     if bounds is None:
         bounds = (
             [0.0] * resolved_ndim,
@@ -478,6 +594,9 @@ def create_store(
         base_bin_shape=base_bin_shape,
         format_capabilities=format_capabilities,
         attribute_specs=attribute_specs,
+        shard_shape=shard_shape,
+        manifest_layout=manifest_layout,
+        manifest_block_dtype=manifest_block_dtype,
         name=name,
     )
 
@@ -559,6 +678,9 @@ def _write_root_attrs(
     base_bin_shape: tuple[float, ...] | None = None,
     format_capabilities: list[str] | None = None,
     attribute_specs: dict[str, dict[str, Any]] | None = None,
+    shard_shape: int | Sequence[int] | None = None,
+    manifest_layout: str | None = None,
+    manifest_block_dtype: str | None = None,
     name: str | None = None,
 ) -> None:
     """Write the ``zarr_vectors`` root-attrs block plus the eager NGFF
@@ -602,6 +724,32 @@ def _write_root_attrs(
         zv["reduction_factor"] = int(reduction_factor)
     if base_bin_shape is not None:
         zv["base_bin_shape"] = list(base_bin_shape)
+    if shard_shape is not None:
+        # Verbatim: the scalar form is what a reader looks for, and the
+        # value is cells-per-shard, which is meaningful against any grid.
+        zv["shard_shape"] = (
+            int(shard_shape) if isinstance(shard_shape, int)
+            else [int(x) for x in shard_shape]
+        )
+    if manifest_layout not in (None, "vlen", "dense"):
+        raise MetadataError(
+            f"manifest_layout={manifest_layout!r}; expected 'vlen' or 'dense'"
+        )
+    if manifest_layout == "dense":
+        # Absent means vlen, so only the non-default value is written and
+        # a store that never asks carries no key.
+        zv["manifest_layout"] = "dense"
+        caps = list(zv.get("format_capabilities") or [])
+        if CAP_DENSE_MANIFESTS not in caps:
+            zv["format_capabilities"] = [*caps, CAP_DENSE_MANIFESTS]
+    if manifest_block_dtype not in (None, "int64", "int32"):
+        raise MetadataError(
+            f"manifest_block_dtype={manifest_block_dtype!r}; expected 'int64' or 'int32'"
+        )
+    if manifest_block_dtype == "int32":
+        # Absent means int64, as absent manifest_layout means vlen. No
+        # capability: every reader already widens the blocks to int64.
+        zv["manifest_block_dtype"] = "int32"
     if attribute_specs:
         # Only non-empty scopes, so a store that declares nothing carries
         # no key at all rather than three empty dicts.
@@ -905,6 +1053,7 @@ def _create_or_open_store(
     axes: list[dict[str, str]] | None = None,
     geometry_types: list[str] | None = None,
     ndim: int | None = None,
+    shard_shape: int | Sequence[int] | None = None,
     **backend_kwargs: Any,
 ) -> Group:
     """Warm the store with :func:`create_store` if no store exists at
@@ -917,9 +1066,18 @@ def _create_or_open_store(
     — this lets callers write through a handle they already hold.
 
     The create-only kwargs (``bounds`` / ``chunk_shape`` / ``axes`` /
-    ``geometry_types`` / ``ndim``) are forwarded to :func:`create_store`
-    on a fresh path and ignored when opening an existing store — the
-    existing store's structural metadata stays authoritative.
+    ``geometry_types`` / ``ndim`` / ``shard_shape``) are forwarded to
+    :func:`create_store` on a fresh path and ignored when opening an
+    existing store — the existing store's structural metadata stays
+    authoritative.
+
+    ``shard_shape`` is named rather than left to ``**backend_kwargs``
+    precisely because it is not a backend option: absorbed there it was
+    forwarded to a store constructor that has no notion of sharding, and
+    on a local path dropped without a word.  Declaring it here is also
+    what makes ``write_points(path, shard_shape=8)`` produce a sharded
+    STORE rather than a store with sharded level-0 arrays and flat
+    everything a worker adds later.
     """
     # Pass-through for an already-opened Group handle.
     if isinstance(path, Group):
@@ -936,6 +1094,8 @@ def _create_or_open_store(
         creator_kwargs["geometry_types"] = geometry_types
     if ndim is not None:
         creator_kwargs["ndim"] = ndim
+    if shard_shape is not None:
+        creator_kwargs["shard_shape"] = shard_shape
 
     if backend == "icechunk":
         try:
@@ -1092,7 +1252,9 @@ def open_store(
         store._zv_icechunk_session = session
     zarr_open_mode = "r" if mode == "r" else "r+"
     try:
-        zg = zarr.open_group(store, mode=zarr_open_mode)
+        # zarr-vectors stores are Zarr v3 only; without the format zarr
+        # also asks for .zgroup and .zattrs, two failed round trips.
+        zg = zarr.open_group(store, mode=zarr_open_mode, zarr_format=3)
     except zarr.errors.GroupNotFoundError as e:
         raise StoreError(f"Not a valid ZV store at {path}: {e}") from None
     root = FsGroup.__new__(FsGroup) if isinstance(store, LocalStore) else Group.__new__(Group)
@@ -1144,8 +1306,11 @@ def commit(group: Group, message: str = "zarr-vectors write") -> str | None:
     """Commit pending changes when the store is backed by a transactional
     backend (currently ``icechunk``).
 
-    For non-transactional backends this is a no-op and returns ``None``;
-    writes are durable as soon as they hit the store.
+    For non-transactional backends this is a no-op and returns ``None``:
+    each write is visible as soon as it lands. On an object store a
+    returned PUT is also durable; on a local filesystem it is atomic
+    (renamed into place) but not fsynced unless written inside
+    ``batched_writes(durable=True)`` / ``open_write_session(durable=True)``.
 
     For icechunk-backed stores this calls ``session.commit(message)``
     and returns the new snapshot id (a hex string).  The same session

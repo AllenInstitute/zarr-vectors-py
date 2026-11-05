@@ -146,6 +146,67 @@ def validate_axes(axes: list[dict[str, str]]) -> None:
         last_rank = rank
 
 
+#: The space-axis units NGFF lists (UDUNITS-2 names).  The spec says a
+#: space axis's unit SHOULD be one of these, and a validator flags any
+#: other string -- ``"um"`` included, which is the usual slip.
+NGFF_SPACE_UNITS: frozenset[str] = frozenset({
+    "angstrom", "attometer", "centimeter", "decimeter", "exameter",
+    "femtometer", "foot", "gigameter", "hectometer", "inch", "kilometer",
+    "megameter", "meter", "micrometer", "mile", "millimeter", "nanometer",
+    "parsec", "petameter", "picometer", "terameter", "yard", "yoctometer",
+    "yottameter", "zeptometer", "zettameter",
+})
+
+
+def axes_with_unit(
+    axes: Sequence[dict[str, str]], unit: str,
+) -> list[dict[str, str]]:
+    """``axes`` with ``unit`` declared on every space axis.
+
+    The one-word way to say what the store's vertex coordinates are
+    measured in, for a caller that knows the unit but has no reason to
+    spell out the axes.  It lands in ``multiscales[0].axes`` -- the
+    canonical axis store -- and from there in the ``world`` coordinate
+    system of the RFC 8 ``scene`` (:mod:`zarr_vectors.core.ome`), which
+    is where a collection placing this store beside an image reads it.
+
+    Only ``space`` axes (or axes with no ``type``, which the scene reads
+    as space) get it: a time or channel axis is not measured in metres.
+
+    Args:
+        axes: NGFF axis descriptors.  Not modified.
+        unit: A space unit from :data:`NGFF_SPACE_UNITS`.
+
+    Returns:
+        New axis dicts.
+
+    Raises:
+        MetadataError: If ``unit`` is not an NGFF space unit, or a space
+            axis already declares a *different* one -- two answers to one
+            question, and silently picking one would mislabel every
+            coordinate in the store by a power of ten.
+    """
+    if unit not in NGFF_SPACE_UNITS:
+        raise MetadataError(
+            f"unit={unit!r} is not an NGFF space unit.  Use the UDUNITS-2 "
+            f"name (e.g. 'micrometer', not 'um'); valid: "
+            f"{', '.join(sorted(NGFF_SPACE_UNITS))}"
+        )
+    out: list[dict[str, str]] = []
+    for axis in axes:
+        ax = dict(axis)
+        if ax.get("type", "space") == "space":
+            declared = ax.get("unit")
+            if declared and declared != unit:
+                raise MetadataError(
+                    f"axis {ax.get('name')!r} declares unit {declared!r} "
+                    f"but unit={unit!r} was passed; declare it once"
+                )
+            ax["unit"] = unit
+        out.append(ax)
+    return out
+
+
 def build_coordinate_transforms(
     scale: list[float],
     translation: list[float] | None = None,
@@ -214,6 +275,85 @@ def validate_conventions(
                 "object_index_convention='identity' is only valid for "
                 f"single-chunk stores, but found {num_spatial_chunks} chunks"
             )
+
+
+def _read_shard_shape(raw: Any) -> int | list[int] | None:
+    """A stored ``shard_shape`` back as an int or a list of ints.
+
+    Tolerant on read, like the rest of ``from_dict``: a store written by
+    something else may hold a tuple, a float that is really an int, or a
+    value that means nothing here. Anything unusable reads as ``None`` --
+    unsharded, the conservative answer, and the one every store written
+    before this field gives.
+    """
+    if raw is None or isinstance(raw, bool):
+        return None
+    if isinstance(raw, int):
+        return raw if raw >= 1 else None
+    if isinstance(raw, (list, tuple)):
+        try:
+            vals = [int(x) for x in raw]
+        except (TypeError, ValueError):
+            return None
+        return vals if vals and all(v >= 1 for v in vals) else None
+    return None
+
+
+def normalise_shard_shape(
+    shard_shape: int | Sequence[int] | None,
+    ndim: int,
+    *,
+    bin_axis: bool = False,
+) -> tuple[int, ...] | None:
+    """A shard declaration as a per-axis tuple for a grid of rank ``ndim``.
+
+    The value is *cells per shard per axis*, which says nothing about how
+    big the grid is — the same declaration is meaningful at every level of
+    a pyramid, whose grids differ. So it is stored verbatim and normalised
+    here, against whichever grid is being allocated. A shard larger than
+    the array is legal and is left alone; clipping it would make a coarse
+    level's arrays disagree with the shape the store declared.
+
+    Args:
+        ndim: Rank of the TARGET grid, including the bin axis if there is
+            one.
+        bin_axis: True when the target grid carries a leading
+            attribute-bin axis that the declaration does not describe
+            (``chunk_by_attribute``, and the rechunk engine's output).
+            A scalar still broadcasts across it — that is what a scalar
+            means. An explicit per-axis list gets ``1`` prepended instead,
+            so a shard never straddles bins, which are queried
+            independently and would otherwise be dragged into each
+            other's reads.
+
+    Returns:
+        ``None`` when ``shard_shape`` is ``None`` (explicitly unsharded).
+
+    Raises:
+        ValueError: On a non-positive component, or a list whose rank
+            fits neither the grid nor the grid without its bin axis.
+    """
+    if shard_shape is None:
+        return None
+    if isinstance(shard_shape, bool):
+        # bool is an int subclass; (1,)*ndim from True is never intended.
+        raise ValueError(f"shard_shape must be an int or a sequence, got {shard_shape!r}")
+    if isinstance(shard_shape, int):
+        if shard_shape < 1:
+            raise ValueError(f"shard_shape must be >= 1, got {shard_shape}")
+        return (shard_shape,) * ndim
+    shape = tuple(int(s) for s in shard_shape)
+    if any(s < 1 for s in shape):
+        raise ValueError(f"shard_shape components must be >= 1, got {shape}")
+    if bin_axis and len(shape) == ndim - 1:
+        return (1, *shape)
+    if len(shape) != ndim:
+        expected = f"{ndim - 1} or {ndim}" if bin_axis else str(ndim)
+        raise ValueError(
+            f"shard_shape {shape} has rank {len(shape)} but the chunk grid "
+            f"has rank {ndim}; expected {expected} components"
+        )
+    return shape
 
 
 def requires_links_array(convention: str) -> bool:
@@ -288,6 +428,39 @@ class RootMetadata:
     that the array exists -- it appears when data is written -- but it is
     what lets :meth:`zarr_vectors.api.schema.Schema.from_store` round-trip
     and ``open_or_create`` report a store missing something declared."""
+    shard_shape: int | list[int] | None = None
+    """Cells per shard per axis, or ``None`` for one object per cell.
+
+    The store's declared PACKING, read by every path that allocates a
+    per-chunk array -- including the ones that run long after creation,
+    inside workers that never saw the argument. That is the point of
+    recording it: sharding a store used to mean passing ``shard_shape=``
+    to each writer, so the arrays a worker created lazily came out flat
+    and the store was half sharded.
+
+    Units are grid cells, not coordinates, so one declaration is
+    meaningful at every level of a pyramid even though their grids
+    differ. Stored verbatim -- an ``int`` when every axis agrees, a list
+    when they do not -- and normalised against the target grid by
+    :func:`normalise_shard_shape` at each point of use.
+
+    Optional and additive (0.9.3): absent means unsharded, which is every
+    store written before it. It is a writer default, not a claim about
+    what is on disk; an array's own ``zarr.json`` remains the truth about
+    that array, and ``sharding.get_shard_info`` reports it."""
+    manifest_layout: str | None = None
+    """``"dense"`` when object indexes are created in the dense layout
+    (``manifest_spans`` + ``manifest_blocks``), else ``None`` for the vlen
+    default. Optional (0.9.4): absent means vlen, which is every store
+    written before it. A default for indexes created later; an existing
+    index's own ``layout`` remains the truth about that index."""
+    manifest_block_dtype: str | None = None
+    """``"int32"`` when dense indexes are created with ``int32``
+    ``manifest_blocks``, else ``None`` for the ``int64`` default. A
+    default for indexes created later, like ``manifest_layout``; each
+    index's ``manifest_blocks`` dtype (its ``zarr.json``) is the truth
+    about that index. Optional and additive: every reader widens the
+    blocks to int64, so no reader needs to know it."""
 
     def validate(self) -> None:
         """Validate this metadata object.
@@ -415,6 +588,25 @@ class RootMetadata:
                         f"of base_bin_shape[{i}]={bs} (ratio={ratio:.6f})"
                     )
 
+        # Validate shard_shape if set.  Rank is checked against the
+        # spatial dims here; a grid carrying an attribute-bin axis is
+        # reconciled by ``normalise_shard_shape`` when it allocates,
+        # because the declaration describes the spatial grid either way.
+        if self.manifest_layout not in (None, "vlen", "dense"):
+            raise MetadataError(
+                f"manifest_layout={self.manifest_layout!r}; expected 'vlen' or 'dense'"
+            )
+        if self.manifest_block_dtype not in (None, "int64", "int32"):
+            raise MetadataError(
+                f"manifest_block_dtype={self.manifest_block_dtype!r}; "
+                f"expected 'int64' or 'int32'"
+            )
+        if self.shard_shape is not None:
+            try:
+                normalise_shard_shape(self.shard_shape, sid_ndim)
+            except ValueError as exc:
+                raise MetadataError(f"Invalid shard_shape: {exc}") from exc
+
     @property
     def effective_bin_shape(self) -> tuple[float, ...]:
         """Base bin shape, defaulting to chunk_shape if not set."""
@@ -454,6 +646,16 @@ class RootMetadata:
         }
         if self.base_bin_shape is not None:
             d["zarr_vectors"]["base_bin_shape"] = list(self.base_bin_shape)
+        if self.shard_shape is not None:
+            d["zarr_vectors"]["shard_shape"] = (
+                int(self.shard_shape)
+                if isinstance(self.shard_shape, int)
+                else [int(x) for x in self.shard_shape]
+            )
+        if self.manifest_layout == "dense":
+            d["zarr_vectors"]["manifest_layout"] = "dense"
+        if self.manifest_block_dtype == "int32":
+            d["zarr_vectors"]["manifest_block_dtype"] = "int32"
         if self.format_capabilities:
             d["zarr_vectors"]["format_capabilities"] = list(self.format_capabilities)
         if self.attribute_specs:
@@ -540,6 +742,9 @@ class RootMetadata:
                 }
                 if (specs := zv.get("attribute_specs")) else None
             ),
+            shard_shape=_read_shard_shape(zv.get("shard_shape")),
+            manifest_layout=zv.get("manifest_layout"),
+            manifest_block_dtype=zv.get("manifest_block_dtype"),
         )
 
     def is_complete(self) -> bool:
@@ -604,10 +809,22 @@ class LevelMetadata:
         chunk_attribute_name: Name of the per-vertex attribute that is
             used as the leading chunk axis (single-axis attribute
             chunking; v1 supports only one).  ``None`` for spatial-only.
-        chunk_attribute_values: Ordered list mapping attribute-bin index
-            to the original attribute value.  ``chunk_attribute_values[i]``
-            is the value of the attribute for any vertex in chunks with
-            leading coord ``i``.  ``None`` for spatial-only.
+        chunk_attribute_values: One label per leading-axis bin, in bin
+            order.  ``chunk_attribute_values[i]`` is what a reader's
+            ``attribute_filter`` names to select the chunks with leading
+            coord ``i``, so its length is the bin count.  A writer's
+            categorical bin is labelled by its value.  A rechunk bin cut
+            by edges is labelled by its lower edge, and a group bin by
+            its group index (``-1`` for ungrouped objects, the last bin).
+            ``None`` for spatial-only.
+        chunk_sources: Where each value of a leading ``"source"`` chunk
+            axis lives, for a *composite* level whose objects reference
+            fragments of other stores (see :mod:`zarr_vectors.core.sources`).
+            Entry 0 is ``{"self": true}``: this store's own cells.  Every
+            other entry names a source -- ``{"ref": {"path", "id"}, "level",
+            "transform", "fingerprint"}`` -- and a cell ``(s, *spatial)`` is
+            the source's cell ``spatial`` read through its transform.
+            ``None`` for an ordinary level.
     """
 
     level: int
@@ -628,6 +845,7 @@ class LevelMetadata:
     chunk_dims: list[str] | None = None
     chunk_attribute_name: str | None = None
     chunk_attribute_values: list[Any] | None = None
+    chunk_sources: list[dict[str, Any]] | None = None
     preserves_object_ids: bool = False
     """True for levels written by the per-object pyramid regime.
 
@@ -715,6 +933,8 @@ class LevelMetadata:
             d["chunk_attribute_values"] = [
                 _to_python_scalar(v) for v in self.chunk_attribute_values
             ]
+        if self.chunk_sources is not None:
+            d["chunk_sources"] = [dict(s) for s in self.chunk_sources]
         if self.preserves_object_ids:
             d["preserves_object_ids"] = True
         if self.inherited_num_objects is not None:
@@ -767,6 +987,8 @@ class LevelMetadata:
             chunk_dims=list(cd) if cd else None,
             chunk_attribute_name=lv.get("chunk_attribute_name"),
             chunk_attribute_values=list(cav) if cav is not None else None,
+            chunk_sources=(list(lv["chunk_sources"])
+                           if lv.get("chunk_sources") is not None else None),
             preserves_object_ids=bool(lv.get("preserves_object_ids", False)),
             inherited_num_objects=lv.get("inherited_num_objects"),
             shared_fragments=bool(lv.get("shared_fragments", False)),
@@ -823,6 +1045,17 @@ class LevelMetadata:
                 raise MetadataError(
                     f"Level {self.level} chunk_shape values must be > 0, "
                     f"got {self.chunk_shape}"
+                )
+
+        # A composite level's leading axis is its sources, and nothing else.
+        if self.chunk_sources is not None:
+            from zarr_vectors.core.sources import validate_chunk_sources
+
+            validate_chunk_sources(self.chunk_sources, self.chunk_dims)
+            if self.chunk_attribute_name is not None:
+                raise MetadataError(
+                    "a composite level (chunk_sources) cannot also be chunked by "
+                    "an attribute: its leading chunk axis is the source"
                 )
 
         # Attribute-chunking fields must be coherent.

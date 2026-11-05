@@ -550,3 +550,31 @@ def test_array_partition_anchors_across_differing_grids():
         from zarr_vectors.core.paths import format_offsets
         assert (format_offsets((offset,)),
                 tuple(int(c) for c in src_cc[i])) in got
+
+
+def test_build_pyramid_depth_zero_suppresses_cross_level_links_for_any_storage(
+    tmp_path: Path,
+) -> None:
+    """Depth 0 means none, whatever storage mode is asked for.
+
+    The test above passes storage "none" as well, which is the only thing
+    the inline ±1 emission used to check -- so depth 0 on its own wrote
+    ±1 links while the root recorded depth 0.
+    """
+    store_path = _seed_simple_graph(tmp_path)
+    build_pyramid(
+        store_path,
+        factors=[(2.0, 1.0), (2.0, 1.0)],
+        cross_level_depth=0,
+        cross_level_storage=XLEVEL_EXPLICIT,
+    )
+    root = open_store(str(store_path))
+    seen_any = False
+    for lvl in list_resolution_levels(root):
+        deltas = _assert_deltas_match_listing(root, lvl)
+        assert deltas <= {"0"}
+        seen_any = seen_any or bool(deltas)
+    assert seen_any, "expected at least one level to carry links/0"
+    meta = read_root_metadata(root)
+    assert meta.cross_level_depth == 0
+    assert CAP_MULTISCALE_LINKS not in meta.format_capabilities

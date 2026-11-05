@@ -67,6 +67,29 @@ icechunk = [
 cloud = [
     "zarr-vectors[obstore]",
 ]
+# Optional GPU extension: device (cupy) arrays in and out of the array-form
+# readers and writers. NOT part of `all`: CI has no GPU, and cupy wheels are
+# built per CUDA major version (this one is CUDA 12). In a conda environment
+# install cupy from conda-forge instead of using this extra, which would add
+# a second, pip-built cupy.
+gpu = [
+    "cupy-cuda12x>=13; sys_platform == 'linux'",
+]
+# nvCOMP, for decompressing zstd cells on the device (read_cells with
+# decode="device"). Its wheel carries only its own library, so it is safe in
+# a conda environment too.
+gpu-codecs = [
+    "zarr-vectors[gpu]",
+    "nvidia-nvcomp-cu12>=4.2; sys_platform == 'linux'",
+]
+# kvikio, for reading local files straight into device memory (GPUDirect
+# Storage where the system has it). For pip environments only: its wheel
+# pins a pip cupy, which in a conda environment would sit beside the conda
+# one -- there, install kvikio from the rapidsai channel instead.
+gpu-io = [
+    "zarr-vectors[gpu]",
+    "kvikio-cu12>=25.8; sys_platform == 'linux'",
+]
 all = [
     "zarr-vectors[draco,obstore,fsspec,icechunk]",
 ]
@@ -109,6 +132,10 @@ warn_unused_configs = true
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+markers = [
+    "gpu: needs cupy and a CUDA device (skipped without them)",
+    "vlen_only: tests the vlen object-index layout itself; --manifest-layout does not apply",
+]
 # pytest resets warning filters per test, so the import-time filter in
 # zarr_vectors/__init__.py does not reach it — silence the vlen-bytes /
 # unstable-dtype warning here too so the summary is not flooded.

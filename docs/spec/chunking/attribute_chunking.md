@@ -84,6 +84,32 @@ uses for `vertices/`. Callers passing `fragment_attributes={name:
 combined coords (the leading `attr_bin` plus the spatial coords), not
 the raw spatial coords.
 
+### Array shape
+
+The leading axis is not only a key convention — it is part of the physical
+layout. Every per-chunk array in an attribute-chunked level is allocated at
+rank `1 + sid_ndim`, with the leading axis spanning `K` bins and anchored at
+origin `0`:
+
+```
+vertices                  shape = (K, g_0, g_1, g_2)
+vertex_fragments          shape = (K, g_0, g_1, g_2)
+vertex_attributes/<name>  shape = (K, g_0, g_1, g_2)
+links/<delta>/<offsets>   shape = (K, g_0, g_1, g_2)
+```
+
+`chunk_attribute_values` is authoritative for `K` — it is what writers pass
+as `bin_count`, and its length is the extent. `chunk_dims` names the axes but
+carries no cardinality, so do not size an array from it.
+
+This matters to anything that allocates an array into an existing level.
+A writer that opens a write session is handed the bin count; one that does
+not — a decentralized worker calling `create_attribute_array`, an edit adding
+a links segment — must take the rank from the level rather than deriving a
+spatial grid from the store bounds. An array allocated one axis short cannot
+be addressed by the level's own keys, and where the grid origin is non-zero
+the mismatch used to alias cells rather than raise.
+
 ### Level metadata fields
 
 Three new keys on the level `.zattrs`:
@@ -92,7 +118,7 @@ Three new keys on the level `.zattrs`:
 |---------------------------|------------|-------------------------------------------------------------------------------------------|
 | `chunk_dims`              | `list[str]` | Names of chunk-key axes, leading axis first. e.g. `["gene", "x", "y", "z"]`.            |
 | `chunk_attribute_name`    | `str`      | Name of the per-vertex attribute used as the leading axis.                                |
-| `chunk_attribute_values`  | `list`     | Ordered list mapping `attr_bin` → original attribute value. `[i]` is the value for bin `i`. |
+| `chunk_attribute_values`  | `list`     | One label per bin, in bin order: `[i]` is what `attribute_filter` names to select bin `i`. See *Bin labels* below. |
 
 When `chunk_dims` is absent (legacy stores), readers default to a
 spatial-only layout with `sid_ndim` axes.
@@ -189,6 +215,51 @@ prefix_dim_name="bundle_label")` and runs the standard rechunk engine.
 `categorical=True` disables the legacy quartile fallback in
 `DimensionMapper._map_by_attribute`, which would otherwise collapse
 high-cardinality attributes (>10 unique values) to 4 quartile bins.
+
+#### Bin labels
+
+A rechunk's bins are numbered densely from 0 in the order below, whatever
+bins its `RechunkSpec` could have produced. A bin no object falls in is not
+allocated. A bin's label, its entry in `chunk_attribute_values`, is the
+value `attribute_filter` names to select it:
+
+| `RechunkSpec`                                   | Bin order                  | Label                                  |
+|-------------------------------------------------|----------------------------|----------------------------------------|
+| `by="attribute:<name>"`, categorical            | ascending value            | the value                              |
+| `by="attribute:<name>"` or `by="object_id"`, with `bins` | ascending edge  | the bin's lower edge                   |
+| `by="attribute:<name>"`, quartile fallback      | ascending edge             | the bin's lower edge                   |
+| `by="object_id"`, no `bins`                     | ascending id               | the object id                          |
+| `by="group"`                                    | ascending group index, then ungrouped objects | the group index; `-1` for ungrouped |
+
+A bin cut by edges spans `[edges[i], edges[i + 1])`. Values below the
+first edge fall in the first bin, and the last bin is open above, so
+`bins=[0, 30, 80, inf]` puts a length of 45 in the bin labelled `30`.
+`chunk_attribute_name` is the attribute's name, or the dimension's
+name (`group`, `object_id`, or `prefix_dim_name`) for the other kinds.
+`by="spatial"` has no bins to select between and records no labels.
+
+### Pyramids
+
+`build_pyramid` and `coarsen_level` keep a level's bins at every coarser
+level. The coarse level gets the same leading bin axis, and copies the fine
+level's `chunk_dims`, `chunk_attribute_name` and `chunk_attribute_values`
+verbatim, so bin `i` means the same value at every level, and
+`attribute_filter` works on a coarse level as it does on level 0.
+
+A metavertex aggregates vertices of **one** bin. The grouping key is the
+attribute bin followed by the spatial bin, so a polyline that turns from
+one value to another in a single spatial bin gives one metavertex per
+value. The bin is taken from each vertex's chunk key, because the
+chunk-by attribute is not stored per vertex.
+
+Cross-level links (`links/+N`, `links/-N`) are written at the full rank,
+`sid_ndim + 1`, at both ends. A link never crosses bins, so the bin
+component of its offset is always 0.
+
+A level with a leading axis but no `chunk_attribute_values` is carried
+the same way. Such a level comes from a rechunk made before bin labels
+were recorded. The coarse level's arrays get the axis from the fine
+level's `vertices` shape.
 
 ### Atomicity and writes
 

@@ -91,13 +91,41 @@ class ObjectIndexAppender:
         self._length_attr = length_attr
 
         self._blob_buf: list[bytes] = []
+        self._manifest_buf: list[ObjectManifest] = []
         self._length_buf: list[int] = []
         self._total_appended = 0
+        self._present_appended = 0  # appended manifests with a fragment
         self._closed = False
 
-        self._arr = self._open_manifests_truncated()
+        from zarr_vectors.core import dense_manifests as dense
+        from zarr_vectors.core.arrays import _index_layout_for_write
+
+        # A dense index (see zarr_vectors.core.dense_manifests) is appended
+        # to as arrays; otherwise the vlen path below.
+        self._dense = _index_layout_for_write(level_group) == "dense"
+        if self._dense:
+            empty = np.zeros(1, dtype=np.int64)
+            dense.write(
+                level_group, empty, np.empty((0, self._sid_ndim), np.int64),
+                np.empty(0, np.int64), sid_ndim=self._sid_ndim,
+                mode="append", at=self._base_oid,
+            )
+            self._arr = None
+        else:
+            self._arr = self._open_manifests_truncated()
         # Array length == next free OID; truncation leaves it at base_oid.
         self._len = self._base_oid
+
+    def _present_before_base(self) -> int:
+        """How many rows below ``base_oid`` hold a manifest (0 on a fresh run)."""
+        if self._base_oid == 0:
+            return 0
+        from zarr_vectors.core.arrays import _EMPTY_MANIFEST_BLOB
+
+        blobs = self._level_group.read_vlen_array_raw(
+            f"{OBJECT_INDEX}/manifests", stop=self._base_oid,
+        )
+        return sum(1 for b in blobs if b and bytes(b) != _EMPTY_MANIFEST_BLOB)
 
     def _open_manifests_truncated(self):
         """Open ``object_index/manifests`` resized to ``base_oid``.
@@ -116,12 +144,15 @@ class ObjectIndexAppender:
 
         # vlen-bytes lacks a finalised V3 spec — silence as
         # _write_object_index_manifests does.
+        from zarr_vectors.core.arrays import _object_shards
+
         with warnings.catch_warnings():
             warnings.simplefilter("ignore", UnstableSpecificationWarning)
             arr = oi_group.create_array(
                 "manifests",
                 shape=(self._base_oid,),
                 chunks=(OBJECT_INDEX_MANIFEST_BUCKET,),
+                shards=_object_shards(self._level_group, (OBJECT_INDEX_MANIFEST_BUCKET,)),
                 dtype="bytes",
                 serializer=VLenBytesCodec(),
             )
@@ -153,13 +184,17 @@ class ObjectIndexAppender:
             )
 
         for manifest in manifests:
+            self._present_appended += bool(len(manifest))
             blocks = [
                 (tuple(int(c) for c in chunk_coords), int(fragment_index))
                 for chunk_coords, fragment_index in manifest
             ]
-            self._blob_buf.append(
-                encode_object_manifest_blocks(blocks, sid_ndim=self._sid_ndim)
-            )
+            if self._dense:
+                self._manifest_buf.append(blocks)
+            else:
+                self._blob_buf.append(
+                    encode_object_manifest_blocks(blocks, sid_ndim=self._sid_ndim)
+                )
         self._length_buf.extend(int(length) for length in lengths)
         self._total_appended += len(manifests)
         self._flush(final=False)
@@ -173,6 +208,9 @@ class ObjectIndexAppender:
         the very end on ``final``) is acceptable.
         """
         start = self._len
+        if self._dense:
+            self._flush_dense(final)
+            return
         n = len(self._blob_buf)
         if n == 0:
             return
@@ -191,6 +229,27 @@ class ObjectIndexAppender:
         self._len = start + k
         del self._blob_buf[:k]
 
+    def _flush_dense(self, final: bool) -> None:
+        """The dense twin of :meth:`_flush`: one array append per bucket."""
+        from zarr_vectors.core import dense_manifests as dense
+
+        n = len(self._manifest_buf)
+        if n == 0:
+            return
+        k = n if final else (
+            ((self._len + n) // OBJECT_INDEX_MANIFEST_BUCKET) * OBJECT_INDEX_MANIFEST_BUCKET
+            - self._len
+        )
+        if k <= 0:
+            return
+        offsets, coords, frags = dense.csr_from_manifests(self._manifest_buf[:k], self._sid_ndim)
+        dense.write(
+            self._level_group, offsets, coords, frags, sid_ndim=self._sid_ndim,
+            mode="append", at=self._len,
+        )
+        self._len += k
+        del self._manifest_buf[:k]
+
     def close(self) -> int:
         """Flush everything and write object_index meta, length, groupings.
 
@@ -202,12 +261,33 @@ class ObjectIndexAppender:
         self._flush(final=True)
         total = self._len
 
-        self._level_group.write_array_meta(OBJECT_INDEX, {
-            "zv_array": "object_index",
-            "num_objects": total,
-            "sid_ndim": self._sid_ndim,
-            "layout": OBJECT_INDEX_LAYOUT_V1,
-        })
+        if self._dense:
+            from zarr_vectors.core import dense_manifests as dense
+            from zarr_vectors.core.arrays import (
+                OBJECT_IDS_SORTED_ATTR,
+                _write_object_id_table,
+            )
+
+            # Rows are ids here, as in the vlen layout this writes (V1).
+            _write_object_id_table(self._level_group, range(total), keep_codecs=True)
+            self._level_group.write_array_meta(OBJECT_INDEX, {
+                "zv_array": "object_index",
+                "num_objects": total,
+                "num_present": int(dense.present_mask(self._level_group).sum()),
+                "sid_ndim": self._sid_ndim,
+                "layout": dense.OBJECT_INDEX_LAYOUT_DENSE,
+                OBJECT_IDS_SORTED_ATTR: True,
+            })
+        else:
+            # Counted as appended, plus whatever rows [0, base_oid) held:
+            # without it, the first patch took every slot for present.
+            self._level_group.write_array_meta(OBJECT_INDEX, {
+                "zv_array": "object_index",
+                "num_objects": total,
+                "num_present": self._present_before_base() + self._present_appended,
+                "sid_ndim": self._sid_ndim,
+                "layout": OBJECT_INDEX_LAYOUT_V1,
+            })
 
         self._write_length(total)
 

@@ -33,6 +33,7 @@ import os
 import threading
 from typing import Any, NamedTuple
 
+import numpy as np
 import zarr
 from numcodecs.vlen import VLenBytes
 from zarr.core.array_spec import ArraySpec
@@ -135,6 +136,8 @@ async def _gather_plan(
     async_group: Any,
     plan: list[tuple[str, list[str]]],
     resolved: dict[str, Any] | None = None,
+    *,
+    tolerant: bool = False,
 ) -> dict[tuple[str, str], bytes]:
     """Resolve each ``array_name`` once, then fan out per-chunk reads
     via :func:`asyncio.gather`.
@@ -149,6 +152,11 @@ async def _gather_plan(
     read returned ``None``, are omitted — the caller's sync
     :meth:`Group.read_bytes` then raises :class:`StoreError` on the
     cache miss, exactly as it would have without the prefetch.
+
+    ``tolerant`` leaves a cell whose read *failed* out of the cache as
+    well, instead of failing the whole gather: one corrupt cell no longer
+    costs every other cell in the plan, and the caller's sync read of it
+    raises its own error.
     """
     # Resolve each array_name once.
     nodes: dict[str, Any] = {}
@@ -178,12 +186,14 @@ async def _gather_plan(
 
     if not tasks:
         return {}
-    results = await asyncio.gather(*tasks)
+    results = await asyncio.gather(*tasks, return_exceptions=tolerant)
 
     cache: dict[tuple[str, str], bytes] = {}
     for (array_name, chunk_key), data in zip(flat, results):
-        if data is not None:
+        if isinstance(data, bytes):
             cache[(array_name, chunk_key)] = data
+        elif isinstance(data, BaseException) and not isinstance(data, Exception):
+            raise data
     return cache
 
 
@@ -409,6 +419,20 @@ def _read_pool() -> Any:
     return _READ_POOL
 
 
+def _reset_read_pool_after_fork() -> None:
+    """A forked child inherits the pool object but none of its threads.
+
+    See :func:`zarr_vectors.core._batch_writer._reset_write_pool_after_fork`.
+    """
+    global _READ_POOL, _READ_POOL_LOCK
+    _READ_POOL = None
+    _READ_POOL_LOCK = threading.Lock()
+
+
+if hasattr(os, "register_at_fork"):
+    os.register_at_fork(after_in_child=_reset_read_pool_after_fork)
+
+
 def _direct_read_many(
     spec: _DirectSpec, chunk_keys: list[str],
 ) -> list[tuple[str, bytes]]:
@@ -423,6 +447,8 @@ def _direct_read_many(
 
 def _direct_read_plan(
     entries: list[tuple[str, _DirectSpec, list[str]]],
+    *,
+    tolerant: bool = False,
 ) -> dict[tuple[str, str], bytes]:
     """Read and decode the cells of several arrays as one job.
 
@@ -454,7 +480,13 @@ def _direct_read_plan(
         raws = [_read_file(w[3]) for w in wanted]
     out: dict[tuple[str, str], bytes] = {}
     for (array_name, spec, chunk_key, _path), raw in zip(wanted, raws):
-        data = _decode_direct(spec, raw)
+        try:
+            data = _decode_direct(spec, raw)
+        except Exception:
+            # Tolerant: the cell is left out, and its sync read raises.
+            if not tolerant:
+                raise
+            continue
         if data is not None:
             out[(array_name, chunk_key)] = data
     return out
@@ -465,6 +497,8 @@ def flush_prefetch(
     plan: list[tuple[str, list[str]]],
     nodes: dict[str, Any] | None = None,
     specs: dict[str, Any] | None = None,
+    *,
+    tolerant: bool = False,
 ) -> dict[tuple[str, str], bytes]:
     """Prefetch every chunk in ``plan`` and return a flat cache.
 
@@ -491,12 +525,15 @@ def flush_prefetch(
     For icechunk-backed stores, falls back to serial sync reads via
     :func:`_sync_fallback` — the async-gather pattern bypasses
     icechunk's session-tracking contract.
+
+    ``tolerant`` omits a cell whose read or decode fails rather than
+    raising, on every path; see :func:`_gather_plan`.
     """
     if not plan:
         return {}
 
     if _is_icechunk_store(zarr_group.store):
-        return _sync_fallback(zarr_group, plan)
+        return _sync_fallback(zarr_group, plan, tolerant=tolerant)
 
     # Resolve each array_name once, as ``_gather_plan`` does, then split
     # the plan on whether the direct reader recognised it.
@@ -514,25 +551,143 @@ def flush_prefetch(
             )
         if spec is not None:
             direct[array_name] = spec
-    gathered = [(name, keys) for name, keys in plan if name not in direct]
+    # Arrays the flat reader does not take may still be sharded local
+    # ones, which are read a shard index at a time rather than through
+    # zarr's per-cell sharding codec.
+    sharded: dict[str, _ShardedSpec] = {}
+    resolved = dict(nodes or {})
+    for array_name in seen - set(direct):
+        node = resolved.get(array_name)
+        if node is None:
+            if nodes is not None:
+                # The caller resolved what it has; anything else is the
+                # gather's to resolve, as it always was, not an extra lookup.
+                continue
+            try:
+                node = resolved[array_name] = zarr_group[array_name]
+            except KeyError:
+                continue
+        spec = _sharded_spec(node)
+        if spec is not None:
+            sharded[array_name] = spec
+    gathered = [
+        (name, keys) for name, keys in plan if name not in direct and name not in sharded
+    ]
 
     cache: dict[tuple[str, str], bytes] = {}
     if gathered:
-        cache.update(
-            sync(_gather_plan(zarr_group._async_group, gathered, nodes))
-        )
+        cache.update(sync(_gather_plan(
+            zarr_group._async_group, gathered, resolved, tolerant=tolerant,
+        )))
+    if sharded:
+        cache.update(_sharded_read_plan([
+            (array_name, sharded[array_name], list(chunk_keys))
+            for array_name, chunk_keys in plan
+            if array_name in sharded
+        ], tolerant=tolerant))
 
     cache.update(_direct_read_plan([
         (array_name, direct[array_name], list(chunk_keys))
         for array_name, chunk_keys in plan
         if array_name in direct
-    ]))
+    ], tolerant=tolerant))
     return cache
+
+
+class _ShardedSpec(NamedTuple):
+    """Everything needed to read one sharded array's cells off the filesystem."""
+
+    source: Any                     # _cells_on_disk.CellSource
+    codecs: tuple[Any, ...]         # the inner cells' BytesBytes codecs
+    spec: Any                       # ArraySpec of one inner cell
+
+
+def _sharded_spec(node: Any) -> _ShardedSpec | None:
+    """A :class:`_ShardedSpec` for a sharded local vlen array, else None.
+
+    zarr reads a sharded cell through the sharding codec one cell at a
+    time -- the shard's index, then the cell's range, each a round trip
+    through the event loop. For 4,097 cells of a sharded store that was
+    5 s against 0.4 s for the same cells unsharded. Here each shard's
+    index is read once, every cell's range is read in one pooled pass
+    (each shard opened once per batch), and each cell is decoded by its
+    array's own codecs, so the bytes are zarr's.
+    """
+    from zarr_vectors.core._cells_on_disk import cell_source
+
+    if not isinstance(node, zarr.Array):
+        return None
+    src = cell_source("", node, any_codecs=True)
+    if src is None or src.shard_shape is None or src.local_root is None:
+        return None
+    meta = node.metadata
+    inner = tuple(meta.codecs[0].codecs[1:])
+    try:
+        spec = ArraySpec(
+            shape=(1,) * len(meta.shape),
+            dtype=meta.data_type,
+            fill_value=meta.fill_value,
+            config=node._async_array.config,
+            prototype=_BUFFER_PROTOTYPE,
+        )
+    except Exception:
+        return None
+    return _ShardedSpec(source=src, codecs=inner, spec=spec)
+
+
+def _sharded_read_plan(
+    entries: list[tuple[str, _ShardedSpec, list[str]]],
+    *,
+    tolerant: bool = False,
+) -> dict[tuple[str, str], bytes]:
+    """Read and decode the cells of several sharded arrays as one job.
+
+    The sharded twin of :func:`_direct_read_plan`: keys an array cannot
+    hold are omitted, a cell with nothing stored reads as ``b""``, and a
+    cell that cannot be read is omitted (``tolerant``) or raises.
+    """
+    from zarr_vectors.core._cells_on_disk import read_local
+
+    requests, wanted = [], []
+    for array_name, spec, chunk_keys in entries:
+        src = spec.source
+        cells, keys = [], []
+        for chunk_key in chunk_keys:
+            coords = _parse_coords(chunk_key)
+            if coords is None or len(coords) != len(src.shape):
+                continue
+            if src.origin is not None:
+                coords = tuple(c - o for c, o in zip(coords, src.origin))
+            if any(c < 0 or c >= n for c, n in zip(coords, src.shape)):
+                continue
+            cells.append(coords)
+            keys.append(chunk_key)
+        if keys:
+            requests.append((src, np.asarray(cells, dtype=np.int64)))
+            wanted.append((array_name, spec, keys))
+    if not requests:
+        return {}
+    out: dict[tuple[str, str], bytes] = {}
+    for (array_name, spec, keys), raws in zip(wanted, read_local(requests)):
+        for chunk_key, raw in zip(keys, raws):
+            try:
+                if isinstance(raw, Exception):
+                    raise raw
+                data = _decode_direct(spec, raw)
+            except Exception:
+                if not tolerant:
+                    raise
+                continue
+            if data is not None:
+                out[(array_name, chunk_key)] = data
+    return out
 
 
 def _sync_fallback(
     zarr_group: zarr.Group,
     plan: list[tuple[str, list[str]]],
+    *,
+    tolerant: bool = False,
 ) -> dict[tuple[str, str], bytes]:
     """Serial-read fallback for icechunk and other stores that don't
     play well with the async-gather pattern.
@@ -558,9 +713,13 @@ def _sync_fallback(
             if any(c < 0 or c >= s for c, s in zip(coords, shape)):
                 continue
             region = _vlen_cell_region(coords)
-            cache[(array_name, chunk_key)] = _vlen_region_to_bytes(
-                node[region]
-            )
+            try:
+                cache[(array_name, chunk_key)] = _vlen_region_to_bytes(
+                    node[region]
+                )
+            except Exception:
+                if not tolerant:
+                    raise
     return cache
 
 

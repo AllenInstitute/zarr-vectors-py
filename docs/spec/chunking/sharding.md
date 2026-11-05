@@ -66,9 +66,35 @@ object model, and multiscale metadata are identical with or without sharding.
 
 ### Configuration
 
-Sharding is configured via the `codec_config` argument to write functions,
-or by passing a pre-configured Zarr array spec. A minimal sharding
-configuration for a 3-D Zarr Vectors store:
+Declare it on the store. `create_store(shard_shape=N)` records the shape
+in the root `zarr_vectors` block, and **every array allocated afterwards
+honours it** — including the ones created lazily, on first write, inside
+workers that never saw the argument:
+
+```python
+from zarr_vectors.building import create_store
+
+create_store(
+    "scan.zarrvectors",
+    bounds=[[0, 0, 0], [1000, 1000, 1000]],
+    chunk_shape=(100.0, 100.0, 100.0),
+    geometry_types=["point_cloud"],
+    shard_shape=4,          # 4 cells per shard edge, every axis
+)
+```
+
+The units are grid **cells**, not coordinates, so one declaration stays
+meaningful at every level of a pyramid even though their grids differ. An
+`int` broadcasts to every axis; pass a per-axis list when they differ.
+
+Without the declaration, sharding reaches only the arrays a given writer
+call creates. That was the whole story before 0.9.3, and it produced
+stores that were sharded in whatever the coordinator made and flat in
+everything a worker added — a half-sharded store whose object count was
+nowhere near what was asked for.
+
+The per-call argument still works and still wins, for a writer that wants
+a different packing than the store's:
 
 ```python
 from zarr_vectors.types.points import write_points
@@ -188,6 +214,43 @@ of tiny files for the fragment indices alone. With sharding, many
 fragment-index chunks are packed into a single shard, and a viewer can
 fetch the entire spatial index for a region in a handful of requests.
 
+### Sharding the object layer
+
+The object layer -- `object_index/`'s arrays (`manifests`, or the dense
+`manifest_spans` / `manifest_blocks`, and `object_ids`) and every
+`object_attributes/<name>` column -- has no spatial grid: each array is 1-D
+along objects, chunked in fixed row buckets of 16,384 (index: `manifests`,
+`manifest_spans`, `object_ids`) or 65,536 (a dense index's `manifest_blocks`
+as created now, and attribute columns) rows, one storage object per bucket.
+At 10^9 objects that is about 61,000 objects per index array and 15,000 per
+attribute column.
+
+These arrays may be sharded along rows with the same `sharding_indexed`
+codec, the shard a whole number of buckets. zarr-vectors-py requires the
+shard to hold a multiple of 65,536 rows, so both buckets tile it and every
+array in the layer can share one shard size. This is not a format change:
+the sharding is recorded only in each array's own `zarr.json`, which any
+Zarr v3 reader already understands, and no zarr-vectors metadata key names
+it. A reader reads a sharded object layer exactly as an unsharded one.
+
+zarr-vectors-py keeps a level's object layer in one layout: a writer that
+creates or rewrites an object-layer array (a new attribute column, an index
+rewritten in full) takes the shard size the level's existing object arrays
+have.
+
+```python
+from zarr_vectors.building import shard_object_layer, shard_store
+
+shard_object_layer(level, 1_048_576)        # 16 attribute buckets per shard
+shard_object_layer(level, None)             # back to one object per bucket
+shard_store("scan.zv", shard_shape=8, object_shard_rows=1_048_576)
+```
+
+A write into part of a shard rewrites that shard, so a writer appending in
+small batches pays for the whole shard each time: batch appends in shard-
+sized blocks. For the same reason, the shard (not the bucket) is the unit of
+concurrency for writers that fill disjoint row ranges in parallel.
+
 ### Compatibility
 
 Sharding requires Zarr v3 ≥ 2.18 (where `sharding_indexed` is built in).
@@ -244,28 +307,41 @@ reshard("scan.zv", None)                       # equivalent to unshard_store
 Both conversion functions are idempotent: shards already in the
 requested layout are skipped, and unsharding a flat store is a no-op.
 
-### Ordering: shard the links family last
+### Ordering: rebuild presence before repacking
 
 ```{important}
 `shard_store` MUST run **after** `finalize_links`, never before.
 ```
 
-`finalize_links` rebuilds each link array's `nonempty_chunks` manifest
-from the store listing, via `Group.derive_nonempty_chunks`. That rebuild
-is **unsharded-only**: it works by listing chunk objects at
-`<array>/c/i/j/k` and reading the cell coordinate back out of the key
-name. A shard packs many cells into a single object whose inner index is
-**not derivable from key names**, so once an array is sharded the listing
-no longer enumerates its cells and the rebuild finds nothing.
+This constrains `shard_store` — the pass that repacks an existing store.
+It does **not** mean a store has to be built flat: a store declaring
+`shard_shape` is born sharded and needs no repacking pass at all, which
+is cheaper and sidesteps this ordering constraint entirely.
 
-The constraint is a consequence of how the decentralized write protocol
-splits work. `nonempty_chunks` is array-wide state, so stamping it is a
-read-modify-write that two workers race on even when their *cells* are
-disjoint — the loser's key vanishes while its payload sits on disk.
-Workers therefore write with `record_presence=False` and skip the
-manifest entirely, leaving one coordinator to reconstruct it. Sharding
-before that reconstruction strands the payloads: the cells are on disk,
-but nothing enumerates them.
+`shard_store` selects each array's cells through `list_chunks`, which
+reads the `nonempty_chunks` manifest. The decentralized write protocol
+leaves that manifest empty on purpose: it is array-wide state, so
+stamping it is a read-modify-write that two workers race on even when
+their *cells* are disjoint — the loser's key vanishes while its payload
+sits on disk. Workers therefore pass `record_presence=False` and leave
+one coordinator to reconstruct it. Repacking before that reconstruction
+strands the payloads: the cells are on disk, but nothing enumerates them.
+
+A level declared with `defer_presence` is the exception. Its arrays carry
+no manifest at all rather than an empty one, `list_chunks` answers for
+them from the store, and so `shard_store` finds every cell whether or not
+the rebuild has run.
+
+```{note}
+Until 0.9.3 this section stated a second, stronger constraint: that a
+sharded array's presence could not be rebuilt at all, because
+`derive_nonempty_chunks` listed one object per cell and a sharded array
+has none. It now reads a sharded array's cells out of the shard objects
+themselves — zarr builds a sharded array's chunk grid from the *shard*
+shape, so a listed key names a shard, and the cells it covers are read in
+one slice. That is what makes born-sharded stores repairable, and it is
+why sharding is no longer forced to be the last pass.
+```
 
 The safe order for a scale-out ingest is:
 
@@ -278,6 +354,17 @@ finalize_links(lg, delta=0)     # rebuilds nonempty_chunks + counts
 
 # 3. Coordinator, last:
 shard_store("scan.zv", shard_shape=8)
+```
+
+```{note}
+Step 1's `record_presence=False` leaves the cells invisible to
+`list_chunks` until step 2 runs. Where a writer has no step 2 to wait for
+— consumers reading as soon as it returns — `Group.collect_presence` and
+`Group.apply_presence` hold the stamps back instead, and apply them
+coalesced under a lock the caller already holds. The payloads still go
+out unlocked, so the race this section describes is avoided the same way;
+only the moment of the stamp moves. Sharding remains a coordinator pass
+that runs after all of it.
 ```
 
 Reversing steps 2 and 3 fails **silently, not loudly**. `shard_store`

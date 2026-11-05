@@ -76,8 +76,8 @@ import numpy as np
 import zarr_vectors as zv
 from zarr_vectors.building import (
     LevelMetadata, create_store, create_resolution_level,
-    create_vertices_array, create_attribute_array, open_write_session,
-    open_store, get_resolution_level, write_chunk_vertices,
+    create_vertices_array, create_attribute_array, defer_presence,
+    open_write_session, open_store, get_resolution_level, write_chunk_vertices,
     write_chunk_attributes, rebuild_presence, refresh_arrays_present,
     update_level_metadata, write_multiscale_metadata,
 )
@@ -97,6 +97,8 @@ level = create_resolution_level(root, 0, LevelMetadata(
 with open_write_session(level, bounds=BOUNDS, chunk_shape=CHUNK):
     create_vertices_array(level, dtype="float32")
     create_attribute_array(level, "intensity", dtype="float32")
+
+defer_presence(level)        # partitions write no state shared between cells
 ```
 
 ```{warning}
@@ -145,10 +147,18 @@ for slab in range(4):                      # 4 z-slabs, one chunk deep each
     del positions, intensity
 ```
 
-`record_presence=False` is not an optimisation. `nonempty_chunks` is a single
+Deferring presence is not an optimisation. `nonempty_chunks` is a single
 attribute shared by every cell of an array, so a partition that stamps it
-races every other partition. Partitions skip it; the coordinator rebuilds it
-once, below.
+races every other partition. After `defer_presence` the arrays carry no
+manifest, no write stamps one, and the coordinator writes each once, below.
+`record_presence=False` says the same per call; with the declaration it is
+redundant but harmless, and without it it is the only thing keeping the
+partitions apart.
+
+While the level is deferred, zarr-vectors readers find the cells by asking the
+store, so something downstream that reads before the coordinator gets there
+still sees them. An offline-read session or an older zarr-vectors does not —
+see [Stamping under your own lock](hpc_pipelines.md#stamping-under-your-own-lock).
 
 ### One fragment per bin, not one per cell
 
@@ -181,7 +191,7 @@ coarsening cost above.
 root = open_store(STORE, mode="r+")
 level = get_resolution_level(root, 0)
 
-rebuild_presence(level)                    # the nonempty_chunks nobody stamped
+rebuild_presence(level)                    # every manifest, once; ends the deferral
 print(refresh_arrays_present(level))       # what is actually on disk
 update_level_metadata(level, vertex_count=written)
 write_multiscale_metadata(root)
@@ -200,7 +210,9 @@ ReadResult(kind='point_cloud', vertices=16000, attributes=['intensity'])
 `refresh_arrays_present` walks the level rather than trusting the list the
 writers declared, which is why `vertex_fragments` appears even though the
 `LevelMetadata` above never mentioned it. Both verbs are coordinator-only:
-never run either while partitions are still writing.
+never run either while partitions are still writing. A writer that has no
+coordinator to wait for should use `collect_presence` / `apply_presence`
+instead of `rebuild_presence`.
 
 Coarser levels come afterwards, from the finished store:
 
@@ -253,8 +265,11 @@ argument above applies to them unchanged.
 If your data is already in a format that can be read block by block, the
 smallest change to an existing pipeline is to write it once with a coarse
 chunk shape and re-cut the grid afterwards. `rechunk` with
-`RechunkSpec(by="spatial")` changes the spatial chunk shape and keeps the
-store's topology, levels and object ids:
+`RechunkSpec(by="spatial")` changes the spatial chunk shape. It copies
+level 0's vertices and object index only, which is lossless for a point
+cloud. Links, attributes and coarser levels are not carried over, and the
+grid gains a leading axis of extent 1. For any other geometry kind, use
+`rechunk_spatial`, which keeps links, levels, object ids and attributes:
 
 ```python
 import numpy as np

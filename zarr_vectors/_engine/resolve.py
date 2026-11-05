@@ -74,6 +74,10 @@ class LevelContext:
     bounds: tuple[tuple[float, ...], tuple[float, ...]] | None = None
     attribute_names: tuple[str, ...] = ()
     has_object_index: bool = False
+    manifest_layout: str = "vlen"
+    """The layout the object index is stored in: ``"vlen"`` (one blob per
+    object, in ``manifests``) or ``"dense"`` (``manifest_spans`` into
+    ``manifest_blocks``). Only which arrays are taken whole depends on it."""
     known_cells: tuple[str, ...] = ()
     """Cells known to be populated, when the caller already knows.
 
@@ -127,11 +131,48 @@ def _arrays_for(
         ]
     whole = []
     if ctx.has_object_index:
+        dense = ctx.manifest_layout == "dense"
         if by_object:
             whole.append(ctx.path(OBJECT_INDEX, _OBJECT_IDS_TABLE))
+            if dense:
+                # One span row per object; the blocks it names are
+                # fetched when the reader asks for them.
+                whole.append(ctx.path(OBJECT_INDEX, "manifest_spans"))
+        elif dense:
+            whole.append(ctx.path(OBJECT_INDEX, "manifest_spans"))
+            whole.append(ctx.path(OBJECT_INDEX, "manifest_blocks"))
         else:
             whole.append(ctx.path(OBJECT_INDEX, "manifests"))
     return _Wanted(arrays=tuple(arrays), whole_arrays=tuple(whole))
+
+
+def _match_known(
+    named: Sequence[str], known: Sequence[str], rank: int,
+) -> tuple[str, ...]:
+    """The cells in ``known`` that the keys in ``named`` select, sorted.
+
+    A key of the level's own rank selects itself.  A spatial key -- what
+    ``Grid`` hands out, and what a box expands to -- selects every known
+    cell with that spatial tail: on a level chunked by an attribute, one
+    per bin, compared on the trailing components as :func:`_key_in_box`
+    is.  On a spatial level the tail is the whole key, so this is an
+    exact match there.
+    """
+    known_set = set(known)
+    by_tail: dict[str, list[str]] | None = None
+    out: set[str] = set()
+    for key in named:
+        if key in known_set:
+            out.add(key)
+            continue
+        if key.count(".") + 1 != rank:
+            continue
+        if by_tail is None:
+            by_tail = {}
+            for k in known:
+                by_tail.setdefault(".".join(k.split(".")[-rank:]), []).append(k)
+        out.update(by_tail.get(key, ()))
+    return tuple(sorted(out))
 
 
 def _key_in_box(
@@ -197,8 +238,7 @@ def _cells_in_bbox(
     coords = chunks_intersecting_bbox(lo, hi, tuple(ctx.chunk_shape))
     keys = [".".join(str(int(c)) for c in cc) for cc in coords]
     if ctx.known_cells:
-        known = set(ctx.known_cells)
-        keys = [k for k in keys if k in known]
+        return _match_known(keys, ctx.known_cells, len(ctx.chunk_shape))
     return tuple(sorted(set(keys)))
 
 
@@ -251,7 +291,11 @@ def resolve(selection: Any, ctx: LevelContext) -> ReadPlan:
         # different by orders of magnitude.
         named = sorted({ref.key for ref in explicit})
         cells: tuple[str, ...] | None
-        if ctx.known_cells:
+        if ctx.known_cells and ctx.chunk_shape:
+            # A spatial ref names that cell in every bin of a binned
+            # level; matched as a box is, on the spatial tail.
+            cells = _match_known(named, ctx.known_cells, len(ctx.chunk_shape))
+        elif ctx.known_cells:
             known = set(ctx.known_cells)
             cells = tuple(k for k in named if k in known)
         else:
@@ -317,6 +361,9 @@ def context_from_level(level: Any) -> LevelContext:
         ),
         attribute_names=level.attribute_names("vertex"),
         has_object_index=True,
+        manifest_layout=(
+            "dense" if getattr(root, "manifest_layout", None) == "dense" else "vlen"
+        ),
         known_cells=_known_cells(level),
     )
 
