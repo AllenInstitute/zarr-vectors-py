@@ -1325,7 +1325,14 @@ class Group:
         start, stop = int(start), int(stop)
         if stop <= start:
             return b""
-        if self._offline is None:
+        # Another store's cell (chunk_sources) or one staged in a shard
+        # transaction is not at this store's byte offsets: read_bytes
+        # resolves both, so slice what it returns.
+        staged = (
+            self._shard_txn is not None
+            and self._shard_txn.lookup(array_name, chunk_key) is not None
+        )
+        if self._source_cell(chunk_key) is None and not staged and self._offline is None:
             if self._prefetch_cache is not None:
                 cell = self._prefetch_cache.get((array_name, chunk_key))
                 if cell is not None:
