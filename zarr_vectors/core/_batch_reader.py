@@ -562,3 +562,203 @@ def _sync_fallback(
                 node[region]
             )
     return cache
+
+
+# --------------------------------------------------------------------
+# Byte-range reads within a cell
+# --------------------------------------------------------------------
+#
+# Everything above reads whole cells, because that is the unit a codec
+# can decode.  An *uncompressed* vlen-bytes cell needs no decoding: its
+# stored bytes are an 8-byte header and then the payload verbatim, so
+# payload bytes [a, b) sit at stored bytes [8 + a, 8 + b) -- in the
+# cell's own object when unsharded, or at that offset into the inner
+# chunk the shard index names when sharded.  A reader that knows which
+# rows it wants (a fragment, from the fragment index) can then fetch
+# those rows and nothing else, which is the read a format with a
+# per-object byte index -- Neuroglancer precomputed -- gets by default.
+#
+# Only a pipeline this module positively recognises is range-read; any
+# other answers ``None`` and the caller reads the whole cell, so a
+# compressed store behaves exactly as it did.
+
+#: Stored bytes ahead of a one-cell vlen-bytes payload: numcodecs
+#: ``VLenBytes`` writes a ``uint32`` item count and a ``uint32`` length.
+_VLEN_HEADER = 8
+
+
+class RangeRequest(NamedTuple):
+    """Payload bytes ``[start, stop)`` of one cell."""
+
+    array_name: str
+    chunk_key: str
+    start: int
+    stop: int
+
+
+def _range_layout(node: Any) -> tuple[str, Any] | None:
+    """How ``node``'s cells can be range-read, or None if they cannot.
+
+    ``("plain", None)`` -- unsharded, vlen-bytes and nothing else.
+    ``("shard", codec)`` -- ``sharding_indexed`` over one-cell inner
+    chunks that are vlen-bytes and nothing else.
+    """
+    if not isinstance(node, zarr.Array):
+        return None
+    meta = node.metadata
+    if getattr(meta, "zarr_format", None) != 3:
+        return None
+    if getattr(meta, "storage_transformers", ()):
+        return None
+    codecs = tuple(meta.codecs)
+    if len(codecs) != 1:
+        return None
+    grid = getattr(getattr(meta, "chunk_grid", None), "chunk_shape", None)
+    if grid is None:
+        return None
+    codec = codecs[0]
+    if type(codec).__name__ == "VLenBytesCodec":
+        return ("plain", None) if all(c == 1 for c in grid) else None
+    from zarr.codecs.sharding import ShardingCodec
+
+    if not isinstance(codec, ShardingCodec):
+        return None
+    inner = tuple(codec.codecs)
+    if len(inner) != 1 or type(inner[0]).__name__ != "VLenBytesCodec":
+        return None
+    if any(c != 1 for c in codec.chunk_shape):
+        return None
+    return ("shard", codec)
+
+
+def _cell_index(node: Any, chunk_key: str) -> tuple[int, ...] | None:
+    """0-based cell index of ``chunk_key`` in ``node``, or None off-grid."""
+    coords = _parse_coords(chunk_key)
+    if coords is None or len(coords) != len(node.shape):
+        return None
+    coords = _apply_origin(coords, node.metadata.attributes)
+    if any(c < 0 or c >= s for c, s in zip(coords, node.shape)):
+        return None
+    return coords
+
+
+def _shard_of(
+    node: Any, codec: Any, index: tuple[int, ...],
+) -> tuple[tuple[int, ...], tuple[int, ...], tuple[int, ...]]:
+    """``(chunks_per_shard, shard, inner)`` coordinates of cell ``index``."""
+    outer = node.metadata.chunk_grid.chunk_shape
+    cps = tuple(s // i for s, i in zip(outer, codec.chunk_shape))
+    shard = tuple(c // n for c, n in zip(index, cps))
+    inner = tuple(c % n for c, n in zip(index, cps))
+    return cps, shard, inner
+
+
+def _direct_read_range(spec: _DirectSpec, req: RangeRequest) -> bytes | None:
+    """One range off the local filesystem: seek and read, no event loop."""
+    path = _direct_path(spec, req.chunk_key)
+    if path is None:
+        return None
+    try:
+        with open(path, "rb") as fh:
+            fh.seek(_VLEN_HEADER + req.start)
+            return fh.read(req.stop - req.start)
+    except OSError:
+        return None
+
+
+async def _gather_ranges(
+    requests: list[tuple[RangeRequest, Any, str, Any]],
+) -> list[bytes | None]:
+    """Fetch ``(request, node, kind, codec)`` ranges in at most two
+    gathers: shard indices first, where any are needed, then the data."""
+    from zarr.abc.store import RangeByteRequest
+
+    shard_ix: dict[tuple[str, tuple[int, ...]], Any] = {}
+    index_tasks: dict[tuple[str, tuple[int, ...]], Any] = {}
+    for req, node, kind, codec in requests:
+        if kind != "shard":
+            continue
+        index = _cell_index(node, req.chunk_key)
+        if index is None:
+            continue
+        cps, shard, _ = _shard_of(node, codec, index)
+        key = (req.array_name, shard)
+        if key not in index_tasks:
+            getter = node.store_path / node.metadata.encode_chunk_key(shard)
+            index_tasks[key] = codec._load_shard_index_maybe(getter, cps)
+    if index_tasks:
+        loaded = await asyncio.gather(*index_tasks.values())
+        shard_ix = dict(zip(index_tasks, loaded))
+
+    async def one(req: RangeRequest, node: Any, kind: str, codec: Any) -> bytes | None:
+        index = _cell_index(node, req.chunk_key)
+        if index is None:
+            return None
+        if kind == "plain":
+            getter = node.store_path / node.metadata.encode_chunk_key(index)
+            base = 0
+        else:
+            _, shard, inner = _shard_of(node, codec, index)
+            ix = shard_ix.get((req.array_name, shard))
+            if ix is None:
+                return None
+            sl = ix.get_chunk_slice(inner)
+            if sl is None or sl[1] - sl[0] < _VLEN_HEADER + req.stop:
+                return None
+            getter = node.store_path / node.metadata.encode_chunk_key(shard)
+            base = sl[0]
+        buf = await getter.get(
+            prototype=_BUFFER_PROTOTYPE,
+            byte_range=RangeByteRequest(
+                base + _VLEN_HEADER + req.start, base + _VLEN_HEADER + req.stop,
+            ),
+        )
+        return None if buf is None else buf.to_bytes()
+
+    return list(await asyncio.gather(*(one(*r) for r in requests)))
+
+
+def fetch_ranges(
+    zarr_group: zarr.Group,
+    requests: list[RangeRequest],
+    nodes: dict[str, Any],
+    specs: dict[str, Any] | None = None,
+) -> dict[RangeRequest, bytes]:
+    """Read many payload ranges, each from the cheapest route its array allows.
+
+    ``nodes`` are the resolved arrays by name; ``specs`` their local
+    direct-read specs where the caller has them.  Uncompressed local
+    unsharded cells are read with ``open``/``seek``; other uncompressed
+    cells -- remote, or sharded -- with ranged GETs in one gather (two
+    when shard indices must be read first).
+
+    Returns only the ranges it could serve, each exactly ``stop - start``
+    bytes long; anything else -- a compressed or unrecognised array, an
+    icechunk store, a missing cell, a short read -- is left out, and the
+    caller reads the whole cell instead.
+    """
+    if not requests or _is_icechunk_store(zarr_group.store):
+        return {}
+    out: dict[RangeRequest, bytes] = {}
+    gathered: list[tuple[RangeRequest, Any, str, Any]] = []
+    layouts: dict[str, tuple[str, Any] | None] = {}
+    for req in requests:
+        if req.array_name not in layouts:
+            layouts[req.array_name] = _range_layout(nodes.get(req.array_name))
+        layout = layouts[req.array_name]
+        if layout is None or req.stop <= req.start:
+            continue
+        kind, codec = layout
+        spec = (specs or {}).get(req.array_name)
+        if kind == "plain" and spec is not None and not spec.codecs:
+            data = _direct_read_range(spec, req)
+            if data is not None and len(data) == req.stop - req.start:
+                out[req] = data
+            continue
+        gathered.append((req, _as_async_array(nodes[req.array_name]), kind, codec))
+    if gathered:
+        results = sync(_gather_ranges(gathered))
+        for (req, *_), data in zip(gathered, results):
+            if data is not None and len(data) == req.stop - req.start:
+                out[req] = data
+    return out

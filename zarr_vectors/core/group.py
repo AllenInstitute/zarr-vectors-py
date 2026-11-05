@@ -45,6 +45,9 @@ from zarr.errors import UnstableSpecificationWarning
 from zarr.storage import LocalStore
 
 from zarr_vectors.constants import (
+    LINK_FRAGMENTS as _LINK_FRAGMENTS_ARRAY,
+)
+from zarr_vectors.constants import (
     VERTEX_FRAGMENTS as _VERTEX_FRAGMENTS_ARRAY,
 )
 from zarr_vectors.constants import (
@@ -142,6 +145,9 @@ class Group:
     _pending_writes: list[tuple[str, str, bytes, bool]] | None = None
     _pending_array_metas: dict[str, dict[str, Any]] | None = None
     _prefetch_cache: dict[tuple[str, str], bytes] | None = None
+    # ``{RangeRequest: bytes}`` while a :meth:`batched_range_reads` block
+    # is open; see :meth:`read_cell_range`.
+    _range_cache: dict[Any, bytes] | None = None
     # Active codec spec for chunk-array writes, set by
     # :meth:`batched_writes(compressor=...)`.  ``None`` means callers fall
     # back to zarr v3's default codec pipeline (``bytes`` + ``zstd``).
@@ -180,6 +186,11 @@ class Group:
     # ``fragments_tile`` claim, so a bulk write of N chunks checks it
     # once rather than N times.  See :meth:`_clear_fragments_tile`.
     _tiling_claim_settled: bool = False
+    # The same, for the level's ``link_fragments_aligned`` claim.  Kept
+    # apart from the tiling flag because the two are broken by different
+    # writes: a links edit must not cost a level its tiling claim.  See
+    # :meth:`_clear_link_fragments_aligned`.
+    _alignment_claim_settled: bool = False
     # Per-array presence manifests, cached for the same read-only session
     # as ``_node_cache`` and keyed the same way.  See
     # :meth:`_chunk_listing` and :class:`_ChunkListing`.
@@ -205,12 +216,15 @@ class Group:
         # Prefetch cache activated by :meth:`batched_reads`.  When set,
         # :meth:`read_bytes` looks here first before hitting the store.
         self._prefetch_cache = None
+        # Range cache activated by :meth:`batched_range_reads`.
+        self._range_cache = None
         self._active_codecs = None
         self._native_sharded_config = None
         self._node_cache = None
         self._node_cache_readonly = False
         self._listing_cache = None
         self._tiling_claim_settled = False
+        self._alignment_claim_settled = False
         self._vertex_rows_written = None
         self._object_id_lookup_cache = None
 
@@ -223,6 +237,7 @@ class Group:
         instance._pending_writes = None
         instance._pending_array_metas = None
         instance._prefetch_cache = None
+        instance._range_cache = None
         instance._active_codecs = None
         # An offline snapshot covers the whole tree, so a Group derived
         # from one stays offline; without this a level group would fall
@@ -334,6 +349,39 @@ class Group:
             set(self._zarr.group_keys()) | set(self._zarr.array_keys())
         )
 
+    def child_names(self) -> list[str]:
+        """:meth:`children` from one store listing, reading no child's metadata.
+
+        :meth:`children` resolves every child node to sort arrays from
+        groups -- one ``zarr.json`` read per child, twice over -- and a
+        caller that only wants the names pays for all of it.  The links
+        family is that caller: a mesh at 10^6 vertices has ~170 offsets
+        arrays, and listing them that way was 24 ms of a 34 ms one-object
+        read.  Every directory under a node is a node in Zarr v3, so the
+        listing is the answer.
+
+        Falls back to :meth:`children` offline (the snapshot carries the
+        listing, not the store) and on any store that cannot list.
+        """
+        if self._offline is not None:
+            return self.children()
+        from zarr.core.sync import sync
+
+        store_path = self._zarr.store_path
+        prefix = f"{store_path.path}/" if store_path.path else ""
+
+        async def _collect() -> list[str]:
+            return [name async for name in store_path.store.list_dir(prefix)]
+
+        try:
+            names = sync(_collect())
+        except Exception:
+            return self.children()
+        return sorted({
+            n.rstrip("/") for n in names
+            if n.rstrip("/") and n.rstrip("/") != "zarr.json"
+        })
+
     # ---------------- chunk I/O ------------------------------------------
     #
     # ``<array_name>`` is always a single multidim vlen-bytes Zarr array
@@ -385,6 +433,8 @@ class Group:
             # Either write can break the tiling a level may be claiming:
             # the index directly, the buffer by changing its row count.
             self._clear_fragments_tile()
+        if _breaks_link_alignment(array_name):
+            self._clear_link_fragments_aligned()
         sharded_arr = self._sharded_chunk_array(array_name)
         if sharded_arr is None:
             raise StoreError(
@@ -432,6 +482,8 @@ class Group:
         """
         if array_name in (_VERTICES_ARRAY, _VERTEX_FRAGMENTS_ARRAY):
             self._clear_fragments_tile()
+        if _breaks_link_alignment(array_name):
+            self._clear_link_fragments_aligned()
         sharded_arr = self._sharded_chunk_array(array_name)
         if sharded_arr is None:
             raise StoreError(
@@ -944,6 +996,114 @@ class Group:
                 f"{self._zarr.path or '<root>'}"
             )
         return _vlen_get_cell(sharded_arr, index)
+
+    def read_cell_range(
+        self, array_name: str, chunk_key: str, start: int, stop: int,
+    ) -> bytes:
+        """Payload bytes ``[start, stop)`` of one cell.
+
+        ``read_bytes(array_name, chunk_key)[start:stop]``, without
+        fetching the rest of the cell where the array allows it: an
+        uncompressed cell is read as just those bytes (see
+        :func:`~zarr_vectors.core._batch_reader.fetch_ranges`).  Anything
+        else -- a compressed array, an offline read, a range the store
+        cannot serve -- reads the whole cell and slices it, so the
+        answer is the same either way and only its cost differs.
+
+        Served from :meth:`batched_reads` (whole cells) or
+        :meth:`batched_range_reads` (this range) when either holds it.
+        """
+        start, stop = int(start), int(stop)
+        if stop <= start:
+            return b""
+        if self._offline is None:
+            if self._prefetch_cache is not None:
+                cell = self._prefetch_cache.get((array_name, chunk_key))
+                if cell is not None:
+                    return cell[start:stop]
+            from zarr_vectors.core._batch_reader import RangeRequest
+
+            req = RangeRequest(array_name, chunk_key, start, stop)
+            if self._range_cache is not None:
+                hit = self._range_cache.get(req)
+                if hit is not None:
+                    return hit
+            got = self._fetch_ranges([req]).get(req)
+            if got is not None:
+                return got
+        return self.read_bytes(array_name, chunk_key)[start:stop]
+
+    @contextmanager
+    def batched_range_reads(
+        self, requests: Sequence[tuple[str, str, int, int]],
+    ) -> Iterator[None]:
+        """Fetch every ``(array_name, chunk_key, start, stop)`` range in
+        one go and serve :meth:`read_cell_range` from the result.
+
+        :meth:`batched_reads` for ranges: a reader that has read its
+        fragment indices knows every row it needs, and asking for them
+        together costs one gather rather than a round-trip each.  A
+        range the store cannot serve on its own is simply not cached;
+        :meth:`read_cell_range` then reads its whole cell, as it would
+        have outside the block.
+
+        Offline, every planned range is recorded as a miss of its whole
+        cell -- the snapshot is cell-granular -- exactly as
+        :meth:`batched_reads` records its plan.
+
+        Nesting is not supported and raises :class:`StoreError`.
+        """
+        if self._range_cache is not None:
+            raise StoreError("batched_range_reads() does not support nesting")
+        if self._offline is not None:
+            plan: dict[str, list[str]] = {}
+            for array_name, chunk_key, _start, _stop in requests:
+                plan.setdefault(array_name, []).append(chunk_key)
+            self._record_planned_misses(list(plan.items()))
+            yield
+            return
+        from zarr_vectors.core._batch_reader import RangeRequest
+
+        self._range_cache = self._fetch_ranges([
+            RangeRequest(a, k, int(s), int(e)) for a, k, s, e in requests
+        ])
+        try:
+            yield
+        finally:
+            self._range_cache = None
+
+    def range_readable(self, array_name: str) -> bool:
+        """Can :meth:`read_cell_range` fetch part of a cell of
+        ``array_name`` without reading all of it?
+
+        True for an uncompressed vlen-bytes array, sharded or not, on a
+        store that serves byte ranges; False offline and on icechunk,
+        whose reads are cell-granular.  A reader uses it to decide
+        whether reading an index first and the rows second is worth the
+        extra round-trip over reading both whole in one gather.
+        """
+        if self._offline is not None:
+            return False
+        from zarr_vectors.core._batch_reader import (
+            _is_icechunk_store,
+            _range_layout,
+        )
+
+        if _is_icechunk_store(self._zarr.store):
+            return False
+        return _range_layout(self._sharded_chunk_array(array_name)) is not None
+
+    def _fetch_ranges(self, requests: list[Any]) -> dict[Any, bytes]:
+        """:func:`~zarr_vectors.core._batch_reader.fetch_ranges` with this
+        handle's resolved arrays and direct-read specs."""
+        from zarr_vectors.core._batch_reader import fetch_ranges
+
+        names = {r.array_name for r in requests}
+        return fetch_ranges(
+            self._zarr, requests,
+            {name: self._sharded_chunk_array(name) for name in names},
+            specs={name: self._direct_spec_cached(name) for name in names},
+        )
 
     def chunk_exists(self, array_name: str, chunk_key: str) -> bool:
         sharded_arr = self._sharded_chunk_array(array_name)
@@ -1744,16 +1904,32 @@ class Group:
         if self._tiling_claim_settled:
             return
         self._tiling_claim_settled = True
+        self._drop_level_claim("fragments_tile")
+
+    def _clear_link_fragments_aligned(self) -> None:
+        """Drop this level's ``link_fragments_aligned`` claim, if it holds one.
+
+        :meth:`_clear_fragments_tile` for the claim that link fragment
+        ``k`` of a chunk's intra-chunk link cell is exactly the records
+        owned by vertex fragment ``k``.  Called from the same chokepoint,
+        for the writes that can break it -- see
+        :func:`_breaks_link_alignment`.
+        """
+        if self._alignment_claim_settled:
+            return
+        self._alignment_claim_settled = True
+        self._drop_level_claim("link_fragments_aligned")
+
+    def _drop_level_claim(self, key: str) -> None:
+        """Remove ``key`` from this level's metadata when it is set."""
         try:
             level = self._zarr.attrs.get(_LEVEL_META_KEY)
         except Exception:
             return
-        if not isinstance(level, dict) or not level.get("fragments_tile"):
+        if not isinstance(level, dict) or not level.get(key):
             return
         self._zarr.attrs.update({
-            _LEVEL_META_KEY: {
-                k: v for k, v in level.items() if k != "fragments_tile"
-            },
+            _LEVEL_META_KEY: {k: v for k, v in level.items() if k != key},
         })
 
     def _invalidate_node(self, path: str) -> None:
@@ -2225,6 +2401,27 @@ def _check_coords_in_bounds(
             f"Chunk coords {coords} out of grid {shape} for "
             f"array {array_name!r}"
         )
+
+
+def _breaks_link_alignment(array_name: str) -> bool:
+    """Can a write to ``array_name`` break ``link_fragments_aligned``?
+
+    The claim relates three things -- the vertex fragment index, the link
+    fragment index, and the intra-chunk link array at delta 0 (offsets all
+    zero: ``links/0/0.0.0`` for edges, ``links/0/0.0.0_0.0.0`` for
+    triangles) -- so a write to any of them may.  Cross-chunk offset
+    arrays and the ``vertices`` buffer cannot: neither changes which
+    intra-chunk record belongs to which vertex fragment.
+    """
+    if array_name in (_VERTEX_FRAGMENTS_ARRAY, _LINK_FRAGMENTS_ARRAY):
+        return True
+    prefix = "links/0/"
+    if not array_name.startswith(prefix):
+        return False
+    segment = array_name[len(prefix):]
+    # ``self`` is the segment of a one-endpoint family, which has no
+    # offsets and is therefore intra-chunk too.
+    return segment == "self" or (bool(segment) and set(segment) <= {"0", ".", "_"})
 
 
 def _vlen_get_cell(
