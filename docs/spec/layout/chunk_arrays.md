@@ -46,7 +46,11 @@ relationship between endpoints factored into the path instead
 (see [Links](../object_model/links.md)).
 
 This page documents the dtype, shape, chunk grid, and codec for every array
-defined by the Zarr Vectors specification, for each geometry type.
+defined by the Zarr Vectors specification, for each geometry type. Not every
+array is a chunk array: `vertices`, `vertex_fragments`, `link_fragments`,
+`vertex_attributes/*`, `fragment_attributes/*`, `links/*/*` and
+`link_attributes/*/*/*` are; `object_index/*`, `object_attributes/*`, `groups`
+and `group_attributes/*` are ordinary 1-D / 2-D arrays with no spatial grid.
 
 ---
 
@@ -67,12 +71,14 @@ chunk.
 | Sharding | optional `shard_shape=` wraps cells in `sharding_indexed` |
 | Attributes | `chunk_grid_origin`, `nonempty_chunks`, `zv_array="vertices"`, `dtype`, `encoding` |
 
-Each cell's blob is the Zarr Vectors-encoded positions for that chunk. Within each
-spatial chunk the vertices are stored in **fragment order**: all vertices
-of bin (0,0,0) first, then bin (0,0,1), etc., in C-order bin index. The
-`vertex_fragments/` array encodes one fragment per non-empty bin describing
-its row range within this ordering (see
-[Fragment-index arrays](fragment_index_arrays.md)).
+Each cell's blob is the Zarr Vectors-encoded positions for that chunk. Within
+each spatial chunk the vertices are stored in the order the writer's fragments
+partition them. For an undifferentiated point cloud that is **bin order**: all
+vertices of bin (0,0,0) first, then bin (0,0,1), etc., in C-order bin index,
+with `vertex_fragments/` holding one range fragment per bin. For object-based
+types it is one fragment per object per chunk, in write order. Either way
+`vertex_fragments/` encodes the row range of each fragment within this ordering
+(see [Fragment-index arrays](fragment_index_arrays.md)).
 
 **Example:** a 3-D store with a chunk grid of shape `(5, 6, 4)`, one cell
 per spatial chunk (chunk file at `vertices/c/i/j/k`):
@@ -92,11 +98,20 @@ per spatial chunk (chunk file at `vertices/c/i/j/k`):
     "zv_array": "vertices",
     "dtype": "float32",
     "encoding": "raw",
-    "chunk_grid_origin": [0, 0, 0],
     "nonempty_chunks": ["0.0.0", "0.0.1"]
   }
 }
 ```
+
+`chunk_grid_origin` is **omitted** when it is all zeros, as here; a store whose
+data dips below the origin would carry e.g. `"chunk_grid_origin": [-2, 0, 0]`.
+`nonempty_chunks` lists dotted keys of *absolute* chunk coordinates
+(`c`, not `c - origin`).
+
+A one-cell-per-chunk store with `chunk_shape = (100, 100, 100)` and vertices
+spanning `x ∈ [-150, 250)` has `origin[0] = floor(-150 / 100) = -2` and
+`floor(249.9 / 100) - (-2) + 1 = 5` cells along `x`. The chunk at absolute
+`x`-coordinate `-2` is the first cell, file `vertices/c/0/…`.
 
 Note that `data_type` above is `variable_length_bytes` — that describes the
 *container*, not the payload. The element type of the vertex positions is
@@ -112,14 +127,14 @@ inline header, so a reader needs three pieces of metadata to recover the
 | Input | Source |
 |-------|--------|
 | Element dtype | `vertices/` array attribute `dtype` (e.g. `"float32"`) |
-| `D` (columns) | root metadata `zarr_vectors.spatial_dims` — **not** stored on the array; see [Dimensionality](../foundations/dimensionality.md) |
+| `D` (columns) | the number of spatial axes: `len(multiscales[0].axes)` in the root attributes (`RootMetadata.sid_ndim`) — **not** stored on the array; see [Dimensionality](../foundations/dimensionality.md) |
 | `N` (rows) | derived: `len(blob) // (dtype.itemsize * D)` |
 | Blob framing | `vertices/` array attribute `encoding`: `"raw"` (flat buffer, as above) or `"draco"` (compressed mesh payload; `dtype`/`D` describe the *decoded* result) |
 
 For `encoding == "raw"` the decode is therefore:
 
 ```python
-positions = np.frombuffer(blob, dtype=attrs["dtype"]).reshape(-1, spatial_dims)
+positions = np.frombuffer(blob, dtype=attrs["dtype"]).reshape(-1, sid_ndim)
 ```
 
 Readers **must** honour the stored `dtype` rather than assuming `float32`:
@@ -251,11 +266,10 @@ intra array never sorts its endpoints. For graphs and skeletons, edge order
 is not semantically significant.
 
 For meshes (`link_width=3`) each row is one triangle's three vertex
-indices. Vertex winding order is consistent within a store (default:
-counter-clockwise when viewed from outside the surface, i.e. outward-facing
-normals). The winding order convention is stored in root `.zattrs` under
-`"winding_order"`: `"ccw"` (default) or `"cw"`. Where a face is
-canonical-sorted, `perm_idx` is what recovers its winding.
+indices, in the winding order the writer was given. The library records no
+winding-order convention in the store (there is no `winding_order` key) and does
+not reorder faces on its own; the input order is what `perm_idx` restores
+wherever a face was canonical-sorted into a different cell.
 
 See [Links](../object_model/links.md) for the offsets grammar, the
 placement rules, and the enumeration order.
@@ -272,10 +286,12 @@ link record in the same order.
 | Shape | `chunk_grid_shape` (one cell per spatial chunk) |
 | Fill value | `b""` (empty chunk ⇒ no chunk file) |
 | Codec | `vlen-bytes` (+ optional `zstd` / `blosc` compressor; none by default) |
-| Attributes | `chunk_grid_origin`, `nonempty_chunks`, `zv_array="link_attribute"`, `name`, `dtype`, `offsets`, `level_delta` |
+| Attributes | `chunk_grid_origin`, `nonempty_chunks`, `zv_array="link_attribute"`, `name`, `dtype`, `row_shape`, `offsets`, `level_delta` |
 
 The parent `link_attributes/<name>/<delta>/` is a **group**
-(`zv_array="link_attribute_family"`, plus `name` and `level_delta`).
+(`zv_array="link_attribute_family"`, plus `name`, `level_delta` and, after
+`write_link_attributes`, `num_links`). A cell is always a flat dense blob of
+`sum(M_k)` rows — there is no inline-header branch as there is for link cells.
 
 Attribute rows carry no `perm_idx` — they are per-record values, not
 endpoints, so a placement permutation does not reorder them. Their
@@ -283,10 +299,11 @@ alignment to link records rests entirely on the shared enumeration order
 that `read_links` and `read_link_attributes` both use; see
 [Enumeration order](../object_model/links.md#enumeration-order).
 
-### `attributes/<name>/`
+### `vertex_attributes/<name>/`
 
-One sub-group per named per-vertex attribute. The attribute name is a
-valid Python identifier (alphanumeric and underscores only).
+One chunk array per named per-vertex attribute (the group `vertex_attributes/`
+is a plain Zarr group, one child array per name). Names are path segments;
+valid Python identifiers are the convention.
 
 | Property | Value |
 |----------|-------|
@@ -294,87 +311,112 @@ valid Python identifier (alphanumeric and underscores only).
 | Shape | `chunk_grid_shape` (one cell per spatial chunk) |
 | Fill value | `b""` (empty chunk ⇒ no chunk file) |
 | Codec | `vlen-bytes` (+ optional `zstd` / `blosc` compressor; none by default) |
-| Attributes | `chunk_grid_origin`, `nonempty_chunks`, `zv_array="attribute"`, `name`, `dtype`, optional `channel_names` |
+| Attributes | `chunk_grid_origin`, `nonempty_chunks`, `zv_array="attribute"`, `name`, `dtype`, `row_shape`, optional `channel_names` |
 
 As with `vertices/`, the Zarr `data_type` is the container type; the
-attribute's element type is the `dtype` **attribute**, and the column count
-`K` is `len(channel_names)` (scalar — one column — when `channel_names` is
-absent). A cell decodes as
+attribute's element type is the `dtype` **attribute**, and the column count `K`
+is `row_shape[0]` (`row_shape = []` for a scalar). Stores written before
+`row_shape` existed fall back to `len(channel_names)`, then `1`. A cell decodes as
 `np.frombuffer(blob, dtype=attrs["dtype"]).reshape(-1, K)`, with the row
 count derived from the blob length (see
 [Decoding a cell blob](#decoding-a-cell-blob)). Honouring the stored `dtype`
 matters more here than anywhere else in the format, since attributes are
 routinely non-`float32` (integer labels, `float64` measurements).
 
-The vertex ordering within an attribute chunk must match the vertex ordering
-in the corresponding `vertices/` chunk exactly. That is, attribute value `k`
-in chunk `(i,j,l)` of `attributes/intensity/` corresponds to vertex `k` in
-chunk `(i,j,l)` of `vertices/`.
+There is **no `N_max` padding** and no `(…, N_max, K)` shape: a cell is exactly
+`N × K` elements long.
+
+The row order of an attribute cell must match the row order of the
+corresponding `vertices/` cell exactly: attribute row `k` in chunk `(i,j,l)` of
+`vertex_attributes/intensity/` corresponds to vertex row `k` in chunk `(i,j,l)`
+of `vertices/`. Fragments select rows of both buffers through the same
+`vertex_fragments/` index.
+
+Categorical (string) attributes are stored as integer codes with
+`encoding="dictionary"`, `categories`, `ordered` and an optional `_FillValue`
+among the array attributes.
 
 ### `fragment_attributes/<name>/`
 
-One sub-group per named **per-fragment** attribute. Opt-in; absent unless
-the writer was given explicit per-chunk values. Each chunk stores a dense
-byte blob whose row count equals the number of fragments encoded in
-`vertex_fragments/<chunk>`; the row count is derived at read time from the
-byte length and the row stride (`dtype.itemsize * K`), so no sibling
-offsets blob is written.
+One chunk array per named **per-fragment** attribute. Opt-in; absent unless
+the writer was given explicit per-chunk values (or `write_fragment_owner_column`
+was run). Each cell stores a dense byte blob whose row count equals the number
+of fragments in `vertex_fragments/<chunk>`; the row count is derived at read
+time from the byte length and the row stride (`dtype.itemsize * K`), so no
+sibling offsets blob is written. The count is *not* validated against the
+fragment index when writing.
 
 | Property | Value |
 |----------|-------|
-| Dtype | Any numeric dtype declared in `zarr.json` |
-| Logical shape | `(F,)` for scalar attributes; `(F, K)` for vector attributes of width K, where `F = num_fragments_in_chunk` |
-| Zarr chunk shape | One file per spatial chunk key (same key scheme as `vertices/`) |
-| Fill value | `0` or `NaN` (declared per array) |
-| Codec | `bytes → blosc(zstd, byteshuffle)` (same default as `attributes/`) |
+| Dtype | `variable_length_bytes` (vlen-bytes serializer) |
+| Shape | `chunk_grid_shape` (one cell per spatial chunk) |
+| Cell contents | `F × K` elements of the attribute's `dtype`, C-order: `(F,)` scalar or `(F, K)` |
+| Fill value | `b""` |
+| Codec | `vlen-bytes` (+ optional compressor; none by default) |
+| Attributes | `chunk_grid_origin`, `nonempty_chunks`, `zv_array="fragment_attribute"`, `name`, `dtype`, `row_shape`, optional `channel_names` |
 
-Element `k` corresponds to fragment `k` as encoded in
-`vertex_fragments/<chunk>`. Replace-only at the chunk level; not
-auto-downsampled in the pyramid. The canonical opt-in use case is
-materializing parent-IDs (e.g. the `object_id` owning each fragment) so
-joins on fragment → object don't have to round-trip
-`object_index/manifests`.
+Row `f` corresponds to fragment `f` as encoded in `vertex_fragments/<chunk>`.
+Replace-only at the chunk level; not auto-downsampled in the pyramid. The
+canonical use is materialising parent ids (the `object_id` column, with `-1` =
+unowned and `-2` = shared) so joins on fragment → object don't have to
+round-trip `object_index/manifests`. See
+[Attributes](../object_model/object_attributes.md).
 
 ### `object_index/`
 
-Present for: polyline, streamline, graph, skeleton, mesh.
+Present for: polyline, streamline, graph, skeleton, mesh (and point clouds
+written with objects).
 
-Stores one **manifest blob** per object enumerating every chunk the object
-touches and the fragments within each chunk. Two byte-keyed entries:
+A **group**, not a chunk array. It stores one **manifest blob** per object
+enumerating every chunk the object touches and the fragments within each
+chunk:
 
-| Key | Contents |
-|-----|----------|
-| `data` | concatenated manifest blobs for all `num_objects` objects |
-| `offsets` | `int64` array of length `num_objects`; entry `i` is the byte offset of object `i`'s blob within `data` |
+| Child | Type | Contents |
+|-------|------|----------|
+| `manifests` | 1-D `vlen-bytes` array, shape `(num_objects,)`, Zarr chunk `min(16384, num_objects)` | row `r` = manifest blob of the object at row `r` |
+| `object_ids` | 1-D `int64` array, shape `(num_objects,)` | row `r` = that object's id (layout `vlen_manifests_v2`) |
 
-Group-level `zv_array` metadata: `"object_index"`, plus `num_objects` and
-`sid_ndim`. The arrays are written as opaque bytes (no Zarr codec pipeline).
+Group attributes: `zv_array="object_index"`, `num_objects` (rows), `num_present`
+(non-empty rows), `sid_ndim`, `layout="vlen_manifests_v2"`,
+`object_ids_sorted`. There are no `data` / `offsets` children in the current
+layout; stores that have them are not readable. See
+[Object manifest](../object_model/object_manifest.md) for the byte layout and
+the read path.
 
-See [Object manifest](../object_model/object_manifest.md) for the
-manifest-blob byte layout and the read path.
+### `object_attributes/<name>`
 
-### `object_attributes/<name>/`
-
-One sub-group per named per-object attribute. Shape `(n_objects,)` for
-scalar attributes.
+A plain Zarr array per named per-object attribute (not a chunk array and not a
+group).
 
 | Property | Value |
 |----------|-------|
-| Dtype | Any numeric dtype |
-| Logical shape | `(n_objects,)` or `(n_objects, K)` |
+| Dtype | Any numeric dtype (recorded in `zarr.json`) |
+| Shape | `(n_rows,)` or `(n_rows, K)` where `n_rows == object_index.num_objects` |
 | Zarr chunk shape | `(65536,)` or `(65536, K)` |
-| Fill value | `0` or `NaN` |
+| Fill value | in-band "absent" sentinel: `NaN` (floats), dtype min (signed ints), dtype max (unsigned ints) |
+| Attributes | `zv_array="object_attribute"`, `name`, `dtype`, `shape`, `fill_sentinel_meaning="absent"` |
 
-### `groupings/`
+Row `r` belongs to manifest row `r` of `object_index/manifests` — see
+[Object ids and rows](../object_model/object_manifest.md#object-ids-and-rows).
 
-Maps group IDs to lists of object IDs.
+### `groups` and `group_attributes/<name>`
+
+`groups` maps group ids to lists of object ids. It is a **1-D vlen-bytes
+array**, one cell per group, not a padded 2-D array:
 
 | Property | Value |
 |----------|-------|
-| Dtype | `int64` |
-| Logical shape | `(n_groups, max_group_size)` |
-| Zarr chunk shape | `(1, max_group_size)` |
-| Fill value | `-1` (padding for groups smaller than `max_group_size`) |
+| Zarr `data_type` | `variable_length_bytes` |
+| Shape | `(num_groups,)`, one Zarr chunk |
+| Cell contents | the group's member object ids as raw little-endian `int64` bytes (empty for an empty group) |
+| Attributes | `zv_array="groups"`, `num_groups`, optional `group_ranges` |
+
+`group_ranges` is `{"<gid>": [start, stop]}` for groups written from a Python
+`range`: such a group's cell is empty and its members are `range(start, stop)`.
+
+`group_attributes/<name>` is a plain dense array of shape `(num_groups,)` or
+`(num_groups, K)` with attributes `zv_array="groupings_attribute"`, `name`,
+`dtype`, `shape`.
 
 ### `cross_chunk_links/` — removed in 0.9.0
 

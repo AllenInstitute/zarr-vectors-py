@@ -15,9 +15,10 @@
 
 **Inner chunk**
 : The logical unit of data within a shard, equivalent to a normal Zarr v3
-  chunk. In the Zarr Vectors context, the inner chunk corresponds to one Zarr Vectors spatial
-  chunk. The inner chunk shape must equal the Zarr Vectors `chunk_shape` expressed
-  in array coordinates.
+  chunk. In the Zarr Vectors context, the inner chunk is one array **cell**,
+  i.e. one Zarr Vectors spatial chunk: the inner chunk shape is always
+  `(1, 1, …, 1)` because the array's shape already *is* the chunk grid (see
+  [Chunk arrays](../layout/chunk_arrays.md)).
 
 **Outer chunk** (shard shape)
 : The number of inner chunks grouped into one shard, expressed as a tuple.
@@ -66,9 +67,11 @@ object model, and multiscale metadata are identical with or without sharding.
 
 ### Configuration
 
-Sharding is configured via the `codec_config` argument to write functions,
-or by passing a pre-configured Zarr array spec. A minimal sharding
-configuration for a 3-D Zarr Vectors store:
+Sharding is requested with the **`shard_shape=`** keyword of every `write_*`
+function (`write_points`, `write_polylines`, `write_lines`, `write_graph`,
+`write_mesh`, …), or applied afterwards to an existing store with
+`shard_store`. `shard_shape` is an `int` (broadcast to every axis) or a
+per-axis tuple, in units of cells:
 
 ```python
 from zarr_vectors.types.points import write_points
@@ -76,35 +79,42 @@ from zarr_vectors.types.points import write_points
 write_points(
     "scan.zarrvectors",
     positions,
-    chunk_shape=(100.0, 100.0, 100.0),   # Zarr Vectors logical chunk — the inner chunk
+    chunk_shape=(100.0, 100.0, 100.0),   # the logical chunk — one inner chunk
     bin_shape=(25.0, 25.0, 25.0),
     shard_shape=(4, 4, 4),               # 4×4×4 = 64 inner chunks per shard
 )
 ```
 
-This produces one shard file per `(4, 4, 4)` block of the Zarr Vectors chunk grid.
-Each shard contains up to 64 Zarr Vectors chunks. The total number of shard files is
-`ceil(grid_shape[d] / 4) for d in [0,1,2]` — a factor of 64 fewer files
-than without sharding.
+This produces one shard object per `(4, 4, 4)` block of the chunk grid, each
+holding up to 64 Zarr Vectors chunks. The number of shard objects per array is
+about `ceil(grid_shape[d] / 4)` per axis — a factor of up to 64 fewer objects
+than without sharding. `shard_shape` must have the same rank as the grid
+(which has one extra leading axis in an attribute-chunked store). The default,
+`shard_shape=None`, is unsharded: one storage object per non-empty cell.
+
+A separate `compressor=` keyword (`"zstd"`, `"blosc"` or a codec list) controls
+compression of the cells; it is independent of sharding and defaults to none.
 
 ### Codec pipeline with sharding
 
-When `shard_shape` is specified, the `zarr.json` for each array uses the
-`sharding_indexed` codec as the outermost byte-to-byte codec:
+When a shard shape is given, each per-chunk array's `zarr.json` has the
+`sharding_indexed` codec as its only codec; the `vlen-bytes` serializer (and a
+compressor, if requested) move *inside* it. For a 3-D array with
+`shard_shape=(4, 4, 4)` (as zarr-python 3 writes it):
 
 ```json
 {
+  "shape": [12, 12, 8],
+  "data_type": "variable_length_bytes",
+  "chunk_grid": {"name": "regular", "configuration": {"chunk_shape": [4, 4, 4]}},
   "codecs": [
     {
       "name": "sharding_indexed",
       "configuration": {
-        "chunk_shape": [1, 1, 1, 65536, 3],
-        "codecs": [
-          {"name": "bytes",  "configuration": {"endian": "little"}},
-          {"name": "blosc",  "configuration": {"cname": "zstd", "clevel": 5}}
-        ],
+        "chunk_shape": [1, 1, 1],
+        "codecs": [ {"name": "vlen-bytes", "configuration": {}} ],
         "index_codecs": [
-          {"name": "bytes",  "configuration": {"endian": "little"}},
+          {"name": "bytes", "configuration": {"endian": "little"}},
           {"name": "crc32c"}
         ],
         "index_location": "end"
@@ -114,9 +124,8 @@ When `shard_shape` is specified, the `zarr.json` for each array uses the
 }
 ```
 
-The `chunk_shape` inside the sharding configuration is the *inner* chunk
-shape (one Zarr Vectors spatial chunk). The shard shape is inferred from the outer
-array chunk grid.
+The outer `chunk_grid` is the **shard** shape; the `chunk_shape` inside the
+sharding configuration is the **inner** shape — always one cell.
 
 ### Relationship between shard shape and Zarr Vectors chunk shape
 
@@ -150,13 +159,13 @@ Without sharding, it is **1 HTTP request** per chunk but many more objects.
 
 ### Write behaviour with sharding
 
-Writing to a sharded store serialises writes at the shard level: multiple
-inner chunks that share a shard must be written atomically. `zarr-vectors-py`
-buffers all inner chunks for a shard before writing the shard file. This
-increases peak memory usage compared to non-sharded writes.
-
-For parallel writes (HPC, multi-process), assign non-overlapping shard
-ranges to different workers to avoid shard-level write contention.
+The shard is the unit of storage, so updating one cell of a sharded array
+rewrites its shard object (a read-modify-write of up to `product(shard_shape)`
+cells). Two workers that write different cells of the **same** shard can
+therefore lose each other's updates. For parallel writes (HPC, multi-process),
+assign non-overlapping shard ranges to different workers — or write unsharded
+and run `shard_store` once at the end (see
+[Ordering](#ordering-shard-the-links-family-last)).
 
 ### Choosing shard shape
 
@@ -167,9 +176,10 @@ A good shard shape balances:
 - **Read efficiency:** if most queries read entire shards, a large shard
   shape saves requests. If most queries read only 1–2 inner chunks per
   shard, a small shard shape minimises wasted range-request bytes.
-- **Write parallelism:** shards are the unit of write locking. A shard
-  shape of `(1, 1, 1)` disables sharding (each shard is one inner chunk);
-  this is useful if you need exactly one file per Zarr Vectors chunk.
+- **Write parallelism:** shards are the unit of write contention. If you need
+  exactly one object per Zarr Vectors chunk, leave sharding off
+  (`shard_shape=None`) rather than using `(1, 1, 1)`, which is a degenerate
+  sharded layout with an index per cell.
 
 A practical default for Neuroglancer-style serving:
 
@@ -190,10 +200,15 @@ fetch the entire spatial index for a region in a handful of requests.
 
 ### Compatibility
 
-Sharding requires Zarr v3 ≥ 2.18 (where `sharding_indexed` is built in).
-Readers that use an older Zarr version will fail to open sharded arrays.
-Document the use of sharding in the store's root `.zattrs` `"notes"` field
-to ensure consumers are aware of the requirement.
+`sharding_indexed` is a core Zarr v3 codec, so any Zarr v3 implementation that
+supports it (zarr-python 3.x, zarrs, tensorstore, …) can open a sharded store.
+`zarr-vectors-py` itself creates sharded arrays through zarr-python's `shards=`
+argument, which needs zarr-python 3.2 or later. Consumers on older
+implementations will fail to open sharded arrays; record the requirement for
+them in your own metadata namespace (see
+[Root metadata](../layout/root_metadata.md#application-metadata)). The
+library's own reader does not need to be told: `is_sharded` and
+`get_shard_info` inspect the arrays.
 
 ### Implementation notes (zarr-vectors-py)
 
@@ -232,17 +247,30 @@ to ensure consumers are aware of the requirement.
 ### Conversion API
 
 ```python
-from zarr_vectors.sharding import shard_store, unshard_store, reshard
+from zarr_vectors.sharding import (
+    shard_store, unshard_store, reshard, is_sharded, get_shard_info,
+)
 
-shard_store("scan.zv", shard_shape=8)          # 8x8x8 = 512 chunks/shard
+shard_store("scan.zv", shard_shape=8)          # default 8; 8x8x8 = 512 chunks/shard
 shard_store("scan.zv", shard_shape=(4, 4, 16)) # anisotropic
+shard_store("scan.zv", arrays=["vertices", "vertex_fragments"])   # only some arrays
 unshard_store("scan.zv")                       # back to per-chunk objects
-reshard("scan.zv", 4)                          # change shard shape in place
-reshard("scan.zv", None)                       # equivalent to unshard_store
+reshard("scan.zv", 4)                          # re-layout; shard_shape=None unshards
+is_sharded("scan.zv")                          # True if any array uses sharding_indexed
+get_shard_info("scan.zv")                      # {"sharded", "arrays": [...], "shard_count"}
 ```
 
-Both conversion functions are idempotent: shards already in the
-requested layout are skipped, and unsharding a flat store is a no-op.
+`shard_store` returns `{"arrays_sharded", "chunks_packed", "shard_shape"}`,
+`unshard_store` returns `{"arrays_unsharded", "chunks_extracted"}`. Each
+walks every level and every array for which `_is_per_chunk_array` holds
+(`vertices`, `vertex_fragments`, `link_fragments`, `links/<delta>/<offsets>`,
+`vertex_attributes/*`, `fragment_attributes/*`,
+`link_attributes/*/<delta>/<offsets>`); `object_index`, `object_attributes`,
+`groups` and `group_attributes` have no spatial grid and are never sharded.
+`arrays=` takes **array** paths: naming a family group such as `links/0` is
+silently skipped — name its `<offsets>` children. Arrays already in the
+requested layout are skipped, and unsharding a flat store is a no-op. Both
+read an array's payloads into memory before rewriting it, one array at a time.
 
 ### Ordering: shard the links family last
 

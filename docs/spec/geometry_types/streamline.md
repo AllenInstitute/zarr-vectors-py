@@ -11,21 +11,13 @@
 **`GEOM_STREAMLINE`**
 : The geometry type constant `"streamline"`.
 
-**Step size**
-: The integration step length used during streamline propagation, stored
-  in root `.zattrs` under `"step_size"`. Common unit: mm (for MRI) or µm
-  (for synchrotron). If the step size is uniform across all streamlines it
-  is stored as a scalar; if variable it is stored as a per-object attribute.
-
-**Seeding strategy**
-: The method used to generate the streamline seeds (starting points).
-  Informational metadata stored in root `.zattrs` under `"seeding_strategy"`.
-  Common values: `"wm_mask"`, `"endpoint_roi"`, `"random_wm"`, `"uniform"`.
-
-**Propagation algorithm**
-: The tractography integration algorithm used to generate the streamlines.
-  Informational metadata stored under `"propagation_algorithm"`.
-  Common values: `"deterministic"`, `"probabilistic"`, `"eudx"`, `"ptt"`.
+**Step size**, **seeding strategy**, **propagation algorithm**
+: Tractography provenance (integration step length, how seeds were
+  generated, which algorithm was used). **The format does not define
+  keys for these**: no reader or validator in `zarr-vectors-py`
+  interprets them. Record them yourself in the store's namespaced user
+  metadata (see *Tractography provenance* below) or as a per-object
+  attribute.
 
 ---
 
@@ -33,17 +25,16 @@
 
 `streamline` is a specialisation of `polyline` for MRI tractography and
 orientation-field tractography data. It inherits the full polyline data
-model (vertex sequences, object index, cross-chunk links, groupings) and
-adds a set of metadata fields that record how the streamlines were generated.
-
-These metadata fields are informational — `zarr-vectors-py` does not use
-them for any computation — but they are important for scientific
-reproducibility and for tools that need to know the physical scale of
-the data (step size is required to correctly interpret arc lengths).
+model (vertex sequences, object index, cross-chunk links, groups) and
+differs from it only in the `geometry_types` value, `"streamline"`.
+There are no streamline-specific arrays or root-metadata keys.
+Tractography provenance (step size, seeding, algorithm) is important for
+reproducibility, but it is stored as user metadata or per-object
+attributes rather than in a format-defined block.
 
 The `streamline` type also aligns closely with the TRX format's metadata
 model. See [TRX format comparison](../comparisons/trx_format.md) for a
-detailed mapping between TRX fields and Zarr Vectors `streamline` metadata.
+detailed mapping between TRX fields and Zarr Vectors.
 
 ---
 
@@ -60,9 +51,9 @@ the distinction is in the metadata and semantic interpretation.
 | `vertex_fragments/` | Yes | Fragment index over `vertices/` rows |
 | `object_index/` | Yes | Per-object manifest blobs naming fragments |
 | `links/0/<offsets>/` | Only when a streamline spans chunks | Bridges joining consecutive segments; offsets always non-zero |
-| `attributes/<name>/` | No | Per-vertex attributes (e.g. FA, MD per point) |
+| `vertex_attributes/<name>/` | No | Per-vertex attributes (e.g. FA, MD per point) |
 | `object_attributes/<name>/` | No | Per-streamline attributes (e.g. mean FA, length) |
-| `groupings/` | No | Bundle / tract group assignments |
+| `groups/` | No | Bundle / tract group assignments |
 
 `streamline` shares `polyline`'s connectivity model exactly:
 `links_convention` is `implicit_sequential`, so vertex order within a
@@ -72,39 +63,16 @@ array — that family was merged into `links/`. See
 [Polyline](polyline.md) for the bridge encoding and
 [Links](../object_model/links.md) for the layout.
 
-### Streamline-specific root `.zattrs` keys
+### Root metadata
 
-In addition to the shared Zarr Vectors root metadata, streamline stores may include:
-
-```json
-{
-  "geometry_type":       "streamline",
-  "step_size":           0.5,
-  "step_size_unit":      "mm",
-  "seeding_strategy":    "wm_mask",
-  "propagation_algorithm": "probabilistic",
-  "reference_image":     "T1w_1mm_MNI152.nii.gz",
-  "tractography_software": "DIPY 1.8.0",
-  "min_length":          20.0,
-  "max_length":          250.0,
-  "length_unit":         "mm"
-}
-```
-
-| Key | Type | Description |
-|-----|------|-------------|
-| `step_size` | `float` | Integration step length. May be a per-object attribute instead. |
-| `step_size_unit` | `string` | Unit of `step_size`. |
-| `seeding_strategy` | `string` | How seeds were generated. Informational. |
-| `propagation_algorithm` | `string` | Tractography algorithm. Informational. |
-| `reference_image` | `string` | Filename or identifier of the reference image space. |
-| `tractography_software` | `string` | Name and version of the software. |
-| `min_length` / `max_length` | `float` | Length filters applied during tracking. Informational. |
-
-All keys are optional. Storing them is strongly recommended for
-reproducibility.
+Identical to `polyline` apart from the geometry type
+(`"geometry_types": ["streamline"]`). There are no `step_size`,
+`seeding_strategy`, `reference_image` or similar root keys.
 
 ### Write API
+
+`write_polylines` is the writer for both types, and `"streamline"` is its
+**default** `geometry_type`:
 
 ```python
 import numpy as np
@@ -121,18 +89,37 @@ write_polylines(
     streamlines,
     chunk_shape=(50.0, 50.0, 50.0),
     bin_shape=(10.0, 10.0, 10.0),
-    geometry_type="streamline",             # ← declares streamline type
-    streamline_metadata={
-        "step_size":              0.5,
-        "step_size_unit":         "mm",
-        "seeding_strategy":       "wm_mask",
-        "propagation_algorithm":  "probabilistic",
-    },
+    geometry_type="streamline",             # the default; explicit for clarity
     object_attributes={
         "mean_fa": np.random.default_rng(3).uniform(0.2, 0.8, 5000).astype(np.float32),
     },
 )
 ```
+
+Through the dataset API: `ds.add_polylines(streamlines, streamlines=True)`.
+Reading uses `read_polylines` (see [Polyline](polyline.md#read-api)); there
+is no separate `read_streamlines`.
+
+### Tractography provenance
+
+Use the namespaced user-metadata facility on a dataset opened for
+writing; it keeps your keys apart from the format's own:
+
+```python
+import zarr_vectors as zv
+
+ds = zv.open("tracts.zarrvectors", mode="r+")
+ds.metadata["my_tractography"].update(
+    step_size=0.5,
+    step_size_unit="mm",
+    seeding_strategy="wm_mask",
+    propagation_algorithm="probabilistic",
+)
+print(ds.metadata["my_tractography"]["step_size"])   # 0.5
+```
+
+(These land under the root `user_metadata` attribute, in the namespace
+you name.) No validation is applied to them.
 
 ### Ingest and export
 
@@ -142,45 +129,35 @@ TRK, TCK, and TRX converters live in the companion package
 ### Variable step size
 
 When streamlines in the same store have different step sizes (e.g. from
-different subjects or sessions), store `step_size` as a per-object attribute
-rather than a root metadata scalar:
+different subjects or sessions), store it as a per-object attribute:
 
 ```python
 write_polylines(
     "multi_subject.zarrvectors",
     all_streamlines,
-    geometry_type="streamline",
+    chunk_shape=(50.0, 50.0, 50.0),
     object_attributes={
         "step_size": per_streamline_step_sizes,   # float32, shape (n,)
     },
 )
 ```
 
-When both a root `step_size` and a per-object `step_size` attribute exist,
-the per-object attribute takes precedence for each streamline.
-
 ### Coordinate system and physical units
 
 Streamlines in MRI space are typically in mm, with coordinates aligned to
-the reference image affine. Synchrotron tractography uses µm. Declare the
-units in root `.zattrs`:
+the reference image affine. Synchrotron tractography uses µm. Units are
+declared per axis in `multiscales[0].axes` (for example
+`{"name": "x", "type": "space", "unit": "millimeter"}`); with the dataset
+API, declare them with `zv.Schema(axes=(zv.Axis("x", "millimeter"), ...))`.
+There are no `coordinate_system` or `axis_units` root keys, and the
+low-level `write_polylines` has no axes argument.
 
-```json
-{
-  "coordinate_system": "RAS",
-  "axis_units": "mm"
-}
-```
-
-Zarr Vectors does not store or apply affine transforms internally. If alignment to
-a reference image is required, apply the affine before writing or store it
-in `custom_metadata`.
+Zarr Vectors does not store or apply affine transforms internally. If
+alignment to a reference image is required, apply the affine before
+writing, or record it in your user-metadata namespace.
 
 ### Validation
 
-Same rules as `polyline`, plus:
-
-L2:
-- If `step_size` is present in root `.zattrs`, it is a positive float.
-- If `step_size_unit` is present, it is one of `"mm"`, `"um"`,
-  `"micrometer"`, `"nanometer"`, `"voxel"`.
+Same rules as `polyline`. L4 requires
+`links_convention == "implicit_sequential"` for `streamline`. No
+validator checks any tractography provenance.

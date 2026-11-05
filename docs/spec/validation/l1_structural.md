@@ -3,8 +3,9 @@
 ## Terms
 
 **Structural check**
-: A validation check that examines only the presence of paths in the
-  store, without reading array data or interpreting metadata values.
+: A validation check that examines only the presence of paths and
+  root attribute blocks in the store, without reading array data or
+  interpreting metadata values.
 
 **Required path**
 : A store path that must exist for a valid Zarr Vectors store. Missing required
@@ -12,7 +13,7 @@
   independent** — see *Scope* below.
 
 **Level directory**
-: A directory under the store root whose name parses as an integer
+: A group under the store root whose name parses as an integer
   (`0/`, `1/`, …). Directories whose names do not parse as integers
   (e.g. `parametric/`) are not level directories and are skipped by the
   level walk.
@@ -22,7 +23,8 @@
 ## Introduction
 
 L1 validation answers the question: "does this store have the right shape?"
-It checks that the store root, its metadata file, and each resolution
+It checks that the store opens, the root carries a `zarr_vectors`
+metadata block, and each resolution
 level's required paths are present. It does not read any array data and
 does not interpret metadata values.
 
@@ -34,20 +36,18 @@ structurally incomplete and cannot be read by any Zarr Vectors reader.
 
 L1 is deliberately **narrow**, and narrower than a reader's needs:
 
-- It checks **path presence only**, via ordinary filesystem directory
-  tests. It does **not** open `zarr.json` and does **not** verify Zarr
-  node types. A path that exists as the wrong node type passes L1 and
-  fails later.
+- It checks **presence only**. It opens the store through the same
+  `open_store` machinery the readers use (so it works on local paths,
+  URLs, pre-opened `Group` handles and any supported backend, not just
+  directories), but it does not read array data, does not parse
+  `zarr_vectors` values, and does not verify Zarr node types. A path
+  that exists as the wrong node type passes L1 and fails later.
 - It is **not** parameterised by geometry type. L1 applies one required
   set to every store, so it cannot express "streamlines must have
   links". Type-specific connectivity requirements are checked at **L4**
   by [`validate_conformance`](../../../zarr_vectors/validate/conformance.py),
   which is the level that reads `geometry_types` and
   `links_convention`.
-
-Anything stated as a per-type requirement in this page's history was
-never enforced at L1; it has been removed rather than left as an
-aspiration.
 
 ---
 
@@ -65,29 +65,31 @@ do not carry stable machine-readable check IDs (see
 
 | Rule | Failure type |
 |------|--------------|
-| The store path exists | Error (returns immediately) |
-| The store path is a directory | Error (returns immediately) |
-| At least one of `.zattrs`, `zarr.json`, or `metadata.json` exists at the root | Error |
-| At least one level directory exists | Error (returns immediately) |
+| The store can be opened (`open_store(..., require_zv=False)`) | Error (returns immediately) |
+| The root attributes contain a `zarr_vectors` block | Error |
+| The root attributes contain an RFC 8 `ome` node | Warning |
+| At least one level group exists | Error (returns immediately) |
 
-Any of `.zattrs`, `zarr.json`, or `metadata.json` satisfies the root
-metadata check — L1 does not require a specific one, and does not parse
-whichever it finds. `metadata.json` is **not** separately recommended
-or warned about.
+The `ome` node is optional (format 0.9.2): a store without one is valid
+and fully readable, but cannot be resolved as a member of an OME
+collection. The warning's remedy is
+`zarr_vectors.building.stamp_ome_node(store)`, which adds the node
+without rewriting data.
 
-The first three failures are **fatal to the walk**: `validate_structure`
-returns as soon as one trips, so no per-level results follow.
+The first and last failures are **fatal to the walk**: `validate_structure`
+returns as soon as one trips, so no per-level results follow. A missing
+`zarr_vectors` block is recorded and the walk continues.
 
-#### Per level directory
+##### Per level directory
 
 Repeated for every integer-named directory under the root, in ascending
 numeric order:
 
 | Rule | Failure type |
 |------|--------------|
-| `N/vertices/` exists and is a directory | **Error** |
-| `N/vertex_fragments/` exists and is a directory | Warning |
-| `N/.zattrs` or `N/zarr.json` exists | Warning |
+| `N/vertices/` exists | **Error** |
+| `N/vertex_fragments/` exists | Warning |
+| The level group has non-empty attributes | Warning |
 
 `vertices/` is the **only** per-level path whose absence is an L1 error.
 
@@ -116,30 +118,25 @@ not parse offsets segments, and does not require `links/` to exist for
 any geometry type. Offsets-segment grammar is checked at
 [L3](l3_consistency.md); type-specific connectivity requirements at L4.
 
-> **Legacy tolerance.** `structure.py` applies the same scan to a
-> `cross_chunk_links/` directory if one is present. That family was
-> merged into `links/` and is never written by a current writer; the
-> branch only keeps L1 from being silent about a pre-merge store. It
-> imposes no requirement, and a store MUST NOT rely on it.
-
 ### Example L1 report
 
 ```
 Level 1 validation: FAIL
-  6 passed, 2 warnings, 1 errors
+  6 passed, 3 warnings, 1 errors
   ERROR: 1/vertices/ missing
+  WARN:  No RFC 8 'ome' node in the root attributes; ...
   WARN:  1/vertex_fragments/ missing
   WARN:  0/links/ exists but has no <delta> subdirs
 ```
 
-Passing messages take the form `Store root exists and is a directory`,
-`Root metadata file found`, `Found 2 resolution level(s)`,
+Passing messages take the form `Store root opened`,
+`Root metadata file found`, `RFC 8 'ome' node found`, `Found 2 resolution level(s)`,
 `0/vertices/ exists`, and `0/links/ exists (deltas: 0,+1)`.
 
 ### Implementation notes for contributors
 
-L1 works by walking the store directory with ordinary filesystem tests
-and checking for the presence of required paths:
+L1 opens the store as a `Group` and checks for the presence of required
+paths:
 
 ```python
 from zarr_vectors.validate.structure import validate_structure

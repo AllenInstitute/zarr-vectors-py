@@ -14,6 +14,7 @@ that is a gap to report rather than a reason to import from ``core``.
 
 .. automodule:: zarr_vectors.building
    :no-members:
+   :no-special-members:
 
 Format constants and array names
 --------------------------------
@@ -21,8 +22,8 @@ Format constants and array names
 The array-family names and layout sentinels the on-disk format is spelled
 in.  Import these rather than writing the strings, so code keeps working if
 a name moves.  All of them are importable from ``zarr_vectors.building``.
-The :doc:`constants` page documents the values of some but not all of them —
-``constants.rst`` renders only the constants that carry their own docstring.
+Most are defined in ``zarr_vectors.constants`` (:doc:`constants`);
+``OBJECT_INDEX_LAYOUT_V1`` comes from ``zarr_vectors.core.arrays``.
 
 .. hlist::
    :columns: 3
@@ -92,6 +93,8 @@ promised.
 .. autofunction:: zarr_vectors.building.read_level_metadata
 
 .. autofunction:: zarr_vectors.building.update_level_metadata
+
+.. autofunction:: zarr_vectors.building.stamp_ome_node
 
 Metadata records and grid arithmetic
 ------------------------------------
@@ -341,6 +344,8 @@ phase that deliberately did not stamp them.
 .. autofunction:: zarr_vectors.building.array_is_sharded
 
 .. autofunction:: zarr_vectors.building.is_sharded
+
+.. autofunction:: zarr_vectors.building.build_fragment_owner_index
 
 Sharding and rechunking
 -----------------------

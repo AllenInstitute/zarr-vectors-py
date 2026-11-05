@@ -24,6 +24,48 @@ Four other modules are supported, three with pages of their own —
 ``zarr_vectors.exceptions``, has none: its classes are named in the signatures
 that raise them, which is where you meet them.
 
+Which module do I use for what?
+-------------------------------
+
+.. list-table::
+   :header-rows: 1
+   :widths: 34 16 50
+
+   * - I want to...
+     - Tier
+     - Use
+   * - open, query, read or edit a store
+     - supported
+     - ``zarr_vectors.api`` (or ``import zarr_vectors as zv``): :doc:`api`
+   * - write a store, build a pyramid, work with chunks, fragments, shards, links
+     - supported
+     - ``zarr_vectors.building``: :doc:`building`
+   * - check the package version, API version or a module's tier
+     - supported
+     - ``zarr_vectors.stability``, ``require_api``, ``FEATURES``: :doc:`zarr_vectors`
+   * - name geometry kinds, array families or conventions without raw strings
+     - supported
+     - ``zarr_vectors.constants``: :doc:`constants`
+   * - annotate code with ``ChunkShape``, ``ObjectManifest`` and friends
+     - supported
+     - ``zarr_vectors.typing``: :doc:`typing`
+   * - keep a source format's header (``.trk``, ``.swc``, ...) in a store
+     - supported
+     - ``zarr_vectors.headers`` (``Dataset.headers``): :doc:`headers`
+   * - catch a library error
+     - supported
+     - ``zarr_vectors.exceptions`` (no page; named in signatures)
+   * - check a store against the spec
+     - undecided
+     - ``zarr_vectors.validate``: :doc:`validate`
+   * - call the per-geometry ``read_*`` functions directly
+     - undecided
+     - ``zarr_vectors.types``: :doc:`types` (the ``write_*`` functions are
+       supported via ``zarr_vectors.building``)
+   * - convert LAS, TRK, SWC, OBJ and other formats
+     - n/a
+     - the companion package ``zarr-vectors-tools``
+
 What is *not* here
 ------------------
 

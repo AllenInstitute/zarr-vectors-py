@@ -8,7 +8,11 @@
   of such sequences, each identified by an integer object ID.
 
 **`GEOM_POLYLINE`**
-: The geometry type constant `"polyline"`.
+: The geometry type constant `"polyline"`, recorded in the root
+  `zarr_vectors` block as `"geometry_types": ["polyline"]`. Note that
+  `write_polylines` defaults to `geometry_type="streamline"`; pass
+  `geometry_type="polyline"` (or use `Dataset.add_polylines`, which does
+  so unless `streamlines=True`) to get a `polyline` store.
 
 **Object ID**
 : A non-negative integer uniquely identifying a polyline within the store.
@@ -53,13 +57,13 @@ seeding strategy, propagation algorithm).
 
 | Array path | Required | Description |
 |-----------|----------|-------------|
-| `vertices/` | Yes | Vertex positions |
+| `vertices/` | Yes | Vertex positions (`float32` by default) |
 | `vertex_fragments/` | Yes | Fragment index over `vertices/` rows |
 | `object_index/` | Yes | Per-object manifest blobs naming fragments |
 | `links/0/<offsets>/` | Only when a polyline spans chunks | Bridges joining consecutive segments; offsets always non-zero |
-| `attributes/<name>/` | No | Per-vertex attributes |
+| `vertex_attributes/<name>/` | No | Per-vertex attributes |
 | `object_attributes/<name>/` | No | Per-polyline attributes |
-| `groupings/` | No | Group ID → [object IDs] |
+| `groups/` | No | Group ID → [object IDs] |
 
 There is no `cross_chunk_links/` array — that family was merged into
 `links/`. A store whose polylines each sit within one chunk has **no
@@ -118,40 +122,60 @@ polylines = [
     for _ in range(1000)
 ]
 
-write_polylines(
+summary = write_polylines(
     "paths.zarrvectors",
     polylines,
     chunk_shape=(200.0, 200.0, 200.0),
     bin_shape=(50.0, 50.0, 50.0),
-    # Optional group assignment
+    geometry_type="polyline",        # default is "streamline"
+    # Optional group assignment: {int group id: [polyline indices]}
     groups={
-        "group_A": list(range(500)),
-        "group_B": list(range(500, 1000)),
+        0: list(range(500)),
+        1: list(range(500, 1000)),
     },
-    # Optional per-polyline attributes
+    # Optional per-polyline attributes, shape (O,) or (O, C)
     object_attributes={
         "length": np.array([np.sum(np.linalg.norm(np.diff(p, axis=0), axis=1))
                             for p in polylines], dtype=np.float32),
     },
 )
+# summary: {"polyline_count", "vertex_count", "chunk_count",
+#           "cross_chunk_link_count", "group_count"}
 ```
+
+`chunk_shape` is required. Other keywords: `bin_shape`, `bounds`,
+`vertex_attributes` (`{name: [array_per_polyline, ...]}`, each `(N_k,)` or
+`(N_k, C)`), `fragment_attributes`, `group_attributes`, `dtype`,
+`backend`, `chunk_by_attribute`, `out_of_bounds`, `compressor`,
+`shard_shape`. `out_of_bounds="ignore"` is rejected (dropping vertices
+would break path connectivity); use `"raise"` (default) or `"expand"`.
+An empty list raises `ArrayError`.
+
+Through the dataset API the equivalent call is
+`ds.add_polylines(polylines, attributes=..., object_attributes=..., groups=...)`.
 
 ### Read API
 
 ```python
+import numpy as np
 from zarr_vectors.types.polylines import read_polylines
 
 # All polylines
 result = read_polylines("paths.zarrvectors")
 print(result["polyline_count"])        # 1000
-print(len(result["polylines"]))        # list of (N_i, D) arrays
+print(result["vertex_count"])          # total vertices
+print(result["object_ids"][:3])        # source object id per returned polyline
+
+# Each entry of result["polylines"] is a LIST of fragment arrays (one per
+# stored run); concatenate to get the full path.
+path0 = np.concatenate(result["polylines"][0], axis=0)   # (N_0, D)
 
 # By object ID
 result = read_polylines("paths.zarrvectors", object_ids=[0, 5, 42])
 print(result["polyline_count"])        # 3
 
-# By group
-result = read_polylines("paths.zarrvectors", group_ids=["group_A"])
+# By group (integer group ids)
+result = read_polylines("paths.zarrvectors", group_ids=[0])
 print(result["polyline_count"])        # 500
 
 # Spatial bbox
@@ -159,34 +183,34 @@ result = read_polylines(
     "paths.zarrvectors",
     bbox=(np.array([0., 0., 0.]), np.array([100., 100., 100.])),
 )
-# Returns all polylines that have at least one vertex in the bbox.
-# Full polyline geometry is returned (not clipped to bbox).
 ```
+
+Return keys: `polylines`, `object_ids`, `vertex_attributes` (concatenated
+across the returned fragments, in the same order; a column that cannot be
+aligned is omitted), `ndim`, `polyline_count`, `vertex_count`. Other
+keywords: `level`, `chunks`, `attribute_filter`, `backend`.
 
 ### Spatial query semantics
 
-A bbox query on a polyline store returns the complete geometry of every
-polyline that has at least one vertex in the bbox. The full vertex sequence
-(including portions outside the bbox) is returned. This is necessary to
-preserve path continuity.
+A `bbox` query on a polyline store resolves the box to the chunks it
+touches and returns the **complete** geometry of every polyline that has
+at least one fragment in one of those chunks. The match is per chunk, so
+a polyline whose fragment sits in a touched chunk but outside the box
+itself is still returned in full. There is no `clip=` option.
 
-To clip polylines to the bbox (return only the vertices inside), pass
-`clip=True`:
-
-```python
-result = read_polylines("paths.zarrvectors",
-                        bbox=(lo, hi), clip=True)
-```
-
-Clipped polylines that cross the bbox boundary are split at the boundary;
-the result may contain more polylines than the input if a single path
-enters and exits the bbox multiple times.
+To crop at the *segment* level, pass `chunks=[...]` (a whitelist of
+chunk-coordinate tuples): only fragments stored in the listed chunks are
+returned, and each surviving contiguous run becomes its own output
+polyline, so `polyline_count` can exceed the number of objects and
+`object_ids` can repeat. When both `bbox` and `chunks` are given the
+effective whitelist is their intersection.
 
 ### Groupings
 
-Groups are named collections of object IDs. The `groupings/` array stores
-the group → object mapping. Group IDs may be integers or strings (stored
-as a separate string lookup table in `groupings_attributes/name/`).
+Groups are collections of object IDs, `{group_id: [object_id, ...]}`
+with integer group ids, stored in the `groups/` array (per-group
+attributes in `group_attributes/<name>/`). `read_polylines(group_ids=[...])`
+expands a group to its member objects.
 
 ### Validation
 

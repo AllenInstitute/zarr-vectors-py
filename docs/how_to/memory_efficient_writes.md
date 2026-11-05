@@ -1,5 +1,11 @@
 # Memory-efficient writes
 
+**You will learn:** how to write a dataset that does not fit in memory, one
+partition at a time, and how to size the chunks first. **Prerequisite:** the
+[Quickstart](../getting_started/quickstart.md) and the vocabulary in
+[Core concepts](../getting_started/concepts.md). `load_slab` and the other
+data-loading stand-ins below are synthetic; replace them with your reader.
+
 A chunk is written whole. Every vertex that lands in one chunk — positions
 and per-vertex attributes together — must be in memory at the moment that
 chunk is encoded, because its fragment index describes rows of one packed
@@ -118,7 +124,16 @@ must pass the same two values as the coordinator did, or their grids disagree.
 # NOTE: internal import -- see the admonition below.
 from zarr_vectors.spatial.chunking import assign_bins, group_bins_by_chunk
 
-rng = np.random.default_rng(0)
+def load_slab(z_lo, z_hi, n=4_000):
+    """Stand-in for reading one slab of a big dataset from disk."""
+    rng = np.random.default_rng(int(z_lo))
+    positions = np.column_stack([
+        rng.uniform(0., 1000., n), rng.uniform(0., 1000., n),
+        rng.uniform(z_lo, z_hi, n),
+    ]).astype("float32")
+    return positions, rng.uniform(0., 1., n).astype("float32")
+
+
 written = 0
 
 for slab in range(4):                      # 4 z-slabs, one chunk deep each
@@ -260,6 +275,11 @@ store's topology, levels and object ids:
 import numpy as np
 import zarr_vectors as zv
 from zarr_vectors.building import RechunkSpec, rechunk
+
+# Synthetic data: 20 000 points in 200 objects of 100 points each.
+rng = np.random.default_rng(0)
+positions = rng.uniform(0., 1000., (20_000, 3)).astype("float32")
+object_ids = np.repeat(np.arange(200), 100)
 
 # Initial write: one chunk for the whole volume.
 temp = zv.create("scan_temp.zarrvectors", schema=zv.Schema(

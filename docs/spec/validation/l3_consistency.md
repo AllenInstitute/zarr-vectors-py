@@ -60,7 +60,16 @@ For every chunk key at the level:
 | The chunk's vertex blob decodes via `read_chunk_vertices` | Error |
 | Each decoded fragment is 2-D with `shape[1] == sid_ndim` | Error |
 | No fragment contains NaN / Inf | Warning |
-| The level's `vertex_count` attribute, **if present**, equals the total decoded vertex count | Error |
+| The level's `vertex_count` attribute, **if present as a flat key on the level group**, equals the total decoded vertex count | Error |
+
+| If the level metadata sets `fragments_tile`, every chunk's fragment index tiles its vertex buffer (no unreferenced rows). Reported once per level | Error |
+
+> **Known gap.** Current writers nest `vertex_count` under
+> `zarr_vectors_level`, so the flat-key lookup finds nothing and the
+> `vertex_count` row does not fire on stores written by this package.
+> The same applies to the `bin_shape` lookup that feeds the bin-layout
+> checks below, which then fall back to the root `base_bin_shape` at
+> level 0 and are skipped at coarser levels.
 
 A level with no chunk keys emits a warning (`no chunk data`) and is
 otherwise skipped.
@@ -89,7 +98,7 @@ effective bin shape.
 
 ### Object manifest checks
 
-Read via `read_all_object_manifests`. Failures to read the manifests at
+Read via `read_object_manifest_rows`. Failures to read the manifests at
 all are silently skipped (the store may legitimately have none).
 
 | Rule | Failure type |

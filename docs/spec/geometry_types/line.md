@@ -8,8 +8,8 @@
   no sequential ordering between segments; each segment is independent.
 
 **`GEOM_LINE`**
-: The geometry type constant `"line"`. Stored in root `.zattrs` under
-  `"geometry_type"`.
+: The geometry type constant `"line"`. Stored in the root `zarr_vectors`
+  attribute block as `"geometry_types": ["line"]`.
 
 **`links/<delta>/<offsets>/`**
 : The link family. For `line` it holds only the segments that were
@@ -45,11 +45,11 @@ chunks* below.
 
 | Array path | Required | Description |
 |-----------|----------|-------------|
-| `vertices/` | Yes | Endpoint positions, shape `(N, D)` float32 per chunk |
+| `vertices/` | Yes | Endpoint positions, shape `(N, D)` per chunk (`float32` by default) |
 | `vertex_fragments/` | Yes | Fragment index over `vertices/` rows |
 | `object_index/` | Yes | Per-line manifest of `(chunk, fragment_index)` |
 | `links/0/<offsets>/` | Only when a segment spans chunks | Non-zero-offset links joining a split segment's two halves |
-| `attributes/<name>/` | No | Per-vertex attributes |
+| `vertex_attributes/<name>/` | No | Per-endpoint attributes |
 | `object_attributes/<name>/` | No | Per-line attributes |
 
 There is no `cross_chunk_links/` array: that family was merged into
@@ -95,60 +95,54 @@ across a rewrite of the same input.
 
 ### Write API
 
+`write_lines` takes one `(N, 2, D)` array: N segments, two endpoints each.
+`chunk_shape` is required.
+
 ```python
 import numpy as np
 from zarr_vectors.types.lines import write_lines
 
-# n_segments × 2 × D array: each row is a segment, columns are endpoints
-segments = np.random.default_rng(0).uniform(0, 500, (10_000, 2, 3)).astype(np.float32)
+rng = np.random.default_rng(0)
+endpoints = rng.uniform(0, 500, (10_000, 2, 3)).astype(np.float32)  # (N, 2, D)
 
-# Reshape to flat vertices and edge pairs
-n = len(segments)
-verts = segments.reshape(n * 2, 3)            # (2n, D)
-edges = np.column_stack([                      # (n, 2)
-    np.arange(0, 2*n, 2),
-    np.arange(1, 2*n, 2),
-]).astype(np.int32)
-
-write_lines(
+summary = write_lines(
     "contacts.zarrvectors",
-    vertices=verts,
-    edges=edges,
+    endpoints,
     chunk_shape=(200.0, 200.0, 200.0),
     bin_shape=(50.0, 50.0, 50.0),
 )
+print(summary)   # {"line_count": 10000, "chunk_count": ..., "cross_chunk_count": ...}
 ```
 
-Alternatively, pass a list of `(A, B)` tuples:
-
-```python
-from zarr_vectors.types.lines import write_line_pairs
-
-pairs = [(rng.uniform(0, 500, 3), rng.uniform(0, 500, 3)) for _ in range(10_000)]
-write_line_pairs("contacts.zarrvectors", pairs,
-                 chunk_shape=(200., 200., 200.))
-```
+Optional keywords: `bounds`, `vertex_attributes` (`{name: (N, 2)}` or
+`(N, 2, C)` — one value per endpoint), `object_attributes`
+(`{name: (N,)}` or `(N, C)` — one value per line), `dtype="float32"`,
+`backend`, `chunk_by_attribute`, `out_of_bounds="raise"`, `compressor`,
+`shard_shape`. The old `attributes=` / `line_attributes=` names still
+work but emit a `DeprecationWarning`. There is no `edges=` argument:
+topology is implicit in the `(N, 2, D)` shape.
 
 ### Read API
 
 ```python
+import numpy as np
 from zarr_vectors.types.lines import read_lines
 
 result = read_lines("contacts.zarrvectors")
-print(result["segment_count"])       # int
-print(result["vertices"].shape)      # (2N, D)
-print(result["edges"].shape)         # (N, 2)
+print(result["line_count"])          # int
+print(result["endpoints"].shape)     # (N, 2, D)
+print(result["vertex_attributes"])   # {name: array}, every attribute present
 
-# Return as (N, 2, D) array of segment endpoint pairs
-result = read_lines("contacts.zarrvectors", return_pairs=True)
-print(result["pairs"].shape)         # (N, 2, D)
-
-# Spatial query
+# Spatial query: a line is returned if EITHER endpoint is inside the box
 result = read_lines(
     "contacts.zarrvectors",
     bbox=(np.array([0., 0., 0.]), np.array([200., 200., 200.])),
 )
 ```
+
+Other keywords: `level=0`, `object_ids=` (line ids), `attribute_filter=`,
+`backend=`. Unlike `read_points`, `read_lines` returns all per-endpoint
+attributes without being asked.
 
 ### Relationship to `polyline`
 

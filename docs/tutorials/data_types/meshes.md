@@ -5,6 +5,12 @@ from electron microscopy segmentation, brain or organ surfaces from MRI
 reconstruction, organelle hulls from fluorescence segmentation, or any
 other closed or open triangulated surface.
 
+**You will learn:** how to write a triangle mesh (with attributes, optionally
+Draco-compressed), read it back whole or by region, and store many meshes in one
+store. **Prerequisite:** the [Quickstart](../../getting_started/quickstart.md)
+for the vocabulary (store, chunk, bin, level); the examples below are
+self-contained and generate their own geometry with `numpy`.
+
 Zarr Vectors meshes support optional Draco compression for significant size
 reductions, per-vertex attributes (normals, UV coordinates, scalars), and
 multi-mesh stores that pack thousands of mesh objects into a single
@@ -30,24 +36,51 @@ supported surfaces: `zarr_vectors` itself for reading data, and
 
 ### Write from vertices and faces
 
+A mesh is two arrays: `vertices` of shape `(V, 3)` and `faces` of shape `(F, 3)`
+holding 0-based indices into `vertices`. In practice they come from an OBJ/STL
+file or a segmentation pipeline; here a small helper builds a sphere so the
+page runs as written.
+
 ```python
 import numpy as np
 from zarr_vectors.building import write_mesh
 
-# Generate a simple icosphere (demonstration only)
-# In practice, load from OBJ, STL, PLY, or a segmentation pipeline
-vertices, faces = generate_icosphere(radius=200.0, subdivisions=4)
-# vertices: (N, 3) float32   — vertex positions in µm
-# faces:    (F, 3) int32     — triangle vertex index triplets (0-indexed, global)
+
+def make_sphere(center=(0.0, 0.0, 0.0), radius=200.0, n_lat=24, n_lon=48):
+    """A UV sphere: (V, 3) float32 vertices, (F, 3) int32 triangles."""
+    lat = np.linspace(0.0, np.pi, n_lat + 1)
+    lon = np.linspace(0.0, 2.0 * np.pi, n_lon, endpoint=False)
+    la, lo = np.meshgrid(lat, lon, indexing="ij")
+    unit = np.stack(
+        [np.sin(la) * np.cos(lo), np.sin(la) * np.sin(lo), np.cos(la)], axis=-1
+    ).reshape(-1, 3)
+    verts = (unit * radius + np.asarray(center)).astype(np.float32)
+    idx = np.arange((n_lat + 1) * n_lon).reshape(n_lat + 1, n_lon)
+    a, b = idx[:-1], idx[1:]
+    a2, b2 = np.roll(a, -1, axis=1), np.roll(b, -1, axis=1)
+    quads = np.stack([a, b, b2, a2], axis=-1).reshape(-1, 4)
+    tris = np.concatenate([quads[:, [0, 1, 2]], quads[:, [0, 2, 3]]])
+    return verts, tris.astype(np.int32)
+
+
+vertices, faces = make_sphere(radius=200.0)
+# vertices: (V, 3) float32 — positions in µm
+# faces:    (F, 3) int32   — triangle vertex index triplets (0-indexed, global)
 
 write_mesh(
     "cell.zarrvectors",
-    vertices=vertices.astype(np.float32),
-    faces=faces.astype(np.int32),
+    vertices=vertices,
+    faces=faces,
     chunk_shape=(100.0, 100.0, 100.0),
     bin_shape=(25.0, 25.0, 25.0),
 )
 ```
+
+(The poles of this sphere are degenerate triangles; that is fine for storage.
+`write_mesh` is a building-surface writer, so it takes `chunk_shape` and
+`bin_shape` directly. The data API has a schema-based equivalent,
+`Dataset.add_mesh(vertices, faces, ...)`, used in the same way as `add_points`
+in the [point-cloud tutorial](point_clouds.md).)
 
 Face **winding is preserved automatically** — there is no
 `winding_order` argument. A face is stored as an undirected link record
@@ -67,8 +100,9 @@ and scalar overlays (e.g. cortical thickness):
 rng = np.random.default_rng(0)
 n_verts = len(vertices)
 
-# Compute vertex normals (simplified; use trimesh or open3d in practice)
-normals   = compute_vertex_normals(vertices, faces)   # (N, 3) float32
+# Vertex normals. For a sphere centred on the origin they are the unit radius
+# vectors; for a real mesh use trimesh or open3d.
+normals   = (vertices / np.linalg.norm(vertices, axis=1, keepdims=True)).astype(np.float32)
 curvature = rng.uniform(-0.1, 0.1, n_verts).astype(np.float32)
 thickness = rng.uniform(1.5, 4.5, n_verts).astype(np.float32)
 
@@ -76,8 +110,8 @@ write_mesh(
     "brain_surface.zarrvectors",
     vertices=vertices,
     faces=faces,
-    chunk_shape=(10.0, 10.0, 10.0),     # smaller chunks for dense mesh
-    bin_shape=(5.0, 5.0, 5.0),
+    chunk_shape=(50.0, 50.0, 50.0),     # smaller chunks for a denser mesh
+    bin_shape=(25.0, 25.0, 25.0),
     vertex_attributes={
         "normal":    normals,           # vector attribute: (N, 3)
         "curvature": curvature,         # scalar attribute: (N,)
@@ -166,7 +200,7 @@ clearly when distributing stores.
 ```python
 from zarr_vectors.types.meshes import read_mesh
 
-result = read_mesh("brain.zarrvectors")
+result = read_mesh("brain_surface.zarrvectors")
 
 print(result["vertex_count"])     # int
 print(result["face_count"])       # int
@@ -253,8 +287,8 @@ bbox):
 
 ```python
 result = read_mesh(
-    "brain.zarrvectors",
-    bbox=(np.array([0., 0., 0.]), np.array([50., 50., 50.])),
+    "brain_surface.zarrvectors",
+    bbox=(np.array([0., 0., 0.]), np.array([250., 250., 250.])),
 )
 print(result["face_count"])      # faces with centroid in the bbox region
 ```
@@ -278,6 +312,13 @@ indices into the combined vertex space:
 import numpy as np
 from zarr_vectors.building import write_mesh
 
+# Six spheres standing in for six segmented cells (reuses make_sphere above)
+cell_meshes = [
+    make_sphere(center=(150.0 + 120.0 * i, 150.0, 150.0), radius=40.0 + 5.0 * i,
+                n_lat=12, n_lon=24)
+    for i in range(6)
+]
+
 vert_blocks, face_blocks, oid_blocks = [], [], []
 cell_volumes, cell_types = [], []
 offset = 0
@@ -287,8 +328,8 @@ for cell_id, (verts, faces) in enumerate(cell_meshes):
     face_blocks.append(faces + offset)      # local -> global vertex indices
     oid_blocks.append(np.full(len(verts), cell_id, dtype=np.int64))
     offset += len(verts)
-    cell_volumes.append(compute_volume(verts, faces))
-    cell_types.append(cell_type_of(cell_id))
+    cell_volumes.append(4.0 / 3.0 * np.pi * (40.0 + 5.0 * cell_id) ** 3)
+    cell_types.append(cell_id % 3)
 
 write_mesh(
     "cells.zarrvectors",
@@ -362,8 +403,8 @@ array with no per-object boundary.
 ```python
 result = read_mesh(
     "cells.zarrvectors",
-    bbox=(np.array([500., 500., 200.]),
-          np.array([600., 600., 300.])),
+    bbox=(np.array([0., 0., 0.]),
+          np.array([300., 300., 300.])),
 )
 print(result["face_count"])
 ```
@@ -401,7 +442,7 @@ OBJ and PLY exporters live in the companion package
 ```python
 from zarr_vectors.validate import validate
 
-result = validate("brain.zarrvectors", level=4)
+result = validate("brain_surface.zarrvectors", level=4)
 print(result.summary())
 # Level 4 validation: PASS
 #   26 passed, 0 warnings, 0 errors

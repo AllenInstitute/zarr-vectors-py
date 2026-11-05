@@ -16,7 +16,7 @@
 **`dpp` (data per point)**
 : Per-vertex scalar or matrix arrays in TRX, stored under `dpp/` in the
   ZIP archive. Each array has one value per vertex across all streamlines,
-  in concatenated order. Equivalent to Zarr Vectors `attributes/`.
+  in concatenated order. Equivalent to Zarr Vectors `vertex_attributes/`.
 
 **TRX header**
 : A JSON file `header.json` at the root of the ZIP archive, storing the
@@ -48,7 +48,7 @@ on large datasets, multi-resolution visualisation, and scalable cloud pipelines.
 Most tractography workflows begin with data in TRK, TCK, or TRX format.
 The Zarr Vectors ingest pipeline (`ingest_trx`, `ingest_trk`, `ingest_tck`) converts
 these formats to Zarr Vectors, preserving all `dps` and `dpp` attributes as
-`object_attributes/` and `attributes/` respectively.
+`object_attributes/` and `vertex_attributes/` respectively.
 
 ---
 
@@ -61,14 +61,14 @@ these formats to Zarr Vectors, preserving all `dps` and `dpp` attributes as
 | Container | ZIP archive (`.trx`) | Directory tree (`.zarrvectors`) |
 | Vertex storage | Flat concatenated array + offset table | Spatially chunked, fragment-indexed |
 | Spatial index | None | Chunk grid + fragment index |
-| Per-vertex attributes (`dpp`) | Separate `.npy` files (same layout as vertices) | `attributes/<name>/` arrays |
+| Per-vertex attributes (`dpp`) | Separate `.npy` files (same layout as vertices) | `vertex_attributes/<name>/` arrays |
 | Per-streamline attributes (`dps`) | Separate `.npy` files (one row per streamline) | `object_attributes/<name>/` arrays |
 | Affine transform | Stored in `header.json` | Not stored; apply before writing |
 | Multi-resolution | No | Yes |
 | Cloud access | Not designed for (ZIP download required) | Native (chunk-level range requests) |
 | Write API | Yes (`trx-python`) | Yes (`zarr-vectors-py`) |
 | Memory mapping | Yes (fast local sequential access) | No (but chunk caching is equivalent for sequential reads) |
-| Groupings | `groups/<name>/offsets.npy` | `groupings/` array |
+| Groupings | `groups/<name>/offsets.npy` | `groups/` array (integer group ids; per-group attributes in `group_attributes/`) |
 
 ### Data model mapping
 
@@ -84,18 +84,18 @@ table is `object_index/`, whose per-streamline manifest enumerates every
 Zarr Vectors 0.6.0 this took a primary fragment plus a cross-chunk-link walk;
 the manifest now enumerates the chunks directly.)
 
-#### `dpp` → `attributes/`
+#### `dpp` → `vertex_attributes/`
 
 Each `dpp/<name>.<dtype>.npy` file in TRX contains one value per vertex in
 the same concatenated order as `streamlines/data`. In Zarr Vectors, the equivalent
-is `attributes/<name>/`, which stores one value per vertex in fragment order
+is `vertex_attributes/<name>/`, which stores one value per vertex in fragment order
 (per-chunk, spatially sorted).
 
 | TRX | Zarr Vectors |
 |-----|-----|
-| `dpp/fa.float32.npy` | `attributes/fa/` (float32) |
-| `dpp/md.float32.npy` | `attributes/md/` (float32) |
-| `dpp/t1.float32.npy` | `attributes/t1/` (float32) |
+| `dpp/fa.float32.npy` | `vertex_attributes/fa/` (float32) |
+| `dpp/md.float32.npy` | `vertex_attributes/md/` (float32) |
+| `dpp/t1.float32.npy` | `vertex_attributes/t1/` (float32) |
 
 #### `dps` → `object_attributes/`
 
@@ -116,16 +116,18 @@ both formats. Zarr Vectors stores them as `object_attributes/<name>/` with shape
 #### Groups
 
 TRX groups are sub-ZIP directories: `groups/<name>/offsets.int64.npy`
-lists the indices of streamlines in the group. Zarr Vectors stores groups in
-`groupings/` with group names in `groupings_attributes/name/`.
+lists the indices of streamlines in the group. Zarr Vectors stores groups
+in `groups/` as `{integer group id: [object ids]}`; group *names* are not a
+format-level concept, so a converter must keep its own id-to-name mapping
+(for example as a `group_attributes/` array or in user metadata).
 
 ### TRX metadata not preserved in Zarr Vectors
 
 TRX stores an affine transform from voxel space to RAS mm in `header.json`.
 Zarr Vectors does not store or apply affine transforms; the caller must apply the
 affine to vertex positions before writing to Zarr Vectors. The affine can be stored
-in root `.zattrs` under `custom_metadata.affine` for provenance, but it
-will not be automatically applied by `zarr-vectors-py`.
+for provenance in the store's user metadata (`Dataset.metadata[<namespace>]`),
+but it will not be automatically applied by `zarr-vectors-py`.
 
 TRX ingest (via the companion package **`zarr-vectors-tools`**) exposes
 an `apply_affine` keyword that controls whether the TRX header affine
