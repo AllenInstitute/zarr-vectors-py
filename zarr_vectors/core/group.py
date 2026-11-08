@@ -84,6 +84,30 @@ _MISS_CELL = "cell"
 _MISS_ROW = "row"
 
 
+def _shard_codec(ndim: int, compressors: list[Any]) -> Any:
+    """A sharding codec other than ``sharding_indexed``, or None for the default.
+
+    Prototype switch: ``ZARR_VECTORS_SHARD_CODEC=zarr_octree_sharding``
+    selects zarr-octree's codec (sparse index, Z-order runs of bounded
+    weight), configured by ``ZARR_VECTORS_SHARD_CODEC_CONFIG`` (JSON:
+    ``min_weight``, ``max_weight``, ``unit``).  The cells' codecs are the
+    ones ``shards=`` would put inside ``sharding_indexed``.
+    """
+    import json
+    import os
+
+    name = os.environ.get("ZARR_VECTORS_SHARD_CODEC")
+    if not name or name == "sharding_indexed":
+        return None
+    from zarr.codecs import VLenBytesCodec
+    from zarr.registry import get_codec_class
+
+    config = json.loads(os.environ.get("ZARR_VECTORS_SHARD_CODEC_CONFIG", "{}"))
+    return get_codec_class(name)(
+        chunk_shape=(1,) * ndim, codecs=[VLenBytesCodec(), *compressors], **config,
+    )
+
+
 class _OfflineSession:
     """The snapshot an offline read is served from, shared by a Group and
     every Group derived from it.
@@ -2095,9 +2119,16 @@ class Group:
             "compressors": list(compressors) if compressors else [],
         }
         if shard_shape is not None:
-            # Zarr 3.2 high-level ``shards=`` kwarg: wraps the inner
-            # ``chunks=`` codec in ``sharding_indexed`` automatically.
-            create_kwargs["shards"] = tuple(shard_shape)
+            shard_codec = _shard_codec(ndim, create_kwargs["compressors"])
+            if shard_codec is None:
+                # Zarr 3.2 high-level ``shards=`` kwarg: wraps the inner
+                # ``chunks=`` codec in ``sharding_indexed`` automatically.
+                create_kwargs["shards"] = tuple(shard_shape)
+            else:
+                # Same array, same inner cells and keys; another sharding codec.
+                create_kwargs.update(
+                    chunks=tuple(shard_shape), serializer=shard_codec, compressors=None,
+                )
 
         # Every attribute is passed to ``create_array`` rather than
         # assigned afterwards: each ``arr.attrs[...] = ...`` rewrites the
