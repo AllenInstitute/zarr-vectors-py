@@ -134,6 +134,7 @@ class _Range:
     key: str
     offset: int
     size: int      # -1: the whole object (unsharded)
+    run: int = -1  # the zarr-octree run holding the cell; -1: none
 
 
 def _index_nbytes(src: CellSource) -> int:
@@ -181,11 +182,12 @@ def _locate(
         if index is None:
             out.append(None)
             continue
-        offset, nbytes = index[j]
+        offset, nbytes = index[j, 0], index[j, 1]
         if offset == _EMPTY and nbytes == _EMPTY:
             out.append(None)
         else:
-            out.append(_Range(key, int(offset), int(nbytes)))
+            run = int(index[j, 2]) if index.shape[1] > 2 else -1
+            out.append(_Range(key, int(offset), int(nbytes), run))
     return out, errors
 
 
@@ -265,19 +267,20 @@ def _read_ranges(items: list[tuple[str, int, int]]) -> list[bytes | None | Excep
 
 
 def _read_octree_index(src: CellSource, path: str) -> Any:
-    """A zarr-octree shard's sparse index as dense rows: one tail read, a second if it is larger."""
-    from zarr_octree.codec import INDEX_READ_GUESS, dense_rows, index_tail_nbytes
+    """A zarr-octree shard's sparse index as dense rows plus each cell's run:
+    one tail read, a second if it is larger."""
+    from zarr_octree.codec import dense_rows, index_read_nbytes, index_tail_nbytes
 
     with open(path, "rb") as fh:
         size = fh.seek(0, os.SEEK_END)
-        n = min(size, INDEX_READ_GUESS)
+        n = min(size, index_read_nbytes(src.shard_shape))
         fh.seek(size - n)
         tail = fh.read(n)
         need = index_tail_nbytes(tail)
         if need > len(tail):
             fh.seek(size - need)
             tail = fh.read(need)
-    return dense_rows(tail, src.shard_shape)
+    return dense_rows(tail, src.shard_shape, runs=True)
 
 
 def _read_index(item: tuple[CellSource, str]) -> Any:
@@ -308,12 +311,21 @@ def _read_index(item: tuple[CellSource, str]) -> Any:
 def locate_local(
     requests: list[tuple[CellSource, np.ndarray]],
 ) -> tuple[list[tuple[int, int, str, int, int]], list[dict[int, str]]]:
+    """Where every requested cell of every local array is stored; see :func:`_locate_local`."""
+    flat, errors_of = _locate_local(requests)
+    return [f[:5] for f in flat], errors_of
+
+
+def _locate_local(
+    requests: list[tuple[CellSource, np.ndarray]],
+) -> tuple[list[tuple[int, int, str, int, int, int]], list[dict[int, str]]]:
     """Where every requested cell of every local array is stored.
 
     ``requests`` pairs each array with ``(C, K)`` cell indices into it.
     Every shard index the cells need is read once, in one pooled pass.
-    Returns the stored ranges as ``(request, cell, path, offset, size)``
-    rows (``size < 0``: the whole file), sorted by file so a batch opens
+    Returns the stored ranges as ``(request, cell, path, offset, size, run)``
+    rows (``size < 0``: the whole file; ``run`` -1 but in a zarr-octree
+    shard), sorted by file so a batch opens
     each shard once, and per-request errors keyed by cell. A cell with
     nothing stored has no row.
     """
@@ -333,14 +345,14 @@ def locate_local(
     by_request: list[dict[str, Any]] = [{} for _ in requests]
     for (r, key), index in indexes.items():
         by_request[r][key] = index
-    flat: list[tuple[int, int, str, int, int]] = []
+    flat: list[tuple[int, int, str, int, int, int]] = []
     errors_of: list[dict[int, str]] = []
     for r, ((src, _), cells, mine) in enumerate(zip(requests, plans, by_request)):
         ranges, errors = _locate(src, cells, lambda _keys, mine=mine: mine)
         errors_of.append(dict(errors))
         for i, rng in enumerate(ranges):
             if rng is not None:
-                flat.append((r, i, _file(src, rng.key), rng.offset, rng.size))
+                flat.append((r, i, _file(src, rng.key), rng.offset, rng.size, rng.run))
     flat.sort(key=lambda f: (f[2], f[3]))
     return flat, errors_of
 
@@ -353,17 +365,107 @@ def read_local(
     ``None`` is a cell with nothing stored; an exception is a cell whose
     location or bytes could not be read.
     """
-    flat, errors_of = locate_local(requests)
+    return read_cells(requests)
+
+
+def _coalescing() -> tuple[str, int, int]:
+    """``ZARR_VECTORS_COALESCE`` (prototype): how neighbouring cells of a shard share a read.
+
+    ``runs`` (the default): a zarr-octree shard's wanted cells are read one
+    range per run -- first to last wanted cell -- and a dense shard's one
+    range per cell.  ``none``: one range per cell everywhere.
+    ``gap:<bytes>:<span>``: any shard's cells in offset order share a range
+    while the gap to the next is at most ``bytes`` and the range at most
+    ``span``.
+    """
+    mode = os.environ.get("ZARR_VECTORS_COALESCE", "runs")
+    if mode.startswith("gap:"):
+        _, gap, span = mode.split(":")
+        return "gap", int(gap), int(span)
+    if mode not in ("runs", "none"):
+        raise ValueError(f"ZARR_VECTORS_COALESCE={mode!r}: expected runs, none or gap:<bytes>:<span>")
+    return mode, 0, 0
+
+
+def _spans(rows: list[tuple[int, int, int, int, int]]) -> list[tuple[int, int, list[int]]]:
+    """``rows`` -- (row id, object, offset, size, run), sorted by object then
+    offset -- grouped into ``(start, stop, row ids)`` reads, each within one object."""
+    mode, gap, span = _coalescing()
+    out: list[tuple[int, int, list[int]]] = []
+    prev_obj, prev_run = None, -1
+    for row, obj, off, size, run in rows:
+        if out and size >= 0 and obj == prev_obj:
+            lo, hi, members = out[-1]
+            if mode == "runs" and run >= 0 and run == prev_run:
+                out[-1] = (lo, max(hi, off + size), members + [row])
+                continue
+            if mode == "gap" and off - hi <= gap and off + size - lo <= span:
+                out[-1] = (lo, max(hi, off + size), members + [row])
+                continue
+        out.append((off, off + size, [row]))
+        prev_obj, prev_run = obj, run
+    return out
+
+
+def read_cells(
+    requests: list[tuple[CellSource, np.ndarray]],
+) -> list[list[bytes | None | Exception]]:
+    """:func:`read_local` for local and store-backed arrays alike.
+
+    Each shard's index is read once (pooled from files, gathered from a
+    store), then the cells' ranges, coalesced per :func:`_coalescing`.
+    """
     out: list[list[Any]] = [
         [None] * int(np.asarray(cells).reshape(-1, len(src.shape)).shape[0])
         for src, cells in requests
     ]
-    for r, errors in enumerate(errors_of):
+    local = [r for r, (src, _) in enumerate(requests) if src.local_root is not None]
+    rows: list[tuple[int, int, Any, str, int, int, int]] = []  # request, cell, store, where, offset, size, run
+    if local:
+        flat, errors_of = _locate_local([requests[r] for r in local])
+        for r, errors in zip(local, errors_of):
+            for i, message in errors.items():
+                out[r][i] = ValueError(message)
+        rows += [(local[lr], i, None, path, off, size, run) for lr, i, path, off, size, run in flat]
+    for r, (src, cells) in enumerate(requests):
+        if src.local_root is not None:
+            continue
+        cells = np.asarray(cells, dtype=np.int64).reshape(-1, len(src.shape))
+        ranges, errors = _locate(src, cells, lambda keys, src=src: dict(zip(keys, read_indexes(src, keys))))
         for i, message in errors.items():
             out[r][i] = ValueError(message)
-    blobs = _batched_groups(_read_ranges, [(p, off, size) for _, _, p, off, size in flat])
-    for (r, i, *_), blob in zip(flat, blobs):
-        out[r][i] = blob
+        rows += [(r, i, src.store, rng.key, rng.offset, rng.size, rng.run) for i, rng in enumerate(ranges) if rng is not None]
+    rows.sort(key=lambda f: (id(f[2]), f[3], f[4]))
+    spans = _spans([(j, (id(f[2]), f[3]), f[4], f[5], f[6]) for j, f in enumerate(rows)])
+    on_disk = [s for s in spans if rows[s[2][0]][2] is None]
+    in_store = [s for s in spans if rows[s[2][0]][2] is not None]
+    blobs = _batched_groups(_read_ranges, [(rows[m[0]][3], lo, hi - lo) for lo, hi, m in on_disk])
+    by_store: dict[int, list[int]] = {}
+    for k, (_, _, m) in enumerate(in_store):
+        by_store.setdefault(id(rows[m[0]][2]), []).append(k)
+    store_blobs: list[Any] = [None] * len(in_store)
+    if in_store:
+        from zarr.abc.store import RangeByteRequest
+
+        for ks in by_store.values():
+            store = rows[in_store[ks[0]][2][0]][2]
+            got = _store_get_many(store, [
+                (rows[in_store[k][2][0]][3],
+                 RangeByteRequest(in_store[k][0], in_store[k][1]) if in_store[k][1] >= in_store[k][0] else None)
+                for k in ks
+            ])
+            for k, g in zip(ks, got):
+                store_blobs[k] = g
+    for (lo, hi, members), blob in zip(on_disk + in_store, blobs + store_blobs):
+        for j in members:
+            r, i, _, _, off, size, _ = rows[j]
+            if blob is None or isinstance(blob, Exception):
+                out[r][i] = blob
+            elif size < 0:
+                out[r][i] = blob
+            else:
+                part = blob[off - lo: off - lo + size]
+                out[r][i] = part if len(part) == size else ValueError("short read")
     return out
 
 
@@ -414,9 +516,10 @@ def read_indexes(src: CellSource, keys: list[str]) -> list[np.ndarray | None | E
     from zarr.abc.store import RangeByteRequest, SuffixByteRequest
 
     if src.index_format == "zarr_octree":
-        from zarr_octree.codec import INDEX_READ_GUESS, dense_rows, index_tail_nbytes
+        from zarr_octree.codec import dense_rows, index_read_nbytes, index_tail_nbytes
 
-        tails = _store_get_many(src.store, [(k, SuffixByteRequest(INDEX_READ_GUESS)) for k in keys])
+        guess = SuffixByteRequest(index_read_nbytes(src.shard_shape))
+        tails = _store_get_many(src.store, [(k, guess) for k in keys])
         longer = [i for i, t in enumerate(tails) if isinstance(t, bytes) and index_tail_nbytes(t) > len(t)]
         if longer:
             more = _store_get_many(src.store, [(keys[i], SuffixByteRequest(index_tail_nbytes(tails[i]))) for i in longer])
@@ -425,7 +528,7 @@ def read_indexes(src: CellSource, keys: list[str]) -> list[np.ndarray | None | E
         rows: list[np.ndarray | None | Exception] = []
         for t in tails:
             try:
-                rows.append(t if t is None or isinstance(t, Exception) else dense_rows(t, src.shard_shape))
+                rows.append(t if t is None or isinstance(t, Exception) else dense_rows(t, src.shard_shape, runs=True))
             except Exception as exc:  # noqa: BLE001 - reported per object
                 rows.append(exc)
         return rows

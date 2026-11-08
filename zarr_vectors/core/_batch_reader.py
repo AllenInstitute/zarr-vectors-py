@@ -767,6 +767,13 @@ def flush_prefetch(
     return cache
 
 
+def pooled_sharded() -> bool:
+    """``ZARR_VECTORS_POOLED_SHARDED=1`` (prototype): read sharded arrays
+    through :func:`_sharded_read_plan` -- each shard index once, cell
+    ranges coalesced -- in the query engine too, and from any store."""
+    return os.environ.get("ZARR_VECTORS_POOLED_SHARDED") == "1"
+
+
 class _ShardedSpec(NamedTuple):
     """Everything needed to read one sharded array's cells off the filesystem."""
 
@@ -791,7 +798,10 @@ def _sharded_spec(node: Any) -> _ShardedSpec | None:
     if not isinstance(node, zarr.Array):
         return None
     src = cell_source("", node, any_codecs=True)
-    if src is None or src.shard_shape is None or src.local_root is None:
+    if src is None or src.shard_shape is None:
+        return None
+    if src.local_root is None and not pooled_sharded():
+        # Prototype: a store-backed array is read this way only on request.
         return None
     meta = node.metadata
     inner = tuple(meta.codecs[0].codecs[1:])
@@ -819,7 +829,7 @@ def _sharded_read_plan(
     hold are omitted, a cell with nothing stored reads as ``b""``, and a
     cell that cannot be read is omitted (``tolerant``) or raises.
     """
-    from zarr_vectors.core._cells_on_disk import read_local
+    from zarr_vectors.core._cells_on_disk import read_cells
 
     requests, wanted = [], []
     for array_name, spec, chunk_keys in entries:
@@ -841,7 +851,7 @@ def _sharded_read_plan(
     if not requests:
         return {}
     out: dict[tuple[str, str], bytes] = {}
-    for (array_name, spec, keys), raws in zip(wanted, read_local(requests)):
+    for (array_name, spec, keys), raws in zip(wanted, read_cells(requests)):
         for chunk_key, raw in zip(keys, raws):
             try:
                 if isinstance(raw, Exception):
