@@ -44,6 +44,7 @@ class CellSource:
     zstd: bool
     metadata: Any                          # for encode_chunk_key
     local_root: str | None                 # filesystem root of a LocalStore
+    index_format: str = "dense"            # "dense" (sharding_indexed) or "zarr_octree"
 
 
 def cell_source(name: str, node: Any, *, any_codecs: bool = False) -> CellSource | None:
@@ -68,7 +69,16 @@ def cell_source(name: str, node: Any, *, any_codecs: bool = False) -> CellSource
     codecs = tuple(meta.codecs)
     shard_shape: tuple[int, ...] | None = None
     index_at_end, index_crc = True, False
-    if len(codecs) == 1 and type(codecs[0]).__name__ == "ShardingCodec":
+    index_format = "dense"
+    if len(codecs) == 1 and type(codecs[0]).__name__ == "OctreeShardingCodec":
+        # zarr-octree's sharding: a sparse index at the end, read as dense rows.
+        shard = codecs[0]
+        if any(int(c) != 1 for c in shard.chunk_shape):
+            return None
+        shard_shape = tuple(int(c) for c in grid)
+        index_format = "zarr_octree"
+        codecs = tuple(shard.codecs)
+    elif len(codecs) == 1 and type(codecs[0]).__name__ == "ShardingCodec":
         shard = codecs[0]
         if any(int(c) != 1 for c in shard.chunk_shape):
             return None
@@ -106,6 +116,7 @@ def cell_source(name: str, node: Any, *, any_codecs: bool = False) -> CellSource
         zstd=rest == ["ZstdCodec"],
         metadata=meta,
         local_root=str(store.root) if type(store).__name__ == "LocalStore" else None,
+        index_format=index_format,
     )
 
 
@@ -253,8 +264,31 @@ def _read_ranges(items: list[tuple[str, int, int]]) -> list[bytes | None | Excep
     return out
 
 
+def _read_octree_index(src: CellSource, path: str) -> Any:
+    """A zarr-octree shard's sparse index as dense rows: one tail read, a second if it is larger."""
+    from zarr_octree.codec import INDEX_READ_GUESS, dense_rows, index_tail_nbytes
+
+    with open(path, "rb") as fh:
+        size = fh.seek(0, os.SEEK_END)
+        n = min(size, INDEX_READ_GUESS)
+        fh.seek(size - n)
+        tail = fh.read(n)
+        need = index_tail_nbytes(tail)
+        if need > len(tail):
+            fh.seek(size - need)
+            tail = fh.read(need)
+    return dense_rows(tail, src.shard_shape)
+
+
 def _read_index(item: tuple[CellSource, str]) -> Any:
     src, path = item
+    if src.index_format == "zarr_octree":
+        try:
+            return _read_octree_index(src, path)
+        except FileNotFoundError:
+            return None
+        except Exception as exc:  # noqa: BLE001 - reported per cell
+            return exc
     try:
         with open(path, "rb") as fh:
             n = _index_nbytes(src)
@@ -378,6 +412,23 @@ def read_indexes(src: CellSource, keys: list[str]) -> list[np.ndarray | None | E
     if src.local_root is not None:
         return _batched(_read_index, [(src, _file(src, k)) for k in keys])
     from zarr.abc.store import RangeByteRequest, SuffixByteRequest
+
+    if src.index_format == "zarr_octree":
+        from zarr_octree.codec import INDEX_READ_GUESS, dense_rows, index_tail_nbytes
+
+        tails = _store_get_many(src.store, [(k, SuffixByteRequest(INDEX_READ_GUESS)) for k in keys])
+        longer = [i for i, t in enumerate(tails) if isinstance(t, bytes) and index_tail_nbytes(t) > len(t)]
+        if longer:
+            more = _store_get_many(src.store, [(keys[i], SuffixByteRequest(index_tail_nbytes(tails[i]))) for i in longer])
+            for i, t in zip(longer, more):
+                tails[i] = t
+        rows: list[np.ndarray | None | Exception] = []
+        for t in tails:
+            try:
+                rows.append(t if t is None or isinstance(t, Exception) else dense_rows(t, src.shard_shape))
+            except Exception as exc:  # noqa: BLE001 - reported per object
+                rows.append(exc)
+        return rows
 
     n = _index_nbytes(src)
     request = SuffixByteRequest(n) if src.index_at_end else RangeByteRequest(0, n)
