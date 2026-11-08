@@ -89,12 +89,15 @@ if TYPE_CHECKING:  # pragma: no cover - typing only
 
 
 def _is_native_sharded(zarr_node) -> bool:
-    """True iff ``zarr_node`` is a Zarr Array using sharding_indexed."""
+    """True iff ``zarr_node`` is a Zarr Array using a sharding codec:
+    ``sharding_indexed``, or one built on zarr's ``ShardingCodec`` (such as
+    zarr-octree's ``zarr_octree_sharding``), whose shards zarr reports the same way."""
     import zarr
+    from zarr.codecs.sharding import ShardingCodec
 
     if not isinstance(zarr_node, zarr.Array):
         return False
-    return any(_codec_name(c) == "sharding_indexed"
+    return any(isinstance(c, ShardingCodec) or _codec_name(c) == "sharding_indexed"
                for c in zarr_node.metadata.codecs)
 
 
