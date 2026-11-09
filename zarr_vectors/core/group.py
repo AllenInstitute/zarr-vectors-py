@@ -91,7 +91,7 @@ def _shard_codec(ndim: int, compressors: list[Any]) -> Any:
 
     Optional: ``ZARR_VECTORS_SHARD_CODEC=zarr_octree_sharding`` selects
     zarr-octree's codec (a sparse index, and cells grouped into the leaves of
-    an octree aimed at a target size, 10,000 by default), configured by
+    an octree aimed at a target size, 100,000 by default), configured by
     ``ZARR_VECTORS_SHARD_CODEC_CONFIG`` (JSON: ``target``, ``unit``; or
     ``layout: "runs"`` with ``min_weight`` and ``max_weight``).  It needs the
     zarr-octree package, to write and to read; unset, arrays use
