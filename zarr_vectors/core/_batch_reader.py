@@ -767,11 +767,28 @@ def flush_prefetch(
     return cache
 
 
-def pooled_sharded() -> bool:
-    """``ZARR_VECTORS_POOLED_SHARDED=1`` (prototype): read sharded arrays
-    through :func:`_sharded_read_plan` -- each shard index once, cell
-    ranges coalesced -- in the query engine too, and from any store."""
-    return os.environ.get("ZARR_VECTORS_POOLED_SHARDED") == "1"
+SHARD_READERS = ("optimised", "zarr")
+
+
+def shard_reader() -> str:
+    """How sharded arrays are read: ``ZARR_VECTORS_SHARD_READER``.
+
+    ``optimised`` (the default): through :func:`_sharded_read_plan`, from
+    local files and any store alike -- each shard's index read once for a
+    whole batch, the wanted cells' byte ranges coalesced (see
+    ``_cells_on_disk._coalescing``) and fetched together, each cell decoded
+    by its array's own codecs.  ``zarr``: through zarr's array API only --
+    the array's sharding codec (``sharding_indexed`` or any other) reads
+    every cell, and shard presence is read from the cells themselves.
+    Either works with any sharding codec; neither needs zarr-octree unless
+    an array was written with its codec.
+    """
+    mode = os.environ.get("ZARR_VECTORS_SHARD_READER", "optimised").lower()
+    if mode == "optimized":
+        mode = "optimised"
+    if mode not in SHARD_READERS:
+        raise ValueError(f"ZARR_VECTORS_SHARD_READER={mode!r}: expected one of {SHARD_READERS}")
+    return mode
 
 
 class _ShardedSpec(NamedTuple):
@@ -783,7 +800,8 @@ class _ShardedSpec(NamedTuple):
 
 
 def _sharded_spec(node: Any) -> _ShardedSpec | None:
-    """A :class:`_ShardedSpec` for a sharded local vlen array, else None.
+    """A :class:`_ShardedSpec` for a sharded vlen array, else None (and
+    always None when :func:`shard_reader` is ``zarr``).
 
     zarr reads a sharded cell through the sharding codec one cell at a
     time -- the shard's index, then the cell's range, each a round trip
@@ -795,13 +813,10 @@ def _sharded_spec(node: Any) -> _ShardedSpec | None:
     """
     from zarr_vectors.core._cells_on_disk import cell_source
 
-    if not isinstance(node, zarr.Array):
+    if not isinstance(node, zarr.Array) or shard_reader() == "zarr":
         return None
     src = cell_source("", node, any_codecs=True)
     if src is None or src.shard_shape is None:
-        return None
-    if src.local_root is None and not pooled_sharded():
-        # Prototype: a store-backed array is read this way only on request.
         return None
     meta = node.metadata
     inner = tuple(meta.codecs[0].codecs[1:])

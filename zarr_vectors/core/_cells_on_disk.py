@@ -369,22 +369,29 @@ def read_local(
 
 
 def _coalescing() -> tuple[str, int, int]:
-    """``ZARR_VECTORS_COALESCE`` (prototype): how neighbouring cells of a shard share a read.
+    """``ZARR_VECTORS_COALESCE``: how neighbouring cells of a shard share a read
+    in the optimised reader (see ``_batch_reader.shard_reader``).
 
-    ``runs`` (the default): a zarr-octree shard's wanted cells are read one
-    range per run -- first to last wanted cell -- and a dense shard's one
-    range per cell.  ``none``: one range per cell everywhere.
+    ``auto`` (the default): a zarr-octree shard's wanted cells are read one
+    range per run -- first to last wanted cell -- and any other shard's as
+    ``gap:65536:1048576``.  ``runs``: by run in zarr-octree shards, one range
+    per cell elsewhere.  ``none``: one range per cell everywhere.
     ``gap:<bytes>:<span>``: any shard's cells in offset order share a range
     while the gap to the next is at most ``bytes`` and the range at most
     ``span``.
     """
-    mode = os.environ.get("ZARR_VECTORS_COALESCE", "runs")
+    mode = os.environ.get("ZARR_VECTORS_COALESCE", "auto")
+    if mode == "auto":
+        return "auto", _AUTO_GAP, _AUTO_SPAN
     if mode.startswith("gap:"):
         _, gap, span = mode.split(":")
         return "gap", int(gap), int(span)
     if mode not in ("runs", "none"):
-        raise ValueError(f"ZARR_VECTORS_COALESCE={mode!r}: expected runs, none or gap:<bytes>:<span>")
+        raise ValueError(f"ZARR_VECTORS_COALESCE={mode!r}: expected auto, runs, none or gap:<bytes>:<span>")
     return mode, 0, 0
+
+
+_AUTO_GAP, _AUTO_SPAN = 64 << 10, 1 << 20
 
 
 def _spans(rows: list[tuple[int, int, int, int, int]]) -> list[tuple[int, int, list[int]]]:
@@ -396,10 +403,11 @@ def _spans(rows: list[tuple[int, int, int, int, int]]) -> list[tuple[int, int, l
     for row, obj, off, size, run in rows:
         if out and size >= 0 and obj == prev_obj:
             lo, hi, members = out[-1]
-            if mode == "runs" and run >= 0 and run == prev_run:
+            if mode in ("runs", "auto") and run >= 0 and run == prev_run:
                 out[-1] = (lo, max(hi, off + size), members + [row])
                 continue
-            if mode == "gap" and off - hi <= gap and off + size - lo <= span:
+            by_gap = mode == "gap" or (mode == "auto" and run < 0)
+            if by_gap and off - hi <= gap and off + size - lo <= span:
                 out[-1] = (lo, max(hi, off + size), members + [row])
                 continue
         out.append((off, off + size, [row]))
@@ -574,8 +582,10 @@ def shard_cells(
     a failed checksum): the caller reads that shard whole. Returns
     ``None`` for an array whose layout this does not recognise.
     """
-    from zarr_vectors.core._batch_reader import _decode_direct, _is_icechunk_store
+    from zarr_vectors.core._batch_reader import _decode_direct, _is_icechunk_store, shard_reader
 
+    if shard_reader() == "zarr":
+        return None
     src = cell_source("", node, any_codecs=True)
     if src is None or src.shard_shape is None or _is_icechunk_store(src.store):
         return None
