@@ -87,11 +87,14 @@ _MISS_ROW = "row"
 def _shard_codec(ndim: int, compressors: list[Any]) -> Any:
     """A sharding codec other than ``sharding_indexed``, or None for the default.
 
-    Prototype switch: ``ZARR_VECTORS_SHARD_CODEC=zarr_octree_sharding``
-    selects zarr-octree's codec (sparse index, Z-order runs of bounded
-    weight), configured by ``ZARR_VECTORS_SHARD_CODEC_CONFIG`` (JSON:
-    ``min_weight``, ``max_weight``, ``unit``).  The cells' codecs are the
-    ones ``shards=`` would put inside ``sharding_indexed``.
+    Optional: ``ZARR_VECTORS_SHARD_CODEC=zarr_octree_sharding`` selects
+    zarr-octree's codec (a sparse index, and cells grouped into the leaves of
+    an octree aimed at a target size, 10,000 by default), configured by
+    ``ZARR_VECTORS_SHARD_CODEC_CONFIG`` (JSON: ``target``, ``unit``; or
+    ``layout: "runs"`` with ``min_weight`` and ``max_weight``).  It needs the
+    zarr-octree package, to write and to read; unset, arrays use
+    ``sharding_indexed`` and zarr-octree is never imported.  The cells'
+    codecs are the ones ``shards=`` would put inside ``sharding_indexed``.
     """
     import json
     import os
@@ -103,7 +106,12 @@ def _shard_codec(ndim: int, compressors: list[Any]) -> Any:
     from zarr.registry import get_codec_class
 
     config = json.loads(os.environ.get("ZARR_VECTORS_SHARD_CODEC_CONFIG", "{}"))
-    return get_codec_class(name)(
+    try:
+        codec_class = get_codec_class(name)
+    except (KeyError, ImportError) as exc:  # not registered, or its package is gone
+        hint = " (pip install zarr-octree)" if name == "zarr_octree_sharding" else ""
+        raise ValueError(f"ZARR_VECTORS_SHARD_CODEC={name!r}: no such codec is registered{hint}") from exc
+    return codec_class(
         chunk_shape=(1,) * ndim, codecs=[VLenBytesCodec(), *compressors], **config,
     )
 

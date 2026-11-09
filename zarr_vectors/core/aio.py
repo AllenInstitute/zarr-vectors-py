@@ -167,7 +167,6 @@ async def _fetch_chunks(
         _gather_plan,
         _sharded_read_plan,
         _sharded_spec,
-        pooled_sharded,
     )
 
     if not keys:
@@ -185,7 +184,7 @@ async def _fetch_chunks(
         node = nodes.get(array_path)
         if sync_root is not None and isinstance(node, zarr.Array):
             spec = _direct_spec(sync_root, array_path, node)
-            if spec is None and pooled_sharded():
+            if spec is None:
                 shard_spec = _sharded_spec(node)
                 if shard_spec is not None:
                     sharded.append((array_path, shard_spec, chunk_keys))

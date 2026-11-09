@@ -23,6 +23,13 @@ from zarr_vectors.core import _cells_on_disk as cod
 from zarr_vectors.core import arrays as A
 from zarr_vectors.exceptions import PresenceMismatchError
 
+
+@pytest.fixture(autouse=True)
+def _optimised_reader(monkeypatch):
+    """These tests are about zarr-vectors' own sharded reader, so they pin it
+    whatever ``ZARR_VECTORS_SHARD_READER`` the run was given."""
+    monkeypatch.setenv("ZARR_VECTORS_SHARD_READER", "optimised")
+
 BOUNDS = ([0.0] * 3, [100.0] * 3)
 
 
