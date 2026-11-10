@@ -84,35 +84,31 @@ _MISS_CELL = "cell"
 _MISS_ROW = "row"
 
 
-def _shard_codec(ndim: int, compressors: list[Any]) -> Any:
-    """A sharding codec other than ``sharding_indexed``, or None for the default.
+def _shard_codec(ndim: int, compressors: list[Any], octree: dict[str, Any] | None) -> Any:
+    """The sharding codec for a store marked octree, or None for the default.
 
-    Optional: ``ZARR_VECTORS_SHARD_CODEC=zarr_octree_sharding`` selects
-    zarr-octree's codec (a sparse index, and cells grouped into the leaves of
-    an octree aimed at a target size, 100,000 by default), configured by
-    ``ZARR_VECTORS_SHARD_CODEC_CONFIG`` (JSON: ``target``, ``unit``; or
-    ``layout: "runs"`` with ``min_weight`` and ``max_weight``).  It needs the
-    zarr-octree package, to write and to read; unset, arrays use
-    ``sharding_indexed`` and zarr-octree is never imported.  The cells'
-    codecs are the ones ``shards=`` would put inside ``sharding_indexed``.
+    ``octree`` is the store's marker (root ``zarr_vectors.octree_sharding``,
+    see :data:`zarr_vectors.constants.CAP_OCTREE_SHARDING`): zarr-octree's
+    ``zarr_octree_sharding`` codec with that configuration (a sparse index,
+    and cells grouped into the leaves of an octree aimed at a target size,
+    100,000 by default).  It needs the zarr-octree package, to write and to
+    read; ``None`` (every unmarked store) keeps ``sharding_indexed`` and
+    zarr-octree is never imported.  The cells' codecs are the ones
+    ``shards=`` would put inside ``sharding_indexed``.
     """
-    import json
-    import os
-
-    name = os.environ.get("ZARR_VECTORS_SHARD_CODEC")
-    if not name or name == "sharding_indexed":
+    if octree is None:
         return None
     from zarr.codecs import VLenBytesCodec
     from zarr.registry import get_codec_class
 
-    config = json.loads(os.environ.get("ZARR_VECTORS_SHARD_CODEC_CONFIG", "{}"))
     try:
-        codec_class = get_codec_class(name)
+        codec_class = get_codec_class("zarr_octree_sharding")
     except (KeyError, ImportError) as exc:  # not registered, or its package is gone
-        hint = " (pip install zarr-octree)" if name == "zarr_octree_sharding" else ""
-        raise ValueError(f"ZARR_VECTORS_SHARD_CODEC={name!r}: no such codec is registered{hint}") from exc
+        raise ValueError(
+            "this store is marked octree (zarr_octree_sharding): pip install zarr-octree"
+        ) from exc
     return codec_class(
-        chunk_shape=(1,) * ndim, codecs=[VLenBytesCodec(), *compressors], **config,
+        chunk_shape=(1,) * ndim, codecs=[VLenBytesCodec(), *compressors], **dict(octree),
     )
 
 
@@ -2127,7 +2123,7 @@ class Group:
             "compressors": list(compressors) if compressors else [],
         }
         if shard_shape is not None:
-            shard_codec = _shard_codec(ndim, create_kwargs["compressors"])
+            shard_codec = _shard_codec(ndim, create_kwargs["compressors"], self._store_octree())
             if shard_codec is None:
                 # Zarr 3.2 high-level ``shards=`` kwarg: wraps the inner
                 # ``chunks=`` codec in ``sharding_indexed`` automatically.
@@ -2163,6 +2159,21 @@ class Group:
         # the ``zarr.json`` we have in hand.
         if self._node_cache is not None:
             self._node_cache[self._full_path(array_name)] = arr
+
+    def _store_octree(self) -> dict[str, Any] | None:
+        """The store's octree marker (root ``zarr_vectors.octree_sharding``),
+        or None; read once per group, as the store's ``shard_shape`` is."""
+        if "_octree_sharding" in self.__dict__:
+            return self.__dict__["_octree_sharding"]
+        try:
+            root = zarr.open_group(self._zarr.store, path="/", mode="r", zarr_format=3)
+            block = root.attrs.get("zarr_vectors") or {}
+        except Exception:  # noqa: BLE001 - a bare group (no store root to ask) is unmarked
+            block = {}
+        octree = block.get("octree_sharding")
+        octree = dict(octree) if octree is not None else None
+        self.__dict__["_octree_sharding"] = octree
+        return octree
 
     def create_sharded_chunk_arrays(
         self,
@@ -2218,7 +2229,11 @@ class Group:
             "compressors": list(compressors) if compressors else [],
         }
         if shard_shape is not None:
-            base_kwargs["shards"] = tuple(shard_shape)
+            shard_codec = _shard_codec(ndim, base_kwargs["compressors"], self._store_octree())
+            if shard_codec is None:
+                base_kwargs["shards"] = tuple(shard_shape)
+            else:  # as in create_sharded_chunk_array
+                base_kwargs.update(chunks=tuple(shard_shape), serializer=shard_codec, compressors=None)
         base_attrs: dict[str, Any] = self._initial_presence_attrs()
         if origin is not None and any(int(o) != 0 for o in origin):
             base_attrs[_CHUNK_GRID_ORIGIN_ATTR] = [int(o) for o in origin]

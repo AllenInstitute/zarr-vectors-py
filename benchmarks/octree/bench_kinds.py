@@ -11,13 +11,15 @@ over one uneven density in a 1000-unit cube, written through zarr-vectors
 closed surfaces (``add_mesh``) and a network of branching trees
 (``add_graph``).
 
-Stores (``--layouts``): ``indexed`` (zarr's ``sharding_indexed``, zarr-vectors'
-default) and, optionally, ``octree`` (zarr-octree's ``zarr_octree_sharding``
-with its defaults: an octree aimed at 100 kB) or ``runs`` (its runs layout,
-160-640 kB).  zarr-octree's codec is only asked for by those two.
+Stores (``--layouts``): ``indexed`` (an unmarked store: zarr's
+``sharding_indexed``, zarr-vectors' default) and, optionally, stores marked
+octree at construction (``Layout(octree=...)``): ``octree`` (zarr-octree's
+``zarr_octree_sharding`` with its defaults: an octree aimed at 100 kB) or
+``runs`` (its runs layout, 160-640 kB).  zarr-octree is only needed for those.
 
-Readers (zarr-vectors' ``ZARR_VECTORS_SHARD_READER``): ``zarr`` (zarr's array
-API only) and ``optimised`` (each shard index once, coalesced ranges).
+Readers (zarr-vectors' ``ZARR_VECTORS_SHARD_READER``): ``standard`` (the
+default, as zarr-vectors always read), ``optimised`` (opt-in: each shard index
+once, coalesced ranges, any store) and ``zarr`` (zarr's array API only).
 
 Queries, each through ``select(...).read()``, with the read's faces / edges:
 
@@ -56,12 +58,12 @@ from latency_store import LatencyStore, array_class
 HERE = Path(__file__).parent
 CELLS, SHARD = 64, 16
 ZV_KIND = {"points": "point_cloud", "mesh": "mesh", "network": "graph"}
-LAYOUTS = {  # name: (codec, codec config); {} is the codec's defaults
-    "indexed": ("sharding_indexed", {}),
-    "octree": ("zarr_octree_sharding", {}),
+LAYOUTS = {  # name: (codec, Layout(octree=...)); True is the codec's defaults
+    "indexed": ("sharding_indexed", False),
+    "octree": ("zarr_octree_sharding", True),
     "runs": ("zarr_octree_sharding", {"layout": "runs", "min_weight": 160_000, "max_weight": 640_000}),
 }
-READERS = ("zarr", "optimised")
+READERS = ("zarr", "standard", "optimised")
 VERTEX_BOX = 0.5
 NO_OBJECT_READS = {"network"}
 
@@ -73,26 +75,20 @@ def make_data(kind: str, n: int) -> dict:
 def build(root: Path, kind: str, layout: str, data: dict) -> dict:
     import zarr_vectors as zv
 
-    codec, config = LAYOUTS[layout]
+    codec, octree = LAYOUTS[layout]
     path = root / f"{kind}-{layout}.zv"
     shutil.rmtree(path, ignore_errors=True)
-    os.environ["ZARR_VECTORS_SHARD_CODEC"] = codec
-    os.environ["ZARR_VECTORS_SHARD_CODEC_CONFIG"] = json.dumps(config)
-    try:
-        schema = zv.Schema(bounds=([0, 0, 0], [zv_kinds.BOX] * 3), kind=ZV_KIND[kind],
-                           layout=zv.Layout(cells=CELLS, shard_cells=SHARD, compression="zstd"))
-        t0 = time.perf_counter()
-        ds = zv.create(str(path), schema=schema)
-        if kind == "points":
-            ds.add_points(data["positions"], object_ids=data["object_ids"])
-        elif kind == "mesh":
-            ds.add_mesh(data["positions"], data["faces"], object_ids=data["object_ids"])
-        else:
-            ds.add_graph(data["positions"], data["edges"], object_ids=data["object_ids"])
-        seconds = time.perf_counter() - t0
-    finally:
-        os.environ.pop("ZARR_VECTORS_SHARD_CODEC")
-        os.environ.pop("ZARR_VECTORS_SHARD_CODEC_CONFIG")
+    schema = zv.Schema(bounds=([0, 0, 0], [zv_kinds.BOX] * 3), kind=ZV_KIND[kind],
+                       layout=zv.Layout(cells=CELLS, shard_cells=SHARD, compression="zstd", octree=octree))
+    t0 = time.perf_counter()
+    ds = zv.create(str(path), schema=schema)
+    if kind == "points":
+        ds.add_points(data["positions"], object_ids=data["object_ids"])
+    elif kind == "mesh":
+        ds.add_mesh(data["positions"], data["faces"], object_ids=data["object_ids"])
+    else:
+        ds.add_graph(data["positions"], data["edges"], object_ids=data["object_ids"])
+    seconds = time.perf_counter() - t0
     meta = json.loads((path / "0" / "vertices" / "zarr.json").read_text())
     assert meta["codecs"][0]["name"] == codec, meta["codecs"][0]["name"]
     by_array: dict = {}

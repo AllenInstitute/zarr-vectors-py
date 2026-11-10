@@ -448,6 +448,14 @@ class RootMetadata:
     store written before it. It is a writer default, not a claim about
     what is on disk; an array's own ``zarr.json`` remains the truth about
     that array, and ``sharding.get_shard_info`` reports it."""
+    octree_sharding: dict[str, Any] | None = None
+    """The store's octree marker: the ``zarr_octree_sharding`` codec's
+    configuration (``{}`` for its defaults), or ``None`` for
+    ``sharding_indexed``.  Like ``shard_shape``, a writer default read by
+    every path that allocates a sharded per-chunk array; each array's own
+    ``zarr.json`` remains the truth about that array.  Needs
+    ``shard_shape``.  Optional and additive: absent in every other store
+    (see :data:`zarr_vectors.constants.CAP_OCTREE_SHARDING`)."""
     manifest_layout: str | None = None
     """``"dense"`` when object indexes are created in the dense layout
     (``manifest_spans`` + ``manifest_blocks``), else ``None`` for the vlen
@@ -606,6 +614,11 @@ class RootMetadata:
                 normalise_shard_shape(self.shard_shape, sid_ndim)
             except ValueError as exc:
                 raise MetadataError(f"Invalid shard_shape: {exc}") from exc
+        if self.octree_sharding is not None and self.shard_shape is None:
+            raise MetadataError(
+                "octree_sharding is set but shard_shape is not: the octree "
+                "groups the cells of a shard, so the store must be sharded"
+            )
 
     @property
     def effective_bin_shape(self) -> tuple[float, ...]:
@@ -652,6 +665,8 @@ class RootMetadata:
                 if isinstance(self.shard_shape, int)
                 else [int(x) for x in self.shard_shape]
             )
+        if self.octree_sharding is not None:
+            d["zarr_vectors"]["octree_sharding"] = dict(self.octree_sharding)
         if self.manifest_layout == "dense":
             d["zarr_vectors"]["manifest_layout"] = "dense"
         if self.manifest_block_dtype == "int32":
@@ -743,6 +758,9 @@ class RootMetadata:
                 if (specs := zv.get("attribute_specs")) else None
             ),
             shard_shape=_read_shard_shape(zv.get("shard_shape")),
+            octree_sharding=(
+                dict(zv["octree_sharding"]) if zv.get("octree_sharding") is not None else None
+            ),
             manifest_layout=zv.get("manifest_layout"),
             manifest_block_dtype=zv.get("manifest_block_dtype"),
         )

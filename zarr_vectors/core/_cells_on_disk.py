@@ -370,7 +370,8 @@ def read_local(
 
 def _coalescing() -> tuple[str, int, int]:
     """``ZARR_VECTORS_COALESCE``: how neighbouring cells of a shard share a read
-    in the optimised reader (see ``_batch_reader.shard_reader``).
+    in the optimised reader (see ``_batch_reader.shard_reader``); the
+    standard reader reads one range per cell.
 
     ``auto`` (the default): a zarr-octree shard's wanted cells are read one
     range per run -- first to last wanted cell -- and any other shard's as
@@ -380,6 +381,10 @@ def _coalescing() -> tuple[str, int, int]:
     while the gap to the next is at most ``bytes`` and the range at most
     ``span``.
     """
+    from zarr_vectors.core._batch_reader import shard_reader
+
+    if shard_reader() != "optimised":  # the standard reader: one range per cell, as always
+        return "none", 0, 0
     mode = os.environ.get("ZARR_VECTORS_COALESCE", "auto")
     if mode == "auto":
         return "auto", _AUTO_GAP, _AUTO_SPAN

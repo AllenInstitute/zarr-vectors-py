@@ -538,6 +538,7 @@ def create(
         # object store declared nothing and every array a writer added
         # later came out flat -- the store contradicting its own layout.
         shard_shape=resolved.shard_shape,
+        octree_sharding=resolved.octree,
         ndim=schema.ndim,
         vertex_dtype=schema.position_dtype,
         axes=cast("Any", [a.to_ngff() for a in schema.axes]) if schema.axes else None,

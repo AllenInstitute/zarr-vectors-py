@@ -24,8 +24,9 @@ from matplotlib.patches import Patch
 HERE = Path(__file__).parent
 # Reference palette (dataviz skill), light mode; colour follows the reader everywhere.
 SURFACE, INK, INK2, MUTED, GRID_C = "#fcfcfb", "#0b0b0b", "#52514e", "#8a8985", "#e4e3df"
-READER_COLOR = {"zarr": "#2a78d6", "optimised": "#eb6834"}
-READER_LABEL = {"zarr": "through zarr's API only", "optimised": "zarr-vectors' optimised reader"}
+READER_COLOR = {"zarr": "#2a78d6", "standard": "#6250d6", "optimised": "#eb6834"}
+READER_LABEL = {"zarr": "through zarr's API only", "standard": "zarr-vectors' standard reader (default)",
+                "optimised": "zarr-vectors' optimised reader (opt-in)"}
 plt.rcParams.update({
     "figure.facecolor": SURFACE, "axes.facecolor": SURFACE, "savefig.facecolor": SURFACE,
     "axes.edgecolor": MUTED, "axes.labelcolor": INK2, "xtick.color": INK2, "ytick.color": INK2,
@@ -65,7 +66,8 @@ def fig_time(res: dict, lat: float, out: Path) -> None:
     fig, axes = plt.subplots(len(kinds), len(QUERIES), figsize=(2.6 * len(QUERIES) + 1.4, 0.75 * len(layouts) * len(kinds) + 1.2),
                              squeeze=False)
     y = np.arange(len(layouts))[::-1].astype(float)
-    h = 0.36
+    readers = [m for m in READER_COLOR if any(r["reader"] == m for r in q)]
+    h = 0.8 / len(readers)
     for i, kind in enumerate(kinds):
         for j, (qk, qname) in enumerate(QUERIES):
             ax = axes[i, j]
@@ -79,12 +81,12 @@ def fig_time(res: dict, lat: float, out: Path) -> None:
                 ax.set_xticks([])
             top = 0.0
             for yi, layout in zip(y, layouts):
-                for k, reader in enumerate(READER_COLOR):
+                for k, reader in enumerate(readers):
                     mine = [r for r in rows if r["layout"] == layout and r["reader"] == reader]
                     if not mine:
                         continue
                     v = geomean_of_medians(mine) * 1e3
-                    yy = yi + (h / 2 if k == 0 else -h / 2)
+                    yy = yi + h * ((len(readers) - 1) / 2 - k)
                     ax.barh(yy, v, color=READER_COLOR[reader], height=h * 0.9)
                     ax.text(v * 1.03, yy, fmt(v), va="center", fontsize=7, color=INK2)
                     top = max(top, v)
@@ -98,8 +100,8 @@ def fig_time(res: dict, lat: float, out: Path) -> None:
     setup = res["setup"]
     title = "local store" if not lat else f"{lat * 1e3:.0f} ms + {setup['bandwidth'] / 1e6:.0f} MB/s per request"
     fig.suptitle(f"Query time (ms), {title}", fontsize=10, x=0.01, ha="left")
-    fig.legend(handles=[Patch(color=c, label=READER_LABEL[m]) for m, c in READER_COLOR.items()],
-               loc="lower left", bbox_to_anchor=(0.0, -0.01), ncol=2, fontsize=8, frameon=False)
+    fig.legend(handles=[Patch(color=READER_COLOR[m], label=READER_LABEL[m]) for m in readers],
+               loc="lower left", bbox_to_anchor=(0.0, -0.01), ncol=len(readers), fontsize=8, frameon=False)
     fig.tight_layout(w_pad=0.6, h_pad=0.8, rect=(0, 0.04, 1, 0.97))
     fig.savefig(out, dpi=160, bbox_inches="tight")
     plt.close(fig)
@@ -109,7 +111,7 @@ def fig_bytes(res: dict, lat: float, out: Path) -> None:
     q = [r for r in res["queries"] if r["latency"] == lat]
     kinds = [k for k in KIND_LABEL if any(r["kind"] == k for r in q)]
     layouts = list(res["setup"]["layouts"])
-    bars = [(l, m) for l in layouts for m in READER_COLOR]
+    bars = [(l, m) for l in layouts for m in READER_COLOR if any(r["reader"] == m for r in q)]
     classes = list(ARRAY_COLOR)
     cols = QUERIES + [("disk", "Store size")]
     fig, axes = plt.subplots(len(kinds), len(cols), figsize=(2.5 * len(cols) + 1.6, 0.42 * len(bars) * len(kinds) + 1.4),

@@ -557,6 +557,126 @@ def reshard(
     return {"action": "shard", **result}
 
 
+def _octree_codec_matches(existing: Any, octree: dict[str, Any] | None) -> bool:
+    """Whether a sharded array's codec is the one ``octree`` (the store's
+    marker, or None for ``sharding_indexed``) would give it."""
+    codec = existing.metadata.codecs[0]
+    if octree is None:
+        return _codec_name(codec) == "sharding_indexed"
+    if _codec_name(codec) != "zarr_octree_sharding":
+        return False
+    from zarr_vectors.core.group import _shard_codec
+
+    want = _shard_codec(len(existing.shape), [], octree).to_dict()["configuration"]
+    have = codec.to_dict()["configuration"]
+    return all(have.get(k) == v for k, v in want.items() if k not in ("codecs", "index_codecs"))
+
+
+def set_octree(
+    store_path: str | Path | Group,
+    octree: bool | dict[str, Any] = True,
+    *,
+    arrays: list[str] | None = None,
+) -> dict[str, Any]:
+    """Mark a sharded store octree, or unmark it, and repack its shards to match.
+
+    ``octree=True`` (or the codec's configuration, e.g. ``{"target":
+    100_000}``) stamps the root's ``octree_sharding`` marker and
+    :data:`~zarr_vectors.constants.CAP_OCTREE_SHARDING`, then rewrites every
+    sharded per-chunk array with zarr-octree's ``zarr_octree_sharding``
+    codec; ``octree=False`` removes both and rewrites them with
+    ``sharding_indexed`` -- the store as it would have been written
+    unmarked.  Cells, keys, grid, each array's inner codecs and
+    attributes are kept; only the bytes inside each shard change.  An
+    array already in the wanted codec is left alone, so the call can be
+    re-run to finish an interrupted conversion (each array's
+    ``zarr.json`` says which codec it is in, so a half-converted store
+    reads correctly).  Needs the zarr-octree package for either direction
+    when an octree array is involved.
+
+    Returns:
+        ``{"octree": the marker or None, "arrays_repacked", "chunks_repacked"}``.
+    """
+    import zarr
+
+    from zarr_vectors.constants import CAP_OCTREE_SHARDING
+    from zarr_vectors.core.store import read_root_metadata
+
+    root = open_store(store_path, mode="r+")
+    meta = read_root_metadata(root)
+    config = None if octree is False or octree is None else ({} if octree is True else dict(octree))
+    if config is not None and meta.shard_shape is None:
+        raise ValueError(
+            "set_octree needs a sharded store (the octree groups the cells of a "
+            "shard): shard it first with shard_store()"
+        )
+    if config is not None:
+        from zarr_vectors.core.group import _shard_codec
+
+        _shard_codec(1, [], config)  # zarr-octree present and the configuration valid, before anything changes
+    # The marker first: every array allocated from here on, by this call or
+    # by a writer, takes its codec from it.
+    block = dict(root.attrs.to_dict().get("zarr_vectors", {}))
+    caps = [c for c in block.get("format_capabilities") or [] if c != CAP_OCTREE_SHARDING]
+    if config is None:
+        block.pop("octree_sharding", None)
+    else:
+        block["octree_sharding"] = config
+        caps.append(CAP_OCTREE_SHARDING)
+    block["format_capabilities"] = caps
+    root.attrs.update({"zarr_vectors": block})
+
+    repacked = chunks = 0
+    claims = ("fragments_tile", "link_fragments_aligned")
+    for level_idx in list_resolution_levels(root):
+        level = get_resolution_level(root, level_idx)
+        # Rewriting vertices / fragments / links drops the level's claims
+        # about them (Group._clear_fragments_tile); the cells are rewritten
+        # byte for byte, so the claims still hold and are put back below.
+        before = level.attrs.get("zarr_vectors_level")
+        before = dict(before) if isinstance(before, dict) else None
+        repacked_here = 0
+        for array_name in _list_array_names(level, arrays):
+            if not level.standalone_array_exists(array_name):
+                continue
+            existing = level.zarr_group[array_name]
+            if not isinstance(existing, zarr.Array) or not _is_native_sharded(existing):
+                continue
+            if _octree_codec_matches(existing, config):
+                continue
+            grid_shape = tuple(int(s) for s in existing.shape)
+            shard_shape = tuple(int(s) for s in existing.shards)
+            raw_origin = existing.attrs.get("chunk_grid_origin")
+            origin = tuple(int(x) for x in raw_origin) if raw_origin else None
+            inner = list(existing.metadata.codecs[0].codecs[1:])  # after vlen-bytes: the cells' compressors
+            chunk_keys = [k for k in level.list_chunks(array_name) if _parse_chunk_coords(k) is not None]
+            with level.batched_reads([(array_name, list(chunk_keys))]):
+                payloads = {k: level.read_bytes(array_name, k) for k in chunk_keys}
+            preserved_attrs = dict(level.read_array_meta(array_name))
+            preserved_attrs.pop("nonempty_chunks", None)
+            preserved_attrs.pop("chunk_grid_origin", None)
+            del level.zarr_group[array_name]
+            level.create_sharded_chunk_array(
+                array_name, grid_shape=grid_shape, shard_shape=shard_shape,
+                origin=origin, compressors=inner, attributes=preserved_attrs,
+            )
+            with level.batched_writes():
+                for k in chunk_keys:
+                    data = payloads.pop(k)
+                    if data:
+                        level.write_bytes(array_name, k, data)
+            repacked += 1
+            repacked_here += 1
+            chunks += len(chunk_keys)
+        after = level.attrs.get("zarr_vectors_level")
+        if repacked_here and before is not None and isinstance(after, dict) and (
+            {k: v for k, v in after.items() if k not in claims}
+            == {k: v for k, v in before.items() if k not in claims}
+        ):
+            level.attrs.update({"zarr_vectors_level": before})
+    return {"octree": config, "arrays_repacked": repacked, "chunks_repacked": chunks}
+
+
 # ===================================================================
 # Status queries
 # ===================================================================
