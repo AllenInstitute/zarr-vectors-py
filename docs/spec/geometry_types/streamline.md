@@ -124,7 +124,7 @@ you name.) No validation is applied to them.
 ### Ingest and export
 
 TRK, TCK, and TRX converters live in the companion package
-**`zarr-vectors-tools`**. TRX ingest preserves dps/dpp attributes.
+**`zarr-vectors-tools`**. TRX ingest preserves dps/dpv attributes.
 
 ### Variable step size
 
