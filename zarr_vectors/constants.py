@@ -257,6 +257,16 @@ separate cross-chunk family — a cross-chunk link is a link with a
 non-zero offsets segment — so this token now marks only the presence of
 ``delta != 0`` arrays."""
 
+CAP_OCTREE_SHARDING: str = "octree_sharding"
+"""The store is marked octree: its sharded per-chunk arrays are written with
+zarr-octree's ``zarr_octree_sharding`` codec (cells grouped into the leaves of
+an octree aimed at a target size, and a sparse shard index) instead of
+``sharding_indexed``.  Stamped with the root's ``octree_sharding`` block (the
+codec's configuration); set at construction (``Layout(octree=...)``) or by
+:func:`zarr_vectors.sharding.set_octree`, which converts either way.  Reading
+or writing such an array needs the zarr-octree package.  Optional and
+additive: absent means ``sharding_indexed``, as every other store."""
+
 DEFAULT_AXES_NAMES: tuple[str, ...] = ("x", "y", "z", "w")
 """Default axis names used when ``create_store`` is called without an
 explicit ``axes`` kwarg.  Indexed by ``sid_ndim`` (1 → ``("x",)``, 2 →

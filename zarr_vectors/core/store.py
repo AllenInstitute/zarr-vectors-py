@@ -42,6 +42,7 @@ if TYPE_CHECKING:
 
 from zarr_vectors.constants import (
     CAP_DENSE_MANIFESTS,
+    CAP_OCTREE_SHARDING,
     DEFAULT_AXES_NAMES,
     DEFAULT_BOUNDS_SIDE,
     FORMAT_VERSION,  # noqa: F401  (re-exported for callers)
@@ -374,6 +375,7 @@ def create_store(
     format_capabilities: list[str] | None = None,
     attribute_specs: dict[str, dict[str, Any]] | None = None,
     shard_shape: int | Sequence[int] | None = None,
+    octree_sharding: dict[str, Any] | None = None,
     manifest_layout: str | None = None,
     manifest_block_dtype: str | None = None,
     name: str | None = None,
@@ -457,6 +459,12 @@ def create_store(
             for one storage object per cell.  An ``int`` broadcasts to
             every axis; a per-axis sequence must have one entry per
             spatial dimension.
+        octree_sharding: Mark the store octree: its sharded per-chunk
+            arrays use zarr-octree's ``zarr_octree_sharding`` codec with
+            this configuration (``{}`` for its defaults) instead of
+            ``sharding_indexed``.  Needs ``shard_shape`` and the
+            zarr-octree package.  ``None`` (the default) writes nothing.
+            See :func:`zarr_vectors.sharding.set_octree` to convert.
 
             Recorded on the root, which is what makes it reach the arrays
             nobody passes it to -- an attribute array or links segment
@@ -601,6 +609,7 @@ def create_store(
         format_capabilities=format_capabilities,
         attribute_specs=attribute_specs,
         shard_shape=shard_shape,
+        octree_sharding=octree_sharding,
         manifest_layout=manifest_layout,
         manifest_block_dtype=manifest_block_dtype,
         name=name,
@@ -685,6 +694,7 @@ def _write_root_attrs(
     format_capabilities: list[str] | None = None,
     attribute_specs: dict[str, dict[str, Any]] | None = None,
     shard_shape: int | Sequence[int] | None = None,
+    octree_sharding: dict[str, Any] | None = None,
     manifest_layout: str | None = None,
     manifest_block_dtype: str | None = None,
     name: str | None = None,
@@ -737,6 +747,18 @@ def _write_root_attrs(
             int(shard_shape) if isinstance(shard_shape, int)
             else [int(x) for x in shard_shape]
         )
+    if octree_sharding is not None:
+        # Absent means sharding_indexed, so only an octree store carries
+        # the key and its capability.
+        if shard_shape is None and zv.get("shard_shape") is None:
+            raise MetadataError(
+                "octree_sharding needs shard_shape: the octree groups the "
+                "cells of a shard, so the store must be sharded"
+            )
+        zv["octree_sharding"] = dict(octree_sharding)
+        caps = list(zv.get("format_capabilities") or [])
+        if CAP_OCTREE_SHARDING not in caps:
+            zv["format_capabilities"] = [*caps, CAP_OCTREE_SHARDING]
     if manifest_layout not in (None, "vlen", "dense"):
         raise MetadataError(
             f"manifest_layout={manifest_layout!r}; expected 'vlen' or 'dense'"

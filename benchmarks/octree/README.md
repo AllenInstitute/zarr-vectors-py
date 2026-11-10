@@ -1,14 +1,15 @@
 # Spatial read benchmark: point clouds, meshes, networks
 
 Working branch `octree`: zarr-vectors with an optional octree sharding codec
-(zarr-octree's `zarr_octree_sharding`) and a choice of shard reader.  Neither
-is a format change to zarr-vectors; both act on one zarr array at a time.
+(zarr-octree's `zarr_octree_sharding`) and a choice of shard reader.  Both
+are opt-in and act on one zarr array at a time; without them the branch
+writes byte-identical stores and reads them with identical I/O.
 
 | Setting | Values |
 |---|---|
-| `ZARR_VECTORS_SHARD_CODEC` | unset: `sharding_indexed` (default); `zarr_octree_sharding` (needs zarr-octree) |
-| `ZARR_VECTORS_SHARD_CODEC_CONFIG` | JSON for the codec, e.g. `{"target": 100000}` (its default) |
-| `ZARR_VECTORS_SHARD_READER` | `optimised` (default: each shard index once, coalesced ranges) or `zarr` (zarr's API only) |
+| `Layout(octree=...)` at construction | `False` (default: `sharding_indexed`); `True` or the codec's configuration, e.g. `{"target": 100000}` (its default), marks the store octree (root `octree_sharding` + capability `octree_sharding`); needs zarr-octree and shards |
+| `zarr_vectors.sharding.set_octree(store, octree)` | converts an existing sharded store either way; back to `False` gives the store as written unmarked |
+| `ZARR_VECTORS_SHARD_READER` | `standard` (default: as always), `optimised` (opt-in: each shard index once, coalesced ranges, any store) or `zarr` (zarr's API only) |
 
 ## Running
 
@@ -17,7 +18,8 @@ python bench_kinds.py [--quick] [--layouts indexed octree] [--kinds points mesh 
 python figures_kinds.py            # needs matplotlib
 ```
 
-`--layouts indexed` runs without zarr-octree.  Stores go to `_stores/`,
+`--layouts indexed` runs without zarr-octree; `octree` / `runs` are stores
+marked octree at construction.  Stores go to `_stores/`,
 results to `results/bench_kinds.json`, figures to `results/figures/`.
 
 Data (`kinds_data.py`, synthetic): point clouds, meshes (closed surfaces)

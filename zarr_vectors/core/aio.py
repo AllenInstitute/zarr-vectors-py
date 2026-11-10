@@ -167,6 +167,7 @@ async def _fetch_chunks(
         _gather_plan,
         _sharded_read_plan,
         _sharded_spec,
+        shard_reader,
     )
 
     if not keys:
@@ -184,7 +185,7 @@ async def _fetch_chunks(
         node = nodes.get(array_path)
         if sync_root is not None and isinstance(node, zarr.Array):
             spec = _direct_spec(sync_root, array_path, node)
-            if spec is None:
+            if spec is None and shard_reader() == "optimised":  # opt-in; see shard_reader
                 shard_spec = _sharded_spec(node)
                 if shard_spec is not None:
                     sharded.append((array_path, shard_spec, chunk_keys))

@@ -184,6 +184,7 @@ class ResolvedLayout:
     shard_shape: int | tuple[int, ...] | None
     compressor: Any
     bounds: tuple[list[float], list[float]]
+    octree: dict[str, Any] | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -220,6 +221,14 @@ class Layout:
         including one deliberately built sharded.
     ``compression="auto"``
         ``zstd``, or ``$ZARR_VECTORS_COMPRESSION`` when set.
+    ``octree=False``
+        ``True`` (or the codec's configuration, e.g. ``{"target":
+        100_000}``) marks the store octree: its shards are written with
+        zarr-octree's ``zarr_octree_sharding`` codec instead of
+        ``sharding_indexed``.  It shards the store (``shard_cells="auto"``
+        then packs whatever the store kind), and needs the zarr-octree
+        package.  :func:`zarr_vectors.sharding.set_octree` converts an
+        existing store either way.
     """
 
     cells: int | Sequence[int] | Literal["auto"] = "auto"
@@ -229,6 +238,7 @@ class Layout:
     shard_cells: int | Sequence[int] | None | Literal["auto"] = "auto"
     compression: str | None | Literal["auto"] = "auto"
     target_object_bytes: int = _DEFAULT_TARGET_OBJECT_BYTES
+    octree: bool | Mapping[str, Any] = False
 
     def resolve(self, schema: Schema, *, store_kind: str = "local") -> ResolvedLayout:
         """Turn this into the four physical parameters.
@@ -257,7 +267,7 @@ class Layout:
             pack = (
                 store_kind != "local" if self.pack == "auto"
                 else bool(self.pack)
-            )
+            ) or bool(self.octree)
             shard_shape = (
                 self._shard_shape(extent, chunk_shape, schema) if pack
                 else None
@@ -267,12 +277,21 @@ class Layout:
             # "auto" resolved to *no* compression unless an environment
             # variable said otherwise, which is not what the word means.
             compressor = os.environ.get("ZARR_VECTORS_COMPRESSION") or "zstd"
+        octree = None
+        if self.octree is not False and self.octree is not None:
+            if shard_shape is None:
+                raise MetadataError(
+                    "Layout(octree=...) needs a sharded store: the octree "
+                    "groups the cells of a shard, so shard_cells cannot be None."
+                )
+            octree = {} if self.octree is True else dict(self.octree)
         return ResolvedLayout(
             chunk_shape=chunk_shape,
             bin_shape=bin_shape,
             shard_shape=shard_shape,
             compressor=compressor,
             bounds=(lo, hi),
+            octree=octree,
         )
 
     def _chunk_shape(
@@ -530,6 +549,11 @@ class Schema:
                     root_meta.shard_shape
                     if getattr(root_meta, "shard_shape", None) is not None
                     else "auto"
+                ),
+                octree=(
+                    dict(root_meta.octree_sharding)
+                    if getattr(root_meta, "octree_sharding", None) is not None
+                    else False
                 ),
             ),
         )

@@ -767,23 +767,24 @@ def flush_prefetch(
     return cache
 
 
-SHARD_READERS = ("optimised", "zarr")
+SHARD_READERS = ("standard", "optimised", "zarr")
 
 
 def shard_reader() -> str:
     """How sharded arrays are read: ``ZARR_VECTORS_SHARD_READER``.
 
-    ``optimised`` (the default): through :func:`_sharded_read_plan`, from
-    local files and any store alike -- each shard's index read once for a
-    whole batch, the wanted cells' byte ranges coalesced (see
-    ``_cells_on_disk._coalescing``) and fetched together, each cell decoded
-    by its array's own codecs.  ``zarr``: through zarr's array API only --
-    the array's sharding codec (``sharding_indexed`` or any other) reads
-    every cell, and shard presence is read from the cells themselves.
-    Either works with any sharding codec; neither needs zarr-octree unless
-    an array was written with its codec.
+    ``standard`` (the default): as zarr-vectors always has -- a local
+    store's shards read off the filesystem, each shard's index once for a
+    batch and one range per wanted cell; any other store through zarr's
+    array API.  ``optimised`` (opt-in): through :func:`_sharded_read_plan`
+    from local files and any store alike, each shard's index read once for
+    a whole batch and the wanted cells' byte ranges coalesced (see
+    ``_cells_on_disk._coalescing``).  ``zarr``: through zarr's array API
+    only -- the array's sharding codec reads every cell, and shard presence
+    is read from the cells themselves.  Each works with any sharding codec;
+    none needs zarr-octree unless an array was written with its codec.
     """
-    mode = os.environ.get("ZARR_VECTORS_SHARD_READER", "optimised").lower()
+    mode = os.environ.get("ZARR_VECTORS_SHARD_READER", "standard").lower()
     if mode == "optimized":
         mode = "optimised"
     if mode not in SHARD_READERS:
@@ -800,8 +801,9 @@ class _ShardedSpec(NamedTuple):
 
 
 def _sharded_spec(node: Any) -> _ShardedSpec | None:
-    """A :class:`_ShardedSpec` for a sharded vlen array, else None (and
-    always None when :func:`shard_reader` is ``zarr``).
+    """A :class:`_ShardedSpec` for a sharded vlen array, else None: always
+    under :func:`shard_reader` ``zarr``, and for a store that is not local
+    under ``standard`` (the default).
 
     zarr reads a sharded cell through the sharding codec one cell at a
     time -- the shard's index, then the cell's range, each a round trip
@@ -813,10 +815,13 @@ def _sharded_spec(node: Any) -> _ShardedSpec | None:
     """
     from zarr_vectors.core._cells_on_disk import cell_source
 
-    if not isinstance(node, zarr.Array) or shard_reader() == "zarr":
+    mode = shard_reader()
+    if not isinstance(node, zarr.Array) or mode == "zarr":
         return None
     src = cell_source("", node, any_codecs=True)
     if src is None or src.shard_shape is None:
+        return None
+    if mode == "standard" and src.local_root is None:  # other stores: through zarr, as always
         return None
     meta = node.metadata
     inner = tuple(meta.codecs[0].codecs[1:])
