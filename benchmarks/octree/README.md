@@ -13,6 +13,9 @@ writes byte-identical stores and reads them with identical I/O.
 
 ## Running
 
+zarr-octree is not on PyPI:
+`pip install git+https://github.com/Andrew-Keenlyside/zarr-octree`.
+
 ```
 python bench_kinds.py [--quick] [--layouts indexed octree] [--kinds points mesh network] [--vertices 4000000]
 python figures_kinds.py            # needs matplotlib
