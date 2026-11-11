@@ -33,6 +33,7 @@ from zarr_vectors.constants import (
     LINK_FRAGMENTS,
     LINKS_EXPLICIT,
     LINKS_IMPLICIT_BRANCHES,
+    OBJECT_INDEX,
     OBJIDX_STANDARD,
     RESOLUTION_PREFIX,
     VERTEX_ATTRIBUTES,
@@ -87,6 +88,7 @@ from zarr_vectors.spatial.chunking import (
     assign_chunks,
     compute_bounds,
 )
+from zarr_vectors.types.meshes import _bbox_filter, read_object_links
 from zarr_vectors.typing import (
     BinShape,
     BoundingBox,
@@ -640,7 +642,13 @@ def read_graph(
         store_path: URL or path to the store, a pre-built zarr Store,
             or an already-open Group.
         level: Resolution level.
-        object_ids: Optional object ID filter.
+        object_ids: Optional object ID filter.  Only the named objects'
+            vertex fragments are read -- found through the object index,
+            not by scanning chunks -- and only the edges between them.
+            Ids not in the store are ignored.  A skeleton's object is one
+            tree, so its implicit edges are rebuilt within each fragment
+            as on a full read; a branch whose parent lies outside the
+            read (a ``bbox`` / ``chunks`` scope) comes back as a root.
         bbox: Optional bounding box filter.
         chunks: Optional whitelist of chunk coordinate tuples; only nodes
             (and intra-chunk edges) in those chunks are returned. AND-ed
@@ -653,31 +661,25 @@ def read_graph(
         - ``positions``: ``(N, D)`` node positions
         - ``edges``: ``(M, 2)`` edge list (remapped to output indices)
         - ``node_count``, ``edge_count``
+        - ``object_ids``: ``(N,)`` owning object of each node -- only
+          when ``object_ids=`` was given.  Nodes come back grouped by
+          object, in the order the ids were asked for.
     """
-    if object_ids is not None:
-        # Declared and documented, but never applied — the filter was
-        # never implemented here (``read_polylines`` does implement it).
-        # Silently returning the unfiltered store is the worst outcome:
-        # the caller believes they scoped the read.  Fail loudly until
-        # someone implements it.
-        raise NotImplementedError(
-            "read_graph(object_ids=...) is not implemented: the filter would be "
-            "silently ignored and you would get the whole level back. "
-            "Filter the returned arrays yourself, or use read_polylines, "
-            "which does implement object_ids."
-        )
     root = open_store(store_path, backend=backend)
     with root.cached_nodes():
         # One node-resolution pass for the whole read, and every
         # node it needs asked for in a single gather rather than
         # resolved one at a time as the code reaches them.
         prefix = f"{RESOLUTION_PREFIX}{level}"
-        root.prime_nodes([
+        nodes = [
             prefix,
             f"{prefix}/{VERTICES}",
             f"{prefix}/{VERTEX_FRAGMENTS}",
             f"{prefix}/{LINK_FRAGMENTS}",
-        ])
+        ]
+        if object_ids is not None:
+            nodes.append(f"{prefix}/{OBJECT_INDEX}")
+        root.prime_nodes(nodes)
         return _read_graph(
             root,
             level=level,
@@ -722,11 +724,16 @@ def _read_graph(
     except Exception:
         pass
 
+    scoped = bbox is not None or chunks is not None or bool(attribute_filter)
+
     # Determine chunks to read (physical keys ∩ bbox-implied ∩ chunks
-    # whitelist).
-    chunk_keys = resolve_chunk_keys(
-        level_group, level_chunk_shape, bbox=bbox, chunks=chunks,
-    )
+    # whitelist).  An object read finds its chunks through the object
+    # index, so an unscoped one needs no chunk listing at all.
+    chunk_keys: list[ChunkCoords] | None = None
+    if object_ids is None or scoped:
+        chunk_keys = resolve_chunk_keys(
+            level_group, level_chunk_shape, bbox=bbox, chunks=chunks,
+        )
 
     # attribute_filter: drop chunks whose leading coord doesn't match.
     if attribute_filter:
@@ -758,10 +765,22 @@ def _read_graph(
             return _empty_graph_result(ndim)
         chunk_keys = [k for k in chunk_keys if k and k[0] == filter_bin]
 
+    if object_ids is not None:
+        return _read_graph_objects(
+            level_group,
+            object_ids,
+            scope=None if chunk_keys is None else set(chunk_keys),
+            bbox=bbox,
+            dtype=dtype,
+            ndim=ndim,
+            is_tree=is_tree,
+            aligned=bool(level_meta_for_cs and level_meta_for_cs.link_fragments_aligned),
+        )
+    assert chunk_keys is not None
+
     # A read narrowed to some chunks keeps only edges wholly inside them,
     # so it reads only the link cells those chunks can reach; an
     # unscoped one wants the whole family.
-    scoped = bbox is not None or chunks is not None or bool(attribute_filter)
     link_cells = link_cells_within(level_group, chunk_keys) if scoped else None
     if link_cells is None:
         link_cells = {
@@ -907,6 +926,63 @@ def _read_graph(
         }
     finally:
         _batched_reads_cm.__exit__(None, None, None)
+
+
+def _read_graph_objects(
+    level_group: Any,
+    object_ids: list[int],
+    *,
+    scope: set[ChunkCoords] | None,
+    bbox: BoundingBox | None,
+    dtype: np.dtype,
+    ndim: int,
+    is_tree: bool,
+    aligned: bool = False,
+) -> dict[str, Any]:
+    """:func:`read_graph` for ``object_ids=``: the named objects and nothing else.
+
+    The rows and link records come from
+    :func:`~zarr_vectors.types.meshes.read_object_links`, as for a mesh.
+    A graph's records are its edges, kept when both ends are ours.  A
+    skeleton's are the edges the implicit rule does not give, so its
+    parents are rebuilt as on a full read: ``parent[i] = i - 1`` within
+    a fragment (a fragment is read whole, so its rows keep their order),
+    none at a fragment start, and a record's parent wherever one exists
+    -- ``-1`` (a root) when that parent was not read.
+    """
+    read = read_object_links(
+        level_group, object_ids, scope=scope, dtype=dtype, ndim=ndim,
+        link_width=2, aligned=aligned,
+    )
+    if read is None:
+        result = _empty_graph_result(ndim)
+        result["object_ids"] = np.zeros(0, dtype=np.int64)
+        return result
+    positions_out, owners_out, rows, starts = read
+
+    if is_tree:
+        n = len(positions_out)
+        parent_arr = np.arange(-1, n - 1, dtype=np.int64)
+        parent_arr[starts] = -1
+        ours = rows[:, 0] >= 0
+        parent_arr[rows[ours, 0]] = rows[ours, 1]
+        children = np.flatnonzero(parent_arr >= 0)
+        edges_out = np.stack([children, parent_arr[children]], axis=1).astype(np.int64)
+    else:
+        edges_out = np.ascontiguousarray(rows[(rows >= 0).all(axis=1)])
+
+    if bbox is not None:
+        positions_out, edges_out, keep = _bbox_filter(positions_out, edges_out, bbox, 2)
+        if keep is not None:
+            owners_out = owners_out[keep]
+
+    return {
+        "positions": positions_out,
+        "edges": edges_out,
+        "node_count": len(positions_out),
+        "edge_count": len(edges_out),
+        "object_ids": owners_out,
+    }
 
 
 def _empty_graph_result(ndim: int) -> dict[str, Any]:

@@ -70,23 +70,39 @@ class TestMeshObjectSelection:
 
 
 class TestUnsupportedTermsSaySo:
-    """``read_graph`` cannot scope by object, and ``read_mesh`` has no
-    ``group_ids=``.
+    """``read_mesh`` and ``read_graph`` have no ``group_ids=``.
 
     Refusing is right -- silently returning the whole level is the worst
     outcome -- but the message named a parameter of a function the
     caller never called.
     """
 
-    def test_selecting_objects_on_a_graph_explains_itself(self, graph_store):
+    def test_selecting_groups_on_a_graph_explains_itself(self, graph_store):
         level = zv.open(graph_store).level(0)
-        with pytest.raises(ZVError, match=r"select\(objects=\.\.\.\)"):
-            level.select(objects=[0]).read()
+        with pytest.raises(ZVError, match=r"select\(groups=\.\.\.\)"):
+            level.select(groups=[0]).read()
 
     def test_groups_too(self, mesh_store):
         level = zv.open(mesh_store).level(0)
         with pytest.raises(ZVError, match=r"select\(groups=\.\.\.\)"):
             level.select(groups=[0]).read()
+
+
+class TestGraphObjectSelection:
+    """``select(objects=...)`` on a graph is served by ``read_graph(object_ids=)``."""
+
+    def test_selecting_objects_on_a_graph_reads_that_object(self, graph_store):
+        level = zv.open(graph_store).level(0)
+        # Written without object ids, so the whole graph is object 0.
+        got = level.select(objects=[0]).read()
+        full = level.read()
+        assert got.vertex_count == full.vertex_count == 60
+        assert len(got.edges) == len(full.edges)
+        assert np.array_equal(got.object_ids, np.zeros(60, dtype=np.int64))
+
+    def test_an_absent_object_reads_nothing(self, graph_store):
+        level = zv.open(graph_store).level(0)
+        assert level.select(objects=[5]).read().vertex_count == 0
 
 
 class TestWriterParametersReachTheFacade:
