@@ -107,7 +107,8 @@ def _shard_codec(ndim: int, compressors: list[Any], octree: dict[str, Any] | Non
         codec_class = get_codec_class("zarr_octree_sharding")
     except (KeyError, ImportError) as exc:  # not registered, or its package is gone
         raise ValueError(
-            "this store is marked octree (zarr_octree_sharding): pip install zarr-octree"
+            "this store is marked octree (zarr_octree_sharding): pip install "
+            "git+https://github.com/Andrew-Keenlyside/zarr-octree"
         ) from exc
     return codec_class(
         chunk_shape=(1,) * ndim, codecs=[VLenBytesCodec(), *compressors], **dict(octree),

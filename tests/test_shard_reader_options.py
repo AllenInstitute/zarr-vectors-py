@@ -304,4 +304,4 @@ def test_zarr_octree_is_optional(tmp_path):
     out = json.loads(r.stdout.strip().splitlines()[-1])
     assert out["counts"] == {"standard": out["want"], "zarr": out["want"], "optimised": out["want"]}
     assert not out["imported"]
-    assert out["asked"].startswith("ValueError") and "pip install zarr-octree" in out["asked"], out["asked"]
+    assert out["asked"].startswith("ValueError") and "github.com/Andrew-Keenlyside/zarr-octree" in out["asked"], out["asked"]
