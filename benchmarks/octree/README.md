@@ -46,10 +46,10 @@ links in those cells, kept when every endpoint was read.
 
 ## Current limitations (as found)
 
-* **Graphs cannot be read by object.**  The object index is written, but
-  `read_graph(object_ids=)` was never implemented and refuses
-  (`select(objects=)` on a graph or skeleton too).  Meshes can (they cannot
-  be read by group).  The mesh object path would serve graphs as well.
+* **Graphs could not be read by object** (`read_graph(object_ids=)` refused)
+  until this branch: they now take the mesh object path
+  (`read_object_links`), with a skeleton's implicit edges rebuilt per
+  fragment.  Meshes, graphs and skeletons still cannot be read by group.
 * **Each array's metadata lists every non-empty cell** (`nonempty_chunks`):
   120 kB per array at 20k points, 685 kB at 4 M.  A cold read fetches it
   for each array it touches, so it dominates small reads.
@@ -68,7 +68,7 @@ reads through zarr's API were not run (minutes to hours each).
 |---|---|---|---|
 | store size, indexed / octree | 87 / 82 MB | 342 / 103 MB | 156 / 96 MB |
 | all, local: standard / optimised | 641 / 10.9 s | 653 / 48 s | 962 / 44 s |
-| objects, 20 ms: zarr / optimised | 6.5 / 1.5 s | 4.5 / 2.4 s | not supported |
+| objects, 20 ms: zarr / optimised | 6.5 / 1.5 s | 4.5 / 2.4 s | not run (before graph object reads) |
 | box, 20 ms: zarr / optimised | 2.0 / 1.0 s | 3.6 / 2.1 s | 3.9 / 1.5 s |
 | one vertex, 20 ms (any) | 0.71 s | 0.52 s | 0.72 s |
 

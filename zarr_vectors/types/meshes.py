@@ -707,22 +707,72 @@ def _read_mesh_objects(
 ) -> dict[str, Any]:
     """:func:`read_mesh` for ``object_ids=``: the named objects and nothing else.
 
-    The object index names each object's ``(chunk, fragment)`` pairs, and
-    ``write_mesh`` writes one fragment per object per chunk, so the
-    vertices are exactly those fragments' rows.  Faces come from the
+    The rows and faces come from :func:`read_object_links`; a face is
+    kept only when every endpoint is one of the objects' rows, so a face
+    shared with an object not asked for is dropped.
+    """
+    read = read_object_links(
+        level_group, object_ids, scope=scope, dtype=dtype, ndim=ndim,
+        link_width=link_width, aligned=aligned,
+    )
+    if read is None:
+        result = _empty_mesh_result(ndim, link_width)
+        result["object_ids"] = np.zeros(0, dtype=np.int64)
+        return result
+    positions_out, owners_out, rows, _starts = read
+    faces_out = rows[(rows >= 0).all(axis=1)]
+
+    if bbox is not None:
+        positions_out, faces_out, keep = _bbox_filter(
+            positions_out, faces_out, bbox, link_width,
+        )
+        if keep is not None:
+            owners_out = owners_out[keep]
+
+    return {
+        "vertices": positions_out,
+        "faces": faces_out,
+        "vertex_count": len(positions_out),
+        "face_count": len(faces_out),
+        "object_ids": owners_out,
+    }
+
+
+def read_object_links(
+    level_group: FsGroup,
+    object_ids: list[int],
+    *,
+    scope: set[ChunkCoords] | None,
+    dtype: np.dtype,
+    ndim: int,
+    link_width: int,
+    aligned: bool = False,
+) -> tuple[
+    npt.NDArray, npt.NDArray[np.int64], npt.NDArray[np.int64], npt.NDArray[np.int64],
+] | None:
+    """The named objects' vertex rows and the links among their chunks.
+
+    Shared by the mesh and graph object reads.  The object index names
+    each object's ``(chunk, fragment)`` pairs, and ``write_mesh`` and
+    ``write_graph`` both write one fragment per object per chunk, so the
+    vertices are exactly those fragments' rows.  Links come from the
     link cells wholly inside the objects' chunks
-    (:func:`link_cells_within`) and are kept only when every endpoint is
-    one of those rows.  Nothing outside the objects' chunks is read.
+    (:func:`link_cells_within`).  Nothing outside the objects' chunks is
+    read.
 
     ``scope`` is the chunk set a ``bbox`` / ``chunks`` / attribute filter
     narrowed the read to, or ``None``; fragments outside it are dropped.
 
     ``aligned`` is the level's ``link_fragments_aligned`` claim.  Under
-    it a chunk's intra-chunk faces are filed one link fragment per vertex
+    it a chunk's intra-chunk links are filed one link fragment per vertex
     fragment, so only the objects' own link fragments are taken from
-    each cell; without it the whole cell is taken and filtered.  The
-    filter runs either way, so a face shared with an object not asked
-    for is dropped on both paths.
+    each cell; without it the whole cell is taken.
+
+    Returns ``(positions, owners, link_rows, fragment_starts)`` -- the
+    rows grouped by object in the order asked for, each row's object,
+    every link read as output rows (``-1`` for an endpoint that is not
+    one of ours; the caller decides what that means), and the output row
+    each fragment starts at -- or ``None`` when no fragment is in scope.
     """
     wanted: list[int] = list(dict.fromkeys(int(o) for o in object_ids))
     manifests = read_object_manifests(level_group, ids=wanted) if wanted else {}
@@ -734,9 +784,7 @@ def _read_mesh_objects(
             if scope is None or cc in scope:
                 entries.append((oid, cc, int(frag)))
     if not entries:
-        result = _empty_mesh_result(ndim, link_width)
-        result["object_ids"] = np.zeros(0, dtype=np.int64)
-        return result
+        return None
 
     obj_chunks = sorted({cc for _, cc, _ in entries})
     link_cells = link_cells_within(level_group, obj_chunks)
@@ -776,8 +824,9 @@ def _read_mesh_objects(
 
     positions: list[npt.NDArray] = []
     owners: list[npt.NDArray[np.int64]] = []
+    starts: list[int] = []
     # Chunk-local row -> output row, -1 where the row is not ours.  This
-    # is the whole face filter: a face survives when every endpoint maps.
+    # is the whole link filter: a link survives when every endpoint maps.
     row_maps: dict[ChunkCoords, npt.NDArray[np.int64]] = {}
     running = 0
     with level_group.batched_reads(plan):
@@ -811,6 +860,7 @@ def _read_mesh_objects(
                     read_fragment(level_group, cc, frag, dtype=dtype, ndim=ndim),
                 )
                 owners.append(np.full(len(rows), oid, dtype=np.int64))
+                starts.append(running)
                 running += len(rows)
 
             face_chunks, face_vi = read_link_arrays(
@@ -818,27 +868,15 @@ def _read_mesh_objects(
                 link_fragments=link_fragments,
             )
 
-    positions_out = np.concatenate(positions, axis=0)
-    owners_out = np.concatenate(owners)
-    faces_out = np.zeros((0, link_width), dtype=np.int64)
+    link_rows = np.zeros((0, link_width), dtype=np.int64)
     if face_vi.shape[0] and face_vi.shape[1] == link_width:
-        rows = _endpoints_through_row_maps(face_chunks, face_vi, row_maps)
-        faces_out = rows[(rows >= 0).all(axis=1)]
-
-    if bbox is not None:
-        positions_out, faces_out, keep = _bbox_filter(
-            positions_out, faces_out, bbox, link_width,
-        )
-        if keep is not None:
-            owners_out = owners_out[keep]
-
-    return {
-        "vertices": positions_out,
-        "faces": faces_out,
-        "vertex_count": len(positions_out),
-        "face_count": len(faces_out),
-        "object_ids": owners_out,
-    }
+        link_rows = _endpoints_through_row_maps(face_chunks, face_vi, row_maps)
+    return (
+        np.concatenate(positions, axis=0),
+        np.concatenate(owners),
+        link_rows,
+        np.asarray(starts, dtype=np.int64),
+    )
 
 
 def _link_plan(

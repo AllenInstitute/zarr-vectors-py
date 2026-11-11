@@ -65,7 +65,7 @@ LAYOUTS = {  # name: (codec, Layout(octree=...)); True is the codec's defaults
 }
 READERS = ("zarr", "standard", "optimised")
 VERTEX_BOX = 0.5
-NO_OBJECT_READS = {"network"}
+NO_OBJECT_READS: set[str] = set()  # every kind reads by object (graphs since read_graph(object_ids=))
 
 
 def make_data(kind: str, n: int) -> dict:
