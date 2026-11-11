@@ -58,3 +58,29 @@ links in those cells, kept when every endpoint was read.
   arrays, and links are most of a mesh's or graph's bytes.
 * **Through zarr's API, a whole-level read re-reads a shard's index for every
   cell**: GBs read from a store of MBs, set by the cell count, not the data.
+
+## Results (4 M vertices, 64³ cells, 16³ per shard)
+
+`results/bench_kinds.json`, figures in `results/figures/`.  Whole-level
+reads through zarr's API were not run (minutes to hours each).
+
+| | Point cloud | Mesh | Network |
+|---|---|---|---|
+| store size, indexed / octree | 87 / 82 MB | 342 / 103 MB | 156 / 96 MB |
+| all, local: standard / optimised | 641 / 10.9 s | 653 / 48 s | 962 / 44 s |
+| objects, 20 ms: zarr / optimised | 6.5 / 1.5 s | 4.5 / 2.4 s | not supported |
+| box, 20 ms: zarr / optimised | 2.0 / 1.0 s | 3.6 / 2.1 s | 3.9 / 1.5 s |
+| one vertex, 20 ms (any) | 0.71 s | 0.52 s | 0.72 s |
+
+* **The reader, not the layout, sets the time.**  Octree and
+  `sharding_indexed` are within ~10 % on every query and reader (one
+  exception: objects, local, standard reader, octree 40 % slower).
+* **Octree shrinks link-heavy stores.**  A `sharding_indexed` shard index is
+  16 B for every cell of the shard whether it holds data or not (65 kB at
+  16³); with 61 link arrays (mesh) that is ~230 MB of the 342 MB store.
+  Octree indexes only occupied cells.  Through zarr it also halves the bytes
+  a query reads (it re-reads the index per cell), but at these latencies
+  time follows request count, not bytes.
+* **One vertex costs ~0.5-0.7 s at 20 ms whatever the store or reader**:
+  10-30 MB read, nearly all array metadata (`nonempty_chunks`) and object
+  index; the vertex data is bytes.
