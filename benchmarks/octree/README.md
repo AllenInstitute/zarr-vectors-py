@@ -73,8 +73,8 @@ reads through zarr's API were not run (minutes to hours each).
 | one vertex, 20 ms (any) | 0.71 s | 0.52 s | 0.72 s |
 
 * **The reader, not the layout, sets the time.**  Octree and
-  `sharding_indexed` are within ~10 % on every query and reader (one
-  exception: objects, local, standard reader, octree 40 % slower).
+  `sharding_indexed` are within ~5 % at 20 and 80 ms; locally octree is up
+  to 15 % slower (40 % for objects with the standard reader).
 * **Octree shrinks link-heavy stores.**  A `sharding_indexed` shard index is
   16 B for every cell of the shard whether it holds data or not (65 kB at
   16³); with 61 link arrays (mesh) that is ~230 MB of the 342 MB store.
