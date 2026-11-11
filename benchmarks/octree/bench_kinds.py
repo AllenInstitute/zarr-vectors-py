@@ -153,8 +153,14 @@ def checksum(r) -> dict:
     return out
 
 
+def reads_through_zarr(reader: str, latency: float) -> bool:
+    """Whether ``reader`` reads this store's shards through zarr's API: the
+    ``zarr`` reader always, the ``standard`` one for a store that is not local."""
+    return reader == "zarr" or (reader == "standard" and bool(latency))
+
+
 def run_queries(root: Path, kind: str, layout: str, reader: str, latency: float, bandwidth: float,
-                max_inflight: int, queries: list) -> list[dict]:
+                max_inflight: int, queries: list, skip_zarr_all: bool = False) -> list[dict]:
     import zarr_vectors as zv
 
     os.environ["ZARR_VECTORS_SHARD_READER"] = reader
@@ -162,6 +168,8 @@ def run_queries(root: Path, kind: str, layout: str, reader: str, latency: float,
     path = root / f"{kind}-{layout}.zv"
     rows = []
     for qi, (qkind, label, size, sel) in enumerate(queries):
+        if skip_zarr_all and qkind == "all" and reads_through_zarr(reader, latency):
+            continue
         if latency:
             store = LatencyStore(LocalStore(str(path), read_only=True), latency, bandwidth, max_inflight)
             ds = zv.open(store)
@@ -203,6 +211,9 @@ def main() -> None:
     ap.add_argument("--quick", action="store_true", help="fewer queries and sizes; local and 20 ms only")
     ap.add_argument("--latencies", type=float, nargs="+", help="seconds per request (default 0 0.02 0.08)")
     ap.add_argument("--skip-build", action="store_true", help="reuse the stores and build record already there")
+    ap.add_argument("--skip-zarr-all", action="store_true",
+                    help="no whole-level reads through zarr's API (the zarr reader, and the standard one "
+                         "off a store that is not local): at 4 M vertices each takes minutes")
     ap.add_argument("--max-inflight", type=int, default=128)
     ap.add_argument("--bandwidth", type=float, default=100e6)
     args = ap.parse_args()
@@ -221,7 +232,8 @@ def main() -> None:
     results = {"setup": {"vertices": args.vertices, "cells": CELLS, "shard_cells": SHARD, "layouts":
                          {l: LAYOUTS[l] for l in args.layouts}, "readers": READERS, "latencies": latencies,
                          "zarr": zarr.__version__, "bandwidth": args.bandwidth, "max_inflight": args.max_inflight,
-                         "quick": args.quick, "no_object_reads": sorted(NO_OBJECT_READS)},
+                         "quick": args.quick, "no_object_reads": sorted(NO_OBJECT_READS),
+                         "skip_zarr_all": args.skip_zarr_all},
                "data": {}, "build": {}, "queries": []}
     if args.out.exists():  # keep the kinds a previous run finished
         old = json.loads(args.out.read_text())
@@ -253,7 +265,7 @@ def main() -> None:
                 for reader in READERS:
                     t0 = time.perf_counter()
                     mine = run_queries(args.stores, kind, layout, reader, latency, args.bandwidth,
-                                       args.max_inflight, queries)
+                                       args.max_inflight, queries, args.skip_zarr_all)
                     rows += mine
                     med = {q: np.median([r["seconds"] for r in mine if r["query"] == q]) * 1e3
                            for q in ("all", "vertex", "object", "bbox") if any(r["query"] == q for r in mine)}

@@ -83,10 +83,12 @@ def fig_time(res: dict, lat: float, out: Path) -> None:
             for yi, layout in zip(y, layouts):
                 for k, reader in enumerate(readers):
                     mine = [r for r in rows if r["layout"] == layout and r["reader"] == reader]
+                    yy = yi + h * ((len(readers) - 1) / 2 - k)
                     if not mine:
+                        if rows and qk == "all" and res["setup"].get("skip_zarr_all"):
+                            ax.text(0, yy, " not run (minutes through zarr)", va="center", fontsize=6.5, color=MUTED)
                         continue
                     v = geomean_of_medians(mine) * 1e3
-                    yy = yi + h * ((len(readers) - 1) / 2 - k)
                     ax.barh(yy, v, color=READER_COLOR[reader], height=h * 0.9)
                     ax.text(v * 1.03, yy, fmt(v), va="center", fontsize=7, color=INK2)
                     top = max(top, v)
