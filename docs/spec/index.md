@@ -90,7 +90,7 @@ validator without access to the original authors.
 | [OME-Zarr NGFF](https://ngff.openmicroscopy.org/) | Zarr Vectors borrows the `multiscales` JSON block (which also holds the store's axes) for resolution pyramid metadata, and since 0.9.2 writes an additive RFC 8 `ome` node so an OME collection can name the store. Zarr Vectors-specific keys are additive extensions. |
 | [Allen Institute Zarr Vectors specification](https://github.com/AllenInstitute/zarr_vectors) | The original specification by Forest Collman. `zarr-vectors-py` implements and extends this spec. |
 | [Neuroglancer precomputed](https://github.com/google/neuroglancer/tree/master/src/datasource/precomputed) | A related format for static Neuroglancer hosting. See [comparison](comparisons/neuroglancer_precomputed.md). |
-| [TRX format](https://tractography-file-format.github.io/) | A streamline-specific format. See [comparison](comparisons/trx_format.md). |
+| [TRX format](https://tee-ar-ex.github.io/) | A streamline-specific format. See [comparison](comparisons/trx_format.md). |
 
 ---
 
