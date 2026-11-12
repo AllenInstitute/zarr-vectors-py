@@ -5,16 +5,31 @@ a level becomes octree-chunked only by :func:`to_octree`, which plans
 leaves over the level's own cells (the uniform chunk is the finest leaf)
 and rewrites the per-chunk arrays leaf by leaf.  :func:`to_uniform` undoes
 it: every cell gets back its vertex rows in their order, its fragments,
-its objects' manifest entries and its links.
+its objects' manifest entries (under their own object ids) and its links.
 
 A leaf's vertex block is its cells' blocks laid end to end (cells in Z
 order) and its fragments are theirs, so the conversion moves rows without
 regrouping them; ``octree_chunks/cells`` records which cell each run came
 from, which is what makes the way back exact.
+
+Both conversions are safe to interrupt.  Everything that can fail on the
+input -- unsupported content, links longer than a cell, manifests or
+links naming rows that are not there -- is checked while the level is
+only being read.  The new layout is then written into a staging group
+under the level (``<level>/octree_chunks_staging``), which readers never
+look at, and swapped in array by array.  The swap starts by marking the
+level ``converting``, so a reader refuses it rather than mixing the two
+layouts; running the same conversion (or the other one) again finishes
+an interrupted swap, and discards a staging group whose swap never
+started.  So a failure or kill at any point leaves the old level intact,
+or a level the next call completes.
 """
 
 from __future__ import annotations
 
+import os
+from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 
 import numpy as np
@@ -41,8 +56,9 @@ from zarr_vectors.core.arrays import (
     create_object_index_array,
     create_vertices_array,
     list_link_offsets,
+    object_shard_rows,
     open_write_session,
-    read_all_object_manifests,
+    read_all_object_manifests_csr,
     read_chunk_vertices,
     read_link_arrays,
     read_vertex_fragment_index,
@@ -52,15 +68,20 @@ from zarr_vectors.core.arrays import (
     write_object_index,
 )
 from zarr_vectors.core.metadata import get_level_chunk_shape
+from zarr_vectors.core.paths import parse_delta
 from zarr_vectors.core.store import (
     _finalize_write,
     get_resolution_level,
+    list_resolution_levels,
     open_store,
     read_level_metadata,
     read_root_metadata,
 )
+from zarr_vectors.encoding.compression import codecs_for_create_array, resolve_compressor
+from zarr_vectors.encoding.octree_marker import OCTREE_MARKER_CODEC, is_marker
 from zarr_vectors.encoding.ragged import decode_ragged_blob, encode_ragged_blob
 from zarr_vectors.exceptions import ArrayError
+from zarr_vectors.octree_chunks.guard import LEVEL_KEY, LEVEL_META_KEY, converting
 from zarr_vectors.octree_chunks.table import (
     LeafTable,
     OctreeError,
@@ -70,28 +91,40 @@ from zarr_vectors.octree_chunks.table import (
     plan_leaves,
 )
 
-LEVEL_KEY = "octree_chunks"          # block in the level's zarr_vectors_level attrs
 TABLES = "octree_chunks"             # group holding the leaf and cell tables
 LEAVES_TABLE = f"{TABLES}/leaves"    # (N, 5): depth, i, j, k, weight
 CELLS_TABLE = f"{TABLES}/cells"      # (C, 6): cell i, j, k, leaf, vertices, fragments
-_LEVEL_META_KEY = "zarr_vectors_level"
+STAGING = "octree_chunks_staging"    # group a conversion writes into before the swap
+_STAGING_KEY = "octree_chunks_staging"  # its record: direction, arrays, final metadata
+_LEVEL_META_KEY = LEVEL_META_KEY
 _PER_CHUNK = (VERTICES, VERTEX_FRAGMENTS, LINKS, LINK_FRAGMENTS, OBJECT_INDEX)
+_SWAPPED = (*_PER_CHUNK, TABLES)     # every array a conversion replaces or removes
 
 
 # -- reading the level's octree state -----------------------------------------
 
 def octree_meta(level_group: Any) -> dict[str, Any] | None:
-    """The level's octree block, or ``None`` for a uniform level."""
+    """The level's octree block, or ``None`` for a uniform level.
+
+    A level whose conversion is part way through its swap holds
+    ``{"converting": "to_octree" | "to_uniform"}`` here.
+    """
     level = level_group.attrs.get(_LEVEL_META_KEY)
     block = level.get(LEVEL_KEY) if isinstance(level, dict) else None
     return dict(block) if isinstance(block, dict) else None
 
 
 def leaf_table(level_group: Any) -> LeafTable:
-    """The level's :class:`LeafTable`; raises on a uniform level."""
+    """The level's :class:`LeafTable`; raises on a uniform level, and on
+    one an interrupted conversion left part way through its swap."""
     meta = octree_meta(level_group)
     if meta is None:
         raise OctreeError("this level has uniform chunks, not octree chunks")
+    if "converting" in meta:
+        raise OctreeError(
+            f"this level is part way through {meta['converting']} (interrupted?); "
+            f"run zarr_vectors.octree_chunks.{meta['converting']} on it again to finish"
+        )
     cache = level_group.__dict__.setdefault("_octree_leaf_table", {})
     key = (meta.get("max_depth"), tuple(meta.get("origin_cell", ())), meta.get("leaves"))
     if key not in cache:
@@ -109,15 +142,28 @@ def cell_table(level_group: Any) -> npt.NDArray[np.int64]:
 # -- helpers -------------------------------------------------------------------
 
 def _level_compressors(level_group: Any) -> list[dict[str, Any]] | None:
-    """The cell compressors of the level's ``vertices`` array, to keep on rewrite."""
+    """The cell compressors of the level's ``vertices`` array, to keep on
+    rewrite (without the octree marker codec, which :func:`_marked` sets)."""
     try:
         codecs = level_group._zarr[VERTICES].metadata.to_dict()["codecs"]
     except Exception:
         return None
     if codecs and "sharding" in str(codecs[0].get("name", "")):
         codecs = codecs[0]["configuration"]["codecs"]
-    out = [c for c in codecs if c.get("name") not in ("vlen-bytes", "bytes", "vlen-utf8")]
+    out = [c for c in codecs
+           if c.get("name") not in ("vlen-bytes", "bytes", "vlen-utf8") and not is_marker(c)]
     return out or None
+
+
+def _marked(compressor: Any, octree: bool) -> list[dict[str, Any]] | None:
+    """``compressor`` as a codec list, ending in the octree marker codec
+    (:mod:`zarr_vectors.encoding.octree_marker`) when ``octree``, without it
+    otherwise.  The marker makes zarr readers that do not know octree
+    chunks refuse the level's arrays instead of reading leaves as cells."""
+    codecs = [c for c in codecs_for_create_array(resolve_compressor(compressor)) if not is_marker(c)]
+    if octree:
+        codecs.append({"name": OCTREE_MARKER_CODEC})
+    return codecs or None
 
 
 def _check_convertible(root: Any, level_group: Any, level: int) -> tuple[Any, tuple[float, ...]]:
@@ -132,9 +178,6 @@ def _check_convertible(root: Any, level_group: Any, level: int) -> tuple[Any, tu
     for name in (VERTEX_ATTRIBUTES, FRAGMENT_ATTRIBUTES, LINK_ATTRIBUTES):
         if level_group.array_exists(name):
             raise OctreeError(f"converting a level with {name} is not supported yet")
-    for delta in (-2, -1, 1, 2):
-        if list_link_offsets(level_group, delta):
-            raise OctreeError("converting a level with links to other levels is not supported yet")
     if level_group.array_exists(f"{LINKS}/0"):
         fam = level_group.read_array_meta(f"{LINKS}/0") or {}
         if fam.get("directed") or fam.get("store", "canonical") != "canonical" or int(fam.get("link_width", 2)) != 2:
@@ -148,13 +191,26 @@ def _check_convertible(root: Any, level_group: Any, level: int) -> tuple[Any, tu
     return meta, tuple(get_level_chunk_shape(meta, level_meta))
 
 
-def _drop_per_chunk_arrays(level_group: Any, extra: tuple[str, ...] = ()) -> None:
-    for name in (*_PER_CHUNK, *extra):
-        try:
-            level_group.delete_subtree(name)
-        except Exception:
-            pass
-    level_group.__dict__.pop("_octree_leaf_table", None)
+def _check_no_cross_level_links(root: Any, level: int) -> None:
+    """Refuse when any level holds links into or out of ``level``: they
+    address its vertices by cell and row, which a conversion changes."""
+    for m in list_resolution_levels(root):
+        lg = get_resolution_level(root, m)
+        if not lg.array_exists(LINKS):
+            continue
+        for seg in lg[LINKS].child_names():
+            try:
+                delta = parse_delta(seg)
+            except ValueError:
+                continue
+            if delta == 0 or (m != level and m + delta != level):
+                continue
+            if list_link_offsets(lg, delta):
+                raise OctreeError(
+                    f"level {m} holds links to level {m + delta}; converting level {level} "
+                    f"would leave them naming the wrong vertices (links between levels are "
+                    f"not supported with octree chunks yet)"
+                )
 
 
 def _set_level_block(level_group: Any, block: dict[str, Any] | None) -> None:
@@ -175,11 +231,41 @@ def _set_capability(root: Any, on: bool) -> None:
     root.attrs.update({"zarr_vectors": block})
 
 
+def _any_octree_level(root: Any) -> bool:
+    return any(octree_meta(get_resolution_level(root, m)) is not None
+               for m in list_resolution_levels(root))
+
+
 def _vertex_dtype(level_group: Any) -> np.dtype:
     try:
         return np.dtype(level_group.read_array_meta(VERTICES).get("dtype", "float32"))
     except Exception:
         return np.dtype("float32")
+
+
+def _locate(table: npt.ArrayLike, query: npt.ArrayLike) -> npt.NDArray[np.int64]:
+    """Row of ``table`` (unique ``(N, 3)`` rows) equal to each query row, ``-1`` if none."""
+    table = np.asarray(table, dtype=np.int64).reshape(-1, 3)
+    query = np.asarray(query, dtype=np.int64).reshape(-1, 3)
+    out = np.full(len(query), -1, dtype=np.int64)
+    if not len(table) or not len(query):
+        return out
+    lo = table.min(axis=0)
+    span = table.max(axis=0) - lo + 1
+
+    def code(rows: npt.NDArray[np.int64]) -> npt.NDArray[np.int64]:
+        rel = rows - lo
+        return (rel[:, 0] * span[1] + rel[:, 1]) * span[2] + rel[:, 2]
+
+    tc = code(table)
+    order = np.argsort(tc)
+    rel = query - lo
+    ok = ((rel >= 0) & (rel < span)).all(axis=1)
+    qc = code(np.where(ok[:, None], query, lo))
+    pos = np.minimum(np.searchsorted(tc[order], qc), len(tc) - 1)
+    hit = ok & (tc[order][pos] == qc)
+    out[hit] = order[pos[hit]]
+    return out
 
 
 def _read_cells(level_group: Any, cells: list[tuple[int, ...]], dtype: np.dtype) -> list[list[npt.NDArray]]:
@@ -197,26 +283,118 @@ def _read_cells(level_group: Any, cells: list[tuple[int, ...]], dtype: np.dtype)
                         f"octree chunks need (one run per fragment)"
                     )
                 start += fi.range(f)[1]
-            out.append(read_chunk_vertices(level_group, cc, dtype=dtype, ndim=3))
+            out.append(read_chunk_vertices(level_group, cc, dtype=dtype, ndim=3, _leaf=True))
     return out
 
 
-def _write_octree_links(level_group: Any, table: LeafTable, leaf_a: npt.NDArray[np.int64],
-                        row_a: npt.NDArray[np.int64], leaf_b: npt.NDArray[np.int64],
-                        row_b: npt.NDArray[np.int64]) -> int:
-    """File every link under its source leaf, in the array its ``(offset, Δ)`` names."""
+# -- the object layer ------------------------------------------------------------
+
+@dataclass
+class _Objects:
+    """A level's object index as CSR rows, with each row's real object id."""
+
+    meta: dict[str, Any]                # the index's metadata as found
+    ids: npt.NDArray[np.int64]          # (n,) object id of each row
+    offsets: npt.NDArray[np.int64]      # (n + 1,) row -> its entries
+    coords: npt.NDArray[np.int64]       # (M, 3) chunk of each entry
+    frags: npt.NDArray[np.int64]        # (M,) fragment of each entry
+    layout: str | None                  # "vlen" / "dense"; None: no rows, kept as found
+    block_dtype: Any
+    shard_rows: int | None
+
+
+def _read_objects(level_group: Any) -> _Objects | None:
+    """The level's object index, or ``None`` when it has none.
+
+    Ids come from the index's id table, so sparse ids (``7, 1007, ...``)
+    survive the rewrite; rows must be in increasing id order, the order
+    :func:`write_object_index` writes, so object attribute rows stay
+    aligned with them.
+    """
+    from zarr_vectors.core import dense_manifests as dense
+
+    if not level_group.array_exists(OBJECT_INDEX):
+        return None
+    meta = dict(level_group.read_array_meta(OBJECT_INDEX) or {})
+    shard_rows = object_shard_rows(level_group)
+    if not int(meta.get("num_objects", 0) or 0) or "sid_ndim" not in meta:
+        z = np.zeros(0, np.int64)
+        return _Objects(meta, z, np.zeros(1, np.int64), np.zeros((0, 3), np.int64), z, None, None, shard_rows)
+    if int(meta["sid_ndim"]) != 3:
+        raise OctreeError(f"the object index has {meta['sid_ndim']} spatial index dimensions, not 3")
+    csr = read_all_object_manifests_csr(level_group)
+    offsets = np.asarray(csr.offsets, dtype=np.int64).reshape(-1)
+    n = len(offsets) - 1
+    ids = np.arange(n, dtype=np.int64) if csr.object_ids is None else np.asarray(csr.object_ids, np.int64)
+    if len(ids) != n:
+        raise OctreeError(f"the object id table has {len(ids)} rows for {n} objects")
+    if n > 1 and (np.diff(ids) <= 0).any():
+        raise OctreeError("the object id table is not in increasing order, which converting needs")
+    layout = "dense" if dense.is_dense(level_group, meta) else "vlen"
+    return _Objects(
+        meta, ids, offsets,
+        np.asarray(csr.chunk_coords, dtype=np.int64).reshape(-1, 3),
+        np.asarray(csr.fragment_idx, dtype=np.int64).reshape(-1),
+        layout, meta.get(dense.BLOCK_DTYPE_ATTR) if layout == "dense" else None, shard_rows,
+    )
+
+
+def _write_objects(group: Any, objs: _Objects, coords: npt.NDArray[np.int64],
+                   frags: npt.NDArray[np.int64]) -> None:
+    """Write ``objs`` with its entries moved to ``coords`` / ``frags``, keyed by real id."""
+    create_object_index_array(group)
+    if objs.layout is None:
+        group.write_array_meta(OBJECT_INDEX, objs.meta)
+        return
+    cl, fl, off = coords.tolist(), frags.tolist(), objs.offsets.tolist()
+    manifests = {
+        oid: [(tuple(cl[m]), int(fl[m])) for m in range(off[o], off[o + 1])]
+        for o, oid in enumerate(objs.ids.tolist())
+    }
+    write_object_index(group, manifests, sid_ndim=3, layout=objs.layout, block_dtype=objs.block_dtype)
+
+
+def _shard_objects_like(group: Any, objs: _Objects | None) -> None:
+    """Give the rewritten object layer the row sharding the old one had."""
+    if objs is not None and objs.shard_rows is not None and objs.layout is not None:
+        from zarr_vectors.sharding.io import shard_object_layer
+
+        shard_object_layer(group, objs.shard_rows)
+
+
+# -- octree links ----------------------------------------------------------------
+
+@dataclass
+class _LinkPlan:
+    """Links filed under their source leaf, each with its ``(offset, Δ)`` segment."""
+
+    src: npt.NDArray[np.int64]
+    r_src: npt.NDArray[np.int64]
+    off: npt.NDArray[np.int64]
+    dlt: npt.NDArray[np.int64]
+    r_oth: npt.NDArray[np.int64]
+
+
+def _plan_octree_links(table: LeafTable, leaf_a: npt.NDArray[np.int64], row_a: npt.NDArray[np.int64],
+                       leaf_b: npt.NDArray[np.int64], row_b: npt.NDArray[np.int64]) -> _LinkPlan:
+    """Choose each link's source leaf and segment; raises (before anything is
+    written) when a link joins leaves that are not adjacent."""
     leaf_a, leaf_b = np.asarray(leaf_a, np.int64), np.asarray(leaf_b, np.int64)
     a_src = (leaf_a == leaf_b) | (table.link_source(leaf_a, leaf_b) if len(leaf_a) else np.zeros(0, bool))
     src = np.where(a_src, leaf_a, leaf_b)
     oth = np.where(a_src, leaf_b, leaf_a)
-    r_src = np.where(a_src, row_a, row_b)
-    r_oth = np.where(a_src, row_b, row_a)
     off = np.zeros((len(src), 3), dtype=np.int64)
     dlt = np.zeros(len(src), dtype=np.int64)
     cross = src != oth
     if cross.any():
         off[cross], dlt[cross] = table.link_offsets(src[cross], oth[cross])
+    return _LinkPlan(src, np.where(a_src, row_a, row_b).astype(np.int64), off, dlt,
+                     np.where(a_src, row_b, row_a).astype(np.int64))
 
+
+def _write_octree_links(level_group: Any, table: LeafTable, plan: _LinkPlan) -> int:
+    """File every link under its source leaf, in the array its ``(offset, Δ)`` names."""
+    src = plan.src
     family = f"{LINKS}/0"
     level_group.write_array_meta(family, {
         "zv_array": "links_family", "level_delta": 0, "link_width": 2,
@@ -226,7 +404,7 @@ def _write_octree_links(level_group: Any, table: LeafTable, leaf_a: npt.NDArray[
     })
     if not len(src):
         return 0
-    groups = np.column_stack([off, dlt])
+    groups = np.column_stack([plan.off, plan.dlt])
     seg_rows, seg_of = np.unique(groups, axis=0, return_inverse=True)
     seg_of = seg_of.reshape(-1)
     wanted = []
@@ -244,7 +422,7 @@ def _write_octree_links(level_group: Any, table: LeafTable, leaf_a: npt.NDArray[
         leaves, starts = np.unique(src[order], return_index=True)
         cells = []
         for leaf, rows_idx in zip(leaves.tolist(), np.split(order, starts[1:])):
-            rows = np.column_stack([r_src[rows_idx], r_oth[rows_idx]]).astype(np.int64)
+            rows = np.column_stack([plan.r_src[rows_idx], plan.r_oth[rows_idx]]).astype(np.int64)
             cells.append((_chunk_key(tuple(anchors[leaf].tolist())), encode_ragged_blob([rows], np.dtype(np.int64))))
         level_group.write_cells(path, cells)
     return int(len(src))
@@ -289,6 +467,136 @@ def read_octree_link_cells(level_group: Any, table: LeafTable, leaves: npt.Array
     return tuple(np.concatenate(x).astype(np.int64) for x in out)  # type: ignore[return-value]
 
 
+# -- staging and the swap ------------------------------------------------------------
+
+def _open_staging(level_group: Any) -> Any:
+    """A fresh staging group under the level, carrying the level's metadata
+    (without its octree block), so writers size and pack arrays as the
+    level's own."""
+    level_group.delete_subtree(STAGING)
+    stage = level_group.require_group(STAGING)
+    attrs = dict(level_group.attrs.to_dict())
+    level = dict(attrs.get(_LEVEL_META_KEY) or {})
+    level.pop(LEVEL_KEY, None)
+    attrs[_LEVEL_META_KEY] = level
+    stage.attrs.update(attrs)
+    return stage
+
+
+def _seal(stage: Any, direction: str, block: dict[str, Any] | None, summary: dict[str, Any]) -> None:
+    """Record that ``stage`` is complete, with the level metadata it implies."""
+    level = dict(stage.attrs.get(_LEVEL_META_KEY) or {})
+    level.pop(LEVEL_KEY, None)
+    if block is not None:
+        level[LEVEL_KEY] = block
+    stage.attrs.update({_STAGING_KEY: {
+        "direction": direction, "complete": True,
+        "arrays": [n for n in _SWAPPED if n in stage],
+        "level": level,
+        "summary": {k: ([[int(a), int(b)] for a, b in v.items()] if k == "depths" else v)
+                    for k, v in summary.items()},
+    }})
+
+
+def _summary(rec: dict[str, Any]) -> dict[str, Any]:
+    return {k: ({int(a): int(b) for a, b in v} if k == "depths" else v)
+            for k, v in (rec.get("summary") or {}).items()}
+
+
+def _move(level_group: Any, stage: Any, name: str) -> None:
+    """Put ``<level>/<STAGING>/<name>`` where ``<level>/<name>`` was.
+
+    Idempotent across a kill: the staged node stays until it is in
+    place (a rename on a local store; elsewhere a copy, then ``name``
+    stamped ``moved`` in the staging record, then a delete -- a delete
+    cut short leaves a partial staged node that :func:`_swap` must not
+    copy again).
+    """
+    from zarr.core.buffer import default_buffer_prototype
+    from zarr.core.sync import sync
+    from zarr.storage import LocalStore
+
+    store = level_group.zarr_group.store
+    base = level_group.zarr_group.path.strip("/")
+    src = "/".join(p for p in (base, STAGING, name) if p)
+    dst = "/".join(p for p in (base, name) if p)
+    level_group.delete_subtree(name)
+    stage._invalidate_node(name)
+    if isinstance(store, LocalStore):
+        os.replace(Path(store.root) / src, Path(store.root) / dst)
+    else:
+        async def _copy() -> None:
+            proto = default_buffer_prototype()
+            async for key in store.list_prefix(f"{src}/"):
+                value = await store.get(key, prototype=proto)
+                if value is not None:
+                    await store.set(f"{dst}/{key[len(src) + 1:]}", value)
+
+        sync(_copy())
+        rec = dict(stage.attrs.get(_STAGING_KEY))
+        rec["moved"] = [*rec.get("moved", []), name]
+        stage.attrs.update({_STAGING_KEY: rec})
+        stage.delete_subtree(name)
+    level_group._invalidate_node(name)
+
+
+def _swap(root: Any, level_group: Any, stage: Any) -> dict[str, Any]:
+    """Replace the level's arrays with the staged ones.
+
+    Marking the level ``converting`` is the commit point: from there on
+    readers refuse the level and :func:`_resume` finishes the swap
+    instead of discarding the staging group.
+    """
+    rec = dict(stage.attrs.get(_STAGING_KEY))
+    with converting(level_group, stage, root):
+        _set_level_block(level_group, {"converting": rec["direction"]})
+        _set_capability(root, True)
+        for name in _SWAPPED:
+            if name in rec["arrays"]:
+                if name in stage and name not in rec.get("moved", ()):
+                    _move(level_group, stage, name)
+            else:
+                level_group.delete_subtree(name)
+        level_group.attrs.update({_LEVEL_META_KEY: rec["level"]})
+        level_group.delete_subtree(STAGING)
+        level_group.__dict__.pop("_octree_leaf_table", None)
+        _set_capability(root, _any_octree_level(root))
+    return rec
+
+
+def _resume(root: Any, level_group: Any) -> dict[str, Any] | None:
+    """Deal with what an interrupted conversion left; returns its record
+    when it finished one, else ``None``.
+
+    A staging group whose swap never started is discarded (the level is
+    as it was, and may have changed since the staging copy was made); a
+    swap that started is finished.
+    """
+    block = octree_meta(level_group)
+    marked = block is not None and "converting" in block
+    if STAGING not in level_group:
+        if marked:
+            raise OctreeError(
+                f"this level was part way through {block['converting']} but its staged "
+                f"arrays ({STAGING}) are gone, so it cannot be finished"
+            )
+        return None
+    stage = level_group[STAGING]
+    if not marked:
+        with converting(level_group):
+            level_group.delete_subtree(STAGING)
+        return None
+    rec = stage.attrs.get(_STAGING_KEY)
+    if not (isinstance(rec, dict) and rec.get("complete") and rec.get("direction") == block["converting"]):
+        raise OctreeError(
+            f"this level was part way through {block['converting']} but its staged arrays "
+            f"are incomplete, so it cannot be finished"
+        )
+    _swap(root, level_group, stage)
+    _finalize_write(root, f"{rec['direction']} (resumed)")
+    return rec
+
+
 # -- the conversions ----------------------------------------------------------
 
 def to_octree(store: Any, *, target: float, level: int = 0, balanced: bool = True,
@@ -297,18 +605,30 @@ def to_octree(store: Any, *, target: float, level: int = 0, balanced: bool = Tru
 
     The uniform chunk is the finest leaf: no leaf is smaller, and a cell
     heavier than ``target`` stays one leaf.  Links must not be longer than
-    a cell (they never are between adjacent cells' leaves).
+    a cell (they never are between adjacent cells' leaves), and no level
+    may hold links into or out of this one.  Object ids are kept.  An
+    empty level becomes an octree level with no leaves.
+
+    Nothing is changed when the level cannot be converted.  When a
+    previous conversion of this level was interrupted during its swap,
+    this finishes it first (returning that conversion's summary, with
+    ``"resumed": True``, if it was a ``to_octree``).
 
     Returns a summary: leaf count, the largest leaf, the depths used.
     """
     root = open_store(store, mode="r+", backend=backend)
     level_group = get_resolution_level(root, level)
+    done = _resume(root, level_group)
+    if done is not None and done["direction"] == "to_octree":
+        return {**_summary(done), "resumed": True}
     if octree_meta(level_group) is not None:
         raise OctreeError("this level already has octree chunks; to_uniform first")
     meta, chunk_shape = _check_convertible(root, level_group, level)
+    _check_no_cross_level_links(root, level)
     dtype = _vertex_dtype(level_group)
-    comp = _level_compressors(level_group) if compressor == "inherit" else compressor
+    comp = _marked(_level_compressors(level_group) if compressor == "inherit" else compressor, True)
 
+    # -- plan: everything that can fail on the input, before any write.
     cells = sorted(_parse_chunk_key(k) for k in level_group.list_chunks(VERTICES))
     groups = _read_cells(level_group, cells, dtype)
     counts = np.array([sum(len(g) for g in gs) for gs in groups], dtype=np.int64)
@@ -317,7 +637,7 @@ def to_octree(store: Any, *, target: float, level: int = 0, balanced: bool = Tru
     groups = [g for g, k in zip(groups, keep) if k]
     counts = counts[keep]
     cell_arr = np.asarray(cells, dtype=np.int64).reshape(-1, 3)
-    manifests = read_all_object_manifests(level_group) if level_group.array_exists(OBJECT_INDEX) else []
+    objs = _read_objects(level_group)
     had_links = level_group.array_exists(f"{LINKS}/0")
     links = read_link_arrays(level_group, delta=0) if list_link_offsets(level_group, 0) else None
 
@@ -338,54 +658,84 @@ def to_octree(store: Any, *, target: float, level: int = 0, balanced: bool = Tru
         frag_off[c] = len(gl)
         gl.extend(groups[c])
     cell_rows = np.column_stack([cell_arr[order], leaf_of[order], counts[order], n_frag[order]])
-    cell_index = {c: n for n, c in enumerate(cells)}
     anchors = table.anchors()
 
-    new_manifests: dict[int, list[tuple[tuple[int, ...], int]]] = {}
-    for oid, entries in enumerate(manifests):
-        if entries:
-            new_manifests[oid] = [
-                (tuple(anchors[leaf_of[n]].tolist()), int(frag_off[n] + f))
-                for cc, f in entries
-                for n in [cell_index[tuple(int(x) for x in cc)]]
-            ]
-
-    _drop_per_chunk_arrays(level_group)
-    with open_write_session(level_group, compressor=comp, shard_shape="inherit",
-                            bounds=meta.bounds, chunk_shape=chunk_shape):
-        create_vertices_array(level_group, dtype=str(dtype))
-        create_object_index_array(level_group)
-        for leaf, gl in sorted(leaf_groups.items()):
-            write_chunk_vertices(level_group, tuple(anchors[leaf].tolist()), gl, dtype=dtype)
-        n_links = 0
-        if had_links:
-            ch, vi = links if links is not None else (np.zeros((0, 2, 3), np.int64), np.zeros((0, 2), np.int64))
-            cn_a = np.array([cell_index[tuple(c)] for c in ch[:, 0].tolist()], dtype=np.int64)
-            cn_b = np.array([cell_index[tuple(c)] for c in ch[:, 1].tolist()], dtype=np.int64)
-            n_links = _write_octree_links(
-                level_group, table, leaf_of[cn_a], row_off[cn_a] + vi[:, 0],
-                leaf_of[cn_b], row_off[cn_b] + vi[:, 1],
+    obj_coords = obj_frags = None
+    if objs is not None:
+        n = _locate(cell_arr, objs.coords)
+        bad = (n < 0) | (objs.frags < 0) | (objs.frags >= n_frag[np.maximum(n, 0)] if len(n_frag) else True)
+        if np.any(bad):
+            m = int(np.flatnonzero(bad)[0])
+            raise OctreeError(
+                f"an object manifest names fragment {int(objs.frags[m])} of cell "
+                f"{tuple(objs.coords[m].tolist())}, which the level does not hold"
             )
-        write_object_index(level_group, new_manifests, sid_ndim=3, total_objects=len(manifests))
-    stamp_fragments_tile(level_group, 3)
+        obj_coords = anchors[leaf_of[n]] if len(n) else np.zeros((0, 3), np.int64)
+        obj_frags = frag_off[n] + objs.frags
 
-    level_group.write_array(LEAVES_TABLE, table.to_rows())
-    level_group.write_array(CELLS_TABLE, cell_rows.astype(np.int64))
-    _set_level_block(level_group, {**table.meta(), "weight": "vertices", "leaves": len(table)})
-    _set_capability(root, True)
+    link_plan = None
+    if had_links:
+        ch, vi = links if links is not None else (np.zeros((0, 2, 3), np.int64), np.zeros((0, 2), np.int64))
+        ch = np.asarray(ch, dtype=np.int64).reshape(-1, 2, 3)
+        vi = np.asarray(vi, dtype=np.int64).reshape(-1, 2)
+        cn_a, cn_b = _locate(cell_arr, ch[:, 0]), _locate(cell_arr, ch[:, 1])
+        for cn, end in ((cn_a, 0), (cn_b, 1)):
+            bad = (cn < 0) | (vi[:, end] < 0) | (vi[:, end] >= counts[np.maximum(cn, 0)] if len(counts) else True)
+            if np.any(bad):
+                r = int(np.flatnonzero(bad)[0])
+                raise OctreeError(
+                    f"a link names row {int(vi[r, end])} of cell {tuple(ch[r, end].tolist())}, "
+                    f"which the level does not hold"
+                )
+        link_plan = _plan_octree_links(table, leaf_of[cn_a], row_off[cn_a] + vi[:, 0],
+                                       leaf_of[cn_b], row_off[cn_b] + vi[:, 1])
+
+    summary = {"leaves": len(table), "cells": len(cells),
+               "links": int(len(link_plan.src)) if link_plan is not None else 0,
+               "max_leaf_vertices": int(table.weight.max()) if len(table) else 0,
+               "max_cell_vertices": int(counts.max()) if len(counts) else 0,
+               "depths": {int(d): int(k) for d, k in zip(*np.unique(table.depth, return_counts=True))}}
+    block = {**table.meta(), "weight": "vertices", "leaves": len(table)}
+
+    # -- write the octree layout beside the level, then swap it in.
+    with converting(level_group, root):
+        stage = _open_staging(level_group)
+        with converting(stage):
+            with open_write_session(stage, compressor=comp, shard_shape="inherit",
+                                    bounds=meta.bounds, chunk_shape=chunk_shape):
+                create_vertices_array(stage, dtype=str(dtype))
+                for leaf, gl in sorted(leaf_groups.items()):
+                    write_chunk_vertices(stage, tuple(anchors[leaf].tolist()), gl, dtype=dtype)
+                if link_plan is not None:
+                    _write_octree_links(stage, table, link_plan)
+                if objs is not None:
+                    _write_objects(stage, objs, obj_coords, obj_frags)
+            stamp_fragments_tile(stage, 3)
+            _shard_objects_like(stage, objs)
+            leaf_rows = table.to_rows()
+            stage.write_array(LEAVES_TABLE, leaf_rows, chunks=(max(len(leaf_rows), 1), 5))
+            stage.write_array(CELLS_TABLE, cell_rows.astype(np.int64), chunks=(max(len(cell_rows), 1), 6))
+            _seal(stage, "to_octree", block, summary)
+        _swap(root, level_group, stage)
     _finalize_write(root, "to_octree")
-    return {"leaves": len(table), "cells": len(cells), "links": n_links,
-            "max_leaf_vertices": int(table.weight.max()) if len(table) else 0,
-            "max_cell_vertices": int(counts.max()) if len(counts) else 0,
-            "depths": {int(d): int(n) for d, n in zip(*np.unique(table.depth, return_counts=True))}}
+    return summary
 
 
 def to_uniform(store: Any, *, level: int = 0, compressor: Any = "inherit",
                backend: str | None = None) -> dict[str, Any]:
-    """Rewrite an octree-chunked level with its original uniform chunks."""
+    """Rewrite an octree-chunked level with its original uniform chunks.
+
+    Refused while any level holds links into or out of this one.  As for
+    :func:`to_octree`, nothing is changed when it fails, and a conversion
+    of this level interrupted during its swap is finished first.
+    """
     root = open_store(store, mode="r+", backend=backend)
     level_group = get_resolution_level(root, level)
+    done = _resume(root, level_group)
+    if done is not None and done["direction"] == "to_uniform":
+        return {**_summary(done), "resumed": True}
     table = leaf_table(level_group)
+    _check_no_cross_level_links(root, level)
     cells_t = cell_table(level_group)
     meta = read_root_metadata(root)
     try:
@@ -394,10 +744,10 @@ def to_uniform(store: Any, *, level: int = 0, compressor: Any = "inherit",
         level_meta = None
     chunk_shape = tuple(get_level_chunk_shape(meta, level_meta))
     dtype = _vertex_dtype(level_group)
-    comp = _level_compressors(level_group) if compressor == "inherit" else compressor
+    comp = _marked(_level_compressors(level_group) if compressor == "inherit" else compressor, False)
     anchors = table.anchors()
-    anchor_leaf = {tuple(a): n for n, a in enumerate(anchors.tolist())}
 
+    # -- plan: everything that can fail on the input, before any write.
     # Per leaf, its cells' runs in storage order.
     leaf_col = cells_t[:, 3]
     row_off = np.zeros(len(cells_t), dtype=np.int64)
@@ -411,55 +761,69 @@ def to_uniform(store: Any, *, level: int = 0, compressor: Any = "inherit",
     cell_groups: dict[tuple[int, ...], list[npt.NDArray]] = {}
     with level_group.batched_reads([(VERTICES, keys), (VERTEX_FRAGMENTS, keys)]):
         for leaf in range(len(table)):
-            gl = read_chunk_vertices(level_group, tuple(anchors[leaf].tolist()), dtype=dtype, ndim=3)
+            gl = read_chunk_vertices(level_group, tuple(anchors[leaf].tolist()), dtype=dtype, ndim=3, _leaf=True)
             for n in np.flatnonzero(leaf_col == leaf).tolist():
                 cell_groups[tuple(cells_t[n, :3].tolist())] = gl[frag_off[n]:frag_off[n] + cells_t[n, 5]]
 
-    # (leaf, row) -> (cell, row in cell), through each leaf's run starts.
-    def to_cells(leaf: npt.NDArray[np.int64], row: npt.NDArray[np.int64]) -> tuple[npt.NDArray, npt.NDArray]:
-        key = leaf * (1 << 40) + row
-        starts = leaf_col * (1 << 40) + row_off
+    def run_of(leaf: npt.NDArray[np.int64], at: npt.NDArray[np.int64], start: npt.NDArray[np.int64],
+               size: npt.NDArray[np.int64], what: str) -> npt.NDArray[np.int64]:
+        """Cell row holding position ``at`` (a row or a fragment) of ``leaf``."""
+        if not len(leaf):
+            return np.zeros(0, dtype=np.int64)
+        if not len(cells_t):
+            raise OctreeError(f"a {what} names leaf {int(leaf[0])}, which holds no cells")
+        key = leaf * (1 << 40) + at
+        starts = leaf_col * (1 << 40) + start
         o = np.argsort(starts, kind="stable")
         pos = np.searchsorted(starts[o], key, side="right") - 1
-        n = o[pos]
-        return cells_t[n, :3], row - row_off[n]
+        n = o[np.maximum(pos, 0)]
+        bad = (leaf < 0) | (pos < 0) | (leaf_col[n] != leaf) | (at - start[n] >= size[n]) | (at < 0)
+        if bad.any():
+            b = int(np.flatnonzero(bad)[0])
+            raise OctreeError(f"a {what} names position {int(at[b])} of leaf {int(leaf[b])}, "
+                              f"which the level does not hold")
+        return n
 
-    manifests = read_all_object_manifests(level_group) if level_group.array_exists(OBJECT_INDEX) else []
-    new_manifests: dict[int, list[tuple[tuple[int, ...], int]]] = {}
-    frag_cells = {}
-    for n in range(len(cells_t)):
-        for f in range(int(cells_t[n, 5])):
-            frag_cells[(int(leaf_col[n]), int(frag_off[n]) + f)] = (tuple(cells_t[n, :3].tolist()), f)
-    for oid, entries in enumerate(manifests):
-        if entries:
-            new_manifests[oid] = [frag_cells[(anchor_leaf[tuple(int(x) for x in cc)], int(f))]
-                                  for cc, f in entries]
+    objs = _read_objects(level_group)
+    obj_coords = obj_frags = None
+    if objs is not None:
+        leaf = _locate(anchors, objs.coords)
+        n = run_of(leaf, objs.frags, frag_off, cells_t[:, 5], "object manifest")
+        obj_coords = cells_t[n, :3] if len(n) else np.zeros((0, 3), np.int64)
+        obj_frags = objs.frags - frag_off[n]
 
     had_links = level_group.array_exists(f"{LINKS}/0")
     src, r_src, oth, r_oth = read_octree_link_cells(level_group, table)
     if (oth < 0).any():
         raise OctreeError("a link names a leaf that is not stored")
+    na = run_of(src, r_src, row_off, cells_t[:, 4], "link")
+    nb = run_of(oth, r_oth, row_off, cells_t[:, 4], "link")
+    summary = {"cells": len(cell_groups), "links": int(len(src))}
 
-    _drop_per_chunk_arrays(level_group, extra=(TABLES,))
-    _set_level_block(level_group, None)
-    with open_write_session(level_group, compressor=comp, shard_shape="inherit",
-                            bounds=meta.bounds, chunk_shape=chunk_shape):
-        create_vertices_array(level_group, dtype=str(dtype))
-        create_object_index_array(level_group)
-        for cc in sorted(cell_groups):
-            write_chunk_vertices(level_group, cc, cell_groups[cc], dtype=dtype)
-        if len(src):
-            ca, va = to_cells(src, r_src)
-            cb, vb = to_cells(oth, r_oth)
-            write_links(level_group, [], 3, delta=0, link_width=2,
-                        _arrays=(np.stack([ca, cb], axis=1), np.column_stack([va, vb])))
-        if had_links:
-            create_links_array(level_group, link_width=2, delta=0, sid_ndim=3)
-        write_object_index(level_group, new_manifests, sid_ndim=3, total_objects=len(manifests))
-    stamp_fragments_tile(level_group, 3)
-    _set_capability(root, False)
+    # -- write the uniform layout beside the level, then swap it in.
+    with converting(level_group, root):
+        stage = _open_staging(level_group)
+        with converting(stage):
+            with open_write_session(stage, compressor=comp, shard_shape="inherit",
+                                    bounds=meta.bounds, chunk_shape=chunk_shape):
+                create_vertices_array(stage, dtype=str(dtype))
+                for cc in sorted(cell_groups):
+                    write_chunk_vertices(stage, cc, cell_groups[cc], dtype=dtype)
+                if len(src):
+                    write_links(stage, [], 3, delta=0, link_width=2, _arrays=(
+                        np.stack([cells_t[na, :3], cells_t[nb, :3]], axis=1),
+                        np.column_stack([r_src - row_off[na], r_oth - row_off[nb]]),
+                    ))
+                if had_links:
+                    create_links_array(stage, link_width=2, delta=0, sid_ndim=3)
+                if objs is not None:
+                    _write_objects(stage, objs, obj_coords, obj_frags)
+            stamp_fragments_tile(stage, 3)
+            _shard_objects_like(stage, objs)
+            _seal(stage, "to_uniform", None, summary)
+        _swap(root, level_group, stage)
     _finalize_write(root, "to_uniform")
-    return {"cells": len(cell_groups), "links": int(len(src))}
+    return summary
 
 
 __all__ = [

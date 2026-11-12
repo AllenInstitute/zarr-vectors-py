@@ -312,9 +312,18 @@ class Query:
         Deduplicated across families — ``vertices`` and
         ``vertex_fragments`` name the same cell of the same grid — and
         returned as a :class:`~zarr_vectors.api.grid.CellSet`, so it feeds
-        straight back into ``select(cells=...)``.
+        straight back into ``select(cells=...)``.  Refused on a level with
+        octree chunks, as :meth:`~zarr_vectors.api.level.Level.cells` is.
         """
         from zarr_vectors.api.grid import CellRef, CellSet
+        from zarr_vectors.octree_chunks.guard import refuse_octree_read
+
+        level = self._selection.level
+        target = (
+            self._level if level in (None, self._level._index)
+            else self._level._dataset.level(level)
+        )
+        refuse_octree_read(target.store, "Query.cells()")
 
         refs = set()
         for request in self.plan().cells:

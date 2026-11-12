@@ -421,6 +421,12 @@ def rechunk_spatial(
     all_levels = sorted(list_resolution_levels(root))
     todo = all_levels if levels is None else [lo for lo in all_levels if lo in levels]
 
+    # Each level is read as uniform cells, which a level with octree
+    # chunks does not have (its links are filed by leaf): refused before
+    # anything is written.
+    from zarr_vectors.octree_chunks.guard import refuse_octree_levels
+
+    refuse_octree_levels(root, todo, "rechunk_spatial", read=True)
     if chunk_shape is None:
         chunk_shape = suggest_chunk_shape(
             src_path, target_links_per_chunk=target_links_per_chunk)
@@ -438,6 +444,10 @@ def rechunk_spatial(
                  geometry_types=list(meta.geometry_types), ndim=ndim,
                  base_bin_shape=tuple(float(b) for b in base_bin),
                  shard_shape=getattr(meta, "shard_shape", None),
+                 # Packing is the store's: an octree-sharded store (the
+                 # zarr_octree_sharding codec) rechunks to one, as a
+                 # sharded store rechunks to a sharded one.
+                 octree_sharding=getattr(meta, "octree_sharding", None),
                  links_convention=getattr(meta, "links_convention", None)
                  or "explicit",
                  object_index_convention=getattr(

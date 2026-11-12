@@ -8,7 +8,14 @@ Pinned here:
 * addresses (``d/i.j.k`` and octant paths) and link names (``o`` / ``o^Δ``)
   round-trip;
 * ``to_octree`` then ``to_uniform`` gives back every cell's vertex rows,
-  fragments, object manifests and links;
+  fragments, object manifests (under their own, possibly sparse, object
+  ids) and links;
+* a conversion that cannot be done, or fails or is killed part way,
+  leaves the level reading exactly as before -- or, once the swap has
+  begun, a level the next call finishes; links between levels, into or
+  out of the converted one, are refused;
+* the root keeps ``octree_chunks`` while any level is octree; an empty
+  level converts both ways;
 * on an octree level, ``read_graph`` / ``read_points`` (whole, box, object)
   answer what the uniform level answers, and per-leaf reads plus seams
   hold every link exactly once.
@@ -27,6 +34,7 @@ from zarr_vectors.core.arrays import (
     read_all_object_manifests,
     read_chunk_vertices,
     read_link_arrays,
+    read_object_id_table,
 )
 from zarr_vectors.core.store import get_resolution_level, open_store, read_root_metadata
 from zarr_vectors.octree_chunks import (
@@ -83,15 +91,27 @@ def _edge_set(positions, edges):
     return {frozenset((_key(positions[a]), _key(positions[b]))) for a, b in edges}
 
 
-def _snapshot(path):
-    lg = get_resolution_level(open_store(path), 0)
+def _snapshot(path, level=0):
+    lg = get_resolution_level(open_store(path), level)
     cells = {}
     for k in lg.list_chunks("vertices"):
         cc = _parse_chunk_key(k)
-        cells[cc] = [g.tobytes() for g in read_chunk_vertices(lg, cc, dtype=np.float32, ndim=3)]
-    man = [[(tuple(int(c) for c in cc), int(f)) for cc, f in m] for m in read_all_object_manifests(lg)]
+        cells[cc] = [g.tobytes() for g in read_chunk_vertices(lg, cc, dtype=np.float32, ndim=3, _leaf=True)]
+    # Keyed by the real object id: a row-indexed list would not see ids renumbered.
+    man = {}
+    meta = lg.read_array_meta("object_index") if lg.array_exists("object_index") else {}
+    n = int(meta.get("num_objects", 0) or 0)
+    if n and "sid_ndim" in meta:
+        ids = read_object_id_table(lg)
+        rows = read_all_object_manifests(lg)[:n]
+        man = {int(ids[r]) if ids is not None else r: [(tuple(int(c) for c in cc), int(f)) for cc, f in m]
+               for r, m in enumerate(rows)}
     edges = set()
-    if list_link_offsets(lg, 0):
+    if octree_meta(lg) is not None:
+        from zarr_vectors.octree_chunks.convert import read_octree_link_cells
+        src, r_src, oth, r_oth = read_octree_link_cells(lg, leaf_table(lg))
+        edges = {frozenset([(int(a), int(b)), (int(c), int(d))]) for a, b, c, d in zip(src, r_src, oth, r_oth)}
+    elif list_link_offsets(lg, 0):
         ch, vi = read_link_arrays(lg, delta=0)
         edges = {frozenset([(tuple(ch[r, 0]), int(vi[r, 0])), (tuple(ch[r, 1]), int(vi[r, 1]))])
                  for r in range(len(vi))}
@@ -161,6 +181,7 @@ def graph_store(request, tmp_path):
 def test_round_trip_is_exact(graph_store):
     path = graph_store[0]
     before = _snapshot(path)
+    attrs = get_resolution_level(open_store(path), 0).attrs.to_dict()
     summary = to_octree(path, target=300)
     assert summary["leaves"] < len(before[0])
     to_uniform(path)
@@ -168,6 +189,8 @@ def test_round_trip_is_exact(graph_store):
     assert after[0] == before[0]
     assert after[1] == before[1]
     assert after[2] == before[2]
+    assert get_resolution_level(open_store(path), 0).attrs.to_dict() == attrs
+    assert _no_staging(path)
 
 
 def test_marked_while_octree_and_unmarked_after(graph_store):
@@ -290,3 +313,477 @@ def test_unsupported_kinds_are_refused(tmp_path):
     write_mesh(path, _uneven(n=300), rng.integers(0, 300, (100, 3)), chunk_shape=(CELL,) * 3)
     with pytest.raises(OctreeError, match="point clouds and graphs"):
         to_octree(path, target=100)
+
+
+# -- object ids ------------------------------------------------------------------
+
+def _small_graph(path, oids, *, n=2000, seed=7, shard=None):
+    pos = _uneven(n=n, seed=seed)
+    edges = _short_edges(pos, seed=seed)
+    oids = np.asarray(oids(len(pos)) if callable(oids) else oids, dtype=np.int64)
+    write_graph(path, pos, edges, chunk_shape=(CELL,) * 3, bounds=([0] * 3, [BOX] * 3), object_ids=oids,
+                shard_shape=shard)
+    return pos, edges, oids
+
+
+def _object_reads(path, ids, reader=read_graph):
+    out = {}
+    for oid in ids:
+        r = reader(path, object_ids=[oid])
+        key = sorted(map(_key, r["positions"]))
+        if "edges" in r:
+            out[oid] = (key, _edge_set(r["positions"], r["edges"]))
+        else:
+            out[oid] = (key, None)
+    return out
+
+
+@pytest.mark.parametrize("shard", [None, 4])
+def test_sparse_object_ids_are_kept_both_ways(tmp_path, shard):
+    path = tmp_path / "sparse.zv"
+    _, _, oids = _small_graph(path, lambda n: (np.arange(n) // 40) * 1000 + 7, shard=shard)
+    ids = np.unique(oids)
+    asked = [int(ids[0]), int(ids[1]), int(ids[-1]), 1, 0]   # 1 and 0 are not ids here
+    before, reads = _snapshot(path), _object_reads(path, asked)
+    assert reads[1007][0] and not reads[1][0]
+    table = read_object_id_table(get_resolution_level(open_store(path), 0)).tolist()
+
+    to_octree(path, target=150)
+    assert read_object_id_table(get_resolution_level(open_store(path), 0)).tolist() == table
+    assert _object_reads(path, asked) == reads
+    g = read_graph(path, object_ids=[1007])
+    assert set(g["object_ids"].tolist()) == {1007}
+
+    to_uniform(path)
+    assert read_object_id_table(get_resolution_level(open_store(path), 0)).tolist() == table
+    assert _object_reads(path, asked) == reads
+    assert _snapshot(path) == before
+
+
+def test_sparse_object_ids_on_points(tmp_path):
+    pos = _uneven(n=2000, seed=8)
+    oids = (np.arange(len(pos)) // 100) * 7919 + 3
+    path = tmp_path / "p.zv"
+    write_points(path, pos, chunk_shape=(CELL,) * 3, bounds=([0] * 3, [BOX] * 3), object_ids=oids)
+    asked = [3, 7922, int(oids[-1]), 1]
+    before, reads = _snapshot(path), _object_reads(path, asked, read_points)
+    to_octree(path, target=120)
+    assert _object_reads(path, asked, read_points) == reads
+    to_uniform(path)
+    assert _snapshot(path) == before
+
+
+@pytest.mark.parametrize("oids", [[5, 5, 5], [0, 0, 5], [9, 9, 2]])
+def test_repeated_object_ids_in_one_cell(tmp_path, oids):
+    pos = np.array([[1, 1, 1], [2, 2, 2], [3, 3, 3]], np.float32)
+    path = tmp_path / "one.zv"
+    write_graph(path, pos, np.array([[0, 1], [1, 2]]), chunk_shape=(CELL,) * 3, bounds=([0] * 3, [BOX] * 3),
+                object_ids=np.array(oids))
+    asked = sorted(set(oids) | {0, 5})
+    before, reads = _snapshot(path), _object_reads(path, asked)
+    to_octree(path, target=1)
+    assert _object_reads(path, asked) == reads
+    to_uniform(path)
+    assert _object_reads(path, asked) == reads
+    assert _snapshot(path) == before
+
+
+@pytest.mark.parametrize("layout", ["vlen", "dense"])
+def test_the_object_layer_keeps_its_layout_and_row_shards(tmp_path, layout):
+    from zarr_vectors import building as zb
+    from zarr_vectors.core import dense_manifests as dense
+    from zarr_vectors.core.arrays import write_object_index
+    path = tmp_path / "g.zv"
+    _small_graph(path, lambda n: (np.arange(n) // 40) * 3 + 11)
+    root = open_store(path, mode="r+")
+    block = dict(root.attrs.to_dict()["zarr_vectors"])
+    root.attrs.update({"zarr_vectors": {**block, "manifest_layout": layout}})
+    lg = get_resolution_level(root, 0)
+    by_id = _snapshot(path)[1]
+    lg.delete_subtree("object_index")
+    write_object_index(lg, by_id, sid_ndim=3)
+    zb.shard_object_layer(lg, zb.OBJECT_SHARD_ROW_MULTIPLE)
+    before = _state(path, ids=(11, 14, 0))
+    assert before[2][11][0] and not before[2][0][0]
+
+    def layer():
+        lg = get_resolution_level(open_store(path), 0)
+        return dense.is_dense(lg), zb.object_shard_rows(lg)
+
+    assert layer() == (layout == "dense", zb.OBJECT_SHARD_ROW_MULTIPLE)
+    to_octree(path, target=150)
+    assert layer() == (layout == "dense", zb.OBJECT_SHARD_ROW_MULTIPLE)
+    assert _object_reads(path, [11, 14, 0]) == before[2]
+    to_uniform(path)
+    assert layer() == (layout == "dense", zb.OBJECT_SHARD_ROW_MULTIPLE)
+    assert _state(path, ids=(11, 14, 0)) == before
+
+
+# -- refusals and failures leave the level as it was --------------------------
+
+def _state(path, ids=(0, 3, 40)):
+    """What a reader sees: the snapshot plus whole and per-object graph reads."""
+    g = read_graph(path)
+    return _snapshot(path), _edge_set(g["positions"], g["edges"]), _object_reads(path, ids)
+
+
+def _no_staging(path):
+    from zarr_vectors.octree_chunks.convert import STAGING
+    return STAGING not in get_resolution_level(open_store(path), 0)
+
+
+def test_a_link_longer_than_a_cell_is_refused_before_anything_changes(tmp_path):
+    pos = np.array([[10, 10, 10], [60, 10, 10], [12, 10, 10], [62, 10, 10]], np.float32)
+    path = tmp_path / "long.zv"
+    write_graph(path, pos, np.array([[0, 1], [0, 2], [1, 3]]), chunk_shape=(CELL,) * 3,
+                bounds=([0] * 3, [100] * 3))
+    before = _snapshot(path)
+    with pytest.raises(OctreeError, match="not adjacent"):
+        to_octree(path, target=1)
+    assert _snapshot(path) == before
+    assert read_graph(path)["edge_count"] == 3
+    assert octree_meta(get_resolution_level(open_store(path), 0)) is None
+    assert _no_staging(path)
+
+
+class _Boom(Exception):
+    pass
+
+
+def _fail_on(monkeypatch, name, nth=1, exc=_Boom):
+    """Make ``convert.<name>`` raise on its ``nth`` call; also check that
+    every group it is handed is marked as being converted."""
+    from zarr_vectors.octree_chunks import convert as cv
+    from zarr_vectors.octree_chunks.guard import is_converting
+    orig = getattr(cv, name)
+    calls = {"n": 0}
+
+    def wrapped(*args, **kwargs):
+        calls["n"] += 1
+        for a in args:
+            if hasattr(a, "zarr_group"):
+                assert is_converting(a), f"{name} wrote through an unmarked group"
+        if calls["n"] == nth:
+            raise exc(f"injected failure in {name}")
+        return orig(*args, **kwargs)
+
+    monkeypatch.setattr(cv, name, wrapped)
+    return calls
+
+
+# Failures while the new layout is being staged: the level is untouched.
+_STAGE_FAILURES = [
+    ("write_chunk_vertices", 1, _Boom), ("write_chunk_vertices", 40, KeyboardInterrupt),
+    ("write_object_index", 1, _Boom), ("stamp_fragments_tile", 1, _Boom), ("_seal", 1, KeyboardInterrupt),
+]
+
+
+@pytest.mark.parametrize("name,nth,exc,shard", [
+    *[(*f, None) for f in _STAGE_FAILURES], ("_write_octree_links", 1, _Boom, None),
+    ("write_chunk_vertices", 40, KeyboardInterrupt, 4), ("_write_octree_links", 1, _Boom, 4),
+])
+def test_to_octree_failing_while_staging_leaves_the_level_intact(tmp_path, monkeypatch, shard, name, nth, exc):
+    path = tmp_path / "g.zv"
+    _small_graph(path, lambda n: np.arange(n) // 40, shard=shard)
+    before = _state(path)
+    _fail_on(monkeypatch, name, nth, exc)
+    with pytest.raises(exc):
+        to_octree(path, target=150)
+    monkeypatch.undo()
+    assert _state(path) == before
+    root = open_store(path)
+    assert octree_meta(get_resolution_level(root, 0)) is None
+    assert CAP_OCTREE_CHUNKS not in read_root_metadata(root).format_capabilities
+    # Running it again starts afresh, and the result round-trips exactly.
+    assert "resumed" not in to_octree(path, target=150)
+    assert _no_staging(path)
+    assert _edge_set(*(lambda g: (g["positions"], g["edges"]))(read_graph(path))) == before[1]
+    to_uniform(path)
+    assert _state(path) == before
+
+
+@pytest.mark.parametrize("name,nth,exc", [*_STAGE_FAILURES, ("write_links", 1, _Boom)])
+def test_to_uniform_failing_while_staging_leaves_the_level_intact(tmp_path, monkeypatch, name, nth, exc):
+    path = tmp_path / "g.zv"
+    _small_graph(path, lambda n: np.arange(n) // 40)
+    uniform = _state(path)
+    to_octree(path, target=150)
+    octree = _state(path)
+    _fail_on(monkeypatch, name, nth, exc)
+    with pytest.raises(exc):
+        to_uniform(path)
+    monkeypatch.undo()
+    assert _state(path) == octree
+    assert octree_meta(get_resolution_level(open_store(path), 0))["leaves"] > 1
+    to_uniform(path)
+    assert _no_staging(path)
+    assert _state(path) == uniform
+
+
+@pytest.mark.parametrize("nth,shard", [(1, None), (3, 4), (5, None)])
+def test_to_octree_killed_during_the_swap_is_finished_by_the_next_call(tmp_path, monkeypatch, shard, nth):
+    path = tmp_path / "g.zv"
+    _small_graph(path, lambda n: np.arange(n) // 40, shard=shard)
+    before = _state(path)
+    expect = to_octree(_copy(path, tmp_path / "clean.zv"), target=150)
+    _fail_on(monkeypatch, "_move", nth, KeyboardInterrupt)
+    with pytest.raises(KeyboardInterrupt):
+        to_octree(path, target=150)
+    monkeypatch.undo()
+    # Half swapped: readers refuse the level rather than mixing layouts.
+    with pytest.raises(OctreeError, match="part way through to_octree"):
+        read_graph(path)
+    assert CAP_OCTREE_CHUNKS in read_root_metadata(open_store(path)).format_capabilities
+    assert to_octree(path, target=150) == {**expect, "resumed": True}
+    assert _no_staging(path)
+    assert _snapshot(path) == _snapshot(tmp_path / "clean.zv")
+    to_uniform(path)
+    assert _state(path) == before
+
+
+def _not_local(path):
+    """``path`` through a store that is no LocalStore, so the swap takes the
+    copy-then-delete branch an object store does (a ``memory://`` path does
+    not: it opens as a LocalStore)."""
+    from zarr.storage import LocalStore, WrapperStore
+    return WrapperStore(LocalStore(str(path)))
+
+
+def test_the_swap_copies_on_a_store_without_renames(tmp_path, monkeypatch):
+    path = tmp_path / "g.zv"
+    _small_graph(path, lambda n: (np.arange(n) // 40) * 5 + 2, n=1500)
+    before = _state(path, ids=(2, 7, 0))
+    _fail_on(monkeypatch, "_move", 3, KeyboardInterrupt)
+    with pytest.raises(KeyboardInterrupt):
+        to_octree(_not_local(path), target=150)
+    monkeypatch.undo()
+    assert to_octree(_not_local(path), target=150)["resumed"] is True
+    assert _no_staging(path)
+    assert _object_reads(path, [2, 7, 0]) == before[2]
+    to_uniform(path)
+    assert _state(path, ids=(2, 7, 0)) == before
+
+
+def test_a_kill_while_deleting_a_moved_staged_array_loses_nothing(tmp_path, monkeypatch):
+    # An object store deletes a staged array key by key, its zarr.json
+    # (sorting after c/...) last: a kill there leaves the staged array
+    # listed but short of cells, after it was copied into place.  The
+    # next call must not copy it over the live one again.
+    from zarr.core.sync import sync
+
+    from zarr_vectors.core.group import Group
+    from zarr_vectors.octree_chunks.convert import STAGING
+    path = tmp_path / "g.zv"
+    _small_graph(path, lambda n: (np.arange(n) // 40) * 5 + 2, n=1500)
+    before = _state(path, ids=(2, 7, 0))
+    orig = Group.delete_subtree
+    deleted = []
+
+    def partial(self, name):
+        if name == "vertices" and self.zarr_group.path.endswith(STAGING):
+            store, prefix = self.zarr_group.store, f"{self.zarr_group.path}/vertices/c/"
+
+            async def half():
+                keys = sorted([k async for k in store.list_prefix(prefix)])
+                for k in keys[: len(keys) // 2]:
+                    await store.delete(k)
+                    deleted.append(k)
+
+            sync(half())
+            raise KeyboardInterrupt
+        return orig(self, name)
+
+    monkeypatch.setattr(Group, "delete_subtree", partial)
+    with pytest.raises(KeyboardInterrupt):
+        to_octree(_not_local(path), target=150)
+    monkeypatch.undo()
+    assert deleted
+    assert to_octree(_not_local(path), target=150)["resumed"] is True
+    assert _no_staging(path)
+    assert _object_reads(path, [2, 7, 0]) == before[2]
+    to_uniform(path)
+    assert _state(path, ids=(2, 7, 0)) == before
+
+
+@pytest.mark.parametrize("repack", ["shard_store", "unshard_store", "set_octree"])
+def test_the_shard_repackers_refuse_a_level_part_way_through_a_conversion(tmp_path, monkeypatch, repack):
+    # They would repack the live arrays and not the staged ones swapped in
+    # later, leaving the level packed two ways.
+    from zarr_vectors import sharding
+    path = tmp_path / "g.zv"
+    _small_graph(path, lambda n: np.arange(n) // 40, shard=4 if repack != "shard_store" else None)
+    _fail_on(monkeypatch, "_move", 2, KeyboardInterrupt)
+    with pytest.raises(KeyboardInterrupt):
+        to_octree(path, target=150)
+    monkeypatch.undo()
+    before = _files(path)
+    kwargs = {"shard_store": {"shard_shape": 4}, "unshard_store": {}, "set_octree": {"octree": False}}[repack]
+    with pytest.raises(OctreeError, match="part way through to_octree"):
+        getattr(sharding, repack)(str(path), **kwargs)
+    assert _files(path) == before
+    assert to_octree(path, target=150)["resumed"] is True
+
+
+def test_to_uniform_after_an_interrupted_to_octree_finishes_it_first(tmp_path, monkeypatch):
+    path = tmp_path / "g.zv"
+    _small_graph(path, lambda n: np.arange(n) // 40)
+    before = _state(path)
+    _fail_on(monkeypatch, "_move", 2, _Boom)
+    with pytest.raises(_Boom):
+        to_octree(path, target=150)
+    monkeypatch.undo()
+    assert to_uniform(path)["cells"] == len(before[0][0])
+    assert _state(path) == before
+    assert CAP_OCTREE_CHUNKS not in read_root_metadata(open_store(path)).format_capabilities
+
+
+def test_to_uniform_killed_during_the_swap_is_finished_by_the_next_call(tmp_path, monkeypatch):
+    path = tmp_path / "g.zv"
+    _small_graph(path, lambda n: (np.arange(n) // 40) * 10 + 1)
+    before = _state(path)
+    to_octree(path, target=150)
+    _fail_on(monkeypatch, "_move", 4, KeyboardInterrupt)
+    with pytest.raises(KeyboardInterrupt):
+        to_uniform(path)
+    monkeypatch.undo()
+    with pytest.raises(OctreeError, match="part way through to_uniform"):
+        read_graph(path)
+    assert to_uniform(path)["resumed"] is True
+    assert _no_staging(path)
+    assert _state(path) == before
+
+
+def test_a_staged_copy_whose_swap_never_began_is_discarded(tmp_path, monkeypatch):
+    # Killed after staging but before the level was marked: the level is as
+    # it was (and may be written meanwhile), so the next call redoes the work.
+    from zarr_vectors.octree_chunks import convert as cv
+    path = tmp_path / "g.zv"
+    _small_graph(path, lambda n: np.arange(n) // 40)
+    before = _state(path)
+
+    def killed(*a, **k):
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(cv, "_swap", killed)
+    with pytest.raises(KeyboardInterrupt):
+        to_octree(path, target=150)
+    monkeypatch.undo()
+    assert not _no_staging(path)
+    assert _state(path) == before
+    assert "resumed" not in to_octree(path, target=150)
+    assert _no_staging(path)
+    to_uniform(path)
+    assert _state(path) == before
+
+
+def _files(path):
+    """Every file under ``path`` and its bytes."""
+    from pathlib import Path
+    return {str(f.relative_to(path)): f.read_bytes() for f in sorted(Path(path).rglob("*")) if f.is_file()}
+
+
+def _copy(src, dst):
+    import shutil
+    shutil.copytree(src, dst)
+    return dst
+
+
+# -- links between levels, the capability, empty levels ---------------------------
+
+def _pyramid(path, cross_level_storage=None):
+    _small_graph(path, lambda n: np.arange(n) // 40)
+    kw = {} if cross_level_storage is None else {"cross_level_storage": cross_level_storage}
+    zv.open(path, mode="r+").build_pyramid(factors=[(2.0, 1.0)], **kw)
+
+
+def _cross_deltas(path, level):
+    lg = get_resolution_level(open_store(path), level)
+    return [d for d in (-1, 1) if list_link_offsets(lg, d)]
+
+
+def test_links_between_levels_are_refused_both_ways(tmp_path):
+    path = tmp_path / "pyr.zv"
+    _pyramid(path)
+    assert _cross_deltas(path, 1), "the pyramid should link level 1 to level 0"
+    before = [_snapshot(path, 0), _snapshot(path, 1)]
+    for level in (0, 1):
+        with pytest.raises(OctreeError, match="links to level"):
+            to_octree(path, target=150, level=level)
+    assert [_snapshot(path, 0), _snapshot(path, 1)] == before
+
+    # An octree level that another level links into is not converted back.
+    other = tmp_path / "plain.zv"
+    _pyramid(other, cross_level_storage="none")
+    assert not _cross_deltas(other, 0) and not _cross_deltas(other, 1)
+    to_octree(other, target=150, level=0)
+    import shutil
+    shutil.copytree(path / "1" / "links", other / "1" / "links", dirs_exist_ok=True)
+    assert _cross_deltas(other, 1)
+    octree = _snapshot(other, 0)
+    with pytest.raises(OctreeError, match="links to level"):
+        to_uniform(other, level=0)
+    assert _snapshot(other, 0) == octree
+
+
+def test_capability_stays_while_any_level_is_octree(tmp_path):
+    path = tmp_path / "cap.zv"
+    write_points(path, _uneven(n=3000, seed=3), chunk_shape=(CELL,) * 3, bounds=([0] * 3, [BOX] * 3))
+    zv.open(path, mode="r+").build_pyramid(factors=[(2.0, 1.0)], cross_level_storage="none")
+
+    def caps():
+        return read_root_metadata(open_store(path)).format_capabilities
+
+    to_octree(path, target=150, level=0)
+    to_octree(path, target=150, level=1)
+    to_uniform(path, level=1)
+    assert octree_meta(get_resolution_level(open_store(path), 0)) is not None
+    assert CAP_OCTREE_CHUNKS in caps()
+    to_uniform(path, level=0)
+    assert CAP_OCTREE_CHUNKS not in caps()
+
+
+@pytest.mark.parametrize("kind", ["graph", "points"])
+def test_an_empty_level_converts_both_ways(tmp_path, kind):
+    path = tmp_path / "empty.zv"
+    box = dict(chunk_shape=(CELL,) * 3, bounds=([0] * 3, [100] * 3))
+    if kind == "graph":
+        write_graph(path, np.zeros((0, 3), np.float32), np.zeros((0, 2), np.int64), **box)
+        read = read_graph
+    else:
+        write_points(path, np.zeros((0, 3), np.float32), **box)
+        read = read_points
+    before = _snapshot(path)
+    s = to_octree(path, target=10)
+    assert s["leaves"] == 0 and s["cells"] == 0
+    assert octree_meta(get_resolution_level(open_store(path), 0))["leaves"] == 0
+    r = read(path)
+    assert len(r["positions"]) == 0
+    if kind == "graph":
+        assert r["edge_count"] == 0
+    assert to_uniform(path)["cells"] == 0
+    assert octree_meta(get_resolution_level(open_store(path), 0)) is None
+    assert len(read(path)["positions"]) == 0
+    assert _snapshot(path) == before
+
+
+# -- the guard -------------------------------------------------------------------
+
+def test_guard_marks_handles_and_reads_the_level_block(graph_store):
+    from zarr_vectors.octree_chunks import converting, is_converting, is_octree_level
+    path = graph_store[0]
+    lg = get_resolution_level(open_store(path), 0)
+    assert not is_octree_level(lg) and not is_converting(lg)
+    with converting(lg):
+        assert is_converting(lg)
+        with converting(lg):
+            assert is_converting(lg)
+        assert is_converting(lg)
+    assert not is_converting(lg)
+    try:
+        with converting(lg):
+            raise _Boom
+    except _Boom:
+        pass
+    assert not is_converting(lg)
+    to_octree(path, target=300)
+    assert is_octree_level(get_resolution_level(open_store(path), 0))

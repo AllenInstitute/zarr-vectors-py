@@ -84,7 +84,7 @@ def read_leaves(level_group: Any, table: LeafTable, leaves: npt.ArrayLike, *, wi
     running = 0
     with level_group.batched_reads([(VERTICES, keys), (VERTEX_FRAGMENTS, keys)], tolerant=True):
         for n in leaves.tolist():
-            gl = read_chunk_vertices(level_group, tuple(anchors[n].tolist()), dtype=dtype, ndim=3)
+            gl = read_chunk_vertices(level_group, tuple(anchors[n].tolist()), dtype=dtype, ndim=3, _leaf=True)
             block = np.concatenate(gl) if gl else np.zeros((0, 3), dtype=dtype)
             offsets[n] = running
             positions.append(block)
@@ -179,7 +179,7 @@ def _read_objects(level_group: Any, table: LeafTable, object_ids: Sequence[int],
     positions, owners, leaf_col, row_col = [], [], [], []
     running = 0
     with level_group.batched_reads([(VERTICES, keys), (VERTEX_FRAGMENTS, keys)], tolerant=True):
-        blocks = {n: read_chunk_vertices(level_group, tuple(anchors[n].tolist()), dtype=dtype, ndim=3)
+        blocks = {n: read_chunk_vertices(level_group, tuple(anchors[n].tolist()), dtype=dtype, ndim=3, _leaf=True)
                   for n in leaves}
         for oid, n, f in entries:
             fi = read_vertex_fragment_index(level_group, tuple(anchors[n].tolist()))

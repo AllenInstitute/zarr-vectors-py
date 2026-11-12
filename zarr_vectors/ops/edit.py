@@ -146,6 +146,8 @@ class EditSession:
 
         self._report = EditReport(oid_prefix=self.oid_prefix)
         self._touched_levels: set[int] = set()
+        # Levels checked not to have octree chunks (see _check_level).
+        self._checked_levels: set[int] = set()
         self._closed = False
 
     # ------------------------------------------------------------------
@@ -729,6 +731,7 @@ class EditSession:
         if level in self._all_manifests:
             return self._all_manifests[level]
         from zarr_vectors.core.arrays import read_object_manifest_rows
+        self._check_level(level)
         from zarr_vectors.core.store import get_resolution_level
         level_group = get_resolution_level(self.root, level)
         try:
@@ -981,16 +984,29 @@ class EditSession:
     # Builders & touch tracking
     # ------------------------------------------------------------------
 
+    def _check_level(self, level: int) -> None:
+        """Refuse a level with octree chunks before anything is staged
+        for it: its chunks are leaves, not the uniform cells every edit
+        reads and rewrites (see :mod:`zarr_vectors.octree_chunks.guard`)."""
+        if level in self._checked_levels:
+            return
+        from zarr_vectors.octree_chunks.guard import refuse_octree_levels
+
+        refuse_octree_levels(self.root, [level], "an edit")
+        self._checked_levels.add(level)
+
     def _builder(self, level: int, chunk: ChunkCoords) -> ChunkChangeBuilder:
         key = (level, tuple(chunk))
         existing = self._builders.get(key)
         if existing is not None:
             return existing
+        self._check_level(level)
         builder = ChunkChangeBuilder.from_disk(self.root, level, key[1])
         self._builders[key] = builder
         return builder
 
     def _mark_edit(self, level: int) -> None:
+        self._check_level(level)
         self._touched_levels.add(level)
         self._report.n_edits += 1
         if self.refresh_pyramid is True:
@@ -1023,6 +1039,16 @@ class EditSession:
         # don't maintain the family-wide counts, so each needs one
         # finalize_links pass once every cell is on disk.
         touched_link_families: set[tuple[int, int]] = set()
+
+        # Nothing is written to any level until every level about to be
+        # written has been checked: an octree level refuses the flush.
+        pending_levels = (
+            {lv for lv, _ in self._builders}
+            | {lv for lv, _ in self._manifest_ops}
+            | self._touched_levels
+        )
+        for level in sorted(pending_levels):
+            self._check_level(level)
 
         with self.root.batched_writes():
             for (level, cc), builder in self._builders.items():
