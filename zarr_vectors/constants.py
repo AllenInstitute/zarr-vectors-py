@@ -266,8 +266,12 @@ CAP_OCTREE_CHUNKS: str = "octree_chunks"
 per octree leaf (an aligned cube of the uniform grid's cells, sized by its
 vertex count), at the leaf's minimum-corner cell, with cross-leaf links named
 by ``(offset, depth change)``.  A reader without it must not read such a
-level: it would take each leaf for one uniform cell.  Optional, and
-converted to and from uniform chunks by ``zarr_vectors.octree_chunks``."""
+level: it would take each leaf for one uniform cell.  Readers that do not
+check capabilities are stopped by zarr itself: the level's per-chunk arrays
+carry the ``zarr_vectors_octree_chunks`` codec
+(:mod:`zarr_vectors.encoding.octree_marker`), which a zarr reader must know
+to open them.  Optional, and converted to and from uniform chunks by
+``zarr_vectors.octree_chunks``."""
 
 DEFAULT_AXES_NAMES: tuple[str, ...] = ("x", "y", "z", "w")
 """Default axis names used when ``create_store`` is called without an

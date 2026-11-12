@@ -83,6 +83,10 @@ def vacuum(
         list_resolution_levels,
     )
 
+    from zarr_vectors.octree_chunks.guard import refuse_octree_levels
+
+    # Every level is rewritten below; refuse before the first one is.
+    refuse_octree_levels(root, None, "vacuum")
     meta = RootMetadata.from_dict(root.attrs.to_dict())
     sid_ndim = meta.sid_ndim
 

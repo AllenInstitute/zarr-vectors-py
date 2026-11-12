@@ -261,6 +261,10 @@ class Layout:
 
         chunk_shape = self._chunk_shape(extent, ndim, schema)
         bin_shape = self._bin_shape(chunk_shape)
+        # ``{}`` (the codec's defaults, and what ``Schema.from_store`` gives
+        # back for ``octree=True``) asks for the octree as much as True does,
+        # so it is tested by identity, never by truth value.
+        wants_octree = self.octree is not False and self.octree is not None
         if self.shard_cells != "auto":
             # Said outright: neither ``pack`` nor ``store_kind`` gets a vote.
             from zarr_vectors.core.metadata import normalise_shard_shape
@@ -270,7 +274,7 @@ class Layout:
             pack = (
                 store_kind != "local" if self.pack == "auto"
                 else bool(self.pack)
-            ) or bool(self.octree)
+            ) or wants_octree
             shard_shape = (
                 self._shard_shape(extent, chunk_shape, schema) if pack
                 else None
@@ -281,7 +285,7 @@ class Layout:
             # variable said otherwise, which is not what the word means.
             compressor = os.environ.get("ZARR_VECTORS_COMPRESSION") or "zstd"
         octree = None
-        if self.octree is not False and self.octree is not None:
+        if wants_octree:
             if shard_shape is None:
                 raise MetadataError(
                     "Layout(octree=...) needs a sharded store: the octree "

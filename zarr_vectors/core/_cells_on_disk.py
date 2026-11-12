@@ -96,9 +96,13 @@ def cell_source(name: str, node: Any, *, any_codecs: bool = False) -> CellSource
         return None
     if not codecs or type(codecs[0]).__name__ != "VLenBytesCodec":
         return None
-    rest = [type(c).__name__ for c in codecs[1:]]
+    # The octree marker (zarr_vectors.encoding.octree_marker) is the
+    # identity on bytes: it only makes readers without octree chunks
+    # refuse the array, so the stored bytes are as if it were not there.
+    byte_codecs = [c for c in codecs[1:] if type(c).__name__ != "OctreeChunksMarker"]
+    rest = [type(c).__name__ for c in byte_codecs]
     if any_codecs:
-        if not all(hasattr(c, "_decode_sync") for c in codecs[1:]):
+        if not all(hasattr(c, "_decode_sync") for c in byte_codecs):
             return None
     elif rest not in ([], ["ZstdCodec"]):
         return None

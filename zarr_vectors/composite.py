@@ -171,7 +171,7 @@ def add_geometry(
         )
         create_kwargs["ndim"] = int(sample_points.shape[1])
 
-    root = _create_or_open_store(str(store_path), **create_kwargs)
+    root = _create_or_open_store(str(store_path), level=level, **create_kwargs)
 
     if sample_points is None or sample_points.size == 0:
         meta = read_root_metadata(root)

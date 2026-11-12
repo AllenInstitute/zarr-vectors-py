@@ -471,6 +471,12 @@ class Level:
             else self._dataset.level(selection.level)
         )
         level_group = target.store
+        from zarr_vectors.octree_chunks.guard import is_octree_level
+
+        if is_octree_level(level_group):
+            # Its chunks are leaves, which chunks= cannot name (the reader
+            # refuses it): read the level and keep the first ``limit``.
+            return None
         try:
             keys = list_chunk_keys(level_group)
         except (ArrayError, StoreError, KeyError):
@@ -509,13 +515,20 @@ class Level:
         data. It is the better argument to ``select(cells=...)`` whenever
         the caller wants "what is here", and ``Grid.cells_in`` remains
         the right one for "what could be here".
+
+        Refused on a level with octree chunks: its chunks are leaves
+        stored at their anchor cells, not cells, and ``select(cells=)``
+        cannot read them (see :mod:`zarr_vectors.octree_chunks`, whose
+        ``leaf_table`` lists the leaves).
         """
         import numpy as _np
 
         from zarr_vectors.api.grid import CellRef, CellSet
         from zarr_vectors.core.arrays import list_chunk_keys, resolve_chunk_keys
+        from zarr_vectors.octree_chunks.guard import refuse_octree_read
 
         level_group = self.store
+        refuse_octree_read(level_group, "Level.cells()")
         if bbox is None:
             coords = list_chunk_keys(level_group)
         else:
