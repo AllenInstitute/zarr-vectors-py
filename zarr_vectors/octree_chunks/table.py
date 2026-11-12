@@ -30,7 +30,8 @@ crosses a shard boundary, so each leaf's data lives in one shard and a
 shard can be written, rewritten or read on its own.  The plan's root
 cube starts on a shard boundary and no leaf is wider than
 :func:`shard_leaf_cap` -- the largest power of two dividing every shard
-side -- so leaves tile shards exactly.
+side -- so leaves tile shards exactly.  ``fit_shards=False`` opts out:
+the plan is then the unsharded one, and leaves may straddle shards.
 """
 
 from __future__ import annotations
@@ -127,6 +128,7 @@ def plan_leaves(
     max_leaf_cells: int | None = None,
     shard_shape: Sequence[int] | None = None,
     shard_origin: Sequence[int] | None = None,
+    fit_shards: bool = True,
 ) -> LeafTable:
     """Split the root cube until every leaf weighs at most ``target``.
 
@@ -137,19 +139,24 @@ def plan_leaves(
             cannot be split and stays one leaf.
         origin_cell: Grid position of the root cube's minimum corner;
             defaults to the cells' minimum, or ``0`` where that is
-            non-negative -- moved down to a shard boundary when
-            ``shard_shape`` is given.
+            non-negative -- moved down to a shard boundary when the plan
+            is fitted to ``shard_shape``.
         max_depth: ``D``; defaults to the smallest root cube covering the
             cells.
         balanced: Split further until adjacent leaves (faces, edges and
             corners) differ by at most one depth.
         max_leaf_cells: Widest leaf allowed, in cells per side (a power of
-            two).  ``None``: the shard's cap when ``shard_shape`` is given
-            (:func:`shard_leaf_cap`), no cap otherwise.
+            two).  ``None``: the shard's cap when the plan is fitted to
+            ``shard_shape`` (:func:`shard_leaf_cap`), no cap otherwise.
         shard_shape: Cells per shard per axis when the level is sharded:
             the plan then keeps every leaf inside one shard.
         shard_origin: The cell a shard starts at (the arrays' grid
             origin); defaults to ``0``.
+        fit_shards: ``False`` ignores ``shard_shape`` and ``shard_origin``:
+            no shard-boundary origin, no shard cap, ``max_leaf_cells`` any
+            power of two -- the plan is the unsharded one, and leaves may
+            straddle shards.  Recorded in the table (and the level's
+            octree block) so ``validate`` does not report them.
 
     Returns:
         The non-empty leaves.
@@ -160,6 +167,8 @@ def plan_leaves(
         raise OctreeError(f"{len(cells)} cells but {len(weights)} weights")
     if target <= 0:
         raise OctreeError(f"target must be positive, got {target}")
+    if not fit_shards:
+        shard_shape = shard_origin = None
     cap = leaf_cap(max_leaf_cells, shard_shape)
     shards = None if shard_shape is None else np.asarray(shard_shape, dtype=np.int64).reshape(3)
     s_origin = np.zeros(3, np.int64) if shard_origin is None else np.asarray(shard_origin, np.int64).reshape(3)
@@ -225,6 +234,7 @@ def plan_leaves(
         target=float(target), balanced=balanced, max_leaf_cells=cap,
         shard_shape=None if shards is None else shards.tolist(),
         shard_origin=None if shards is None else s_origin.tolist(),
+        fit_shards=fit_shards,
     )
 
 
@@ -284,6 +294,7 @@ class LeafTable:
     max_leaf_cells: int | None = None              # leaf side cap; None: uncapped
     shard_shape: tuple[int, int, int] | None = None  # the shards the plan was fitted to
     shard_origin: tuple[int, int, int] | None = None
+    fit_shards: bool = True                         # False: leaves not fitted to shards, by request
     _by_depth: dict[int, tuple[npt.NDArray[np.int64], npt.NDArray[np.int64]]] = field(
         default_factory=dict, repr=False,
     )
@@ -293,7 +304,8 @@ class LeafTable:
                     ijk: npt.ArrayLike, weight: npt.ArrayLike, target: float | None = None,
                     balanced: bool = True, max_leaf_cells: int | None = None,
                     shard_shape: Sequence[int] | None = None,
-                    shard_origin: Sequence[int] | None = None) -> LeafTable:
+                    shard_origin: Sequence[int] | None = None,
+                    fit_shards: bool = True) -> LeafTable:
         depth = np.asarray(depth, dtype=np.int64).reshape(-1)
         ijk = np.asarray(ijk, dtype=np.int64).reshape(-1, 3)
         weight = np.asarray(weight, dtype=np.float64).reshape(-1)
@@ -304,7 +316,8 @@ class LeafTable:
                 target=target, balanced=balanced,
                 max_leaf_cells=None if max_leaf_cells is None else int(max_leaf_cells),
                 shard_shape=None if shard_shape is None else tuple(int(c) for c in shard_shape),
-                shard_origin=None if shard_origin is None else tuple(int(c) for c in shard_origin))
+                shard_origin=None if shard_origin is None else tuple(int(c) for c in shard_origin),
+                fit_shards=bool(fit_shards))
         for d in np.unique(t.depth).tolist():
             idx = np.flatnonzero(t.depth == d)
             codes = _codes(t.ijk[idx], d)
@@ -327,6 +340,8 @@ class LeafTable:
             target=meta.get("target"), balanced=bool(meta.get("balanced", True)),
             max_leaf_cells=meta.get("max_leaf_cells"), shard_shape=meta.get("shard_shape"),
             shard_origin=meta.get("shard_origin"),
+            # Absent in blocks written before the opt-out: fitted when sharded.
+            fit_shards=bool(meta.get("fit_shards", True)),
         )
 
     def meta(self) -> dict[str, Any]:
@@ -334,7 +349,8 @@ class LeafTable:
                 "target": self.target, "balanced": self.balanced,
                 "max_leaf_cells": self.max_leaf_cells,
                 "shard_shape": None if self.shard_shape is None else list(self.shard_shape),
-                "shard_origin": None if self.shard_origin is None else list(self.shard_origin)}
+                "shard_origin": None if self.shard_origin is None else list(self.shard_origin),
+                "fit_shards": self.fit_shards}
 
     # -- addressing ------------------------------------------------------
 

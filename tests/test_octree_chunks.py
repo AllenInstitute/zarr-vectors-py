@@ -22,7 +22,13 @@ Pinned here:
 * on a sharded level every leaf lies inside one shard -- also for shard
   sides that are not powers of two -- where the uncapped plan would not,
   the cap is recorded, the level keeps its packing both ways, and
-  ``validate`` flags leaves a later reshard splits.
+  ``validate`` flags leaves a later reshard splits; ``fit_shards=False``
+  plans as if unsharded, is recorded, and validates clean;
+* the root lists ``octree_chunks`` in ``required_capabilities`` from the
+  commit point while any level is octree, beside other entries, and a
+  store converted and back has its root ``zarr.json`` byte for byte;
+  rewrites of the root keep the list, and ``validate`` warns when it is
+  missing or stale.
 """
 
 from __future__ import annotations
@@ -186,9 +192,12 @@ def test_round_trip_is_exact(graph_store):
     path = graph_store[0]
     before = _snapshot(path)
     attrs = get_resolution_level(open_store(path), 0).attrs.to_dict()
+    root_json = (path / "zarr.json").read_bytes()
     summary = to_octree(path, target=300)
     assert summary["leaves"] < len(before[0])
+    assert _required(path) == [CAP_OCTREE_CHUNKS]
     to_uniform(path)
+    assert (path / "zarr.json").read_bytes() == root_json
     after = _snapshot(path)
     assert after[0] == before[0]
     assert after[1] == before[1]
@@ -538,11 +547,14 @@ def test_to_octree_killed_during_the_swap_is_finished_by_the_next_call(tmp_path,
     with pytest.raises(OctreeError, match="part way through to_octree"):
         read_graph(path)
     assert CAP_OCTREE_CHUNKS in read_root_metadata(open_store(path)).format_capabilities
+    assert _required(path) == [CAP_OCTREE_CHUNKS]  # from the commit point on
     assert to_octree(path, target=150) == {**expect, "resumed": True}
+    assert _required(path) == [CAP_OCTREE_CHUNKS]
     assert _no_staging(path)
     assert _snapshot(path) == _snapshot(tmp_path / "clean.zv")
     to_uniform(path)
     assert _state(path) == before
+    assert _required(path) is None
 
 
 def _not_local(path):
@@ -652,7 +664,9 @@ def test_to_uniform_killed_during_the_swap_is_finished_by_the_next_call(tmp_path
     monkeypatch.undo()
     with pytest.raises(OctreeError, match="part way through to_uniform"):
         read_graph(path)
+    assert _required(path) == [CAP_OCTREE_CHUNKS]  # kept while the level is mid-conversion
     assert to_uniform(path)["resumed"] is True
+    assert _required(path) is None
     assert _no_staging(path)
     assert _state(path) == before
 
@@ -739,11 +753,14 @@ def test_capability_stays_while_any_level_is_octree(tmp_path):
 
     to_octree(path, target=150, level=0)
     to_octree(path, target=150, level=1)
+    assert _required(path) == [CAP_OCTREE_CHUNKS]
     to_uniform(path, level=1)
     assert octree_meta(get_resolution_level(open_store(path), 0)) is not None
     assert CAP_OCTREE_CHUNKS in caps()
+    assert _required(path) == [CAP_OCTREE_CHUNKS]
     to_uniform(path, level=0)
     assert CAP_OCTREE_CHUNKS not in caps()
+    assert _required(path) is None
 
 
 @pytest.mark.parametrize("kind", ["graph", "points"])
@@ -936,6 +953,302 @@ def test_validate_warns_on_uncapped_leaves_a_shard_store_splits(tmp_path):
     result = validate(path, level=3)
     assert result.ok, result.errors
     assert any("not inside one shard" in w and "without a leaf cap" in w for w in result.warnings)
+    # A block from before the opt-out, without the key, means what it did.
+    _drop_fit_shards(path)
+    result = validate(path, level=3)
+    assert result.ok, result.errors
+    assert any("not inside one shard" in w and "without a leaf cap" in w for w in result.warnings)
+
+
+def _drop_fit_shards(path):
+    from zarr_vectors.octree_chunks import converting
+    from zarr_vectors.octree_chunks.convert import _set_level_block
+    lg = get_resolution_level(open_store(path, mode="r+"), 0)
+    block = octree_meta(lg)
+    assert "fit_shards" in block
+    del block["fit_shards"]
+    with converting(lg):
+        _set_level_block(lg, block)
+    assert leaf_table(get_resolution_level(open_store(path), 0)).fit_shards
+
+
+def test_validate_still_errors_on_capped_leaves_without_the_key(tmp_path):
+    from zarr_vectors.sharding.io import reshard
+    from zarr_vectors.validate import validate
+
+    path = tmp_path / "g.zv"
+    _small_graph(path, lambda n: np.arange(n) // 40, n=6000, shard=4)
+    to_octree(path, target=1500)
+    reshard(str(path), 2)
+    _drop_fit_shards(path)
+    assert any("not inside one shard" in e for e in validate(path, level=3).errors)
+
+
+# -- opting out of the shard fit ------------------------------------------------
+
+OPT_OUT_SHARDS = [(2, 2, 2), (6, 6, 6), (3, 5, 7)]
+
+
+def _same_plan(a, b):
+    assert (a.max_depth, a.origin_cell) == (b.max_depth, b.origin_cell)
+    assert np.array_equal(a.depth, b.depth) and np.array_equal(a.ijk, b.ijk)
+    assert np.array_equal(a.weight, b.weight)
+
+
+@pytest.mark.parametrize("shard", OPT_OUT_SHARDS)
+def test_fit_shards_false_plans_as_if_unsharded(shard):
+    cells, counts = _cells_and_counts()
+    free = plan_leaves(cells, counts, target=1200)
+    t = plan_leaves(cells, counts, target=1200, shard_shape=shard, shard_origin=(-1, -1, -1),
+                    fit_shards=False)
+    _same_plan(t, free)
+    assert t.max_leaf_cells is None and t.shard_shape is None and t.shard_origin is None
+    assert not t.fit_shards and t.meta()["fit_shards"] is False
+    assert len(t.straddling(shard, (-1, -1, -1)))
+    fitted = plan_leaves(cells, counts, target=1200, shard_shape=shard, shard_origin=(-1, -1, -1))
+    assert fitted.fit_shards and len(fitted) > len(t)
+
+
+def test_fit_shards_false_takes_any_power_of_two_cap():
+    cells, counts = _cells_and_counts()
+    with pytest.raises(OctreeError, match="inside one shard"):
+        plan_leaves(cells, counts, target=1200, max_leaf_cells=4, shard_shape=(3, 5, 7))
+    for cap in (4, 8):
+        t = plan_leaves(cells, counts, target=1200, max_leaf_cells=cap, shard_shape=(3, 5, 7),
+                        fit_shards=False)
+        _same_plan(t, plan_leaves(cells, counts, target=1200, max_leaf_cells=cap))
+        assert t.max_leaf_cells == cap and int(t.sides().max()) == cap
+    with pytest.raises(OctreeError, match="power of two"):
+        plan_leaves(cells, counts, target=1200, max_leaf_cells=3, shard_shape=(3, 5, 7),
+                    fit_shards=False)
+
+
+def _graph_for_shards(path, shard):
+    pos = _skewed()
+    edges = _short_edges(pos)
+    oids = (np.arange(len(pos)) // 40).astype(np.int64)
+    # Bounds below zero put the shard grid's origin at cell -1, not 0.
+    write_graph(path, pos, edges, chunk_shape=(CELL,) * 3, bounds=([-CELL] * 3, [WIDE] * 3),
+                object_ids=oids, shard_shape=shard)
+    return pos, edges
+
+
+@pytest.mark.parametrize("shard,via", [((2, 2, 2), "local"), ((6, 6, 6), "local"),
+                                       ((3, 5, 7), "local"), ((3, 5, 7), "wrapper")])
+def test_to_octree_with_fit_shards_false(tmp_path, shard, via):
+    from zarr_vectors.octree_chunks.convert import array_shard_grid
+    from zarr_vectors.validate import validate
+
+    path = tmp_path / "g.zv"
+    pos, edges = _graph_for_shards(path, shard)
+    uniform = _copy(path, tmp_path / "uniform.zv")
+    cells, counts = _cells_and_counts(pos)
+    grid = array_shard_grid(get_resolution_level(open_store(path), 0))
+    assert grid == (shard, (-1, -1, -1))
+    before = _snapshot(path)
+    store = path if via == "local" else _not_local(path)
+    s = to_octree(store, target=1200, fit_shards=False)
+    assert s["max_leaf_cells"] is None
+
+    lg = get_resolution_level(open_store(path), 0)
+    block = octree_meta(lg)
+    assert block["fit_shards"] is False and block["max_leaf_cells"] is None
+    assert block["shard_shape"] is None and block["shard_origin"] is None
+    t = leaf_table(lg)
+    _same_plan(t, plan_leaves(cells, counts, target=1200))  # the plan before the cap
+    assert len(t.straddling(*grid))
+    assert array_shard_grid(lg) == grid  # still packed as it was
+    result = validate(path, level=3)
+    assert result.ok and not result.warnings, (result.errors, result.warnings)
+
+    for reader in (path, _not_local(path)):
+        for q in ({}, {"bbox": ([60, 60, 60], [300, 280, 310])}, {"object_ids": [0, 17, 150, 230]}):
+            a, b = read_graph(uniform, **q), read_graph(reader, **q)
+            assert sorted(map(_key, a["positions"])) == sorted(map(_key, b["positions"])), q
+            assert _edge_set(a["positions"], a["edges"]) == _edge_set(b["positions"], b["edges"]), q
+
+    to_uniform(store)
+    assert _snapshot(path) == before  # cells, manifests and links
+    assert array_shard_grid(get_resolution_level(open_store(path), 0)) == grid
+    assert (path / "zarr.json").read_bytes() == (uniform / "zarr.json").read_bytes()
+
+
+def test_to_octree_fit_shards_false_takes_a_cap_wider_than_the_shards(tmp_path):
+    from zarr_vectors.validate import validate
+
+    path = tmp_path / "g.zv"
+    pos, _ = _graph_for_shards(path, (2, 2, 2))
+    before = _snapshot(path)
+    with pytest.raises(OctreeError, match="inside one shard"):
+        to_octree(path, target=1200, max_leaf_cells=8)
+    assert _snapshot(path) == before
+    assert to_octree(path, target=1200, max_leaf_cells=8, fit_shards=False)["max_leaf_cells"] == 8
+    lg = get_resolution_level(open_store(path), 0)
+    assert octree_meta(lg)["max_leaf_cells"] == 8 and octree_meta(lg)["fit_shards"] is False
+    cells, counts = _cells_and_counts(pos)
+    t = leaf_table(lg)
+    _same_plan(t, plan_leaves(cells, counts, target=1200, max_leaf_cells=8))
+    assert int(t.sides().max()) == 8
+    result = validate(path, level=3)
+    assert result.ok and not result.warnings, (result.errors, result.warnings)
+    to_uniform(path)
+    assert _snapshot(path) == before
+
+
+def test_fit_shards_false_on_an_unsharded_level_changes_only_the_record(tmp_path):
+    path = tmp_path / "g.zv"
+    _small_graph(path, lambda n: np.arange(n) // 40)
+    other = _copy(path, tmp_path / "other.zv")
+    to_octree(path, target=300, fit_shards=False)
+    to_octree(other, target=300)
+    a = get_resolution_level(open_store(path), 0)
+    b = get_resolution_level(open_store(other), 0)
+    _same_plan(leaf_table(a), leaf_table(b))
+    assert octree_meta(a)["fit_shards"] is False and octree_meta(b)["fit_shards"] is True
+    assert _snapshot(path) == _snapshot(other)
+
+
+# -- required_capabilities ---------------------------------------------------------
+
+def _required(path):
+    """The root's ``required_capabilities`` as stored (``None``: no key)."""
+    import json
+    return json.loads((path / "zarr.json").read_bytes())["attributes"]["zarr_vectors"].get(
+        "required_capabilities")
+
+
+def _require(path, caps):
+    from zarr_vectors.core.store import update_root_metadata
+    update_root_metadata(open_store(path, mode="r+"), required_capabilities=list(caps))
+
+
+def test_required_capabilities_keep_other_entries(tmp_path):
+    path = tmp_path / "g.zv"
+    _small_graph(path, lambda n: np.arange(n) // 40)
+    _require(path, ["additive_levels"])
+    root_json = (path / "zarr.json").read_bytes()
+    assert read_root_metadata(open_store(path)).required_capabilities == ["additive_levels"]
+    to_octree(path, target=150)
+    assert _required(path) == ["additive_levels", CAP_OCTREE_CHUNKS]
+    assert read_root_metadata(open_store(path)).required_capabilities == ["additive_levels", CAP_OCTREE_CHUNKS]
+    to_uniform(path)
+    assert _required(path) == ["additive_levels"]
+    assert (path / "zarr.json").read_bytes() == root_json
+
+
+def test_root_metadata_round_trips_required_capabilities():
+    from zarr_vectors.core.metadata import RootMetadata
+    attrs = {"zarr_vectors": {"zv_version": "0.9.4", "chunk_shape": [1.0], "bounds": [[0.0], [1.0]],
+                              "geometry_types": ["point_cloud"],
+                              "required_capabilities": ["additive_levels", CAP_OCTREE_CHUNKS]},
+             "multiscales": [{"axes": [{"name": "x", "type": "space"}]}]}
+    meta = RootMetadata.from_dict(attrs)
+    assert meta.required_capabilities == ["additive_levels", CAP_OCTREE_CHUNKS]
+    assert meta.to_dict()["zarr_vectors"]["required_capabilities"] == ["additive_levels", CAP_OCTREE_CHUNKS]
+    meta.required_capabilities = []
+    assert "required_capabilities" not in meta.to_dict()["zarr_vectors"]
+
+
+@pytest.mark.parametrize("rewrite", ["shard_store", "unshard_store", "set_octree", "set_bounds", "coarsen_level"])
+def test_rewrites_of_the_root_keep_required_capabilities(tmp_path, rewrite):
+    from zarr_vectors import sharding
+    from zarr_vectors.core.store import set_bounds
+    from zarr_vectors.multiresolution.coarsen import coarsen_level
+
+    if rewrite == "set_octree":
+        pytest.importorskip("zarr_octree")
+    path = tmp_path / "g.zv"
+    if rewrite == "coarsen_level":
+        write_points(path, _uneven(n=3000, seed=3), chunk_shape=(CELL,) * 3, bounds=([0] * 3, [BOX] * 3),
+                     object_ids=np.arange(4000) // 10)
+        zv.open(path, mode="r+").build_pyramid(factors=[(2.0, 1.0)], cross_level_storage="none")
+    else:
+        _small_graph(path, lambda n: np.arange(n) // 40, shard=None if rewrite == "shard_store" else 4)
+    _require(path, ["additive_levels"])
+    to_octree(path, target=150)
+    want = ["additive_levels", CAP_OCTREE_CHUNKS]
+    assert _required(path) == want
+    if rewrite == "shard_store":
+        sharding.shard_store(str(path), shard_shape=4)
+    elif rewrite == "unshard_store":
+        sharding.unshard_store(str(path))
+    elif rewrite == "set_octree":
+        sharding.set_octree(str(path), octree=True)
+    elif rewrite == "set_bounds":
+        set_bounds(open_store(path, mode="r+"), ([-10.0] * 3, [BOX + 10] * 3))
+    else:
+        coarsen_level(str(path), 1, 2, coarsen_factor=2.0)  # rewrites the multiscales block
+    assert _required(path) == want
+    assert read_root_metadata(open_store(path)).required_capabilities == want
+    to_uniform(path)
+    assert _required(path) == ["additive_levels"]
+
+
+def test_validate_warns_on_a_missing_or_stale_octree_capability(tmp_path):
+    from zarr_vectors.octree_chunks import refresh_capabilities
+    from zarr_vectors.validate import validate
+
+    path = tmp_path / "g.zv"
+    _small_graph(path, lambda n: np.arange(n) // 40)
+    _require(path, ["additive_levels"])
+    root_json = (path / "zarr.json").read_bytes()
+    to_octree(path, target=150)
+    result = validate(path, level=3)
+    assert result.ok and not result.warnings, (result.errors, result.warnings)
+    assert not refresh_capabilities(path)
+
+    # Converted before the list was written: a warning saying how to fix it.
+    _require(path, ["additive_levels"])
+    result = validate(path, level=3)
+    assert result.ok, result.errors
+    assert any("required_capabilities lacks 'octree_chunks'" in w and "refresh_capabilities" in w
+               for w in result.warnings), result.warnings
+    assert refresh_capabilities(path)
+    assert _required(path) == ["additive_levels", CAP_OCTREE_CHUNKS]
+    assert not validate(path, level=3).warnings
+
+    # Listed with no octree level left (a to_uniform killed before the root).
+    to_uniform(path)
+    _require(path, ["additive_levels", CAP_OCTREE_CHUNKS])
+    result = validate(path, level=3)
+    assert result.ok, result.errors
+    assert any("lists 'octree_chunks' but no level" in w for w in result.warnings), result.warnings
+    assert refresh_capabilities(path)
+    assert _required(path) == ["additive_levels"]
+    assert (path / "zarr.json").read_bytes() == root_json
+
+
+@pytest.mark.parametrize("value", [7, True, "additive_levels", {"a": 1}])
+def test_a_required_capabilities_that_is_not_a_list_is_left_alone(tmp_path, value):
+    """Malformed, so not ours to rewrite: the store still opens, reads and
+    validates, and a conversion and back leaves the root as it was."""
+    import json
+    from zarr_vectors.octree_chunks import refresh_capabilities
+    from zarr_vectors.validate import validate
+    path = tmp_path / "g.zv"
+    pos, _, _ = _small_graph(path, lambda n: np.arange(n) // 40)
+    doc = json.loads((path / "zarr.json").read_text())
+    doc["attributes"]["zarr_vectors"]["required_capabilities"] = value
+    (path / "zarr.json").write_text(json.dumps(doc))
+    assert read_root_metadata(open_store(path)).required_capabilities == []
+    assert read_graph(path)["node_count"] == len(pos)
+    assert validate(path, level=3).ok
+    to_octree(path, target=150)
+    assert _required(path) == value
+    assert read_graph(path)["node_count"] == len(pos)
+    assert not refresh_capabilities(path)
+    to_uniform(path)
+    assert json.loads((path / "zarr.json").read_text()) == doc
+
+
+def test_object_reads_of_a_graph_without_edges(tmp_path):
+    path = tmp_path / "g.zv"
+    pos = _uneven(n=500)
+    write_graph(path, pos, np.zeros((0, 2), np.int64), chunk_shape=(CELL,) * 3, bounds=([0] * 3, [BOX] * 3))
+    to_octree(path, target=50)
+    assert read_graph(path)["node_count"] == len(pos)
+    got = read_graph(path, object_ids=[0])
+    assert got["edge_count"] == 0 and got["edges"].shape == (0, 2)
 
 
 # -- the guard -------------------------------------------------------------------

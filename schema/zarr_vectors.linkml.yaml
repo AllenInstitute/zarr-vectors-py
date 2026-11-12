@@ -183,6 +183,13 @@ enums:
           is no separate cross-chunk family — a cross-chunk link is a
           link with a non-zero offsets segment — so this token now marks
           only the presence of ``delta != 0`` arrays.
+      octree_chunks:
+        description: >
+          At least one level has octree chunks: its chunks are octree
+          leaves of several grid cells each, stored at each leaf's anchor
+          cell, and links between leaves are named ``offset^depth-change``.
+          A reader without it would take each leaf for one grid cell, so
+          a store using it also lists it in ``required_capabilities``.
 
   ZvArrayTag:
     description: >
@@ -312,6 +319,7 @@ classes:
       - reduction_factor
       - base_bin_shape
       - format_capabilities
+      - required_capabilities
       - attribute_specs
       - shard_shape
       - manifest_layout
@@ -663,6 +671,14 @@ slots:
     range: ObjectIndexLayout
   format_capabilities:
     description: Optional 0.3+ feature tokens advertised by this store.
+    range: FormatCapability
+    multivalued: true
+  required_capabilities:
+    description: >
+      Capabilities a reader must implement to read this store correctly;
+      a reader that checks the list refuses a store naming one it does
+      not implement.  Optional, default empty.  A store with an
+      octree-chunked level lists ``octree_chunks``.
     range: FormatCapability
     multivalued: true
   attribute_specs:

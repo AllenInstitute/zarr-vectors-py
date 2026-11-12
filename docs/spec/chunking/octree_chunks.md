@@ -32,14 +32,16 @@ converts to and from uniform chunks without loss.
 **Leaf cap**
 : The widest leaf allowed, in cells per side (`max_leaf_cells`, a power of
   two).  On a sharded level it is at most the largest power of two
-  dividing every shard side; see Leaves and shards.
+  dividing every shard side, unless the conversion opts out
+  (`fit_shards=False`); see Leaves and shards.
 
 ## Layout
 
 | Where | What |
 |---|---|
 | root `format_capabilities` | `octree_chunks` while any level has octree chunks |
-| level `zarr_vectors_level.octree_chunks` | `max_depth`, `origin_cell`, `target`, `balanced`, `weight` (`"vertices"`), `leaves`, `max_leaf_cells` (`null`: uncapped), `shard_shape` and `shard_origin` (the shard grid the leaves were fitted to, in cells; `null` when unsharded) |
+| root `required_capabilities` | `octree_chunks` while any level has octree chunks, after any other entries (e.g. `additive_levels`); the key is absent when nothing else is listed and no level is octree (see Compatibility) |
+| level `zarr_vectors_level.octree_chunks` | `max_depth`, `origin_cell`, `target`, `balanced`, `weight` (`"vertices"`), `leaves`, `max_leaf_cells` (`null`: uncapped), `shard_shape` and `shard_origin` (the shard grid the leaves were fitted to, in cells; `null` when unsharded or not fitted), `fit_shards` (`false` when the conversion opted out of fitting the leaves to the shards; absent in blocks written before the opt-out, which keep their meaning) |
 | `<level>/octree_chunks/leaves` | `(N, 5)` int64: `depth, i, j, k, weight` per stored (non-empty) leaf |
 | `<level>/octree_chunks/cells` | `(C, 6)` int64: `i, j, k` (cell), `leaf`, `vertices`, `fragments`, in storage order |
 | `vertices`, `vertex_fragments`, `object_index` | as for uniform chunks, keyed by the leaf's anchor; the object index keeps the level's object ids, layout and row sharding |
@@ -53,8 +55,9 @@ runs.  Manifest entries name `(anchor, fragment)`.
 ## Leaves and shards
 
 On a sharded level a leaf is never larger than a shard and never crosses
-a shard boundary, so all of a leaf's data -- vertices, fragments, the links
-filed under it -- is in one shard.  A shard can then be written by one
+a shard boundary (unless the conversion opts out, below), so all of a
+leaf's data -- vertices, fragments, the links filed under it -- is in
+one shard.  A shard can then be written by one
 task without locks (as BRIDGE writes, one task per shard), rewritten on
 its own after a failure, and read without touching its neighbours; a
 leaf larger than a shard would put the data of several shards into its
@@ -86,6 +89,32 @@ This is the rule Zarr's own sharding has for regular chunks -- a shard
 shape must be a whole number of chunks, so every chunk is in exactly one
 shard -- applied to chunks of several sizes.
 
+**Opting out.**  `to_octree(..., fit_shards=False)` plans a sharded
+level as if it were unsharded: the root cube starts where it would
+without shards, there is no shard cap, and `max_leaf_cells` may be any
+power of two (or `None`, uncapped).  Leaves may then straddle shards: a
+leaf's data still sits at its anchor, in its anchor's shard, but its
+cells span several, so per-shard writing and repair no longer hold.
+The block records `"fit_shards": false`, with `max_leaf_cells` as given
+and `shard_shape` / `shard_origin` `null` -- no shard grid was fitted;
+the arrays' own `zarr.json` says how they are packed, and the
+conversions keep that packing either way.  `validate` does not report
+straddling leaves on such a level.  On an unsharded level `fit_shards`
+does not change the plan, only the record -- which decides whether
+`validate` reports straddling leaves if the level is sharded later.
+
+The fit is the default because it is what keeps a shard self-contained:
+with every leaf's data in one shard, one task per shard writes without
+locks (as BRIDGE does), and a shard can be rewritten or read alone.  It
+costs chunks where shards are small.  On a clustered synthetic graph of
+100,000 vertices with `target=3000`, shards of 2 cells take the leaves
+from 284 to 1,088 and a whole-level read from 0.30 s to 0.76 s; shards
+of 4 cost 0.27 s to 0.34 s; shards of 8 change nothing.  Shard shapes
+that are not powers of two do worst: `(3, 5, 7)` forces 1-cell leaves.
+So prefer power-of-two shard sides of at least 8 cells, which cost
+nothing on clustered data, and opt out only for smaller or odd shards
+whose shards are not written or repaired one by one.
+
 The cap costs chunk count where space is sparse: leaves that would have
 spanned several shards become one per shard (or finer, for small or
 non-power-of-two shards).  On a clustered synthetic level of 10^6
@@ -104,7 +133,8 @@ keeps every leaf inside one shard; one that splits leaves (`(4, 4, 4)`
 to `(2, 2, 2)`) does not, and `validate` reports each leaf not inside
 one shard of the arrays' current shard grid -- as an error when the
 level was converted with a cap, as a warning when it was converted
-without one (unsharded at the time, or by a `to_octree` before the cap).
+without one (unsharded at the time, or by a `to_octree` before the cap),
+and not at all when it was converted with `fit_shards=False`.
 `to_uniform` then `to_octree` fits the leaves to the new shards.
 
 ## Links
@@ -151,6 +181,30 @@ registers it (`zarr_vectors.encoding.octree_marker`).  `to_octree` adds
 it, `to_uniform` writes the arrays without it -- a converted-back level
 has the same `zarr.json` files as before -- and the shard repackers
 (`shard_store`, `unshard_store`, `set_octree`) keep it.
+
+**`required_capabilities`.**  The root's
+`zarr_vectors.required_capabilities` lists what a reader must implement
+to read the store; a viewer that checks it (the Neuroglancer-based
+ngplatform viewer does) refuses a store naming one it lacks, saying so
+-- "this store requires octree_chunks, which this viewer does not
+implement" -- rather than failing on an unknown codec.  The conversions
+keep `octree_chunks` in it exactly as in `format_capabilities`: added
+at the commit point, before any live array is swapped (see Converting
+safely); kept while any level has an octree block, including one part
+way through a conversion; removed when the last octree level is
+converted back.  Other entries (such as `additive_levels`) are left
+where they are, a value that is not a list is left untouched, and the
+key is removed rather than left empty when
+`octree_chunks` was all it held -- so a store converted and back has
+the root `zarr.json` it had.  It is a courtesy, not the gate: the marker
+codec stays the hard stop for zarr readers and for older zarr-vectors,
+which do not read the list.  `validate` warns when either list lacks
+`octree_chunks` while a level has an octree block (stores converted
+before `required_capabilities` was written), and when either lists it
+with no octree level left (a `to_uniform` killed between putting the
+level back and updating the root); `zarr_vectors.octree_chunks.refresh_capabilities(store)` sets both
+lists from the levels.  Warnings, not errors: neither case lets a reader
+misread a level.
 
 Uniform levels are unchanged.  Every writer writes uniform chunks, and
 nothing but the two conversions (and the shard repackers, which move cells
@@ -201,7 +255,9 @@ carrying a copy of the level's metadata, and swapped in:
    attribute: direction, the arrays it holds, the level metadata to end
    with);
 2. the level's octree block becomes `{"converting": "to_octree" |
-   "to_uniform"}` and the root gains `octree_chunks` -- the commit point;
+   "to_uniform"}` and the root gains `octree_chunks` (in
+   `format_capabilities` and `required_capabilities`, one write) -- the
+   commit point;
    from here a reader refuses the level instead of mixing layouts;
 3. each of `vertices`, `vertex_fragments`, `links`, `link_fragments`,
    `object_index`, `octree_chunks` is replaced by its staged copy, or
@@ -210,8 +266,8 @@ carrying a copy of the level's metadata, and swapped in:
    staging record, then the staged copy deleted -- so a delete cut short
    is never copied over the live array again);
 4. the level's metadata is set from the record, the staging group
-   removed, and the root's `octree_chunks` kept only while any level
-   still has an octree block.
+   removed, and the root's `octree_chunks` (both lists) kept only while
+   any level still has an octree block.
 
 Running either conversion again after a failure or kill cleans up: a
 staging group whose swap never began (no `converting` mark) is

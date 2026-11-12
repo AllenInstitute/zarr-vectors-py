@@ -250,8 +250,10 @@ def read_graph_octree(root: Any, *, level: int, bbox: Any, object_ids: Any, chun
     """:func:`~zarr_vectors.types.graphs.read_graph` on an octree level."""
     _refuse(chunks, attribute_filter)
     out = read_octree(root, level=level, bbox=bbox, object_ids=object_ids)
-    res = {"positions": out["positions"], "edges": out["edges"],
-           "node_count": len(out["positions"]), "edge_count": len(out["edges"])}
+    # A graph written without edges has no link arrays to read.
+    edges = out.get("edges", np.zeros((0, 2), np.int64))
+    res = {"positions": out["positions"], "edges": edges,
+           "node_count": len(out["positions"]), "edge_count": len(edges)}
     if "object_ids" in out:
         res["object_ids"] = out["object_ids"]
     return res

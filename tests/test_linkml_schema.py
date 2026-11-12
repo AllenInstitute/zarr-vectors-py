@@ -114,6 +114,15 @@ def test_root_metadata_round_trip_validates(schema):
     _validate(schema, "RootMetadata", _to_linkml_logical_form(wire))
 
 
+def test_root_metadata_with_octree_chunks_validates(schema):
+    rm = _minimal_root_md()
+    rm.format_capabilities = ["octree_chunks"]
+    rm.required_capabilities = ["octree_chunks"]
+    wire = rm.to_dict()["zarr_vectors"]
+    assert wire["required_capabilities"] == ["octree_chunks"]
+    _validate(schema, "RootMetadata", _to_linkml_logical_form(wire))
+
+
 def test_root_metadata_with_dense_int32_manifests_validates(schema):
     rm = _minimal_root_md()
     rm.manifest_layout, rm.manifest_block_dtype = "dense", "int32"

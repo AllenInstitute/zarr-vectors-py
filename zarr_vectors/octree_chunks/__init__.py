@@ -14,6 +14,7 @@ from zarr_vectors.octree_chunks.convert import (
     cell_table,
     leaf_table,
     octree_meta,
+    refresh_capabilities,
     to_octree,
     to_uniform,
 )
@@ -40,6 +41,6 @@ __all__ = [
     "LeafTable", "OctreeError", "cell_table", "converting", "format_link_segment",
     "is_converting", "is_octree_level", "leaf_table", "leaves_in_box", "octree_levels",
     "octree_meta", "parse_link_segment", "plan_leaves", "read_leaves", "read_octree",
-    "read_seams", "refuse_octree_levels", "refuse_octree_read", "refuse_octree_write", "refuse_unfinished_conversions",
+    "read_seams", "refresh_capabilities", "refuse_octree_levels", "refuse_octree_read", "refuse_octree_write", "refuse_unfinished_conversions",
     "to_octree", "to_uniform",
 ]
