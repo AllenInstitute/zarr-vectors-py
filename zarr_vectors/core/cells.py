@@ -633,9 +633,15 @@ def read_neighbourhood(
     ``present_only`` (the default), neighbours ``present_array`` holds
     no data for are left out rather than read as empty. Filtering rows to
     an overlap band is the caller's business.
+
+    Refused on a level with octree chunks, whose neighbours are leaves of
+    other sizes, not the cells around this one
+    (:func:`zarr_vectors.octree_chunks.read_octree` reads a leaf with a halo).
     """
+    from zarr_vectors.octree_chunks.guard import refuse_octree_read
     from zarr_vectors.spatial.chunking import neighbouring_chunk_keys
 
+    refuse_octree_read(level_group, "read_neighbourhood")
     centre = tuple(int(c) for c in chunk_coords)
     occupied = level_group.chunk_present_set(present_array) if present_only else None
     around = neighbouring_chunk_keys(centre, halo=halo, occupied_keys=occupied)

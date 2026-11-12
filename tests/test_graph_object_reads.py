@@ -152,3 +152,31 @@ def test_sharded_stores_and_every_reader(tmp_path, monkeypatch, octree, reader, 
     nodes, edge_set = _expected(positions, edges, oids, [1, 8], directed)
     assert {_key(p) for p in got["positions"]} == nodes
     assert _edge_set(got["positions"], got["edges"], directed) == edge_set
+
+
+def test_skeleton_object_read_survives_an_empty_last_fragment(tmp_path):
+    """An object manifest may name an empty vertex fragment (a custom
+    writer, an edit).  Taken last, its start equalled the row count and
+    the skeleton rebuild indexed past the end."""
+    from zarr_vectors.core.arrays import (
+        read_chunk_vertices, read_object_manifests, write_chunk_vertices,
+        write_object_index,
+    )
+    from zarr_vectors.core.store import get_resolution_level, open_store
+
+    positions = np.array([[50, 50, 50], [60, 50, 50], [70, 50, 50]], dtype=np.float32)
+    edges = np.array([[1, 0], [2, 1]], dtype=np.int64)
+    path = tmp_path / "empty.zarrvectors"
+    write_graph(path, positions, edges, chunk_shape=CHUNK, bounds=BOUNDS,
+                kind="skeleton", object_ids=np.zeros(3, dtype=np.int64))
+    level = get_resolution_level(open_store(str(path), mode="r+"), 0)
+    groups = read_chunk_vertices(level, (0, 0, 0), dtype=np.float32, ndim=3)
+    write_chunk_vertices(level, (0, 0, 0), [*groups, np.zeros((0, 3), np.float32)],
+                         dtype=np.float32)
+    manifests = read_object_manifests(level)
+    manifests[0] = [*manifests[0], ((0, 0, 0), len(groups))]
+    write_object_index(level, manifests, sid_ndim=3)
+
+    got = read_graph(path, object_ids=[0])
+    assert got["node_count"] == 3
+    assert _edge_set(got["positions"], got["edges"], True) == _edge_set(positions, edges, True)

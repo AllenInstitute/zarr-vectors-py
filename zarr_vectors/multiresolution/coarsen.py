@@ -173,6 +173,23 @@ def coarsen_level(
         Summary dict.  Always includes ``method``,
         ``preserves_object_ids``, ``vertex_count``.
     """
+    if method == COARSEN_PER_OBJECT:
+        if options:
+            raise CoarseningError(
+                f"method='{COARSEN_PER_OBJECT}' takes no extra options; got "
+                f"{sorted(options)}. Those keywords belong to a registered "
+                f"strategy — pass method= as well."
+            )
+        strategy = _per_object_coarsen
+    else:
+        # Advanced coarsening methods live in zarr-vectors-tools.
+        from zarr_vectors.multiresolution.registry import require_coarsen_strategy
+        strategy = require_coarsen_strategy(method)
+    # Before any write, and for registered methods too: an octree level's
+    # chunks are leaves, which the coarseners would read as uniform cells,
+    # and the cross-level links they write would address its rows by
+    # leaf -- which to_uniform then leaves naming the wrong vertices.
+    _refuse_octree_levels(store_path, [source_level, target_level], "coarsening")
     kwargs = dict(
         store_path=store_path,
         source_level=source_level,
@@ -187,19 +204,26 @@ def coarsen_level(
     if sparsity_attribute is not None:
         kwargs["sparsity_attribute"] = sparsity_attribute
         kwargs["sparsity_attribute_mode"] = sparsity_attribute_mode
-    if method == COARSEN_PER_OBJECT:
-        if options:
-            raise CoarseningError(
-                f"method='{COARSEN_PER_OBJECT}' takes no extra options; got "
-                f"{sorted(options)}. Those keywords belong to a registered "
-                f"strategy — pass method= as well."
-            )
+    if strategy is _per_object_coarsen:
         summary = _per_object_coarsen(**kwargs)
         _refresh_arrays_present(store_path, (source_level, target_level))
         return summary
-    # Advanced coarsening methods live in zarr-vectors-tools.
-    from zarr_vectors.multiresolution.registry import require_coarsen_strategy
-    return require_coarsen_strategy(method)(**kwargs, **(options or {}))
+    return strategy(**kwargs, **(options or {}))
+
+
+def _refuse_octree_levels(store_path: Any, levels: list[int] | None, what: str) -> None:
+    """Refuse when any of ``levels`` (all when ``None``) has octree chunks
+    (:mod:`zarr_vectors.octree_chunks`).  A store that does not open has
+    no octree level to protect; the coarsener reports that its own way."""
+    from zarr_vectors.core.store import open_store
+    from zarr_vectors.exceptions import StoreError
+    from zarr_vectors.octree_chunks.guard import refuse_octree_levels
+
+    try:
+        root = open_store(store_path)
+    except (StoreError, FileNotFoundError):
+        return
+    refuse_octree_levels(root, levels, what)
 
 
 def _refresh_arrays_present(
@@ -1461,6 +1485,9 @@ def build_pyramid(
             f"chunk_scale_factors length {len(chunk_scale_factors)} != "
             f"factors length {len(factors)}",
         )
+    # Every level, not only those coarsened: the cross-level pass below
+    # writes links into any level pair it finds.
+    _refuse_octree_levels(store_path, None, "building a pyramid")
 
     summaries: list[dict[str, Any]] = []
     for i, fac in enumerate(factors):

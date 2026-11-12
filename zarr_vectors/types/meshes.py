@@ -822,6 +822,7 @@ def read_object_links(
     ndim: int,
     link_width: int,
     aligned: bool = False,
+    touching: bool = False,
 ) -> tuple[
     npt.NDArray, npt.NDArray[np.int64], npt.NDArray[np.int64], npt.NDArray[np.int64],
 ] | None:
@@ -832,8 +833,8 @@ def read_object_links(
     ``write_graph`` both write one fragment per object per chunk, so the
     vertices are exactly those fragments' rows.  Links come from the
     link cells wholly inside the objects' chunks
-    (:func:`link_cells_within`).  Nothing outside the objects' chunks is
-    read.
+    (:func:`link_cells_within`), or touching them under ``touching``.
+    No vertex outside the objects' chunks is read.
 
     ``scope`` is the chunk set a ``bbox`` / ``chunks`` / attribute filter
     narrowed the read to, or ``None``; fragments outside it are dropped.
@@ -842,6 +843,14 @@ def read_object_links(
     it a chunk's intra-chunk links are filed one link fragment per vertex
     fragment, so only the objects' own link fragments are taken from
     each cell; without it the whole cell is taken.
+
+    ``touching`` also takes the link cells that merely touch the
+    objects' chunks (``link_cells_within(touching=True)``), whose other
+    endpoints lie elsewhere.  A skeleton read needs them: the record of a
+    child whose parent is in a chunk not read -- outside the scope, or
+    another object's -- is what makes that child a root rather than the
+    next row of its fragment.  Those cells are read whole; their
+    unread endpoints come back as ``-1``.
 
     Returns ``(positions, owners, link_rows, fragment_starts)`` -- the
     rows grouped by object in the order asked for, each row's object,
@@ -862,7 +871,7 @@ def read_object_links(
         return None
 
     obj_chunks = sorted({cc for _, cc, _ in entries})
-    link_cells = link_cells_within(level_group, obj_chunks)
+    link_cells = link_cells_within(level_group, obj_chunks, touching=touching)
     key_strs = [".".join(str(c) for c in cc) for cc in obj_chunks]
     intra_seg = format_offsets(intra_offsets(len(obj_chunks[0]), link_width))
     link_fragments: dict[str, list[int]] | None = None
@@ -935,7 +944,10 @@ def read_object_links(
                     read_fragment(level_group, cc, frag, dtype=dtype, ndim=ndim),
                 )
                 owners.append(np.full(len(rows), oid, dtype=np.int64))
-                starts.append(running)
+                # An empty fragment starts no row: recorded, its start
+                # could equal the row count and index past the end.
+                if len(rows):
+                    starts.append(running)
                 running += len(rows)
 
             face_chunks, face_vi = read_link_arrays(

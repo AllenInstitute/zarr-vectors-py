@@ -626,6 +626,14 @@ def _derive_level_scales(
         return ndim_fallback, ndim_fallback
 
 
+def _refuse_octree_allocation(level_group: Group, array_name: str) -> None:
+    """Refuse allocating an array on a level with octree chunks, before
+    anything is created (see :mod:`zarr_vectors.octree_chunks.guard`)."""
+    from zarr_vectors.octree_chunks.guard import refuse_octree_write
+
+    refuse_octree_write(level_group, f"allocating {array_name}")
+
+
 def _ensure_array_dir(
     level_group: Group,
     array_name: str,
@@ -660,6 +668,7 @@ def _ensure_array_dir(
     array already exists it is *not* recreated, so the metadata is applied
     with a normal write — same end state either way.
     """
+    _refuse_octree_allocation(level_group, array_name)
     explicit_cfg = level_group._native_sharded_config
     cfg = explicit_cfg
     if cfg is None and _is_per_chunk_array(array_name):
@@ -728,6 +737,7 @@ def _ensure_chunk_arrays(
     """
     if not arrays:
         return
+    _refuse_octree_allocation(level_group, arrays[0][0])
     explicit_cfg = level_group._native_sharded_config
     cfg = explicit_cfg if explicit_cfg is not None else _derive_native_config(level_group)
     to_create: list[tuple[str, dict[str, Any] | None]] = []
@@ -911,6 +921,11 @@ def open_write_session(
     """
     from contextlib import ExitStack
 
+    from zarr_vectors.octree_chunks.guard import refuse_octree_write
+
+    # Before anything is allocated or stamped: a session addresses
+    # uniform cells, which an octree level does not have.
+    refuse_octree_write(level_group, "a write session")
     if bounds is None or chunk_shape is None:
         raise ArrayError(
             "open_write_session requires `bounds` and `chunk_shape` so "
@@ -5691,6 +5706,8 @@ def read_chunk_vertices(
     chunk_coords: ChunkCoords,
     dtype: np.dtype | str | None = None,
     ndim: int = 3,
+    *,
+    _leaf: bool = False,
 ) -> list[npt.NDArray[np.floating]]:
     """Read all fragments from a spatial chunk.
 
@@ -5715,6 +5732,11 @@ def read_chunk_vertices(
     Raises:
         ArrayError: If the chunk does not exist or data is malformed.
     """
+    from zarr_vectors.octree_chunks.guard import refuse_octree_read
+
+    # A leaf is no uniform cell: only the octree readers (``_leaf``) read one.
+    if not _leaf:
+        refuse_octree_read(level_group, "read_chunk_vertices")
     full, fi = _read_chunk_buffer(level_group, chunk_coords, dtype, ndim)
     return [] if full is None else _partition_rows(full, fi)
 
@@ -6382,6 +6404,10 @@ def read_chunk_links(
         List of arrays, each ``(M_k, L)`` — or ``(M_k, 1 + L)`` when the
         array carries ``perm_idx``.
     """
+    from zarr_vectors.octree_chunks.guard import refuse_octree_read
+
+    # A leaf is no uniform cell (the octree readers go through read_octree).
+    refuse_octree_read(level_group, "read_chunk_links")
     key = _chunk_key(chunk_coords)
     dtype = np.dtype(dtype)
 
@@ -8079,6 +8105,7 @@ def link_cells_within(
     within: Iterable[ChunkCoords],
     *,
     delta: int = 0,
+    touching: bool = False,
 ) -> dict[str, list[str]]:
     """The cells of ``links/<delta>/`` whose records lie wholly in ``within``.
 
@@ -8102,6 +8129,15 @@ def link_cells_within(
         delta: Level delta.  Only ``0``: a cross-level record's endpoints
             sit on two different chunk grids, and one set of chunk
             coordinates cannot scope both.
+        touching: Keep a cell when *any* of its endpoint chunks is in
+            ``within``, not all of them.  A skeleton reader needs this:
+            a record whose child was read but whose parent was not is
+            what tells it the child is a root there, and without the
+            record the child silently inherits its fragment predecessor
+            as parent.  The source of such a cell may lie outside
+            ``within`` (canonical placement files a record under its
+            lowest endpoint chunk), so candidates are ``within`` shifted
+            back by each offset.
 
     Returns:
         ``{offsets_segment: [cell_key, ...]}`` naming only cells that are
@@ -8152,6 +8188,23 @@ def link_cells_within(
             ) from e
         # Endpoint 0 is the source itself; at delta 0 the anchor is the
         # identity, so endpoint k is ``src + o_k``.
+        if touching:
+            # A source whose endpoint k lands in ``within`` is ``w - o_k``
+            # for some w in it; every such source touches by construction.
+            cand = np.unique(np.concatenate(
+                [src] + [src - np.asarray(off, dtype=np.int64)
+                         for off in offsets if any(off)],
+                axis=0,
+            ), axis=0)
+            seg_path = f"{family}/{seg}"
+            present = set(level_group.list_chunks(seg_path))
+            keys = sorted(
+                k for k in (_chunk_key(tuple(c)) for c in cand.tolist())
+                if k in present
+            )
+            if keys:
+                out[seg] = keys
+            continue
         shifts = [off for off in offsets if any(off)]
         if few:
             ok = np.fromiter(
@@ -8416,6 +8469,7 @@ def read_link_rows(
     *,
     delta: int = 0,
     cells: Mapping[str, Sequence[str]] | None = None,
+    touching: bool = False,
 ) -> npt.NDArray[np.int64]:
     """Link records under ``links/<delta>/`` as output rows, ``(M, L)``.
 
@@ -8433,9 +8487,12 @@ def read_link_rows(
     reader's per-chunk slice of one ``cumsum(mask) - 1`` table, or of
     ``arange`` when every row is taken.
 
-    ``cells`` scopes the read as in :func:`read_link_arrays`.  Returns
-    an empty ``(0, L)`` array when no record survives, ``(0, 0)`` when
-    the family is absent.
+    ``cells`` scopes the read as in :func:`read_link_arrays`.  With
+    ``touching``, a record is kept when its first endpoint maps to a row,
+    and an endpoint that does not map comes back as ``-1``: a skeleton
+    reader needs a read child's record even when its parent was not read
+    (see :func:`link_cells_within`).  Returns an empty ``(0, L)`` array
+    when no record survives, ``(0, 0)`` when the family is absent.
     """
     layout = _link_segment_blobs(
         level_group, delta, include_intra=True, cells=cells,
@@ -8464,24 +8521,25 @@ def read_link_rows(
             maps = [row_maps.get(c) for c in cell_endpoint_chunks(
                 _parse_chunk_key(cell_key), offsets, scale_src, scale_trg,
             )]
-            if any(m is None for m in maps):
+            if not touching and any(m is None for m in maps):
                 continue
             vi = rows[:, 1:] if has_perm else rows
             placed = np.empty((rows.shape[0], link_width), dtype=np.int64)
-            ok = np.ones(rows.shape[0], dtype=bool)
             for k, table in enumerate(maps):
+                if table is None or not len(table):
+                    placed[:, k] = -1
+                    continue
                 v = vi[:, k]
                 inside = (v >= 0) & (v < len(table))
-                if not inside.all():
-                    v = np.where(inside, v, 0)
-                    ok &= inside
-                placed[:, k] = table[v] if len(table) else -1
-            ok &= (placed >= 0).all(axis=1)
-            if not ok.all():
-                placed = placed[ok]
-                rows = rows[ok]
+                if inside.all():
+                    placed[:, k] = table[v]
+                else:
+                    placed[:, k] = np.where(inside, table[np.where(inside, v, 0)], -1)
             if has_perm and placed.shape[0]:
                 placed = np.take_along_axis(placed, inverse[rows[:, 0]], axis=1)
+            ok = placed[:, 0] >= 0 if touching else (placed >= 0).all(axis=1)
+            if not ok.all():
+                placed = placed[ok]
             parts.append(placed)
     if not parts:
         return np.empty((0, link_width), dtype=np.int64)

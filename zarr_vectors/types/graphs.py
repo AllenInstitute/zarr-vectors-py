@@ -787,8 +787,14 @@ def _read_graph(
 
     # A read narrowed to some chunks keeps only edges wholly inside them,
     # so it reads only the link cells those chunks can reach; an
-    # unscoped one wants the whole family.
-    link_cells = link_cells_within(level_group, chunk_keys) if scoped else None
+    # unscoped one wants the whole family.  A skeleton also needs the
+    # records that only *touch* them: a read child whose parent was not
+    # read is a root here, and only its record says so -- without it the
+    # child kept its implicit ``i - 1`` and the read invented an edge.
+    link_cells = (
+        link_cells_within(level_group, chunk_keys, touching=is_tree)
+        if scoped else None
+    )
     if link_cells is None:
         link_cells = {
             seg: level_group.list_chunks(f"{links_group_path(0)}/{seg}")
@@ -857,8 +863,10 @@ def _read_graph(
         rows = read_link_rows(
             level_group,
             {cc: row_of[start:end] for (cc, start), end in zip(starts, ends)},
-            delta=0, cells=link_cells,
+            delta=0, cells=link_cells, touching=is_tree,
         )
+        # A skeleton keeps every record whose child was read; a parent of
+        # -1 (not read) makes that child a root below.
         if rows.shape[0] and rows.shape[1] == 2:
             all_edges.append(np.ascontiguousarray(rows))
 
@@ -877,6 +885,8 @@ def _read_graph(
             if fragment_starts:
                 parent_arr[np.asarray(fragment_starts, dtype=np.int64)] = -1
             # Vectorized branch-link override: one fancy-index per block.
+            # A record's parent may be -1 -- it lies outside the read --
+            # and then the child is a root here.
             for edge_block in all_edges:
                 if len(edge_block) == 0:
                     continue
@@ -955,11 +965,15 @@ def _read_graph_objects(
     parents are rebuilt as on a full read: ``parent[i] = i - 1`` within
     a fragment (a fragment is read whole, so its rows keep their order),
     none at a fragment start, and a record's parent wherever one exists
-    -- ``-1`` (a root) when that parent was not read.
+    -- ``-1`` (a root) when that parent was not read.  So the records
+    are read from every link cell touching the objects' chunks, not only
+    those wholly inside them: a record whose parent is in a chunk not
+    read (outside the scope, or another object's) is the only thing that
+    stops its child inheriting the previous row as parent.
     """
     read = read_object_links(
         level_group, object_ids, scope=scope, dtype=dtype, ndim=ndim,
-        link_width=2, aligned=aligned,
+        link_width=2, aligned=aligned, touching=is_tree,
     )
     if read is None:
         result = _empty_graph_result(ndim)

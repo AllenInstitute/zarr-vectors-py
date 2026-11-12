@@ -187,6 +187,11 @@ def rechunk(
 
     # Read level 0 data
     src_level = get_resolution_level(src_root, 0)
+    # Its cells, manifests and links are read as uniform cells: refused
+    # on a level with octree chunks, before the output is created.
+    from zarr_vectors.octree_chunks.guard import refuse_octree_read
+
+    refuse_octree_read(src_level, "rechunk")
 
     # Read object manifests
     try:
@@ -267,8 +272,10 @@ def rechunk(
         geometry_types=src_meta.geometry_types,
         # Packing is a property of the store, so a rechunk of a sharded
         # store produces a sharded store. Dropping it here would have
-        # quietly unsharded every rechunk output.
+        # quietly unsharded every rechunk output.  The same for the
+        # octree marker: an octree-sharded store's output is octree-sharded.
         shard_shape=src_meta.shard_shape,
+        octree_sharding=src_meta.octree_sharding,
         links_convention=src_meta.links_convention,
         object_index_convention=src_meta.object_index_convention,
         cross_chunk_strategy=src_meta.cross_chunk_strategy,

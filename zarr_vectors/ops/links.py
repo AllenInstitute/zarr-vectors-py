@@ -562,6 +562,9 @@ def materialise_object_links_explicit(
         return 0  # already explicit; nothing to materialise
 
     level_group = get_resolution_level(root, level)
+    from zarr_vectors.octree_chunks.guard import refuse_octree_write
+
+    refuse_octree_write(level_group, "materialising links")
     manifest = read_object_manifest(level_group, object_id)
     if not manifest:
         return 0
@@ -755,6 +758,9 @@ def reorder_vertices_implicit(
         )
 
     level_group = get_resolution_level(root, level)
+    from zarr_vectors.octree_chunks.guard import refuse_octree_write
+
+    refuse_octree_write(level_group, "reordering vertices")
     # The slot count is stamped on the index; reading every manifest to
     # take its length decoded the whole level to learn a number already
     # written down. Only the targeted objects' manifests are then read.
