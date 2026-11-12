@@ -169,7 +169,8 @@
         "preserved_object_ids",
         "shared_fragments",
         "fragment_index",
-        "multiscale_links"
+        "multiscale_links",
+        "octree_chunks"
       ],
       "title": "FormatCapability",
       "type": "string"
@@ -847,6 +848,16 @@
           "minimum": 2,
           "type": [
             "integer",
+            "null"
+          ]
+        },
+        "required_capabilities": {
+          "description": "Capabilities a reader must implement to read this store correctly; a reader that checks the list refuses a store naming one it does not implement.  Optional, default empty.  A store with an octree-chunked level lists ``octree_chunks``.\n",
+          "items": {
+            "$ref": "#/$defs/FormatCapability"
+          },
+          "type": [
+            "array",
             "null"
           ]
         },
