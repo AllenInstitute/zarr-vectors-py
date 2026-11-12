@@ -805,6 +805,26 @@ def _lehmer_table(link_width: int) -> tuple[npt.NDArray[np.int64], npt.NDArray[n
     return table, radix
 
 
+def _pack_rows(rows: npt.NDArray[np.int64]) -> npt.NDArray[np.int64] | None:
+    """Each row of a 2-D integer array as one int64, ordered as the rows
+    sort lexicographically (first column most significant), or None
+    when the columns' ranges do not fit in 63 bits."""
+    if rows.shape[0] == 0:
+        return None
+    lo = rows.min(axis=0)
+    span = rows.max(axis=0) - lo + 1
+    total = 1
+    for s in span.tolist():
+        total *= int(s)
+    if total >= (1 << 62):
+        return None
+    out = np.zeros(rows.shape[0], dtype=np.int64)
+    for c in range(rows.shape[1]):
+        out *= int(span[c])
+        out += rows[:, c] - lo[c]
+    return out
+
+
 def partition_link_arrays(
     chunks: npt.NDArray[np.int64],
     vi: npt.NDArray[np.int64],
@@ -902,13 +922,21 @@ def partition_link_arrays(
         # record with the record as primary key, stable like the sorted()
         # it replaces.  Intra-chunk records keep input order, as
         # _cell_placements does.
-        rec = xp.repeat(xp.arange(n, dtype=xp.int64), L)
-        keys = [vi.reshape(-1)]
-        flat_chunks = chunks.reshape(-1, sid_ndim)
-        keys += [flat_chunks[:, d] for d in range(sid_ndim - 1, -1, -1)]
-        keys.append(rec)
-        order = xp.lexsort(xp.stack(keys))
-        sigma = order.reshape(n, L) - (xp.arange(n, dtype=xp.int64) * L)[:, None]
+        packed = None if on_device else _pack_rows(
+            np.concatenate([chunks, vi[:, :, None]], axis=2).reshape(-1, sid_ndim + 1)
+        )
+        if packed is not None:
+            # (chunk_coords, vi) as one integer per endpoint, so the
+            # within-record order is a stable argsort along each row.
+            sigma = np.argsort(packed.reshape(n, L), axis=1, kind="stable")
+        else:
+            rec = xp.repeat(xp.arange(n, dtype=xp.int64), L)
+            keys = [vi.reshape(-1)]
+            flat_chunks = chunks.reshape(-1, sid_ndim)
+            keys += [flat_chunks[:, d] for d in range(sid_ndim - 1, -1, -1)]
+            keys.append(rec)
+            order = xp.lexsort(xp.stack(keys))
+            sigma = order.reshape(n, L) - (xp.arange(n, dtype=xp.int64) * L)[:, None]
         sigma = xp.where(intra[:, None], identity[None, :], sigma)
 
     rowsel = xp.arange(n, dtype=xp.int64)[:, None]
@@ -929,13 +957,22 @@ def partition_link_arrays(
 
     # --- group by (source chunk, offsets) -----------------------------
     key = xp.concatenate([src, offsets.reshape(n, -1)], axis=1)
-    order = xp.lexsort(key.T[::-1])
-    key_sorted = key[order]
-    starts = xp.flatnonzero(
-        xp.concatenate((
-            xp.ones(1, dtype=bool), xp.any(key_sorted[1:] != key_sorted[:-1], axis=1),
-        ))
-    )
+    packed = None if on_device else _pack_rows(key)
+    if packed is not None:
+        # One stable argsort of one integer per record, in place of a
+        # lexsort over every column: same order, a fraction of the time.
+        order = np.argsort(packed, kind="stable")
+        ps = packed[order]
+        key_sorted = key[order]
+        starts = np.flatnonzero(np.concatenate(([True], ps[1:] != ps[:-1])))
+    else:
+        order = xp.lexsort(key.T[::-1])
+        key_sorted = key[order]
+        starts = xp.flatnonzero(
+            xp.concatenate((
+                xp.ones(1, dtype=bool), xp.any(key_sorted[1:] != key_sorted[:-1], axis=1),
+            ))
+        )
 
     placed_vi = placed_vi[order]
     perm = perm[order]
