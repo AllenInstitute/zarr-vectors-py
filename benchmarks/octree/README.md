@@ -1,15 +1,17 @@
 # Spatial read benchmark: point clouds, meshes, networks
 
 Working branch `octree`: zarr-vectors with an optional octree sharding codec
-(zarr-octree's `zarr_octree_sharding`) and a choice of shard reader.  Both
-are opt-in and act on one zarr array at a time; without them the branch
-writes byte-identical stores and reads them with identical I/O.
+(zarr-octree's `zarr_octree_sharding`) and a choice of shard reader.  The
+codec is opt-in and the default reader follows it, one zarr array at a time:
+an array in the octree codec is read by the optimised reader, any other
+exactly as before.  Without the codec the branch writes byte-identical stores
+and reads them with identical I/O.
 
 | Setting | Values |
 |---|---|
 | `Layout(octree=...)` at construction | `False` (default: `sharding_indexed`); `True` or the codec's configuration, e.g. `{"target": 100000}` (its default), marks the store octree (root `octree_sharding` + capability `octree_sharding`); needs zarr-octree and shards |
 | `zarr_vectors.sharding.set_octree(store, octree)` | converts an existing sharded store either way; back to `False` gives the store as written unmarked |
-| `ZARR_VECTORS_SHARD_READER` | `standard` (default: as always), `optimised` (opt-in: each shard index once, coalesced ranges, any store) or `zarr` (zarr's API only) |
+| `ZARR_VECTORS_SHARD_READER` | `auto` (default: per array, `optimised` for a `zarr_octree_sharding` array and `standard` for any other), `standard` (every array as always: a local store's shards read off the files one range per cell, any other store through zarr), `optimised` (every array: each shard index once, coalesced ranges, any store) or `zarr` (zarr's API only) |
 
 ## Running
 

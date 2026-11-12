@@ -408,8 +408,9 @@ def _validate_octree_level(lg: Any, ndim: int, prefix: str, result: ValidationRe
     and fragments both tables say; the level's ``vertex_count``; object
     manifests naming ``(anchor, fragment)`` of a leaf; every link joining
     stored leaves at rows they hold, as many as its family records; no
-    links to other levels; and the marker codec that makes readers
-    without octree chunks refuse the level.
+    links to other levels; the marker codec that makes readers without
+    octree chunks refuse the level; and, on a sharded level, every leaf
+    inside one shard (:func:`_check_octree_shards`).
     """
     from zarr_vectors.constants import VERTEX_FRAGMENTS, VERTICES
     from zarr_vectors.core.arrays import list_link_deltas
@@ -434,6 +435,7 @@ def _validate_octree_level(lg: Any, ndim: int, prefix: str, result: ValidationRe
     except Exception as e:
         result.add_error(f"{prefix}: octree chunks: cannot read the leaf and cell tables: {e}")
         return
+    _check_octree_shards(lg, table, prefix, result)
     n_leaves = len(table)
     anchors = [tuple(a) for a in table.anchors().tolist()]
     leaf_at = {a: n for n, a in enumerate(anchors)}
@@ -536,6 +538,57 @@ def _validate_octree_level(lg: Any, ndim: int, prefix: str, result: ValidationRe
     result.add_pass(
         f"{prefix}: octree chunks: {n_leaves} leaves, {total} vertices, {n_links} links validated"
     )
+
+
+def _check_octree_shards(lg: Any, table: Any, prefix: str, result: ValidationResult) -> None:
+    """No leaf wider than the level's recorded cap, nor -- the level being
+    sharded -- outside one shard of its arrays' current shard grid.
+
+    ``to_octree`` fits the leaves to the shards, but the shard repackers
+    (``shard_store``, ``reshard``) move cells unchanged and may be given
+    a shard shape that splits leaves.  On a level converted with a cap
+    (its octree block's ``max_leaf_cells``) that is an error; on one
+    converted without (unsharded then, or by a ``to_octree`` before the
+    cap) a warning.  Either way ``to_uniform`` then ``to_octree`` fits
+    the leaves to the shards again.
+    """
+    from zarr_vectors.octree_chunks.convert import array_shard_grid
+
+    if not len(table):
+        return
+    cap = table.max_leaf_cells
+    sides = table.sides()
+    if cap is not None and int(sides.max()) > int(cap):
+        n = int(np.argmax(sides))
+        result.add_error(
+            f"{prefix}: octree chunks: {int((sides > cap).sum())} leaves are wider than the "
+            f"level's max_leaf_cells={cap}, e.g. leaf {table.key(n)} ({int(sides[n])} cells per side)"
+        )
+    try:
+        grid = array_shard_grid(lg)
+    except Exception:
+        grid = None
+    if grid is None or grid[0] is None or len(grid[0]) != 3:
+        return
+    shard, origin = grid
+    bad = table.straddling(shard, origin)
+    if not len(bad):
+        return
+    n = int(bad[0])
+    msg = (
+        f"{prefix}: octree chunks: {len(bad)} leaves are not inside one shard of "
+        f"{list(shard)} cells, e.g. leaf {table.key(n)} ({int(sides[n])} cells per side "
+        f"at cell {tuple(table.anchors()[n].tolist())}), so its data sits in its anchor's "
+        f"shard and per-shard writes and reads miss it; run zarr_vectors.octree_chunks."
+        f"to_uniform, then to_octree, to fit the leaves to these shards"
+    )
+    if cap is not None:
+        fitted = (f"shards of {list(table.shard_shape)} cells" if table.shard_shape is not None
+                  else "no shards")
+        result.add_error(f"{msg} (it was converted with leaves capped at {cap} cells for "
+                         f"{fitted} and has been resharded since)")
+    else:
+        result.add_warning(f"{msg} (it was converted without a leaf cap)")
 
 
 def _dense_index_problems(lg: Any) -> list[str]:
