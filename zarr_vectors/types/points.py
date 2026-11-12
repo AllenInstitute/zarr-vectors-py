@@ -663,6 +663,13 @@ def _read_points(
             resolved_obj_ids &= set(object_ids)
         object_ids = sorted(resolved_obj_ids)
 
+    if level_meta is not None and level_meta.octree_chunks is not None:
+        from zarr_vectors.octree_chunks.read import read_points_octree
+        return read_points_octree(
+            root, level=level, bbox=bbox, object_ids=object_ids, chunks=chunks,
+            attribute_names=attribute_names, attribute_filter=attribute_filter,
+        )
+
     # Pre-resolve the chunks whitelist once (intersected with bbox-implied
     # chunks) so both code paths can reuse it.
     #
