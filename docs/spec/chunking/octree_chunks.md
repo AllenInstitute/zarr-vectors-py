@@ -29,12 +29,17 @@ converts to and from uniform chunks without loss.
 : Adjacent leaves (sharing a face, edge or corner) differ by at most one
   depth.
 
+**Leaf cap**
+: The widest leaf allowed, in cells per side (`max_leaf_cells`, a power of
+  two).  On a sharded level it is at most the largest power of two
+  dividing every shard side; see Leaves and shards.
+
 ## Layout
 
 | Where | What |
 |---|---|
 | root `format_capabilities` | `octree_chunks` while any level has octree chunks |
-| level `zarr_vectors_level.octree_chunks` | `max_depth`, `origin_cell`, `target`, `balanced`, `weight` (`"vertices"`), `leaves` |
+| level `zarr_vectors_level.octree_chunks` | `max_depth`, `origin_cell`, `target`, `balanced`, `weight` (`"vertices"`), `leaves`, `max_leaf_cells` (`null`: uncapped), `shard_shape` and `shard_origin` (the shard grid the leaves were fitted to, in cells; `null` when unsharded) |
 | `<level>/octree_chunks/leaves` | `(N, 5)` int64: `depth, i, j, k, weight` per stored (non-empty) leaf |
 | `<level>/octree_chunks/cells` | `(C, 6)` int64: `i, j, k` (cell), `leaf`, `vertices`, `fragments`, in storage order |
 | `vertices`, `vertex_fragments`, `object_index` | as for uniform chunks, keyed by the leaf's anchor; the object index keeps the level's object ids, layout and row sharding |
@@ -44,6 +49,63 @@ converts to and from uniform chunks without loss.
 A leaf's vertex block is its cells' blocks end to end (cells in Z order), and
 its fragments are theirs in the same order; `octree_chunks/cells` records the
 runs.  Manifest entries name `(anchor, fragment)`.
+
+## Leaves and shards
+
+On a sharded level a leaf is never larger than a shard and never crosses
+a shard boundary, so all of a leaf's data -- vertices, fragments, the links
+filed under it -- is in one shard.  A shard can then be written by one
+task without locks (as BRIDGE writes, one task per shard), rewritten on
+its own after a failure, and read without touching its neighbours; a
+leaf larger than a shard would put the data of several shards into its
+anchor's shard.
+
+`to_octree` fits the plan to the level's shard grid -- the shard shape of
+its `vertices` array (or the store's declared `shard_shape` when the
+level has none) and that array's grid origin (`chunk_grid_origin`, where
+the first shard starts):
+
+* the root cube starts on a shard boundary;
+* no leaf is wider than the largest power of two dividing every shard
+  side: 4 for shards of `(4, 4, 4)`, 2 for `(4, 2, 8)`, and 2 for
+  `(6, 6, 6)`, since a leaf of 4 cells would cross the boundary at 6.
+  Leaves are power-of-two cubes from a shard boundary, so they tile the
+  shards exactly;
+* a leaf that holds anything is split while wider than the cap; empty
+  space is not stored and is left coarse.  Balancing only ever splits
+  leaves, so it never makes one wider than the cap.
+
+`max_leaf_cells=` caps the leaf side further (a power of two, at most the
+shard's cap), or caps it on an unsharded level, which otherwise is not
+capped.  The cap and the shard grid are recorded in the level's octree
+block.  Both conversions keep the level's packing: the rewritten arrays
+are sharded as the level's `vertices` were, also when that was done by
+`shard_store` without a root declaration.
+
+This is the rule Zarr's own sharding has for regular chunks -- a shard
+shape must be a whole number of chunks, so every chunk is in exactly one
+shard -- applied to chunks of several sizes.
+
+The cap costs chunk count where space is sparse: leaves that would have
+spanned several shards become one per shard (or finer, for small or
+non-power-of-two shards).  On a clustered synthetic level of 10^6
+vertices in 80^3 cells (140,299 occupied) with `target=5000`, the
+uncapped plan has 1,665 leaves (side 1 to 16); capped, shards of 16 give
+the same 1,665, shards of 8 give 2,141, shards of 4 give 8,546, and
+shards of 2 (or `(6, 6, 6)`, `(4, 2, 8)`, capped at 2) give 58,151 leaves
+averaging 17 vertices.  The largest leaf (4,936 vertices) is the same in
+every case: the cap only splits leaves.
+
+**Repacking an octree level.**  `shard_store`, `reshard` and
+`unshard_store` move cells unchanged, so every leaf stays a correct
+chunk at its anchor and they are allowed on an octree level.  A new
+shard shape the recorded cap still divides (`(4, 4, 4)` to `(8, 8, 8)`)
+keeps every leaf inside one shard; one that splits leaves (`(4, 4, 4)`
+to `(2, 2, 2)`) does not, and `validate` reports each leaf not inside
+one shard of the arrays' current shard grid -- as an error when the
+level was converted with a cap, as a warning when it was converted
+without one (unsharded at the time, or by a `to_octree` before the cap).
+`to_uniform` then `to_octree` fits the leaves to the new shards.
 
 ## Links
 
@@ -121,7 +183,8 @@ delete on an octree level's handle unless the handle is marked by
 `zarr_vectors.octree_chunks.guard.converting`.  `validate` checks an
 octree level with checks of its own (leaf and cell tables, every leaf's
 vertex and fragment counts, manifests, link rows, no links between
-levels, and the marker codec) instead of the uniform ones.
+levels, the marker codec, and every leaf inside one shard) instead of
+the uniform ones.
 `zarr_vectors.octree_chunks.to_octree` / `to_uniform` convert a level,
 and the way back restores every cell's vertex rows, fragments, manifest
 entries and links.

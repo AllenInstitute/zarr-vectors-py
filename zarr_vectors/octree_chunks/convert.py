@@ -12,6 +12,11 @@ order) and its fragments are theirs, so the conversion moves rows without
 regrouping them; ``octree_chunks/cells`` records which cell each run came
 from, which is what makes the way back exact.
 
+On a sharded level no leaf is larger than a shard or crosses a shard
+boundary (:func:`~zarr_vectors.octree_chunks.table.plan_leaves` with the
+level's shard grid), and both conversions keep the level's packing: the
+rewritten arrays are sharded as the level's own ``vertices`` are.
+
 Both conversions are safe to interrupt.  Everything that can fail on the
 input -- unsupported content, links longer than a cell, manifests or
 links naming rows that are not there -- is checked while the level is
@@ -55,6 +60,7 @@ from zarr_vectors.core.arrays import (
     create_links_array,
     create_object_index_array,
     create_vertices_array,
+    level_grid_layout,
     list_link_offsets,
     object_shard_rows,
     open_write_session,
@@ -67,7 +73,7 @@ from zarr_vectors.core.arrays import (
     write_links,
     write_object_index,
 )
-from zarr_vectors.core.metadata import get_level_chunk_shape
+from zarr_vectors.core.metadata import get_level_chunk_shape, normalise_shard_shape
 from zarr_vectors.core.paths import parse_delta
 from zarr_vectors.core.store import (
     _finalize_write,
@@ -87,6 +93,7 @@ from zarr_vectors.octree_chunks.table import (
     OctreeError,
     _morton,
     format_link_segment,
+    leaf_cap,
     parse_link_segment,
     plan_leaves,
 )
@@ -137,6 +144,58 @@ def leaf_table(level_group: Any) -> LeafTable:
 def cell_table(level_group: Any) -> npt.NDArray[np.int64]:
     """``(C, 6)`` rows ``(i, j, k, leaf, vertices, fragments)``, in storage order."""
     return np.asarray(level_group._zarr[CELLS_TABLE][...], dtype=np.int64).reshape(-1, 6)
+
+
+def array_shard_grid(level_group: Any, name: str = VERTICES
+                     ) -> tuple[tuple[int, ...] | None, tuple[int, ...]] | None:
+    """``(shard_shape, origin)`` of the level's per-chunk array ``name``, in
+    cells: its cells per shard (``None`` when unsharded) and the cell its
+    grid starts at, where the first shard starts.  ``None`` when the level
+    has no such array."""
+    import zarr
+
+    try:
+        node = level_group._zarr[name]
+    except KeyError:
+        return None
+    if not isinstance(node, zarr.Array):
+        return None
+    meta = node.metadata
+    codecs = tuple(getattr(meta, "codecs", ()))
+    shard = None
+    if codecs and type(codecs[0]).__name__ in ("ShardingCodec", "OctreeShardingCodec"):
+        # Zarr-vectors cells are the inner chunks, one per cell, so the
+        # outer (stored) chunk is the shard.
+        shard = tuple(int(c) for c in meta.chunk_grid.chunk_shape)
+    raw = node.attrs.get("chunk_grid_origin")
+    origin = tuple(int(o) for o in raw) if raw else (0,) * len(meta.shape)
+    return shard, origin
+
+
+def _level_packing(root_meta: Any, level_group: Any, chunk_shape: tuple[float, ...]
+                   ) -> tuple[tuple[int, ...] | None, tuple[int, ...]]:
+    """The shard grid a conversion writes the level in: the shard shape of
+    the level's ``vertices`` (the store's declaration when it has none) and
+    the grid origin the level's bounds give, where the rewritten arrays
+    start.  A conversion keeps the level's packing: a level sharded by
+    ``shard_store`` without a root declaration stays sharded."""
+    origin, _ = level_grid_layout(root_meta.bounds, chunk_shape)
+    found = array_shard_grid(level_group)
+    shard = found[0] if found is not None else normalise_shard_shape(root_meta.shard_shape, len(origin))
+    return (None if shard is None else tuple(int(c) for c in shard)), tuple(int(o) for o in origin)
+
+
+def _check_staged_packing(stage: Any, shard: tuple[int, ...] | None, origin: tuple[int, ...]) -> None:
+    """Refuse, before the swap, staged arrays not packed on the shard grid
+    the leaves were planned for (their leaves could straddle its shards)."""
+    found = array_shard_grid(stage)
+    if found is None:
+        return
+    if found[0] != shard or (shard is not None and found[1] != origin):
+        raise OctreeError(
+            f"the rewritten level came out with shards of {found[0]} cells from {found[1]}, "
+            f"not the {shard} from {origin} its leaves were planned for"
+        )
 
 
 # -- helpers -------------------------------------------------------------------
@@ -600,7 +659,8 @@ def _resume(root: Any, level_group: Any) -> dict[str, Any] | None:
 # -- the conversions ----------------------------------------------------------
 
 def to_octree(store: Any, *, target: float, level: int = 0, balanced: bool = True,
-              compressor: Any = "inherit", backend: str | None = None) -> dict[str, Any]:
+              max_leaf_cells: int | None = None, compressor: Any = "inherit",
+              backend: str | None = None) -> dict[str, Any]:
     """Rewrite a uniform level with octree chunks of at most ``target`` vertices.
 
     The uniform chunk is the finest leaf: no leaf is smaller, and a cell
@@ -609,12 +669,23 @@ def to_octree(store: Any, *, target: float, level: int = 0, balanced: bool = Tru
     may hold links into or out of this one.  Object ids are kept.  An
     empty level becomes an octree level with no leaves.
 
+    On a sharded level every leaf lies inside one shard: the root cube
+    starts on a shard boundary and no leaf is wider than the largest power
+    of two dividing every shard side (so a shard of ``(6, 6, 6)`` cells
+    takes leaves of up to 2).  ``max_leaf_cells`` (a power of two) caps
+    the leaf side further, or on an unsharded level at all; it may not
+    exceed the shard's cap.  The cap and the shard grid are recorded in
+    the level's octree block (``max_leaf_cells``, ``shard_shape``,
+    ``shard_origin``).  The level keeps its packing (the shard shape of
+    its ``vertices``).
+
     Nothing is changed when the level cannot be converted.  When a
     previous conversion of this level was interrupted during its swap,
     this finishes it first (returning that conversion's summary, with
     ``"resumed": True``, if it was a ``to_octree``).
 
-    Returns a summary: leaf count, the largest leaf, the depths used.
+    Returns a summary: leaf count, the largest leaf, the depths used, the
+    leaf side cap (``max_leaf_cells``, ``None`` when uncapped).
     """
     root = open_store(store, mode="r+", backend=backend)
     level_group = get_resolution_level(root, level)
@@ -625,6 +696,8 @@ def to_octree(store: Any, *, target: float, level: int = 0, balanced: bool = Tru
         raise OctreeError("this level already has octree chunks; to_uniform first")
     meta, chunk_shape = _check_convertible(root, level_group, level)
     _check_no_cross_level_links(root, level)
+    shard, grid_origin = _level_packing(meta, level_group, chunk_shape)
+    leaf_cap(max_leaf_cells, shard)  # a bad cap is refused before the level is read
     dtype = _vertex_dtype(level_group)
     comp = _marked(_level_compressors(level_group) if compressor == "inherit" else compressor, True)
 
@@ -641,7 +714,9 @@ def to_octree(store: Any, *, target: float, level: int = 0, balanced: bool = Tru
     had_links = level_group.array_exists(f"{LINKS}/0")
     links = read_link_arrays(level_group, delta=0) if list_link_offsets(level_group, 0) else None
 
-    table = plan_leaves(cell_arr, counts, target=target, balanced=balanced)
+    table = plan_leaves(cell_arr, counts, target=target, balanced=balanced,
+                        max_leaf_cells=max_leaf_cells, shard_shape=shard,
+                        shard_origin=grid_origin if shard is not None else None)
     leaf_of = table.leaf_of_cells(cell_arr)
     rel = cell_arr - np.asarray(table.origin_cell)
     order = np.lexsort((_morton(rel, max(table.max_depth, 1)), leaf_of))
@@ -694,14 +769,15 @@ def to_octree(store: Any, *, target: float, level: int = 0, balanced: bool = Tru
                "links": int(len(link_plan.src)) if link_plan is not None else 0,
                "max_leaf_vertices": int(table.weight.max()) if len(table) else 0,
                "max_cell_vertices": int(counts.max()) if len(counts) else 0,
-               "depths": {int(d): int(k) for d, k in zip(*np.unique(table.depth, return_counts=True))}}
+               "depths": {int(d): int(k) for d, k in zip(*np.unique(table.depth, return_counts=True))},
+               "max_leaf_cells": table.max_leaf_cells}
     block = {**table.meta(), "weight": "vertices", "leaves": len(table)}
 
     # -- write the octree layout beside the level, then swap it in.
     with converting(level_group, root):
         stage = _open_staging(level_group)
         with converting(stage):
-            with open_write_session(stage, compressor=comp, shard_shape="inherit",
+            with open_write_session(stage, compressor=comp, shard_shape=shard,
                                     bounds=meta.bounds, chunk_shape=chunk_shape):
                 create_vertices_array(stage, dtype=str(dtype))
                 for leaf, gl in sorted(leaf_groups.items()):
@@ -711,6 +787,7 @@ def to_octree(store: Any, *, target: float, level: int = 0, balanced: bool = Tru
                 if objs is not None:
                     _write_objects(stage, objs, obj_coords, obj_frags)
             stamp_fragments_tile(stage, 3)
+            _check_staged_packing(stage, shard, grid_origin)
             _shard_objects_like(stage, objs)
             leaf_rows = table.to_rows()
             stage.write_array(LEAVES_TABLE, leaf_rows, chunks=(max(len(leaf_rows), 1), 5))
@@ -743,6 +820,7 @@ def to_uniform(store: Any, *, level: int = 0, compressor: Any = "inherit",
     except Exception:
         level_meta = None
     chunk_shape = tuple(get_level_chunk_shape(meta, level_meta))
+    shard, _ = _level_packing(meta, level_group, chunk_shape)
     dtype = _vertex_dtype(level_group)
     comp = _marked(_level_compressors(level_group) if compressor == "inherit" else compressor, False)
     anchors = table.anchors()
@@ -804,7 +882,7 @@ def to_uniform(store: Any, *, level: int = 0, compressor: Any = "inherit",
     with converting(level_group, root):
         stage = _open_staging(level_group)
         with converting(stage):
-            with open_write_session(stage, compressor=comp, shard_shape="inherit",
+            with open_write_session(stage, compressor=comp, shard_shape=shard,
                                     bounds=meta.bounds, chunk_shape=chunk_shape):
                 create_vertices_array(stage, dtype=str(dtype))
                 for cc in sorted(cell_groups):
@@ -827,6 +905,6 @@ def to_uniform(store: Any, *, level: int = 0, compressor: Any = "inherit",
 
 
 __all__ = [
-    "ArrayError", "cell_table", "leaf_table", "octree_meta", "read_octree_link_cells",
+    "ArrayError", "array_shard_grid", "cell_table", "leaf_table", "octree_meta", "read_octree_link_cells",
     "to_octree", "to_uniform",
 ]

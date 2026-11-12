@@ -18,7 +18,11 @@ Pinned here:
   level converts both ways;
 * on an octree level, ``read_graph`` / ``read_points`` (whole, box, object)
   answer what the uniform level answers, and per-leaf reads plus seams
-  hold every link exactly once.
+  hold every link exactly once;
+* on a sharded level every leaf lies inside one shard -- also for shard
+  sides that are not powers of two -- where the uncapped plan would not,
+  the cap is recorded, the level keeps its packing both ways, and
+  ``validate`` flags leaves a later reshard splits.
 """
 
 from __future__ import annotations
@@ -764,6 +768,174 @@ def test_an_empty_level_converts_both_ways(tmp_path, kind):
     assert octree_meta(get_resolution_level(open_store(path), 0)) is None
     assert len(read(path)["positions"]) == 0
     assert _snapshot(path) == before
+
+
+# -- leaves and shards ------------------------------------------------------------
+
+SHARDS = [(2, 2, 2), (4, 4, 4), (4, 2, 8), (6, 6, 6)]
+WIDE = 2 * BOX  # 32 cells per side: room for the uncapped plan to make 8-cell leaves
+
+
+def _skewed(n=8000, seed=0):
+    """A dense cluster in one corner and sparse space elsewhere."""
+    rng = np.random.default_rng(seed)
+    pos = np.concatenate([rng.normal(120, 22, (n, 3)), rng.uniform(0, WIDE, (n // 3, 3))])
+    return np.clip(pos, 0.5, WIDE - 0.5).astype(np.float32)
+
+
+def _cells_and_counts(pos=None):
+    pos = _skewed() if pos is None else pos
+    return np.unique(np.floor(pos / CELL).astype(np.int64), axis=0, return_counts=True)
+
+
+@pytest.mark.parametrize("shard", SHARDS)
+@pytest.mark.parametrize("shard_origin", [(0, 0, 0), (-3, 1, -2)])
+def test_capped_leaves_stay_inside_one_shard(shard, shard_origin):
+    from zarr_vectors.octree_chunks.table import shard_leaf_cap
+
+    cells, counts = _cells_and_counts()
+    cap = shard_leaf_cap(shard)
+    assert cap == {(2, 2, 2): 2, (4, 4, 4): 4, (4, 2, 8): 2, (6, 6, 6): 2}[shard]
+    free = plan_leaves(cells, counts, target=1200)
+    # The test bites: unconstrained, sparse space gets leaves wider than a shard allows.
+    assert int(free.sides().max()) > cap and len(free.straddling(shard, shard_origin))
+    t = plan_leaves(cells, counts, target=1200, shard_shape=shard, shard_origin=shard_origin)
+    assert t.max_leaf_cells == cap and t.shard_shape == shard and t.shard_origin == shard_origin
+    assert int(t.sides().max()) <= cap
+    assert not len(t.straddling(shard, shard_origin))
+    assert not ((np.asarray(t.origin_cell) - shard_origin) % shard).any()
+    lc = t.leaf_of_cells(cells)
+    assert (lc >= 0).all() and np.allclose(np.bincount(lc, counts, minlength=len(t)), t.weight)
+    assert t.weight.max() <= max(1200, counts.max())
+    for n in range(len(t)):  # balancing kept, and never forced a leaf past the cap
+        assert np.abs(t.depth[t.neighbours(n)] - t.depth[n]).max(initial=0) <= 1
+    assert len(t) > len(free)
+
+
+def test_leaf_cap_arguments():
+    cells, counts = _cells_and_counts()
+    t = plan_leaves(cells, counts, target=1200, max_leaf_cells=2)  # unsharded, capped on request
+    assert int(t.sides().max()) == 2 and t.max_leaf_cells == 2 and t.shard_shape is None
+    assert plan_leaves(cells, counts, target=1200, max_leaf_cells=1, shard_shape=(4, 4, 4)).sides().max() == 1
+    assert plan_leaves(cells, counts, target=1200).max_leaf_cells is None
+    with pytest.raises(OctreeError, match="power of two"):
+        plan_leaves(cells, counts, target=1200, max_leaf_cells=3)
+    with pytest.raises(OctreeError, match="inside one shard"):
+        plan_leaves(cells, counts, target=1200, max_leaf_cells=4, shard_shape=(6, 6, 6))
+    with pytest.raises(OctreeError, match="not on a shard boundary"):
+        plan_leaves(cells, counts, target=1200, origin_cell=(1, 0, 0), shard_shape=(4, 4, 4))
+
+
+@pytest.mark.parametrize("shard", SHARDS)
+def test_to_octree_fits_leaves_to_the_shards(tmp_path, shard):
+    from zarr_vectors.octree_chunks.convert import array_shard_grid
+    from zarr_vectors.octree_chunks.table import shard_leaf_cap
+    from zarr_vectors.validate import validate
+
+    pos = _skewed()
+    edges = _short_edges(pos)
+    oids = (np.arange(len(pos)) // 40).astype(np.int64)
+    path = tmp_path / "g.zv"
+    # Bounds below zero put the shard grid's origin at cell -1, not 0.
+    write_graph(path, pos, edges, chunk_shape=(CELL,) * 3, bounds=([-CELL] * 3, [WIDE] * 3),
+                object_ids=oids, shard_shape=shard)
+    cells, counts = _cells_and_counts(pos)
+    lg = get_resolution_level(open_store(path), 0)
+    got_shard, origin = array_shard_grid(lg)
+    assert got_shard == shard and origin == (-1, -1, -1)
+    free = plan_leaves(cells, counts, target=1200)
+    assert int(free.sides().max()) > shard_leaf_cap(shard) and len(free.straddling(shard, origin))
+    before = _snapshot(path)
+    s = to_octree(path, target=1200)
+    cap = shard_leaf_cap(shard)
+    assert s["max_leaf_cells"] == cap
+    lg = get_resolution_level(open_store(path), 0)
+    block = octree_meta(lg)
+    assert block["max_leaf_cells"] == cap and block["shard_shape"] == list(shard)
+    assert block["shard_origin"] == [-1, -1, -1]
+    assert array_shard_grid(lg) == (shard, origin)
+    t = leaf_table(lg)
+    assert int(t.sides().max()) <= cap and not len(t.straddling(shard, origin))
+    result = validate(path, level=3)
+    assert result.ok and not result.warnings, (result.errors, result.warnings)
+    g = read_graph(path)
+    assert g["node_count"] == len(pos) and g["edge_count"] == len(edges)
+    to_uniform(path)
+    assert _snapshot(path) == before
+    assert array_shard_grid(get_resolution_level(open_store(path), 0)) == (shard, origin)
+
+
+def test_max_leaf_cells_on_an_unsharded_level(tmp_path):
+    from zarr_vectors.validate import validate
+
+    path = tmp_path / "g.zv"
+    _small_graph(path, lambda n: np.arange(n) // 40)
+    before = _snapshot(path)
+    with pytest.raises(OctreeError, match="power of two"):
+        to_octree(path, target=300, max_leaf_cells=3)
+    assert _snapshot(path) == before
+    assert to_octree(path, target=300, max_leaf_cells=2)["max_leaf_cells"] == 2
+    lg = get_resolution_level(open_store(path), 0)
+    assert octree_meta(lg)["max_leaf_cells"] == 2 and octree_meta(lg)["shard_shape"] is None
+    assert int(leaf_table(lg).sides().max()) <= 2
+    assert validate(path, level=3).ok
+    to_uniform(path)
+    assert _snapshot(path) == before
+
+
+def test_a_level_sharded_by_shard_store_keeps_its_shards(tmp_path):
+    """Packing follows the level's arrays, not only the root declaration,
+    which ``shard_store`` does not write."""
+    from zarr_vectors.octree_chunks.convert import array_shard_grid
+    from zarr_vectors.sharding.io import shard_store
+
+    path = tmp_path / "g.zv"
+    _small_graph(path, lambda n: np.arange(n) // 40)
+    shard_store(str(path), shard_shape=4)
+    assert read_root_metadata(open_store(path)).shard_shape is None
+    before = _snapshot(path)
+    assert to_octree(path, target=300)["max_leaf_cells"] == 4
+    assert array_shard_grid(get_resolution_level(open_store(path), 0))[0] == (4, 4, 4)
+    to_uniform(path)
+    assert array_shard_grid(get_resolution_level(open_store(path), 0))[0] == (4, 4, 4)
+    assert _snapshot(path) == before
+
+
+def test_validate_flags_leaves_a_reshard_splits(tmp_path):
+    from zarr_vectors.octree_chunks.convert import array_shard_grid
+    from zarr_vectors.sharding.io import reshard
+    from zarr_vectors.validate import validate
+
+    path = tmp_path / "g.zv"
+    _small_graph(path, lambda n: np.arange(n) // 40, n=6000, shard=4)
+    before = _snapshot(path)
+    to_octree(path, target=1500)
+    assert int(leaf_table(get_resolution_level(open_store(path), 0)).sides().max()) == 4
+    reshard(str(path), 8)  # coarser shards, still a multiple: every leaf still fits
+    assert validate(path, level=3).ok
+    reshard(str(path), 2)  # finer shards split the 4-cell leaves
+    errors = validate(path, level=3).errors
+    assert any("not inside one shard" in e and "to_uniform, then to_octree" in e
+               and "resharded since" in e for e in errors), errors
+    to_uniform(path)
+    assert _snapshot(path) == before
+    assert to_octree(path, target=1500)["max_leaf_cells"] == 2
+    assert validate(path, level=3).ok
+    assert array_shard_grid(get_resolution_level(open_store(path), 0))[0] == (2, 2, 2)
+
+
+def test_validate_warns_on_uncapped_leaves_a_shard_store_splits(tmp_path):
+    from zarr_vectors.sharding.io import shard_store
+    from zarr_vectors.validate import validate
+
+    path = tmp_path / "g.zv"
+    _small_graph(path, lambda n: np.arange(n) // 40, n=6000)
+    to_octree(path, target=1500)
+    assert octree_meta(get_resolution_level(open_store(path), 0))["max_leaf_cells"] is None
+    shard_store(str(path), shard_shape=2)
+    result = validate(path, level=3)
+    assert result.ok, result.errors
+    assert any("not inside one shard" in w and "without a leaf cap" in w for w in result.warnings)
 
 
 # -- the guard -------------------------------------------------------------------

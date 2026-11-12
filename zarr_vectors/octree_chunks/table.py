@@ -24,6 +24,13 @@ its own depth -- always one grid step, in ``{-1, 0, 1}**3`` -- plus ``Δ``::
 so the other endpoint is ``(d - Δ, (ijk >> Δ) + o)``.  A 2:1-balanced plan
 (adjacent leaves differ by at most one depth) needs at most 26 + 26
 offset arrays besides the intra-leaf one.
+
+Leaves and shards.  On a sharded level no leaf is larger than a shard or
+crosses a shard boundary, so each leaf's data lives in one shard and a
+shard can be written, rewritten or read on its own.  The plan's root
+cube starts on a shard boundary and no leaf is wider than
+:func:`shard_leaf_cap` -- the largest power of two dividing every shard
+side -- so leaves tile shards exactly.
 """
 
 from __future__ import annotations
@@ -71,6 +78,44 @@ def depth_for(extent_cells: Sequence[int]) -> int:
     return int(np.ceil(np.log2(n))) if n > 1 else 0
 
 
+def _is_power_of_two(n: int) -> bool:
+    return n >= 1 and n & (n - 1) == 0
+
+
+def shard_leaf_cap(shard_shape: Sequence[int]) -> int:
+    """Widest leaf (cells per side) that tiles shards of ``shard_shape``.
+
+    The largest power of two dividing every shard side: ``(4, 4, 4)`` gives
+    4, ``(4, 2, 8)`` gives 2, and ``(6, 6, 6)`` gives 2, as a leaf of 4 cells
+    would cross the boundary at 6.  With the root cube on a shard boundary,
+    every leaf of this side or less lies in one shard.
+    """
+    sides = [int(s) for s in shard_shape]
+    if not sides or min(sides) < 1:
+        raise OctreeError(f"bad shard shape {tuple(sides)}")
+    return min(s & -s for s in sides)
+
+
+def leaf_cap(max_leaf_cells: int | None, shard_shape: Sequence[int] | None) -> int | None:
+    """The leaf side cap a plan uses: ``max_leaf_cells``, or on a sharded level
+    the shard's (:func:`shard_leaf_cap`) when that is not given or smaller.
+
+    Raises when ``max_leaf_cells`` is not a power of two, or is wider than a
+    sharded level allows (a leaf must never be larger than a shard).
+    """
+    if max_leaf_cells is not None and not _is_power_of_two(int(max_leaf_cells)):
+        raise OctreeError(f"max_leaf_cells must be a power of two, got {max_leaf_cells}")
+    if shard_shape is None:
+        return None if max_leaf_cells is None else int(max_leaf_cells)
+    cap = shard_leaf_cap(shard_shape)
+    if max_leaf_cells is not None and int(max_leaf_cells) > cap:
+        raise OctreeError(
+            f"max_leaf_cells={max_leaf_cells} is wider than shards of {tuple(shard_shape)} "
+            f"cells allow ({cap}): a leaf must lie inside one shard"
+        )
+    return cap if max_leaf_cells is None else int(max_leaf_cells)
+
+
 def plan_leaves(
     cells: npt.ArrayLike,
     weights: npt.ArrayLike,
@@ -79,6 +124,9 @@ def plan_leaves(
     origin_cell: Sequence[int] | None = None,
     max_depth: int | None = None,
     balanced: bool = True,
+    max_leaf_cells: int | None = None,
+    shard_shape: Sequence[int] | None = None,
+    shard_origin: Sequence[int] | None = None,
 ) -> LeafTable:
     """Split the root cube until every leaf weighs at most ``target``.
 
@@ -89,11 +137,19 @@ def plan_leaves(
             cannot be split and stays one leaf.
         origin_cell: Grid position of the root cube's minimum corner;
             defaults to the cells' minimum, or ``0`` where that is
-            non-negative.
+            non-negative -- moved down to a shard boundary when
+            ``shard_shape`` is given.
         max_depth: ``D``; defaults to the smallest root cube covering the
             cells.
         balanced: Split further until adjacent leaves (faces, edges and
             corners) differ by at most one depth.
+        max_leaf_cells: Widest leaf allowed, in cells per side (a power of
+            two).  ``None``: the shard's cap when ``shard_shape`` is given
+            (:func:`shard_leaf_cap`), no cap otherwise.
+        shard_shape: Cells per shard per axis when the level is sharded:
+            the plan then keeps every leaf inside one shard.
+        shard_origin: The cell a shard starts at (the arrays' grid
+            origin); defaults to ``0``.
 
     Returns:
         The non-empty leaves.
@@ -104,9 +160,19 @@ def plan_leaves(
         raise OctreeError(f"{len(cells)} cells but {len(weights)} weights")
     if target <= 0:
         raise OctreeError(f"target must be positive, got {target}")
+    cap = leaf_cap(max_leaf_cells, shard_shape)
+    shards = None if shard_shape is None else np.asarray(shard_shape, dtype=np.int64).reshape(3)
+    s_origin = np.zeros(3, np.int64) if shard_origin is None else np.asarray(shard_origin, np.int64).reshape(3)
     if origin_cell is None:
         origin_cell = np.minimum(cells.min(axis=0), 0) if len(cells) else np.zeros(3, np.int64)
+        if shards is not None:
+            origin_cell = s_origin + ((np.asarray(origin_cell, np.int64) - s_origin) // shards) * shards
     origin = np.asarray(origin_cell, dtype=np.int64).reshape(3)
+    if shards is not None and ((origin - s_origin) % shards).any():
+        raise OctreeError(
+            f"origin_cell {tuple(origin.tolist())} is not on a shard boundary "
+            f"(shards of {tuple(shards.tolist())} cells from {tuple(s_origin.tolist())})"
+        )
     rel = cells - origin
     if len(rel) and rel.min() < 0:
         raise OctreeError("a cell lies below origin_cell")
@@ -122,19 +188,23 @@ def plan_leaves(
         u, inv = np.unique(codes, return_inverse=True)
         node_weight.append(dict(zip(u.tolist(), np.bincount(inv, weights).tolist())))
 
+    # A leaf is split while too heavy or, holding anything, wider than the
+    # cap; empty space is never stored, so it is left coarse.
     leaves: list[set[int]] = [set() for _ in range(D + 1)]
     stack = [(0, 0, 0, 0)]
     while stack:
         d, i, j, k = stack.pop()
         code = (i << (2 * d)) | (j << d) | k
         w = node_weight[d].get(code, 0.0)
-        if w > target and d < D:
+        if d < D and w > 0 and (w > target or (cap is not None and (1 << (D - d)) > cap)):
             for c in range(8):
                 stack.append((d + 1, 2 * i + (c >> 2), 2 * j + ((c >> 1) & 1), 2 * k + (c & 1)))
         else:
             leaves[d].add(code)
 
     if balanced:
+        # Balancing only ever splits a leaf into its children, so it keeps
+        # every leaf within the cap.
         _balance(leaves, D)
 
     out_d, out_ijk, out_w = [], [], []
@@ -152,7 +222,9 @@ def plan_leaves(
         depth=np.asarray(out_d, dtype=np.int64),
         ijk=np.asarray(out_ijk, dtype=np.int64).reshape(-1, 3),
         weight=np.asarray(out_w, dtype=np.float64),
-        target=float(target), balanced=balanced,
+        target=float(target), balanced=balanced, max_leaf_cells=cap,
+        shard_shape=None if shards is None else shards.tolist(),
+        shard_origin=None if shards is None else s_origin.tolist(),
     )
 
 
@@ -209,6 +281,9 @@ class LeafTable:
     weight: npt.NDArray[np.float64]
     target: float | None = None
     balanced: bool = True
+    max_leaf_cells: int | None = None              # leaf side cap; None: uncapped
+    shard_shape: tuple[int, int, int] | None = None  # the shards the plan was fitted to
+    shard_origin: tuple[int, int, int] | None = None
     _by_depth: dict[int, tuple[npt.NDArray[np.int64], npt.NDArray[np.int64]]] = field(
         default_factory=dict, repr=False,
     )
@@ -216,7 +291,9 @@ class LeafTable:
     @classmethod
     def from_arrays(cls, *, max_depth: int, origin_cell: Sequence[int], depth: npt.ArrayLike,
                     ijk: npt.ArrayLike, weight: npt.ArrayLike, target: float | None = None,
-                    balanced: bool = True) -> LeafTable:
+                    balanced: bool = True, max_leaf_cells: int | None = None,
+                    shard_shape: Sequence[int] | None = None,
+                    shard_origin: Sequence[int] | None = None) -> LeafTable:
         depth = np.asarray(depth, dtype=np.int64).reshape(-1)
         ijk = np.asarray(ijk, dtype=np.int64).reshape(-1, 3)
         weight = np.asarray(weight, dtype=np.float64).reshape(-1)
@@ -224,7 +301,10 @@ class LeafTable:
         order = np.lexsort((depth, _morton(anchors_rel, max(max_depth, 1))))
         t = cls(max_depth=int(max_depth), origin_cell=tuple(int(c) for c in origin_cell),
                 depth=depth[order], ijk=ijk[order], weight=weight[order],
-                target=target, balanced=balanced)
+                target=target, balanced=balanced,
+                max_leaf_cells=None if max_leaf_cells is None else int(max_leaf_cells),
+                shard_shape=None if shard_shape is None else tuple(int(c) for c in shard_shape),
+                shard_origin=None if shard_origin is None else tuple(int(c) for c in shard_origin))
         for d in np.unique(t.depth).tolist():
             idx = np.flatnonzero(t.depth == d)
             codes = _codes(t.ijk[idx], d)
@@ -245,11 +325,16 @@ class LeafTable:
             max_depth=int(meta["max_depth"]), origin_cell=meta["origin_cell"],
             depth=rows[:, 0], ijk=rows[:, 1:4], weight=rows[:, 4],
             target=meta.get("target"), balanced=bool(meta.get("balanced", True)),
+            max_leaf_cells=meta.get("max_leaf_cells"), shard_shape=meta.get("shard_shape"),
+            shard_origin=meta.get("shard_origin"),
         )
 
     def meta(self) -> dict[str, Any]:
         return {"max_depth": self.max_depth, "origin_cell": list(self.origin_cell),
-                "target": self.target, "balanced": self.balanced}
+                "target": self.target, "balanced": self.balanced,
+                "max_leaf_cells": self.max_leaf_cells,
+                "shard_shape": None if self.shard_shape is None else list(self.shard_shape),
+                "shard_origin": None if self.shard_origin is None else list(self.shard_origin)}
 
     # -- addressing ------------------------------------------------------
 
@@ -263,6 +348,17 @@ class LeafTable:
     def sides(self) -> npt.NDArray[np.int64]:
         """Cells per side of each leaf."""
         return np.int64(1) << (self.max_depth - self.depth)
+
+    def straddling(self, shard_shape: Sequence[int], shard_origin: Sequence[int] | None = None
+                   ) -> npt.NDArray[np.int64]:
+        """Leaves not inside one shard of ``shard_shape`` cells (shards start
+        at ``shard_origin``, default ``0``): wider than a shard, or across a
+        shard boundary."""
+        shards = np.asarray(shard_shape, dtype=np.int64).reshape(3)
+        o = np.zeros(3, np.int64) if shard_origin is None else np.asarray(shard_origin, np.int64).reshape(3)
+        lo = self.anchors() - o
+        hi = lo + self.sides()[:, None] - 1
+        return np.flatnonzero((lo // shards != hi // shards).any(axis=1))
 
     def key(self, n: int) -> str:
         i, j, k = self.ijk[n].tolist()

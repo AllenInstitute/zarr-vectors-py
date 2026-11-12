@@ -10,7 +10,11 @@ Supports two modes:
 - **Skeleton (tree)**: nodes reordered depth-first, parent links mostly
   sequential.  Only branch points (parent ≠ i−1) need an intra-chunk
   record, but *every* boundary-crossing edge is still explicit — implicit
-  sequential order does not span chunks.
+  sequential order does not span chunks.  A vertex with no record takes
+  the row before it as parent unless it opens a fragment, so the writer
+  opens each fragment with its parentless vertex, if any, and stores
+  every parent edge of a vertex that has several; see
+  :func:`_skeleton_edges` for the read rule.
   ``links_convention: "implicit_sequential_with_branches"``.
 
 Edge attributes (weight, type, etc.) are stored in ``link_attributes/``
@@ -135,7 +139,9 @@ def write_graph(
     Args:
         store_path: Path for the new store.
         positions: ``(N, D)`` node positions.
-        edges: ``(M, 2)`` edge list (global vertex indices).
+        edges: ``(M, 2)`` edge list (global vertex indices).  For a
+            skeleton each row is ``[child, parent]``, and a parent of
+            ``-1`` (SWC style) marks the child a root -- no edge.
         chunk_shape: Spatial chunk size per dimension.
         kind: ``"graph"`` (default — general graph, explicit links
             convention) or ``"skeleton"`` (depth-first reorder, implicit
@@ -224,6 +230,25 @@ def write_graph(
     # For skeletons: reorder depth-first
     reorder_map: npt.NDArray | None = None
     if is_tree:
+        # A ``[child, -1]`` row is the SWC way of saying "child is a root",
+        # and the skeleton spec's own example writes one.  It is no edge:
+        # taken as one, ``-1`` indexed the last vertex and the store held
+        # an edge from the root to it.
+        if (edges[:, 0] < 0).any() or (edges[:, 1] < -1).any():
+            raise ValueError(
+                "skeleton edges are [child, parent] vertex indices, with a "
+                "parent of -1 marking the child a root; got a negative "
+                "child, or a parent below -1"
+            )
+        no_parent = edges[:, 1] < 0
+        if no_parent.any():
+            edges = edges[~no_parent]
+            n_edges = len(edges)
+            if edge_attributes:
+                edge_attributes = {
+                    name: np.asarray(data)[~no_parent]
+                    for name, data in edge_attributes.items()
+                }
         positions, edges, node_attributes, edge_attributes, reorder_map = (
             _reorder_tree(positions, edges, node_attributes, edge_attributes)
         )
@@ -347,10 +372,27 @@ def write_graph(
     # actually stored, and every edge in a chunk holding more than one
     # object then points at the wrong vertex.  ``meshes.py`` already does
     # this, for the same reason and with the same comment.
+    #
+    # A skeleton also puts each fragment's parentless vertex first.  The
+    # reader gives every vertex but a fragment's first the row before it
+    # as parent, unless a record says otherwise -- and a vertex with no
+    # parent has no record to say so.  At a fragment start it needs none;
+    # anywhere else it read back joined to its predecessor.  Depth-first
+    # order puts it there already when an object is one whole tree, but
+    # not when the object's other vertices hang off another object's tree
+    # and are visited first.  ``_check_one_root_per_object`` leaves at
+    # most one such vertex per object, so per fragment.  Only fragments
+    # that need the move are re-sorted.
+    n_child_edges: npt.NDArray[np.int64] | None = None
+    if is_tree:
+        n_child_edges = _child_edge_counts(edges, n_nodes)
+        parentless = n_child_edges == 0
     for _cc, _gi in list(chunk_assignments.items()):
         _gi = np.asarray(_gi, dtype=np.int64)
         if _gi.size > 1:
             _gi = _gi[np.argsort(object_ids[_gi], kind="stable")]
+            if is_tree:
+                _gi = _parentless_first(_gi, object_ids[_gi], parentless[_gi])
         chunk_assignments[_cc] = _gi
     chunk_list = sorted(chunk_assignments.keys())
 
@@ -403,10 +445,17 @@ def write_graph(
         # there the old rule dropped a real edge and let the root inherit
         # the previous chunk's last vertex as its parent -- reading back
         # an edge nobody ever wrote.
+        #
+        # And only when it is the child's ONE parent edge.  The reader
+        # gives the implicit parent only to a vertex with no record, so a
+        # vertex with two parent edges (not a tree, but accepted: a cycle
+        # closing on the root, a repeated edge) needs every one stored --
+        # an implied one left out was silently replaced by its sibling.
         _child, _parent = edges[:, 0], edges[:, 1]
         implied = (
             (read_idx[_child] == read_idx[_parent] + 1)
             & ~is_fragment_start[_child]
+            & (n_child_edges[_child] == 1)
         )
         store_mask = ~implied
         _check_one_root_per_object(edges, object_ids, n_nodes)
@@ -612,10 +661,13 @@ def read_graph(
         object_ids: Optional object ID filter.  Only the named objects'
             vertex fragments are read -- found through the object index,
             not by scanning chunks -- and only the edges between them.
-            Ids not in the store are ignored.  A skeleton's object is one
-            tree, so its implicit edges are rebuilt within each fragment
-            as on a full read; a branch whose parent lies outside the
-            read (a ``bbox`` / ``chunks`` scope) comes back as a root.
+            Ids not in the store are ignored.  For a graph and a skeleton
+            alike the edges are the induced subgraph: an edge comes back
+            exactly when both its ends are read, so one between two
+            objects needs both asked for.  A skeleton's implicit edges
+            are rebuilt within each fragment as on a full read; a vertex
+            whose parent was not read (another object's, or outside a
+            ``bbox`` / ``chunks`` scope) comes back as a root.
         bbox: Optional bounding box filter.
         chunks: Optional whitelist of chunk coordinate tuples; only nodes
             (and intra-chunk edges) in those chunks are returned. AND-ed
@@ -845,29 +897,17 @@ def _read_graph(
             # took the previous fragment's last vertex as its parent,
             # returning an edge the writer never stored (and, for a root in
             # a later chunk, one edge too many).
-            parent_arr = np.arange(-1, total_nodes - 1, dtype=np.int64)
-            if fragment_starts:
-                parent_arr[np.asarray(fragment_starts, dtype=np.int64)] = -1
-            # Vectorized branch-link override: one fancy-index per block.
-            # A record's parent may be -1 -- it lies outside the read --
-            # and then the child is a root here.
-            for edge_block in all_edges:
-                if len(edge_block) == 0:
-                    continue
-                children = edge_block[:, 0].astype(np.int64, copy=False)
-                parents = edge_block[:, 1].astype(np.int64, copy=False)
-                valid = (children >= 0) & (children < total_nodes)
-                if valid.any():
-                    parent_arr[children[valid]] = parents[valid]
-            # Build edge list from parent array
-            all_edges = []
-            mask = parent_arr >= 0
-            children_idx = np.flatnonzero(mask)
-            if len(children_idx) > 0:
-                tree_edges = np.stack(
-                    [children_idx, parent_arr[children_idx]], axis=1
-                ).astype(np.int64)
-                all_edges.append(tree_edges)
+            records = (
+                all_edges[0] if len(all_edges) == 1
+                else np.concatenate(all_edges, axis=0) if all_edges
+                else np.zeros((0, 2), dtype=np.int64)
+            )
+            valid = (records[:, 0] >= 0) & (records[:, 0] < total_nodes)
+            all_edges = [_skeleton_edges(
+                total_nodes,
+                np.asarray(fragment_starts, dtype=np.int64),
+                records[valid].astype(np.int64, copy=False),
+            )]
 
         if all_edges:
             edges_out = np.concatenate(all_edges, axis=0)
@@ -926,10 +966,11 @@ def _read_graph_objects(
     :func:`~zarr_vectors.types.meshes.read_object_links`, as for a mesh.
     A graph's records are its edges, kept when both ends are ours.  A
     skeleton's are the edges the implicit rule does not give, so its
-    parents are rebuilt as on a full read: ``parent[i] = i - 1`` within
-    a fragment (a fragment is read whole, so its rows keep their order),
-    none at a fragment start, and a record's parent wherever one exists
-    -- ``-1`` (a root) when that parent was not read.  So the records
+    edges are rebuilt as on a full read (:func:`_skeleton_edges`):
+    ``parent[i] = i - 1`` within a fragment (a fragment is read whole, so
+    its rows keep their order) for a vertex without a record, none at a
+    fragment start, and every record otherwise -- no edge, but a root,
+    when its parent was not read.  So the records
     are read from every link cell touching the objects' chunks, not only
     those wholly inside them: a record whose parent is in a chunk not
     read (outside the scope, or another object's) is the only thing that
@@ -946,13 +987,9 @@ def _read_graph_objects(
     positions_out, owners_out, rows, starts = read
 
     if is_tree:
-        n = len(positions_out)
-        parent_arr = np.arange(-1, n - 1, dtype=np.int64)
-        parent_arr[starts] = -1
-        ours = rows[:, 0] >= 0
-        parent_arr[rows[ours, 0]] = rows[ours, 1]
-        children = np.flatnonzero(parent_arr >= 0)
-        edges_out = np.stack([children, parent_arr[children]], axis=1).astype(np.int64)
+        edges_out = _skeleton_edges(
+            len(positions_out), starts, rows[rows[:, 0] >= 0],
+        )
     else:
         edges_out = np.ascontiguousarray(rows[(rows >= 0).all(axis=1)])
 
@@ -968,6 +1005,53 @@ def _read_graph_objects(
         "edge_count": len(edges_out),
         "object_ids": owners_out,
     }
+
+
+def _skeleton_edges(
+    n: int,
+    fragment_starts: npt.NDArray[np.int64],
+    records: npt.NDArray[np.int64],
+) -> npt.NDArray[np.int64]:
+    """A skeleton read's ``(child, parent)`` edges over ``n`` read rows.
+
+    The ``implicit_sequential_with_branches`` rule, stated whole:
+
+    - a vertex with no record whose child it is, and that does not open
+      a fragment, has the row before it as parent -- the only implicit
+      edge;
+    - every record ``[child, parent]`` is an edge, and suppresses its
+      child's implicit one.  A record whose parent was not read
+      (``-1``: outside the scope, or another object's) is no edge here,
+      but still suppresses -- the child is a root of this read.
+
+    So a vertex with several records (a cycle, a repeated edge -- not a
+    tree, but the writer accepts them) gets every one.  The parent array
+    alone kept the last.  Edges come out in child order, with any such
+    vertex's records after the rest.
+
+    ``records`` are output rows, each child in ``[0, n)``.
+    """
+    parent_arr = np.arange(-1, n - 1, dtype=np.int64)
+    if len(fragment_starts):
+        parent_arr[fragment_starts] = -1
+    extra: npt.NDArray[np.int64] | None = None
+    if len(records):
+        children, parents = records[:, 0], records[:, 1]
+        parent_arr[children] = parents
+        # Several records for one child?  Fewer distinct children than
+        # records says so -- a scatter and a count, no sort; which ones
+        # is worked out only then.
+        hit = np.zeros(n, dtype=bool)
+        hit[children] = True
+        if int(np.count_nonzero(hit)) != len(children):
+            multi = np.bincount(children, minlength=n)[children] > 1
+            parent_arr[children[multi]] = -1
+            extra = records[multi & (parents >= 0)]
+    kids = np.flatnonzero(parent_arr >= 0)
+    edges = np.stack([kids, parent_arr[kids]], axis=1).astype(np.int64, copy=False)
+    if extra is not None and len(extra):
+        edges = np.concatenate([edges, extra.astype(np.int64, copy=False)], axis=0)
+    return edges
 
 
 def _empty_graph_result(ndim: int) -> dict[str, Any]:
@@ -1001,60 +1085,55 @@ def _reorder_tree(
     """
     n = len(positions)
 
-    # Build adjacency from edges via numpy: sort by parent, then slice
-    # per-parent runs.  The previous ``for e in edges`` loop was ~O(M)
-    # Python iterations; this is one ``argsort`` + per-unique-parent
-    # ``.tolist()`` slice.
-    children: dict[int, list[int]] = {i: [] for i in range(n)}
-    if len(edges) > 0:
-        e_children = edges[:, 0].astype(np.int64, copy=False)
-        e_parents = edges[:, 1].astype(np.int64, copy=False)
-        sort_idx = np.argsort(e_parents, kind="stable")
-        sorted_parents = e_parents[sort_idx]
-        sorted_children = e_children[sort_idx]
-        unique_parents, start_indices = np.unique(
-            sorted_parents, return_index=True,
-        )
-        end_indices = np.concatenate(
-            [start_indices[1:], np.array([len(sorted_parents)], dtype=np.int64)]
-        )
-        for parent, lo, hi in zip(
-            unique_parents.tolist(),
-            start_indices.tolist(),
-            end_indices.tolist(),
-        ):
-            children[parent] = sorted_children[lo:hi].tolist()
-    child_nodes_arr = (
-        edges[:, 0].astype(np.int64, copy=False) if len(edges) > 0 else np.array([], dtype=np.int64)
-    )
+    # Adjacency as CSR: edges sorted by parent (stably, so each parent's
+    # children keep their edge order), ``first[v]:first[v + 1]`` the run
+    # of ``v``'s children.  Plain lists, as the walk below indexes them
+    # one vertex at a time.  This replaces a dict of one list per vertex,
+    # filled by a ``.tolist()`` per parent -- most of what the old
+    # reorder cost, and the reason walking every tree now costs no more
+    # than walking the first.
+    e_children = edges[:, 0].astype(np.int64, copy=False)
+    e_parents = edges[:, 1].astype(np.int64, copy=False)
+    sort_idx = np.argsort(e_parents, kind="stable")
+    sorted_parents = e_parents[sort_idx]
+    child_list: list[int] = e_children[sort_idx].tolist()
+    first: list[int] = np.searchsorted(
+        sorted_parents, np.arange(n + 1, dtype=np.int64), side="left",
+    ).tolist()
 
-    # Find root (node with no parent) — vectorized set difference.
+    # Roots (nodes with no parent) — vectorized set difference.
     is_child = np.zeros(n, dtype=bool)
-    if len(child_nodes_arr) > 0:
-        in_range = (child_nodes_arr >= 0) & (child_nodes_arr < n)
-        is_child[child_nodes_arr[in_range]] = True
+    if len(e_children) > 0:
+        in_range = (e_children >= 0) & (e_children < n)
+        is_child[e_children[in_range]] = True
     root_candidates = np.flatnonzero(~is_child)
-    root_node = int(root_candidates[0]) if len(root_candidates) > 0 else 0
 
-    # DFS ordering
+    # DFS ordering from every root, in index order, then from whatever
+    # no root reaches (a cycle) -- not from the first root alone with the
+    # rest appended as given.  That left every tree after the first in
+    # input order, so a forest given in any other order stored nearly all
+    # of its edges.  Input already in depth-first order comes out
+    # unchanged either way.  A child already visited is pushed anyway and
+    # skipped when popped, which visits in the same order as not pushing
+    # it.
     order: list[int] = []
-    stack = [root_node]
-    visited = set()
-    while stack:
-        node = stack.pop()
-        if node in visited:
+    visited = bytearray(n)
+    for start in (*root_candidates.tolist(), *range(n)):
+        if visited[start]:
             continue
-        visited.add(node)
-        order.append(node)
-        # Push children in reverse so first child is processed first
-        for child in reversed(children.get(node, [])):
-            if child not in visited:
-                stack.append(child)
-
-    # Add any unvisited nodes (disconnected components)
-    for i in range(n):
-        if i not in visited:
-            order.append(i)
+        stack = [start]
+        while stack:
+            node = stack.pop()
+            if visited[node]:
+                continue
+            visited[node] = 1
+            order.append(node)
+            lo, hi = first[node], first[node + 1]
+            if hi - lo == 1:
+                stack.append(child_list[lo])
+            elif hi > lo:
+                # Push children in reverse so first child is processed first
+                stack.extend(reversed(child_list[lo:hi]))
 
     reorder_map = np.array(order, dtype=np.int64)
     inv_map = np.empty(n, dtype=np.int64)
@@ -1076,6 +1155,45 @@ def _reorder_tree(
         }
 
     return new_positions, new_edges, new_node_attrs, edge_attributes, reorder_map
+
+
+def _child_edge_counts(edges: npt.NDArray, n_nodes: int) -> npt.NDArray[np.int64]:
+    """How many ``[child, parent]`` rows name each vertex as the child.
+
+    One for every vertex of a tree but its root, which has none.  Rows
+    whose child is out of range are not counted.
+    """
+    children = edges[:, 0].astype(np.int64, copy=False)
+    in_range = (children >= 0) & (children < n_nodes)
+    if not in_range.all():
+        children = children[in_range]
+    return np.bincount(children, minlength=n_nodes)
+
+
+def _parentless_first(
+    chunk_vertices: npt.NDArray[np.int64],
+    chunk_oids: npt.NDArray,
+    chunk_parentless: npt.NDArray[np.bool_],
+) -> npt.NDArray[np.int64]:
+    """Move each fragment's parentless vertex to the fragment's start.
+
+    ``chunk_vertices`` is one chunk's vertices already grouped by object
+    (``chunk_oids`` their owners, ``chunk_parentless`` which have no
+    parent edge).  Returned as given when every parentless vertex already
+    opens its fragment -- the depth-first case -- and otherwise re-sorted
+    by (object, has a parent), stably, so the rest keep their order.
+    """
+    if not chunk_parentless.any():
+        return chunk_vertices
+    starts = np.empty(len(chunk_oids), dtype=bool)
+    starts[0] = True
+    np.not_equal(chunk_oids[1:], chunk_oids[:-1], out=starts[1:])
+    if not (chunk_parentless & ~starts).any():
+        return chunk_vertices
+    order = np.lexsort((
+        np.arange(len(chunk_vertices)), ~chunk_parentless, chunk_oids,
+    ))
+    return chunk_vertices[order]
 
 
 def _check_one_root_per_object(

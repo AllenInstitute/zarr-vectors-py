@@ -154,6 +154,48 @@ def test_sharded_stores_and_every_reader(tmp_path, monkeypatch, octree, reader, 
     assert _edge_set(got["positions"], got["edges"], directed) == edge_set
 
 
+@pytest.mark.parametrize("shuffled", [False, True], ids=["dfs", "shuffled"])
+def test_skeleton_trees_cut_into_several_objects(tmp_path, shuffled):
+    """Each tree cut into pieces, every piece its own object, so many
+    edges join two objects.  Any set of objects reads its induced
+    subgraph: every edge with both ends asked for, endpoint order kept,
+    and nothing standing in for an edge whose other end was not -- the
+    rule a plain graph's object read follows."""
+    positions, edges, _ = _forest(seed=5)
+    rng = np.random.default_rng(5)
+    parent = np.full(len(positions), -1)
+    parent[edges[:, 0]] = edges[:, 1]
+    oids = np.zeros(len(positions), dtype=np.int64)
+    next_id = 0
+    for i in range(len(positions)):        # parents precede children here
+        if parent[i] < 0 or rng.random() < 0.2:
+            oids[i] = next_id
+            next_id += 1
+        else:
+            oids[i] = oids[parent[i]]
+    if shuffled:
+        perm = rng.permutation(len(positions))
+        inv = np.argsort(perm)
+        positions, oids, edges = positions[perm], oids[perm], inv[edges]
+    path = tmp_path / "cut.zarrvectors"
+    write_graph(path, positions, edges, chunk_shape=CHUNK, bounds=BOUNDS,
+                kind="skeleton", object_ids=oids)
+    graph = tmp_path / "cut_graph.zarrvectors"
+    write_graph(graph, positions, edges, chunk_shape=CHUNK, bounds=BOUNDS,
+                kind="graph", object_ids=oids)
+    for _ in range(10):
+        wanted = rng.choice(next_id, size=int(rng.integers(1, 12)), replace=False).tolist()
+        nodes, edge_set = _expected(positions, edges, oids, wanted, True)
+        got = read_graph(path, object_ids=wanted)
+        assert {_key(p) for p in got["positions"]} == nodes
+        assert _edge_set(got["positions"], got["edges"], True) == edge_set
+        assert got["edge_count"] == len(edge_set)
+        plain = read_graph(graph, object_ids=wanted)
+        assert _edge_set(plain["positions"], plain["edges"], False) == {
+            frozenset(e) for e in edge_set
+        }
+
+
 def test_skeleton_object_read_survives_an_empty_last_fragment(tmp_path):
     """An object manifest may name an empty vertex fragment (a custom
     writer, an edit).  Taken last, its start equalled the row count and
