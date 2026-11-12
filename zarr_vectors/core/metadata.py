@@ -909,6 +909,10 @@ class LevelMetadata:
     written before this field says, and costs only the read it would
     otherwise have saved."""
     link_fragments_aligned: bool = False
+    #: Octree chunks (``zarr_vectors.octree_chunks``): the plan's
+    #: ``max_depth``, ``origin_cell``, ``target``, ``balanced``; ``None`` for
+    #: a uniform level, which is every level unless converted.
+    octree_chunks: dict[str, Any] | None = None
     """True when, in EVERY chunk of this level, the intra-chunk link
     array at delta 0 carries one link fragment per vertex fragment, and
     link fragment ``k`` holds exactly the records whose first stored
@@ -963,6 +967,8 @@ class LevelMetadata:
             d["fragments_tile"] = True
         if self.link_fragments_aligned:
             d["link_fragments_aligned"] = True
+        if self.octree_chunks is not None:
+            d["octree_chunks"] = dict(self.octree_chunks)
         return {"zarr_vectors_level": d}
 
     @classmethod
@@ -1012,6 +1018,7 @@ class LevelMetadata:
             shared_fragments=bool(lv.get("shared_fragments", False)),
             fragments_tile=bool(lv.get("fragments_tile", False)),
             link_fragments_aligned=bool(lv.get("link_fragments_aligned", False)),
+            octree_chunks=dict(lv["octree_chunks"]) if isinstance(lv.get("octree_chunks"), dict) else None,
         )
 
     def validate(self) -> None:

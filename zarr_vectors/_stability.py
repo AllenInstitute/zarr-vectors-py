@@ -77,6 +77,11 @@ INTERNAL: tuple[str, ...] = (
 
 #: Not yet either, with the reason.
 UNDECIDED: dict[str, str] = {
+    "zarr_vectors.octree_chunks": (
+        "Optional octree chunking of a level (to_octree / to_uniform), on the "
+        "octree branch: point clouds and undirected graphs only so far, and "
+        "its on-disk layout is an extension the spec does not yet carry."
+    ),
     "zarr_vectors.types": (
         "The five store-creating writers are promoted into `building` and "
         "are supported there. The readers are superseded by Level.read() / "

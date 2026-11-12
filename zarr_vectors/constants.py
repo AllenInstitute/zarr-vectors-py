@@ -261,6 +261,14 @@ codec's configuration); set at construction (``Layout(octree=...)``) or by
 or writing such an array needs the zarr-octree package.  Optional and
 additive: absent means ``sharding_indexed``, as every other store."""
 
+CAP_OCTREE_CHUNKS: str = "octree_chunks"
+"""A level of the store has octree chunks: its per-chunk arrays hold one cell
+per octree leaf (an aligned cube of the uniform grid's cells, sized by its
+vertex count), at the leaf's minimum-corner cell, with cross-leaf links named
+by ``(offset, depth change)``.  A reader without it must not read such a
+level: it would take each leaf for one uniform cell.  Optional, and
+converted to and from uniform chunks by ``zarr_vectors.octree_chunks``."""
+
 DEFAULT_AXES_NAMES: tuple[str, ...] = ("x", "y", "z", "w")
 """Default axis names used when ``create_store`` is called without an
 explicit ``axes`` kwarg.  Indexed by ``sid_ndim`` (1 → ``("x",)``, 2 →
