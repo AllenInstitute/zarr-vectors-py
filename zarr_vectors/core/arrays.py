@@ -8329,12 +8329,29 @@ def link_endpoints_to_rows(
     if m == 0:
         return np.empty((0, link_width), dtype=np.int64)
     flat = chunks.reshape(-1, sid_ndim)
-    unique, inverse = np.unique(flat, axis=0, return_inverse=True)
-    starts = np.fromiter(
-        (chunk_offsets.get(tuple(row), -1) for row in unique.tolist()),
-        dtype=np.int64, count=unique.shape[0],
-    )
-    base = starts[np.asarray(inverse).reshape(-1)].reshape(m, link_width)
+    # Each endpoint's chunk as one integer, by mixed radix over the
+    # coordinates' range.  ``np.unique(axis=0)`` sorts the rows as a
+    # structured dtype, which on a mesh's five million endpoints was
+    # 5 s of a 6 s whole-level read; a table gather is linear.
+    lo = flat.min(axis=0)
+    span = flat.max(axis=0) - lo + 1
+    cells = int(np.prod(span.astype(object)))
+    if cells <= max(4 * flat.shape[0], 1 << 20):
+        key = np.ravel_multi_index(tuple((flat - lo).T), tuple(int(s) for s in span))
+        table = np.full(cells, -1, dtype=np.int64)
+        for cc, start in chunk_offsets.items():
+            rel = np.asarray(cc, dtype=np.int64) - lo
+            if len(cc) == sid_ndim and np.all(rel >= 0) and np.all(rel < span):
+                table[np.ravel_multi_index(tuple(int(x) for x in rel),
+                                           tuple(int(s) for s in span))] = start
+        base = table[key].reshape(m, link_width)
+    else:
+        unique, inverse = np.unique(flat, axis=0, return_inverse=True)
+        starts = np.fromiter(
+            (chunk_offsets.get(tuple(row), -1) for row in unique.tolist()),
+            dtype=np.int64, count=unique.shape[0],
+        )
+        base = starts[np.asarray(inverse).reshape(-1)].reshape(m, link_width)
     return np.where(base >= 0, base + vi, -1)
 
 
