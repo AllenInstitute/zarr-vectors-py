@@ -740,6 +740,23 @@ def _read_polylines(
             )
         )
 
+    # A box alone names no objects, so the read below would take its
+    # whole-level branch: decode every vertex chunk in the level, then
+    # keep the polylines that touch the box -- a full read, whatever the
+    # box.  The manifests already say which objects touch it, as flat
+    # arrays and without per-object Python, so narrow to those objects
+    # and read only their chunks.  Same objects, same order.
+    if (
+        target_chunks is not None
+        and not explicit_subset
+        and chunk_whitelist is None
+        and filter_bin is None
+    ):
+        touching = _objects_touching(level_group, target_chunks)
+        if touching is not None:
+            object_ids = touching
+            explicit_subset = True
+
     result_polylines: list[list[npt.NDArray]] = []
     # One entry per emitted polyline, mirroring ``result_polylines``:
     # ``{name: [rows_per_fragment, ...]}``.
@@ -1018,6 +1035,55 @@ def _read_polylines(
         "polyline_count": len(result_polylines),
         "vertex_count": total_verts,
     }
+
+
+def _objects_touching(
+    level_group: Any, target_chunks: set[ChunkCoords],
+) -> list[int] | None:
+    """Ids of the objects with a fragment in ``target_chunks``, ascending.
+
+    None when the level's manifests cannot be read as arrays, and the
+    caller keeps its whole-level read.
+    """
+    from zarr_vectors.core.arrays import read_all_object_manifests_csr
+
+    if not target_chunks:
+        return []
+    try:
+        offsets, coords, _frags = csr = read_all_object_manifests_csr(level_group)
+        offsets = np.asarray(offsets, dtype=np.int64)
+        coords = np.asarray(coords, dtype=np.int64)
+    except Exception:
+        return None
+    n_obj = int(offsets.shape[0]) - 1
+    if n_obj <= 0 or coords.shape[0] == 0:
+        return []
+    targets = np.asarray(sorted(target_chunks), dtype=np.int64)
+    if targets.ndim != 2 or targets.shape[1] != coords.shape[1]:
+        return None
+    # Each chunk coordinate as one integer over the range both span.
+    lo = np.minimum(coords.min(axis=0), targets.min(axis=0))
+    span = np.maximum(coords.max(axis=0), targets.max(axis=0)) - lo + 1
+    total = 1
+    for v in span.tolist():
+        total *= int(v)
+    if total >= (1 << 62):
+        return None
+
+    def pack(a: npt.NDArray[np.int64]) -> npt.NDArray[np.int64]:
+        out = np.zeros(a.shape[0], dtype=np.int64)
+        for d in range(a.shape[1]):
+            out *= int(span[d])
+            out += a[:, d] - lo[d]
+        return out
+
+    hit = np.isin(pack(coords), pack(targets))
+    owner = np.repeat(np.arange(n_obj, dtype=np.int64), np.diff(offsets))
+    rows = np.unique(owner[hit])
+    ids = csr.object_ids
+    if ids is not None:
+        rows = np.sort(np.asarray(ids, dtype=np.int64)[rows])
+    return rows.tolist()
 
 
 def _read_manifest_run(
