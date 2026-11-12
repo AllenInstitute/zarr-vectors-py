@@ -550,7 +550,10 @@ def _check_octree_shards(lg: Any, table: Any, prefix: str, result: ValidationRes
     (its octree block's ``max_leaf_cells``) that is an error; on one
     converted without (unsharded then, or by a ``to_octree`` before the
     cap) a warning.  Either way ``to_uniform`` then ``to_octree`` fits
-    the leaves to the shards again.
+    the leaves to the shards again.  A level converted with
+    ``fit_shards=False`` asked for leaves that may straddle shards, so
+    they are not reported at all (its ``max_leaf_cells``, if any, still
+    is).
     """
     from zarr_vectors.octree_chunks.convert import array_shard_grid
 
@@ -564,6 +567,8 @@ def _check_octree_shards(lg: Any, table: Any, prefix: str, result: ValidationRes
             f"{prefix}: octree chunks: {int((sides > cap).sum())} leaves are wider than the "
             f"level's max_leaf_cells={cap}, e.g. leaf {table.key(n)} ({int(sides[n])} cells per side)"
         )
+    if not table.fit_shards:
+        return
     try:
         grid = array_shard_grid(lg)
     except Exception:

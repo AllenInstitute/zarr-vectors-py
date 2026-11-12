@@ -276,8 +276,10 @@ level: it would take each leaf for one uniform cell.  Readers that do not
 check capabilities are stopped by zarr itself: the level's per-chunk arrays
 carry the ``zarr_vectors_octree_chunks`` codec
 (:mod:`zarr_vectors.encoding.octree_marker`), which a zarr reader must know
-to open them.  Optional, and converted to and from uniform chunks by
-``zarr_vectors.octree_chunks``."""
+to open them.  Listed in the root's ``required_capabilities`` as well as
+``format_capabilities``, for the same span, so a viewer that checks the
+first can refuse the store with a clear message.  Optional, and converted
+to and from uniform chunks by ``zarr_vectors.octree_chunks``."""
 
 DEFAULT_AXES_NAMES: tuple[str, ...] = ("x", "y", "z", "w")
 """Default axis names used when ``create_store`` is called without an

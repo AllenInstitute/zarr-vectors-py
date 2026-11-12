@@ -14,8 +14,9 @@ from, which is what makes the way back exact.
 
 On a sharded level no leaf is larger than a shard or crosses a shard
 boundary (:func:`~zarr_vectors.octree_chunks.table.plan_leaves` with the
-level's shard grid), and both conversions keep the level's packing: the
-rewritten arrays are sharded as the level's own ``vertices`` are.
+level's shard grid) -- unless ``to_octree(fit_shards=False)`` opts out --
+and both conversions keep the level's packing: the rewritten arrays are
+sharded as the level's own ``vertices`` are.
 
 Both conversions are safe to interrupt.  Everything that can fail on the
 input -- unsupported content, links longer than a cell, manifests or
@@ -106,6 +107,7 @@ _STAGING_KEY = "octree_chunks_staging"  # its record: direction, arrays, final m
 _LEVEL_META_KEY = LEVEL_META_KEY
 _PER_CHUNK = (VERTICES, VERTEX_FRAGMENTS, LINKS, LINK_FRAGMENTS, OBJECT_INDEX)
 _SWAPPED = (*_PER_CHUNK, TABLES)     # every array a conversion replaces or removes
+_REQUIRED = "required_capabilities"  # the root list a reader must implement all of
 
 
 # -- reading the level's octree state -----------------------------------------
@@ -282,17 +284,62 @@ def _set_level_block(level_group: Any, block: dict[str, Any] | None) -> None:
 
 
 def _set_capability(root: Any, on: bool) -> None:
+    """``octree_chunks`` in the root's ``format_capabilities`` and
+    ``required_capabilities`` while ``on``, out of both otherwise, in one
+    write of the root; other entries (``additive_levels``, say) stay as
+    they are, and a ``required_capabilities`` that is not a list is left
+    untouched.  ``required_capabilities`` is dropped when taking ours out
+    leaves it empty, so a store that had no list has none again after
+    its last octree level is converted back."""
     block = dict(root.attrs.to_dict().get("zarr_vectors", {}))
     caps = [c for c in block.get("format_capabilities") or [] if c != CAP_OCTREE_CHUNKS]
     if on:
         caps.append(CAP_OCTREE_CHUNKS)
     block["format_capabilities"] = caps
+    had = block.get(_REQUIRED)
+    if had is None or isinstance(had, list):
+        had = had or []
+        required = [c for c in had if c != CAP_OCTREE_CHUNKS]
+        if on:
+            required.append(CAP_OCTREE_CHUNKS)
+        if required:
+            block[_REQUIRED] = required
+        elif CAP_OCTREE_CHUNKS in had:
+            block.pop(_REQUIRED, None)
     root.attrs.update({"zarr_vectors": block})
 
 
 def _any_octree_level(root: Any) -> bool:
     return any(octree_meta(get_resolution_level(root, m)) is not None
                for m in list_resolution_levels(root))
+
+
+def refresh_capabilities(store: Any, *, backend: str | None = None) -> bool:
+    """Set the root's ``octree_chunks`` capability -- in
+    ``format_capabilities`` and ``required_capabilities`` -- from the
+    levels: present while any level has an octree block (also one part
+    way through a conversion), absent otherwise.  Writes the root only
+    when that changes it; returns whether it did.
+
+    The conversions keep both lists themselves.  This is for a store
+    converted before ``required_capabilities`` was written, and for one
+    whose last ``to_uniform`` was killed between putting the level back
+    and updating the root -- the cases ``validate`` warns about.
+    """
+    root = open_store(store, mode="r+", backend=backend)
+    before = root.attrs.to_dict().get("zarr_vectors", {})
+    on = _any_octree_level(root)
+    required = before.get(_REQUIRED)
+    if required is None or isinstance(required, list):
+        listed = CAP_OCTREE_CHUNKS in (required or [])
+    else:
+        listed = on  # not a list: left as it is, so nothing to bring in line
+    have = (CAP_OCTREE_CHUNKS in (before.get("format_capabilities") or []), listed)
+    if have == (on, on):
+        return False
+    _set_capability(root, on)
+    _finalize_write(root, "refresh octree_chunks capability")
+    return True
 
 
 def _vertex_dtype(level_group: Any) -> np.dtype:
@@ -659,8 +706,8 @@ def _resume(root: Any, level_group: Any) -> dict[str, Any] | None:
 # -- the conversions ----------------------------------------------------------
 
 def to_octree(store: Any, *, target: float, level: int = 0, balanced: bool = True,
-              max_leaf_cells: int | None = None, compressor: Any = "inherit",
-              backend: str | None = None) -> dict[str, Any]:
+              max_leaf_cells: int | None = None, fit_shards: bool = True,
+              compressor: Any = "inherit", backend: str | None = None) -> dict[str, Any]:
     """Rewrite a uniform level with octree chunks of at most ``target`` vertices.
 
     The uniform chunk is the finest leaf: no leaf is smaller, and a cell
@@ -678,6 +725,16 @@ def to_octree(store: Any, *, target: float, level: int = 0, balanced: bool = Tru
     the level's octree block (``max_leaf_cells``, ``shard_shape``,
     ``shard_origin``).  The level keeps its packing (the shard shape of
     its ``vertices``).
+
+    ``fit_shards=False`` opts out on a sharded level: the plan is the one
+    an unsharded level gets (no shard-boundary origin, no shard cap,
+    ``max_leaf_cells`` any power of two or ``None``), so a leaf may
+    straddle shards -- fewer, larger leaves where space is sparse, but a
+    leaf's cells no longer share one shard.  The block then records
+    ``"fit_shards": false`` with ``shard_shape`` and ``shard_origin``
+    ``null`` (no grid was fitted), and ``validate`` does not report the
+    straddling leaves.  On an unsharded level it changes nothing but the
+    record.
 
     Nothing is changed when the level cannot be converted.  When a
     previous conversion of this level was interrupted during its swap,
@@ -697,7 +754,7 @@ def to_octree(store: Any, *, target: float, level: int = 0, balanced: bool = Tru
     meta, chunk_shape = _check_convertible(root, level_group, level)
     _check_no_cross_level_links(root, level)
     shard, grid_origin = _level_packing(meta, level_group, chunk_shape)
-    leaf_cap(max_leaf_cells, shard)  # a bad cap is refused before the level is read
+    leaf_cap(max_leaf_cells, shard if fit_shards else None)  # a bad cap is refused before the level is read
     dtype = _vertex_dtype(level_group)
     comp = _marked(_level_compressors(level_group) if compressor == "inherit" else compressor, True)
 
@@ -716,7 +773,8 @@ def to_octree(store: Any, *, target: float, level: int = 0, balanced: bool = Tru
 
     table = plan_leaves(cell_arr, counts, target=target, balanced=balanced,
                         max_leaf_cells=max_leaf_cells, shard_shape=shard,
-                        shard_origin=grid_origin if shard is not None else None)
+                        shard_origin=grid_origin if shard is not None else None,
+                        fit_shards=fit_shards)
     leaf_of = table.leaf_of_cells(cell_arr)
     rel = cell_arr - np.asarray(table.origin_cell)
     order = np.lexsort((_morton(rel, max(table.max_depth, 1)), leaf_of))
@@ -906,5 +964,5 @@ def to_uniform(store: Any, *, level: int = 0, compressor: Any = "inherit",
 
 __all__ = [
     "ArrayError", "array_shard_grid", "cell_table", "leaf_table", "octree_meta", "read_octree_link_cells",
-    "to_octree", "to_uniform",
+    "refresh_capabilities", "to_octree", "to_uniform",
 ]

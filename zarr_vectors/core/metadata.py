@@ -372,6 +372,14 @@ def requires_object_index(convention: str, num_chunks: int) -> bool:
 # RootMetadata
 # ===================================================================
 
+def _capability_list(value: Any) -> list[str]:
+    """``required_capabilities`` as read: the list's string entries, and
+    nothing for a value that is not a list (it is left alone on disk)."""
+    if not isinstance(value, (list, tuple)):
+        return []
+    return [c for c in value if isinstance(c, str)]
+
+
 @dataclass
 class RootMetadata:
     """Root-level metadata for a ZV store.
@@ -418,6 +426,15 @@ class RootMetadata:
     """Optional capability tokens this store uses.  See
     :mod:`zarr_vectors.constants` for the canonical token names
     (``CAP_*``).  Empty list by default."""
+    required_capabilities: list[str] = field(default_factory=list)
+    """Capabilities a reader must implement to read this store correctly;
+    a reader that checks the list refuses a store naming one it does not
+    implement.  A store with an octree-chunked level lists
+    :data:`~zarr_vectors.constants.CAP_OCTREE_CHUNKS` (kept by the
+    conversions in :mod:`zarr_vectors.octree_chunks`); one with additive
+    levels, ``"additive_levels"``.  This package does not refuse on it
+    yet.  Optional and empty by default -- written only when non-empty --
+    and round-tripped here so a rewrite of the root keeps it."""
     attribute_specs: dict[str, dict[str, Any]] | None = None
     """What the store declares its attributes to be, by scope.
 
@@ -682,6 +699,8 @@ class RootMetadata:
             d["zarr_vectors"]["manifest_block_dtype"] = "int32"
         if self.crs is not None:
             d["zarr_vectors"]["crs"] = self.crs
+        if self.required_capabilities:
+            d["zarr_vectors"]["required_capabilities"] = list(self.required_capabilities)
         if self.attribute_specs:
             d["zarr_vectors"]["attribute_specs"] = {
                 scope: {n: dict(spec) for n, spec in named.items()}
@@ -759,6 +778,7 @@ class RootMetadata:
             reduction_factor=zv.get("reduction_factor", DEFAULT_REDUCTION_FACTOR),
             base_bin_shape=tuple(bbs) if bbs else None,
             format_capabilities=list(caps),
+            required_capabilities=_capability_list(zv.get("required_capabilities")),
             attribute_specs=(
                 {
                     scope: {n: dict(spec) for n, spec in named.items()}
