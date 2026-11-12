@@ -181,6 +181,23 @@ write_graph(
 )
 ```
 
+Edge rows are `[child, parent]` vertex indices, in any row order, and
+vertices may come in any order: the writer reorders them depth-first
+from every root.  A row `[root, -1]` declares a root and is not an
+edge; any other negative index is refused.  An object may hold at most
+one root, but may hold pieces of several trees.
+
+**The read rule.**  Within a fragment, a vertex with no stored record
+has the row before it as its parent; the writer puts each fragment's
+parentless vertex first so the rule never invents an edge.  Every
+stored record is an edge, and a vertex with several (a cycle, a repeated
+edge -- not a tree, but accepted) keeps them all.  A scoped read
+(`bbox=`, `chunks=`, `object_ids=`) returns the induced subgraph: an
+edge comes back exactly when both its ends are read, so an edge between
+objects A and B needs both.  `edit_link(new_endpoints=...)` on a branch
+record re-points the child's parent: it rewrites the record in place,
+under `atomic=True` too.
+
 ### Multi-skeleton stores
 
 For connectome-scale datasets with thousands of neurons in a shared

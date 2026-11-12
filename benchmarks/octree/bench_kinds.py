@@ -17,9 +17,11 @@ octree at construction (``Layout(octree=...)``): ``octree`` (zarr-octree's
 ``zarr_octree_sharding`` with its defaults: an octree aimed at 100 kB) or
 ``runs`` (its runs layout, 160-640 kB).  zarr-octree is only needed for those.
 
-Readers (zarr-vectors' ``ZARR_VECTORS_SHARD_READER``): ``standard`` (the
-default, as zarr-vectors always read), ``optimised`` (opt-in: each shard index
-once, coalesced ranges, any store) and ``zarr`` (zarr's array API only).
+Readers (zarr-vectors' ``ZARR_VECTORS_SHARD_READER``): ``auto`` (the default:
+``optimised`` for ``zarr_octree_sharding`` arrays, ``standard`` for the rest),
+``standard`` (as zarr-vectors always read), ``optimised`` (each shard index
+once, coalesced ranges, any store) and ``zarr`` (zarr's array API only).  The
+benchmark always names its reader.
 
 Queries, each through ``select(...).read()``, with the read's faces / edges:
 

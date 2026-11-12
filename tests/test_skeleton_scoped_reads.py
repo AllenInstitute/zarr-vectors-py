@@ -89,10 +89,17 @@ def test_unscoped_chain_reads_whole(chain, objects):
     assert _edge_set(got["positions"], got["edges"]) == _edge_set(_CHAIN_P, _CHAIN_E)
 
 
+@pytest.mark.parametrize("shuffled", [False, True], ids=["dfs", "shuffled"])
 @pytest.mark.parametrize("seed", [0, 1, 2])
 @pytest.mark.parametrize("parity", [0, 1])
-def test_checkerboard_chunks_read_only_written_edges(tmp_path, seed, parity):
+def test_checkerboard_chunks_read_only_written_edges(tmp_path, seed, parity, shuffled):
     positions, edges, oids = _forest(seed=seed)
+    if shuffled:
+        # Vertices in no particular order: every tree's root must still
+        # come back a root, not joined to the row read before it.
+        perm = np.random.default_rng(seed).permutation(len(positions))
+        inv = np.argsort(perm)
+        positions, oids, edges = positions[perm], oids[perm], inv[edges]
     path = tmp_path / "forest.zarrvectors"
     write_graph(path, positions, edges, chunk_shape=CHUNK, bounds=BOUNDS,
                 kind="skeleton", object_ids=oids)

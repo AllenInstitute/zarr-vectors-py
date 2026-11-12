@@ -168,6 +168,7 @@ async def _fetch_chunks(
         _sharded_read_plan,
         _sharded_spec,
         shard_reader,
+        shard_reader_for,
     )
 
     if not keys:
@@ -185,9 +186,11 @@ async def _fetch_chunks(
         node = nodes.get(array_path)
         if sync_root is not None and isinstance(node, zarr.Array):
             spec = _direct_spec(sync_root, array_path, node)
-            if spec is None and shard_reader() == "optimised":  # opt-in; see shard_reader
+            # The optimised reader's arrays (see shard_reader_for: under
+            # the default, zarr-octree ones); the rest gather, as always.
+            if spec is None and shard_reader() != "standard":
                 shard_spec = _sharded_spec(node)
-                if shard_spec is not None:
+                if shard_spec is not None and shard_reader_for(shard_spec.source) == "optimised":
                     sharded.append((array_path, shard_spec, chunk_keys))
                     continue
         if spec is None:

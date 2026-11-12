@@ -319,7 +319,15 @@ def edit_link_in_session(
     if new_endpoints is not None:
         src, dst = int(new_endpoints[0]), int(new_endpoints[1])
         new_row = np.asarray([src, dst], dtype=group.dtype)
-        if atomic:
+        # On a skeleton a branch record names its child's parent, and the
+        # reader takes every record as an edge; appending would leave the
+        # child with its old parent as well, so a re-point always rewrites
+        # the record in place.
+        from zarr_vectors.core.metadata import RootMetadata
+        conv = RootMetadata.from_dict(
+            session.root.attrs.to_dict(),
+        ).links_convention
+        if atomic and conv != LINKS_IMPLICIT_BRANCHES:
             new_idx = builder.append_link_row(cell, ref.fragment, new_row)
             target_row = new_idx
         else:

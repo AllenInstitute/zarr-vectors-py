@@ -1,8 +1,10 @@
 """Sharded arrays read the same through every reader, with either sharding codec.
 
-``ZARR_VECTORS_SHARD_READER`` picks how sharded arrays are read: ``standard``
-(the default: as zarr-vectors always has), ``optimised`` (opt-in: each shard
-index once, coalesced ranges, any store) or ``zarr`` (zarr's array API only).
+``ZARR_VECTORS_SHARD_READER`` picks how sharded arrays are read: ``auto``
+(the default: ``optimised`` for an array sharded with ``zarr_octree_sharding``,
+``standard`` for any other), ``standard`` (as zarr-vectors always has),
+``optimised`` (each shard index once, coalesced ranges, any store) or ``zarr``
+(zarr's array API only).
 A store marked octree at construction (``Layout(octree=...)``) writes its
 shards with zarr-octree's ``zarr_octree_sharding`` instead of
 ``sharding_indexed``, and :func:`zarr_vectors.sharding.set_octree` converts
@@ -146,10 +148,10 @@ def test_optimised_reader_reads_store_backed_shards_itself(tmp_path, monkeypatch
 
 @pytest.mark.parametrize("codec", list(CODECS))
 def test_standard_reader_reads_store_backed_shards_through_zarr_as_before(tmp_path, monkeypatch, codec):
-    """The default: one range per cell, and a store that is not local read
+    """``standard``: one range per cell, and a store that is not local read
     through zarr, never by the optimised reader."""
     _write(tmp_path / "s.zv", codec)
-    monkeypatch.delenv("ZARR_VECTORS_SHARD_READER", raising=False)
+    monkeypatch.setenv("ZARR_VECTORS_SHARD_READER", "standard")
     monkeypatch.setenv("ZARR_VECTORS_COALESCE", "gap:1000000:100000000")  # ignored by the standard reader
     assert _batch_reader.shard_reader() == "standard"
     assert _cells_on_disk._coalescing()[0] == "none"
@@ -168,7 +170,7 @@ def test_an_unknown_reader_is_an_error(monkeypatch):
     monkeypatch.setenv("ZARR_VECTORS_SHARD_READER", "optimized")
     assert _batch_reader.shard_reader() == "optimised"
     monkeypatch.delenv("ZARR_VECTORS_SHARD_READER")
-    assert _batch_reader.shard_reader() == "standard"
+    assert _batch_reader.shard_reader() == "auto"
 
 
 def test_an_unmarked_store_carries_no_marker(tmp_path):

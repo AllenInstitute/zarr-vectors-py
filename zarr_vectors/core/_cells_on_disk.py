@@ -372,10 +372,12 @@ def read_local(
     return read_cells(requests)
 
 
-def _coalescing() -> tuple[str, int, int]:
-    """``ZARR_VECTORS_COALESCE``: how neighbouring cells of a shard share a read
-    in the optimised reader (see ``_batch_reader.shard_reader``); the
-    standard reader reads one range per cell.
+def _coalescing(src: CellSource | None = None) -> tuple[str, int, int]:
+    """``ZARR_VECTORS_COALESCE``: how neighbouring cells of a shard of ``src``
+    share a read when that array is read by the optimised reader (see
+    ``_batch_reader.shard_reader_for``: under the default ``auto``, a
+    zarr-octree array); an array read by the standard reader -- and, under
+    ``auto``, ``src`` None -- reads one range per cell.
 
     ``auto`` (the default): a zarr-octree shard's wanted cells are read one
     range per run -- first to last wanted cell -- and any other shard's as
@@ -385,9 +387,9 @@ def _coalescing() -> tuple[str, int, int]:
     while the gap to the next is at most ``bytes`` and the range at most
     ``span``.
     """
-    from zarr_vectors.core._batch_reader import shard_reader
+    from zarr_vectors.core._batch_reader import shard_reader_for
 
-    if shard_reader() != "optimised":  # the standard reader: one range per cell, as always
+    if shard_reader_for(src) != "optimised":  # the standard reader: one range per cell, as always
         return "none", 0, 0
     mode = os.environ.get("ZARR_VECTORS_COALESCE", "auto")
     if mode == "auto":
@@ -403,13 +405,14 @@ def _coalescing() -> tuple[str, int, int]:
 _AUTO_GAP, _AUTO_SPAN = 64 << 10, 1 << 20
 
 
-def _spans(rows: list[tuple[int, int, int, int, int]]) -> list[tuple[int, int, list[int]]]:
-    """``rows`` -- (row id, object, offset, size, run), sorted by object then
-    offset -- grouped into ``(start, stop, row ids)`` reads, each within one object."""
-    mode, gap, span = _coalescing()
+def _spans(rows: list[tuple[int, Any, int, int, int, tuple[str, int, int]]]) -> list[tuple[int, int, list[int]]]:
+    """``rows`` -- (row id, object, offset, size, run, coalescing), sorted by
+    object then offset -- grouped into ``(start, stop, row ids)`` reads, each
+    within one object.  ``coalescing`` is the :func:`_coalescing` of the
+    row's array, and so the same for every row of an object."""
     out: list[tuple[int, int, list[int]]] = []
     prev_obj, prev_run = None, -1
-    for row, obj, off, size, run in rows:
+    for row, obj, off, size, run, (mode, gap, span) in rows:
         if out and size >= 0 and obj == prev_obj:
             lo, hi, members = out[-1]
             if mode in ("runs", "auto") and run >= 0 and run == prev_run:
@@ -430,7 +433,9 @@ def read_cells(
     """:func:`read_local` for local and store-backed arrays alike.
 
     Each shard's index is read once (pooled from files, gathered from a
-    store), then the cells' ranges, coalesced per :func:`_coalescing`.
+    store), then the cells' ranges, coalesced per :func:`_coalescing` of
+    each array -- decided once per array, so one batch may coalesce one
+    array's cells and read another's one range per cell.
     """
     out: list[list[Any]] = [
         [None] * int(np.asarray(cells).reshape(-1, len(src.shape)).shape[0])
@@ -453,7 +458,8 @@ def read_cells(
             out[r][i] = ValueError(message)
         rows += [(r, i, src.store, rng.key, rng.offset, rng.size, rng.run) for i, rng in enumerate(ranges) if rng is not None]
     rows.sort(key=lambda f: (id(f[2]), f[3], f[4]))
-    spans = _spans([(j, (id(f[2]), f[3]), f[4], f[5], f[6]) for j, f in enumerate(rows)])
+    how = [_coalescing(src) for src, _ in requests]
+    spans = _spans([(j, (id(f[2]), f[3]), f[4], f[5], f[6], how[f[0]]) for j, f in enumerate(rows)])
     on_disk = [s for s in spans if rows[s[2][0]][2] is None]
     in_store = [s for s in spans if rows[s[2][0]][2] is not None]
     blobs = _batched_groups(_read_ranges, [(rows[m[0]][3], lo, hi - lo) for lo, hi, m in on_disk])
