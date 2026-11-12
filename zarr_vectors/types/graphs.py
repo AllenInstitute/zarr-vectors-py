@@ -726,6 +726,13 @@ def _read_graph(
 
     scoped = bbox is not None or chunks is not None or bool(attribute_filter)
 
+    if level_meta_for_cs is not None and level_meta_for_cs.octree_chunks is not None:
+        from zarr_vectors.octree_chunks.read import read_graph_octree
+        return read_graph_octree(
+            root, level=level, bbox=bbox, object_ids=object_ids, chunks=chunks,
+            attribute_filter=attribute_filter,
+        )
+
     # Determine chunks to read (physical keys ∩ bbox-implied ∩ chunks
     # whitelist).  An object read finds its chunks through the object
     # index, so an unscoped one needs no chunk listing at all.
