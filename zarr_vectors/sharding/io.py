@@ -44,6 +44,26 @@ The Morton / Hilbert curve indirection of older versions is gone; the
 native sharding codec already clusters spatially-adjacent inner chunks
 into the same shard via its C-order outer grid, giving the same
 read-locality benefit without a custom mapping.
+
+Post-hoc, not the only way
+--------------------------
+
+These verbs repack a store that already exists.  A store can also be
+born sharded -- ``create_store(shard_shape=)`` records the shape and
+every array allocated afterwards honours it, including the ones created
+lazily in workers.  That is cheaper than writing flat and repacking, and
+it is what a pipeline that knows its own object budget should do.
+
+This module used to document the opposite as a contract: sharding had to
+be the LAST coordinator pass, because ``nonempty_chunks`` could only be
+rebuilt from a per-cell store listing and a sharded array does not have
+one.  :meth:`~zarr_vectors.core.group.Group.derive_nonempty_chunks` now
+reads a sharded array's cells out of its shard objects, so that ordering
+is no longer forced.  What remains true is narrower: ``shard_store``
+selects cells through the presence manifest, so a store whose workers
+wrote with ``record_presence=False`` still needs its rebuild before it
+is repacked -- otherwise there is nothing to migrate and the pass
+silently does nothing.
 """
 
 from __future__ import annotations
@@ -172,6 +192,7 @@ def shard_store(
     *,
     shard_shape: int | Sequence[int] = 8,
     arrays: list[str] | None = None,
+    object_shard_rows: int | None = None,
 ) -> dict[str, Any]:
     """Repack every per-chunk array in the store with the
     ``sharding_indexed`` codec.
@@ -194,10 +215,14 @@ def shard_store(
         arrays: Optional list of logical array names to migrate.  When
             omitted, every per-array container under every resolution
             level is converted.
+        object_shard_rows: Also repack every level's object layer into
+            shards of this many rows (a multiple of 65,536); see
+            :func:`shard_object_layer`.  ``None`` leaves it alone.
 
     Returns:
         Stats dict with ``arrays_sharded``, ``chunks_packed``,
-        ``shard_shape``.
+        ``shard_shape``, and with ``object_shard_rows`` the
+        ``object_arrays_repacked`` count.
     """
 
     root = open_store(store_path, mode="r+")
@@ -210,12 +235,6 @@ def shard_store(
         level = get_resolution_level(root, level_idx)
         for array_name in _list_array_names(level, arrays):
             if not level.array_exists(array_name):
-                continue
-            chunk_keys = [
-                k for k in level.list_chunks(array_name)
-                if _parse_chunk_coords(k) is not None
-            ]
-            if not chunk_keys:
                 continue
 
             import zarr
@@ -241,11 +260,17 @@ def shard_store(
                 final_shard_shape = this_shard_shape
 
             # Already native-sharded with the right shape → skip.
-            if (
-                isinstance(existing, zarr.Array)
-                and _is_native_sharded(existing)
-                and existing.shards == this_shard_shape
-            ):
+            # Tested BEFORE the manifest walk below: on a store that was
+            # born sharded this is every array, and the answer is one
+            # zarr.json read rather than a presence enumeration per array.
+            if _is_native_sharded(existing) and existing.shards == this_shard_shape:
+                continue
+
+            chunk_keys = [
+                k for k in level.list_chunks(array_name)
+                if _parse_chunk_coords(k) is not None
+            ]
+            if not chunk_keys:
                 continue
 
             # Snapshot existing per-chunk payloads + array metadata so
@@ -297,11 +322,19 @@ def shard_store(
             arrays_sharded += 1
             chunks_packed += n_packed
 
-    return {
+    out: dict[str, Any] = {
         "arrays_sharded": arrays_sharded,
         "chunks_packed": chunks_packed,
         "shard_shape": list(final_shard_shape) if final_shard_shape else None,
     }
+    if object_shard_rows is not None:
+        out["object_arrays_repacked"] = sum(
+            len(shard_object_layer(
+                get_resolution_level(root, level_idx), object_shard_rows,
+            )["arrays_repacked"])
+            for level_idx in list_resolution_levels(root)
+        )
+    return out
 
 
 def unshard_store(
@@ -342,9 +375,13 @@ def unshard_store(
                 tuple(int(x) for x in raw_origin) if raw_origin else None
             )
             chunk_keys = level.list_chunks(array_name)
-            chunk_payloads: dict[str, bytes] = {
-                k: level.read_bytes(array_name, k) for k in chunk_keys
-            }
+            # One gather rather than a round trip per cell, as the shard
+            # direction already does. It matters more here: every one of
+            # these reads is currently a whole-shard fetch.
+            with level.batched_reads([(array_name, chunk_keys)]):
+                chunk_payloads: dict[str, bytes] = {
+                    k: level.read_bytes(array_name, k) for k in chunk_keys
+                }
             preserved_attrs = dict(level.read_array_meta(array_name))
             preserved_attrs.pop("nonempty_chunks", None)
             preserved_attrs.pop("chunk_grid_origin", None)
@@ -371,6 +408,119 @@ def unshard_store(
         "arrays_unsharded": arrays_unsharded,
         "chunks_extracted": chunks_extracted,
     }
+
+
+def shard_object_layer(level_group: Group, shard_rows: int | None) -> dict[str, Any]:
+    """Repack a level's object layer into shards of ``shard_rows`` rows.
+
+    The object layer -- ``object_index``'s arrays and every
+    ``object_attributes/<name>`` column -- is 1-D along objects, chunked
+    in fixed row buckets (16,384 index rows, 65,536 attribute rows), one
+    storage object per bucket: about 70,000 objects per column at 10^9
+    objects. Sharding packs ``shard_rows // bucket`` buckets into one
+    object. ``shard_rows`` must be a multiple of 65,536, so both buckets
+    tile it; ``None`` unshards.
+
+    Nothing here is a zarr-vectors format key: sharding lives in each
+    array's own ``zarr.json`` as zarr's ``sharding_indexed`` codec, which
+    any Zarr v3 reader reads. Writers keep a level's object layer in the
+    layout its arrays already have (see
+    :func:`zarr_vectors.core.arrays.object_shard_rows`), so a column
+    created after this call is sharded too.
+
+    Each array is streamed, never held whole: copied block by block
+    (blocks aligned to both layouts) into a sibling array, which then
+    replaces it -- by a directory rename on a local store, by copying its
+    objects elsewhere. A coordinator operation: nothing else may write the
+    object layer meanwhile.
+
+    Returns:
+        ``{"arrays_repacked": [...], "shard_rows": shard_rows}``.
+    """
+    from zarr_vectors.core.arrays import (
+        check_object_shard_rows,
+        object_layer_arrays,
+    )
+
+    rows = None if shard_rows is None else check_object_shard_rows(shard_rows)
+    repacked: list[str] = []
+    for path in object_layer_arrays(level_group):
+        arr = level_group.zarr_group[path]
+        want = None if rows is None else (rows, *(int(c) for c in arr.chunks[1:]))
+        have = tuple(int(s) for s in arr.shards) if arr.shards is not None else None
+        if have == want:
+            continue
+        _repack_rows(level_group, path, arr, want)
+        repacked.append(path)
+    return {"arrays_repacked": repacked, "shard_rows": rows}
+
+
+_REPACK_SUFFIX = "__repacking"
+
+
+def _repack_rows(level_group: Group, path: str, arr: Any, shards: Any) -> None:
+    """Rewrite one row-chunked array with ``shards``, streamed."""
+    import math
+    import warnings
+
+    from zarr.errors import UnstableSpecificationWarning
+
+    parent_path, _, leaf = path.rpartition("/")
+    parent = level_group.zarr_group[parent_path] if parent_path else level_group.zarr_group
+    tmp_leaf = f"{leaf}{_REPACK_SUFFIX}"
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", UnstableSpecificationWarning)
+        if tmp_leaf in parent:
+            del parent[tmp_leaf]  # left by an interrupted repack
+        tmp = parent.create_array(
+            tmp_leaf,
+            shape=arr.shape,
+            chunks=arr.chunks,
+            shards=shards,
+            dtype=arr.metadata.data_type,
+            serializer=arr.serializer,
+            compressors=arr.compressors,
+            filters=arr.filters,
+            fill_value=arr.fill_value,
+            attributes=dict(arr.attrs),
+        )
+        old_outer = int((arr.shards or arr.chunks)[0])
+        new_outer = int((shards or arr.chunks)[0])
+        step = math.lcm(old_outer, new_outer)
+        n = int(arr.shape[0])
+        for lo in range(0, n, step):
+            hi = min(lo + step, n)
+            tmp[lo:hi] = arr[lo:hi]
+    _replace_array(level_group, parent, leaf, tmp_leaf)
+    level_group._invalidate_node(path)
+
+
+def _replace_array(level_group: Group, parent: Any, leaf: str, tmp_leaf: str) -> None:
+    """Put ``parent/tmp_leaf`` where ``parent/leaf`` was."""
+    import os
+
+    from zarr.core.buffer import default_buffer_prototype
+    from zarr.core.sync import sync
+    from zarr.storage import LocalStore
+
+    store = level_group.zarr_group.store
+    base = parent.path.strip("/")
+    src = f"{base}/{tmp_leaf}" if base else tmp_leaf
+    dst = f"{base}/{leaf}" if base else leaf
+    del parent[leaf]
+    if isinstance(store, LocalStore):
+        os.replace(Path(store.root) / src, Path(store.root) / dst)
+        return
+
+    async def _copy() -> None:
+        proto = default_buffer_prototype()
+        async for key in store.list_prefix(f"{src}/"):
+            value = await store.get(key, prototype=proto)
+            if value is not None:
+                await store.set(f"{dst}/{key[len(src) + 1:]}", value)
+
+    sync(_copy())
+    del parent[tmp_leaf]
 
 
 def reshard(

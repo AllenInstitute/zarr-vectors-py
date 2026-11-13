@@ -161,6 +161,31 @@ class TestDegradation:
         )
         assert {c.key for c in plan.cells} == {"0.0.0.0", "3.0.0.0"}
 
+    def test_a_small_box_on_a_binned_level_names_every_bin(self):
+        # One candidate cell against three known keys: the box path, not
+        # the scan.  It built spatial keys and matched them whole against
+        # binned ones, so it named nothing.
+        ctx = LevelContext(
+            level=0, ndim=3, chunk_shape=CTX.chunk_shape,
+            known_cells=("0.0.0.0", "3.0.0.0", "3.9.9.9"),
+        )
+        plan = resolve(
+            Selection(bbox=([10.0, 10.0, 10.0], [20.0, 20.0, 20.0])), ctx,
+        )
+        assert {c.key for c in plan.cells} == {"0.0.0.0", "3.0.0.0"}
+
+    def test_a_spatial_cell_ref_on_a_binned_level_names_every_bin(self):
+        from zarr_vectors.api.grid import CellRef
+
+        ctx = LevelContext(
+            level=0, ndim=3, chunk_shape=CTX.chunk_shape,
+            known_cells=("0.0.0.0", "3.0.0.0", "3.9.9.9"),
+        )
+        spatial = resolve(Selection(cells=[CellRef((0, 0, 0))]), ctx)
+        exact = resolve(Selection(cells=[CellRef((3, 9, 9, 9))]), ctx)
+        assert {c.key for c in spatial.cells} == {"0.0.0.0", "3.0.0.0"}
+        assert {c.key for c in exact.cells} == {"3.9.9.9"}
+
     def test_named_cells_the_level_does_not_hold_are_dropped(self):
         # The caller's region is theirs and is not re-derived, but a cell
         # the level is known not to hold fetches nothing, so asking for

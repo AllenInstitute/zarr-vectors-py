@@ -20,6 +20,13 @@ import numpy.typing as npt
 class RechunkSpec:
     """Specification for rechunking a store along a non-spatial dimension.
 
+    The output's bins are numbered densely from 0; a bin no object falls
+    in is not allocated.  Each bin's label -- the value a reader's
+    ``attribute_filter`` names to select it -- is recorded in
+    ``chunk_attribute_values``: a categorical value, a bin's lower edge,
+    an object id, or a group index.  Ungrouped objects under
+    ``by="group"`` are the last bin, labelled ``-1``.
+
     Args:
         by: Dimension to rechunk by. One of:
             - ``"group"`` — chunk by group membership
@@ -58,10 +65,19 @@ class DimensionMapper:
 
     Args:
         spec: The rechunk specification.
+
+    Attributes:
+        labels: Set by :meth:`map_objects`: ``{bin_index: label}``, the
+            value a reader passes to select that bin.  A categorical bin
+            is labelled by its value, a bin cut by edges by its lower
+            edge, and a group bin by its group index (``-1`` for the
+            ungrouped).  Empty for ``by="spatial"``, which has no bins
+            to select between.
     """
 
     def __init__(self, spec: RechunkSpec) -> None:
         self.spec = spec
+        self.labels: dict[int, Any] = {}
 
     def map_objects(
         self,
@@ -76,6 +92,7 @@ class DimensionMapper:
             ``{object_id: bin_index}`` mapping.
         """
         by = self.spec.by
+        self.labels = {}
 
         if by == "group":
             return self._map_by_group(n_objects, groupings)
@@ -91,7 +108,7 @@ class DimensionMapper:
                 n_objects, object_attributes[attr_name],
             )
         elif by == "spatial":
-            # All objects in bin 0 (no prefix dimension)
+            # All objects in bin 0; nothing to label.
             return {oid: 0 for oid in range(n_objects)}
         else:
             raise ValueError(f"Unknown rechunk dimension: '{by}'")
@@ -104,12 +121,15 @@ class DimensionMapper:
         """Assign objects to bins by group membership."""
         if groupings is None:
             # No groupings → all in bin 0
+            self.labels = {0: 0}
             return {oid: 0 for oid in range(n_objects)}
 
         mapping: dict[int, int] = {}
         for group_idx, members in enumerate(groupings):
             for oid in members:
                 mapping[oid] = group_idx
+        self.labels = {g: g for g in range(len(groupings))}
+        self.labels[-1] = -1
 
         # Objects not in any group → bin -1 (ungrouped)
         for oid in range(n_objects):
@@ -122,9 +142,11 @@ class DimensionMapper:
         """Assign objects to bins by ID ranges."""
         if self.spec.bins is None:
             # Each object is its own bin
+            self.labels = {oid: oid for oid in range(n_objects)}
             return {oid: oid for oid in range(n_objects)}
 
         edges = sorted(self.spec.bins)
+        self.labels = {i: _hashable(e) for i, e in enumerate(edges)}
         mapping: dict[int, int] = {}
         for oid in range(n_objects):
             bin_idx = int(np.searchsorted(edges, oid, side="right")) - 1
@@ -146,6 +168,7 @@ class DimensionMapper:
             # unique values that quartile-binning would be silly.
             if self.spec.categorical or len(unique_vals) <= 10:
                 val_to_bin = {_hashable(v): i for i, v in enumerate(unique_vals)}
+                self.labels = {i: v for v, i in val_to_bin.items()}
                 return {
                     oid: val_to_bin[_hashable(values[oid])]
                     for oid in range(n_objects)
@@ -153,13 +176,19 @@ class DimensionMapper:
             # Continuous fallback: auto-bin to quartiles.
             q = np.quantile(values, [0.0, 0.25, 0.5, 0.75, 1.0])
             edges = np.unique(q)
+            # Bin i spans [edges[i], edges[i + 1]).
+            self.labels = {i: _hashable(e) for i, e in enumerate(edges[:-1])}
             if len(edges) < 2:
+                self.labels = {0: _hashable(edges[0])}
                 return {oid: 0 for oid in range(n_objects)}
             indices = np.searchsorted(edges[1:], values, side="right")
             indices = np.clip(indices, 0, len(edges) - 2)
             return {oid: int(indices[oid]) for oid in range(n_objects)}
 
         edges = np.array(sorted(self.spec.bins), dtype=np.float64)
+        # Bin i spans [edges[i], edges[i + 1]); values below the first
+        # edge are clipped into bin 0, and the last bin is open above.
+        self.labels = {i: _hashable(e) for i, e in enumerate(edges)}
         indices = np.searchsorted(edges, values, side="right") - 1
         indices = np.clip(indices, 0, len(edges) - 1)
         return {oid: int(indices[oid]) for oid in range(n_objects)}

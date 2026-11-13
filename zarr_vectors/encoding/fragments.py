@@ -251,6 +251,194 @@ def encode_fragments(
     return b"".join(parts)
 
 
+# Array-form encoding ------------------------------------------------
+#
+# The same byte layout, built from CSR arrays with array operations only:
+# no Python object per fragment, and an append that concatenates sections
+# instead of decoding the existing index to a list and re-encoding it.
+# ``encode_fragments`` above stays the definition these are tested
+# against, byte for byte.
+
+
+@dataclass(frozen=True)
+class FragmentSections:
+    """A fragment index as its four sections, before packing.
+
+    ``is_range[f]`` says which section fragment ``f`` lives in; the range
+    table and the explicit CSR each hold their fragments in fragment
+    order, exactly as the packed blob does.
+    """
+
+    is_range: npt.NDArray[np.bool_]           # (F,)
+    range_table: npt.NDArray[np.int64]        # (R, 2): start, count
+    explicit_offsets: npt.NDArray[np.int64]   # (E + 1,), [0] == 0
+    explicit_indices: npt.NDArray[np.int64]   # (T,)
+
+    @property
+    def num_fragments(self) -> int:
+        return int(self.is_range.shape[0])
+
+
+def _as_int64(a: Any, what: str) -> npt.NDArray[np.int64]:
+    arr = np.asarray(a)
+    if arr.ndim != 1:
+        raise ArrayError(f"{what} must be 1-D, got shape {arr.shape}")
+    if arr.size and arr.dtype.kind not in "iu":
+        raise ArrayError(f"{what} must be integers, got {arr.dtype}")
+    return arr.astype(np.int64, copy=False)
+
+
+def classify_fragments_csr(
+    indices: Any,
+    offsets: Any,
+    *,
+    force_explicit: bool = False,
+) -> FragmentSections:
+    """Split CSR fragments into range and explicit sections.
+
+    Fragment ``f`` is ``indices[offsets[f]:offsets[f + 1]]``. It becomes a
+    range exactly when :func:`encode_fragments` would make it one: it is
+    non-empty, starts at an index >= 0, and steps by one throughout. An
+    empty fragment stays explicit. A negative index anywhere raises, as it
+    does there: it can never sit in a range, so the explicit path would
+    reject it.
+
+    Vectorised: a fragment is a run of +1 steps exactly when the running
+    count of steps that are not +1 is the same at its first and last
+    index.
+    """
+    from zarr_vectors import _xp
+
+    if _xp.encode_on_device(indices, offsets):
+        from zarr_vectors.gpu import _encode
+
+        return _encode.classify_fragments_csr(indices, offsets, force_explicit=force_explicit)
+    idx = _as_int64(_xp.to_host(indices), "indices")
+    off = _as_int64(_xp.to_host(offsets), "offsets")
+    if off.size == 0 or off[0] != 0 or off[-1] != idx.size:
+        raise ArrayError(
+            f"offsets must start at 0 and end at len(indices)={idx.size}; "
+            f"got {off[:1].tolist()}..{off[-1:].tolist()}"
+        )
+    counts = np.diff(off)
+    if counts.size and int(counts.min()) < 0:
+        raise ArrayError("offsets must be non-decreasing")
+    if idx.size and int(idx.min()) < 0:
+        raise ArrayError("Explicit fragment indices must be non-negative")
+
+    num = counts.size
+    starts = off[:-1]
+    if force_explicit or idx.size == 0:
+        is_range = np.zeros(num, dtype=bool)
+    else:
+        breaks = np.concatenate(([0], np.cumsum(np.diff(idx) != 1)))
+        nonempty = counts > 0
+        is_range = np.zeros(num, dtype=bool)
+        is_range[nonempty] = (
+            breaks[off[1:][nonempty] - 1] == breaks[starts[nonempty]]
+        )
+    range_table = np.stack(
+        [idx[starts[is_range]], counts[is_range]], axis=1,
+    ).reshape(-1, 2)
+    explicit = ~is_range
+    return FragmentSections(
+        is_range=is_range,
+        range_table=range_table,
+        explicit_offsets=np.concatenate(([0], np.cumsum(counts[explicit]))).astype(np.int64),
+        explicit_indices=idx[np.repeat(explicit, counts)],
+    )
+
+
+def range_fragment_sections(starts: Any, counts: Any) -> FragmentSections:
+    """Sections for fragments that are all ``(start, count)`` ranges.
+
+    The array form of passing ``encode_fragments`` a list of tuples.
+    """
+    st = _as_int64(starts, "starts")
+    ct = _as_int64(counts, "counts")
+    if st.shape != ct.shape:
+        raise ArrayError(f"starts {st.shape} and counts {ct.shape} differ")
+    if ct.size and int(ct.min()) < 0:
+        raise ArrayError("Fragment count must be >= 0")
+    return FragmentSections(
+        is_range=np.ones(st.size, dtype=bool),
+        range_table=np.stack([st, ct], axis=1).reshape(-1, 2),
+        explicit_offsets=np.zeros(1, dtype=np.int64),
+        explicit_indices=np.empty(0, dtype=np.int64),
+    )
+
+
+def fragment_sections_from_index(fi: ChunkFragmentIndex) -> FragmentSections:
+    """The sections of a decoded index, as they are stored."""
+    num = fi.num_fragments
+    is_range = np.unpackbits(fi._bitmap, bitorder="little")[:num].astype(bool)
+    if int(is_range.sum()) != fi.num_range_fragments:
+        raise ArrayError(
+            f"fragment index bitmap marks {int(is_range.sum())} ranges but "
+            f"its table holds {fi.num_range_fragments}"
+        )
+    return FragmentSections(
+        is_range=is_range,
+        range_table=np.asarray(fi._range_table, dtype=np.int64).reshape(-1, 2),
+        explicit_offsets=np.asarray(fi._csr_offsets, dtype=np.int64),
+        explicit_indices=np.asarray(fi._csr_indices, dtype=np.int64),
+    )
+
+
+def concat_fragment_sections(a: FragmentSections, b: FragmentSections) -> FragmentSections:
+    """``a``'s fragments followed by ``b``'s, each kept as it was classified."""
+    return FragmentSections(
+        is_range=np.concatenate([a.is_range, b.is_range]),
+        range_table=np.concatenate([a.range_table, b.range_table]).reshape(-1, 2),
+        explicit_offsets=np.concatenate([
+            a.explicit_offsets, b.explicit_offsets[1:] + a.explicit_offsets[-1],
+        ]),
+        explicit_indices=np.concatenate([a.explicit_indices, b.explicit_indices]),
+    )
+
+
+def pack_fragment_sections(sections: FragmentSections) -> bytes:
+    """The v1 blob for ``sections``; the bytes :func:`encode_fragments` writes."""
+    num = sections.num_fragments
+    num_ranges = int(sections.range_table.shape[0])
+    if num == 0:
+        return _HEADER_STRUCT.pack(
+            FRAGMENT_INDEX_MAGIC, FRAGMENT_INDEX_VERSION, 0, 0, 0,
+        )
+    if int(sections.is_range.sum()) != num_ranges:
+        raise ArrayError("range bitmap and range table disagree")
+    total = int(sections.explicit_offsets[-1])
+    if total >= 2**32:
+        raise ArrayError(
+            f"{total} explicit indices in one cell; the v1 layout stores "
+            f"their offsets as uint32"
+        )
+    bitmap = np.zeros(_bitmap_padded_length(num), dtype=np.uint8)
+    packed = np.packbits(sections.is_range, bitorder="little")
+    bitmap[:packed.size] = packed
+    return b"".join([
+        _HEADER_STRUCT.pack(
+            FRAGMENT_INDEX_MAGIC, FRAGMENT_INDEX_VERSION, 0, num, num_ranges,
+        ),
+        bitmap.tobytes(),
+        np.ascontiguousarray(sections.range_table, dtype="<i8").tobytes(),
+        np.ascontiguousarray(sections.explicit_offsets, dtype="<u4").tobytes(),
+        np.ascontiguousarray(sections.explicit_indices, dtype="<i8").tobytes(),
+    ])
+
+
+def encode_fragments_csr(
+    indices: Any,
+    offsets: Any,
+    *,
+    force_explicit: bool = False,
+) -> bytes:
+    """:func:`encode_fragments` for fragments held as CSR arrays."""
+    return pack_fragment_sections(
+        classify_fragments_csr(indices, offsets, force_explicit=force_explicit),
+    )
+
+
 # Decoding -----------------------------------------------------------
 
 
@@ -356,6 +544,90 @@ class ChunkFragmentIndex:
         if self.num_explicit_fragments or self._range_table.shape[0] != self.num_fragments:
             return None
         return self._range_table
+
+    def flat(
+        self,
+    ) -> tuple[
+        npt.NDArray[np.int64], npt.NDArray[np.int64],
+        npt.NDArray[np.int64], npt.NDArray[np.int64],
+    ]:
+        """Every fragment at once, as ``(starts, counts, index_counts, indices)``.
+
+        ``(F,)`` arrays in fragment order: a range fragment covers rows
+        ``starts[f]`` to ``starts[f] + counts[f]``; an explicit one has
+        ``starts[f] == -1`` and its ``counts[f]`` rows are the next
+        ``index_counts[f]`` (``== counts[f]``) entries of ``indices``,
+        which holds the explicit fragments' rows in order. Range
+        fragments have ``index_counts[f] == 0``. The whole-index form of
+        :meth:`range` and :meth:`indices`, built without a loop.
+        """
+        f = self.num_fragments
+        is_range = np.unpackbits(self._bitmap, bitorder="little")[:f].astype(bool)
+        starts = np.full(f, -1, dtype=np.int64)
+        counts = np.empty(f, dtype=np.int64)
+        starts[is_range] = self._range_table[:, 0]
+        counts[is_range] = self._range_table[:, 1]
+        counts[~is_range] = np.diff(self._csr_offsets.astype(np.int64))
+        index_counts = np.where(is_range, 0, counts)
+        return starts, counts, index_counts, self._csr_indices.astype(np.int64, copy=False)
+
+    def gather(
+        self, frags: Any,
+    ) -> tuple[npt.NDArray[np.int64], npt.NDArray[np.int64]]:
+        """The rows of several fragments at once, as ``(rows, lengths)``.
+
+        For fragments ``frags`` -- in any order, repeated or not --
+        ``rows`` is ``np.concatenate([self.indices(f) for f in frags])``
+        and ``lengths[i]`` is ``len(self.indices(frags[i]))``, so fragment
+        ``frags[i]``'s rows are ``rows[o[i]:o[i + 1]]`` with ``o`` the
+        cumulative sum of ``lengths`` from 0. Built with one repeat and one
+        cumulative sum over the request, never a call per fragment: a
+        range fragment is ``start + (0 .. count)``, an explicit one the
+        same over the CSR slice it owns, then looked up in its indices.
+
+        Raises:
+            IndexError: A fragment outside ``[0, len(self))``, as
+                :meth:`indices` raises.
+        """
+        f = np.asarray(frags, dtype=np.int64).reshape(-1)
+        if f.size == 0:
+            return np.empty(0, dtype=np.int64), np.empty(0, dtype=np.int64)
+        bad = (f < 0) | (f >= self.num_fragments)
+        if bad.any():
+            raise IndexError(
+                f"Fragment index {int(f[bad][0])} out of range "
+                f"[0, {self.num_fragments})",
+            )
+        bits = np.unpackbits(self._bitmap, bitorder="little")[: self.num_fragments]
+        is_range = bits[f].astype(bool)
+        # Row of the fragment in its own table: ranges count the set bits
+        # before it, explicit fragments the clear ones.
+        prefix = self._popcount_prefix().astype(np.int64, copy=False)
+        slot = np.where(is_range, prefix[f], f - prefix[f])
+        starts = np.empty(f.size, dtype=np.int64)
+        lengths = np.empty(f.size, dtype=np.int64)
+        if is_range.any():
+            table = np.asarray(self._range_table, dtype=np.int64)
+            starts[is_range] = table[slot[is_range], 0]
+            lengths[is_range] = table[slot[is_range], 1]
+        explicit = ~is_range
+        if explicit.any():
+            csr = np.asarray(self._csr_offsets, dtype=np.int64)
+            starts[explicit] = csr[slot[explicit]]
+            lengths[explicit] = csr[slot[explicit] + 1] - csr[slot[explicit]]
+        # What ``arange(a, a + n)`` and ``indices[a:b]`` give a corrupt
+        # (negative) count: nothing.
+        np.maximum(lengths, 0, out=lengths)
+        total = int(lengths.sum())
+        if total == 0:
+            return np.empty(0, dtype=np.int64), lengths
+        ends = np.cumsum(lengths)
+        within = np.arange(total, dtype=np.int64) - np.repeat(ends - lengths, lengths)
+        rows = np.repeat(starts, lengths) + within
+        if explicit.any():
+            mask = np.repeat(explicit, lengths)
+            rows[mask] = np.asarray(self._csr_indices, dtype=np.int64)[rows[mask]]
+        return rows, lengths
 
     def is_range(self, f: int) -> bool:
         """Return True if fragment ``f`` is a contiguous range.
@@ -819,6 +1091,208 @@ def decode_object_manifests_many(
     for b, c, i in zip(blob_of_block.tolist(), coords.tolist(), indices.tolist()):
         out[b].append((tuple(c), i))
     return out, True
+
+
+def encode_object_manifests_csr(
+    chunk_coords: Any,
+    fragment_idx: Any,
+    manifest_offsets: Any = None,
+    *,
+    sid_ndim: int | None = None,
+) -> npt.NDArray[np.object_]:
+    """Manifest blobs for objects held as CSR arrays, with no per-object Python.
+
+    Object ``o`` owns the blocks ``manifest_offsets[o]:manifest_offsets[o+1]``;
+    block ``b`` names chunk ``chunk_coords[b]`` and fragment
+    ``fragment_idx[b]`` in it (a single-fragment, mode-0 block). With
+    ``manifest_offsets=None`` every object owns exactly one block. The
+    blobs are the ones :func:`encode_object_manifest_blocks` writes for
+    ``[(chunk_coords, int(fragment_idx)), ...]``, byte for byte.
+
+    Returns:
+        An object array of ``bytes``, one per object, ready to store.
+    """
+    from zarr_vectors import _xp
+
+    if _xp.encode_on_device(chunk_coords, fragment_idx, manifest_offsets):
+        from zarr_vectors.gpu import _encode
+
+        return _encode.encode_object_manifests_csr(
+            chunk_coords, fragment_idx, manifest_offsets,
+            sid_ndim=sid_ndim, mode_single=MANIFEST_MODE_SINGLE,
+        )
+    chunk_coords, fragment_idx = _xp.to_host(chunk_coords), _xp.to_host(fragment_idx)
+    if manifest_offsets is not None:
+        manifest_offsets = _xp.to_host(manifest_offsets)
+    cc = np.asarray(chunk_coords)
+    idx = np.asarray(fragment_idx)
+    if idx.ndim != 1:
+        raise ArrayError(f"fragment_idx must be 1-D, got shape {idx.shape}")
+    total = int(idx.size)
+    if cc.size == 0:
+        cc = cc.reshape(0, sid_ndim if sid_ndim is not None else 0)
+    if cc.ndim != 2 or cc.shape[0] != total:
+        raise ArrayError(
+            f"chunk_coords must be ({total}, sid_ndim); got shape {cc.shape}"
+        )
+    if sid_ndim is None:
+        sid_ndim = int(cc.shape[1])
+    elif total and cc.shape[1] != sid_ndim:
+        raise ArrayError(
+            f"chunk_coords have rank {cc.shape[1]}, expected sid_ndim={sid_ndim}"
+        )
+    for name, arr in (("chunk_coords", cc), ("fragment_idx", idx)):
+        if arr.size and arr.dtype.kind not in "iu":
+            raise ArrayError(f"{name} must be integers, got {arr.dtype}")
+    idx = idx.astype(np.int64, copy=False)
+    if total and int(idx.min()) < 0:
+        raise ArrayError(f"fragment_index must be >= 0, got {int(idx.min())}")
+    if manifest_offsets is None:
+        off = np.arange(total + 1, dtype=np.int64)
+    else:
+        off = _as_int64(manifest_offsets, "manifest_offsets")
+        if off.size == 0 or off[0] != 0 or off[-1] != total:
+            raise ArrayError(
+                f"manifest_offsets must start at 0 and end at {total}"
+            )
+    counts = np.diff(off)
+    if counts.size and int(counts.min()) < 0:
+        raise ArrayError("manifest_offsets must be non-decreasing")
+
+    width = sid_ndim * 8 + 1 + 8
+    table = np.empty((total, width), dtype=np.uint8)
+    table[:, : sid_ndim * 8] = (
+        np.ascontiguousarray(cc, dtype="<i8").view(np.uint8).reshape(total, sid_ndim * 8)
+    )
+    table[:, sid_ndim * 8] = MANIFEST_MODE_SINGLE
+    table[:, sid_ndim * 8 + 1:] = (
+        np.ascontiguousarray(idx, dtype="<i8").view(np.uint8).reshape(total, 8)
+    )
+
+    out = np.empty(counts.size, dtype=object)
+    # One pass per distinct block count, never per object. Each blob is a
+    # fixed-width row there, and a void view of the rows turns into full
+    # ``bytes`` in C -- a fixed-width byte string would strip the trailing
+    # NULs every manifest ends with.
+    for k in np.unique(counts).tolist():
+        rows = np.flatnonzero(counts == k)
+        blob_width = 4 + k * width
+        blobs = np.empty((rows.size, blob_width), dtype=np.uint8)
+        blobs[:, :4] = np.array([k], dtype="<u4").view(np.uint8)
+        if k:
+            gather = off[rows][:, None] + np.arange(k)
+            blobs[:, 4:] = table[gather].reshape(rows.size, k * width)
+        out[rows] = blobs.view(f"V{blob_width}").ravel().astype(object)
+    return out
+
+
+def _expand_blocks(blocks: list) -> tuple[list[tuple[int, ...]], list[int]]:
+    """One ``(coords, fragment)`` pair per fragment a block list names."""
+    coords: list[tuple[int, ...]] = []
+    frags: list[int] = []
+    for cc, ref in blocks:
+        if isinstance(ref, int):
+            members = [ref]
+        elif isinstance(ref, tuple):
+            members = list(range(int(ref[0]), int(ref[0]) + int(ref[1])))
+        else:
+            members = [int(v) for v in ref]
+        coords.extend([tuple(cc)] * len(members))
+        frags.extend(members)
+    return coords, frags
+
+
+def decode_object_manifests_csr(
+    blobs: Sequence[bytes | None],
+    sid_ndim: int,
+) -> tuple[npt.NDArray[np.int64], npt.NDArray[np.int64], npt.NDArray[np.int64]]:
+    """Every manifest as CSR: ``(offsets, chunk_coords, fragment_idx)``.
+
+    Object ``o``'s fragments are rows ``offsets[o]:offsets[o+1]`` of
+    ``chunk_coords`` (``(M, sid_ndim)``) and ``fragment_idx`` (``(M,)``),
+    in manifest order, with range and explicit-list blocks expanded to one
+    row per fragment -- the pairs :func:`decode_object_manifest_blocks`
+    followed by the usual expansion would give.
+
+    A blob made only of single-fragment blocks -- what every bulk writer
+    produces -- is parsed with array operations. That test is exact, not
+    a guess from the length: if a blob's first block is single-fragment,
+    the next block starts where a single-fragment block ends, and so on,
+    so checking every such position's mode byte proves the whole blob.
+    Anything else is decoded blob by blob and merged in place. An empty
+    or ``None`` blob is an object with no fragments.
+    """
+    n = len(blobs)
+    width = sid_ndim * 8 + 1 + 8
+    empty = (
+        np.zeros(n + 1, dtype=np.int64),
+        np.empty((0, sid_ndim), dtype=np.int64),
+        np.empty(0, dtype=np.int64),
+    )
+    if n == 0:
+        return empty
+    lengths = np.fromiter(
+        (0 if b is None else len(b) for b in blobs), dtype=np.int64, count=n,
+    )
+    if np.any((lengths > 0) & (lengths < 4)):
+        raise ArrayError("a manifest blob is shorter than its 4-byte header")
+    buf = np.frombuffer(b"".join(b for b in blobs if b), dtype=np.uint8)
+    starts = np.cumsum(lengths) - lengths
+    has = lengths > 0
+    num_blocks = np.zeros(n, dtype=np.int64)
+    num_blocks[has] = (
+        buf[starts[has][:, None] + np.arange(4)].copy().view("<u4").ravel()
+    )
+    fast = (lengths == 0) | (lengths == 4 + num_blocks * width)
+    cand = fast & (num_blocks > 0)
+    if cand.any():
+        blob_of = np.repeat(np.flatnonzero(cand), num_blocks[cand])
+        first = np.cumsum(num_blocks[cand]) - num_blocks[cand]
+        within = np.arange(blob_of.size) - np.repeat(first, num_blocks[cand])
+        mode_at = starts[blob_of] + 4 + within * width + sid_ndim * 8
+        wrong = buf[mode_at] != MANIFEST_MODE_SINGLE
+        if wrong.any():
+            fast[np.unique(blob_of[wrong])] = False
+    slow = ~fast
+
+    # Fast blocks: drop every header and every slow blob with one byte
+    # mask over the buffer, then the rest is a (blocks, width) table.
+    keep = np.ones(buf.size, dtype=bool)
+    keep[(starts[has][:, None] + np.arange(4)).ravel()] = False
+    if slow.any():
+        edge = np.zeros(buf.size + 1, dtype=np.int64)
+        np.add.at(edge, starts[slow], 1)
+        np.add.at(edge, starts[slow] + lengths[slow], -1)
+        keep &= np.cumsum(edge[:-1]) == 0
+    blocks = buf[keep].reshape(-1, width)
+    fast_coords = np.ascontiguousarray(blocks[:, : sid_ndim * 8]).view("<i8").reshape(-1, sid_ndim)
+    fast_idx = np.ascontiguousarray(blocks[:, sid_ndim * 8 + 1:]).view("<i8").ravel()
+
+    counts = np.where(fast, num_blocks, 0)
+    slow_parts: dict[int, tuple[list, list]] = {}
+    for o in np.flatnonzero(slow).tolist():
+        slow_parts[o] = _expand_blocks(decode_object_manifest_blocks(bytes(blobs[o]), sid_ndim))
+        counts[o] = len(slow_parts[o][1])
+    offsets = np.concatenate([[0], np.cumsum(counts)]).astype(np.int64)
+    if not slow_parts:
+        return offsets, fast_coords.astype(np.int64, copy=False), fast_idx.astype(np.int64)
+
+    total = int(offsets[-1])
+    coords = np.empty((total, sid_ndim), dtype=np.int64)
+    frags = np.empty(total, dtype=np.int64)
+    fast_objects = np.flatnonzero(fast & (num_blocks > 0))
+    if fast_objects.size:
+        per = num_blocks[fast_objects]
+        rank = np.arange(int(per.sum())) - np.repeat(np.cumsum(per) - per, per)
+        pos = np.repeat(offsets[fast_objects], per) + rank
+        coords[pos] = fast_coords
+        frags[pos] = fast_idx
+    for o, (cs, fs) in slow_parts.items():
+        lo = offsets[o]
+        if fs:
+            coords[lo:lo + len(fs)] = np.asarray(cs, dtype=np.int64).reshape(-1, sid_ndim)
+            frags[lo:lo + len(fs)] = fs
+    return offsets, coords, frags
 
 
 def decode_object_manifest_blocks(

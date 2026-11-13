@@ -39,7 +39,9 @@ The :doc:`constants` page documents the values of some but not all of them —
    * ``LINKS``
    * ``LINK_FRAGMENTS``
    * ``LINK_ATTRIBUTES``
-   * ``OBJECT_INDEX_LAYOUT_V1``
+   * ``OBJECT_INDEX_LAYOUT_V1``, ``OBJECT_INDEX_LAYOUT_V2``,
+     ``OBJECT_INDEX_LAYOUT_DENSE``
+   * ``OBJECT_INDEX_MANIFEST_BUCKET``
    * ``LINKS_IMPLICIT_SEQUENTIAL``
    * ``LINKS_IMPLICIT_BRANCHES``
    * ``XLEVEL_NONE``
@@ -175,6 +177,8 @@ into them.
 
 .. autofunction:: zarr_vectors.building.create_link_attributes_array
 
+.. autofunction:: zarr_vectors.building.create_link_segments
+
 .. autofunction:: zarr_vectors.building.attribute_layout
 
 Chunk I/O: vertices, fragments and attributes
@@ -202,6 +206,8 @@ ingest worker runs in parallel.
 .. autofunction:: zarr_vectors.building.read_chunk_fragment_attributes
 
 .. autofunction:: zarr_vectors.building.read_vertex_fragment_index
+
+.. autofunction:: zarr_vectors.building.decode_fragment_index
 
 .. autofunction:: zarr_vectors.building.write_chunk_vertices
 
@@ -295,6 +301,18 @@ per-object attribute arrays beside it.
 
 .. autofunction:: zarr_vectors.building.read_object_manifests
 
+.. autofunction:: zarr_vectors.building.read_object_manifests_csr
+
+.. autofunction:: zarr_vectors.building.commit_object_index
+
+.. autofunction:: zarr_vectors.building.reserve_object_rows
+
+.. autofunction:: zarr_vectors.building.concurrency_contract
+
+.. autofunction:: zarr_vectors.building.aligned_regions
+
+.. autofunction:: zarr_vectors.building.is_dense_index
+
 .. autofunction:: zarr_vectors.building.read_all_object_manifests
 
 .. autofunction:: zarr_vectors.building.read_object_vertices
@@ -302,6 +320,8 @@ per-object attribute arrays beside it.
 .. autofunction:: zarr_vectors.building.write_object_index
 
 .. autofunction:: zarr_vectors.building.write_object_manifests
+
+.. autofunction:: zarr_vectors.building.patch_object_manifests
 
 .. autofunction:: zarr_vectors.building.read_object_attributes
 
@@ -332,15 +352,58 @@ The coordinator-side verbs: what is actually on disk, and rebuilding the
 ``nonempty_chunks`` and ``arrays_present`` records after a parallel write
 phase that deliberately did not stamp them.
 
+:func:`~zarr_vectors.building.defer_presence` is the other end of that
+phase: a coordinator declares a level deferred before its workers start, so
+they share no state between cells, and :func:`~zarr_vectors.building.rebuild_presence`
+ends the declaration when it writes the manifests.
+
+The worker-side alternative is :meth:`Group.collect_presence
+<zarr_vectors.building.Group.collect_presence>` and
+:meth:`~zarr_vectors.building.Group.apply_presence`, for a writer whose
+consumers cannot ask the store and run before any coordinator pass -- see
+:doc:`/how_to/hpc_pipelines`.
+
+.. autofunction:: zarr_vectors.building.defer_presence
+
 .. autofunction:: zarr_vectors.building.refresh_arrays_present
 
 .. autofunction:: zarr_vectors.building.rebuild_presence
+
+.. autofunction:: zarr_vectors.building.set_presence
+
+.. autofunction:: zarr_vectors.building.end_presence_deferral
 
 .. autofunction:: zarr_vectors.building.per_chunk_array_paths
 
 .. autofunction:: zarr_vectors.building.array_is_sharded
 
 .. autofunction:: zarr_vectors.building.is_sharded
+
+.. autofunction:: zarr_vectors.building.cell_objects
+
+.. autofunction:: zarr_vectors.building.shard_object_layer
+
+.. autofunction:: zarr_vectors.building.shard_transaction
+
+.. autofunction:: zarr_vectors.building.shard_of
+
+.. autofunction:: zarr_vectors.building.object_shard_rows
+
+.. autofunction:: zarr_vectors.building.store_layout
+
+.. autoclass:: zarr_vectors.building.StoreLayout
+
+.. autofunction:: zarr_vectors.building.user_metadata
+
+.. autofunction:: zarr_vectors.building.observe_presence_writes
+
+.. note::
+
+   ``observe_presence_writes`` is an *instrument*, not a data API.  It
+   answers "where did this stamp happen -- under which lock, on which
+   thread", which nothing readable from the store can answer after the
+   fact.  To ask what the manifest says, use
+   :meth:`Group.list_chunks <zarr_vectors.building.Group.list_chunks>`.
 
 Sharding and rechunking
 -----------------------
@@ -431,4 +494,41 @@ one-shot counterpart.
 .. autofunction:: zarr_vectors.building.set_coordinate_offset
 
 .. autofunction:: zarr_vectors.building.read_skeleton_by_segment_id
+
+
+Array-form I/O and device arrays
+--------------------------------
+
+Many cells, many objects or many records per call, as flat arrays rather
+than a Python object each -- the shape a vectorised or GPU pipeline
+already holds. Each writer leaves the store its per-object counterpart
+leaves, byte for byte; each accepts device (cupy) arrays, and the readers
+return them with ``device="cuda"``. See :doc:`../how_to/gpu`.
+
+.. autofunction:: zarr_vectors.building.read_cells
+
+.. autofunction:: zarr_vectors.building.read_neighbourhood
+
+.. autoclass:: zarr_vectors.building.CellBatch
+   :members:
+
+.. autoclass:: zarr_vectors.building.CellColumn
+   :members:
+
+.. autoclass:: zarr_vectors.building.CellReadError
+
+.. autoclass:: zarr_vectors.building.ArrayRead
+
+.. autoclass:: zarr_vectors.building.FragmentColumn
+   :members:
+
+.. autofunction:: zarr_vectors.building.read_all_object_manifests_csr
+
+.. autoclass:: zarr_vectors.building.ManifestCSR
+
+.. autofunction:: zarr_vectors.building.encode_object_manifests_csr
+
+.. autofunction:: zarr_vectors.building.decode_object_manifests_csr
+
+.. autofunction:: zarr_vectors.building.write_object_attribute_columns
 

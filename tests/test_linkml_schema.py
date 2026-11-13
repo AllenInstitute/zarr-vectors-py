@@ -69,6 +69,14 @@ def _to_linkml_logical_form(root_dict: dict) -> dict:
             "min_corner": list(out["bounds"][0]),
             "max_corner": list(out["bounds"][1]),
         }
+    # ``shard_shape`` on disk is a bare int when every axis agrees -- the
+    # compact form ``create_store`` stamps and a reader looks for. LinkML
+    # has no int-or-list union the generator renders cleanly, so the slot
+    # is multivalued and the scalar is widened here.
+    if isinstance(out.get("shard_shape"), int) and not isinstance(
+        out["shard_shape"], bool
+    ):
+        out["shard_shape"] = [out["shard_shape"]]
     return out
 
 
@@ -106,6 +114,14 @@ def test_root_metadata_round_trip_validates(schema):
     _validate(schema, "RootMetadata", _to_linkml_logical_form(wire))
 
 
+def test_root_metadata_with_dense_int32_manifests_validates(schema):
+    rm = _minimal_root_md()
+    rm.manifest_layout, rm.manifest_block_dtype = "dense", "int32"
+    wire = rm.to_dict()["zarr_vectors"]
+    assert wire["manifest_block_dtype"] == "int32"
+    _validate(schema, "RootMetadata", _to_linkml_logical_form(wire))
+
+
 def test_level_metadata_minimal_validates(schema):
     lm = LevelMetadata(level=0, vertex_count=0, arrays_present=[])
     wire = lm.to_dict()["zarr_vectors_level"]
@@ -120,6 +136,21 @@ def test_level_metadata_with_attribute_chunking_validates(schema):
         chunk_dims=["gene", "x", "y", "z"],
         chunk_attribute_name="gene",
         chunk_attribute_values=["A", "B"],
+    )
+    wire = lm.to_dict()["zarr_vectors_level"]
+    _validate(schema, "LevelMetadata", wire)
+
+
+@pytest.mark.parametrize("values", [[0, 2, -1], [30.0, 80.0], [3, 7]])
+def test_level_metadata_with_numeric_bin_labels_validates(schema, values):
+    """Categorical ints, lower edges and group indices are all numbers."""
+    lm = LevelMetadata(
+        level=0,
+        vertex_count=500,
+        arrays_present=["vertices", "object_index"],
+        chunk_dims=["group", "x", "y", "z"],
+        chunk_attribute_name="group",
+        chunk_attribute_values=values,
     )
     wire = lm.to_dict()["zarr_vectors_level"]
     _validate(schema, "LevelMetadata", wire)
@@ -345,25 +376,27 @@ def test_constant_set_matches_schema_enum(schema, enum_name, members):
 # ===================================================================
 
 
-def test_format_version_is_0_9_2():
-    """The current ZV writer stamps 0.9.2; bump tests here when bumping."""
+def test_format_version_is_0_9_4():
+    """The current ZV writer stamps 0.9.4; bump tests here when bumping."""
     from zarr_vectors.constants import FORMAT_VERSION
 
-    assert FORMAT_VERSION == "0.9.2", (
+    assert FORMAT_VERSION == "0.9.4", (
         f"FORMAT_VERSION drifted to {FORMAT_VERSION!r}; if intentional "
         f"update this test and the version-cutoff check in "
         f"zarr_vectors.core.metadata.RootMetadata.validate()."
     )
 
 
-def test_the_0_9_x_additions_did_not_move_the_read_cutoff():
-    """0.9.1 and 0.9.2 are additive, so 0.9.0 stores must still read.
+@pytest.mark.parametrize("zv_version", ["0.9.0", "0.9.1", "0.9.2", "0.9.3"])
+def test_the_0_9_x_additions_did_not_move_the_read_cutoff(zv_version):
+    """Every 0.9.x addition is additive, so earlier 0.9 stores still read.
 
     The hard break is at 0.9.0 -- the single-array layout.
-    ``attribute_specs`` (0.9.1) and the RFC 8 ``ome`` node (0.9.2) each
-    only add an optional root key.  Raising the cutoff alongside the
-    version would strand every 0.9.0 store for fields they are entitled
-    not to have.
+    ``attribute_specs`` (0.9.1), the RFC 8 ``ome`` node (0.9.2) and
+    ``shard_shape`` (0.9.3) and ``manifest_layout`` (0.9.4) each only
+    add an optional root key.  Raising
+    the cutoff alongside the version would strand earlier stores for
+    fields they are entitled not to have.
     """
     from zarr_vectors.core.metadata import RootMetadata
 
@@ -373,9 +406,27 @@ def test_the_0_9_x_additions_did_not_move_the_read_cutoff():
         chunk_shape=(100.0, 100.0, 100.0),
         bounds=([0.0] * 3, [100.0] * 3),
         geometry_types=["point_cloud"],
-        zv_version="0.9.0",
+        zv_version=zv_version,
     )
     meta.validate()  # must not raise
+
+
+def test_an_absent_shard_shape_reads_as_unsharded():
+    """What every store written before 0.9.3 looks like."""
+    from zarr_vectors.core.metadata import RootMetadata
+
+    axes = [{"name": n, "type": "space"} for n in "xyz"]
+    meta = RootMetadata.from_dict({
+        "zarr_vectors": {
+            "zv_version": "0.9.2",
+            "chunk_shape": [100.0] * 3,
+            "bounds": [[0.0] * 3, [100.0] * 3],
+            "geometry_types": ["point_cloud"],
+        },
+        "multiscales": [{"axes": axes}],
+    })
+    assert meta.shard_shape is None
+    assert meta.manifest_layout is None  # absent: the vlen layout
 
 
 @pytest.mark.parametrize(

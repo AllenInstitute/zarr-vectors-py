@@ -98,7 +98,7 @@ def test_rechunk_by_attribute_wrapper_categorical(tmp_path):
     lm = read_level_metadata(root, 0)
     assert lm.chunk_attribute_name == "cluster"
     assert lm.chunk_attribute_values is not None
-    assert sorted(lm.chunk_attribute_values) == sorted(set(int(c) for c in clusters))
+    assert lm.chunk_attribute_values == sorted(set(int(c) for c in clusters))
     assert lm.chunk_dims is not None
     assert lm.chunk_dims[0] == "cluster"
 

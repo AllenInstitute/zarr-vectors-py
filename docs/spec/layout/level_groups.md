@@ -81,6 +81,15 @@ Full example for level 1, produced from a 3-D streamline store:
 | `object_count` | `integer` | Total object count at this level. |
 | `chunk_count` | `integer` | Number of non-empty chunks at this level. |
 
+#### Build-time keys
+
+Carried only while a level is being written, and absent from a finished
+store.
+
+| Key | Type | Description |
+|-----|------|-------------|
+| `zarr_vectors_presence` | `"deferred"` | The level's presence is deferred to one coordinator rebuild. Its per-chunk arrays carry no `nonempty_chunks`, so concurrent writers share no state between cells, and a reader takes presence from the store (see [Chunk arrays](chunk_arrays.md)). A writer allocating an array in such a level creates it without a manifest, and a write into an array without one records nothing. Removed by the rebuild. Since 0.9.3. |
+
 ### Level 0 special case
 
 Level 0 is always the full-resolution level. Its per-level `.zattrs` must

@@ -71,10 +71,9 @@ _ALLOWED_UNCOVERED = frozenset({
     "FragmentRef",
     "VertexRef",
     # Imported only to monkeypatch ``.indices`` and count fragment decodes
-    # in a downstream regression test.  The value itself already comes back
-    # from the exported read_vertex_fragment_index; exporting the class
-    # would additionally promise the decode entry point that test is
-    # deliberately reaching behind.
+    # in a downstream regression test.  Instances come back from the
+    # exported read_vertex_fragment_index and decode_fragment_index; the
+    # class itself is not a name a builder constructs or branches on.
     "ChunkFragmentIndex",
     # Reaching past: list_chunk_keys(level_group, array_name=...) returns
     # coordinate tuples for ANY array.  Both downstream reimplementations

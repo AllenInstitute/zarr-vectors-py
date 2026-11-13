@@ -81,7 +81,8 @@ half-open range (`z_lo <= z < z_hi`), never a closed one.
 import numpy as np
 from zarr_vectors.building import (
     LevelMetadata, create_store, create_resolution_level,
-    create_vertices_array, create_attribute_array, open_write_session,
+    create_vertices_array, create_attribute_array, defer_presence,
+    open_write_session,
 )
 
 STORE  = "/scratch/scan.zarrvectors"
@@ -98,6 +99,8 @@ level = create_resolution_level(root, 0, LevelMetadata(
 with open_write_session(level, bounds=BOUNDS, chunk_shape=CHUNK):
     create_vertices_array(level, dtype="float32")
     create_attribute_array(level, "intensity", dtype="float32")
+
+defer_presence(level)        # tasks write no state shared between cells
 ```
 
 ```{warning}
@@ -181,10 +184,30 @@ if __name__ == "__main__":
     main()
 ```
 
-`record_presence=False` is what makes this safe to run in parallel.
-`nonempty_chunks` is one attribute shared by every cell of an array, so a task
-that stamps it races every other task; tasks skip it and the finalisation step
-rebuilds it from disk.
+`defer_presence` in `init_store.py` is what makes this safe to run in
+parallel. `nonempty_chunks` is one attribute shared by every cell of an array,
+so a task that stamps it races every other task, and each stamp rewrites the
+whole list. A deferred level's arrays carry no manifest at all, so no write
+stamps one — whatever `record_presence` says, and including writers that do
+not take the flag. The finalisation step writes each manifest once.
+
+`record_presence=False` says the same thing one call at a time, and is what to
+use on a level nobody declared. It is harmless alongside the declaration.
+
+```{note}
+A cell in a deferred level is visible as soon as its payload lands:
+`list_chunks` lists the array and `chunk_exists` reads the cell, so a stage
+that reads what a worker just wrote sees it without waiting for the
+coordinator. That costs a listing per array, so the rebuild is still what a
+finished store wants. An offline-read session and a zarr-vectors older than
+0.9.3 see the cells only after the rebuild; neuroglancer's datasource probes
+every cell of an array with no manifest, which finds them, slowly. If one of
+those has to run mid-build, see
+[Stamping under your own lock](#stamping-under-your-own-lock) below.
+
+Without the declaration, `record_presence=False` alone leaves the cells
+invisible to `list_chunks` until the rebuild runs.
+```
 
 Write the vertices of a cell as one fragment **per bin**, as above, rather
 than one fragment for the whole cell. Fragments are what a coarsener draws
@@ -229,7 +252,7 @@ args = parser.parse_args()
 root = open_store(args.output, mode="r+")
 level = get_resolution_level(root, 0)
 
-rebuild_presence(level)                      # the nonempty_chunks nobody stamped
+rebuild_presence(level)                      # every manifest, once; ends the deferral
 print(refresh_arrays_present(level))         # what is actually on disk
 update_level_metadata(level, vertex_count=args.vertices)
 write_multiscale_metadata(root)
@@ -248,6 +271,59 @@ Store finalised.
 declared, which is why `vertex_fragments` shows up even though `init_store.py`
 never listed it. Both it and `rebuild_presence` are coordinator verbs — never
 run either while tasks are still writing.
+
+`rebuild_presence` finds the cells by reading the store back: a listing and a
+read of every shard of every array. If your tasks already report the cells they
+wrote, the coordinator can record those instead and skip the read:
+
+```python
+set_presence(level, {"vertices": cells, "vertex_fragments": cells, ...},
+             end_deferral=True)
+```
+
+Each named array's manifest becomes exactly the cells given, so name every
+array the tasks wrote, and pass the union for a cell more than one task wrote.
+`end_presence_deferral` ends the declaration on its own, and refuses while any
+array is still without a manifest unless told `missing="derive"`.
+
+### Stamping under your own lock
+
+A deferred level keeps every cell visible to current zarr-vectors readers, but
+not to an offline-read session or a zarr-vectors older than 0.9.3, and a viewer
+reading `nonempty_chunks` straight from `zarr.json` has to fall back to probing
+every cell. Without the declaration, `record_presence=False` hides the cells
+from everyone until `rebuild_presence` runs, and a stage that reads the chunks a
+worker just wrote sees nothing and silently does no work.
+
+If your workers already serialise *something* (a file lock, a queue, a
+database row), you can keep the payloads unlocked and move only the manifest
+update inside that section. `collect_presence` holds the stamps back;
+`apply_presence` lands them, coalesced to one attribute write per array:
+
+```python
+with level.collect_presence() as pending:
+    flush(level)                    # payloads -- the bulk of the I/O, unlocked
+with store_write_lock(path):        # short, and the only thing serialised
+    level.apply_presence(pending)
+```
+
+Unlike `batched_writes`, the cell payloads are **not** deferred — they land
+inline, exactly as they would otherwise. Only the stamp waits. By the time
+`apply_presence` returns, `list_chunks` reports every cell in the block, so a
+consumer running immediately afterwards sees the work.
+
+Pick by what follows the write:
+
+| Situation | Use |
+|---|---|
+| A coordinator pass follows | `defer_presence` + `rebuild_presence` |
+| Consumers run before the coordinator, and read through zarr-vectors | the same — they ask the store while the level is deferred |
+| Consumers that cannot ask the store run before the coordinator, and you hold a lock | `collect_presence` / `apply_presence` |
+| Single writer, no concurrency | the default — stamp inline |
+
+`collect_presence` cannot be combined with `batched_writes`, which defers the
+payloads too and stamps its own manifest when it flushes; nesting the two
+raises `StoreError`. A `pending` token belongs to the thread that collected it.
 
 `build_pyramid` needs the whole store, so it belongs here rather than in a
 task. Coarsening a single level in isolation is not on the supported surface;
@@ -348,6 +424,125 @@ mutable state is the presence manifest, which is exactly what
 
 ---
 
+## Workers that append objects
+
+A pipeline that builds objects chunk by chunk (skeleton paths, say, with
+seam links between neighbouring chunks) flushes in a fixed order. Each call
+takes whole arrays, numpy or device, and leaves the same bytes as its
+per-object counterpart:
+
+```python
+from zarr_vectors import building as zb
+
+n0 = committed_objects                      # the coordinator's count
+start, k = zb.write_chunk_fragments(        # 1. the new objects' fragments
+    lg, cc, csr=(indices, offsets), mode="append")
+zb.write_object_manifests(                  # 2. one manifest row per object
+    lg, chunk_coords=np.tile(cc, (k, 1)), fragment_idx=np.arange(start, start + k),
+    mode="append", at=n0)
+zb.write_object_attribute_columns(          # 3. their attribute columns
+    lg, {"length": lengths, "n_nodes": counts}, at=n0)
+zb.write_link_cells(                        # 4. seams and their attributes
+    lg, chunks=seam_chunks, vids=seam_vids, attributes={"w": weights})
+# the coordinator then commits num_objects = n0 + k
+```
+
+If the store was created with `manifest_layout="dense"`, step 2 writes the
+arrays as they are, with no blob per object, and a later
+`read_all_object_manifests_csr` is a gather rather than a decode; see
+[Dense object indexes](gpu.md#dense-object-indexes).
+
+When every worker has finished, the coordinator runs `zb.finalize_links(lg,
+delta=0)` once. It rebuilds presence for the link, link-attribute and
+link-fragment arrays, which the array-form link writer does not record. In a
+deferred level it leaves presence alone, for the level's `rebuild_presence` or
+`set_presence`: a manifest written there would put the stamps of any task still
+writing back to racing.
+
+Two things are shared between workers here, unlike the cell writes in the
+patterns above:
+
+- **The object index and object attribute columns.** An `at=` append is a
+  resume cursor for one writer: below the current length it truncates what
+  follows, above it pads, and every call resizes. Several processes must not
+  append at once. To fill the object layer in parallel, reserve it and place
+  rows instead (below).
+- **Seam link cells.** A seam is stored in the cell of its anchor chunk,
+  which may belong to another worker's partition. Either route each seam to
+  the worker that owns its anchor, or serialise these writes too.
+
+### One shard per task, published at the end
+
+When each task owns a shard of a sharded store, a retry should not start from
+its failed attempt's cells. Inside `zb.shard_transaction(level, shard)` every
+cell write -- through any writer -- is staged, and must fall inside the shard;
+reads of the task's cells see the staging (under the default `mode="replace"`
+a cell not yet written reads empty, so an append does not re-read old rows).
+On exit each changed shard object is written as a `.partial` file, fsynced,
+and renamed into place; an exception publishes nothing.
+
+```python
+shard = zb.shard_of(lg, first_chunk_of_task)       # the shard's grid index
+with zb.shard_transaction(lg, shard) as tx:        # presence must be deferred
+    for cc in task_chunks:
+        zb.write_chunk_vertices(lg, cc, groups)
+        zb.write_chunk_attributes(lg, "intensity", cc, values)
+report(tx.written)                                 # {array: [chunk_key, ...]}
+```
+
+The coordinator allocates every array beforehand, and afterwards records
+presence from the tasks' reports with `zb.set_presence(..., end_deferral=True)`.
+A crash while renaming leaves some of the task's shards new and some old;
+re-running the task converges, since the same cells encode to the same bytes.
+
+On a network filesystem every create, fsync and rename is a round trip, and a
+task touching a hundred arrays publishes a hundred objects. Pass
+`io_threads=16` to encode, write and fsync them from a pool; the renames still
+wait for every object to be on disk, and a failure on any thread publishes
+nothing. On entry the transaction removes the `.partial` files a failed
+attempt left, which lists each owned shard's directory; a task that knows the
+shard's last transaction completed can pass `sweep=False`.
+
+`zv.concurrency_contract()` states what may be written at once: cells or
+shards owned by one process each, and object-layer rows placed in disjoint,
+aligned ranges after one reservation.
+
+```python
+# Coordinator, before the workers:
+contract = zv.concurrency_contract(lg)       # at_alignment: 65,536 unsharded
+zb.reserve_object_rows(
+    lg, n_objects, sid_ndim=3,
+    n_blocks=block_starts[-1],               # dense index: see aligned_regions
+    columns={"length": "float32", "rgb": ("uint8", (3,))},
+    shard_rows=None,                         # or a multiple of 65,536
+)
+
+# Each worker, rows [lo, hi) with lo and hi multiples of at_alignment
+# (the last range may end at n_objects):
+zb.write_object_manifests(lg, chunk_coords=cc, fragment_idx=fi,
+                          manifest_offsets=off, mode="place", at=lo,
+                          block_at=block_starts[worker])   # dense only
+zb.write_object_attribute_columns(lg, {"length": lengths}, mode="place", at=lo)
+
+# Coordinator, once every worker has finished:
+zb.commit_object_index(lg, n_objects)
+```
+
+`mode="place"` writes only rows `[at, at + n)`: no resize, no padding, no
+metadata. A dense index also needs each worker's fragments at its own
+aligned block region: `zb.aligned_regions(counts, contract["block_alignment"])`
+turns per-worker fragment counts into region starts, and the last start is
+the `n_blocks` to reserve. Every reserved row must be written, an object with
+no fragments as an empty manifest; `commit_object_index` refuses rows nobody
+wrote where it can tell.
+
+A worker that needs a halo around its own chunk reads it in one prefetch
+with `zb.read_neighbourhood(lg, cc, arrays, halo=1)`. See
+[GPU arrays and array-form I/O](gpu.md) for the read side and the device
+model.
+
+---
+
 ## Sharding read work across ranks
 
 Reading back is easier than writing, because `Query.cells()` computes which
@@ -420,7 +615,16 @@ carry the bulk of the bytes.
   format detects the collision; the second writer simply wins.
 - **Skip the presence manifest in tasks.** Pass `record_presence=False` to
   every per-chunk write and rebuild once, afterwards. This is the one piece of
-  genuinely shared state.
+  genuinely shared state. If a consumer runs before that rebuild, collect the
+  stamps and apply them under your own lock instead — see
+  [Stamping under your own lock](#stamping-under-your-own-lock).
+- **Declare `shard_shape` on the store if you need one.** Pass it to
+  `create_store`, not to each writer: tasks allocate attribute arrays and link
+  segments on first write, and a task never sees the coordinator's arguments.
+  Declared on the store, those arrays are born sharded too; passed per call,
+  only the arrays that call creates are, and the store comes out half sharded.
+  Sharding also changes the locking you need — many cells share one object, so
+  two tasks writing *disjoint* cells are no longer writing disjoint files.
 - **Use a large `chunk_shape` on Lustre.** Stripe granularity is typically
   1–4 MB; cells smaller than that see no parallelism benefit.
   `Grid.plan(...).capacity(n_vertices=...)` gives the per-cell figure before
