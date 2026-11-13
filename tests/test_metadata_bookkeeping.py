@@ -100,3 +100,18 @@ def test_iter_link_cells_trusts_stored_has_perm(tmp_path, monkeypatch):
     monkeypatch.setattr(arrays, "links_has_perm", lambda *a, **k: False)
     assert widths() == before
     assert len(arrays.read_links(level)) == expected
+
+
+# --- object_row_count is object_count ------------------------------------
+
+def test_object_row_count_matches_object_count(tmp_path):
+    from zarr_vectors.core.arrays import object_count, object_row_count
+    from zarr_vectors.core.store import get_resolution_level, open_store
+    from zarr_vectors.types.points import write_points
+
+    path = tmp_path / "p.zv"
+    pts = np.random.default_rng(5).random((30, 3)).astype("f4") * 100
+    write_points(path, pts, chunk_shape=(50.0,) * 3,
+                 object_ids=np.repeat(np.arange(6), 5))
+    level = get_resolution_level(open_store(path), 0)
+    assert object_row_count(level) == object_count(level) == 6
