@@ -173,3 +173,26 @@ def test_arrays_present_matches_disk(tmp_path, kind, chunk):
     assert declared == refresh_arrays_present(get_resolution_level(root, 0))
     if kind in ("lines", "polyline", "streamline") and chunk == 30.0:
         assert "links" in declared
+
+
+# --- RootMetadata.to_dict and _write_root_attrs agree on key presence ----
+
+def test_root_to_dict_key_presence_matches_writer(tmp_path):
+    from zarr_vectors.core.store import create_store, read_root_metadata
+
+    root = create_store(tmp_path / "r.zv", bounds=([0, 0, 0], [10, 10, 10]),
+                        chunk_shape=(5.0, 5.0, 5.0))
+    stored = root.attrs.to_dict()["zarr_vectors"]
+    wire = read_root_metadata(root).to_dict()["zarr_vectors"]
+    always = {"zv_version", "format_capabilities", "chunk_shape", "bounds",
+              "geometry_types"}
+    assert always <= set(stored) and always <= set(wire)
+    # Everything the writer stores, to_dict emits too; to_dict's extras
+    # are only the policy fields a store leaves to their defaults.
+    assert set(stored) <= set(wire)
+    assert set(wire) - set(stored) <= {
+        "links_convention", "object_index_convention", "cross_chunk_strategy",
+        "cross_level_depth", "cross_level_storage", "reduction_factor",
+    }
+    assert wire["format_capabilities"] == stored["format_capabilities"] == []
+    assert "crs" not in stored and "crs" not in wire
