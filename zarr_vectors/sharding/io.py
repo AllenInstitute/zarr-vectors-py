@@ -347,7 +347,9 @@ def unshard_store(
     storage object per spatial chunk (``<array>/c/i/j/k``).
 
     The logical single-array layout is unchanged; only the Zarr v3
-    ``sharding_indexed`` packing is removed.  Useful for write-heavy
+    ``sharding_indexed`` packing is removed.  Unsharding the whole store
+    (``arrays=None``) also clears the root ``shard_shape``, so arrays
+    created afterwards are unsharded too.  Useful for write-heavy
     workflows where shard read-modify-write contention hurts throughput,
     or when a reader prefers one file per chunk.
     """
@@ -403,6 +405,18 @@ def unshard_store(
 
             arrays_unsharded += 1
             chunks_extracted += len(chunk_payloads)
+
+    # The root's shard_shape is what every array allocated LATER honours
+    # (create_store(shard_shape=) records it for exactly that), so leaving
+    # it behind made the next write -- a pyramid level, a new attribute --
+    # come out sharded again in a store just unsharded.  Only a whole-store
+    # unshard clears it: one limited to some arrays leaves the rest, and
+    # the store's default, as they were.
+    if arrays is None:
+        attrs = root.attrs.to_dict()
+        block = dict(attrs.get("zarr_vectors", {}))
+        if block.pop("shard_shape", None) is not None:
+            root.attrs.update({"zarr_vectors": block})
 
     return {
         "arrays_unsharded": arrays_unsharded,
