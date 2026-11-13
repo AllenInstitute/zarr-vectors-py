@@ -31,6 +31,7 @@ from __future__ import annotations
 import asyncio
 import os
 import threading
+import time
 from typing import Any, NamedTuple
 
 import numpy as np
@@ -470,7 +471,18 @@ def direct_elements(node: Any, indices: Any) -> np.ndarray | None:
 #: it a slow store stops being read one file at a time. ``open`` and
 #: ``read`` release the GIL, so the threads genuinely overlap; decoding
 #: stays on the calling thread.
+#:
+#: Above the threshold the files are still read one after another while
+#: the store proves warm, because there the pool is not merely overhead
+#: but a loss: a future per file costs more than reading the file, and
+#: 2,852 warm files took 330 ms through the pool against 173 ms serially.
+#: Each run of :data:`_READ_PROBE` files is timed, and the first run
+#: averaging over :data:`_SLOW_READ_S` a file hands everything left to
+#: the pool -- so a cold store pays for at most one slow run serially,
+#: wherever in the plan it turns cold.
 _PARALLEL_READ_MIN = 256
+_READ_PROBE = 32
+_SLOW_READ_S = 200e-6
 _PARALLEL_READ_WORKERS = min(16, (os.cpu_count() or 4) * 2)
 
 _READ_POOL: Any = None
@@ -509,6 +521,27 @@ def _reset_read_pool_after_fork() -> None:
 
 if hasattr(os, "register_at_fork"):
     os.register_at_fork(after_in_child=_reset_read_pool_after_fork)
+
+
+def _read_files(paths: list[str]) -> list[bytes | None]:
+    """:func:`_read_file` for each of ``paths``, in order.
+
+    Serial while the store answers quickly, pooled from the first run of
+    files that does not; see :data:`_PARALLEL_READ_MIN`.
+    """
+    if len(paths) < _PARALLEL_READ_MIN:
+        return [_read_file(p) for p in paths]
+    raws: list[bytes | None] = []
+    for start in range(0, len(paths), _READ_PROBE):
+        run = paths[start:start + _READ_PROBE]
+        t0 = time.perf_counter()
+        raws.extend(_read_file(p) for p in run)
+        if time.perf_counter() - t0 > _SLOW_READ_S * len(run):
+            raws.extend(
+                _read_pool().map(_read_file, paths[start + len(run):])
+            )
+            break
+    return raws
 
 
 def _direct_read_many(
@@ -550,12 +583,7 @@ def _direct_read_plan(
                 wanted.append((array_name, spec, chunk_key, path))
     if not wanted:
         return {}
-    if len(wanted) >= _PARALLEL_READ_MIN:
-        raws = list(
-            _read_pool().map(_read_file, [w[3] for w in wanted])
-        )
-    else:
-        raws = [_read_file(w[3]) for w in wanted]
+    raws = _read_files([w[3] for w in wanted])
     out: dict[tuple[str, str], bytes] = {}
     for (array_name, spec, chunk_key, _path), raw in zip(wanted, raws):
         try:
