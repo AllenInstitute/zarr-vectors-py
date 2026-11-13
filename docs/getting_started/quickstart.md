@@ -104,7 +104,7 @@ steers the automatic layout.
 ### Chunks, bins and the layout
 
 A **chunk** is the I/O unit, one file on disk, and a **bin** is the spatial
-index unit inside it (see [Core concepts](concepts.md)). Both come from the
+index unit inside it (see [Core concepts](../explanation/concepts.md)). Both come from the
 schema's `Layout`; no read or write call takes them.
 
 `zv.Layout(cells=5)` divides the 1000 µm bounds into five cells per axis,
@@ -147,7 +147,7 @@ about 64 MB each instead. Pass `cells=` when you know the chunk size you
 want.
 
 For the reasoning behind a particular chunk and bin size, see
-[Core concepts](concepts.md) and
+[Core concepts](../explanation/concepts.md) and
 [Choosing a layout](../how_to/choose_chunk_and_bin.md).
 
 If the store may already exist, `zv.open_or_create` is the entry point that
@@ -625,7 +625,7 @@ error, because the two selections intersect.
 Reading from and writing to third-party formats (LAS, PLY, CSV, TRK, TCK,
 TRX, SWC, GraphML, OBJ, STL) is in the companion package `zarr-vectors-tools`,
 together with its `zvtools` command-line tool. See
-[Ingesting other formats](../tutorials/io/ingest_formats.md).
+[Ingesting other formats](../how_to/convert_files.md).
 
 ---
 
@@ -660,7 +660,7 @@ Level 5 validation: PASS
 
 The warning appears because `build_pyramid` wrote a links array into the
 point-cloud store; a freshly written point cloud has none. See
-[Validation](../tutorials/io/validation_and_repair.md) for what each level
+[Validation](../how_to/validate_and_repair.md) for what each level
 checks.
 
 ---
@@ -706,7 +706,7 @@ wrong. `zv.FEATURES` lists the known feature names.
 
 ## Next steps
 
-- [Core concepts](concepts.md): chunks, bins, fragments and the multiscale
+- [Core concepts](../explanation/concepts.md): chunks, bins, fragments and the multiscale
   pyramid.
 - [Choosing a layout](../how_to/choose_chunk_and_bin.md): what to pass when the
   `Layout` defaults do not suit your data.
@@ -714,5 +714,5 @@ wrong. `zv.FEATURES` lists the known feature names.
   data-type tutorials: each geometry in depth.
 - [Building pyramids](../tutorials/multiscale/building_pyramids.md): the
   coarsening strategies and what they keep.
-- [View stores in Neuroglancer](../tutorials/neuroglancer/overview.md):
+- [View stores in Neuroglancer](../how_to/view_in_neuroglancer.md):
   open stores in ngplatform.

@@ -62,7 +62,7 @@ one entry. For a 3-D store with one level whose bin shape is
 ```
 
 - `axes` is the store's axis list and the source of its dimensionality
-  (see [Dimensionality](../foundations/dimensionality.md)). Each axis
+  (see [Dimensionality](../../spec/foundations/dimensionality.md)). Each axis
   has a `unit` only when one was given.
 - Each `datasets` entry names a level group. Its `scale` is the
   level's `bin_ratio` and its `translation` is half the level's
@@ -71,7 +71,7 @@ one entry. For a 3-D store with one level whose bin shape is
   format. No other key is added to the block. A level's `bin_ratio` and
   `bin_shape` are read back from these transforms; its other values,
   such as `object_sparsity`, are in the level's `zarr_vectors_level`
-  attributes (see [Level groups](../layout/level_groups.md)).
+  attributes (see [Level groups](../../spec/layout/level_groups.md)).
 
 The meaning of `scale` differs between the formats. In OME-Zarr,
 `scale` converts array indices to physical units. Zarr Vectors stores
@@ -79,7 +79,7 @@ vertex positions in world coordinates at every level, so its `scale` is
 a dimensionless bin ratio and is not needed to place vertices. A
 reader that applies these transforms to Zarr Vectors positions would
 misplace them. The full block is described in
-[Multiscale metadata](../multiscale/multiscale_metadata.md).
+[Multiscale metadata](../../spec/multiscale/multiscale_metadata.md).
 
 ### The `ome` node
 
@@ -128,11 +128,11 @@ a store that lacks one.
 - **Image arrays.** OME-Zarr images are dense arrays with a value at
   every index. Zarr Vectors per-chunk arrays hold one variable-length
   byte cell per spatial chunk (see
-  [Zarr v3 primer](../foundations/zarr_v3_primer.md)), so an image
+  [Zarr v3 primer](../../spec/foundations/zarr_v3_primer.md)), so an image
   reader cannot display them.
 - **Labels.** OME-Zarr labels are integer image arrays. Zarr Vectors
   stores labels as vertex or object attributes (see
-  [Object attributes](../object_model/object_attributes.md)).
+  [Object attributes](../../spec/object_model/object_attributes.md)).
 - **High-content screening.** OME-Zarr's plate and well layout has no
   equivalent.
 
@@ -141,11 +141,11 @@ a store that lacks one.
 To overlay a Zarr Vectors store on an OME-Zarr image, give the store
 the same axis names, order and units as the image's physical space
 (through `axes` at creation, see
-[Dimensionality](../foundations/dimensionality.md)) and write vertex
+[Dimensionality](../../spec/foundations/dimensionality.md)) and write vertex
 positions in those physical units. An RFC 8 collection elsewhere can
 then reference the store's `world` coordinate system by its `id`.
 
 ### Validation
 
 Level 1 (`validate/structure.py`) warns when the root attributes have
-no `ome` node. No level reads the `multiscales` block itself. See [Validation](../validation/overview.md).
+no `ome` node. No level reads the `multiscales` block itself. See [Validation](../../spec/validation/overview.md).

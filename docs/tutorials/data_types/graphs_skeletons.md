@@ -8,7 +8,7 @@ of nodes and edges.
 
 The steps run in order as one Python session. The
 [quickstart](../../getting_started/quickstart.md) introduces the shared calls
-on point clouds and polylines, and [Concepts](../../getting_started/concepts.md)
+on point clouds and polylines, and [Concepts](../../explanation/concepts.md)
 explains chunks, bins and objects.
 
 ## 1. Create the store
@@ -204,7 +204,7 @@ Level 4 validation: PASS
   51 passed, 0 warnings, 0 errors
 ```
 
-[Validation and repair](../io/validation_and_repair.md) lists what each level
+[Validation and repair](../../how_to/validate_and_repair.md) lists what each level
 checks.
 
 To convert SWC or GraphML files to and from a store, use the companion package

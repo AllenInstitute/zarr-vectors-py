@@ -8,7 +8,7 @@ tracks, as polylines.
 
 The steps run in order as one Python session. The
 [quickstart](../../getting_started/quickstart.md) introduces the same calls
-more briefly, and [Concepts](../../getting_started/concepts.md) explains
+more briefly, and [Concepts](../../explanation/concepts.md) explains
 chunks, bins, objects and groups.
 
 ## 1. Create the store
@@ -253,7 +253,7 @@ Level 4 validation: PASS
   53 passed, 0 warnings, 0 errors
 ```
 
-[Validation and repair](../io/validation_and_repair.md) lists what each level
+[Validation and repair](../../how_to/validate_and_repair.md) lists what each level
 checks.
 
 To convert TRK, TCK or TRX files to and from a store, use the companion

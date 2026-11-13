@@ -6,7 +6,7 @@ store; only the URL changes, plus a `zv.StorageOptions` where the backend
 needs settings. This tutorial installs a cloud backend, shows how the backend
 is chosen, writes and packs a store for an object store, counts the objects it
 will create, and writes links from parallel workers. The backend layer is
-specified in [Store types](../../spec/foundations/store_types.md).
+specified in [Store types](../spec/foundations/store_types.md).
 
 ## Install a cloud backend
 
@@ -309,7 +309,7 @@ True 42
 `shard_shape` counts spatial chunks: an integer applies to every axis, a
 tuple sets each axis. `arrays=[...]` limits the change to some arrays.
 `reshard(path, None)` unshards. The result is plain Zarr v3; see
-[Sharding](../../spec/chunking/sharding.md).
+[Sharding](../spec/chunking/sharding.md).
 
 ## Build a pyramid on a remote store
 
@@ -322,13 +322,13 @@ ds.build_pyramid(factors=[(2.0, 1.0), (2.0, 1.0)], chunk_scale_factors=[2, 2])
 
 Pass `chunk_scale_factors`: without it every level keeps the level-0 chunk
 shape, so coarse levels are stored in as many objects as level 0. See
-[Building multi-resolution pyramids](../multiscale/building_pyramids.md).
+[Building multi-resolution pyramids](../tutorials/multiscale/building_pyramids.md).
 
 ## Read from a remote store
 
 `ds.levels`, `Level.vertex_count` and `Level.objects.count` come from metadata.
 `Query.explain()` and `Query.cells()` show what a read will fetch before it
-runs. [Deferred reads and out-of-core access](../multiscale/lazy_loading.md)
+runs. [Deferred reads and out-of-core access](../tutorials/multiscale/lazy_loading.md)
 covers choosing a level and reading cell by cell.
 
 ## Consolidated metadata
@@ -441,7 +441,7 @@ print(shard_store("edges.zarrvectors"))
 
 `finalize_links` recounts every cell, so run it after all cells are written
 and before sharding. Unreconciled counts fail
-[consistency validation](validation_and_repair.md#check-a-store).
+[consistency validation](validate_and_repair.md#check-a-store).
 
 ### How link rows and attribute rows line up
 

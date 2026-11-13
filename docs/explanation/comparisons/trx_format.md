@@ -50,15 +50,15 @@ data between the two.
 | Property | TRX | Zarr Vectors `streamline` |
 |----------|-----|---------------------------|
 | Container | ZIP archive or directory | Zarr v3 hierarchy (`.zarrvectors`) |
-| Vertices | One `positions` array, concatenated | Per-chunk cells, sorted into fragments (see [Chunk arrays](../layout/chunk_arrays.md)) |
-| Streamline boundaries | `offsets` | Object manifests listing each streamline's chunks and fragments (see [Object manifest](../object_model/object_manifest.md)) |
+| Vertices | One `positions` array, concatenated | Per-chunk cells, sorted into fragments (see [Chunk arrays](../../spec/layout/chunk_arrays.md)) |
+| Streamline boundaries | `offsets` | Object manifests listing each streamline's chunks and fragments (see [Object manifest](../../spec/object_model/object_manifest.md)) |
 | Spatial index | None | Chunk grid and fragment index |
 | Per-vertex data | `dpv/` | `vertex_attributes/<name>` |
 | Per-streamline data | `dps/` | `object_attributes/<name>` |
 | Groups | `groups/` | `groups` array, with names in its `group_names` attribute |
 | Per-group data | `dpg/` | `group_attributes/<name>` |
 | Reference image | `header.json` | Kept as a `trx` header by `zarr-vectors-tools` (see below) |
-| Resolution levels | One | Several (see [Multiscale metadata](../multiscale/multiscale_metadata.md)) |
+| Resolution levels | One | Several (see [Multiscale metadata](../../spec/multiscale/multiscale_metadata.md)) |
 
 ### Data model mapping
 
@@ -110,4 +110,4 @@ TCK files have their own converters (`ingest_trk`, `ingest_tck`,
 `zarr-vectors-py` does not validate TRX files. A store written by
 `ingest_trx` is a `streamline` store; level 4 of
 `zarr_vectors.validate.validate` checks that its `links_convention` is
-`implicit_sequential`. See [Validation](../validation/overview.md).
+`implicit_sequential`. See [Validation](../../spec/validation/overview.md).

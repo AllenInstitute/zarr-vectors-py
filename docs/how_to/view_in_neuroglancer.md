@@ -9,7 +9,7 @@ ngplatform is a browser workspace around an unchanged
 plugins. Its Zarr Vectors plugin, on by default, reads a store into a
 Neuroglancer segmentation layer with one segment per object. Stock
 Neuroglancer cannot read a store; for it, export to the precomputed format
-([Precomputed export](precomputed_export.md)).
+([Precomputed export](view_in_neuroglancer.md)).
 
 ## Start ngplatform
 
@@ -98,4 +98,18 @@ sliders set the target.
 
 The store's levels and their bin shapes are in the root attributes, under
 `multiscales` and `zarr_vectors`; see
-[Multiscale metadata](../../spec/multiscale/multiscale_metadata.md).
+[Multiscale metadata](../spec/multiscale/multiscale_metadata.md).
+
+## Stock Neuroglancer
+
+Stock Neuroglancer does not read Zarr Vectors stores. To view a store
+there, export it to Neuroglancer's precomputed format with
+`zarr-vectors-tools`:
+
+```bash
+zvtools convert STORE OUTPUT --format precomputed
+```
+
+The tools
+[Visualise](https://zarr-vectors-tools.readthedocs.io/en/latest/visualise.html)
+page lists which geometry types it exports.

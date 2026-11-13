@@ -83,7 +83,7 @@ grid cell (the chunk shape), `Level.resolution` the size of one bin, and
 `select(...)` and finish with a terminal.
 
 A remote store opens with the same call, given a URL and a
-`zv.StorageOptions`; see [Cloud stores](../io/cloud_stores.md).
+`zv.StorageOptions`; see [Cloud stores](../../how_to/cloud_stores.md).
 
 ## A query is the deferred read
 

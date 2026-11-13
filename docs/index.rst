@@ -58,7 +58,7 @@ Where to start
 
    * - :doc:`getting_started/quickstart`
      - Write and query your first vector store in a few lines of Python.
-   * - :doc:`getting_started/concepts`
+   * - :doc:`explanation/concepts`
      - The mental model: chunks, supervoxel bins, fragments, the object model
        and the resolution pyramid — and how ``Layout`` sets them.
    * - :doc:`api/api`
@@ -76,20 +76,11 @@ Where to start
 
 .. toctree::
    :maxdepth: 1
-   :caption: Getting Started
+   :caption: Getting started
    :hidden:
 
    getting_started/installation
    getting_started/quickstart
-   getting_started/concepts
-   getting_started/faq
-
-.. toctree::
-   :maxdepth: 1
-   :caption: Specification
-   :hidden:
-
-   spec/index
 
 .. toctree::
    :maxdepth: 1
@@ -103,29 +94,46 @@ Where to start
    tutorials/data_types/mesh_streaming
    tutorials/multiscale/building_pyramids
    tutorials/multiscale/lazy_loading
-   tutorials/io/cloud_stores
-   tutorials/io/validation_and_repair
-   tutorials/io/ingest_formats
-   tutorials/neuroglancer/overview
-   tutorials/neuroglancer/precomputed_export
 
 .. toctree::
    :maxdepth: 1
-   :caption: API Reference
-   :hidden:
-
-   api/index
-
-.. toctree::
-   :maxdepth: 1
-   :caption: How-To Guides
+   :caption: How-to guides
    :hidden:
 
    how_to/choose_chunk_and_bin
    how_to/memory_efficient_writes
    how_to/hpc_pipelines
+   how_to/cloud_stores
+   how_to/validate_and_repair
+   how_to/convert_files
+   how_to/view_in_neuroglancer
    how_to/gpu
    how_to/cite
+
+.. toctree::
+   :maxdepth: 1
+   :caption: Explanation
+   :hidden:
+
+   explanation/concepts
+   explanation/faq
+   explanation/comparisons/neuroglancer_precomputed
+   explanation/comparisons/ome_zarr
+   explanation/comparisons/trx_format
+
+.. toctree::
+   :maxdepth: 1
+   :caption: Specification
+   :hidden:
+
+   spec/index
+
+.. toctree::
+   :maxdepth: 1
+   :caption: API reference
+   :hidden:
+
+   api/index
 
 .. toctree::
    :maxdepth: 1

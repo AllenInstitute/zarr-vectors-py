@@ -26,7 +26,7 @@ Physical units belong to the axes in `multiscales`; see
 
 TRK, TCK and TRX converters are in the companion package
 [zarr-vectors-tools](https://zarr-vectors-tools.readthedocs.io/en/latest/convert/streamlines.html).
-[TRX format comparison](../comparisons/trx_format.md) maps TRX fields onto
+[TRX format comparison](../../explanation/comparisons/trx_format.md) maps TRX fields onto
 this layout.
 
 ## Technical reference

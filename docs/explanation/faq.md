@@ -20,7 +20,7 @@ Zarr Vectors uses the `multiscales` JSON block from the OME-Zarr NGFF
 specification, so an OME-Zarr-aware viewer can find its resolution pyramid.
 It is not a subset of OME-Zarr: OME-Zarr is mainly for dense image volumes,
 Zarr Vectors for sparse vector geometry.
-[Zarr Vectors and OME-Zarr](../spec/comparisons/ome_zarr.md) lists which
+[Zarr Vectors and OME-Zarr](comparisons/ome_zarr.md) lists which
 fields are shared and which are specific to Zarr Vectors.
 
 ### Why does the store have a `.zarrvectors` extension? Is it required?
@@ -53,7 +53,7 @@ run on 3.11 and 3.12. The `[icechunk]` extra needs Python 3.12 or later.
 
 The base install needs only `numpy`, `numcodecs` and `zarr`, all of which
 support Windows. The optional extras listed in
-[Installation](installation.md) have their own platform requirements; the
+[Installation](../getting_started/installation.md) have their own platform requirements; the
 `[gpu]` extras are Linux only.
 
 ### I get an error about `DracoPy` — what do I do?
@@ -203,15 +203,15 @@ package `zarr-vectors-tools`.
 Open it in [ngplatform](https://github.com/AllenInstitute/ngplatform), a
 browser workspace around Neuroglancer whose Zarr Vectors plugin reads
 stores from your computer or a URL. See
-[View stores in Neuroglancer](../tutorials/neuroglancer/overview.md).
+[View stores in Neuroglancer](../how_to/view_in_neuroglancer.md).
 
 ### Is Zarr Vectors compatible with the Neuroglancer precomputed format?
 
 They are separate formats with shared goals, such as spatial chunking and
 multiscale levels. `zarr-vectors-tools` exports skeleton and mesh stores as
 Neuroglancer precomputed layers; see
-[Precomputed export](../tutorials/neuroglancer/precomputed_export.md). See
-[Zarr Vectors and Neuroglancer precomputed](../spec/comparisons/neuroglancer_precomputed.md)
+[Precomputed export](../how_to/view_in_neuroglancer.md). See
+[Zarr Vectors and Neuroglancer precomputed](comparisons/neuroglancer_precomputed.md)
 for a comparison of the formats.
 
 ---
@@ -230,7 +230,7 @@ for a comparison of the formats.
   `zv.open("s3://bucket/scan.zarrvectors")`. The backend comes from the URL
   scheme, or from `StorageOptions(backend=...)` to force one.
   `Layout(pack=...)` packs several cells into one object; it is on by default
-  for non-local stores. See [Cloud stores](../tutorials/io/cloud_stores.md).
+  for non-local stores. See [Cloud stores](../how_to/cloud_stores.md).
 - Build the pyramid as a separate pass over the finished base level, and thin
   the coarse levels with a `sparsity_factor` above 1.0 if they are the cost.
 

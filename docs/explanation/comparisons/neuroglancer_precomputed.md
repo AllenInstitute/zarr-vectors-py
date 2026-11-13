@@ -47,7 +47,7 @@ Stock Neuroglancer does not read Zarr Vectors stores. They are viewed
 with ngplatform, a Neuroglancer build with a `zarr-vectors` data source
 that opens a store from its URL followed by `/|zarr-vectors:`, or
 exported to precomputed with `zarr-vectors-tools`. See the
-[Neuroglancer overview](../../tutorials/neuroglancer/overview.md).
+[Neuroglancer overview](../../how_to/view_in_neuroglancer.md).
 
 ---
 
@@ -64,7 +64,7 @@ exported to precomputed with `zarr-vectors-tools`. See the
 | `neuroglancer_legacy_mesh`, `neuroglancer_multilod_draco` | `mesh` | |
 | none | `polyline`, `streamline` | |
 
-See [Geometry types](../geometry_types/index.md) for each Zarr Vectors
+See [Geometry types](../../spec/geometry_types/index.md) for each Zarr Vectors
 type.
 
 ### Structural differences
@@ -72,8 +72,8 @@ type.
 | Property | Zarr Vectors | Precomputed |
 |----------|--------------|-------------|
 | Spatial unit of storage | A per-chunk cell holding every object's vertices in that chunk, with a fragment index | Skeletons and meshes: one object per file or shard entry; annotations: spatially chunked records |
-| Objects that cross chunks | Fragments in each chunk, joined by the object manifest and by links whose cell is the source chunk (see [Links](../object_model/links.md)) | Skeletons are stored whole; legacy meshes are split into fragments named by a manifest |
-| Resolution levels | Coarser levels in the same store (see [Multiscale metadata](../multiscale/multiscale_metadata.md)) | Per format: annotation spatial-index levels, multi-resolution Draco meshes |
+| Objects that cross chunks | Fragments in each chunk, joined by the object manifest and by links whose cell is the source chunk (see [Links](../../spec/object_model/links.md)) | Skeletons are stored whole; legacy meshes are split into fragments named by a manifest |
+| Resolution levels | Coarser levels in the same store (see [Multiscale metadata](../../spec/multiscale/multiscale_metadata.md)) | Per format: annotation spatial-index levels, multi-resolution Draco meshes |
 | Per-vertex attributes | Any NumPy dtype | Skeleton `vertex_attributes` |
 | Per-object attributes | `object_attributes/<name>` arrays | Segment properties, annotation `properties` |
 | Metadata | Root, level and array attributes in `zarr.json` | `info` JSON per layer |
@@ -84,9 +84,9 @@ A Zarr Vectors mesh face whose vertices all lie in one chunk is stored
 with that chunk. A face whose vertices span chunks is stored in a
 links array whose cell is the face's source chunk, with the offsets to
 the other vertices' chunks in the array's path (see
-[Links](../object_model/links.md)). With
+[Links](../../spec/object_model/links.md)). With
 `encoding="draco"`, intra-chunk faces are inside each chunk's Draco
-bitstream instead (see [Codec pipeline](../foundations/codec_pipeline.md)).
+bitstream instead (see [Codec pipeline](../../spec/foundations/codec_pipeline.md)).
 
 ### Converting between the formats
 
@@ -105,11 +105,11 @@ page):
   Zarr Vectors stores.
 
 `zarr-vectors-py` itself has no precomputed converter; see
-[Precomputed export](../../tutorials/neuroglancer/precomputed_export.md).
+[Precomputed export](../../how_to/view_in_neuroglancer.md).
 
 ### Validation
 
 Precomputed output is not validated by `zarr-vectors-py`. Before
 exporting, `zarr_vectors.validate.validate(store, level=4)` checks the
 geometry rules the exporter relies on, such as a mesh's `link_width`
-of at least 3. See [Validation](../validation/overview.md).
+of at least 3. See [Validation](../../spec/validation/overview.md).

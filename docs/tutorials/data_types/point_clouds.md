@@ -8,7 +8,7 @@ lidar returns.
 
 The steps run in order as one Python session. The
 [quickstart](../../getting_started/quickstart.md) introduces the same calls
-more briefly, and [Concepts](../../getting_started/concepts.md) explains
+more briefly, and [Concepts](../../explanation/concepts.md) explains
 chunks, bins and levels.
 
 ## 1. Create the store
@@ -243,7 +243,7 @@ Level 4 validation: PASS
 The warning refers to the `links/` arrays that `build_pyramid` writes to
 connect each level's points to the level before and after it; the store reads
 correctly.
-[Validation and repair](../io/validation_and_repair.md) lists what each level
+[Validation and repair](../../how_to/validate_and_repair.md) lists what each level
 checks.
 
 To convert LAS, PLY, CSV or XYZ files to and from a store, use the companion

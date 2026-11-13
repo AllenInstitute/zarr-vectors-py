@@ -2,7 +2,7 @@
 
 This page explains the ideas behind Zarr Vectors and `zarr-vectors-py`:
 enough to choose chunk sizes, bin sizes and resolution pyramids before you
-write a large dataset. The [Quickstart](quickstart.md) shows the calls; this
+write a large dataset. The [Quickstart](../getting_started/quickstart.md) shows the calls; this
 page explains what they do to the store. The
 [Specification](../spec/index.md) treats each concept in full.
 
@@ -265,7 +265,7 @@ ids — Zarr Vectors stores an additional `object_index` group whose
 enumerating every chunk the object touches and the fragments within each
 chunk. Reading one object by id is a manifest decode plus the fragment reads
 it names. With the `tracts.zarrvectors` store from the
-[Quickstart](quickstart.md#writing-polylines):
+[Quickstart](../getting_started/quickstart.md#writing-polylines):
 
 ```python
 tracts = zv.open("tracts.zarrvectors")

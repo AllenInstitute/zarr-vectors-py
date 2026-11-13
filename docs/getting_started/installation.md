@@ -20,7 +20,7 @@ extras, described below. Format converters are in a separate package.
 Format converters and the `zvtools` command-line tool are in the companion
 package `zarr-vectors-tools`. Install it separately to read or write LAS,
 PLY, CSV/XYZ, TRK, TCK, TRX, SWC, GraphML, OBJ or STL files; see
-[Ingesting other formats](../tutorials/io/ingest_formats.md).
+[Ingesting other formats](../how_to/convert_files.md).
 
 ### Draco mesh compression
 
@@ -54,7 +54,7 @@ Adds the Icechunk transactional store, selected with
 `StorageOptions(backend="icechunk")`; it is never chosen from a URL. It needs
 Python 3.12 or later.
 
-See [Cloud stores](../tutorials/io/cloud_stores.md) for configuration.
+See [Cloud stores](../how_to/cloud_stores.md) for configuration.
 
 ### GPU arrays
 

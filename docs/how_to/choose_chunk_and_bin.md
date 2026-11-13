@@ -2,7 +2,7 @@
 
 This page shows how to choose the `zv.Layout` for a store, check the choice
 with `zv.Grid` before writing anything, and profile the result afterwards.
-[Core concepts](../getting_started/concepts.md) explains what cells (chunks),
+[Core concepts](../explanation/concepts.md) explains what cells (chunks),
 bins and fragments are.
 
 ## What you need

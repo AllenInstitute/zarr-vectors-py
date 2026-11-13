@@ -23,4 +23,4 @@ Some formats are read only, and several need an extra, such as
 documentation lists each format's direction, extra and options.
 
 To write data you already hold as arrays, use the `zarr_vectors` API
-directly; see the [Quickstart](../../getting_started/quickstart.md).
+directly; see the [Quickstart](../getting_started/quickstart.md).

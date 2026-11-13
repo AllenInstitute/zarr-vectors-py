@@ -5,7 +5,7 @@ each one with the functions in `zarr_vectors.building`. Those functions
 reconcile bookkeeping (counts, lists and manifests) with the data on disk;
 they do not reconstruct damaged data, which is rewritten from source. What
 each validation level checks is listed in the
-[Validation overview](../../spec/validation/overview.md).
+[Validation overview](../spec/validation/overview.md).
 
 ## Create a store
 

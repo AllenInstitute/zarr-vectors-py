@@ -42,10 +42,10 @@ to be enough to write a conforming reader, writer or validator.
 | Specification | Relationship |
 |---------------|-------------|
 | [Zarr v3 core spec](https://zarr-specs.readthedocs.io/en/latest/v3/core/v3.0.html) | Every store is a Zarr v3 hierarchy; array storage, codecs and metadata follow Zarr v3. |
-| [OME-Zarr NGFF](https://ngff.openmicroscopy.org/) | The root attributes carry an NGFF `multiscales` block for the pyramid and an RFC 8 `ome` node. See [OME-Zarr comparison](comparisons/ome_zarr.md). |
+| [OME-Zarr NGFF](https://ngff.openmicroscopy.org/) | The root attributes carry an NGFF `multiscales` block for the pyramid and an RFC 8 `ome` node. See [OME-Zarr comparison](../explanation/comparisons/ome_zarr.md). |
 | [Allen Institute Zarr Vectors specification](https://github.com/AllenInstitute/zarr_vectors) | The specification by Forrest Collman that `zarr-vectors-py` implements and extends. |
-| [Neuroglancer precomputed](https://github.com/google/neuroglancer/tree/master/src/datasource/precomputed) | A format for static Neuroglancer hosting. See [Neuroglancer precomputed comparison](comparisons/neuroglancer_precomputed.md). |
-| [TRX format](https://tractography-file-format.github.io/) | A streamline exchange format. See [TRX comparison](comparisons/trx_format.md). |
+| [Neuroglancer precomputed](https://github.com/google/neuroglancer/tree/master/src/datasource/precomputed) | A format for static Neuroglancer hosting. See [Neuroglancer precomputed comparison](../explanation/comparisons/neuroglancer_precomputed.md). |
+| [TRX format](https://tractography-file-format.github.io/) | A streamline exchange format. See [TRX comparison](../explanation/comparisons/trx_format.md). |
 
 ---
 
@@ -63,6 +63,11 @@ layout/root_metadata
 layout/level_groups
 layout/chunk_arrays
 layout/fragment_index_arrays
+geometry_types/index
+object_model/fragments
+object_model/object_manifest
+object_model/links
+object_model/object_attributes
 chunking/chunk_shape
 chunking/bin_shape
 chunking/chunk_vs_bin
@@ -74,18 +79,10 @@ chunking/octree_chunks
 multiscale/multiscale_metadata
 multiscale/pyramid_construction
 multiscale/sparsity
-geometry_types/index
-object_model/fragments
-object_model/object_manifest
-object_model/links
-object_model/object_attributes
 validation/overview
 validation/l1_structural
 validation/l2_metadata
 validation/l3_consistency
-comparisons/neuroglancer_precomputed
-comparisons/trx_format
-comparisons/ome_zarr
 contributing/spec_change_process
 contributing/adding_geometry_types
 contributing/test_compliance

@@ -405,7 +405,7 @@ print(coarsen_level(
 
 `coarsen_level` writes no links between levels. To recompute every level
 above a changed one, see
-[Validation and repair](../io/validation_and_repair.md).
+[Validation and repair](../../how_to/validate_and_repair.md).
 
 ## Listing and removing levels
 
