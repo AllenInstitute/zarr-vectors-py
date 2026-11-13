@@ -12,10 +12,11 @@ for skeletons (rooted trees of ``[child, parent]`` edges):
   fragment boundaries.  Returns the ``(object_id, chunk, fragment_idx)``
   records that a downstream reduce groups into a dense ``object_index``.
 
-- :func:`write_skeleton_cross_chunk_links` — store parent→child edges that
-  cross a chunk boundary.  They land in the non-zero-offset arrays of the
-  same ``links/0/`` family the branch links above use, which is declared
-  ``directed=True`` because parent→child order is data.
+- :func:`write_skeleton_cross_chunk_links` — store ``[child, parent]``
+  edges that cross a chunk boundary.  They land in the non-zero-offset
+  arrays of the same ``links/0/`` family the branch links above use, which
+  is declared ``directed=True`` because child→parent order is data.  Every
+  record in the family, intra- or cross-chunk, leads with the child.
 
 - :func:`read_skeleton_by_segment_id` — resolve a segment ID to its
   object, follow the manifest, and reconstruct the skeleton (positions +
@@ -49,8 +50,10 @@ from zarr_vectors.core.arrays import (
     create_links_array,
     create_object_index_array,
     create_vertices_array,
+    link_cells_within,
     read_chunk_link_fragment,
     read_fragment,
+    read_link_arrays,
     read_object_attributes,
     read_object_manifest,
     read_vertex_fragment_index,
@@ -402,10 +405,10 @@ def init_skeleton_store(
     ):
         create_vertices_array(level_group, dtype="float32")
         # One links family holds both the intra-chunk branch links and the
-        # boundary-crossing parent→child edges.  ``directed=True`` is family
-        # policy: it stops the cross-chunk arrays canonical-sorting endpoints
-        # (which would swap parent and child).  Intra-chunk records are stored
-        # in input order regardless, so branch links are unaffected.
+        # boundary-crossing edges, all ``[child, parent]``.  ``directed=True``
+        # is family policy: it stops the cross-chunk arrays canonical-sorting
+        # endpoints (which would swap child and parent).  Intra-chunk records
+        # are stored in input order regardless, so branch links are unaffected.
         create_links_array(
             level_group, link_width=2, delta=0, sid_ndim=ndim, directed=True,
         )
@@ -428,19 +431,24 @@ def write_skeleton_cross_chunk_links(
     *,
     ndim: int,
 ) -> None:
-    """Write parent→child edges that cross a chunk boundary.
+    """Write ``[child, parent]`` edges that cross a chunk boundary.
 
     Each link is ``((chunkA, viA), (chunkB, viB))`` with chunk-local
-    vertex indices, endpoint 0 the parent and endpoint 1 the child.
-    These are the connections the coarsener uses to merge an object's
-    fragments once both endpoints fall in the same (coarser) chunk.
+    vertex indices, endpoint 0 the **child** and endpoint 1 its
+    **parent** -- the same order as the intra-chunk branch links
+    :func:`write_skeleton_chunk` writes, the ``write_graph(kind=
+    "skeleton")`` records, and what :func:`read_skeleton_by_segment_id`
+    and ``read_graph`` decode.  These are the connections the coarsener
+    uses to merge an object's fragments once both endpoints fall in the
+    same (coarser) chunk.
 
-    Stored ``directed=True`` so the parent→child order survives — a
+    Stored ``directed=True`` so the child→parent order survives -- a
     canonical sort by chunk coord would otherwise silently swap
-    endpoints whenever the child chunk sorts before the parent chunk.
-    Each link lands in the offsets array naming where the child chunk
-    sits relative to the parent's, within the same ``links/0/`` family
-    :func:`write_skeleton_chunk` writes branch links into.
+    endpoints whenever the parent chunk sorts before the child chunk.
+    Each link lands in the cell of the child's chunk, in the offsets
+    array naming where the parent's chunk sits relative to it, within
+    the same ``links/0/`` family :func:`write_skeleton_chunk` writes
+    branch links into.
     """
     if not links:
         return
@@ -553,7 +561,23 @@ def read_skeleton_by_segment_id(
             if a is not None and b is not None:
                 all_edges.append(np.array([[a, b]], dtype=np.int64))
 
-    positions = np.concatenate(all_pos, axis=0) if all_pos else np.zeros((0, ndim), np.float32)
+    # Cross-chunk records ([child, parent], non-zero offsets) join this
+    # object's fragments across chunk boundaries.  Only cells whose every
+    # endpoint chunk is one the manifest names can hold such a record.
+    cells = link_cells_within(level_group, list(cc_frags))
+    cells = {seg: keys for seg, keys in cells.items() if keys}
+    if cells:
+        x_chunks, x_vi = read_link_arrays(
+            level_group, delta=0, include_intra=False, cells=cells,
+        )
+        if x_vi.shape[0] and x_vi.shape[1] == 2:
+            for rec_cc, rec_vi in zip(x_chunks.tolist(), x_vi.tolist()):
+                a = _to_global(tuple(rec_cc[0]), int(rec_vi[0]))
+                b = _to_global(tuple(rec_cc[1]), int(rec_vi[1]))
+                if a is not None and b is not None:
+                    all_edges.append(np.array([[a, b]], dtype=np.int64))
+
+    positions =np.concatenate(all_pos, axis=0) if all_pos else np.zeros((0, ndim), np.float32)
     offset = get_coordinate_offset(root, ndim)
     if positions.size and np.any(offset != 0):
         positions = positions + offset.astype(positions.dtype)

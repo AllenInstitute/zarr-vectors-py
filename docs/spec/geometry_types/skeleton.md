@@ -53,8 +53,8 @@ provide lossless round-tripping between SWC and Zarr Vectors for standard SWC fi
 
 ### Arrays present
 
-Identical to `graph`, except that the link family is written
-`directed=True`.
+Identical to `graph`, except that a streamed skeleton store's link
+family is written `directed=True` (see below).
 
 | Array path | Required | Description |
 |-----------|----------|-------------|
@@ -90,12 +90,17 @@ Skeleton-ness is carried by `geometry_type` and `links_convention`.
 ### The link family for skeletons
 
 A skeleton store has **one** `links/0/` family, written with
-`link_width=2` and — uniquely among the core geometry types —
-**`directed=True`**.
+`link_width=2`. The streaming writers (`init_skeleton_store`,
+`write_skeleton_chunk`, `write_skeleton_cross_chunk_links`) declare it —
+uniquely among the core geometry types — **`directed=True`**.
+`write_graph(kind="skeleton")` keeps an undirected, canonical family whose
+`perm_idx` restores each record's `[child, parent]` input order on read;
+downstream tools tell the two skeleton layouts apart by this flag. Either
+way a reader sees `[child, parent]`.
 
 `directed=True` is family policy set at creation
 (`create_links_array(..., directed=True)`). It suppresses the canonical
-sort, which matters because parent→child order is *data*: sorting
+sort, which matters because child→parent order is *data*: sorting
 endpoints by `(chunk_coords, vertex_index)` would silently swap parent
 and child whenever the child's chunk sorts before the parent's.
 
@@ -107,12 +112,13 @@ constrained to be lex-non-negative, and [L3](../validation/l3_consistency.md)
 skips that check for them (`enforce_canonical` requires `not directed`).
 `perm_idx` is `0` throughout, since no permutation is applied.
 
-Two writers populate this one family:
+Three writers populate this family:
 
 | Writer | Lands in | Endpoint order |
 |--------|----------|----------------|
 | `write_skeleton_chunk` | all-zero offsets (`0.0.0`) | `[child_local, parent_local]` |
-| `write_skeleton_cross_chunk_links` | non-zero offsets | endpoint 0 = **parent**, endpoint 1 = child |
+| `write_skeleton_cross_chunk_links` | non-zero offsets | `[child, parent]` |
+| `write_graph(kind="skeleton")` | all offsets (undirected, `perm_idx`) | `[child, parent]` after `perm_idx` |
 
 Intra-chunk branch links are written per-cell (`write_chunk_links`),
 not through `write_links`, because they are already chunk-local and
@@ -122,17 +128,13 @@ a cell's records as a single group. Intra-chunk records are stored in
 input order regardless of the `directed` policy, so branch links are
 unaffected by it.
 
-> **Known inconsistency.** The two writers use *opposite* endpoint
-> conventions within the same family: the intra array is
-> `[child, parent]` while the cross-chunk records lead with the parent.
-> Because `directed=True` preserves input order verbatim, nothing on
-> disk distinguishes them — a reader must know which writer produced a
-> record. Treat the endpoint order of a skeleton link as
-> writer-dependent until this is reconciled in the code; do not rely on
-> a single rule across both arrays.
+Every record in a skeleton's link family, intra- or cross-chunk, is
+`[child, parent]`: endpoint 0 is the child, endpoint 1 its parent. Readers
+(`read_graph`, `read_skeleton_by_segment_id`, the pyramid coarsener) apply
+that one rule to every array of the family.
 
-For cross-chunk records the source is the **parent's** chunk, so the
-offsets name where the child's chunk sits relative to the parent's.
+For cross-chunk records the source is the **child's** chunk, so the
+offsets name where the parent's chunk sits relative to the child's.
 
 This is a key distinction from `polyline` links, where direction encodes
 traversal order and the family is undirected. For skeletons, direction
