@@ -30,6 +30,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+import struct
 import threading
 import time
 from typing import Any, NamedTuple
@@ -62,6 +63,9 @@ _VLEN_BYTES = VLenBytes()
 # process that reconfigures zarr's buffer prototype mid-run would need a
 # restart, which nothing in ZV does.
 _BUFFER_PROTOTYPE = default_buffer_prototype()
+
+# numcodecs' VLenBytes header: item count, then the first item's length.
+_VLEN_COUNT_LENGTH = struct.Struct("<II")
 
 
 def _is_icechunk_store(store: Any) -> bool:
@@ -349,10 +353,28 @@ def _decode_direct(spec: _DirectSpec, raw: bytes | None) -> bytes | None:
     """
     if raw is None:
         return b""
-    buffer = spec.spec.prototype.buffer.from_bytes(raw)
-    for codec in reversed(spec.codecs):
-        buffer = codec._decode_sync(buffer, spec.spec)
-    decoded = _VLEN_BYTES.decode(buffer.as_numpy_array())
+    codecs = spec.codecs
+    if all(type(codec).__name__ == "ZstdCodec" for codec in codecs):
+        # The mirror of the writer's ``_encode_direct``: the numcodecs
+        # Zstd instance the zarr codec delegates to, minus the Buffer
+        # wrapping around every call.
+        frame: Any = raw
+        for codec in reversed(codecs):
+            frame = codec._zstd_codec.decode(frame)
+    else:
+        buffer = spec.spec.prototype.buffer.from_bytes(raw)
+        for codec in reversed(codecs):
+            buffer = codec._decode_sync(buffer, spec.spec)
+        frame = buffer.as_numpy_array()
+    # A cell holds one vlen item, so its payload is the frame past the
+    # header; VLenBytes would build an object array to say the same.
+    # Any other frame takes VLenBytes, which judges it exactly as before.
+    view = memoryview(frame)
+    if view.nbytes >= _VLEN_COUNT_LENGTH.size:
+        count, length = _VLEN_COUNT_LENGTH.unpack_from(view)
+        if count == 1 and length == view.nbytes - _VLEN_COUNT_LENGTH.size:
+            return bytes(view[_VLEN_COUNT_LENGTH.size:])
+    decoded = _VLEN_BYTES.decode(frame)
     if decoded.size != 1:
         return None
     value = decoded.flat[0]
@@ -470,7 +492,7 @@ def direct_elements(node: Any, indices: Any) -> np.ndarray | None:
 #: than where parallelism first helps: below it nothing changes, above
 #: it a slow store stops being read one file at a time. ``open`` and
 #: ``read`` release the GIL, so the threads genuinely overlap; decoding
-#: stays on the calling thread.
+#: has its own threshold, :data:`_PARALLEL_DECODE_MIN_BYTES`.
 #:
 #: Above the threshold the files are still read one after another while
 #: the store proves warm, because there the pool is not merely overhead
@@ -483,6 +505,19 @@ def direct_elements(node: Any, indices: Any) -> np.ndarray | None:
 _PARALLEL_READ_MIN = 256
 _READ_PROBE = 32
 _SLOW_READ_S = 200e-6
+
+#: Compressed bytes above which a plan's cells are decoded on the reader
+#: pool.
+#:
+#: Decoding is the other half of a large read, and it scales with bytes,
+#: not cells: a 10^7-point cloud is 126 cells of ~0.8 MB, below the read
+#: threshold, and their serial zstd decode was most of ``read_points``.
+#: zstd releases the GIL, so the pool overlaps the decompression.  Only
+#: compressed cells count: an uncompressed cell's decode is the payload
+#: copy, which holds the GIL, and pooling 114 MB of them made the copy
+#: half again slower.  Below this a plan decodes serially, as before --
+#: a 10^6-point read (~10 MB) gained nothing from the pool.
+_PARALLEL_DECODE_MIN_BYTES = 32 << 20
 _PARALLEL_READ_WORKERS = min(16, (os.cpu_count() or 4) * 2)
 
 _READ_POOL: Any = None
@@ -584,17 +619,49 @@ def _direct_read_plan(
     if not wanted:
         return {}
     raws = _read_files([w[3] for w in wanted])
+    specs = [w[1] for w in wanted]
+    compressed = sum(
+        len(raw) for spec, raw in zip(specs, raws)
+        if raw is not None and spec.codecs
+    )
+    if len(wanted) > 1 and compressed >= _PARALLEL_DECODE_MIN_BYTES:
+        # A few slices per worker rather than a future per cell, so a
+        # plan of many small cells does not pay a hand-off for each.
+        step = -(-len(wanted) // (4 * _PARALLEL_READ_WORKERS))
+        starts = range(0, len(wanted), step)
+        decoded = [
+            data
+            for part in _read_pool().map(
+                _decode_all,
+                [specs[i:i + step] for i in starts],
+                [raws[i:i + step] for i in starts],
+            )
+            for data in part
+        ]
+    else:
+        decoded = _decode_all(specs, raws)
     out: dict[tuple[str, str], bytes] = {}
-    for (array_name, spec, chunk_key, _path), raw in zip(wanted, raws):
-        try:
-            data = _decode_direct(spec, raw)
-        except Exception:
+    for (array_name, _spec, chunk_key, _path), data in zip(wanted, decoded):
+        if isinstance(data, Exception):
             # Tolerant: the cell is left out, and its sync read raises.
             if not tolerant:
-                raise
+                raise data
             continue
         if data is not None:
             out[(array_name, chunk_key)] = data
+    return out
+
+
+def _decode_all(specs: list[_DirectSpec], raws: list[bytes | None]) -> list[Any]:
+    """:func:`_decode_direct` over paired cells, returning rather than
+    raising each cell's error, so a pooled decode reports the first
+    failing cell in plan order and a tolerant one skips just that cell."""
+    out: list[Any] = []
+    for spec, raw in zip(specs, raws):
+        try:
+            out.append(_decode_direct(spec, raw))
+        except Exception as exc:
+            out.append(exc)
     return out
 
 
