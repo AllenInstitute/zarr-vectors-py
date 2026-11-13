@@ -25,7 +25,6 @@ from zarr_vectors.constants import RESOLUTION_PREFIX
 from zarr_vectors.core.store import (
     FsGroup,
     list_resolution_levels,
-    read_level_metadata,
     read_root_metadata,
 )
 
@@ -151,54 +150,26 @@ def write_multiscale_metadata(root: FsGroup) -> list[dict[str, Any]]:
             out["unit"] = unit
         axes.append(out)
 
-    # Build datasets array (one per level)
+    # Build datasets array (one per level).  Every level's vertices are
+    # in level-0 coordinates, so every level gets level 0's transform:
+    # scale 1 (a coarse level is not on a coarser index grid; its
+    # metavertices are centroids of level-0 positions).
+    scale0 = [1.0] * ndim
+    translation0 = [bs / 2.0 for bs in base_bin]
+    transforms0: list[dict[str, Any]] = [{"type": "scale", "scale": scale0}]
+    if any(t != 0 for t in translation0):
+        transforms0.append({"type": "translation", "translation": translation0})
+
     datasets: list[dict[str, Any]] = []
     for lvl in levels:
-        path = f"{RESOLUTION_PREFIX}{lvl}"
-
-        if lvl == 0:
-            # Level 0: scale = 1.0, translation = base_bin/2
-            scale = [1.0] * ndim
-            translation = [bs / 2.0 for bs in base_bin]
-        else:
-            try:
-                lm = read_level_metadata(root, lvl)
-                if lm.bin_ratio is not None:
-                    scale = [float(r) for r in lm.bin_ratio]
-                elif lm.bin_shape is not None:
-                    # Plain float division, not compute_bin_ratio: the
-                    # NGFF scale is a float multiplier with no integer
-                    # requirement, unlike the separately-typed
-                    # ``bin_ratio: tuple[int, ...]`` field.  A fractional
-                    # cumulative coarsen factor must not fail here — and
-                    # because this block is wrapped in ``except
-                    # Exception`` below, an integer-ratio failure would
-                    # not surface as an error at all: it would silently
-                    # degrade the transform to scale=1.0.
-                    scale = [
-                        (float(bs) / float(bb)) if bb else 1.0
-                        for bb, bs in zip(base_bin, lm.bin_shape)
-                    ]
-                else:
-                    scale = [1.0] * ndim
-
-                if lm.bin_shape is not None:
-                    translation = [bs / 2.0 for bs in lm.bin_shape]
-                else:
-                    translation = [bs / 2.0 for bs in base_bin]
-            except Exception:
-                scale = [1.0] * ndim
-                translation = [bs / 2.0 for bs in base_bin]
-
-        transforms: list[dict[str, Any]] = [
-            {"type": "scale", "scale": scale},
-        ]
-        if any(t != 0 for t in translation):
-            transforms.append({"type": "translation", "translation": translation})
-
+        if lvl != 0:
+            # A store written before coarse levels carried their bin
+            # geometry in their own block kept it only in this NGFF entry,
+            # which is about to be rewritten -- move it across first.
+            _migrate_level_bins(root, lvl)
         datasets.append({
-            "path": path,
-            "coordinateTransformations": transforms,
+            "path": f"{RESOLUTION_PREFIX}{lvl}",
+            "coordinateTransformations": [dict(t) for t in transforms0],
         })
 
     multiscales = [{
@@ -218,6 +189,30 @@ def write_multiscale_metadata(root: FsGroup) -> list[dict[str, Any]]:
     root.attrs.update(attrs)
 
     return multiscales
+
+
+def _migrate_level_bins(root: FsGroup, level: int) -> None:
+    """Copy a coarse level's NGFF-encoded bin geometry into its own block.
+
+    No-op when the level already carries ``bin_shape`` / ``bin_ratio``.
+    """
+    from zarr_vectors.core.store import get_resolution_level
+
+    try:
+        lg = get_resolution_level(root, level)
+        attrs = lg.attrs.to_dict()
+        zvl = dict(attrs.get("zarr_vectors_level") or {})
+        if not zvl or zvl.get("bin_shape") or zvl.get("bin_ratio"):
+            return
+        scale, translation = read_level_transform(root, level)
+    except Exception:
+        return
+    if scale is None:
+        return
+    zvl["bin_ratio"] = [float(x) for x in scale]
+    if translation is not None:
+        zvl["bin_shape"] = [2.0 * float(t) for t in translation]
+    lg.attrs.update({"zarr_vectors_level": zvl})
 
 
 def read_multiscale_metadata(root: FsGroup) -> list[dict[str, Any]] | None:

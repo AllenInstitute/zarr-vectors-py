@@ -1498,14 +1498,13 @@ def create_resolution_level(
 ) -> Group:
     """Create a new resolution level group within the store.
 
-    The level's spatial transform (``bin_ratio`` → NGFF ``scale``,
-    ``bin_shape`` → NGFF ``translation = bin_shape / 2``) is written to
-    the NGFF ``multiscales[0].datasets`` block via
-    :func:`zarr_vectors.core.multiscale.upsert_level_transform` so the
-    NGFF block stays the **single source of truth** for spatial
-    geometry.  ``bin_shape`` and ``bin_ratio`` are intentionally
-    omitted from the level's own ``zarr_vectors_level`` attrs; readers
-    derive them from the NGFF block (see :func:`read_level_metadata`).
+    The level's NGFF ``multiscales[0].datasets`` entry is written via
+    :func:`zarr_vectors.core.multiscale.upsert_level_transform`.  Every
+    level stores its vertices in level-0 coordinates, so a coarse level's
+    entry repeats level 0's transform; a coarse level's ``bin_shape`` and
+    ``bin_ratio`` go in its own ``zarr_vectors_level`` attrs, where
+    :func:`read_level_metadata` reads them (falling back to the NGFF
+    block for stores that encoded them there).
     """
     level_metadata.validate()
     if strict:
@@ -1527,11 +1526,13 @@ def create_resolution_level(
     payload = level_metadata.to_dict()
     payload["zarr_vectors_level"].pop("bin_shape", None)
     payload["zarr_vectors_level"].pop("bin_ratio", None)
-    level_group.attrs.update(payload)
 
-    # Mirror the spatial transform into the NGFF block.
-    from zarr_vectors.core.multiscale import upsert_level_transform
+    from zarr_vectors.core.multiscale import (
+        read_level_transform,
+        upsert_level_transform,
+    )
     if level == 0:
+        level_group.attrs.update(payload)
         # Level 0: scale = 1.0 per-axis; translation seeded by base_bin/2 if known.
         try:
             root_meta = read_root_metadata(root)
@@ -1545,51 +1546,48 @@ def create_resolution_level(
         upsert_level_transform(
             root, level, scale=scale, translation=translation,
         )
-    elif level_metadata.bin_ratio is not None or level_metadata.bin_shape is not None:
-        base_bin: tuple[float, ...] | None = None
-        try:
-            root_meta = read_root_metadata(root)
-            ndim = root_meta.sid_ndim
-            base_bin = root_meta.effective_bin_shape
-        except Exception:
-            ndim = (
-                len(level_metadata.bin_ratio) if level_metadata.bin_ratio
-                else (len(level_metadata.bin_shape) if level_metadata.bin_shape else 1)
-            )
-        if level_metadata.bin_shape is not None and base_bin is not None:
-            # Derive the NGFF scale from bin_shape (this level's ÷ the
-            # root's).  ``bin_shape`` is preferred over ``bin_ratio``
-            # because the OTHER half of this same transform — the
-            # translation below — is bin_shape/2, so sourcing the two
-            # halves from different fields lets one transform contradict
-            # itself.  It did: a coarsen_factor of 1.5 on a root bin of 8
-            # gave bin_shape 12, translation 6.0 (right) and, via a
-            # bin_ratio rounded to 2, scale 2.0 (33% wrong) — invisible
-            # through the ZV API and visible in any NGFF viewer.
-            #
-            # It also covers the case a caller sets only bin_shape,
-            # letting the ratio be implied so cumulative-across-levels
-            # bin_shape math is the single source of truth; that used to
-            # fall through to a non-cumulative scale of 1.0.
-            #
-            # Plain float division, not compute_bin_ratio: the NGFF scale
-            # is a float multiplier with no integer requirement, so a
-            # fractional coarsen factor must not raise.
-            scale = [
-                (float(bs) / float(bb)) if bb else 1.0
-                for bb, bs in zip(base_bin, level_metadata.bin_shape)
-            ]
-        elif level_metadata.bin_ratio is not None:
-            # No bin_shape to derive from — the ratio is all there is.
-            scale = [float(r) for r in level_metadata.bin_ratio]
-        else:
-            scale = [1.0] * ndim
-        translation = (
-            [bs / 2.0 for bs in level_metadata.bin_shape]
-            if level_metadata.bin_shape is not None
-            else None
+    else:
+        # A coarse level's vertices are stored in level-0 coordinates
+        # (metavertices are centroids of level-0 positions), so the NGFF
+        # transform that places them is level 0's own.  This block used to
+        # stamp ``scale = bin_ratio`` and ``translation = bin_shape / 2``,
+        # which an NGFF viewer applies to the stored positions: level 1
+        # drawn at twice its size and shifted by a bin, level 2 at four
+        # times.  The bin geometry is ZV's own business and is kept in the
+        # level's ``zarr_vectors_level`` block, where
+        # :func:`read_level_metadata` reads it first.
+        if level_metadata.bin_ratio is not None or level_metadata.bin_shape is not None:
+            base_bin: tuple[float, ...] | None = None
+            try:
+                base_bin = read_root_metadata(root).effective_bin_shape
+            except Exception:
+                pass
+            if level_metadata.bin_shape is not None and base_bin is not None:
+                # The ratio as a float off bin_shape, not a rounded
+                # bin_ratio: a coarsen factor of 1.5 must read back as 1.5.
+                ratio = [
+                    (float(bs) / float(bb)) if bb else 1.0
+                    for bb, bs in zip(base_bin, level_metadata.bin_shape)
+                ]
+            elif level_metadata.bin_ratio is not None:
+                ratio = [float(r) for r in level_metadata.bin_ratio]
+            else:
+                ratio = None
+            zvl = payload["zarr_vectors_level"]
+            if ratio is not None:
+                zvl["bin_ratio"] = ratio
+            if level_metadata.bin_shape is not None:
+                zvl["bin_shape"] = [float(b) for b in level_metadata.bin_shape]
+        level_group.attrs.update(payload)
+        scale0, translation0 = read_level_transform(root, 0)
+        if scale0 is None:
+            try:
+                scale0 = [1.0] * read_root_metadata(root).sid_ndim
+            except Exception:
+                scale0 = [1.0]
+        upsert_level_transform(
+            root, level, scale=scale0, translation=translation0,
         )
-        upsert_level_transform(root, level, scale=scale, translation=translation)
 
     # Keep the RFC 8 node's level list in step with the level groups.
     # Derived from disk rather than appended to, so it cannot drift.
@@ -1601,17 +1599,17 @@ def create_resolution_level(
 #: Level-metadata fields that are DERIVED, and therefore refused by
 #: :func:`update_level_metadata`.
 #:
-#: ``bin_shape`` / ``bin_ratio`` live in the NGFF ``multiscales`` block:
-#: :func:`create_resolution_level` pops them from the level payload and
-#: :func:`read_level_metadata` rebuilds them from the transform, so writing
-#: them here produces keys no reader consults.  ``chunk_shape`` and
+#: ``bin_shape`` / ``bin_ratio`` are fixed when the level is written:
+#: :func:`create_resolution_level` derives them (into the level block for a
+#: coarse level, into the NGFF block for level 0), and the level's
+#: vertices were binned against them.  ``chunk_shape`` and
 #: ``bounds`` are worse than dead -- they feed ``level_grid_layout``, so
 #: changing one after arrays exist would size the NEXT allocated array to a
 #: different grid than the arrays already on disk, which is a layout change
 #: reached through a metadata-only call.
 _DERIVED_LEVEL_FIELDS: dict[str, str] = {
-    "bin_shape": "the NGFF multiscales block; use upsert_level_transform",
-    "bin_ratio": "the NGFF multiscales block; use upsert_level_transform",
+    "bin_shape": "the binning the level was written with; rewrite the level",
+    "bin_ratio": "the binning the level was written with; rewrite the level",
     "chunk_shape": (
         "the level's array grids; changing it after allocation would "
         "mis-size every later array. Rewrite the level instead"
@@ -1804,7 +1802,13 @@ def read_level_metadata(root: Group, level: int) -> LevelMetadata:
     level_group = get_resolution_level(root, level)
     lm = LevelMetadata.from_dict(level_group.attrs.to_dict())
 
-    # NGFF takes precedence over the legacy fields when present.
+    # A coarse level written since the NGFF transform became level 0's
+    # carries its bin geometry in its own block, and that is the answer.
+    # Otherwise the NGFF block holds it: stores written before then
+    # encoded ``bin_ratio`` as the scale and ``bin_shape / 2`` as the
+    # translation.
+    if level != 0 and (lm.bin_shape is not None or lm.bin_ratio is not None):
+        return lm
     from zarr_vectors.core.multiscale import read_level_transform
     scale, translation = read_level_transform(root, level)
     if scale is not None:

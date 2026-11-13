@@ -28,6 +28,10 @@ from zarr_vectors.constants import (
     CAP_SHARED_FRAGMENTS,
     COARSEN_PER_OBJECT,
     DEFAULT_CROSS_LEVEL_DEPTH,
+    GEOM_LINE,
+    GEOM_POLYLINE,
+    GEOM_SKELETON,
+    GEOM_STREAMLINE,
     DEFAULT_CROSS_LEVEL_STORAGE,
     LINKS,
     OBJECT_ATTRIBUTES,
@@ -96,6 +100,8 @@ def coarsen_level(
     cross_level_storage: str = XLEVEL_NONE,
     method: str = COARSEN_PER_OBJECT,
     options: dict[str, Any] | None = None,
+    sparsity_attribute: str | None = None,
+    sparsity_attribute_mode: str = "max",
 ) -> dict[str, Any]:
     """Coarsen a single level and write it to the store.
 
@@ -139,6 +145,12 @@ def coarsen_level(
         sparsity_strategy: Object selection strategy — ``"random"`` (core)
             or a name registered by ``zarr-vectors-tools``.
         sparsity_seed: Random seed.
+        sparsity_attribute: Name of a per-object attribute on the source
+            level whose values are handed to the selection strategy as
+            ``attribute_values`` (the ``"attribute"`` strategy ranks by
+            it).  ``None`` passes none.
+        sparsity_attribute_mode: ``"max"`` or ``"min"``, forwarded as
+            ``attribute_mode``.
         cross_level_storage: When called via ``build_pyramid`` this is
             threaded through to enable inline ``±1`` cross-level link
             emission.  Standalone callers should leave it at the
@@ -172,6 +184,9 @@ def coarsen_level(
         sparsity_seed=sparsity_seed,
         cross_level_storage=cross_level_storage,
     )
+    if sparsity_attribute is not None:
+        kwargs["sparsity_attribute"] = sparsity_attribute
+        kwargs["sparsity_attribute_mode"] = sparsity_attribute_mode
     if method == COARSEN_PER_OBJECT:
         if options:
             raise CoarseningError(
@@ -179,10 +194,32 @@ def coarsen_level(
                 f"{sorted(options)}. Those keywords belong to a registered "
                 f"strategy — pass method= as well."
             )
-        return _per_object_coarsen(**kwargs)
+        summary = _per_object_coarsen(**kwargs)
+        _refresh_arrays_present(store_path, (source_level, target_level))
+        return summary
     # Advanced coarsening methods live in zarr-vectors-tools.
     from zarr_vectors.multiresolution.registry import require_coarsen_strategy
     return require_coarsen_strategy(method)(**kwargs, **(options or {}))
+
+
+def _refresh_arrays_present(
+    store_path: str | Path | Group, levels,
+) -> None:
+    """Re-derive ``arrays_present`` on ``levels`` from what is on disk.
+
+    A coarsen step writes more than the level it creates declares: the
+    coarse level's ``vertex_fragments``, ``object_attributes`` and link
+    families, and a ``links/+1`` family on the source level.  The list was
+    hand-written as ``[vertices, object_index]`` and never revisited, so a
+    reader gating on it could not see arrays that exist.
+    """
+    from zarr_vectors.building import refresh_arrays_present
+
+    root = open_store(store_path, mode="r+")
+    present = set(list_resolution_levels(root))
+    for level in levels:
+        if level in present:
+            refresh_arrays_present(get_resolution_level(root, level))
 
 
 def _per_object_coarsen(
@@ -196,6 +233,8 @@ def _per_object_coarsen(
     sparsity_strategy: str,
     sparsity_seed: int | None,
     cross_level_storage: str = XLEVEL_NONE,
+    sparsity_attribute: str | None = None,
+    sparsity_attribute_mode: str = "max",
 ) -> dict[str, Any]:
     """Per-object pyramid: aggregate within-bin source vertices into
     shared metavertices, preserving each surviving object's OID and
@@ -348,16 +387,43 @@ def _per_object_coarsen(
         }
 
     # --- Step 1: drop a fraction of source objects ----------------------
+    # Selection is nested: it draws from the objects the source level
+    # still holds, not from every id it inherited.  A dropped object stays
+    # addressable at every coarser level as an empty manifest, and drawing
+    # from all rows again redrew dropped ones -- with a fixed seed the
+    # same half every level, so nothing further was dropped; without one,
+    # a level's draw mostly landed on objects already gone.
     keep_oids: list[int]
-    if sparsity_factor > 1.0 and n_src_objects > 1:
+    candidates = [row for row, m in enumerate(src_manifests) if m]
+    # The fraction this step kept, as the level records it: 1.0 unless a
+    # selection actually ran.  A point cloud without objects is one
+    # implicit object and is never thinned, yet was stamped
+    # ``1 / sparsity_factor`` as though it had been.
+    sparsity_applied = sparsity_factor > 1.0 and len(candidates) > 1
+    step_sparsity = (1.0 / sparsity_factor) if sparsity_applied else 1.0
+    if sparsity_applied:
         keep_frac = 1.0 / sparsity_factor
+        # The per-object context the strategy interface defines, aligned
+        # with ``candidates``.  It was never built: every registered
+        # strategy got ``representative_points=None`` and no lengths or
+        # values, so spatial-coverage, length and attribute selection could
+        # not run through this entry point.  ``random`` uses none of it.
+        ctx: dict[str, Any] = {}
+        if sparsity_strategy != "random":
+            ctx = _selection_context(
+                src_group, candidates, src_manifests, src_fragment_positions,
+                ndim=ndim,
+                geometry_types=root_meta.geometry_types,
+                attribute=sparsity_attribute,
+            )
         kept = apply_sparsity(
-            n_src_objects, keep_frac, sparsity_strategy,
+            len(candidates), keep_frac, sparsity_strategy,
             seed=sparsity_seed,
-            representative_points=None,
             bin_shape=base_bin,
+            attribute_mode=sparsity_attribute_mode,
+            **ctx,
         )
-        keep_oids = sorted(int(o) for o in kept)
+        keep_oids = sorted(candidates[int(i)] for i in kept)
     else:
         keep_oids = list(range(n_src_objects))
 
@@ -408,7 +474,7 @@ def _per_object_coarsen(
                 base_bin=base_bin,
                 root_meta=root_meta,
                 coarsen_factor=coarsen_factor,
-                sparsity_factor=sparsity_factor,
+                sparsity_factor=sparsity_factor if sparsity_applied else 1.0,
                 inherited_num_objects=n_src_objects,
                 chunk_shape=chunk_shape,
                 chunk_shape_override=target_chunk_shape_override,
@@ -530,7 +596,7 @@ def _per_object_coarsen(
                 for t, r in zip(target_bin_shape, root_meta.effective_bin_shape)
             ),
             chunk_shape=target_chunk_shape_override,
-            object_sparsity=(1.0 / sparsity_factor),
+            object_sparsity=step_sparsity,
             coarsening_method=COARSEN_PER_OBJECT,
             parent_level=source_level,
             preserves_object_ids=src_has_objects,
@@ -664,6 +730,68 @@ def _per_object_coarsen(
         "preserves_object_ids": True,
         "shared_fragments": True,
     }
+
+
+_PATH_GEOMETRIES = frozenset({
+    GEOM_LINE, GEOM_POLYLINE, GEOM_STREAMLINE, GEOM_SKELETON,
+})
+
+
+def _selection_context(
+    src_group,
+    candidates: list[int],
+    manifests: list,
+    fragment_positions: dict[tuple[ChunkCoords, int], npt.NDArray],
+    *,
+    ndim: int,
+    geometry_types: list[str],
+    attribute: str | None,
+) -> dict[str, Any]:
+    """Per-object context for a registered selection strategy.
+
+    Each array is aligned with ``candidates`` (source manifest rows):
+
+    * ``representative_points`` -- each object's middle vertex in manifest
+      order, the convention ``zarr-vectors-tools`` uses for a polyline's
+      representative point;
+    * ``lengths`` -- path length through the object's vertices for line
+      geometries (lines, polylines, streamlines, skeletons), otherwise its
+      vertex count as a size measure;
+    * ``attribute_values`` -- the named per-object attribute's rows, when
+      one is named.
+    """
+    n = len(candidates)
+    rep = np.zeros((n, ndim), dtype=np.float64)
+    lengths = np.zeros(n, dtype=np.float64)
+    path_like = bool(set(geometry_types or ()) & _PATH_GEOMETRIES)
+    for slot, row in enumerate(candidates):
+        parts = [
+            fragment_positions[key] for key in manifests[row]
+            if key in fragment_positions and len(fragment_positions[key])
+        ]
+        if not parts:
+            continue
+        pts = np.concatenate(parts, axis=0).astype(np.float64, copy=False)
+        rep[slot] = pts[len(pts) // 2]
+        if path_like:
+            lengths[slot] = float(
+                np.sqrt((np.diff(pts, axis=0) ** 2).sum(axis=1)).sum()
+            )
+        else:
+            lengths[slot] = float(len(pts))
+    ctx: dict[str, Any] = {"representative_points": rep, "lengths": lengths}
+    if attribute is not None:
+        try:
+            values = read_object_attributes(src_group, attribute)
+        except ArrayError as exc:
+            raise CoarseningError(
+                f"sparsity_attribute {attribute!r} is not an object "
+                f"attribute of the source level"
+            ) from exc
+        ctx["attribute_values"] = np.asarray(values)[
+            np.asarray(candidates, dtype=np.int64)
+        ]
+    return ctx
 
 
 def _emit_inline_cross_level_links(
@@ -1267,6 +1395,8 @@ def build_pyramid(
     cross_level_storage: str = DEFAULT_CROSS_LEVEL_STORAGE,
     method: str = COARSEN_PER_OBJECT,
     options: dict[str, Any] | None = None,
+    sparsity_attribute: str | None = None,
+    sparsity_attribute_mode: str = "max",
 ) -> dict[str, Any]:
     """Build a multi-resolution pyramid for an existing store.
 
@@ -1297,6 +1427,9 @@ def build_pyramid(
         sparsity_strategy: Object selection strategy — ``"random"`` (core)
             or a name registered by ``zarr-vectors-tools``.
         sparsity_seed: Random seed.
+        sparsity_attribute / sparsity_attribute_mode: Per-object attribute
+            handed to the selection strategy as ``attribute_values`` (see
+            :func:`coarsen_level`).
         method: Coarsening method; ``"per_object"`` (core default) or a
             ``zarr-vectors-tools``-registered method (see
             :func:`coarsen_level`).
@@ -1358,6 +1491,8 @@ def build_pyramid(
             ),
             method=method,
             options=options,
+            sparsity_attribute=sparsity_attribute,
+            sparsity_attribute_mode=sparsity_attribute_mode,
         ))
 
     # Compose deeper-delta cross-level links from the inline-emitted +1
@@ -1368,6 +1503,10 @@ def build_pyramid(
         cross_level_depth=cross_level_depth,
         cross_level_storage=cross_level_storage,
     )
+    # The finalize pass adds the deeper ``+N`` / ``-N`` link families to
+    # levels the per-step refresh has already seen.
+    if cross_level_depth not in (0, 1) and cross_level_storage != XLEVEL_NONE:
+        _refresh_arrays_present(store_path, range(len(factors) + 1))
 
     return {
         "levels_created": len(summaries),

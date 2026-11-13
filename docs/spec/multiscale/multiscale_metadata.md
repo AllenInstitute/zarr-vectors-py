@@ -11,21 +11,25 @@
 
 **Coordinate transform**
 : An affine-like spatial transformation declared per resolution level in
-  the `multiscales` block. Zarr Vectors uses two transforms per level: a `scale`
-  transform (encoding `bin_ratio`) and a `translation` transform (encoding
-  the centroid offset of the coarsened bins).
+  the `multiscales` block. Every level stores its vertices in level-0
+  coordinates (a coarse level's metavertices are centroids of level-0
+  positions), so every level carries level 0's transform: `scale` 1 and
+  level 0's `translation`. A coarse level's `bin_ratio` and `bin_shape`
+  are recorded in its own `zarr_vectors_level` attributes, not in the
+  transform.
 
 **Scale transform**
-: A multiplicative factor per axis applied to convert a coordinate in
-  level-`N` space back to level-0 physical space. For a level with
-  `bin_ratio = [2, 2, 2]`, the scale is `[2.0, 2.0, 2.0]` — a point in
-  level-1 coordinates must be multiplied by 2 to recover its level-0
-  physical position.
+: A multiplicative factor per axis applied to a stored coordinate. Stored
+  coordinates are level-0 coordinates at every level, so the scale is
+  `[1.0, …, 1.0]` at every level. (Stores written before this was fixed
+  carry `scale = bin_ratio` and `translation = bin_shape / 2` on coarse
+  levels; readers take `bin_ratio` / `bin_shape` from that entry when the
+  level's own attributes lack them, and `write_multiscale_metadata`
+  moves them across and rewrites the entry.)
 
 **Translation transform**
-: An additive offset per axis applied after the scale transform. For Zarr Vectors
-  metanodes (binned vertices), the translation encodes the shift from the
-  bin origin to the bin centroid: `translation[d] = bin_shape[d] / 2`.
+: An additive offset per axis applied after the scale transform; the same
+  at every level as at level 0.
 
 **OME-Zarr compatibility**
 : The property that an OME-Zarr-aware tool (Neuroglancer, napari, OME-Zarr
@@ -86,8 +90,8 @@ correctly interpret the resolution pyramid without Zarr Vectors-specific code.
         "bin_shape":       [100.0, 100.0, 100.0],
         "object_sparsity": 0.5,
         "coordinateTransformations": [
-          {"type": "scale",       "scale":       [2.0, 2.0, 2.0]},
-          {"type": "translation", "translation": [50.0, 50.0, 50.0]}
+          {"type": "scale",       "scale":       [1.0, 1.0, 1.0]},
+          {"type": "translation", "translation": [25.0, 25.0, 25.0]}
         ]
       }
     ],
@@ -153,30 +157,12 @@ Applied in order (scale first, then translation):
 physical_position = metanode_position × scale + translation
 ```
 
-**Scale:** encodes the bin ratio. For level `N` with `bin_ratio = [r_0, …, r_{D-1}]`:
+**Scale:** `[1.0, …, 1.0]` at every level. A coarse level's vertices are
+centroids of level-0 positions, already in level-0 coordinates; scaling
+them by the bin ratio would draw level 1 at twice its size.
 
-```json
-{"type": "scale", "scale": [r_0, r_1, ..., r_{D-1}]}
-```
-
-A viewer multiplies metanode coordinates by the scale to recover physical
-coordinates.
-
-**Translation:** encodes the bin centroid offset. For level `N` with
-`bin_shape = [b_0, …, b_{D-1}]`:
-
-```json
-{"type": "translation", "translation": [b_0/2, b_1/2, ..., b_{D-1}/2]}
-```
-
-A metanode at a bin's origin has its reported coordinate at the bin centre
-after applying the translation.
-
-**Combined for level 1, `bin_ratio=[2,2,2]`, `bin_shape=[100,100,100]`:**
-
-A metanode at position `[50.0, 100.0, 75.0]` in level-1 coordinates maps to
-physical position `[50.0×2 + 50.0, 100.0×2 + 50.0, 75.0×2 + 50.0]` =
-`[150.0, 250.0, 200.0]` µm.
+**Translation:** level 0's translation, repeated at every level, so all
+levels land in the same place.
 
 ### OME-Zarr compatibility notes
 
@@ -211,8 +197,8 @@ root = open_store("scan.zarrvectors", mode="r+")
 write_multiscale_metadata(root)
 
 # Inspect individual level transforms
-print(get_level_scale(root, level=1))        # [2.0, 2.0, 2.0]
-print(get_level_translation(root, level=1))  # [50.0, 50.0, 50.0]
+print(get_level_scale(root, level=1))        # [1.0, 1.0, 1.0]
+print(get_level_translation(root, level=1))  # [25.0, 25.0, 25.0] (level 0's)
 ```
 
 ### Validation
@@ -226,5 +212,5 @@ L2 validation checks:
   `bin_shape`, and `coordinateTransformations` are present and consistent.
 - `coordinateTransformations` contains exactly one `scale` and one
   `translation` transform in that order.
-- `scale[d] == bin_ratio[d]` for all `d`.
-- `translation[d] == bin_shape[d] / 2` for all `d` (within tolerance).
+- Every level's transform equals level 0's (stored coordinates are
+  level-0 coordinates at every level).

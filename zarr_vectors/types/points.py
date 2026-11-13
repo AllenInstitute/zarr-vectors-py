@@ -28,6 +28,7 @@ from zarr_vectors.constants import (
     GROUP_ATTRIBUTES,
     GROUPS,
     OBJECT_ATTRIBUTES,
+    OBJECT_INDEX,
     OBJIDX_STANDARD,
     RESOLUTION_PREFIX,
     VERTEX_ATTRIBUTES,
@@ -526,6 +527,10 @@ def read_points(
             prefix,
             f"{prefix}/{VERTICES}",
             f"{prefix}/{VERTEX_FRAGMENTS}",
+            # A box query asks whether the level has an object index (its
+            # fragments are then per object, not per bin); in the same
+            # gather, so the answer costs no extra round-trip.
+            *((f"{prefix}/{OBJECT_INDEX}",) if bbox is not None else ()),
             *(f"{prefix}/{VERTEX_ATTRIBUTES}/{name}"
               for name in (attribute_names or ())),
         ])
@@ -839,6 +844,44 @@ def _read_points(
         not chunk_keys or len(chunk_keys[0]) == len(level_chunk_shape)
     )
     has_bins = any(b > 1 for b in bins_per_chunk) and keys_are_spatial
+    total_bins_per_chunk = 1
+    for _bpc in bins_per_chunk:
+        total_bins_per_chunk *= int(_bpc)
+    if has_bins and bbox is not None:
+        # Bin-level targeting reads fragment ``k`` of a cell as bin ``k``.
+        # That holds only where the level was written one fragment per
+        # root bin, on the root's chunk grid.  Elsewhere the fragment it
+        # names holds other points (or none), and the box silently loses
+        # rows, so those levels take chunk-level targeting -- which is
+        # exact, because the box mask below runs on every row:
+        #
+        # * a coarsened level (``shared_fragments``): one fragment per
+        #   metavertex;
+        # * a level on its own chunk grid (``chunk_scale_factors``) or
+        #   with its own bin: the root's ``bins_per_chunk`` is not this
+        #   level's;
+        # * a level with an object index: points written with object ids
+        #   are one fragment per object per cell.
+        #
+        # A cell written as a single fragment (``building.assign_chunks``)
+        # on an otherwise per-bin level is caught per cell below.
+        _lvl_bin = getattr(level_meta, "bin_shape", None)
+        if (
+            getattr(level_meta, "shared_fragments", False)
+            or any(
+                abs(float(a) - float(b)) > 1e-9
+                for a, b in zip(level_chunk_shape, root_meta.chunk_shape)
+            )
+            or (
+                _lvl_bin is not None
+                and any(
+                    abs(float(a) - float(b)) > 1e-9
+                    for a, b in zip(_lvl_bin, effective_bin)
+                )
+            )
+            or OBJECT_INDEX in level_group
+        ):
+            has_bins = False
 
     # ``None`` for a chunk means every bin in it is wanted -- see the
     # bin-targeting block below.
@@ -940,6 +983,10 @@ def _read_points(
 
             chunk_keys_set = set(chunk_keys)
             all_positions = []
+            # Uncompressed arrays on a byte-range store read just a bin's
+            # bytes through ``read_fragment``; elsewhere the whole cell is
+            # read anyway, so it is sliced once below.
+            ranged = level_group.range_readable(VERTICES)
             for cc, fragment_indices in chunk_fragment_targets.items():
                 if fragment_indices is None:
                     # Whole chunk wanted. One read rather than one per
@@ -953,6 +1000,40 @@ def _read_points(
                         continue
                     if len(rows) > 0:
                         all_positions.append(rows)
+                    continue
+                # A cell whose fragments are not one per bin -- a single
+                # fragment from ``building.assign_chunks``, say -- cannot
+                # be addressed by bin; read it whole and let the mask
+                # below cut it.  The fragment index is prefetched and is
+                # decoded once here: off a byte-range store the wanted
+                # bins are sliced from it directly, rather than through
+                # ``read_fragment``, which decoded it again for every bin.
+                try:
+                    fi = read_vertex_fragment_index(level_group, cc)
+                except (ArrayError, StoreError):
+                    continue
+                if fi.num_fragments != total_bins_per_chunk:
+                    try:
+                        rows = read_chunk_vertex_rows(
+                            level_group, cc, dtype=dtype, ndim=ndim,
+                        )
+                    except ArrayError:
+                        continue
+                    if len(rows) > 0:
+                        all_positions.append(rows)
+                    continue
+                if not ranged:
+                    try:
+                        full = _reshape_vertex_buffer(
+                            level_group.read_bytes(VERTICES, _chunk_key(cc)),
+                            dtype, ndim,
+                        )
+                    except (ArrayError, StoreError):
+                        continue
+                    for fragment_index in fragment_indices:
+                        fragment = fragment_rows(full, fi, fragment_index)
+                        if len(fragment) > 0:
+                            all_positions.append(fragment)
                     continue
                 for fragment_index in fragment_indices:
                     try:
