@@ -196,3 +196,18 @@ def test_root_to_dict_key_presence_matches_writer(tmp_path):
     }
     assert wire["format_capabilities"] == stored["format_capabilities"] == []
     assert "crs" not in stored and "crs" not in wire
+
+
+# --- point clouds carry no links_convention ------------------------------
+
+def test_point_cloud_is_not_stamped_with_links_convention(tmp_path):
+    from zarr_vectors.core.store import open_store, read_root_metadata
+    from zarr_vectors.types.points import write_points
+
+    path = tmp_path / "p.zv"
+    write_points(path, np.random.default_rng(7).random((20, 3)) * 10,
+                 chunk_shape=(5.0, 5.0, 5.0))
+    root = open_store(path)
+    assert "links_convention" not in root.attrs.to_dict()["zarr_vectors"]
+    # Readers still see the documented default.
+    assert read_root_metadata(root).links_convention == "implicit_sequential"

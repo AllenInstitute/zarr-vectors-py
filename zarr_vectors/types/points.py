@@ -27,7 +27,6 @@ from zarr_vectors.constants import (
     GEOM_POINT_CLOUD,
     GROUP_ATTRIBUTES,
     GROUPS,
-    LINKS_IMPLICIT_SEQUENTIAL,
     OBJECT_ATTRIBUTES,
     OBJIDX_STANDARD,
     RESOLUTION_PREFIX,
@@ -286,7 +285,10 @@ def write_points(
         inferred_ndim=ndim,
         geometry_type=GEOM_POINT_CLOUD,
         base_bin_shape=bin_shape,
-        links_convention=LINKS_IMPLICIT_SEQUENTIAL,
+        # A point cloud has no links, and the spec says it carries no
+        # links_convention; stamping one here also pinned it (first
+        # writer wins) for any linked geometry added to the store later.
+        links_convention=None,
         object_index_convention=OBJIDX_STANDARD,
         cross_chunk_strategy=CROSS_CHUNK_EXPLICIT,
     )
