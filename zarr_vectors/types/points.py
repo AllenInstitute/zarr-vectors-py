@@ -58,11 +58,11 @@ from zarr_vectors.core.arrays import (
     stamp_fragments_tile,
     write_chunk_attributes,
     write_chunk_fragment_attributes,
-    write_chunk_vertices,
+    write_chunk_vertex_runs,
     write_groupings,
     write_groupings_attributes,
     write_object_attributes,
-    write_object_index,
+    write_object_index_csr,
 )
 from zarr_vectors.core.arrays import (
     chunk_fragments_tile as _chunk_tiles,
@@ -93,18 +93,12 @@ from zarr_vectors.encoding.categorical import (
     encode_categorical,
 )
 from zarr_vectors.exceptions import ArrayError, StoreError
-from zarr_vectors.spatial.chunking import (
-    assign_bins,
-    assign_chunks,
-    compute_bounds,
-    group_bins_by_chunk,
-)
+from zarr_vectors.spatial.chunking import compute_bounds
 from zarr_vectors.typing import (
     BinShape,
     BoundingBox,
     ChunkCoords,
     ChunkShape,
-    ObjectManifest,
 )
 
 if TYPE_CHECKING:
@@ -202,9 +196,6 @@ def write_points(
     bins_per_chunk = tuple(
         int(round(cs / bs)) for cs, bs in zip(chunk_shape, effective_bin)
     )
-    total_bins_per_chunk = 1
-    for b in bins_per_chunk:
-        total_bins_per_chunk *= b
 
     # Attribute-chunking setup.  When enabled, every chunk key gains a
     # leading attr-bin dim, vertices are split per-vertex, and we need
@@ -289,10 +280,6 @@ def write_points(
     )
     axes = root_meta.spatial_index_dims
 
-    bin_assignments = assign_bins(positions, effective_bin)
-    chunked_bins = group_bins_by_chunk(bin_assignments, bins_per_chunk)
-    n_chunks = len(chunked_bins)
-
     arrays_present = [VERTICES]
     if attributes:
         arrays_present.append(VERTEX_ATTRIBUTES)
@@ -318,8 +305,6 @@ def write_points(
         chunk_attribute_values=attr_bin_values,
     )
     level_group = create_resolution_level(root, 0, level_meta)
-
-    object_manifests: dict[int, ObjectManifest] = {}
 
     # Dictionary-encode any string-typed attributes.  Non-numeric
     # dtypes (Unicode/bytes/object) are stored on disk as integer
@@ -410,114 +395,33 @@ def write_points(
         if needs_objects:
             create_object_index_array(level_group)
 
-        if object_ids is not None:
-            # With objects: use per-object fragments per chunk (not per-bin)
-            # This preserves correct object_index semantics for read_object_vertices.
-            # When ``attr_bins`` is set the chunk key gains a leading attr-bin
-            # dim and a single object's vertices may land in multiple keys.
-            spatial_assignments = assign_chunks(positions, chunk_shape)
-
-            # Build {combined_chunk_coords: global_indices}.  Combined coords
-            # are spatial-only when ``attr_bins is None``, else
-            # ``(attr_bin, *spatial)`` after splitting each spatial chunk by
-            # the per-vertex attr-bin.
-            combined_assignments: dict[ChunkCoords, npt.NDArray[np.int64]] = {}
-            for spatial_cc, global_indices in spatial_assignments.items():
-                global_indices = np.asarray(global_indices, dtype=np.int64)
-                if attr_bins is None:
-                    combined_assignments[spatial_cc] = global_indices
-                    continue
-                chunk_attr_bins = attr_bins[global_indices]
-                for ab in np.unique(chunk_attr_bins):
-                    mask = chunk_attr_bins == ab
-                    combined_assignments[(int(ab), *spatial_cc)] = global_indices[mask]
-
-            for chunk_coords, global_indices in sorted(combined_assignments.items()):
-                # One fragment per object, ordered by object id. Built by
-                # sorting the chunk's vertices by owner and splitting at
-                # the boundaries -- NOT by masking the chunk once per
-                # object, which reads every vertex once per object and so
-                # costs objects x vertices for the chunk. On 500k objects
-                # sharing a cell that was 633s; this is the same linear
-                # argsort-and-split ``write_mesh`` already uses.
-                #
-                # The sort is stable, so vertices keep their input order
-                # within an object, which is the order the mask produced.
-                chunk_obj_ids = object_ids[global_indices]
-                vert_groups: list[npt.NDArray] = []
-                attr_groups_per_name: dict[str, list[npt.NDArray]] = {}
-                if attributes:
-                    for attr_name in attributes:
-                        attr_groups_per_name[attr_name] = []
-
-                if len(global_indices):
-                    order = np.argsort(chunk_obj_ids, kind="stable")
-                    ordered_global = global_indices[order]
-                    unique_objs, first_at = np.unique(
-                        chunk_obj_ids[order], return_index=True,
-                    )
-                    split_at = first_at[1:]
-                    vert_groups = list(
-                        np.split(positions[ordered_global], split_at)
-                    )
-                    for fragment_idx, obj_id in enumerate(unique_objs):
-                        object_manifests.setdefault(int(obj_id), []).append(
-                            (chunk_coords, fragment_idx),
-                        )
-                    for attr_name, attr_data in (attributes or {}).items():
-                        attr_groups_per_name[attr_name] = list(
-                            np.split(attr_data[ordered_global], split_at)
-                        )
-
-                write_chunk_vertices(level_group, chunk_coords, vert_groups, dtype=np_dtype)
-                if attributes:
-                    for attr_name, groups_list in attr_groups_per_name.items():
-                        write_chunk_attributes(level_group, attr_name, chunk_coords, groups_list,
-                                               dtype=attributes[attr_name].dtype)
-                if fragment_attributes:
-                    _write_fragment_attrs_for_chunk(
-                        level_group, fragment_attributes, fragment_attr_dtypes,
-                        chunk_coords, num_fragments=len(vert_groups),
-                    )
-        else:
-            # Undifferentiated: use per-bin fragments
-            for chunk_coords, fragment_dict in sorted(chunked_bins.items()):
-                vert_groups_bin: list[npt.NDArray] = [
-                    np.zeros((0, ndim), dtype=np_dtype) for _ in range(total_bins_per_chunk)
-                ]
-                attr_groups_per_name_bin: dict[str, list[npt.NDArray]] = {}
-                if attributes:
-                    for attr_name, attr_data in attributes.items():
-                        shape_tail = attr_data.shape[1:] if attr_data.ndim > 1 else ()
-                        attr_groups_per_name_bin[attr_name] = [
-                            np.zeros((0,) + shape_tail, dtype=attr_data.dtype)
-                            for _ in range(total_bins_per_chunk)
-                        ]
-
-                for fragment_idx, global_indices in fragment_dict.items():
-                    vert_groups_bin[fragment_idx] = positions[global_indices]
-                    if attributes:
-                        for attr_name, attr_data in attributes.items():
-                            attr_groups_per_name_bin[attr_name][
-                                fragment_idx
-                            ] = attr_data[global_indices]
-
-                write_chunk_vertices(level_group, chunk_coords, vert_groups_bin, dtype=np_dtype)
-                if attributes:
-                    for attr_name, groups_list in attr_groups_per_name_bin.items():
-                        write_chunk_attributes(level_group, attr_name, chunk_coords, groups_list,
-                                               dtype=attributes[attr_name].dtype)
-                if fragment_attributes:
-                    _write_fragment_attrs_for_chunk(
-                        level_group, fragment_attributes, fragment_attr_dtypes,
-                        chunk_coords, num_fragments=len(vert_groups_bin),
-                    )
-
-        if needs_objects and object_manifests:
+        # The chunk count reported is the number of chunks the bin grid
+        # groups the vertices into, on either layout.
+        n_chunks = 0
+        n_objects = 0
+        if n_vertices and object_ids is not None:
+            # With objects: one fragment per object per chunk (not per
+            # bin), so the object index can name each object's pieces.
+            # With ``attr_bins`` the chunk key gains a leading attr-bin
+            # dim and an object's vertices may land in several keys.
+            row_ids, offsets, coords, frags = _write_object_point_chunks(
+                level_group, positions, attributes, object_ids, chunk_shape,
+                np_dtype, attr_bins, fragment_attributes, fragment_attr_dtypes,
+            )
             idx_ndim = ndim + 1 if attr_bins is not None else ndim
-            write_object_index(level_group, object_manifests, sid_ndim=idx_ndim)
+            write_object_index_csr(
+                level_group, row_ids, offsets, coords, frags, idx_ndim,
+            )
+            n_objects = len(row_ids)
+            bin_chunks, _ = _bin_cells(positions, effective_bin, bins_per_chunk)
+            n_chunks = len(_rank_cells(bin_chunks)[1])
+        elif n_vertices:
+            # Undifferentiated: one fragment per bin, empty bins included.
+            n_chunks = _write_binned_point_chunks(
+                level_group, positions, attributes, effective_bin,
+                bins_per_chunk, np_dtype, fragment_attributes, fragment_attr_dtypes,
+            )
 
-    n_objects = len(object_manifests) if object_manifests else 0
     if object_attributes:
         for name, data in object_attributes.items():
             create_object_attributes_array(level_group, name)
@@ -1250,3 +1154,229 @@ def _write_fragment_attrs_for_chunk(
             level_group, fname, chunk_coords, arr,
             dtype=fragment_attr_dtypes[fname],
         )
+
+
+def _floor_cells(
+    positions: npt.NDArray[np.floating], cell: tuple[float, ...],
+) -> list[npt.NDArray[np.int64]]:
+    """``floor(positions / cell)`` as one int64 column per axis.
+
+    The arithmetic of :func:`~zarr_vectors.spatial.chunking.assign_chunks`, a column at a time, so a
+    vertex lands in the same cell either way.
+    """
+    cs = np.asarray(cell, dtype=np.float64)
+    out = []
+    for d in range(positions.shape[1]):
+        q = positions[:, d] / cs[d:d + 1]
+        np.floor(q, out=q)
+        out.append(q.astype(np.int64))
+    return out
+
+
+def _bin_cells(
+    positions: npt.NDArray[np.floating],
+    bin_shape: tuple[float, ...],
+    bins_per_chunk: tuple[int, ...],
+) -> tuple[list[npt.NDArray[np.int64]], npt.NDArray[np.int64]]:
+    """Each vertex's chunk (one column per axis) and the row-major index
+    of its bin inside that chunk: what
+    :func:`~zarr_vectors.spatial.chunking.group_bins_by_chunk` derives from
+    :func:`~zarr_vectors.spatial.chunking.assign_bins`, without grouping."""
+    bins = _floor_cells(positions, bin_shape)
+    chunk_cols = []
+    local = np.zeros(len(positions), dtype=np.int64)
+    for b, w in zip(bins, bins_per_chunk):
+        c = np.floor_divide(b, w)
+        local *= w
+        local += b - c * w
+        chunk_cols.append(c)
+    return chunk_cols, local
+
+
+def _rank_cells(
+    cols: list[npt.NDArray[np.int64]],
+) -> tuple[npt.NDArray[np.int64], npt.NDArray[np.int64]]:
+    """``(ranks, cells)``: the distinct rows of ``cols`` (one int64 column
+    per axis) in lexicographic order, and each row's rank among them."""
+    n = cols[0].size
+    lo = np.array([c.min() for c in cols], dtype=np.int64)
+    span = np.array([c.max() for c in cols], dtype=np.int64) - lo + 1
+    if float(np.prod(span.astype(np.float64))) >= 2.0 ** 62:
+        cells, ranks = np.unique(
+            np.stack(cols, axis=1), axis=0, return_inverse=True,
+        )
+        return ranks.reshape(-1).astype(np.int64, copy=False), cells
+    key = cols[0] - lo[0]
+    for c, low, width in zip(cols[1:], lo[1:], span[1:]):
+        key *= width
+        key += c
+        key -= low
+    size = int(np.prod(span))
+    if size <= 2 * n + 65536:
+        # A grid this small is ranked through a lookup table, not a sort.
+        present = np.zeros(size, dtype=bool)
+        present[key] = True
+        linear = np.flatnonzero(present)
+        ranks = (np.cumsum(present, dtype=np.int64) - 1)[key]
+    else:
+        linear, ranks = np.unique(key, return_inverse=True)
+    cells = np.empty((linear.size, len(cols)), dtype=np.int64)
+    for d in range(len(cols) - 1, -1, -1):
+        linear, cells[:, d] = np.divmod(linear, span[d])
+        cells[:, d] += lo[d]
+    return ranks, cells
+
+
+def _stable_order(key: npt.NDArray[np.int64], n_keys: int) -> npt.NDArray[np.intp]:
+    """``np.argsort(key, kind="stable")`` for keys in ``[0, n_keys)``.
+
+    Narrowed to 8 or 16 bits when they fit, where numpy radix-sorts:
+    at 10^7 keys that is a quarter of the int64 sort's time.
+    """
+    if n_keys <= 1 << 8:
+        key = key.astype(np.uint8)
+    elif n_keys <= 1 << 16:
+        key = key.astype(np.uint16)
+    return np.argsort(key, kind="stable")
+
+
+def _write_point_chunks(
+    level_group: FsGroup,
+    cells: npt.NDArray[np.int64],
+    row_ends: npt.NDArray[np.int64],
+    frag_counts: Any,
+    positions: npt.NDArray[np.floating],
+    attributes: dict[str, npt.NDArray],
+    np_dtype: np.dtype,
+    fragment_attributes: dict[str, dict[ChunkCoords, npt.NDArray]] | None,
+    fragment_attr_dtypes: dict[str, np.dtype],
+) -> None:
+    """Write vertices already sorted by chunk, then by fragment.
+
+    Chunk ``cells[i]`` holds rows ``row_ends[i-1]:row_ends[i]`` of
+    ``positions`` (and of each attribute), as fragments of
+    ``frag_counts[i]`` rows each.
+    """
+    start = 0
+    for cc, end, counts in zip(map(tuple, cells.tolist()), row_ends.tolist(), frag_counts):
+        write_chunk_vertex_runs(
+            level_group, cc, positions[start:end], counts, dtype=np_dtype,
+        )
+        for attr_name, attr_data in attributes.items():
+            write_chunk_attributes(
+                level_group, attr_name, cc, [attr_data[start:end]],
+                dtype=attr_data.dtype,
+            )
+        if fragment_attributes:
+            _write_fragment_attrs_for_chunk(
+                level_group, fragment_attributes, fragment_attr_dtypes,
+                cc, num_fragments=len(counts),
+            )
+        start = end
+
+
+def _write_binned_point_chunks(
+    level_group: FsGroup,
+    positions: npt.NDArray[np.floating],
+    attributes: dict[str, npt.NDArray] | None,
+    bin_shape: tuple[float, ...],
+    bins_per_chunk: tuple[int, ...],
+    np_dtype: np.dtype,
+    fragment_attributes: dict[str, dict[ChunkCoords, npt.NDArray]] | None,
+    fragment_attr_dtypes: dict[str, np.dtype],
+) -> int:
+    """Write every chunk as one fragment per bin, empty bins included.
+
+    One stable sort by (chunk, bin) orders the vertices; each chunk is
+    then a contiguous run of them, and each bin a run inside it, so
+    vertices keep their input order within a bin.  Returns the number
+    of chunks written.
+    """
+    chunk_cols, local = _bin_cells(positions, bin_shape, bins_per_chunk)
+    ranks, cells = _rank_cells(chunk_cols)
+    per_chunk = int(np.prod(bins_per_chunk))
+    n_keys = len(cells) * per_chunk
+    key = ranks * per_chunk
+    key += local
+    order = _stable_order(key, n_keys)
+    counts = np.bincount(key, minlength=n_keys).reshape(len(cells), per_chunk)
+    _write_point_chunks(
+        level_group, cells, np.cumsum(counts.sum(axis=1)), counts,
+        np.take(positions, order, axis=0),
+        {k: np.take(v, order, axis=0) for k, v in (attributes or {}).items()},
+        np_dtype, fragment_attributes, fragment_attr_dtypes,
+    )
+    return len(cells)
+
+
+def _write_object_point_chunks(
+    level_group: FsGroup,
+    positions: npt.NDArray[np.floating],
+    attributes: dict[str, npt.NDArray] | None,
+    object_ids: npt.ArrayLike,
+    chunk_shape: tuple[float, ...],
+    np_dtype: np.dtype,
+    attr_bins: npt.NDArray[np.int64] | None,
+    fragment_attributes: dict[str, dict[ChunkCoords, npt.NDArray]] | None,
+    fragment_attr_dtypes: dict[str, np.dtype],
+) -> tuple[
+    npt.NDArray[np.int64], npt.NDArray[np.int64],
+    npt.NDArray[np.int64], npt.NDArray[np.int64],
+]:
+    """Write every chunk as one fragment per object, ordered by id.
+
+    One stable sort by (chunk, object id) orders the vertices, so each
+    fragment is a contiguous run that keeps its vertices' input order;
+    chunk keys lead with the attr bin when ``attr_bins`` is given.
+    Returns the object index as CSR arrays ``(row_ids, offsets, coords,
+    frags)``: each object's fragments in chunk order, objects by id.
+    """
+    cols = _floor_cells(positions, chunk_shape)
+    if attr_bins is not None:
+        cols = [np.asarray(attr_bins, dtype=np.int64), *cols]
+    ranks, cells = _rank_cells(cols)
+    n_cells = len(cells)
+    oid = np.asarray(object_ids)
+    integer = oid.dtype.kind in "iu"
+    if oid.size < 2 or bool(np.all(oid[1:] >= oid[:-1])):
+        order = _stable_order(ranks, n_cells)
+    elif integer and float(n_cells) * (float(oid.max()) - float(oid.min()) + 1) < 2.0 ** 62:
+        low = oid.min()
+        key = ranks * (int(oid.max()) - int(low) + 1)
+        key += (oid - low).astype(np.int64)
+        order = np.argsort(key, kind="stable")
+    else:
+        by_id = np.argsort(oid, kind="stable")
+        order = by_id[_stable_order(ranks[by_id], n_cells)]
+
+    n = order.size
+    sorted_ranks = ranks[order]
+    sorted_ids = oid[order]
+    new_frag = np.empty(n, dtype=bool)
+    new_frag[0] = True
+    np.not_equal(sorted_ranks[1:], sorted_ranks[:-1], out=new_frag[1:])
+    new_frag[1:] |= sorted_ids[1:] != sorted_ids[:-1]
+    frag_start = np.flatnonzero(new_frag)
+    frag_cell = sorted_ranks[frag_start]
+    cell_first = np.searchsorted(frag_cell, np.arange(n_cells))
+    frag_idx = np.arange(frag_start.size) - cell_first[frag_cell]
+
+    _write_point_chunks(
+        level_group, cells, np.cumsum(np.bincount(ranks, minlength=n_cells)),
+        np.split(np.diff(frag_start, append=n), cell_first[1:]),
+        np.take(positions, order, axis=0),
+        {k: np.take(v, order, axis=0) for k, v in (attributes or {}).items()},
+        np_dtype, fragment_attributes, fragment_attr_dtypes,
+    )
+
+    # Manifests: an object's fragments in chunk order, objects by id.  The
+    # index is keyed by integer id, as ``int(obj_id)`` keyed it.
+    frag_obj = sorted_ids[frag_start]
+    if not integer:
+        frag_obj = frag_obj.astype(np.int64)
+    by_obj = np.argsort(frag_obj, kind="stable")
+    frag_obj = frag_obj[by_obj]
+    first = np.flatnonzero(np.concatenate(([True], frag_obj[1:] != frag_obj[:-1])))
+    row_ids = frag_obj[first].astype(np.int64)
+    offsets = np.append(first, frag_obj.size).astype(np.int64)
+    return row_ids, offsets, cells[frag_cell[by_obj]], frag_idx[by_obj]

@@ -66,6 +66,7 @@ from zarr_vectors.encoding.fragments import (
     decode_object_manifests_many,
     encode_fragments,
     encode_object_manifest_blocks,
+    encode_object_manifests_csr,
     encode_object_manifests_many,
     fragment_sections_from_index,
     pack_fragment_sections,
@@ -2467,19 +2468,10 @@ def write_object_index(
         from zarr_vectors.core import dense_manifests as dense
 
         offsets, coords, frags = dense.csr_from_manifests(manifest_list, sid_ndim)
-        _write_dense_index(
-            level_group, offsets, coords, frags,
-            mode="replace", at=None, ids=None, sid_ndim=sid_ndim, block_dtype=block_dtype,
+        write_object_index_csr(
+            level_group, row_ids, offsets, coords, frags, sid_ndim,
+            layout="dense", block_dtype=block_dtype,
         )
-        _write_object_id_table(level_group, row_ids)
-        level_group.write_array_meta(OBJECT_INDEX, {
-            "zv_array": "object_index",
-            "num_objects": len(row_ids),
-            "num_present": int(np.count_nonzero(np.diff(offsets))),
-            "sid_ndim": sid_ndim,
-            "layout": dense.OBJECT_INDEX_LAYOUT_DENSE,
-            OBJECT_IDS_SORTED_ATTR: True,
-        })
         return
 
     # v0.6 manifest-block encoding.  Each old (chunk, fragment_index) tuple
@@ -2521,43 +2513,60 @@ def write_object_index_arrays(
     frags: npt.NDArray[np.integer],
     sid_ndim: int,
 ) -> None:
-    """:func:`write_object_index` for objects ``0..len(offsets)-2`` whose
-    manifests are held as CSR arrays.
-
-    Object ``o`` owns rows ``offsets[o]:offsets[o+1]`` of ``coords``
-    (``(B, sid_ndim)``) and ``frags`` (``(B,)``), each one
-    ``(chunk_coords, fragment_index)`` pair.  The index written is the
-    one ``write_object_index`` writes for the same manifests, in the
-    layout it would choose, without a Python tuple per pair.
-    """
-    from zarr_vectors.encoding.fragments import encode_object_manifests_csr
-
+    """:func:`write_object_index_csr` for objects ``0..len(offsets)-2``,
+    each row its own id."""
     offsets = np.asarray(offsets, dtype=np.int64)
-    coords = np.asarray(coords, dtype=np.int64).reshape(-1, sid_ndim)
-    frags = np.asarray(frags, dtype=np.int64)
-    n = len(offsets) - 1
-    if _index_layout_for_write(level_group, None) == "dense":
-        from zarr_vectors.core import dense_manifests as dense
+    write_object_index_csr(
+        level_group, np.arange(len(offsets) - 1, dtype=np.int64), offsets,
+        np.asarray(coords, dtype=np.int64).reshape(-1, sid_ndim),
+        np.asarray(frags, dtype=np.int64), sid_ndim,
+    )
 
+
+def write_object_index_csr(
+    level_group: Group,
+    row_ids: Any,
+    offsets: npt.NDArray[np.int64],
+    coords: npt.NDArray[np.int64],
+    frags: npt.NDArray[np.int64],
+    sid_ndim: int,
+    *,
+    layout: str | None = None,
+    block_dtype: Any = None,
+) -> None:
+    """:func:`write_object_index` for manifests already held as CSR arrays.
+
+    Row ``r`` is object ``row_ids[r]`` (sorted ascending) and owns the
+    single-fragment blocks ``offsets[r]:offsets[r+1]`` of ``coords``
+    (``(B, sid_ndim)``) and ``frags`` (``(B,)``).  Writes what
+    :func:`write_object_index` writes for the matching manifest dict,
+    without a Python step per object.
+    """
+    from zarr_vectors.core import dense_manifests as dense
+    from zarr_vectors.core.dense_manifests import check_block_dtype
+
+    check_block_dtype(block_dtype)
+    num_present = int(np.count_nonzero(np.diff(offsets)))
+    if _index_layout_for_write(level_group, layout) == "dense":
         _write_dense_index(
             level_group, offsets, coords, frags,
-            mode="replace", at=None, ids=None, sid_ndim=sid_ndim, block_dtype=None,
+            mode="replace", at=None, ids=None, sid_ndim=sid_ndim, block_dtype=block_dtype,
         )
-        layout = dense.OBJECT_INDEX_LAYOUT_DENSE
+        layout_stamp = dense.OBJECT_INDEX_LAYOUT_DENSE
     else:
         _write_object_index_manifests(
             level_group,
             encode_object_manifests_csr(coords, frags, offsets, sid_ndim=sid_ndim),
             layout="vlen",
         )
-        layout = OBJECT_INDEX_LAYOUT_V2
-    _write_object_id_table(level_group, range(n))
+        layout_stamp = OBJECT_INDEX_LAYOUT_V2
+    _write_object_id_table(level_group, row_ids)
     level_group.write_array_meta(OBJECT_INDEX, {
         "zv_array": "object_index",
-        "num_objects": n,
-        "num_present": int(np.count_nonzero(np.diff(offsets))),
+        "num_objects": len(row_ids),
+        "num_present": num_present,
         "sid_ndim": sid_ndim,
-        "layout": layout,
+        "layout": layout_stamp,
         OBJECT_IDS_SORTED_ATTR: True,
     })
 
@@ -2721,6 +2730,7 @@ def _write_object_id_table(
     ids = (
         np.arange(row_ids.start, row_ids.stop, row_ids.step, dtype=np.int64)
         if isinstance(row_ids, range)
+        else np.asarray(row_ids, dtype=np.int64) if isinstance(row_ids, np.ndarray)
         else np.fromiter(row_ids, dtype=np.int64)
     )
     level_group.write_array(
