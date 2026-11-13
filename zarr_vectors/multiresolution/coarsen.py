@@ -356,7 +356,13 @@ def _per_object_coarsen(
     # a level's draw mostly landed on objects already gone.
     keep_oids: list[int]
     candidates = [row for row, m in enumerate(src_manifests) if m]
-    if sparsity_factor > 1.0 and len(candidates) > 1:
+    # The fraction this step kept, as the level records it: 1.0 unless a
+    # selection actually ran.  A point cloud without objects is one
+    # implicit object and is never thinned, yet was stamped
+    # ``1 / sparsity_factor`` as though it had been.
+    sparsity_applied = sparsity_factor > 1.0 and len(candidates) > 1
+    step_sparsity = (1.0 / sparsity_factor) if sparsity_applied else 1.0
+    if sparsity_applied:
         keep_frac = 1.0 / sparsity_factor
         kept = apply_sparsity(
             len(candidates), keep_frac, sparsity_strategy,
@@ -415,7 +421,7 @@ def _per_object_coarsen(
                 base_bin=base_bin,
                 root_meta=root_meta,
                 coarsen_factor=coarsen_factor,
-                sparsity_factor=sparsity_factor,
+                sparsity_factor=sparsity_factor if sparsity_applied else 1.0,
                 inherited_num_objects=n_src_objects,
                 chunk_shape=chunk_shape,
                 chunk_shape_override=target_chunk_shape_override,
@@ -537,7 +543,7 @@ def _per_object_coarsen(
                 for t, r in zip(target_bin_shape, root_meta.effective_bin_shape)
             ),
             chunk_shape=target_chunk_shape_override,
-            object_sparsity=(1.0 / sparsity_factor),
+            object_sparsity=step_sparsity,
             coarsening_method=COARSEN_PER_OBJECT,
             parent_level=source_level,
             preserves_object_ids=src_has_objects,

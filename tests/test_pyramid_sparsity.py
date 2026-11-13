@@ -51,3 +51,27 @@ def test_each_level_selects_from_the_previous_survivors(tmp_path, seed):
         assert now <= previous, level
         assert summary["level_specs"][level - 1]["objects_kept"] == expected
         previous = now
+
+
+def test_point_cloud_without_objects_records_nothing_dropped(tmp_path):
+    from zarr_vectors.types.points import read_points, write_points
+
+    store = str(tmp_path / "p.zarr")
+    pos = np.random.default_rng(1).uniform(0, 100, (500, 3)).astype(np.float32)
+    write_points(
+        store, pos, chunk_shape=(25.0,) * 3, bounds=([0.0] * 3, [100.0] * 3),
+    )
+    build_pyramid(store, factors=[(2, 4)])
+    # One implicit object: nothing to select from, so nothing is dropped.
+    assert len(read_points(store, level=1)["positions"]) > 0
+    assert read_level_metadata(open_store(store), 1).object_sparsity == 1.0
+
+
+def test_object_sparsity_records_a_selection_that_ran(tmp_path):
+    store = str(tmp_path / "l.zarr")
+    write_polylines(
+        store, _lines(), chunk_shape=(25.0,) * 3, bin_shape=(5.0,) * 3,
+        bounds=([0.0] * 3, [100.0] * 3),
+    )
+    build_pyramid(store, factors=[(1, 4)], sparsity_seed=0)
+    assert read_level_metadata(open_store(store), 1).object_sparsity == 0.25
