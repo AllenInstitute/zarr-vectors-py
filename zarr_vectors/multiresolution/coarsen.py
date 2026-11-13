@@ -348,16 +348,23 @@ def _per_object_coarsen(
         }
 
     # --- Step 1: drop a fraction of source objects ----------------------
+    # Selection is nested: it draws from the objects the source level
+    # still holds, not from every id it inherited.  A dropped object stays
+    # addressable at every coarser level as an empty manifest, and drawing
+    # from all rows again redrew dropped ones -- with a fixed seed the
+    # same half every level, so nothing further was dropped; without one,
+    # a level's draw mostly landed on objects already gone.
     keep_oids: list[int]
-    if sparsity_factor > 1.0 and n_src_objects > 1:
+    candidates = [row for row, m in enumerate(src_manifests) if m]
+    if sparsity_factor > 1.0 and len(candidates) > 1:
         keep_frac = 1.0 / sparsity_factor
         kept = apply_sparsity(
-            n_src_objects, keep_frac, sparsity_strategy,
+            len(candidates), keep_frac, sparsity_strategy,
             seed=sparsity_seed,
             representative_points=None,
             bin_shape=base_bin,
         )
-        keep_oids = sorted(int(o) for o in kept)
+        keep_oids = sorted(candidates[int(i)] for i in kept)
     else:
         keep_oids = list(range(n_src_objects))
 
