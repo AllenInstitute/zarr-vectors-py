@@ -6,7 +6,7 @@ import numpy as np
 import pytest
 
 import zarr_vectors as zv
-from zarr_vectors.exceptions import MetadataError, StoreError
+from zarr_vectors.exceptions import ArrayError, MetadataError, StoreError
 
 BOUNDS = ((0.0, 0.0, 0.0), (100.0, 100.0, 100.0))
 
@@ -154,3 +154,85 @@ def test_a_second_add_polylines_is_refused(tmp_path):
     with pytest.raises(StoreError, match="cannot append"):
         ds.add_polylines(lines)
     assert ds.read().part_count == 3
+
+
+# ---------------- clear errors for malformed input ----------------
+
+
+def _new(tmp_path, kind="point_cloud", name="s.zv"):
+    return zv.create(tmp_path / name, schema=zv.Schema(bounds=BOUNDS, kind=kind))
+
+
+def test_select_objects_on_a_store_without_ids_says_so(tmp_path):
+    from zarr_vectors.api.select import SelectionError
+
+    ds = _new(tmp_path)
+    ds.add_points(_pts())
+    with pytest.raises(SelectionError, match="holds no object ids"):
+        ds.select(objects=[1]).read()
+    with pytest.raises(SelectionError, match="holds no groups"):
+        ds.select(groups=[1]).read()
+
+
+def test_select_objects_still_works_with_ids(tmp_path):
+    ds = _new(tmp_path)
+    ds.add_points(_pts(), object_ids=np.arange(1000) % 5)
+    assert ds.select(objects=[1]).read().vertex_count == 200
+
+
+@pytest.mark.parametrize("value", [
+    np.zeros(15, "f4"), np.zeros(3, "f4"), [1.0, 2.0, 3.0],
+])
+def test_flat_polyline_attribute_is_explained(tmp_path, value):
+    ds = _new(tmp_path, "polyline")
+    lines = [_pts(5, seed=i) for i in range(3)]
+    with pytest.raises(ArrayError, match="one array per polyline"):
+        ds.add_polylines(lines, attributes={"a": value})
+
+
+def test_ragged_polyline_attribute_with_a_short_part(tmp_path):
+    ds = _new(tmp_path, "polyline")
+    lines = [_pts(5, seed=i) for i in range(3)]
+    bad = [np.zeros(5, "f4"), np.zeros(5, "f4"), np.zeros(2, "f4")]
+    with pytest.raises(ArrayError, match=r"\[2\] has 2 rows"):
+        ds.add_polylines(lines, attributes={"a": bad})
+    good = [np.zeros(5, "f4")] * 3
+    _new(tmp_path, "polyline", "ok.zv").add_polylines(lines, attributes={"a": good})
+
+
+@pytest.mark.parametrize("call", [
+    lambda ds: ds.add_points(_pts(), attributes={"a": np.zeros(10, "f4")}),
+    lambda ds: ds.add_points(_pts(), attributes={"a": np.zeros(2000, "f4")}),
+    lambda ds: ds.add_points(_pts(), object_ids=np.zeros(10, int)),
+    lambda ds: ds.add_points(
+        _pts(), object_ids=np.arange(1000) % 5,
+        object_attributes={"a": np.zeros(2, "f4")},
+    ),
+])
+def test_wrong_length_point_arrays_are_explained(tmp_path, call):
+    with pytest.raises(ArrayError, match="exactly one row per item"):
+        call(_new(tmp_path))
+
+
+def test_wrong_length_mesh_and_graph_arrays_are_explained(tmp_path):
+    p = _pts(6)
+    with pytest.raises(ArrayError, match="6 vertices"):
+        _new(tmp_path, "mesh").add_mesh(
+            p, np.array([[0, 1, 2], [3, 4, 5]]), attributes={"a": np.zeros(2, "f4")},
+        )
+    with pytest.raises(ArrayError, match="2 edges"):
+        _new(tmp_path, "graph", "g.zv").add_graph(
+            p, np.array([[0, 1], [2, 3]]), edge_attributes={"a": np.zeros(1, "f4")},
+        )
+
+
+def test_string_group_key_is_explained(tmp_path):
+    with pytest.raises(TypeError, match="integer group ids"):
+        _new(tmp_path).add_points(
+            _pts(), object_ids=np.arange(1000) % 5, groups={"g": [1, 2]},
+        )
+
+
+def test_out_of_bounds_message_names_the_api_keyword(tmp_path):
+    with pytest.raises(MetadataError, match="on_out_of_bounds="):
+        _new(tmp_path).add_points(_pts() + 200)

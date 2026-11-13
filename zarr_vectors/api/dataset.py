@@ -35,7 +35,7 @@ from zarr_vectors.api.result import ReadResult
 from zarr_vectors.api.schema import Layout, Schema, SchemaConflict, StorageOptions
 from zarr_vectors.api.select import Query
 from zarr_vectors.constants import GEOM_POLYLINE
-from zarr_vectors.exceptions import MetadataError, StoreError, ZVError
+from zarr_vectors.exceptions import ArrayError, MetadataError, StoreError, ZVError
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
     from zarr_vectors.core.group import Group
@@ -256,6 +256,17 @@ class Dataset:
         """Write a point cloud."""
         from zarr_vectors.types.points import write_points
 
+        n = _n_rows(positions, "positions")
+        _check_rows("object_ids", object_ids, n, "points")
+        _check_columns("attributes", attributes, n, "points")
+        _check_groups(groups)
+        if object_attributes:
+            n_objects = (
+                n if object_ids is None
+                else len(np.unique(np.asarray(object_ids)))
+            )
+            _check_columns("object_attributes", object_attributes, n_objects, "objects")
+
         return self._write(
             write_points, positions,
             vertex_attributes=dict(attributes or {}) or None,
@@ -276,9 +287,33 @@ class Dataset:
         streamlines: bool = False,
         on_out_of_bounds: Literal["raise", "ignore", "expand"] = "raise",
     ) -> dict[str, Any]:
-        """Write polylines, or streamlines when ``streamlines=True``."""
+        """Write polylines, or streamlines when ``streamlines=True``.
+
+        ``attributes`` takes one array per polyline for each name -- a
+        list as long as ``polylines``, each with one row per vertex --
+        and ``object_attributes`` one row per polyline.
+        """
         from zarr_vectors.constants import GEOM_STREAMLINE
         from zarr_vectors.types.polylines import write_polylines
+
+        polylines = list(polylines)
+        lengths = [_n_rows(p, f"polylines[{i}]") for i, p in enumerate(polylines)]
+        for name, value in (attributes or {}).items():
+            if not hasattr(value, "__len__") or (len(value) and np.ndim(value[0]) == 0):
+                raise ArrayError(
+                    f"attributes[{name!r}] must be one array per polyline -- "
+                    f"a list of {len(polylines)} arrays, each with one row "
+                    f"per vertex of its polyline -- not a single flat array."
+                )
+            if len(value) != len(polylines):
+                raise ArrayError(
+                    f"attributes[{name!r}] has {len(value)} arrays but there "
+                    f"are {len(polylines)} polylines."
+                )
+            for i, (part, n_i) in enumerate(zip(value, lengths)):
+                _check_rows(f"attributes[{name!r}][{i}]", part, n_i, f"vertices in polyline {i}")
+        _check_columns("object_attributes", object_attributes, len(polylines), "polylines")
+        _check_groups(groups)
 
         return self._write(
             write_polylines, polylines,
@@ -306,6 +341,8 @@ class Dataset:
         """
         from zarr_vectors.types.lines import write_lines
 
+        _check_columns("object_attributes", object_attributes, _n_rows(endpoints, "endpoints"), "lines")
+
         return self._write(
             write_lines, endpoints,
             vertex_attributes=dict(attributes or {}) or None,
@@ -326,6 +363,15 @@ class Dataset:
     ) -> dict[str, Any]:
         """Write a triangulated surface."""
         from zarr_vectors.types.meshes import write_mesh
+
+        n = _n_rows(vertices, "vertices")
+        _check_rows("object_ids", object_ids, n, "vertices")
+        _check_columns("attributes", attributes, n, "vertices")
+        if object_attributes and object_ids is not None:
+            _check_columns(
+                "object_attributes", object_attributes,
+                len(np.unique(np.asarray(object_ids))), "objects",
+            )
 
         return self._write(
             write_mesh, vertices, faces,
@@ -350,6 +396,16 @@ class Dataset:
     ) -> dict[str, Any]:
         """Write a graph, or a skeleton when ``tree=True``."""
         from zarr_vectors.types.graphs import write_graph
+
+        n = _n_rows(positions, "positions")
+        _check_rows("object_ids", object_ids, n, "nodes")
+        _check_columns("attributes", attributes, n, "nodes")
+        _check_columns("edge_attributes", edge_attributes, _n_rows(edges, "edges"), "edges")
+        if object_attributes and object_ids is not None:
+            _check_columns(
+                "object_attributes", object_attributes,
+                len(np.unique(np.asarray(object_ids))), "objects",
+            )
 
         # ``kind=``, not the ``is_tree=`` alias: that alias is deprecated
         # and warns on every call, so the supported surface was emitting a
@@ -765,6 +821,51 @@ def _stamp_declared(
                     level.write_array_meta(path, extra)
             except Exception:  # noqa: BLE001 - annotation, never fatal
                 continue
+
+
+def _n_rows(value: Any, what: str) -> int:
+    arr = np.asarray(value)
+    if arr.ndim == 0:
+        raise ArrayError(f"{what} must be an array with one row per item, not a scalar.")
+    return int(arr.shape[0])
+
+
+def _check_rows(what: str, value: Any, expected: int, of: str) -> None:
+    """Raise unless ``value`` has exactly ``expected`` rows.
+
+    Checked here, before the write: a short array otherwise surfaced from
+    deep in a writer as ``IndexError: index 259 is out of bounds``, and a
+    long one was silently truncated.
+    """
+    if value is None:
+        return
+    got = _n_rows(value, what)
+    if got != expected:
+        raise ArrayError(
+            f"{what} has {got} rows but there are {expected} {of}; it needs "
+            f"exactly one row per item."
+        )
+
+
+def _check_columns(
+    what: str, columns: Mapping[str, Any] | None, expected: int, of: str,
+) -> None:
+    for name, value in (columns or {}).items():
+        _check_rows(f"{what}[{name!r}]", value, expected, of)
+
+
+def _check_groups(groups: Mapping[Any, Any] | None) -> None:
+    """Group ids are integers; the writer failed on a string with an
+    unrelated ``TypeError`` about string concatenation."""
+    import numbers
+
+    for key in (groups or {}):
+        if isinstance(key, bool) or not isinstance(key, numbers.Integral):
+            raise TypeError(
+                f"groups keys are integer group ids, got {key!r} "
+                f"({type(key).__name__}). Key groups= by integer id; give "
+                f"them names afterwards with Dataset.groups.name_rows()."
+            )
 
 
 def _inherit_grid(layout: Layout, stored: Layout) -> Layout:

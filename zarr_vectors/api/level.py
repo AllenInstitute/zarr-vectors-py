@@ -393,6 +393,7 @@ class Level:
         """
         if selection.objects is None and selection.groups is None:
             return
+        self._check_has_objects(selection)
         if self.kind == GEOM_MESH and selection.groups is None:
             return
         if self.kind not in (GEOM_MESH, GEOM_GRAPH, GEOM_SKELETON):
@@ -406,6 +407,40 @@ class Level:
             f"the arrays yourself, or use level.objects[...] on a geometry "
             f"that supports it (point clouds, polylines, lines, meshes)."
         )
+
+    def _check_has_objects(self, selection: Selection) -> None:
+        """Refuse ``objects=`` / ``groups=`` on a level that has none.
+
+        A point cloud written without ``object_ids`` has no object index,
+        and the reader failed on it with a bare ``KeyError: 'sid_ndim'``
+        (or ``Array 'groups' not found``), which says nothing about what
+        the caller did.
+        """
+        from zarr_vectors.api.select import SelectionError
+        from zarr_vectors.constants import GROUPS
+
+        target = (
+            self if selection.level in (None, self._index)
+            else self._dataset.level(selection.level)
+        )
+        if selection.objects is not None and len(target.objects) == 0:
+            raise SelectionError(
+                f"select(objects=...) on level {target.index}: this "
+                f"{self.kind!r} level holds no object ids (it was written "
+                f"without object_ids=), so there are no objects to select."
+            )
+        if selection.groups is not None:
+            group = target.store
+            try:
+                present = group.array_exists(GROUPS) or group.standalone_array_exists(GROUPS)
+            except Exception:  # noqa: BLE001 - unknown: let the reader decide
+                present = True
+            if not present:
+                raise SelectionError(
+                    f"select(groups=...) on level {target.index}: this "
+                    f"{self.kind!r} level holds no groups (it was written "
+                    f"without groups=), so there are none to select."
+                )
 
     def _reader_kwargs(self, selection: Selection, supports: Sequence[str]) -> dict[str, Any]:
         """Selection terms this reader can express, with ``"all"`` resolved.
