@@ -13,17 +13,20 @@ from zarr_vectors.constants import (
     GEOM_POLYLINE,
     GEOM_SKELETON,
     GEOM_STREAMLINE,
+    LINKS,
     LINKS_EXPLICIT,
     LINKS_IMPLICIT_BRANCHES,
     LINKS_IMPLICIT_SEQUENTIAL,
 )
 from zarr_vectors.core.arrays import list_chunk_keys, read_chunk_vertices
+from zarr_vectors.core.paths import links_group_path
 from zarr_vectors.core.store import (
     get_resolution_level,
     list_resolution_levels,
     open_store,
     read_root_metadata,
 )
+from zarr_vectors.validate.metadata import level_fields
 from zarr_vectors.validate.structure import ValidationResult
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
@@ -53,6 +56,19 @@ def validate_conformance(store_path: str | Path | Group) -> ValidationResult:
 
     geom_types = meta.geometry_types or []
     lc = meta.links_convention
+    # RootMetadata fills an absent links_convention with
+    # implicit_sequential.  A store created empty (create_store,
+    # api.create) declares none until its first links write stamps the
+    # geometry's own, so an absent key on a store with no links yet is
+    # "not declared", not a mismatch.
+    declared = "links_convention" in (root.attrs.to_dict().get("zarr_vectors") or {})
+    undeclared_and_unlinked = False
+    if not declared:
+        try:
+            lg0 = get_resolution_level(root, 0)
+            undeclared_and_unlinked = not lg0.array_exists(LINKS)
+        except Exception:
+            undeclared_and_unlinked = True
 
     for gt in geom_types:
         req = GEOMETRY_LINK_REQ.get(gt)
@@ -62,7 +78,12 @@ def validate_conformance(store_path: str | Path | Group) -> ValidationResult:
         if not req:
             result.add_pass(f"'{gt}': no links convention required")
             continue
-        if lc not in req:
+        if lc not in req and undeclared_and_unlinked:
+            result.add_pass(
+                f"'{gt}': no links written yet and no links_convention "
+                f"declared"
+            )
+        elif lc not in req:
             # Check if this is a composite store with a geometry index
             # (each type has its own namespaced link arrays, so the root
             # links_convention only applies to the primary geometry)
@@ -93,9 +114,13 @@ def validate_conformance(store_path: str | Path | Group) -> ValidationResult:
 
     if GEOM_MESH in geom_types:
         # Check mesh link_width — in composite stores, look at links_mesh/
+        # ``read_array_meta`` answers {} for a missing path rather than
+        # raising, so existence is asked explicitly.
         found_mesh_links = False
         try:
-            lmeta = lg.read_array_meta("links/0")
+            if not lg.array_exists(links_group_path(0)):
+                raise LookupError("no links/0")
+            lmeta = lg.read_array_meta(links_group_path(0))
             lw = lmeta.get("link_width", 0)
             if lw >= 3:
                 result.add_pass(f"Mesh link_width={lw}")
@@ -122,10 +147,11 @@ def validate_conformance(store_path: str | Path | Group) -> ValidationResult:
     if GEOM_POINT_CLOUD in geom_types and not any(
         gt in geom_types for gt in [GEOM_GRAPH, GEOM_SKELETON, GEOM_MESH]
     ):
-        try:
-            lg.read_array_meta("links/0")
+        # Not read_array_meta: it returns {} for a missing path instead
+        # of raising, so this warned on every point cloud.
+        if lg.array_exists(LINKS):
             result.add_warning("Point cloud but links array exists")
-        except Exception:
+        else:
             result.add_pass("Point cloud: no links (correct)")
 
     return result
@@ -160,9 +186,10 @@ def validate_multiresolution(store_path: str | Path | Group) -> ValidationResult
     for li in levels:
         try:
             lg = get_resolution_level(root, li)
-            attrs = lg.attrs
+            attrs = level_fields(root, li, lg)
             vc = attrs.get("vertex_count")
-            if vc is None:
+            if not vc:
+                # Absent, or the 0 placeholder a build path left unrefreshed.
                 vc = 0
                 for ck in list_chunk_keys(lg):
                     try:

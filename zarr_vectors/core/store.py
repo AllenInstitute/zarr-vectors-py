@@ -552,6 +552,13 @@ def create_store(
         )
     if geometry_types is None:
         geometry_types = []
+    if base_bin_shape is not None:
+        # Before anything touches disk: a bin that does not tile the chunk
+        # otherwise makes a store that fails validation.
+        from zarr_vectors.core.metadata import check_bin_shape_tiles_chunk
+        check_bin_shape_tiles_chunk(
+            chunk_shape, base_bin_shape, name="base_bin_shape",
+        )
 
     from zarr.abc.store import Store as _ZStore
     local_root: Path | None = None
@@ -855,6 +862,10 @@ def _ensure_root_metadata_for_write(
         zv["geometry_types"] = gts
 
     if base_bin_shape is not None:
+        # Every type writer stamps its bin_shape here; refuse one that
+        # does not tile the store's chunks before it reaches the store.
+        from zarr_vectors.core.metadata import check_bin_shape_tiles_chunk
+        check_bin_shape_tiles_chunk(zv["chunk_shape"], base_bin_shape)
         zv["base_bin_shape"] = list(base_bin_shape)
 
     if links_convention is not None:
