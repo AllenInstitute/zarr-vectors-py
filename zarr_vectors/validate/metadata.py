@@ -94,6 +94,22 @@ def validate_metadata(store_path: str | Path | Group) -> ValidationResult:
         return result
     result.add_pass("Root metadata parsed")
 
+    # Parsing checks only that the keys are there; RootMetadata.validate
+    # holds the rules about their values (format version, conventions,
+    # cross-level settings, manifest layout, ...).  Readers do not run it,
+    # so this is where a store that breaks them is reported.
+    from zarr_vectors.exceptions import ConventionError, MetadataError
+    try:
+        meta.validate()
+    except (MetadataError, ConventionError) as e:
+        result.add_error(f"Root metadata invalid: {e}")
+    except Exception as e:
+        result.add_error(
+            f"Root metadata cannot be validated: {type(e).__name__}: {e}"
+        )
+    else:
+        result.add_pass("Root metadata validated")
+
     sid_ndim = meta.sid_ndim
     if sid_ndim < 1:
         result.add_error(f"SID dimensionality is {sid_ndim}, must be >= 1")
