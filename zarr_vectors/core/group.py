@@ -32,6 +32,7 @@ Public surface mirrors the legacy :class:`FsGroup` for back-compat:
 
 from __future__ import annotations
 
+import os
 import warnings
 from collections.abc import Callable, Iterable, Iterator, Sequence
 from contextlib import contextmanager
@@ -388,14 +389,27 @@ class Group:
         read.  Every directory under a node is a node in Zarr v3, so the
         listing is the answer.
 
+        A local directory is listed with ``os.listdir``: the store's
+        ``list_dir`` does the same walk behind a sync hop and a
+        ``pathlib`` call per entry, 1.4-2.6 ms for the 33 offsets arrays
+        of a mesh against tens of microseconds.
+
         Falls back to :meth:`children` offline (the snapshot carries the
         listing, not the store) and on any store that cannot list.
         """
         if self._offline is not None:
             return self.children()
+        store_path = self._zarr.store_path
+        if isinstance(store_path.store, LocalStore):
+            try:
+                names = os.listdir(
+                    os.path.join(str(store_path.store.root), store_path.path)
+                )
+            except (FileNotFoundError, NotADirectoryError):
+                return []
+            return sorted(n for n in names if n != "zarr.json")
         from zarr.core.sync import sync
 
-        store_path = self._zarr.store_path
         prefix = f"{store_path.path}/" if store_path.path else ""
 
         async def _collect() -> list[str]:
@@ -2020,8 +2034,13 @@ class Group:
         offline = self._offline_rows(path, indices)
         if offline is not None:
             return offline
+        from zarr_vectors.core._batch_reader import direct_elements
+
         node = self._require_array_node(path)
         idx = np.asarray(indices, dtype=np.int64)
+        direct = direct_elements(node, idx)
+        if direct is not None:
+            return [bytes(b) for b in direct]
         try:
             selected = node.get_coordinate_selection((idx,))
         except Exception:

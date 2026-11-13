@@ -7403,8 +7403,14 @@ def _id_table_is_identity(level_group: Group, meta: dict[str, Any], node: Any) -
     if meta.get(OBJECT_IDS_SORTED_ATTR):
         committed = meta.get("num_objects")
         m = n if committed is None else max(0, min(int(committed), n))
-        if m and (int(node[0]) != 0 or int(node[m - 1]) != m - 1):
-            return False
+        if m:
+            from zarr_vectors.core._batch_reader import direct_elements
+
+            ends = direct_elements(node, [0, m - 1])
+            if ends is None:
+                ends = (node[0], node[m - 1])
+            if int(ends[0]) != 0 or int(ends[1]) != m - 1:
+                return False
         lo = m
     else:
         lo = 0
@@ -8112,6 +8118,12 @@ def link_cells_within(
     lo = src.min(axis=0)
     ext = src.max(axis=0) - lo + 1
     src_keys = np.ravel_multi_index((src - lo).T, ext)
+    # A handful of chunks -- one object's -- is tested as tuples against
+    # a set: the array form below costs ~60 us of numpy calls per
+    # segment whatever the size, ~2 ms over a mesh's 33 segments.
+    few = src.shape[0] <= _LINK_CELLS_SET_MAX
+    src_rows = [tuple(c) for c in src.tolist()] if few else []
+    src_set = set(src_rows)
 
     out: dict[str, list[str]] = {}
     for seg in list_link_offsets(level_group, delta):
@@ -8124,16 +8136,29 @@ def link_cells_within(
             ) from e
         # Endpoint 0 is the source itself; at delta 0 the anchor is the
         # identity, so endpoint k is ``src + o_k``.
-        ok = np.ones(src.shape[0], dtype=bool)
-        for off in offsets:
-            if not any(off):
-                continue
-            rel = src + np.asarray(off, dtype=np.int64) - lo
-            inside = np.all((rel >= 0) & (rel < ext), axis=1)
-            keys = np.ravel_multi_index(np.where(inside[:, None], rel, 0).T, ext)
-            ok &= inside & np.isin(keys, src_keys)
-            if not ok.any():
-                break
+        shifts = [off for off in offsets if any(off)]
+        if few:
+            ok = np.fromiter(
+                (
+                    all(
+                        tuple(a + b for a, b in zip(c, off)) in src_set
+                        for off in shifts
+                    )
+                    for c in src_rows
+                ),
+                dtype=bool, count=len(src_rows),
+            )
+        else:
+            ok = np.ones(src.shape[0], dtype=bool)
+            for off in shifts:
+                rel = src + np.asarray(off, dtype=np.int64) - lo
+                inside = np.all((rel >= 0) & (rel < ext), axis=1)
+                keys = np.ravel_multi_index(
+                    np.where(inside[:, None], rel, 0).T, ext,
+                )
+                ok &= inside & np.isin(keys, src_keys)
+                if not ok.any():
+                    break
         if not ok.any():
             continue
         seg_path = f"{family}/{seg}"
@@ -8145,6 +8170,11 @@ def link_cells_within(
         if keys:
             out[seg] = keys
     return out
+
+
+#: Most chunks :func:`link_cells_within` tests as Python tuples rather
+#: than arrays.
+_LINK_CELLS_SET_MAX = 256
 
 
 @_device_result

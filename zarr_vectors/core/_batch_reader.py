@@ -36,6 +36,7 @@ from typing import Any, NamedTuple
 import numpy as np
 import zarr
 from numcodecs.vlen import VLenBytes
+from zarr.abc.codec import BytesBytesCodec
 from zarr.core.array_spec import ArraySpec
 from zarr.core.buffer import default_buffer_prototype
 from zarr.core.sync import sync
@@ -371,6 +372,83 @@ def _direct_read(spec: _DirectSpec, chunk_key: str) -> bytes | None:
     if path is None:
         return None
     return _decode_direct(spec, _read_file(path))
+
+
+def direct_elements(node: Any, indices: Any) -> np.ndarray | None:
+    """Elements ``indices`` of a 1-D local array, read off the filesystem.
+
+    The row form of the direct path above, for the object index: a by-id
+    read wants one manifest row and the two end rows of the id table,
+    and each went through a zarr selection -- indexers, a sync hop onto
+    the event loop and back, a codec pipeline pass -- that cost 1-5 ms
+    around a decode of well under one. Here each chunk file the rows
+    fall in is opened and decoded through the array's own codecs, so the
+    values are the ones the selection returns.
+
+    Returns the elements in the order asked, or None for anything not
+    recognised (not a local unsharded v3 array, a codec other than one
+    array-to-bytes serializer plus bytes-to-bytes codecs, an index off
+    the array, a chunk with no stored object), which the caller reads
+    through zarr instead.
+    """
+    store = node.store_path.store
+    if type(store).__name__ != "LocalStore":
+        return None
+    meta = node.metadata
+    if getattr(meta, "zarr_format", None) != 3 or len(meta.shape) != 1:
+        return None
+    if getattr(meta, "storage_transformers", ()):
+        return None
+    chunk_shape = getattr(getattr(meta, "chunk_grid", None), "chunk_shape", None)
+    if chunk_shape is None or len(chunk_shape) != 1:
+        return None
+    serializer, *bytes_codecs = meta.codecs
+    if type(serializer).__name__ not in ("VLenBytesCodec", "BytesCodec"):
+        return None
+    if not all(
+        isinstance(c, BytesBytesCodec) and hasattr(c, "_decode_sync")
+        for c in bytes_codecs
+    ):
+        return None
+    cke = meta.chunk_key_encoding.to_dict()
+    if cke.get("name") != "default":
+        return None
+    separator = (cke.get("configuration") or {}).get("separator", "/")
+
+    idx = np.asarray(indices, dtype=np.int64).ravel()
+    n = int(meta.shape[0])
+    if idx.size == 0 or int(idx.min()) < 0 or int(idx.max()) >= n:
+        return None
+    rows = int(chunk_shape[0])
+    try:
+        spec = ArraySpec(
+            shape=(rows,),
+            dtype=meta.data_type,
+            fill_value=meta.fill_value,
+            config=node._async_array.config,
+            prototype=_BUFFER_PROTOTYPE,
+        )
+    except Exception:
+        return None
+
+    root = os.path.join(str(store.root), node.store_path.path, "c")
+    chunk_of = idx // rows
+    out: np.ndarray | None = None
+    for c in np.unique(chunk_of).tolist():
+        raw = _read_file(f"{root}{separator}{c}")
+        if raw is None:
+            return None
+        buffer = _BUFFER_PROTOTYPE.buffer.from_bytes(raw)
+        for codec in reversed(bytes_codecs):
+            buffer = codec._decode_sync(buffer, spec)
+        values = serializer._decode_sync(buffer, spec).as_numpy_array()
+        if values.shape != (rows,):
+            return None
+        at = chunk_of == c
+        if out is None:
+            out = np.empty(idx.size, dtype=values.dtype)
+        out[at] = values[idx[at] - c * rows]
+    return out
 
 
 #: Cells above which the direct path reads in parallel.
