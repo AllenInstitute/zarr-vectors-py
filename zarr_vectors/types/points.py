@@ -198,6 +198,12 @@ def write_points(
         side = max_extent + abs(float(np.max(bounds[1]))) + 1.0
         chunk_shape = tuple(side for _ in range(ndim))
 
+    if bin_shape is not None:
+        # Up front: a bin that does not tile the chunk used to write a
+        # store that fails validation, or fail later with an unrelated
+        # out-of-grid StoreError.
+        from zarr_vectors.core.metadata import check_bin_shape_tiles_chunk
+        check_bin_shape_tiles_chunk(chunk_shape, bin_shape)
     effective_bin = bin_shape if bin_shape is not None else chunk_shape
     bins_per_chunk = tuple(
         int(round(cs / bs)) for cs, bs in zip(chunk_shape, effective_bin)

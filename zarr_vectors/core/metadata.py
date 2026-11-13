@@ -1647,6 +1647,41 @@ def level_chunk_scale(
     return tuple(out)
 
 
+def check_bin_shape_tiles_chunk(
+    chunk_shape: Sequence[float],
+    bin_shape: Sequence[float],
+    *,
+    name: str = "bin_shape",
+) -> None:
+    """Raise unless ``bin_shape`` tiles ``chunk_shape`` on every axis.
+
+    The level-0 bin grid must nest inside the chunk grid: each chunk is
+    split into a whole number of bins.  Writers call this up front, so a
+    bin that does not divide the chunk is rejected at the call that
+    declared it rather than producing a store that fails validation (or
+    an unrelated error from deep inside the chunk writer).
+
+    Raises:
+        MetadataError: On a rank mismatch, a non-positive bin, or a bin
+            that does not divide its chunk.
+    """
+    if len(bin_shape) != len(chunk_shape):
+        raise MetadataError(
+            f"{name} has {len(bin_shape)} axes but chunk_shape has "
+            f"{len(chunk_shape)}"
+        )
+    for i, (cs, bs) in enumerate(zip(chunk_shape, bin_shape)):
+        if not bs > 0:
+            raise MetadataError(f"{name}[{i}]={bs} must be > 0")
+        ratio = float(cs) / float(bs)
+        if ratio < 1 - 1e-9 or abs(ratio - round(ratio)) > 1e-9:
+            raise MetadataError(
+                f"{name}[{i}]={bs} does not divide chunk_shape[{i}]={cs}: "
+                f"each chunk must hold a whole number of bins "
+                f"(chunk / bin = {ratio:.6g})"
+            )
+
+
 def validate_level_chunk_shape_against_root(
     root_meta: RootMetadata,
     level_meta: LevelMetadata,
