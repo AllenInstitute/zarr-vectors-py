@@ -22,19 +22,26 @@ from typing import Any
 import numpy as np
 import numpy.typing as npt
 
-from zarr_vectors.constants import GEOM_POINT_CLOUD, VERTICES
+from zarr_vectors.constants import (
+    FRAGMENT_ATTRIBUTES,
+    GEOM_POINT_CLOUD,
+    OBJECT_INDEX,
+    VERTEX_ATTRIBUTES,
+    VERTICES,
+)
 from zarr_vectors.core.arrays import (
     list_chunk_keys,
+    read_chunk_attributes,
     read_chunk_vertices,
+    vertices_dtype,
+    write_chunk_attributes,
     write_chunk_vertices,
 )
-from zarr_vectors.core.metadata import (
-    LevelMetadata,
-    compute_bin_ratio,
-    validate_bin_shape_divides_chunk,
-)
+from zarr_vectors.core.metadata import validate_bin_shape_divides_chunk
+from zarr_vectors.core.multiscale import read_level_transform, upsert_level_transform
 from zarr_vectors.core.store import (
     get_resolution_level,
+    list_resolution_levels,
     open_store,
     read_level_metadata,
     read_root_metadata,
@@ -55,13 +62,15 @@ def rebin_level(
 
     Reads each chunk, re-bins its vertices into ``target_bin_shape``
     supervoxel cells, and rewrites the chunk with one fragment per occupied
-    bin.  Per-vertex attribute arrays are **not** touched — they remain
-    aligned with the on-disk vertex order.  Because re-binning shuffles
-    vertex order within a chunk, callers that have post-write per-vertex
-    attribute arrays should regenerate them.
+    bin.  Per-vertex attribute arrays are re-sorted with their vertices,
+    and vertices keep the store's dtype.
 
-    Updates root ``base_bin_shape`` (when ``level == 0``) and the level
-    metadata's ``bin_shape`` / ``bin_ratio``.
+    The bin shape lives in the NGFF ``multiscales`` block, not in the
+    level's own attrs.  Re-binning level 0 sets the root
+    ``base_bin_shape`` and the level-0 translation (``bin / 2``), and
+    re-derives every coarser level's scale against the new base (their
+    absolute bins are unchanged).  Re-binning a coarser level sets that
+    level's scale (``bin / base``) and translation.
 
     Args:
         store_path: Path or URL to a writable ZV store.
@@ -114,12 +123,31 @@ def rebin_level(
     bins_created = 0
     bs = np.asarray(target_bin_shape, dtype=np.float64)
 
+    # Fragments are rebuilt from positions, so anything that names a
+    # fragment -- an object manifest, a per-fragment attribute -- would be
+    # left pointing at the wrong vertices.
+    named = [f for f in (OBJECT_INDEX, FRAGMENT_ATTRIBUTES)
+             if f in level_group.children()]
+    if named:
+        raise StoreError(
+            f"rebin_level: level {level} has {named}, which name fragments "
+            f"that re-binning would rebuild; use "
+            f"zarr_vectors.rechunk.rechunk_spatial instead"
+        )
+
+    vdtype = vertices_dtype(level_group)
+    attr_meta = {}
+    if VERTEX_ATTRIBUTES in level_group.children():
+        for name in sorted(level_group[VERTEX_ATTRIBUTES].children()):
+            attr_meta[name] = dict(level_group.read_array_meta(
+                f"{VERTEX_ATTRIBUTES}/{name}") or {})
+
     for cc in chunk_keys:
         # Flatten any existing fragment structure: a point cloud's fragments are
         # re-derived from positions, so we don't care about the old
         # grouping.
         try:
-            groups = read_chunk_vertices(level_group, cc, ndim=ndim)
+            groups = read_chunk_vertices(level_group, cc, dtype=vdtype, ndim=ndim)
         except Exception:
             continue
         if not groups:
@@ -127,59 +155,68 @@ def rebin_level(
         positions = np.concatenate(groups, axis=0)
         if positions.shape[0] == 0:
             continue
+        # Per-vertex attributes in the same (fragment) order as positions.
+        attrs: dict[str, npt.NDArray] = {}
+        for name, meta in attr_meta.items():
+            adt = np.dtype(meta.get("dtype", "float32"))
+            rs = meta.get("row_shape") or []
+            ncols = int(rs[0]) if rs else max(
+                1, len(meta.get("channel_names") or []))
+            agroups = read_chunk_attributes(level_group, name, cc,
+                                            dtype=adt, ncols=ncols)
+            attrs[name] = np.concatenate([np.asarray(a) for a in agroups])
 
         # Re-bin into one fragment per occupied bin, sorted by bin key for a
         # deterministic on-disk ordering.
         bin_assignments = assign_bins(positions, tuple(float(b) for b in bs))
-        new_groups: list[npt.NDArray] = []
-        for bin_key in sorted(bin_assignments.keys()):
-            idxs = bin_assignments[bin_key]
-            new_groups.append(positions[idxs].astype(np.float32, copy=False))
+        order = [bin_assignments[k] for k in sorted(bin_assignments.keys())]
+        new_groups = [positions[idxs] for idxs in order]
 
-        write_chunk_vertices(level_group, cc, new_groups, dtype=np.float32)
+        write_chunk_vertices(level_group, cc, new_groups, dtype=vdtype)
+        for name, data in attrs.items():
+            write_chunk_attributes(level_group, name, cc,
+                                   [data[idxs] for idxs in order],
+                                   dtype=data.dtype)
         chunks_processed += 1
         vertices_processed += int(positions.shape[0])
         bins_created += len(new_groups)
 
-    # Update level metadata.
+    # The bin shape is DERIVED metadata: it lives in the NGFF transform
+    # (scale = bin / base, translation = bin / 2), never in the level's own
+    # attrs -- LevelMetadata.validate forbids a level-0 bin_shape, and
+    # read_level_metadata ignores one anyway.  This used to write
+    # bin_shape / bin_ratio into the level attrs and leave the NGFF
+    # translation at the old value.
     new_bin_shape = tuple(float(b) for b in target_bin_shape)
-    new_bin_ratio: tuple[int, ...] | None = None
-    base_bin = root_meta.effective_bin_shape
-    if base_bin is not None:
-        try:
-            new_bin_ratio = compute_bin_ratio(base_bin, new_bin_shape)
-        except Exception:
-            new_bin_ratio = None
-    new_level_meta = LevelMetadata(
-        level=level_meta.level,
-        vertex_count=level_meta.vertex_count,
-        arrays_present=level_meta.arrays_present,
-        bin_shape=new_bin_shape,
-        bin_ratio=new_bin_ratio,
-        object_sparsity=level_meta.object_sparsity,
-        coarsening_method=level_meta.coarsening_method,
-        parent_level=level_meta.parent_level,
-        chunk_dims=level_meta.chunk_dims,
-        chunk_attribute_name=level_meta.chunk_attribute_name,
-        chunk_attribute_values=level_meta.chunk_attribute_values,
-        preserves_object_ids=level_meta.preserves_object_ids,
-        inherited_num_objects=level_meta.inherited_num_objects,
-        shared_fragments=level_meta.shared_fragments,
-    )
-    level_group.attrs.update(new_level_meta.to_dict())
-
-    # Update root base_bin_shape when re-binning level 0 (so future
-    # writes / reads see the new default).
-    #
-    # Through ``update_root_metadata``, which read-modify-writes the one
-    # field named.  This used to rebuild a whole RootMetadata from named
-    # fields and ``attrs.update(to_dict())``, which REPLACES the block --
-    # so every field the reconstruction forgot was destroyed.
-    # ``attribute_specs`` already was, silently, and ``shard_shape`` would
-    # have been next.  Listing one more field here would only re-arm that;
-    # not rebuilding the block is the fix.
     if level == 0:
+        # Through ``update_root_metadata``, which read-modify-writes the one
+        # field named; rebuilding the whole block destroyed every field the
+        # reconstruction forgot.
         update_root_metadata(root, base_bin_shape=new_bin_shape)
+        upsert_level_transform(
+            root, 0, scale=[1.0] * ndim,
+            translation=[b / 2.0 for b in new_bin_shape],
+        )
+        # Coarser levels keep their absolute bins; their scale is relative
+        # to the base, so it moves with it.
+        for lv in list_resolution_levels(root):
+            if lv == 0:
+                continue
+            scale, translation = read_level_transform(root, lv)
+            if translation is None:
+                continue
+            upsert_level_transform(
+                root, lv,
+                scale=[2.0 * t / b for t, b in zip(translation, new_bin_shape)],
+                translation=translation,
+            )
+    else:
+        base_bin = read_root_metadata(root).effective_bin_shape
+        upsert_level_transform(
+            root, level,
+            scale=[n / b for n, b in zip(new_bin_shape, base_bin)],
+            translation=[n / 2.0 for n in new_bin_shape],
+        )
 
     return {
         "chunks_processed": chunks_processed,
