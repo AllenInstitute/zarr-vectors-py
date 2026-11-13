@@ -321,3 +321,48 @@ def test_multichannel_vertex_attribute_is_read_back(tmp_path, kind):
     order = got.attributes["tag"].astype(int)
     assert got.attributes["colour"].shape == (6, 3)
     assert np.array_equal(got.attributes["colour"], colour[order])
+
+
+# ---------------- Query.iter_cells ----------------
+
+
+@pytest.mark.parametrize("kind", ["point_cloud", "polyline", "mesh", "graph", "line"])
+def test_iter_cells_covers_the_query_cell_by_cell(tmp_path, kind):
+    ds = _gridded(tmp_path, kind)
+    pts = _pts(60)
+    if kind == "point_cloud":
+        ds.add_points(pts)
+    elif kind == "polyline":
+        ds.add_polylines([pts[i:i + 6] for i in range(0, 60, 6)])
+    elif kind == "mesh":
+        ds.add_mesh(pts, np.arange(60).reshape(20, 3))
+    elif kind == "graph":
+        ds.add_graph(pts, np.array([[i, i + 1] for i in range(59)]))
+    else:
+        ds.add_lines(pts.reshape(30, 2, 3))
+    for q in (ds.select(), ds.select(bbox=_LOW)):
+        pairs = list(q.iter_cells())
+        refs = [ref for ref, _ in pairs]
+        assert refs == sorted(q.cells())
+        assert all(not r.errors for _, r in pairs)
+        total = sum(r.vertex_count for _, r in pairs)
+        whole = q.read().vertex_count
+        if kind in ("polyline", "line") and q.selection.bbox is not None:
+            # Whole parts reaching outside the box's cells: documented.
+            assert 0 < total <= whole
+        else:
+            assert total == whole
+
+
+def test_iter_cells_shares_a_limit_across_cells(tmp_path):
+    ds = _gridded(tmp_path, "point_cloud")
+    ds.add_points(_pts())
+    pairs = list(ds.select(limit=300).iter_cells())
+    assert sum(r.vertex_count for _, r in pairs) == 300
+
+
+def test_unnarrowed_query_cells_are_the_levels_cells(tmp_path):
+    ds = _gridded(tmp_path, "point_cloud")
+    ds.add_points(_pts())
+    assert set(ds.select().cells()) == set(ds.level(0).cells())
+    assert len(ds.select().cells()) > 1

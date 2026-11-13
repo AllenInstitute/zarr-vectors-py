@@ -397,9 +397,11 @@ class TestLevelIsOptional:
 class TestDeferredCapabilities:
     """The facade must not advertise what it cannot do."""
 
-    def test_iter_cells_says_it_is_not_available_yet(self, points_store):
-        with pytest.raises(NotImplementedError, match="resolver phase"):
-            zv.open(points_store).select().iter_cells()
+    def test_iter_cells_streams_the_whole_query(self, points_store):
+        q = zv.open(points_store).select()
+        pairs = list(q.iter_cells())
+        assert pairs
+        assert sum(r.vertex_count for _, r in pairs) == q.count()
 
 
 class TestAsync:
