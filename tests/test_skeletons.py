@@ -253,3 +253,11 @@ class TestLinkOrderAgreement:
             (tuple(pos[c].tolist()), tuple(pos[p].tolist())) for c, p in edges
         }
         assert back == want
+
+
+def test_finalize_stamps_vertex_count(tmp_path: Path) -> None:
+    """A streamed store used to keep init's ``vertex_count: 0`` forever."""
+    from zarr_vectors.core.store import open_store, read_level_metadata
+
+    path = _two_chunk_tree(tmp_path)  # finalized, 4 vertices in 2 chunks
+    assert read_level_metadata(open_store(path), 0).vertex_count == 4

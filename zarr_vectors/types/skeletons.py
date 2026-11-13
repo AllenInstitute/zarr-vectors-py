@@ -45,12 +45,14 @@ from zarr_vectors.constants import (
     VERTICES,
 )
 from zarr_vectors.core.arrays import (
+    chunk_vertex_count,
     create_attribute_array,
     create_fragment_attribute_array,
     create_links_array,
     create_object_index_array,
     create_vertices_array,
     link_cells_within,
+    list_chunk_keys,
     read_chunk_link_fragment,
     read_fragment,
     read_link_arrays,
@@ -71,8 +73,10 @@ from zarr_vectors.core.store import (
     _finalize_write,
     create_resolution_level,
     get_resolution_level,
+    list_resolution_levels,
     open_store,
     read_root_metadata,
+    update_level_metadata,
 )
 from zarr_vectors.exceptions import ArrayError
 from zarr_vectors.typing import ChunkCoords
@@ -458,6 +462,20 @@ def write_skeleton_cross_chunk_links(
 
 
 def finalize_skeleton_store(root) -> None:
+    """Finish a streamed skeleton store: stamp counts, then commit.
+
+    ``init_skeleton_store`` creates level 0 before any vertex exists, so
+    it records ``vertex_count: 0``; the per-chunk writers never touch the
+    shared level metadata (concurrent workers would race on it).  Here,
+    on the coordinator, every level's ``vertex_count`` is set from its
+    chunks' fragment indices -- kilobytes per chunk, no vertex decoding.
+    """
+    for level in list_resolution_levels(root):
+        lg = get_resolution_level(root, level)
+        total = sum(
+            chunk_vertex_count(lg, cc) for cc in list_chunk_keys(lg, VERTICES)
+        )
+        update_level_metadata(lg, vertex_count=int(total))
     # No ``fragments_tile`` stamp here, deliberately.  This finalises a
     # DECENTRALISED write -- many workers, each owning some chunks -- so
     # the layout is exactly the one whose tiling nothing can vouch for
