@@ -260,12 +260,12 @@ class Query:
         return self.read().vertex_count
 
     def object_ids(self) -> npt.NDArray[Any]:
-        """The distinct object ids this query touches."""
-        result = self.read()
-        for source in (result.part_objects, result.object_ids):
-            if source is not None and len(source):
-                return np.unique(np.asarray(source))
-        return np.zeros((0,), dtype=np.int64)
+        """The distinct object ids this query touches.
+
+        An object is touched when at least one of its vertices survives
+        the selection.  Empty for a level written without object ids.
+        """
+        return self._level._touched_object_ids(self._selection)
 
     # ---------------- diagnostics ----------------
 

@@ -236,3 +236,64 @@ def test_string_group_key_is_explained(tmp_path):
 def test_out_of_bounds_message_names_the_api_keyword(tmp_path):
     with pytest.raises(MetadataError, match="on_out_of_bounds="):
         _new(tmp_path).add_points(_pts() + 200)
+
+
+# ---------------- Query.object_ids for every geometry ----------------
+
+_G = np.array(
+    [[10, 10, 10], [11, 11, 11], [12, 12, 12],
+     [80, 80, 80], [81, 81, 81], [90, 90, 90]], "f4",
+)
+_LOW = ((0, 0, 0), (50, 50, 50))
+
+
+def _gridded(tmp_path, kind):
+    return zv.create(
+        tmp_path / f"{kind}.zv",
+        schema=zv.Schema(bounds=BOUNDS, kind=kind, layout=zv.Layout(cells=4)),
+    )
+
+
+def test_object_ids_for_points(tmp_path):
+    pts = _pts()
+    ids = (pts[:, 0] // 10).astype(int)
+    ds = _gridded(tmp_path, "point_cloud")
+    ds.add_points(pts, object_ids=ids)
+    assert ds.select().object_ids().tolist() == list(range(10))
+    lo, hi = np.asarray(_LOW[0]), np.asarray(_LOW[1])
+    inside = np.all((pts >= lo) & (pts <= hi), axis=1)
+    assert ds.select(bbox=_LOW).object_ids().tolist() == sorted(set(ids[inside]))
+
+
+def test_object_ids_for_points_without_ids_is_empty(tmp_path):
+    ds = _gridded(tmp_path, "point_cloud")
+    ds.add_points(_pts())
+    assert ds.select().object_ids().size == 0
+    assert ds.select(bbox=_LOW).object_ids().size == 0
+
+
+@pytest.mark.parametrize("tree", [False, True])
+def test_object_ids_for_graphs(tmp_path, tree):
+    ds = _gridded(tmp_path, "skeleton" if tree else "graph")
+    ds.add_graph(
+        _G, np.array([[0, 1], [1, 2], [3, 4], [4, 5]]),
+        object_ids=np.array([0, 0, 0, 1, 1, 1]), tree=tree,
+    )
+    assert ds.select().object_ids().tolist() == [0, 1]
+    assert ds.select(bbox=_LOW).object_ids().tolist() == [0]
+    assert ds.select(near=((90, 90, 90), 1.0)).object_ids().tolist() == [1]
+
+
+def test_object_ids_for_meshes(tmp_path):
+    ds = _gridded(tmp_path, "mesh")
+    ds.add_mesh(_G, np.array([[0, 1, 2], [3, 4, 5]]), object_ids=np.array([0, 0, 0, 1, 1, 1]))
+    assert ds.select().object_ids().tolist() == [0, 1]
+    assert ds.select(bbox=_LOW).object_ids().tolist() == [0]
+
+
+def test_object_ids_for_lines(tmp_path):
+    ds = _gridded(tmp_path, "line")
+    ds.add_lines(_G.reshape(3, 2, 3))
+    assert ds.select().object_ids().tolist() == [0, 1, 2]
+    # line 1 runs (12,12,12)-(80,80,80): one endpoint in the box.
+    assert ds.select(bbox=_LOW).object_ids().tolist() == [0, 1]
