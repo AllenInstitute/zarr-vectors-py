@@ -33,6 +33,7 @@ from zarr_vectors.constants import (
     VERTICES,
 )
 from zarr_vectors.core.arrays import (
+    _read_chunk_fragments,
     attribute_layout,
     create_attribute_array,
     create_fragment_attribute_array,
@@ -42,7 +43,6 @@ from zarr_vectors.core.arrays import (
     create_object_index_array,
     create_vertices_array,
     read_chunk_attributes,
-    read_chunk_vertices,
     read_fragment,
     read_group_object_ids,
     read_object_manifest_rows,
@@ -96,6 +96,8 @@ from zarr_vectors.typing import (
 )
 
 if TYPE_CHECKING:
+    from collections.abc import Sequence
+
     from zarr_vectors.core.store import ReadSource, WriteTarget
 
 
@@ -759,6 +761,7 @@ def _read_polylines(
     # box.  The manifests already say which objects touch it, as flat
     # arrays and without per-object Python, so narrow to those objects
     # and read only their chunks.  Same objects, same order.
+    touching_manifests: dict[int, ObjectManifest] | None = None
     if (
         target_chunks is not None
         and not explicit_subset
@@ -767,7 +770,7 @@ def _read_polylines(
     ):
         touching = _objects_touching(level_group, target_chunks)
         if touching is not None:
-            object_ids = touching
+            object_ids, touching_manifests = touching
             explicit_subset = True
 
     result_polylines: list[list[npt.NDArray]] = []
@@ -808,12 +811,15 @@ def _read_polylines(
         # it takes to read every polyline in it. Missing and
         # out-of-range ids are simply absent from the result, which is
         # what the per-id ``except: continue`` was for.
-        try:
-            manifest_by_oid = read_object_manifests(
-                level_group, ids=[int(o) for o in object_ids],
-            )
-        except Exception:
-            manifest_by_oid = {}
+        if touching_manifests is not None:
+            manifest_by_oid = touching_manifests
+        else:
+            try:
+                manifest_by_oid = read_object_manifests(
+                    level_group, ids=[int(o) for o in object_ids],
+                )
+            except Exception:
+                manifest_by_oid = {}
         for m in manifest_by_oid.values():
             for cc, _fi in m:
                 needed_chunks.add(cc)
@@ -881,10 +887,10 @@ def _read_polylines(
         # Decode each materialised chunk's fragments exactly once.  The
         # per-object dispatch then slices from this cache — O(K_per_chunk)
         # per chunk instead of per-call offset recomputation.
-        chunk_cache: dict[ChunkCoords, list[npt.NDArray]] = {}
+        chunk_cache: dict[ChunkCoords, Sequence[npt.NDArray]] = {}
         for cc in chunk_iter:
             try:
-                chunk_cache[cc] = read_chunk_vertices(
+                chunk_cache[cc] = _read_chunk_fragments(
                     level_group, cc, dtype=dtype, ndim=ndim,
                 )
             except ArrayError:
@@ -1052,51 +1058,86 @@ def _read_polylines(
 
 def _objects_touching(
     level_group: Any, target_chunks: set[ChunkCoords],
-) -> list[int] | None:
-    """Ids of the objects with a fragment in ``target_chunks``, ascending.
+) -> tuple[list[int], dict[int, ObjectManifest] | None] | None:
+    """Ids of the objects with a fragment in ``target_chunks``, ascending,
+    with their manifests.
 
-    None when the level's manifests cannot be read as arrays, and the
-    caller keeps its whole-level read.
+    The manifests are cut from the decode that found the ids, so the
+    caller need not read them again by id: the ids are spread over the
+    whole level, so that read decodes nearly every manifest bucket a
+    second time.  They are ``None`` when two rows share an id, which a
+    read by id resolves its own way.  None when the level's manifests
+    cannot be read as arrays, and the caller keeps its whole-level read.
     """
-    from zarr_vectors.core.arrays import read_all_object_manifests_csr
+    from zarr_vectors.core.arrays import (
+        _manifest_csr_arrays,
+        _object_id_lookup,
+        read_object_id_table,
+    )
+    from zarr_vectors.core.dense_manifests import manifests_from_csr
 
     if not target_chunks:
-        return []
+        return [], {}
     try:
-        offsets, coords, _frags = csr = read_all_object_manifests_csr(level_group)
+        offsets, coords, frags = _manifest_csr_arrays(level_group)
         offsets = np.asarray(offsets, dtype=np.int64)
         coords = np.asarray(coords, dtype=np.int64)
+        frags = np.asarray(frags, dtype=np.int64)
+        # Row -> id. An identity table is proved from its stamp without
+        # reading it.
+        lookup = _object_id_lookup(level_group)
+        ids = None
+        if lookup is not None and lookup[0] != "identity":
+            ids = read_object_id_table(level_group)
     except Exception:
         return None
     n_obj = int(offsets.shape[0]) - 1
     if n_obj <= 0 or coords.shape[0] == 0:
-        return []
+        return [], {}
     targets = np.asarray(sorted(target_chunks), dtype=np.int64)
     if targets.ndim != 2 or targets.shape[1] != coords.shape[1]:
         return None
-    # Each chunk coordinate as one integer over the range both span.
-    lo = np.minimum(coords.min(axis=0), targets.min(axis=0))
-    span = np.maximum(coords.max(axis=0), targets.max(axis=0)) - lo + 1
+    # Each chunk coordinate as one integer over the range both span.  One
+    # column at a time: an axis-0 reduction over a narrow C-order array
+    # is several times slower.
+    cols = range(coords.shape[1])
+    lo = [min(int(coords[:, d].min()), int(targets[:, d].min())) for d in cols]
+    span = [
+        max(int(coords[:, d].max()), int(targets[:, d].max())) - lo[d] + 1
+        for d in cols
+    ]
     total = 1
-    for v in span.tolist():
-        total *= int(v)
+    for v in span:
+        total *= v
     if total >= (1 << 62):
         return None
 
     def pack(a: npt.NDArray[np.int64]) -> npt.NDArray[np.int64]:
         out = np.zeros(a.shape[0], dtype=np.int64)
-        for d in range(a.shape[1]):
-            out *= int(span[d])
+        for d in cols:
+            out *= span[d]
             out += a[:, d] - lo[d]
         return out
 
     hit = np.isin(pack(coords), pack(targets))
     owner = np.repeat(np.arange(n_obj, dtype=np.int64), np.diff(offsets))
     rows = np.unique(owner[hit])
-    ids = csr.object_ids
     if ids is not None:
-        rows = np.sort(np.asarray(ids, dtype=np.int64)[rows])
-    return rows.tolist()
+        ids = ids[:n_obj]
+        oids = ids[rows]
+        if lookup[1].size > 1 and not np.all(lookup[1][1:] != lookup[1][:-1]):
+            return np.sort(oids).tolist(), None
+    else:
+        oids = rows
+    # These rows' manifests, gathered out of the CSR in hand.
+    starts = offsets[rows]
+    counts = offsets[rows + 1] - starts
+    bounds = np.zeros(rows.size + 1, dtype=np.int64)
+    np.cumsum(counts, out=bounds[1:])
+    sel = np.repeat(starts - bounds[:-1], counts) + np.arange(int(bounds[-1]))
+    manifests = manifests_from_csr(bounds, coords[sel], frags[sel])
+    by_id = dict(zip(oids.tolist(), manifests))
+    return np.sort(oids).tolist(), by_id
 
 
 def _read_manifest_run(

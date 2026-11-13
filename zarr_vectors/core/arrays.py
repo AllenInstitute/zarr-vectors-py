@@ -5700,6 +5700,59 @@ def read_chunk_vertices(
     Raises:
         ArrayError: If the chunk does not exist or data is malformed.
     """
+    full, fi = _read_chunk_buffer(level_group, chunk_coords, dtype, ndim)
+    return [] if full is None else _partition_rows(full, fi)
+
+
+def _read_chunk_fragments(
+    level_group: Group,
+    chunk_coords: ChunkCoords,
+    dtype: np.dtype | str | None = None,
+    ndim: int = 3,
+) -> Sequence[npt.NDArray[np.floating]]:
+    """:func:`read_chunk_vertices`, cutting range fragments on access.
+
+    A reader that needs a few fragments of a chunk -- a box query reads
+    the neighbour chunks its objects reach into for a handful of their
+    thousands of fragments -- otherwise builds a view per fragment it
+    never looks at.  The same arrays, indexed the same way.
+    """
+    full, fi = _read_chunk_buffer(level_group, chunk_coords, dtype, ndim)
+    if full is None:
+        return []
+    table = fi.ranges()
+    if table is None:
+        return _partition_rows(full, fi)
+    return _RangeFragments(full, table)
+
+
+class _RangeFragments(Sequence):
+    """``full`` as a sequence of row ranges, each a view cut when indexed."""
+
+    __slots__ = ("_full", "_starts", "_stops")
+
+    def __init__(self, full: npt.NDArray, table: npt.NDArray[np.int64]) -> None:
+        self._full = full
+        self._starts = table[:, 0].tolist()
+        self._stops = (table[:, 0] + table[:, 1]).tolist()
+
+    def __len__(self) -> int:
+        return len(self._starts)
+
+    def __getitem__(self, f: Any) -> Any:
+        if isinstance(f, slice):
+            return [self[i] for i in range(*f.indices(len(self)))]
+        return self._full[self._starts[f] : self._stops[f]]
+
+
+def _read_chunk_buffer(
+    level_group: Group,
+    chunk_coords: ChunkCoords,
+    dtype: np.dtype | str | None,
+    ndim: int,
+) -> tuple[npt.NDArray | None, ChunkFragmentIndex]:
+    """A chunk's ``(N, D)`` vertex buffer and fragment index; the buffer
+    is ``None`` when the chunk holds no fragments."""
     key = _chunk_key(chunk_coords)
     # Default to the declared dtype rather than float32.  Nothing in the
     # blob records the element type, so an assumed dtype is not checkable
@@ -5718,9 +5771,8 @@ def read_chunk_vertices(
         fi = read_vertex_fragment_index(level_group, chunk_coords)
 
     if fi.num_fragments == 0:
-        return []
-    full = _reshape_vertex_buffer(raw, dtype, ndim)
-    return _partition_rows(full, fi)
+        return None, fi
+    return _reshape_vertex_buffer(raw, dtype, ndim), fi
 
 
 def _partition_rows(
