@@ -269,33 +269,34 @@ def test_direct_path_declines_a_missing_array(tmp_path):
 # ---------------------------------------------------------------------------
 
 
-def test_cached_nodes_resolves_each_node_once(tmp_path):
+def test_cached_nodes_resolves_each_node_once(tmp_path, monkeypatch):
+    import zarr_vectors.core.group as group_module
+
     root = create_store(str(tmp_path / "store"), ndim=3)
     name = _cell_array(root, "cells")
     root.write_bytes(name, "0.0.0", b"payload")
 
+    # A LocalStore resolves through ``resolve_local_node`` rather than
+    # zarr's ``__getitem__``; count that.
     calls = []
-    real = type(root._zarr).__getitem__
+    real = group_module.resolve_local_node
 
-    def counting(self, key):
+    def counting(group, key):
         calls.append(key)
-        return real(self, key)
+        return real(group, key)
 
-    type(root._zarr).__getitem__ = counting
-    try:
-        with root.cached_nodes():
-            for _ in range(5):
-                root.read_array_meta(name)
-                root.list_chunks(name)
-        inside = list(calls)
-
-        calls.clear()
+    monkeypatch.setattr(group_module, "resolve_local_node", counting)
+    with root.cached_nodes():
         for _ in range(5):
             root.read_array_meta(name)
             root.list_chunks(name)
-        outside = list(calls)
-    finally:
-        type(root._zarr).__getitem__ = real
+    inside = list(calls)
+
+    calls.clear()
+    for _ in range(5):
+        root.read_array_meta(name)
+        root.list_chunks(name)
+    outside = list(calls)
 
     assert len(inside) == 1, inside
     assert len(outside) == 10, outside

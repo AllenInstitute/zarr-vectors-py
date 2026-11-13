@@ -53,6 +53,7 @@ from zarr_vectors.constants import (
 from zarr_vectors.constants import (
     VERTICES as _VERTICES_ARRAY,
 )
+from zarr_vectors.core._local_meta import resolve_local_node
 from zarr_vectors.core._vlen import (
     cell_region as _vlen_cell_region,
 )
@@ -777,6 +778,17 @@ class Group:
             return
         missing = {p for p in paths if self._full_path(p) not in cache}
         if not missing:
+            return
+        try:
+            # A local store answers on this thread faster than the
+            # gather below can be scheduled.
+            for path in sorted(missing):
+                node = resolve_local_node(self._zarr, path)
+                cache[self._full_path(path)] = _ABSENT if node is None else node
+            return
+        except NotImplementedError:
+            pass
+        except Exception:
             return
         from zarr.core.sync import sync
 
@@ -2299,8 +2311,13 @@ class Group:
             if hit is not None:
                 return None if hit is _ABSENT else hit
         try:
-            node = self._zarr[path]
-        except KeyError:
+            node = resolve_local_node(self._zarr, path)
+        except NotImplementedError:
+            try:
+                node = self._zarr[path]
+            except KeyError:
+                return None
+        if node is None:
             return None
         if cache is not None and (
             isinstance(node, zarr.Array) or self._node_cache_readonly
