@@ -913,6 +913,16 @@ def _apply_out_of_bounds_policy(
         )
     bmin = np.asarray(cur_bounds[0], dtype=positions.dtype)
     bmax = np.asarray(cur_bounds[1], dtype=positions.dtype)
+    # Per-column extremes first: when they sit inside the bounds every
+    # point does, and 2*D column reductions cost a fraction of the
+    # (N, D) masks below.  A NaN makes its column's min and max NaN,
+    # which fails this test and takes the exact path.
+    ndim = positions.shape[1]
+    if bmin.shape == bmax.shape == (ndim,) and all(
+        positions[:, k].min() >= bmin[k] and positions[:, k].max() <= bmax[k]
+        for k in range(ndim)
+    ):
+        return positions, np.ones(len(positions), dtype=bool)
     in_bounds = np.all(
         (positions >= bmin) & (positions <= bmax), axis=1,
     )

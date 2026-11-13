@@ -811,8 +811,10 @@ def _pack_rows(rows: npt.NDArray[np.int64]) -> npt.NDArray[np.int64] | None:
     when the columns' ranges do not fit in 63 bits."""
     if rows.shape[0] == 0:
         return None
-    lo = rows.min(axis=0)
-    span = rows.max(axis=0) - lo + 1
+    # Column by column: an axis-0 reduction over a tall, narrow array is
+    # several times slower than one pass per contiguous-stride column.
+    lo = np.array([rows[:, c].min() for c in range(rows.shape[1])], dtype=rows.dtype)
+    span = np.array([rows[:, c].max() for c in range(rows.shape[1])], dtype=rows.dtype) - lo + 1
     total = 1
     for s in span.tolist():
         total *= int(s)
@@ -912,7 +914,12 @@ def partition_link_arrays(
         return {}
 
     # --- placement: which input endpoint leads, and in what order -----
-    intra = xp.all(chunks == chunks[:, :1, :], axis=(1, 2))
+    # One 1-D compare per (endpoint, axis) rather than an (n, L, D) mask
+    # reduced over its two short trailing axes.
+    intra = xp.ones(n, dtype=bool)
+    for j in range(1, L):
+        for d in range(sid_ndim):
+            intra &= chunks[:, j, d] == chunks[:, 0, d]
     identity = xp.arange(L, dtype=xp.int64)
     if cross_level or directed or L == 1:
         sigma = xp.broadcast_to(identity, (n, L))

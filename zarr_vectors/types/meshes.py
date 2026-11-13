@@ -303,7 +303,11 @@ def write_mesh(
     # record reaches ``write_links``.
     f_chunk = vertex_chunks[faces]                      # (F, L)
     f_local = vertex_local[faces]                       # (F, L)
-    is_intra_face = np.all(f_chunk == f_chunk[:, :1], axis=1)
+    # Column against column: ``np.all(..., axis=1)`` over the short
+    # trailing axis was several times slower than L - 1 1-D compares.
+    is_intra_face = np.ones(len(f_chunk), dtype=bool)
+    for col in range(1, f_chunk.shape[1]):
+        is_intra_face &= f_chunk[:, col] == f_chunk[:, 0]
     is_draco = encoding == ENCODING_DRACO and ndim == 3
 
     # Draco embeds a chunk's intra-chunk faces in that chunk's own
@@ -315,16 +319,17 @@ def write_mesh(
             faces, vertex_chunks, vertex_local, chunk_list
         )
         store_rows = np.flatnonzero(~is_intra_face)
-    else:
-        store_rows = np.arange(n_faces, dtype=np.int64)
+        f_chunk = f_chunk[store_rows]
+        f_local = f_local[store_rows]
 
     # Records stay in face order, which the partitioner preserves within
     # each cell.  Held as arrays -- ``(F, L, D)`` endpoint chunks and
     # ``(F, L)`` local indices -- rather than one list of tuples per
     # face: building those and taking them apart again was 3 s of a
-    # half-million-face write before anything was partitioned.
-    link_chunks = np.asarray(chunk_list, dtype=np.int64)[f_chunk[store_rows]]
-    link_vi = f_local[store_rows]
+    # half-million-face write before anything was partitioned.  Raw
+    # stores every face, so it takes the gathered arrays as they are.
+    link_chunks = np.asarray(chunk_list, dtype=np.int64)[f_chunk]
+    link_vi = f_local
 
     # Write vertices per chunk, one fragment per object in the chunk.
     object_manifests: dict[int, ObjectManifest] = {}
