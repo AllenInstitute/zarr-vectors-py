@@ -113,29 +113,90 @@ _TIERS: tuple[tuple[str, Tier], ...] = (
 )
 
 
-def stability(module: str) -> Tier:
-    """Which tier ``module`` (or anything under it) is in.
-
-    Args:
-        module: A dotted module name, e.g. ``"zarr_vectors.core.arrays"``.
-
-    Raises:
-        KeyError: If nothing in the manifest covers it — which means a
-            module was added without being classified, not that the
-            caller asked wrongly.
-    """
+def _prefix_tier(module: str) -> Tier | None:
     best: tuple[int, Tier] | None = None
     for prefix, tier in _TIERS:
         if module == prefix or module.startswith(prefix + "."):
             if best is None or len(prefix) > best[0]:
                 best = (len(prefix), tier)
-    if best is None:
+    return None if best is None else best[1]
+
+
+def _exists(name: str) -> bool:
+    """Whether ``name`` is an importable module or an attribute of one."""
+    import importlib
+    import importlib.util
+
+    try:
+        if importlib.util.find_spec(name) is not None:
+            return True
+    except (ImportError, ValueError):
+        pass
+    parent, _, attr = name.rpartition(".")
+    if not parent:
+        return False
+    try:
+        return hasattr(importlib.import_module(parent), attr)
+    except ImportError:
+        return False
+
+
+def stability(module: str) -> Tier:
+    """Which tier ``module`` (or anything under it) is in.
+
+    Args:
+        module: A dotted module name, e.g. ``"zarr_vectors.core.arrays"``,
+            or a dotted name exported from one, e.g.
+            ``"zarr_vectors.api.Dataset"``.
+
+    The package itself and the names it exports are answered too:
+    ``"zarr_vectors"`` is supported, a name listed in
+    ``zarr_vectors.__all__`` (``zarr_vectors.open``,
+    ``zarr_vectors.stability``, ...) is supported, and any other
+    top-level name -- the storage-layer re-exports retired from
+    ``__all__``, such as ``zarr_vectors.FsGroup`` or
+    ``zarr_vectors.rechunk_by_attribute`` -- is internal: importable for
+    now, promised by nobody.  Where one of those has a supported
+    spelling it is in :mod:`zarr_vectors.building`.
+
+    Raises:
+        KeyError: If nothing in the manifest covers it — which means a
+            module was added without being classified — or if no such
+            module or exported name exists.  A name that does not exist
+            is not "supported" just because it sits under a supported
+            prefix.
+    """
+    if module == "zarr_vectors":
+        return "supported"
+    if not _exists(module):
+        raise KeyError(
+            f"{module!r} is not in the stability manifest: no module or "
+            f"exported name of that name exists."
+        )
+    parent, _, attr = module.rpartition(".")
+    if parent == "zarr_vectors":
+        import importlib.util
+
+        is_module = False
+        try:
+            is_module = importlib.util.find_spec(module) is not None
+        except (ImportError, ValueError):
+            pass
+        if not is_module:
+            import zarr_vectors
+
+            return (
+                "supported" if attr in getattr(zarr_vectors, "__all__", ())
+                else "internal"
+            )
+    tier = _prefix_tier(module)
+    if tier is None:
         raise KeyError(
             f"{module!r} is not in the stability manifest. Add it to "
             f"SUPPORTED, INTERNAL or UNDECIDED in zarr_vectors/_stability.py "
             f"— a module with no tier is a promise nobody made or refused."
         )
-    return best[1]
+    return tier
 
 
 def is_internal(module: str) -> bool:

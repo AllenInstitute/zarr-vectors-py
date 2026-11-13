@@ -31,3 +31,31 @@ def test_capacity_without_extent_uses_allocation():
     grid = zv.Grid(shape=(2, 2, 2), cell_shape=(1.0, 1.0, 1.0))
     cap = grid.capacity(n_vertices=800)
     assert cap.est_bytes_per_cell == pytest.approx(800 * 12 / 8)
+
+
+# ---------------- stability manifest vs exports ----------------
+
+
+@pytest.mark.parametrize("name", [
+    "zarr_vectors", "zarr_vectors.open", "zarr_vectors.stability",
+    "zarr_vectors.runtime_capabilities", "zarr_vectors.concurrency_contract",
+    "zarr_vectors.Dataset",
+])
+def test_top_level_exports_are_supported(name):
+    assert zv.stability(name) == "supported"
+
+
+def test_every_name_in_dunder_all_is_supported():
+    for name in zv.__all__:
+        assert zv.stability(f"zarr_vectors.{name}") == "supported", name
+
+
+def test_retired_top_level_reexports_are_internal():
+    assert zv.stability("zarr_vectors.rechunk_by_attribute") == "internal"
+    assert zv.stability("zarr_vectors.FsGroup") == "internal"
+
+
+def test_a_missing_name_under_a_supported_prefix_raises():
+    with pytest.raises(KeyError, match="no module or exported name"):
+        zv.stability("zarr_vectors.api.nonexistent")
+    assert zv.stability("zarr_vectors.api.Dataset") == "supported"
