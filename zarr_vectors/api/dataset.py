@@ -614,7 +614,7 @@ def open(
     group = open_store(
         source, mode,
         backend=storage.resolve_backend(str(source)),
-        storage_options=dict(storage.options) or None,
+        storage_options=storage.resolve_options(str(source)),
     )
     return Dataset(group, storage=storage)
 
@@ -650,7 +650,7 @@ def create(
         geometry_types=[schema.kind] if schema.kind else None,
         attribute_specs=schema.to_root_block() or None,
         backend=storage.resolve_backend(str(target)),
-        storage_options=dict(storage.options) or None,
+        storage_options=storage.resolve_options(str(target)),
     )
     return Dataset(group, storage=storage)
 
@@ -682,7 +682,7 @@ def open_or_create(
         group = open_store(
             target, "r+",
             backend=storage.resolve_backend(str(target)),
-            storage_options=dict(storage.options) or None,
+            storage_options=storage.resolve_options(str(target)),
         )
     except (StoreError, FileNotFoundError, KeyError):
         return create(target, schema=schema, storage=storage)
@@ -717,7 +717,7 @@ async def aopen(source: Any, *, storage: StorageOptions | None = None) -> Datase
     group = await open_store_async(
         source,
         backend=storage.resolve_backend(str(source)),
-        storage_options=dict(storage.options) or None,
+        storage_options=storage.resolve_options(str(source)),
     )
     return Dataset(group, storage=storage)
 

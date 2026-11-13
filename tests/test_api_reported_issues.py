@@ -366,3 +366,37 @@ def test_unnarrowed_query_cells_are_the_levels_cells(tmp_path):
     ds.add_points(_pts())
     assert set(ds.select().cells()) == set(ds.level(0).cells())
     assert len(ds.select().cells()) > 1
+
+
+# ---------------- StorageOptions.branch ----------------
+
+
+def test_branch_reaches_the_icechunk_session(monkeypatch, tmp_path):
+    from zarr_vectors.core.backends import icechunk_backend
+
+    seen = {}
+
+    class Reached(Exception):
+        pass
+
+    def fake(url, *, mode="r+", **kw):
+        seen.update(kw, mode=mode)
+        raise Reached
+
+    monkeypatch.setattr(icechunk_backend, "make_icechunk_session", fake)
+    storage = zv.StorageOptions(backend="icechunk", branch="dev")
+    with pytest.raises(Reached):
+        zv.open(str(tmp_path / "repo"), storage=storage)
+    assert seen["branch"] == "dev"
+
+
+def test_branch_without_icechunk_is_refused(tmp_path):
+    ds = _new(tmp_path)
+    ds.add_points(_pts())
+    with pytest.raises(ValueError, match="icechunk"):
+        zv.open(tmp_path / "s.zv", storage=zv.StorageOptions(branch="dev"))
+
+
+def test_storage_options_without_branch_are_unchanged():
+    assert zv.StorageOptions().resolve_options("x") is None
+    assert zv.StorageOptions(options={"a": 1}).resolve_options("x") == {"a": 1}
