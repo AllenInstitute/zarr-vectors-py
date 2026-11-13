@@ -249,6 +249,7 @@ def write_polylines(
     out_of_bounds: str = DEFAULT_OOB_POLICY,
     compressor: Any = None,
     shard_shape: int | tuple[int, ...] | None | Literal["inherit"] = "inherit",
+    manifest_layout: str | None = None,
 ) -> dict[str, Any]:
     """Write polylines/streamlines to a new zarr vectors store.
 
@@ -270,6 +271,13 @@ def write_polylines(
         group_attributes: Per-group attributes ``{name: (G,) or (G,C)}``.
         dtype: Numpy dtype for positions.
         geometry_type: ``"streamline"`` or ``"polyline"``.
+        manifest_layout: ``"dense"`` to write the object index as
+            fixed-width integer arrays rather than one vlen blob per
+            polyline (see :func:`~zarr_vectors.core.store.create_store`),
+            which makes a whole-index scan such as a ``bbox`` read a
+            numeric gather.  The store then needs a 0.9.4+ reader.  Only
+            meaningful when this call creates the store; ``None`` keeps
+            the vlen default.
 
     Returns:
         Summary dict.
@@ -318,6 +326,7 @@ def write_polylines(
         # one keeps its own declaration. "inherit" means the caller said
         # nothing, so there is nothing to declare on a fresh store.
         shard_shape=None if shard_shape == "inherit" else shard_shape,
+        manifest_layout=manifest_layout,
     )
     _apply_out_of_bounds_policy(root, all_pts, policy=out_of_bounds)
 

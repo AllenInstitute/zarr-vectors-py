@@ -1054,6 +1054,7 @@ def _create_or_open_store(
     geometry_types: list[str] | None = None,
     ndim: int | None = None,
     shard_shape: int | Sequence[int] | None = None,
+    manifest_layout: str | None = None,
     **backend_kwargs: Any,
 ) -> Group:
     """Warm the store with :func:`create_store` if no store exists at
@@ -1066,7 +1067,8 @@ def _create_or_open_store(
     — this lets callers write through a handle they already hold.
 
     The create-only kwargs (``bounds`` / ``chunk_shape`` / ``axes`` /
-    ``geometry_types`` / ``ndim`` / ``shard_shape``) are forwarded to
+    ``geometry_types`` / ``ndim`` / ``shard_shape`` /
+    ``manifest_layout``) are forwarded to
     :func:`create_store` on a fresh path and ignored when opening an
     existing store — the existing store's structural metadata stays
     authoritative.
@@ -1096,6 +1098,8 @@ def _create_or_open_store(
         creator_kwargs["ndim"] = ndim
     if shard_shape is not None:
         creator_kwargs["shard_shape"] = shard_shape
+    if manifest_layout is not None:
+        creator_kwargs["manifest_layout"] = manifest_layout
 
     if backend == "icechunk":
         try:
