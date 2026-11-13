@@ -1021,6 +1021,98 @@ def partition_link_arrays(
     return out
 
 
+def partition_link_indices(
+    chunk_table: npt.NDArray[np.int64],
+    cidx: npt.NDArray[np.int64],
+    vi: npt.NDArray[np.int64],
+    *,
+    sid_ndim: int,
+    intra: npt.NDArray[np.bool_] | None = None,
+) -> dict[tuple[str, ChunkCoords], tuple[npt.NDArray[np.int64], npt.NDArray[np.int64]]]:
+    """:func:`partition_link_arrays` for same-level, undirected records
+    whose endpoint chunks are given as indices into a sorted table.
+
+    Returns exactly what ``partition_link_arrays(chunk_table[cidx], vi,
+    ...)`` returns with ``delta=0`` scales, without building the
+    ``(M, L, sid_ndim)`` coordinate array.  A mesh has nearly all its
+    faces inside one chunk, and for those the general placement is the
+    identity, the offsets are zero and the bucket is the source chunk,
+    so they are grouped by a stable sort of their chunk index alone.
+    Only the records that cross a chunk boundary go through
+    :func:`partition_link_arrays`.
+
+    Args:
+        chunk_table: ``(C, sid_ndim)`` chunk coords, lexicographically
+            sorted and distinct, so index order is coordinate order.
+        cidx: ``(M, L)`` index into ``chunk_table`` of every endpoint.
+        vi: ``(M, L)`` chunk-local vertex index of every endpoint.
+        sid_ndim: Spatial index dimensionality.
+        intra: ``(M,)`` whether all of a record's endpoints share a
+            chunk, when the caller has it already.
+
+    Returns:
+        As :func:`partition_link_arrays`.
+    """
+    chunk_table = np.asarray(chunk_table, dtype=np.int64)
+    cidx = np.asarray(cidx, dtype=np.int64)
+    vi = np.asarray(vi, dtype=np.int64)
+    n, L = vi.shape
+    if L > _MAX_ARRAY_LINK_WIDTH:
+        raise ChunkingError(
+            f"partition_link_indices: link_width {L} exceeds "
+            f"{_MAX_ARRAY_LINK_WIDTH}; use partition_records_by_offset"
+        )
+    if intra is None:
+        intra = np.all(cidx == cidx[:, :1], axis=1)
+    intra_idx = np.flatnonzero(intra)
+    cross_idx = np.flatnonzero(~intra)
+    intra_buckets: list[
+        tuple[tuple[str, ChunkCoords], tuple[npt.NDArray[np.int64], npt.NDArray[np.int64]]]
+    ] = []
+    if intra_idx.size:
+        src = cidx[intra_idx, 0]
+        # numpy sorts 16-bit keys stably by radix, in linear time.
+        key = src.astype(np.uint16) if len(chunk_table) <= (1 << 16) else src
+        sort = np.argsort(key, kind="stable")
+        order = intra_idx[sort]
+        src = src[sort]
+        rows = vi[order]
+        starts = np.flatnonzero(np.concatenate(([True], src[1:] != src[:-1])))
+        ends = np.append(starts[1:], order.size)
+        segment = format_offsets(((0,) * sid_ndim,) * (L - 1))
+        heads = chunk_table[src[starts]].tolist()
+        for head, start, end in zip(heads, starts.tolist(), ends.tolist()):
+            intra_buckets.append(
+                ((segment, tuple(head)), (rows[start:end], order[start:end])),
+            )
+    cross: dict[
+        tuple[str, ChunkCoords], tuple[npt.NDArray[np.int64], npt.NDArray[np.int64]]
+    ] = {}
+    if cross_idx.size:
+        unit = [1] * sid_ndim
+        cross = partition_link_arrays(
+            chunk_table[cidx[cross_idx]], vi[cross_idx],
+            link_width=L, sid_ndim=sid_ndim, scale_src=unit, scale_trg=unit,
+        )
+    # Buckets in the order partition_link_arrays gives them: by source
+    # chunk, then offsets.  A crossing record's offsets are
+    # lexicographically positive, so a chunk's intra bucket leads its own.
+    out: dict[
+        tuple[str, ChunkCoords], tuple[npt.NDArray[np.int64], npt.NDArray[np.int64]]
+    ] = {}
+    pending = iter(intra_buckets)
+    nxt = next(pending, None)
+    for bucket, (rows, idx) in cross.items():
+        while nxt is not None and nxt[0][1] <= bucket[1]:
+            out[nxt[0]] = nxt[1]
+            nxt = next(pending, None)
+        out[bucket] = (rows, cross_idx[idx])
+    while nxt is not None:
+        out[nxt[0]] = nxt[1]
+        nxt = next(pending, None)
+    return out
+
+
 # ===================================================================
 # Vertex assignment helpers
 # ===================================================================

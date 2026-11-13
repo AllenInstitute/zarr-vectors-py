@@ -86,6 +86,7 @@ from zarr_vectors.exceptions import ArrayError
 from zarr_vectors.spatial.boundary import (
     build_vertex_chunk_mapping,
     partition_faces,
+    partition_link_indices,
 )
 from zarr_vectors.spatial.chunking import (
     assign_chunks,
@@ -320,24 +321,31 @@ def write_mesh(
             faces, vertex_chunks, vertex_local, chunk_list
         )
         store_rows = np.flatnonzero(~is_intra_face)
-        f_chunk = f_chunk[store_rows]
-        f_local = f_local[store_rows]
+        link_cidx = f_chunk[store_rows]
+        link_vi = f_local[store_rows]
+        link_intra = is_intra_face[store_rows]
+    else:
+        link_cidx, link_vi, link_intra = f_chunk, f_local, is_intra_face
 
     # Records stay in face order, which the partitioner preserves within
-    # each cell.  Held as arrays -- ``(F, L, D)`` endpoint chunks and
-    # ``(F, L)`` local indices -- rather than one list of tuples per
-    # face: building those and taking them apart again was 3 s of a
-    # half-million-face write before anything was partitioned.  Raw
-    # stores every face, so it takes the gathered arrays as they are.
-    link_chunks = np.asarray(chunk_list, dtype=np.int64)[f_chunk]
-    link_vi = f_local
+    # each cell.  Held as arrays -- ``(F, L)`` endpoint chunk indices and
+    # local indices -- rather than one list of tuples per face: building
+    # those and taking them apart again was 3 s of a half-million-face
+    # write before anything was partitioned.  Chunk indices rather than
+    # coords, so the intra-chunk faces group by one small-integer sort.
+    idx_ndim = ndim + 1 if vertex_attr_bins is not None else ndim
+    link_buckets: dict[tuple[str, ChunkCoords], Any] = {}
+    if len(link_vi):
+        link_buckets = partition_link_indices(
+            np.asarray(chunk_list, dtype=np.int64), link_cidx, link_vi,
+            sid_ndim=idx_ndim, intra=link_intra,
+        )
 
     # Write vertices per chunk, one fragment per object in the chunk.
     object_manifests: dict[int, ObjectManifest] = {}
     # First row of each chunk's vertex fragments, so write_links can file
     # each chunk's intra-chunk faces one link fragment per vertex fragment.
     fragment_starts: dict[ChunkCoords, npt.NDArray[np.int64]] = {}
-    idx_ndim = ndim + 1 if vertex_attr_bins is not None else ndim
 
     # Collapse all per-array zarr.json + per-chunk byte writes into one
     # asyncio.gather (mirrors points.py:300).  ``shard_shape`` also
@@ -422,10 +430,11 @@ def write_mesh(
         # Intra-chunk faces are filed one link fragment per vertex
         # fragment -- i.e. per object -- so an object read can take its
         # own faces without decoding its neighbours'.
-        if len(link_vi):
+        if link_buckets:
             write_links(
                 level_group, [], idx_ndim, delta=0,
-                link_width=link_width, _arrays=(link_chunks, link_vi),
+                link_width=link_width, _prepartitioned=link_buckets,
+                _num_records=len(link_vi),
                 fragment_starts=fragment_starts or None,
             )
         # Backstop: `arrays_present` advertises the family, and the
