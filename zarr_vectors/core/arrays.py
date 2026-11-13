@@ -4923,7 +4923,9 @@ def iter_link_cells(
 
     Offsets come from each array's own ``offsets`` meta when present,
     falling back to parsing the path segment; the two agree, but the
-    meta needs no ``sid_ndim`` to decode.
+    meta needs no ``sid_ndim`` to decode.  The row width likewise comes
+    from the array's ``has_perm`` stamp, as :func:`read_links` reads it,
+    with :func:`links_has_perm` only as the fallback for unstamped arrays.
     """
     policy = link_family_policy(level_group, delta)
     if policy is None:
@@ -4943,9 +4945,14 @@ def iter_link_cells(
         else:
             continue
         dtype = np.dtype(meta.get("dtype", "int64"))
-        has_perm = links_has_perm(
-            offsets, delta=delta, directed=directed, store=store,
-        )
+        # The array's own stamp wins, as in read_links; the policy is
+        # only the fallback for an array written before it was stamped.
+        has_perm = bool(meta.get(
+            "has_perm",
+            links_has_perm(
+                offsets, delta=delta, directed=directed, store=store,
+            ),
+        ))
         width = link_width + (1 if has_perm else 0)
         for key in sorted(level_group.list_chunks(full_name)):
             try:
@@ -7542,15 +7549,6 @@ def object_ids_for_rows(
     return table if rows is None else table[np.asarray(list(rows), dtype=np.int64)]
 
 
-def object_row_count(level_group: Group) -> int:
-    """How many manifest rows this level holds."""
-    try:
-        meta = level_group.read_array_meta(OBJECT_INDEX)
-    except Exception:
-        return 0
-    return int(meta.get("num_objects", 0) or 0)
-
-
 def object_count(level_group: Group) -> int:
     """How many objects this level declares, without decoding any of them."""
     try:
@@ -7558,6 +7556,17 @@ def object_count(level_group: Group) -> int:
     except Exception:
         return 0
     return int(meta.get("num_objects", 0) or 0)
+
+
+def object_row_count(level_group: Group) -> int:
+    """How many manifest rows this level holds.
+
+    The same number as :func:`object_count` -- one manifest row per
+    declared object, both read from ``object_index``'s ``num_objects``
+    stamp -- and kept as an alias that delegates to it.  An id lookup's
+    row count is not this; callers read that from the lookup itself.
+    """
+    return object_count(level_group)
 
 
 def object_present_mask(level_group: Group) -> npt.NDArray[np.bool_]:

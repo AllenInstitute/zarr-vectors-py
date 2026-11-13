@@ -628,14 +628,23 @@ class RootMetadata:
         the NGFF ``multiscales[0].axes`` block, written separately by
         :func:`zarr_vectors.core.multiscale.write_multiscale_metadata`.
         Combine the two when writing root attrs.
+
+        Key presence follows :func:`zarr_vectors.core.store._write_root_attrs`:
+        ``zv_version``, ``format_capabilities`` (possibly empty),
+        ``chunk_shape``, ``bounds`` and ``geometry_types`` are always
+        written; ``crs`` and the other optional keys only when they carry
+        a value.  The policy fields (``links_convention`` ...
+        ``reduction_factor``) always have one here, so they are always
+        emitted, whereas a store records them only once a writer stamps
+        them -- :meth:`from_dict` reads an absent one as its default.
         """
         d = {
             "zarr_vectors": {
                 "zv_version": self.zv_version,
+                "format_capabilities": list(self.format_capabilities),
                 "chunk_shape": list(self.chunk_shape),
                 "bounds": [list(self.bounds[0]), list(self.bounds[1])],
                 "geometry_types": self.geometry_types,
-                "crs": self.crs,
                 "links_convention": self.links_convention,
                 "object_index_convention": self.object_index_convention,
                 "cross_chunk_strategy": self.cross_chunk_strategy,
@@ -656,8 +665,8 @@ class RootMetadata:
             d["zarr_vectors"]["manifest_layout"] = "dense"
         if self.manifest_block_dtype == "int32":
             d["zarr_vectors"]["manifest_block_dtype"] = "int32"
-        if self.format_capabilities:
-            d["zarr_vectors"]["format_capabilities"] = list(self.format_capabilities)
+        if self.crs is not None:
+            d["zarr_vectors"]["crs"] = self.crs
         if self.attribute_specs:
             d["zarr_vectors"]["attribute_specs"] = {
                 scope: {n: dict(spec) for n, spec in named.items()}

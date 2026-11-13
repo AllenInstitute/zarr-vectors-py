@@ -25,7 +25,9 @@ from zarr_vectors.constants import (
     DEFAULT_OOB_POLICY,
     FRAGMENT_ATTRIBUTES,
     GEOM_POINT_CLOUD,
-    LINKS_IMPLICIT_SEQUENTIAL,
+    GROUP_ATTRIBUTES,
+    GROUPS,
+    OBJECT_ATTRIBUTES,
     OBJIDX_STANDARD,
     RESOLUTION_PREFIX,
     VERTEX_ATTRIBUTES,
@@ -274,19 +276,30 @@ def write_points(
         inferred_ndim=ndim,
         geometry_type=GEOM_POINT_CLOUD,
         base_bin_shape=bin_shape,
-        links_convention=LINKS_IMPLICIT_SEQUENTIAL,
+        # A point cloud has no links, and the spec says it carries no
+        # links_convention; stamping one here also pinned it (first
+        # writer wins) for any linked geometry added to the store later.
+        links_convention=None,
         object_index_convention=OBJIDX_STANDARD,
         cross_chunk_strategy=CROSS_CHUNK_EXPLICIT,
     )
     axes = root_meta.spatial_index_dims
 
-    arrays_present = [VERTICES]
+    # Every family this call writes, so the level declares what is on
+    # disk (vertex_fragments is always written next to vertices).
+    arrays_present = [VERTICES, VERTEX_FRAGMENTS]
     if attributes:
         arrays_present.append(VERTEX_ATTRIBUTES)
     if fragment_attributes:
         arrays_present.append(FRAGMENT_ATTRIBUTES)
     if needs_objects:
         arrays_present.append("object_index")
+    if object_attributes:
+        arrays_present.append(OBJECT_ATTRIBUTES)
+    if groups:
+        arrays_present.append(GROUPS)
+    if group_attributes:
+        arrays_present.append(GROUP_ATTRIBUTES)
 
     level_chunk_dims: list[str] | None = None
     if chunk_by_attribute is not None:

@@ -235,7 +235,13 @@ rather than a contiguous-byte vertex group)."""
 CAP_FRAGMENT_INDEX: str = "fragment_index"
 """The store uses the v0.6 fragment-index encoding for ``vertex_fragments``
 and ``link_fragments`` (single uint8 blob per chunk; see
-:mod:`zarr_vectors.encoding.fragments`)."""
+:mod:`zarr_vectors.encoding.fragments`).
+
+Reserved, not stamped: every store this package writes uses that
+encoding, and each sidecar array declares it itself
+(``encoding: "fragment_index_v1"`` in its own metadata), which is what
+readers consult.  Root ``format_capabilities`` never carries this token,
+so no reader may require it."""
 
 CAP_DENSE_MANIFESTS: str = "dense_manifests"
 """At least one level's object index is (or will be written) in the

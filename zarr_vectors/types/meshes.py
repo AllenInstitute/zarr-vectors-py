@@ -31,6 +31,7 @@ from zarr_vectors.constants import (
     OBJECT_INDEX,
     OBJIDX_STANDARD,
     RESOLUTION_PREFIX,
+    VERTEX_ATTRIBUTES,
     VERTEX_FRAGMENTS,
     VERTICES,
 )
@@ -130,7 +131,9 @@ def write_mesh(
         vertices: ``(V, D)`` vertex positions.
         faces: ``(F, L)`` face index array (L=3 triangles, L=4 quads).
         chunk_shape: Spatial chunk size per dimension.
-        encoding: ``"raw"`` or ``"draco"``.
+        encoding: ``"raw"`` or ``"draco"``.  Draco applies to 3-D
+            triangle meshes only; on vertices that are not 3-D the mesh
+            is written (and stamped) raw.
         vertex_attributes: Per-vertex attributes ``{name: (V,) or (V,C)}``.
         object_ids: ``(V,)`` array assigning vertices to mesh objects.
             If None, all vertices belong to object 0.
@@ -177,6 +180,28 @@ def write_mesh(
             "Use 'raise' (default) or 'expand', or pre-filter vertices "
             "and remap faces upstream."
         )
+    # Draco is only applied to 3-D vertices; anything else is written
+    # raw, and the vertices array must say so -- it used to be stamped
+    # with the requested encoding regardless.
+    is_draco = encoding == ENCODING_DRACO and ndim == 3
+    stored_encoding = ENCODING_DRACO if is_draco else (
+        ENCODING_RAW if encoding == ENCODING_DRACO else encoding
+    )
+    if is_draco:
+        # Fail before anything is created: a Draco failure inside the
+        # chunk loop left the root, level and empty arrays on disk.
+        from zarr_vectors.encoding.draco import draco_backend_available
+        from zarr_vectors.exceptions import DracoError
+        if link_width != 3:
+            raise ArrayError(
+                f"encoding='draco' encodes triangles only; faces have "
+                f"{link_width} vertices each. Use encoding='raw'."
+            )
+        if not draco_backend_available():
+            raise DracoError(
+                "encoding='draco' needs DracoPy or the draco_encoder CLI, "
+                "and neither was found. Install with: pip install DracoPy"
+            )
     root = _create_or_open_store(
         store_path,
         backend=backend,
@@ -253,7 +278,15 @@ def write_mesh(
     level_meta = LevelMetadata(
         level=0,
         vertex_count=n_verts,
-        arrays_present=[VERTICES, "links", "object_index"],
+        # Every family this call writes.  ``links`` and its
+        # ``link_fragments`` sidecar always exist: the backstop below
+        # creates the intra-chunk array even when no face is stored.
+        arrays_present=[
+            VERTICES, VERTEX_FRAGMENTS, "links", LINK_FRAGMENTS,
+            "object_index",
+            *([VERTEX_ATTRIBUTES] if vertex_attributes else []),
+            *(["object_attributes"] if object_attributes else []),
+        ],
         chunk_dims=level_chunk_dims,
         chunk_attribute_name=chunk_by_attribute,
         chunk_attribute_values=attr_bin_values,
@@ -309,7 +342,6 @@ def write_mesh(
     is_intra_face = np.ones(len(f_chunk), dtype=bool)
     for col in range(1, f_chunk.shape[1]):
         is_intra_face &= f_chunk[:, col] == f_chunk[:, 0]
-    is_draco = encoding == ENCODING_DRACO and ndim == 3
 
     # Draco embeds a chunk's intra-chunk faces in that chunk's own
     # bitstream, in chunk-local indices, so only the boundary-crossing
@@ -360,7 +392,9 @@ def write_mesh(
         bounds=bounds_list, chunk_shape=chunk_shape,
         bin_count=session_bin_count,
     ):
-        create_vertices_array(level_group, dtype=dtype, encoding=encoding)
+        create_vertices_array(
+            level_group, dtype=dtype, encoding=stored_encoding,
+        )
         create_object_index_array(level_group)
         # The links family is created by ``write_links`` below, stamped
         # with the real face arity.  The pre-merge cross-chunk family was
