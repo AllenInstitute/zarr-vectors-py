@@ -75,3 +75,28 @@ def test_schema_rejects_an_unknown_kind():
 ])
 def test_schema_accepts_every_geometry_type(kind):
     assert zv.Schema(kind=kind).kind == kind
+
+
+# ---------------- Schema.position_dtype ----------------
+
+
+@pytest.mark.parametrize("kind,write", [
+    ("point_cloud", lambda ds, p: ds.add_points(p)),
+    ("polyline", lambda ds, p: ds.add_polylines([p[:5], p[5:9]])),
+    ("mesh", lambda ds, p: ds.add_mesh(p[:3], np.array([[0, 1, 2]]))),
+    ("graph", lambda ds, p: ds.add_graph(p[:5], np.array([[0, 1]]))),
+])
+def test_position_dtype_float64_is_honoured(tmp_path, kind, write):
+    pts = np.random.default_rng(1).uniform(0, 100, (50, 3))
+    ds = zv.create(
+        tmp_path / "s.zv",
+        schema=zv.Schema(bounds=BOUNDS, kind=kind, position_dtype="float64"),
+    )
+    write(ds, pts)
+    got = ds.read().positions
+    assert got.dtype == np.float64
+    if kind == "point_cloud":
+        # Full precision, not float32 widened back.
+        order = np.lexsort(got.T)
+        want = pts[np.lexsort(pts.T)]
+        assert np.array_equal(got[order], want)

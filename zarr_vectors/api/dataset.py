@@ -378,6 +378,11 @@ class Dataset:
         effective = layout or schema.layout
         resolved = effective.resolve(schema, store_kind=self._store_kind())
         kwargs = {k: v for k, v in kwargs.items() if v is not None}
+        # The position dtype the store was created with.  ``create``
+        # stamps Schema.position_dtype on level 0's vertices array, but
+        # every writer defaults ``dtype="float32"``, so without this a
+        # float64 schema silently stored float32 positions.
+        kwargs.setdefault("dtype", self._position_dtype())
         # Checked BEFORE the write: a declaration the data contradicts is
         # worth catching while the store is still as it was.
         _check_declared(schema, kwargs)
@@ -393,6 +398,18 @@ class Dataset:
         )
         _stamp_declared(self, schema, kwargs)
         return report
+
+    def _position_dtype(self) -> str:
+        """The vertex dtype level 0 declares; ``float32`` when it has none."""
+        from zarr_vectors.core.arrays import vertices_dtype
+        from zarr_vectors.core.store import get_resolution_level
+
+        try:
+            return np.dtype(
+                vertices_dtype(get_resolution_level(self._group, 0))
+            ).name
+        except Exception:  # noqa: BLE001 - no level 0 yet: writer default
+            return "float32"
 
     def _store_kind(self) -> str:
         from zarr_vectors.core.backends import detect_scheme
