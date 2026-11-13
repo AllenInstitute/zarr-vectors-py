@@ -240,3 +240,68 @@ class TestChunkScopedEdges:
 
         assert len(got["positions"]) == int(inside.sum())
         assert as_set(got["positions"], got["edges"]) == as_set(pos, want)
+
+
+class TestSkeletonEdgeAttributes:
+    """``link_attributes`` on a skeleton keep a value for EVERY edge.
+
+    Implied (sequential) edges used to be skipped as records, and
+    ``link_attributes/`` mirrors records row for row, so their values were
+    dropped: 123 rows came back for 780 edges.
+    """
+
+    def test_every_edge_keeps_its_value(self, tmp_path: Path) -> None:
+        from zarr_vectors.core.arrays import read_link_attributes, read_links
+        from zarr_vectors.core.store import get_resolution_level, open_store
+
+        rng = np.random.default_rng(0)
+        n = 300
+        parent = np.array([rng.integers(0, i) for i in range(1, n)])
+        edges = np.stack([np.arange(1, n), parent], axis=1)
+        pos = rng.uniform(0, 1000, (n, 3)).astype(np.float32)
+        weight = np.arange(len(edges), dtype=np.float32) + 0.5
+        store = str(tmp_path / "skel_attr.zarrvectors")
+        write_graph(
+            store, pos, edges, chunk_shape=(250.0,) * 3, kind="skeleton",
+            link_attributes={"w": weight},
+        )
+        # Topology is unchanged by the extra explicit records.
+        g = read_graph(store)
+        got = {
+            (tuple(g["positions"][c].tolist()), tuple(g["positions"][p].tolist()))
+            for c, p in g["edges"].tolist()
+        }
+        want = {
+            (tuple(pos[c].tolist()), tuple(pos[p].tolist())) for c, p in edges
+        }
+        assert got == want
+
+        lg = get_resolution_level(open_store(store), 0)
+        vals = read_link_attributes(lg, "w")
+        recs = read_links(lg)
+        assert len(vals) == len(recs) == len(edges)
+        verts: dict = {}
+
+        def _at(cc, vi):
+            if cc not in verts:
+                from zarr_vectors.core.arrays import read_chunk_vertices
+                verts[cc] = np.concatenate(read_chunk_vertices(lg, cc, ndim=3))
+            return tuple(verts[cc][vi].tolist())
+
+        by_pair = {
+            (tuple(pos[c].tolist()), tuple(pos[p].tolist())): float(w)
+            for (c, p), w in zip(edges, weight)
+        }
+        for ((ccc, cv), (pcc, pv)), v in zip(recs, np.asarray(vals).ravel()):
+            assert by_pair[(_at(ccc, cv), _at(pcc, pv))] == float(v)
+
+    def test_without_attributes_only_needed_records_are_stored(
+        self, tmp_path: Path,
+    ) -> None:
+        pos = np.array([[10, 10, 10], [20, 10, 10], [30, 10, 10]], np.float32)
+        edges = np.array([[1, 0], [2, 1]])
+        summary = write_graph(
+            str(tmp_path / "s.zarrvectors"), pos, edges,
+            chunk_shape=(100.0,) * 3, kind="skeleton",
+        )
+        assert summary["intra_edge_count"] == 0

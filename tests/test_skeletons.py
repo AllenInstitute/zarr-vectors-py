@@ -106,8 +106,9 @@ class TestPerChunkWrite:
 class TestDirectedCrossChunk:
     def test_parent_child_order_preserved(self, tmp_path: Path) -> None:
         root, lg = _init(tmp_path)
-        # Parent in chunk (1,0,0), child in chunk (0,0,0): canonical sort
-        # would swap them; directed storage must not.
+        # Records are [child, parent].  Child in chunk (1,0,0), parent in
+        # chunk (0,0,0): canonical sort would swap them; directed storage
+        # must not.
         links = [(((1, 0, 0), 0), ((0, 0, 0), 0))]
         write_skeleton_cross_chunk_links(lg, links, ndim=3)
 
@@ -117,9 +118,9 @@ class TestDirectedCrossChunk:
         out = read_cross_links(lg, delta=0)
         assert out == [(((1, 0, 0), 0), ((0, 0, 0), 0))]
 
-        # The parent is the source cell and the child sits one chunk back
+        # The child is the source cell and the parent sits one chunk back
         # along -x.  A canonical sort would instead have led with the
-        # child, filing the record at cell 0.0.0 under offsets "+1.0.0" —
+        # parent, filing the record at cell 0.0.0 under offsets "+1.0.0" —
         # the negative offset is the direction surviving on disk.
         # (``0.0.0``, the intra array, is pre-created empty by init.)
         segments = lg[links_group_path(0)].children()
@@ -169,3 +170,94 @@ class TestReadBySegmentId:
         )
         skel = read_skeleton_by_segment_id(str(tmp_path / "skel.zv"), 999)
         assert skel is None
+
+
+def _two_chunk_tree(tmp_path: Path):
+    """Streaming store holding one tree 0-1 | 2-3 whose edge 2->1 crosses
+    from chunk (1,0,0) into chunk (0,0,0)."""
+    from zarr_vectors.types.skeletons import finalize_skeleton_store
+
+    root, lg = _init(tmp_path)
+    pa = {
+        "segment_id": 5,
+        "positions": np.array([[10, 10, 10], [50, 10, 10]], np.float32),
+        "edges": np.array([[1, 0]]), "anchors": {"parent": 1},
+        "attributes": {"radius": np.array([1.0, 2.0], np.float32)},
+    }
+    pb = {
+        "segment_id": 5,
+        "positions": np.array([[150, 10, 10], [170, 10, 10]], np.float32),
+        "edges": np.array([[1, 0]]), "anchors": {"child": 0},
+        "attributes": {"radius": np.array([3.0, 4.0], np.float32)},
+    }
+    _r, la = write_skeleton_chunk(lg, (0, 0, 0), [pa])
+    _r, lb = write_skeleton_chunk(lg, (1, 0, 0), [pb])
+    write_skeleton_cross_chunk_links(lg, [(lb["child"], la["parent"])], ndim=3)
+    write_object_index(
+        lg, {0: [((0, 0, 0), 0), ((1, 0, 0), 0)]}, sid_ndim=3, total_objects=1,
+    )
+    write_object_attributes(lg, "segment_id", np.array([5], dtype=np.uint64))
+    finalize_skeleton_store(root)
+    return str(tmp_path / "skel.zv")
+
+
+class TestLinkOrderAgreement:
+    """Every skeleton writer stores [child, parent]; every reader decodes it."""
+
+    def test_read_graph_on_streamed_store(self, tmp_path: Path) -> None:
+        from zarr_vectors.types.graphs import read_graph
+
+        path = _two_chunk_tree(tmp_path)
+        got = {tuple(e) for e in read_graph(path)["edges"].tolist()}
+        assert got == {(1, 0), (2, 1), (3, 2)}
+
+    def test_read_by_segment_id_follows_cross_chunk_links(
+        self, tmp_path: Path,
+    ) -> None:
+        path = _two_chunk_tree(tmp_path)
+        skel = read_skeleton_by_segment_id(path, 5)
+        got = {tuple(e) for e in skel["edges"].tolist()}
+        # 2->1 is the cross-chunk edge; it used to be dropped.
+        assert got == {(1, 0), (2, 1), (3, 2)}
+
+    def test_write_graph_skeleton_records_lead_with_child(
+        self, tmp_path: Path,
+    ) -> None:
+        from zarr_vectors.core.store import get_resolution_level, open_store
+        from zarr_vectors.types.graphs import read_graph, write_graph
+
+        # Chain whose root sits in the lowest chunk, so every cross edge's
+        # parent chunk sorts before its child chunk and the canonical sort
+        # stores the parent first; perm_idx must restore [child, parent].
+        pos = np.array(
+            [[50, 5, 5], [150, 5, 5], [250, 5, 5], [350, 5, 5]], np.float32,
+        )
+        edges = np.array([[1, 0], [2, 1], [3, 2]])
+        path = str(tmp_path / "g.zv")
+        write_graph(path, pos, edges, chunk_shape=(100.0,) * 3, kind="skeleton")
+        lg = get_resolution_level(open_store(path), 0)
+        # The whole-store writer keeps its undirected family (tools tell
+        # the two skeleton layouts apart by this flag); perm_idx restores
+        # the [child, parent] input order on read.
+        assert lg.read_array_meta(links_group_path(0))["directed"] is False
+        recs = read_cross_links(lg)
+        assert recs
+        for (c_cc, _c), (p_cc, _p) in recs:
+            assert c_cc[0] > p_cc[0]  # child (higher x chunk) leads
+        g = read_graph(path)
+        back = {
+            (tuple(g["positions"][c].tolist()), tuple(g["positions"][p].tolist()))
+            for c, p in g["edges"].tolist()
+        }
+        want = {
+            (tuple(pos[c].tolist()), tuple(pos[p].tolist())) for c, p in edges
+        }
+        assert back == want
+
+
+def test_finalize_stamps_vertex_count(tmp_path: Path) -> None:
+    """A streamed store used to keep init's ``vertex_count: 0`` forever."""
+    from zarr_vectors.core.store import open_store, read_level_metadata
+
+    path = _two_chunk_tree(tmp_path)  # finalized, 4 vertices in 2 chunks
+    assert read_level_metadata(open_store(path), 0).vertex_count == 4
