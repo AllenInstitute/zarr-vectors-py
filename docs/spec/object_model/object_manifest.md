@@ -1,275 +1,127 @@
 # Object manifest
 
-```{admonition} Format change in Zarr Vectors 0.6.0
-:class: note
-
-Prior to Zarr Vectors 0.6.0 the `object_index/` array was a fixed-shape
-`(n_objects, 2)` `int64` table storing one *primary-fragment address*
-per object; reading a multi-chunk object required walking
-`cross_chunk_links/` forwards from the primary fragment. Zarr Vectors 0.6.0
-replaced this with a self-contained per-object manifest stored
-as a ragged `uint8` blob: every chunk the object touches, and
-every fragment within each chunk, is enumerated directly.
-
-The cross-chunk-link walk is no longer required during object
-read. Links still encode geometric edges across chunks — as
-records with non-zero offsets in the `links/0/<offsets>/` family
-(see [Links](links.md)) — but they are not used to discover which
-chunks an object touches.
-```
-
-```{admonition} Format change in Zarr Vectors 0.9.0
-:class: note
-
-The `cross_chunk_links/` and `cross_chunk_link_attributes/` families
-were merged into `links/` and `link_attributes/`. **Manifests are
-unaffected**: they reference vertex fragments only, and have not
-referenced links since the walk was removed in 0.6.0.
-```
-
 ## Terms
 
 **Object manifest**
-: The full description of where an object's vertices live across
-  the Zarr Vectors store. Encoded as a sequence of **manifest blocks**, one
-  per chunk the object touches.
+: The ordered list of fragments that make up one object at one level,
+  each named by `(chunk_coords, fragment_index)`. Reading the fragments
+  in manifest order gives the object's vertices in order.
 
 **Manifest block**
-: One entry inside a manifest: a chunk's coordinates plus a
-  *fragment reference* naming the fragments in that chunk that
-  belong to this object.
+: One entry of a manifest: a chunk's coordinates and a reference to
+  one or more fragments in that chunk. An object that leaves a chunk and
+  returns has more than one block for it.
 
-**Manifest block mode**
-: How the fragment reference is encoded. Three modes:
-  - `mode 0` (single) — exactly one fragment index
-  - `mode 1` (range) — a contiguous run `[start, start + count)`
-    of fragment indices
-  - `mode 2` (explicit) — an arbitrary list of fragment indices
+**Object index**
+: The `object_index/` group of a level, which holds every object's
+  manifest and the object ids.
 
-**Manifest blob**
-: The byte sequence that encodes one object's full manifest.
-  Stored as the OID-th element of the ragged `object_index/manifests`
-  array (vlen-bytes codec, ~16K objects per zarr chunk so per-object
-  random access reads only one chunk).
+**Object row**
+: The position of an object in the object index. Object attributes are
+  aligned to it (see [Object attributes](object_attributes.md)).
 
 **Shared fragment**
-: A fragment named by more than one object's manifest. The fragment's
-  vertices are stored once and referenced by each manifest. Marked
-  per-level with `LevelMetadata.shared_fragments=True` and at the
-  store level with the `CAP_SHARED_FRAGMENTS` capability token.
-
-**Primary fragment**
-: The first fragment of an object in traversal order. Useful for
-  preview rendering and as a stable per-object handle, but no longer
-  the only addressable thing in `object_index/` — the new manifest
-  format enumerates every fragment.
+: A fragment named by more than one object's manifest; see
+  [Fragment-index arrays](../layout/fragment_index_arrays.md).
 
 ---
 
 ## Introduction
 
-The object manifest is the mechanism that turns "object ID `k`" into
-a concrete read plan. Without it, fetching one streamline from a
-large tractography store would require scanning every chunk to find
-the streamline's vertices.
+The object index turns an object id into a read plan: the manifest names
+every chunk and fragment the object occupies, so an object is read with
+one manifest lookup and one read per chunk, without scanning chunks or
+following links. Fragment references are local to their chunk, so chunks
+can be written without coordinating fragment numbering. Links between an
+object's vertices are stored separately (see [Links](links.md)) and are
+not needed to find them.
 
-The pre-0.6 design used a thin primary-address row in `object_index/`
-plus a recursive walk of `cross_chunk_links/` to discover continuation
-chunks. This walk was the bottleneck for streamline rendering across
-many chunks: each hop required a round-trip to fetch the next link.
-
-The post-0.6 design enumerates every chunk and every fragment the
-object touches directly in the manifest itself. Reading an object
-becomes a fixed-cost decode plus parallel chunk reads — no chain
-of dependent fetches. The storage cost is small (a handful of bytes
-per chunk per object) and is recovered immediately when shared
-fragments at coarsened levels eliminate vertex duplication.
-
-A second consequence: different objects' manifests can both name
-the same `(chunk_coords, fragment_index)` pair. The fragment's
-vertex rows are stored once; each object recovers them via its
-own manifest. This is the **shared fragments** feature, the central
-gain of the 0.6.0 rewrite at coarsened pyramid levels.
+The object index has three layouts. This page specifies each, how a
+reader tells them apart, the manifest encoding, and the checks the
+validators make.
 
 ---
 
 ## Technical reference
 
-### `object_index/` group layout
+### Layouts
 
-`object_index/` is a Zarr group containing a single ragged Zarr array
-named `manifests`:
+| `layout` | Arrays under `object_index/` | Object ids |
+|----------|------------------------------|------------|
+| `vlen_manifests_v2` | `manifests`, `object_ids` | Row `k` holds the object with id `object_ids[k]` |
+| `vlen_manifests_v1` | `manifests` | Row `k` holds object `k` |
+| `dense_manifests_v1` | `manifest_spans`, `manifest_blocks`, `object_ids` | Row `k` holds the object with id `object_ids[k]` |
 
-| Key | Type | Contents |
-|-----|------|----------|
-| `manifests` | 1-D `vlen-bytes` zarr array of length `num_objects`, chunked at ~16K objects per chunk | Entry `i` is the encoded manifest blob for object `i` |
+A reader dispatches on the `layout` attribute of `object_index/`. An
+index with no `layout`, or one the reader does not know, is not read:
+zarr-vectors-py raises `ArrayError`.
 
-Group-level metadata (`zv_array`):
+zarr-vectors-py writes `vlen_manifests_v2` for a new index unless the
+root attributes say `manifest_layout: "dense"` or the writer is asked
+for `layout="dense"` (see [Choosing the layout](#choosing-the-layout)).
+It writes `vlen_manifests_v1` when rows are reserved in advance for
+parallel writers (`reserve_object_rows`) and from the streaming writer
+`zarr_vectors.core.streaming.ObjectIndexAppender`, where row `k` is
+object `k` by construction.
+
+### `object_index/` attributes
+
+The attributes of a `vlen_manifests_v2` index written for three objects
+with ids 5, 9 and 12, of which object 12 has an empty manifest:
 
 ```json
 {
-  "zv_array":    "object_index",
-  "num_objects": <int>,
-  "sid_ndim":    <int>,
-  "layout":      "vlen_manifests_v1"
+  "zv_array": "object_index",
+  "num_objects": 3,
+  "num_present": 2,
+  "sid_ndim": 3,
+  "layout": "vlen_manifests_v2",
+  "object_ids_sorted": true
 }
 ```
 
-The `layout` field discriminates the on-disk container. The value
-`"vlen_manifests_v1"` selects the ragged-array layout described here.
-Its absence signals the legacy `data` + `offsets` byte-blob layout
-described in the *Legacy layout* section below.
+| Key | Meaning |
+|-----|---------|
+| `zv_array` | `"object_index"` |
+| `layout` | One of the layouts above |
+| `sid_ndim` | Number of chunk coordinates in a block |
+| `num_objects` | Number of object rows |
+| `num_present` | Number of rows with a non-empty manifest |
+| `object_ids_sorted` | `true` when `object_ids` is in ascending order |
+| `block_dtype` | Dense layout only, and only when `"int32"` (see [Dense layout](#dense-layout)) |
 
-To read object `i`'s manifest blob, slice the array (scalar indexing
-on a zarr vlen-bytes array yields a 0-d object ndarray; slicing yields
-a 1-D ndarray whose element is the bytes object directly):
+### Object ids and absent objects
 
-```python
-manifests = level_group.zarr_group["object_index/manifests"]
-blob      = manifests[i:i + 1][0]  # one chunk fetch
-```
+`object_ids` is an `int64` array of shape `(num_objects,)`. Ids are
+non-negative and need not be contiguous. An object with an empty
+manifest is absent from the level: a level built by
+[sparsification](../multiscale/sparsity.md) keeps a row for every id of
+its source level and empties the rows of the objects it drops.
+`read_object_manifest` raises `ArrayError` for an id with no row.
 
-An empty manifest is legal and occupies 4 bytes (`B = 0`).
-ID-preserving sparsified levels emit empty manifest blobs for
-dropped object IDs rather than removing rows; see the *Object ID
-assignment* section below.
+### Vlen layouts
 
-#### Why a single ragged array
-
-Pre-vlen Zarr Vectors stored `object_index` as two single-chunked byte blobs
-(`data` and `offsets`), so reading one object's manifest required
-loading the entire offsets table (8 × `num_objects` bytes) and the
-entire concatenated data blob, regardless of which OID was requested.
-At 1M objects that is 8 MB of offsets plus the full data blob on every
-single-object read.
-
-The vlen-bytes ragged array eliminates that amplification. Each zarr
-chunk holds ~16K manifest blobs; per-object random access reads only
-the chunk holding the requested OID. Bulk reads (the whole `manifests`
-array sliced with `[:]`) fetch every chunk in parallel via zarr's
-async pipeline.
+`manifests` is a `variable_length_bytes` array (codec `vlen-bytes`) of
+shape `(num_objects,)`; cell `k` is row `k`'s manifest blob. A row that
+was never written reads as empty and counts as absent. zarr-vectors-py
+chunks `manifests` and `object_ids` at 16,384 rows.
 
 ```{warning}
-The Zarr V3 specification for variable-length byte arrays is still in
-development (tracked at
+Zarr v3 has no finished specification for variable-length byte arrays
+(see
 [zarr-extensions](https://github.com/zarr-developers/zarr-extensions/tree/main/data-types)).
-Zarr Vectors 0.x stores written with `vlen-bytes` may need to be re-encoded if
-the eventual spec lands incompatibly.
+`vlen-bytes` stores may need re-encoding if the specification settles
+on an incompatible encoding.
 ```
 
-#### Dense layout (0.9.4)
+#### Manifest blob
 
-A store may instead keep its object indexes as fixed-width integer
-arrays, with no blob per object (`layout: "dense_manifests_v1"`):
-
-| Key | Type | Contents |
-|-----|------|----------|
-| `manifest_spans` | `int64`, shape `(num_objects, 2)`, chunked at 16,384 rows | Row `o` is `(start, count)`: object row `o` owns rows `start .. start + count` of `manifest_blocks` |
-| `manifest_blocks` | `int64` or `int32`, shape `(n_blocks, sid_ndim + 1)`, chunked at 65,536 rows (16,384 in an index created before) | One row per fragment reference: `sid_ndim` chunk coordinates, then the fragment index |
-| `object_ids` | `int64`, shape `(num_objects,)` | Row `o`'s object id, as in the `vlen_manifests_v2` layout |
-
-An object's blocks are its manifest, in order. Each block names exactly
-one fragment: a range or explicit-list block of the vlen encoding is
-stored as one row per fragment it names. An empty manifest is
-`count == 0` (its `start` is not read). Blocks are not required to be
-contiguous or ordered by object: an append adds rows to both arrays,
-and a patch appends an object's new blocks and rewrites only its span,
-so blocks a patch replaced stay in `manifest_blocks` unreferenced until
-the index is next rewritten in full.
-
-The chunking and the codecs are each array's own (its `zarr.json`), not
-part of the layout: a reader takes both from there. zarr-vectors-py
-chunks the blocks at 65,536 rows, since they outnumber objects and are
-read in long runs, and creates the three arrays with `zstd` at level 9:
-a write session that compresses with `zstd` at a lower level is raised
-to 9 for them, one that compresses with another codec keeps it, and one
-that does not compress gets the default. An index keeps the chunking and
-codecs it was created with; a full rewrite creates its arrays afresh.
-
-`manifest_blocks` is `int64` unless the index was created `int32`, for
-a store whose chunk coordinates and fragment indices all fit in it. The
-array's `zarr.json` `data_type` is the truth about it; a reader widens
-the blocks to `int64` and returns them exactly as an `int64` index would
-(every reader of 0.9.4 already does, so an `int32` index needs no newer
-reader and no capability). Spans and ids are always `int64`: a span's
-`start` passes `2**31` at a few billion fragments.
-
-- The root's `manifest_block_dtype: "int32"` makes it the default for
-  dense indexes created later (absent means `int64`, and only the
-  non-default value is written), as `manifest_layout` is for the layout.
-- A narrow index states it on `object_index` as `block_dtype: "int32"`,
-  for information only; an index without the key is `int64` or, if its
-  `zarr.json` says so, whatever that says.
-- An index keeps its dtype for its life: an append, a patch or a placed
-  range writes into the dtype it has. zarr casts a write into a narrower
-  array without a check, wrapping a value that does not fit, so a writer
-  must check every value it writes into an `int32` index and refuse one
-  outside `[-2**31, 2**31 - 1]`; zarr-vectors-py raises `ArrayError`
-  before anything of that write is stored. (A zarr-vectors-py older than
-  the `manifest-block-dtype` feature reads such an index correctly but
-  appends to it unchecked.)
-
-The layout is chosen per store by the root's `manifest_layout: "dense"`
-(absent means vlen), which also stamps the `dense_manifests`
-capability. That is a default for indexes created later: an index keeps
-the layout it was created with, and the `layout` field on
-`object_index` is the truth about it. A reader that finds no `layout`
-it knows, or `manifest_spans` without `manifests`, must not read the
-index as vlen.
-
-Reading every manifest is a gather, with no decode:
-
-```python
-spans  = object_index["manifest_spans"][:]            # (n, 2)
-blocks = object_index["manifest_blocks"][:]           # (b, sid_ndim + 1)
-counts = spans[:, 1]
-offsets = np.concatenate([[0], np.cumsum(counts)])    # CSR over objects
-rows = np.repeat(spans[:, 0], counts) + (
-    np.arange(offsets[-1]) - np.repeat(offsets[:-1], counts))
-chunk_coords, fragment_idx = blocks[rows, :-1], blocks[rows, -1]
-```
-
-Stores that do not use it are unchanged, and a 0.9.3 reader rejects an
-index in this layout by its unknown `layout` rather than misreading it.
-
-#### Legacy layout
-
-Stores written before the `vlen_manifests_v1` layout was introduced
-have two byte-blob children instead of `manifests`:
-
-| Key | Contents |
-|-----|----------|
-| `data` | concatenated manifest blobs for all `num_objects` objects, in OID order |
-| `offsets` | flat `int64` array of length `num_objects`; entry `i` is the byte offset of object `i`'s blob within `data` |
-
-To read object `i`'s manifest blob from the legacy layout:
-
-```python
-start = offsets[i]
-end   = offsets[i + 1] if i + 1 < num_objects else len(data)
-blob  = data[start:end]
-```
-
-```{important}
-`offsets` has length `num_objects`, **not** `num_objects + 1`. The
-last object's blob extends from `offsets[num_objects - 1]` to the
-end of `data`. Readers MUST handle the final entry as an open-ended
-slice.
-```
-
-Readers in `zarr_vectors.core.arrays` (`read_object_manifest` and
-`read_all_object_manifests`) auto-detect both layouts via the `layout`
-group attribute and dispatch accordingly. Writers always emit the new
-layout going forward; no migration tool is provided — legacy stores
-remain readable as-is.
-
-### Manifest blob byte layout
+All integers are little-endian.
 
 ```
-HEADER
-  uint32 num_blocks B
+uint32 num_blocks B
 
-For each block (1 of B):
+For each of the B blocks:
   int64  chunk_coords[sid_ndim]
   uint8  mode
   if mode == 0:   # single fragment
@@ -281,217 +133,124 @@ For each block (1 of B):
     int64  fragment_indices[count]
 ```
 
-All fragment references are **chunk-local** — they index into the
-named chunk's `vertex_fragments/<chunk_coords>` blob only. This
-preserves chunk-write independence: a chunk can be written without
-coordinating fragment numbering with any other chunk.
+An empty manifest is 4 bytes, `B = 0`. A range block names fragments
+`start` to `start + count - 1`; every index is non-negative.
 
-An empty manifest is 4 bytes: `B = 0`.
+`zarr_vectors.encoding.fragments.encode_object_manifest_blocks(blocks,
+sid_ndim, *, force_explicit=False)` encodes a list of
+`(chunk_coords, fragment_ref)` pairs. An `int` gives mode 0, a
+`(start, count)` tuple mode 1, and a 1-D integer array mode 1 when it is
+a run of consecutive indices and mode 2 otherwise (always mode 2 with
+`force_explicit=True`). `decode_object_manifest_blocks(raw, sid_ndim)`
+returns the pairs with the same three reference types. The
+`write_*` functions write one mode-0 block per fragment.
 
-### Mode selection rules
+### Dense layout
 
-The reference writer (`encode_object_manifest_blocks` in
-[`zarr_vectors.encoding.fragments`](../../api/index.rst)) chooses
-the mode per block:
+The dense layout stores every manifest in fixed-width integer arrays:
 
-| Mode | When |
-|------|------|
-| Single (0) | The object touches exactly one fragment in this chunk. Most common for small or point-like objects whose every bin contributes exactly one fragment. |
-| Range (1)  | The object touches a contiguous run `[start, start + count)` of fragment indices in this chunk. Most common for long polylines / streamlines whose path through one chunk visits adjacent bins in succession. |
-| Explicit (2) | The object touches a non-contiguous set of fragment indices in this chunk. Most common after coarsening, where the object's metavertices may be scattered across the chunk's fragment list. |
+| Array | Type | Contents |
+|-------|------|----------|
+| `manifest_spans` | `int64`, shape `(num_objects, 2)` | Row `k` is `(start, count)`: row `k`'s manifest is rows `start` to `start + count - 1` of `manifest_blocks` |
+| `manifest_blocks` | `int64` or `int32`, shape `(n_blocks, sid_ndim + 1)` | One row per fragment: `sid_ndim` chunk coordinates, then the fragment index |
+| `object_ids` | `int64`, shape `(num_objects,)` | As in `vlen_manifests_v2` |
 
-A writer that passes an `int` chooses mode 0; a `(start, count)`
-tuple chooses mode 1; a 1-D integer array auto-detects mode 1 (if
-the array equals `arange(start, start + len)`) or mode 2 otherwise.
-Pass `force_explicit=True` to disable the auto-promotion — useful
-for round-trip testing of the explicit path.
+An object's block rows, in order, are its manifest. An empty manifest
+has `count == 0`, and its `start` is not read. Block rows need not be
+contiguous or ordered by object: an append adds rows to both arrays, and
+a patch appends an object's new blocks and rewrites only its span, so
+the rows it replaced stay in `manifest_blocks`, unreferenced, until the
+index is rewritten in full.
 
-### Reading an object's vertices
+Each array's chunking and codecs are in its own `zarr.json`. zarr-vectors-py
+chunks spans and ids at 16,384 rows and blocks at 65,536 rows, and
+compresses all three with `zstd` at level 9: a write session that
+compresses with `zstd` at a lower level is raised to 9, one with another
+codec keeps it, and one with no compression gets `zstd` level 9. An
+index keeps its chunking and codecs until it is rewritten in full.
 
-```python
-def read_object_vertices(level_group, object_id):
-    """Read and concatenate all vertices of an object, in manifest order."""
-    meta     = level_group.read_array_meta(OBJECT_INDEX)
-    sid_ndim = meta["sid_ndim"]
+`manifest_blocks` is `int32` only when the index was created so, for a
+store whose chunk coordinates and fragment indices all fit. The array's
+`data_type` states its dtype, and `object_index/` then carries
+`block_dtype: "int32"` for information. A reader widens the blocks to
+`int64`. An index keeps its dtype: appends and patches write into the
+dtype it has, and zarr-vectors-py raises `ArrayError` before storing a
+value outside `[-2**31, 2**31 - 1]` in an `int32` index. Spans and ids
+are always `int64`.
 
-    # New (vlen_manifests_v1) layout — one chunk fetch.
-    manifests = level_group.zarr_group["object_index/manifests"]
-    blob      = manifests[object_id:object_id + 1][0]
-
-    out = []
-    for chunk_coords, fragment_ref in decode_object_manifest_blocks(blob, sid_ndim):
-        fidx     = read_fragment_index(
-            level_group, VERTEX_FRAGMENTS, chunk_coords,
-        )
-        vertices = level_group.read_vertices(chunk_coords)
-
-        if isinstance(fragment_ref, int):
-            rows = fidx.indices(fragment_ref)
-        elif isinstance(fragment_ref, tuple):
-            s, c = fragment_ref
-            rows = np.concatenate([fidx.indices(f) for f in range(s, s + c)])
-        else:  # 1-D int64 array
-            rows = np.concatenate([fidx.indices(int(f)) for f in fragment_ref])
-
-        out.append(vertices[rows, :])
-
-    return np.concatenate(out, axis=0)
-```
-
-The reference reader in `zarr_vectors.core.arrays` is `read_object_manifest`
-(returns the decoded block list) and downstream geometry-type readers
-that consume it. Note the simplification compared with pre-0.6: there
-is no link-walk loop, no `visited_chunks` cycle guard, no chain of
-dependent reads — the manifest itself enumerates every chunk.
-
-### Shared fragments
-
-When a level is written with `LevelMetadata.shared_fragments=True`:
-
-- A fragment in `vertex_fragments/<chunk_coords>` MAY be named by
-  more than one object's manifest.
-- The fragment's vertex rows are stored once in `vertices/<chunk_coords>`.
-- The store advertises `CAP_SHARED_FRAGMENTS` in
-  `RootMetadata.format_capabilities`.
-
-**Writer responsibility.** The coarsening pipeline emits one fragment
-per *distinct* metavertex per chunk, then writes each object's
-manifest to reference the metavertices it touches. When two coarsened
-objects share a metavertex, both manifests name the same fragment
-index in the same chunk.
-
-**Reader responsibility.** None. The shared-fragments case is fully
-transparent to read paths — the same `fidx.indices(f)` call resolves
-the vertex rows whether the fragment is shared or not. Code that
-naively unions `(chunk_coords, fragment_index)` pairs across all
-manifests must not assume the union is disjoint when
-`shared_fragments=True`.
-
-**Storage rationale.** At a typical coarsening level with `bin_ratio
-= (2, 2, 2)` and an `object_sparsity` retention of ~50%, naive
-replication would multiply storage by the per-metavertex
-participation count `k` (often 4–16 for densely connected tract
-data). Shared fragments eliminate this multiplier; the cost is the
-per-block manifest bytes naming the metavertex, which is amortised
-over `k` objects.
-
-### Object ID assignment
-
-Object IDs are non-negative integers assigned at write time. At
-level 0 they are dense (no gaps) starting from 0. The maximum object
-ID is `num_objects − 1`.
-
-For levels with `preserves_object_ids=True` (the ID-preserving
-sparsification regime), `num_objects` equals the parent level's
-`num_objects`. Dropped objects appear as empty manifest blobs
-(4 bytes, `B = 0`); their OIDs are *preserved* rather than
-*remapped*. The companion `present_mask` sidecar in
-`object_attributes/` flags which rows are real. See
-[Object attributes](object_attributes.md).
-
-For levels with `preserves_object_ids=False`, surviving objects are
-renumbered to `[0, num_retained)`. The mapping back to level-0 OIDs
-is written as a per-object attribute.
-
-Object IDs are stable across reads of a given store but MAY change
-when a store is rechunked.
-
-### Decoding a manifest
-
-Given a manifest blob `raw`, the decoder is straightforward — there
-is no recursion, no graph walk, no joins across arrays:
+Every manifest is read with a gather:
 
 ```python
-def decode_object_manifest_blocks(raw, sid_ndim):
-    b = struct.unpack_from("<I", raw, 0)[0]
-    offset = 4
-    blocks = []
-    for _ in range(b):
-        coords = tuple(int(c) for c in np.frombuffer(
-            raw, dtype=np.int64, count=sid_ndim, offset=offset,
-        ))
-        offset += sid_ndim * 8
-
-        mode = struct.unpack_from("<B", raw, offset)[0]
-        offset += 1
-
-        if mode == 0:  # single
-            idx = struct.unpack_from("<q", raw, offset)[0]
-            offset += 8
-            blocks.append((coords, int(idx)))
-        elif mode == 1:  # range
-            start, count = struct.unpack_from("<qq", raw, offset)
-            offset += 16
-            blocks.append((coords, (int(start), int(count))))
-        else:  # explicit
-            count = struct.unpack_from("<I", raw, offset)[0]
-            offset += 4
-            indices = np.frombuffer(
-                raw, dtype=np.int64, count=count, offset=offset,
-            ).copy()
-            offset += count * 8
-            blocks.append((coords, indices))
-    return blocks
+spans  = object_index["manifest_spans"][:]            # (n, 2)
+blocks = object_index["manifest_blocks"][:]           # (b, sid_ndim + 1)
+counts = spans[:, 1]
+offsets = np.concatenate([[0], np.cumsum(counts)])    # CSR over objects
+rows = np.repeat(spans[:, 0], counts) + (
+    np.arange(offsets[-1]) - np.repeat(offsets[:-1], counts))
+chunk_coords, fragment_idx = blocks[rows, :-1], blocks[rows, -1]
 ```
 
-Decoded `fragment_ref` types: `int` for mode 0, `(start, count)` tuple
-for mode 1, `np.ndarray[int64]` for mode 2. Callers that prefer a
-uniform shape (always an array of indices) can map over the result.
+### Choosing the layout
+
+The layout of a new index is, in order of precedence:
+
+1. the `layout=` argument (`"vlen"` or `"dense"`) of the writer, such as
+   `write_object_index` or `write_object_manifests`;
+2. the layout of the index already there, which a rewrite keeps;
+3. the root's `manifest_layout`: `"dense"` gives the dense layout;
+   absent means vlen.
+
+`create_store(..., manifest_layout="dense")` writes
+`manifest_layout: "dense"` to the root attributes and adds
+`dense_manifests` to `format_capabilities`; writing a dense index adds
+the capability as well. `create_store(..., manifest_block_dtype="int32")`
+writes `manifest_block_dtype: "int32"`, which makes `int32` the default
+for dense indexes created later. Each key is written only with its
+non-default value. `block_dtype=` on the writer overrides it for one
+index.
+
+`zarr_vectors.building.store_layout(root)` reports a store's layout,
+including the `object_index` layout of level 0.
+
+### Reading an object
+
+```python
+from zarr_vectors.building import read_object_vertices
+from zarr_vectors.core.arrays import read_object_manifest
+from zarr_vectors.core.store import get_resolution_level, open_store
+
+lg = get_resolution_level(open_store("tracts.zarrvectors"), 0)
+print(read_object_manifest(lg, 0)[:3])
+# e.g. [((1, 0, 1), 0), ((1, 1, 1), 0), ((1, 0, 1), 1)]
+fragments = read_object_vertices(lg, 0)   # one (n_i, D) array per manifest entry
+```
+
+`read_object_manifest(level_group, object_id)` returns the manifest as
+`(chunk_coords, fragment_index)` pairs in every layout, with range and
+explicit blocks expanded to one pair per fragment.
+`read_object_vertices` reads those fragments, prefetching each chunk
+once.
+
+### Shared fragments and coarser levels
+
+Each level has its own object index, which names that level's
+fragments. At a level with `shared_fragments: true`, the manifests of
+different objects may name the same fragment; see
+[Shared fragments](fragments.md#shared-fragments).
 
 ### Validation
 
-**L1 (structural).**
-- `object_index/` group exists for all discrete-object geometry types.
-- Exactly one of these layouts is present:
-  - `object_index/manifests` array (new layout: `layout ==
-    "vlen_manifests_v1"`); or
-  - both `object_index/data` and `object_index/offsets` byte entries
-    (legacy layout: `layout` absent).
-- `object_index/`'s `zv_array` metadata names `num_objects` and
-  `sid_ndim`.
-- Dense layout (`layout == "dense_manifests_v1"`): `manifest_spans`,
-  `manifest_blocks` and `object_ids` are present and `manifests` is
-  not.
+**L1** reports whether a level has `object_index/`.
 
-**L2 (metadata).**
-- New layout: `manifests.shape == (num_objects,)` and `manifests.dtype
-  == object` (vlen-bytes).
-- Dense layout: `manifest_spans.shape == (num_objects, 2)`,
-  `manifest_blocks.shape[1] == sid_ndim + 1`; `manifest_spans` is
-  `int64` and `manifest_blocks` `int64` or `int32`, matching
-  `object_index`'s `block_dtype` where it states one; every span has
-  `count >= 0`, and a span with `count > 0` lies inside
+**L3**, for each level:
+
+- A dense index has `manifest_spans`, `manifest_blocks` and `object_ids`,
+  and no `manifests`; `manifest_spans` is `int64`; `manifest_blocks` is
+  `int64` or `int32` and agrees with `block_dtype` where it is stated;
+  `manifest_spans` has at least `num_objects` rows of 2;
+  `manifest_blocks` has `sid_ndim + 1` columns; no span has a negative
+  count, and no non-empty span reaches past the end of
   `manifest_blocks`.
-- Legacy layout: `len(offsets) == num_objects`; `offsets` is
-  monotonically non-decreasing; `offsets[0] == 0` when `num_objects >
-  0`; `offsets[i] <= len(data)` for all `i`.
-
-**L3 (consistency).**
-- Each manifest blob decodes without error via
-  `decode_object_manifest_blocks(blob, sid_ndim)`.
-- For every decoded block: `chunk_coords` is a valid chunk in the
-  level's chunk grid.
-- For every decoded `fragment_index`: `fragment_index <
-  ChunkFragmentIndex.num_fragments` in the named chunk's
-  `vertex_fragments/<chunk_coords>` blob.
-- For range mode: `start + count <=` the chunk's `num_fragments`.
-- When `shared_fragments == False` at this level: the union of
-  `(chunk_coords, fragment_index)` pairs across all manifests is
-  disjoint (no fragment is named twice).
-- Legacy layout only: trailing bytes in `data` after
-  `offsets[num_objects - 1]` plus the last blob's encoded length are
-  zero.
-
-### Object index at coarser pyramid levels
-
-`object_index/` is recomputed per-level: each level has its own
-manifest list referring to that level's `vertex_fragments/` blobs.
-At levels with `shared_fragments=True`, manifests for closely
-spaced objects converge on shared metavertices; reading either
-object yields the same vertex row from one underlying chunk.
-
-If a coarse level uses ID-preserving sparsification
-(`preserves_object_ids=True`), dropped objects have empty
-manifest blobs. Otherwise the surviving objects are renumbered
-densely and a mapping back to level-0 OIDs is stored in
-`object_attributes/level0_object_id/` at the coarse level.
+- Every `(chunk_coords, fragment_index)` of every manifest names a chunk
+  that holds vertices, and a fragment index below that chunk's fragment
+  count.

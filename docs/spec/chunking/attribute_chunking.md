@@ -3,93 +3,54 @@
 ## Terms
 
 **Attribute chunking**
-: A chunking mode where a per-vertex categorical *attribute* (e.g. a gene
-  label, a tract bundle label, a cell-type code) becomes the **leading
-  axis** of the chunk key. Spatial coordinates follow as trailing axes.
-  Reading all vertices for one attribute value becomes a prefix scan
-  over chunk keys instead of a full-store scan.
-
-**Leading chunk axis**
-: The first dimension of a chunk key. For a spatial-only Zarr Vectors store the
-  leading axis is the first spatial dim; for an attribute-chunked store
-  the leading axis is the attribute bin index. Chunk keys go from
-  `z.y.x` to `attr_bin.z.y.x`.
+: A layout in which a categorical attribute becomes the leading axis of
+  every chunk key, before the spatial axes. Chunk keys change from
+  `i.j.k` to `b.i.j.k`.
 
 **Attribute bin**
-: A dense integer index in `[0, K)` assigned to each unique value of the
-  chunk-by attribute. Bin order is the sorted order returned by
-  `numpy.unique`. The mapping bin → original value is stored in level
-  metadata.
+: A dense integer in `[0, K)` for one value of the chunk-by attribute,
+  where `K` is the number of distinct values.
 
-**Per-vertex grouping**
-: When the chunk-by attribute differs across vertices of the *same
-  object*, the object is split across the corresponding attribute
-  chunks. A polyline whose first half is `bundle="A"` and second half
-  is `bundle="B"` appears in two attribute chunks; the `links/` family
-  stitches the segments back together at read time, via a record whose
-  offsets are non-zero on the prepended bin axis.
-
-**Per-object uniformity**
-: A restricted form of attribute chunking where all vertices of an
-  object are required to share the same attribute value. Used for
-  geometry types where per-vertex splitting would fragment the topology
-  (mesh faces, graph edges, line endpoints). The writer raises if the
-  attribute is mixed within any object.
+**Bin label**
+: The value an attribute bin stands for, recorded in
+  `chunk_attribute_values`.
 
 ---
 
 ## Introduction
 
-Zarr Vectors chunks data spatially by default — points, vertices, faces, edges
-are bucketed by their position in a fixed-size 3D grid. This is correct
-for *spatial-locality* queries ("give me everything in this bounding
-box") but wrong for *categorical* queries ("give me everything for gene
-X"). Categorical queries against a spatially-chunked store have to scan
-every spatial chunk that touches the gene's territory, which for
-20 000-gene spatial transcriptomics is most of them.
+By default a store is chunked by position only, which suits box queries
+but not queries by category: reading every point of one gene from a
+spatial-transcriptomics store means reading every chunk the gene's
+points fall in, mixed with all other genes.
 
-Attribute chunking re-arranges the on-disk layout so that data sharing
-an attribute value is **physically contiguous**: one disk prefix per
-gene, one prefix per bundle label. A categorical query becomes a single
-sub-tree listing followed by O(matching-chunks) reads.
-
-The format change is small: chunk keys gain a leading dim and the level
-metadata records the bin-to-value mapping. Existing readers that
-iterate chunk keys via `list_chunk_keys` work unchanged on
-attribute-chunked stores because the chunk-key parser is arity-agnostic
-(`_parse_chunk_key` in `zarr_vectors/core/arrays.py`).
+With attribute chunking, data sharing a value is stored together under
+one key prefix. A query for one value reads only the chunks with that
+leading coordinate. A level can be written this way directly
+(`chunk_by_attribute=`) or rechunked into it afterwards
+([`rechunk_by_attribute`](rechunking.md#grouping-objects-under-a-leading-axis)).
 
 ---
 
 ## Technical reference
 
-### Chunk key layout
+### Chunk keys
 
-When attribute chunking is in use, chunk keys for every per-vertex array
-(`vertices/`, `attributes/<name>/`, etc.) take the form:
+On an attribute-chunked level every per-chunk array is keyed
+`<bin>.<i>.<j>.<k>`. Object manifests carry the same extended
+coordinates, so the object index has rank `1 + D`.
 
-```
-<attr_bin>.<spatial_0>.<spatial_1>.<spatial_2>
-```
+`fragment_attributes` passed to a writer must be keyed by these combined
+coordinates, the bin first, not by spatial coordinates alone.
 
-`attr_bin` is an integer in `[0, K)`. Spatial coordinates follow in the
-existing dot-separated order. Object index entries store the same
-extended tuple — `sid_ndim` on the `object_index` `.zattrs` is `ndim +
-1` for attribute-chunked stores.
-
-`fragment_attributes/<name>/` follows the **same** extended key scheme:
-each per-chunk blob is keyed by the same combined coords the type-writer
-uses for `vertices/`. Callers passing `fragment_attributes={name:
-{chunk_coords: ndarray}}` to a writer must key by the post-prefix
-combined coords (the leading `attr_bin` plus the spatial coords), not
-the raw spatial coords.
+The chunk-by attribute is not also stored as a vertex attribute array;
+`chunk_attribute_values` and the leading coordinate give each vertex's
+value.
 
 ### Array shape
 
-The leading axis is not only a key convention — it is part of the physical
-layout. Every per-chunk array in an attribute-chunked level is allocated at
-rank `1 + sid_ndim`, with the leading axis spanning `K` bins and anchored at
-origin `0`:
+Every per-chunk array of an attribute-chunked level has rank `1 + D`,
+with a leading axis of length `K` starting at 0:
 
 ```
 vertices                  shape = (K, g_0, g_1, g_2)
@@ -98,183 +59,140 @@ vertex_attributes/<name>  shape = (K, g_0, g_1, g_2)
 links/<delta>/<offsets>   shape = (K, g_0, g_1, g_2)
 ```
 
-`chunk_attribute_values` is authoritative for `K` — it is what writers pass
-as `bin_count`, and its length is the extent. `chunk_dims` names the axes but
-carries no cardinality, so do not size an array from it.
+`K` is `len(chunk_attribute_values)`, which writers pass as `bin_count`.
+`chunk_dims` names the axes but does not give their sizes. Any code that
+allocates an array in an existing level (a worker calling
+`create_attribute_array`, an edit adding a links segment) must take the
+rank and leading extent from the level; an array one axis short cannot be
+addressed by the level's keys.
 
-This matters to anything that allocates an array into an existing level.
-A writer that opens a write session is handed the bin count; one that does
-not — a decentralized worker calling `create_attribute_array`, an edit adding
-a links segment — must take the rank from the level rather than deriving a
-spatial grid from the store bounds. An array allocated one axis short cannot
-be addressed by the level's own keys, and where the grid origin is non-zero
-the mismatch used to alias cells rather than raise.
+### Level metadata
 
-### Level metadata fields
+The level's `zarr_vectors_level` block gains three keys. After writing
+3,000 points labelled with three genes:
 
-Three new keys on the level `.zattrs`:
+```json
+{
+  "zarr_vectors_level": {
+    "chunk_dims": ["gene", "x", "y", "z"],
+    "chunk_attribute_name": "gene",
+    "chunk_attribute_values": ["Gad1", "Pvalb", "Slc17a7"]
+  }
+}
+```
 
-| Field                     | Type       | Meaning                                                                                   |
-|---------------------------|------------|-------------------------------------------------------------------------------------------|
-| `chunk_dims`              | `list[str]` | Names of chunk-key axes, leading axis first. e.g. `["gene", "x", "y", "z"]`.            |
-| `chunk_attribute_name`    | `str`      | Name of the per-vertex attribute used as the leading axis.                                |
-| `chunk_attribute_values`  | `list`     | One label per bin, in bin order: `[i]` is what `attribute_filter` names to select bin `i`. See *Bin labels* below. |
+| Key | Type | Meaning |
+|-----|------|---------|
+| `chunk_dims` | `list[str]` | Names of the chunk-key axes, leading axis first |
+| `chunk_attribute_name` | `str` | The attribute that `attribute_filter` names |
+| `chunk_attribute_values` | `list` | Bin labels, in bin order: entry `i` is the value of bin `i` |
 
-When `chunk_dims` is absent (legacy stores), readers default to a
-spatial-only layout with `sid_ndim` axes.
+A level without `chunk_dims` is chunked by position only. A reader must
+check `chunk_dims` before interpreting chunk keys, and must take bin
+labels from `chunk_attribute_values`, not from key prefixes.
 
-The chunk-by attribute is **not** also stored as a per-chunk attribute
-array; its value is implicit in the leading axis and recoverable from
-`chunk_attribute_values`.
+### Writing
 
-### Categorical-only constraint (v1)
-
-Attribute chunking is **categorical only** in v1:
-
-- Allowed dtypes: integer, boolean, string (Unicode or bytes).
-- Floating-point attributes are rejected with a helpful error. For
-  continuous values, bin externally and pass the bin index, or use the
-  rechunk module's bin-edge support.
-- Every unique value becomes its own bin, regardless of cardinality.
-  20 000 unique genes produce 20 000 chunk prefixes.
-
-### Per-vertex vs per-object semantics
-
-| Type        | Semantics      | Behaviour on mixed-value objects                                |
-|-------------|----------------|-----------------------------------------------------------------|
-| points      | per-vertex     | Each point is its own object; no mixing possible.               |
-| polylines   | per-vertex     | Polylines with mixed values are split; cross-chunk links bridge. |
-| lines       | per-object     | Both endpoints of a line must share the same `line_attributes` value. |
-| graphs      | per-object     | All nodes of one object must share the same value.              |
-| meshes      | per-object     | All vertices of one mesh object must share the same value.      |
-
-The per-object types raise `ArrayError` when the constraint is violated
-— they do not silently drop or average values.
-
-### Write API
-
-Every writer that has per-vertex (or per-object) attributes accepts a
-`chunk_by_attribute: str | None = None` kwarg:
+The writers `write_points`, `write_polylines`, `write_lines`,
+`write_graph` and `write_mesh` take `chunk_by_attribute: str | None`. It
+names an entry of the writer's `vertex_attributes` (for
+`write_lines`, also of `object_attributes`):
 
 ```python
+import numpy as np
 from zarr_vectors.types.points import write_points
 
-write_points(
-    "genes.zarrvectors",
-    positions,
-    chunk_shape=(50.0, 50.0, 50.0),
-    attributes={"gene": gene_labels},
-    chunk_by_attribute="gene",
-)
+rng = np.random.default_rng(0)
+positions = rng.uniform(0, 200, (3000, 3)).astype("float32")
+gene = rng.choice(np.array(["Gad1", "Slc17a7", "Pvalb"]), 3000)
+
+write_points("genes.zarrvectors", positions, chunk_shape=(50., 50., 50.),
+             vertex_attributes={"gene": gene}, chunk_by_attribute="gene")
 ```
 
-The named attribute must appear in the writer's per-vertex / per-object
-dict (`attributes`, `vertex_attributes`, `node_attributes`, or
-`line_attributes` depending on the type).
+The `vertices` array then has shape `[3, 4, 4, 4]`.
 
-### Read API
+The attribute must be categorical: integer, boolean or string. A
+floating-point attribute raises `ArrayError`; bin continuous values
+yourself, or use `rechunk` with bin edges. Each distinct value becomes
+one bin, in the sorted order of `numpy.unique`, however many there are.
+Adding a value to a written level means rechunking it.
 
-Eager readers (`read_points`, `read_polylines`, etc.) accept an
-`attribute_filter: dict[str, Any] | None` kwarg:
+How each type treats an object whose vertices have different values:
+
+| Type | Behaviour |
+|------|-----------|
+| Points | Each point is its own object |
+| Polylines | The polyline is split between bins; links join the pieces, so it reads back whole |
+| Lines | Both endpoints of a line must share a value, or `ArrayError` |
+| Graphs | All vertices of one object must share a value, or `ArrayError`. Without `object_ids`, each vertex is its own object |
+| Meshes | All vertices of one object must share a value, or `ArrayError` |
+
+### Reading
+
+The eager readers (`read_points`, `read_polylines`, and the others) take
+`attribute_filter: dict[str, Any] | None`:
 
 ```python
-read_points("genes.zarrvectors", attribute_filter={"gene": "Gad1"})
+from zarr_vectors.types.points import read_points
+
+read_points("genes.zarrvectors", attribute_filter={"gene": "Gad1"})["vertex_count"]
+# 1034
 ```
 
-The filter is a `{name: value}` dict with exactly one entry. The name
-must match the store's `chunk_attribute_name`. The value is resolved to
-a bin index via the stored `chunk_attribute_values` list, and the chunk
-scan is restricted to keys with that leading coord. Unknown values
-yield an empty result rather than an error.
+The filter must have exactly one entry, and its key must be the level's
+`chunk_attribute_name`; otherwise it raises `ArrayError`. The value is
+looked up in `chunk_attribute_values` and only chunks with that bin are
+read. A value not in the list returns an empty result. A box query on an
+attribute-chunked level reads every bin of the chunks the box touches.
 
-Lazy readers (`ZVLevel`) expose:
+The lazy level object (`ZVLevel`, from `zarr_vectors.lazy.open_zv`) has
+`chunk_dims`, `chunk_attribute_name`, `attribute_values` and
+`read_attribute_chunk(value)`, which returns the fragments of every chunk
+in that value's bin.
 
-- `chunk_dims` — the level's chunk-axis names, or `None` for legacy.
-- `chunk_attribute_name` — the leading-axis attribute name.
-- `attribute_values` — the ordered value list.
-- `read_attribute_chunk(value)` — convenience: reads all fragments
-  for chunks whose leading coord matches `value`.
+### Bin labels from a rechunk
 
-### Post-hoc rechunking
+`rechunk` numbers its bins densely from 0 in the order below, and
+allocates no bin that no object falls in. The label is the value
+`attribute_filter` names to select the bin:
 
-For stores that already have a per-object attribute and need to be
-re-laid out, `rechunk_by_attribute` is the ergonomic wrapper:
-
-```python
-from zarr_vectors import rechunk_by_attribute
-
-rechunk_by_attribute(
-    "tracts.zarrvectors",
-    "bundle_label",
-    output="tracts-by-bundle.zarrvectors",
-)
-```
-
-It builds a `RechunkSpec(by="attribute:bundle_label", categorical=True,
-prefix_dim_name="bundle_label")` and runs the standard rechunk engine.
-`categorical=True` disables the legacy quartile fallback in
-`DimensionMapper._map_by_attribute`, which would otherwise collapse
-high-cardinality attributes (>10 unique values) to 4 quartile bins.
-
-#### Bin labels
-
-A rechunk's bins are numbered densely from 0 in the order below, whatever
-bins its `RechunkSpec` could have produced. A bin no object falls in is not
-allocated. A bin's label, its entry in `chunk_attribute_values`, is the
-value `attribute_filter` names to select it:
-
-| `RechunkSpec`                                   | Bin order                  | Label                                  |
-|-------------------------------------------------|----------------------------|----------------------------------------|
-| `by="attribute:<name>"`, categorical            | ascending value            | the value                              |
-| `by="attribute:<name>"` or `by="object_id"`, with `bins` | ascending edge  | the bin's lower edge                   |
-| `by="attribute:<name>"`, quartile fallback      | ascending edge             | the bin's lower edge                   |
-| `by="object_id"`, no `bins`                     | ascending id               | the object id                          |
-| `by="group"`                                    | ascending group index, then ungrouped objects | the group index; `-1` for ungrouped |
+| `RechunkSpec` | Bin order | Label |
+|---------------|-----------|-------|
+| `by="attribute:<name>"`, categorical | Ascending value | The value |
+| `by="attribute:<name>"` or `by="object_id"`, with `bins` | Ascending edge | The bin's lower edge |
+| `by="attribute:<name>"`, more than 10 values and no `bins` | Ascending quartile edge | The bin's lower edge |
+| `by="object_id"`, no `bins` | Ascending id | The object id |
+| `by="group"` | Ascending group index, then ungrouped objects | The group index; `-1` for ungrouped |
 
 A bin cut by edges spans `[edges[i], edges[i + 1])`. Values below the
-first edge fall in the first bin, and the last bin is open above, so
-`bins=[0, 30, 80, inf]` puts a length of 45 in the bin labelled `30`.
-`chunk_attribute_name` is the attribute's name, or the dimension's
-name (`group`, `object_id`, or `prefix_dim_name`) for the other kinds.
-`by="spatial"` has no bins to select between and records no labels.
+first edge fall in the first bin and the last bin is open above, so
+`bins=[0, 30, 80, inf]` puts a value of 45 in the bin labelled `30`.
+`chunk_attribute_name` is the attribute's name, or `group`, `object_id`
+or `prefix_dim_name` for the other kinds. `by="spatial"` records no
+labels.
 
 ### Pyramids
 
-`build_pyramid` and `coarsen_level` keep a level's bins at every coarser
-level. The coarse level gets the same leading bin axis, and copies the fine
-level's `chunk_dims`, `chunk_attribute_name` and `chunk_attribute_values`
-verbatim, so bin `i` means the same value at every level, and
-`attribute_filter` works on a coarse level as it does on level 0.
+`build_pyramid` and `coarsen_level` keep the bins at every coarser level:
+the coarse level has the same leading axis and copies `chunk_dims`,
+`chunk_attribute_name` and `chunk_attribute_values`, so
+`attribute_filter` works on any level. Each coarse vertex aggregates
+vertices of one attribute bin and one spatial bin, so a polyline that
+changes value within a spatial bin gives one coarse vertex per value.
 
-A metavertex aggregates vertices of **one** bin. The grouping key is the
-attribute bin followed by the spatial bin, so a polyline that turns from
-one value to another in a single spatial bin gives one metavertex per
-value. The bin is taken from each vertex's chunk key, because the
-chunk-by attribute is not stored per vertex.
-
-Cross-level links (`links/+N`, `links/-N`) are written at the full rank,
-`sid_ndim + 1`, at both ends. A link never crosses bins, so the bin
-component of its offset is always 0.
+Links between levels (`links/+N`, `links/-N`) have rank `1 + D` at both
+ends. A link never crosses attribute bins, so the bin component of its
+offset is always 0 (segments such as `0.0.0.+1`).
 
 A level with a leading axis but no `chunk_attribute_values` is carried
-the same way. Such a level comes from a rechunk made before bin labels
-were recorded. The coarse level's arrays get the axis from the fine
+the same way; the coarse level takes the axis length from the fine
 level's `vertices` shape.
 
-### Atomicity and writes
+### Validation
 
-Attribute-chunked writes inherit the same atomicity guarantees as
-spatial writes: each chunk is one file (or one object on a cloud
-store), and per-chunk writes are atomic. A failed write can leave a
-partially-populated store — there is no transactional rollback in v1.
-
-### Compatibility notes
-
-- A reader that ignores `chunk_dims` and treats the leading axis as
-  spatial will read garbage. Always inspect `chunk_dims` before
-  interpreting chunk keys.
-- Bin order is fixed by `numpy.unique` at write time. Adding new
-  attribute values to an existing attribute-chunked store requires a
-  rechunk (the existing bin numbering does not accommodate inserts).
-- `chunk_attribute_values` is the authoritative bin → value map. Do
-  not infer it from chunk-key prefixes alone.
+[`zarr_vectors.validate`](../validation/overview.md) has no checks
+specific to attribute chunking. Level 3 reads every chunk key of any
+rank, and the per-bin point checks of [Bin shape](bin_shape.md#validation)
+apply only to point-cloud levels without an object index, which an
+attribute-chunked point level always has.

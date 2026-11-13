@@ -1,16 +1,17 @@
 Constants
 =========
 
-Geometry type string constants. Import these instead of using raw strings
-to ensure forward-compatibility if constant values change.
+String constants used in store metadata, including the geometry type names.
+Importing a constant instead of typing the string lets a typo fail at import
+time.
 
 .. automodule:: zarr_vectors.constants
    :members:
    :undoc-members:
    :show-inheritance:
 
-Geometry type constant values
-------------------------------
+Geometry type values
+--------------------
 
 .. list-table::
    :header-rows: 1

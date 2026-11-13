@@ -1,9 +1,9 @@
 # Geometry types
 
-Zarr Vectors defines seven geometry types. Each type is identified by a string
-constant stored in the root `.zattrs` under `"geometry_type"`. A single
-Zarr Vectors store holds exactly one geometry type; multi-type datasets require
-multiple stores.
+Zarr Vectors defines seven geometry types. A store names its types in the
+`geometry_types` list of the `zarr_vectors` block in the root attributes; see
+[Root metadata](../layout/root_metadata.md). Each writer described in these
+pages creates a store with one geometry type.
 
 ## Type constants
 
@@ -21,36 +21,27 @@ from zarr_vectors.constants import (
 
 ## Comparison matrix
 
+What each type's writer stores at level 0. "Optional" means the writer stores
+it when the caller passes the matching argument.
+
 | Property | `point_cloud` | `line` | `polyline` | `streamline` | `graph` | `skeleton` | `mesh` |
 |----------|:---:|:---:|:---:|:---:|:---:|:---:|:---:|
-| Discrete objects | — | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
-| `links/` family | — | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
-| `link_width` | — | 2 | 2 | 2 | 2 | 2 | ≥ 3 |
-| Intra-chunk links (`0.0.0`) | — | — | — | — | ✓ | ✓ | ✓* |
-| Cross-chunk links (non-zero offsets) | — | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
-| Family `directed` | — | false | false | false | false | **true** | false |
-| `object_index/` | — | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
-| `object_attributes/` | — | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
-| `groupings/` | — | — | ✓ | ✓ | ✓ | ✓ | ✓ |
-| Per-vertex attributes | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
-| Object sparsity | — | — | ✓ | ✓ | ✓ | ✓ | ✓ |
-| Multiscale pyramid | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
-| Draco compression | — | — | — | — | — | — | ✓ |
+| `links_convention` | `implicit_sequential` | `implicit_sequential` | `implicit_sequential` | `implicit_sequential` | `explicit` | `implicit_sequential_with_branches` | `explicit` |
+| `links/0/` family | — | when a line crosses a chunk | when a polyline crosses a chunk | when a streamline crosses a chunk | ✓ | ✓ | ✓ |
+| `link_width` | — | 2 | 2 | 2 | 2 | 2 | face size, ≥ 3 |
+| Intra-chunk links (`0.0.0`) | — | — | — | — | ✓ | branch records | ✓ (raw encoding) |
+| Family `directed` | — | false | false | false | false | see [Skeleton](skeleton.md) | false |
+| `object_index/` | optional | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
+| `object_attributes/` | optional | optional | optional | optional | optional | optional | optional |
+| `groups/` | optional | — | optional | optional | — | — | — |
+| `vertex_attributes/` | optional | optional | optional | optional | optional | optional | optional |
+| `link_attributes/` | — | — | — | — | optional | optional | — |
+| Draco encoding | — | — | — | — | — | — | optional |
 
-\* Mesh intra-chunk faces move into the Draco bitstream under
-`encoding="draco"`, leaving only boundary faces in `links/`.
-
-There is no `cross_chunk_links/` family: connectivity is one family,
-and an intra-chunk link is simply one whose offsets are all zero.
-`line`, `polyline`, and `streamline` use
-`links_convention: implicit_sequential` — vertex order within a
-fragment carries the topology — so they emit **only** non-zero-offset
-links, and a store whose objects never cross a chunk has no `links/`
-group at all.
-
-There are no `is_directed` or `is_tree` root keys; `directed` is
-per-family link policy, and tree-ness is carried by `geometry_type`
-plus `links_convention`. See [Links](../object_model/links.md).
+In the `implicit_sequential` types, vertex order within a fragment carries
+the connectivity, so the writers store only the links that cross a chunk
+boundary; a store whose objects all sit in one chunk has no `links/` group.
+How links are stored is described in [Links](../object_model/links.md).
 
 ## Type selection guide
 
@@ -58,8 +49,8 @@ plus `links_convention`. See [Links](../object_model/links.md).
 |-----------------|-----------------|
 | Lidar, synchrotron point scan, single-molecule localisation | `point_cloud` |
 | Pairs of connected points (short segments, contact sites) | `line` |
-| Ordered vertex sequences without tractography metadata | `polyline` |
-| MRI/synchrotron tractography streamlines with step size / seeding metadata | `streamline` |
+| Ordered vertex sequences | `polyline` |
+| Tractography streamlines | `streamline` |
 | General connectivity graph (not necessarily a tree) | `graph` |
 | Neuronal morphology, vascular tree (tree topology, SWC-compatible) | `skeleton` |
 | 3-D surface mesh (cell boundary, brain surface, organelle hull) | `mesh` |

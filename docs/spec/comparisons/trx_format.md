@@ -1,155 +1,113 @@
-# Zarr Vectors and TRX format
+# Zarr Vectors and TRX
+
+This page compares Zarr Vectors streamline stores with the TRX
+tractography format, maps TRX arrays onto Zarr Vectors arrays, and
+describes the converters between them.
 
 ## Terms
 
-**TRX format**
-: Tractography Exchange format — a ZIP-based tractography file format
-  designed to replace TRK and TCK for cross-software data exchange. Defined
-  at https://tractography-file-format.github.io. Implemented in
-  `trx-python` and supported by DIPY, MRtrix, Mrtrix3Tissue, and others.
+**TRX**
+: A tractography file format defined at
+  <https://tractography-file-format.github.io>, with a reference
+  implementation in `trx-python`. A TRX file is a ZIP archive or a
+  directory of uncompressed binary arrays plus a `header.json`.
 
-**`dps` (data per streamline)**
-: Per-streamline scalar or matrix arrays in TRX, stored under `dps/` in
-  the ZIP archive. Each array has one row per streamline. Equivalent to
-  Zarr Vectors `object_attributes/`.
+**`positions` and `offsets`**
+: The TRX arrays holding every streamline's vertices concatenated, and
+  the index of each streamline's first vertex.
 
-**`dpp` (data per point)**
-: Per-vertex scalar or matrix arrays in TRX, stored under `dpp/` in the
-  ZIP archive. Each array has one value per vertex across all streamlines,
-  in concatenated order. Equivalent to Zarr Vectors `attributes/`.
+**`dpv`, `dps`, `dpg`**
+: TRX data per vertex, per streamline and per group: arrays aligned
+  with the vertices, the streamlines or the groups.
+
+**`groups`**
+: Named TRX lists of streamline indices, such as bundles.
 
 **TRX header**
-: A JSON file `header.json` at the root of the ZIP archive, storing the
-  affine transform, voxel dimensions, voxel-to-rasmm transform, and
-  data space identifier.
-
-**Memory mapping**
-: TRX arrays are stored as raw binary `.npy` files within the ZIP,
-  allowing direct memory mapping on POSIX systems without decompression.
-  This is the primary efficiency advantage of TRX for local I/O.
-
-**Offset array**
-: TRX stores the lengths (or cumulative offsets) of individual streamlines
-  in `streamlines/offsets.int64.npy`. Given offsets `[0, 40, 85, …]`,
-  streamline `k` spans points `[offsets[k], offsets[k+1])` of
-  `streamlines/data.float32.npy`.
+: `header.json`, holding the reference image's `VOXEL_TO_RASMM` affine
+  and `DIMENSIONS` and the streamline and vertex counts. TRX positions
+  are in RAS millimetres.
 
 ---
 
 ## Introduction
 
-TRX and Zarr Vectors both store tractography streamline data, but they were designed
-for fundamentally different access patterns. TRX prioritises fast sequential
-access on local storage via memory mapping — it is ideal for software
-pipelines that process all streamlines in sequence. Zarr Vectors prioritises spatial
-random access and cloud-native serving — it is ideal for spatial queries
-on large datasets, multi-resolution visualisation, and scalable cloud pipelines.
-
-Most tractography workflows begin with data in TRK, TCK, or TRX format.
-The Zarr Vectors ingest pipeline (`ingest_trx`, `ingest_trk`, `ingest_tck`) converts
-these formats to Zarr Vectors, preserving all `dps` and `dpp` attributes as
-`object_attributes/` and `attributes/` respectively.
+TRX keeps each array contiguous so that a program can memory-map a
+file and stream every streamline in order. A Zarr Vectors store chunks
+vertices by position, so a program can read the streamlines that pass
+through a region, read one streamline by ID, or read a coarser
+resolution level, without reading the rest. TRX suits whole-file
+processing on local storage; a Zarr Vectors store suits spatial access
+and object-store hosting. The converters in `zarr-vectors-tools` move
+data between the two.
 
 ---
 
 ## Technical reference
 
-### Format structure comparison
+### Structure
 
-| Property | TRX | Zarr Vectors (`streamline`) |
-|----------|-----|--------------------|
-| Container | ZIP archive (`.trx`) | Directory tree (`.zarrvectors`) |
-| Vertex storage | Flat concatenated array + offset table | Spatially chunked, fragment-indexed |
-| Spatial index | None | Chunk grid + fragment index |
-| Per-vertex attributes (`dpp`) | Separate `.npy` files (same layout as vertices) | `attributes/<name>/` arrays |
-| Per-streamline attributes (`dps`) | Separate `.npy` files (one row per streamline) | `object_attributes/<name>/` arrays |
-| Affine transform | Stored in `header.json` | Not stored; apply before writing |
-| Multi-resolution | No | Yes |
-| Cloud access | Not designed for (ZIP download required) | Native (chunk-level range requests) |
-| Write API | Yes (`trx-python`) | Yes (`zarr-vectors-py`) |
-| Memory mapping | Yes (fast local sequential access) | No (but chunk caching is equivalent for sequential reads) |
-| Groupings | `groups/<name>/offsets.npy` | `groupings/` array |
+| Property | TRX | Zarr Vectors `streamline` |
+|----------|-----|---------------------------|
+| Container | ZIP archive or directory | Zarr v3 hierarchy (`.zarrvectors`) |
+| Vertices | One `positions` array, concatenated | Per-chunk cells, sorted into fragments (see [Chunk arrays](../layout/chunk_arrays.md)) |
+| Streamline boundaries | `offsets` | Object manifests listing each streamline's chunks and fragments (see [Object manifest](../object_model/object_manifest.md)) |
+| Spatial index | None | Chunk grid and fragment index |
+| Per-vertex data | `dpv/` | `vertex_attributes/<name>` |
+| Per-streamline data | `dps/` | `object_attributes/<name>` |
+| Groups | `groups/` | `groups` array, with names in its `group_names` attribute |
+| Per-group data | `dpg/` | `group_attributes/<name>` |
+| Reference image | `header.json` | Kept as a `trx` header by `zarr-vectors-tools` (see below) |
+| Resolution levels | One | Several (see [Multiscale metadata](../multiscale/multiscale_metadata.md)) |
 
 ### Data model mapping
 
-#### Vertex positions
+`ingest_trx` (`zarr_vectors_tools.convert.ingest.trx`) writes a
+`streamline` store with `write_polylines`:
 
-TRX stores all streamline vertices as a flat `(total_points, 3)` float32
-array in `streamlines/data.float32.npy`. Streamline boundaries are given
-by `streamlines/offsets.int64.npy` (cumulative sum of streamline lengths).
+- `positions` and `offsets` become one object per streamline, in file
+  order.
+- Each `dpv` array becomes a vertex attribute, kept in the file's dtype
+  and reordered with the vertices.
+- Each `dps` array becomes an object attribute, in the file's dtype.
+- Each TRX group becomes a row of the `groups` array, named after the
+  group; `dpg` arrays become group attributes.
+- `VOXEL_TO_RASMM`, `DIMENSIONS` and the array names are kept in a
+  `trx` header (the `zarr_vectors.headers` registry) so that an export
+  can write them back.
+- The axes record millimetres. Positions are stored as given, in RAS
+  millimetres.
 
-Zarr Vectors stores vertices chunked spatially. The equivalent of the TRX offset
-table is `object_index/`, whose per-streamline manifest enumerates every
-`(chunk, fragment)` the streamline touches, in traversal order. (Before
-Zarr Vectors 0.6.0 this took a primary fragment plus a cross-chunk-link walk;
-the manifest now enumerates the chunks directly.)
+`ingest_trx` can also compute per-streamline length and endpoints,
+drop streamlines outside a length range, and average `dpv` scalars per
+streamline.
 
-#### `dpp` → `attributes/`
+### Export
 
-Each `dpp/<name>.<dtype>.npy` file in TRX contains one value per vertex in
-the same concatenated order as `streamlines/data`. In Zarr Vectors, the equivalent
-is `attributes/<name>/`, which stores one value per vertex in fragment order
-(per-chunk, spatially sorted).
+`export_trx` (`zarr_vectors_tools.convert.export.trx`) writes one
+resolution level to a TRX file: vertex attributes as `dpv`, object
+attributes as `dps`, named groups as `groups` with their attributes as
+`dpg`, and the reference image from the store's TRX or TRK header. A
+store holding TrackVis voxel-millimetre positions is converted to RAS
+millimetres. It can export a subset by object ID, group ID or chunk.
+The chunk layout and the other levels are not part of TRX and are not
+written.
 
-| TRX | Zarr Vectors |
-|-----|-----|
-| `dpp/fa.float32.npy` | `attributes/fa/` (float32) |
-| `dpp/md.float32.npy` | `attributes/md/` (float32) |
-| `dpp/t1.float32.npy` | `attributes/t1/` (float32) |
+The commands are:
 
-#### `dps` → `object_attributes/`
+```bash
+zvtools convert bundles.trx bundles.zarrvectors --chunk-shape 20,20,20
+zvtools convert bundles.zarrvectors cst.trx --group-id 0
+```
 
-Each `dps/<name>.<dtype>.npy` file in TRX contains one value per streamline
-(row `k` corresponds to streamline `k`). In Zarr Vectors, the equivalent is
-`object_attributes/<name>/`.
+Both need the `zarr-vectors-tools[trx]` extra (`trx-python`). TRK and
+TCK files have their own converters (`ingest_trk`, `ingest_tck`,
+`export_trk`). See the zarr-vectors-tools
+[streamlines page](https://zarr-vectors-tools.readthedocs.io/en/latest/convert/streamlines.html).
 
-| TRX | Zarr Vectors |
-|-----|-----|
-| `dps/mean_fa.float32.npy` | `object_attributes/mean_fa/` (float32) |
-| `dps/cluster_id.int16.npy` | `object_attributes/cluster_id/` (int16) |
-| `dps/endpoints.float32.2x3.npy` | `object_attributes/endpoints/` (float32, shape (n, 2, 3)) |
+### Validation
 
-Matrix `dps` attributes (shape `(n_streamlines, K, M)`) are supported in
-both formats. Zarr Vectors stores them as `object_attributes/<name>/` with shape
-`(n_objects, K, M)`.
-
-#### Groups
-
-TRX groups are sub-ZIP directories: `groups/<name>/offsets.int64.npy`
-lists the indices of streamlines in the group. Zarr Vectors stores groups in
-`groupings/` with group names in `groupings_attributes/name/`.
-
-### TRX metadata not preserved in Zarr Vectors
-
-TRX stores an affine transform from voxel space to RAS mm in `header.json`.
-Zarr Vectors does not store or apply affine transforms; the caller must apply the
-affine to vertex positions before writing to Zarr Vectors. The affine can be stored
-in root `.zattrs` under `custom_metadata.affine` for provenance, but it
-will not be automatically applied by `zarr-vectors-py`.
-
-TRX ingest (via the companion package **`zarr-vectors-tools`**) exposes
-an `apply_affine` keyword that controls whether the TRX header affine
-is applied to vertex positions before they are written to Zarr Vectors.
-
-### Performance comparison
-
-| Operation | TRX | Zarr Vectors |
-|-----------|-----|-----|
-| Sequential read of all streamlines | Very fast (memory mapped) | Fast (sequential chunk reads, ~same throughput) |
-| Random access to one streamline by ID | O(1) offset lookup + linear read | O(1) object_index lookup + fragment read |
-| Spatial bbox query | O(n) — scan all streamlines | O(chunks × bins) — spatial index |
-| Cloud access (S3/GCS) | Requires full download | Native range requests |
-| Spatial query on 1M-streamline dataset | Seconds to minutes | < 1 second for a small bbox |
-
-Zarr Vectors' spatial query advantage is most pronounced for datasets with millions
-of streamlines where only a small spatial region is needed. For pipelines
-that process all streamlines sequentially, TRX's memory-mapped access
-pattern has comparable or better throughput than Zarr Vectors' chunked reads.
-
-### Ingest and export
-
-TRX converters live in the companion package **`zarr-vectors-tools`**.
-TRX ingest preserves all dps and dpp attributes; TRX export is lossless
-for the base level (level 0). Coarser resolution levels are not exported
-to TRX (TRX has no multi-resolution concept), and the exported TRX does
-not include the Zarr Vectors chunk layout metadata.
+`zarr-vectors-py` does not validate TRX files. A store written by
+`ingest_trx` is a `streamline` store; level 4 of
+`zarr_vectors.validate.validate` checks that its `links_convention` is
+`implicit_sequential`. See [Validation](../validation/overview.md).

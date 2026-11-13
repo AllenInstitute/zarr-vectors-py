@@ -3,228 +3,138 @@
 ## Terms
 
 **`multiscales` block**
-: An array of objects in root `.zattrs` that describes the resolution
-  pyramid of a Zarr Vectors store. The structure follows the
-  [OME-Zarr NGFF multiscales specification](https://ngff.openmicroscopy.org/),
-  extended with Zarr Vectors-specific keys (`bin_ratio`, `bin_shape`,
-  `object_sparsity`).
+: A list in the root attributes that describes the resolution pyramid of
+  a Zarr Vectors store in the layout of the
+  [OME-NGFF multiscales specification](https://ngff.openmicroscopy.org/)
+  version 0.4.
 
 **Coordinate transform**
-: An affine-like spatial transformation declared per resolution level in
-  the `multiscales` block. Zarr Vectors uses two transforms per level: a `scale`
-  transform (encoding `bin_ratio`) and a `translation` transform (encoding
-  the centroid offset of the coarsened bins).
-
-**Scale transform**
-: A multiplicative factor per axis applied to convert a coordinate in
-  level-`N` space back to level-0 physical space. For a level with
-  `bin_ratio = [2, 2, 2]`, the scale is `[2.0, 2.0, 2.0]` — a point in
-  level-1 coordinates must be multiplied by 2 to recover its level-0
-  physical position.
-
-**Translation transform**
-: An additive offset per axis applied after the scale transform. For Zarr Vectors
-  metanodes (binned vertices), the translation encodes the shift from the
-  bin origin to the bin centroid: `translation[d] = bin_shape[d] / 2`.
-
-**OME-Zarr compatibility**
-: The property that an OME-Zarr-aware tool (Neuroglancer, napari, OME-Zarr
-  validators) can read the `multiscales` block of a Zarr Vectors store and correctly
-  interpret the resolution pyramid, coordinate transforms, and axis
-  metadata, without needing to understand Zarr Vectors-specific keys.
+: A `scale` or `translation` entry in a dataset's
+  `coordinateTransformations` list.
 
 ---
 
 ## Introduction
 
-The `multiscales` block serves two purposes. First, it is the machine-
-readable index of the resolution pyramid: it lists every level, its path,
-and the parameters of the coarsening operation that produced it. Second,
-it encodes the spatial coordinate transforms that relate each coarser level
-back to physical space, following the OME-Zarr convention so that viewers
-can display multi-resolution data with correct physical alignment.
-
-By following OME-Zarr conventions, Zarr Vectors stores are discoverable by the
-existing ecosystem of OME-Zarr tools — not just `zarr-vectors-py`. A viewer
-that understands OME-Zarr multiscales (such as Neuroglancer with the
-`zarr_vectors` data source, or a napari plugin) can open any Zarr Vectors store and
-correctly interpret the resolution pyramid without Zarr Vectors-specific code.
+The `multiscales` block lists every resolution level and gives each one
+a `scale` and a `translation` transform. It follows the OME-NGFF layout
+so that NGFF-aware tools can discover the pyramid. It is also where a
+coarser level's bin geometry is recorded: the level's attributes
+([Level groups](../layout/level_groups.md)) do not carry `bin_shape` or
+`bin_ratio`, and `read_level_metadata` takes them from this block.
 
 ---
 
 ## Technical reference
 
-### Full schema
+### Example
+
+The block of a streamline store with `base_bin_shape` `[50, 50, 50]`
+and a pyramid built with `factors=[(2.0, 1.0), (2.0, 2.0)]`:
 
 ```json
 "multiscales": [
   {
-    "version":  "0.5",
-    "name":     "scan",
-    "type":     "zarr_vectors_multiscale",
+    "version": "0.4",
+    "name": "default",
     "axes": [
-      {"name": "z", "type": "space", "unit": "micrometer"},
-      {"name": "y", "type": "space", "unit": "micrometer"},
-      {"name": "x", "type": "space", "unit": "micrometer"}
+      {"name": "x", "type": "space"},
+      {"name": "y", "type": "space"},
+      {"name": "z", "type": "space"}
     ],
     "datasets": [
       {
-        "path":            "0",
-        "level":           0,
-        "bin_ratio":       [1, 1, 1],
-        "bin_shape":       [50.0, 50.0, 50.0],
-        "object_sparsity": 1.0,
+        "path": "0",
         "coordinateTransformations": [
-          {"type": "scale",       "scale":       [1.0, 1.0, 1.0]},
+          {"type": "scale", "scale": [1.0, 1.0, 1.0]},
           {"type": "translation", "translation": [25.0, 25.0, 25.0]}
         ]
       },
       {
-        "path":            "1",
-        "level":           1,
-        "bin_ratio":       [2, 2, 2],
-        "bin_shape":       [100.0, 100.0, 100.0],
-        "object_sparsity": 0.5,
+        "path": "1",
         "coordinateTransformations": [
-          {"type": "scale",       "scale":       [2.0, 2.0, 2.0]},
+          {"type": "scale", "scale": [2.0, 2.0, 2.0]},
           {"type": "translation", "translation": [50.0, 50.0, 50.0]}
+        ]
+      },
+      {
+        "path": "2",
+        "coordinateTransformations": [
+          {"type": "scale", "scale": [4.0, 4.0, 4.0]},
+          {"type": "translation", "translation": [100.0, 100.0, 100.0]}
         ]
       }
     ],
-    "coordinateTransformations": [
-      {"type": "scale", "scale": [1.0, 1.0, 1.0]}
-    ]
+    "metadata": {"format": "zarr_vectors"}
   }
 ]
 ```
 
-### Key descriptions
+### Keys
 
-#### Top-level `multiscales` fields
+| Key | Value |
+|-----|-------|
+| `version` | `"0.4"` |
+| `name` | `"default"` |
+| `axes` | One entry per spatial axis, taken from the root metadata's axes: `name`, `type` (default `"space"`), and `unit` only when the axis has one (for example in a store created with `create_store(..., unit="micrometer")`) |
+| `datasets` | One entry per resolution level, in ascending level order |
+| `datasets[].path` | The level group's name (`"0"`, `"1"`, …) |
+| `datasets[].coordinateTransformations` | A `scale` transform, followed by a `translation` transform unless every offset is zero |
+| `metadata.format` | `"zarr_vectors"`, which marks the block as a Zarr Vectors pyramid. NGFF reserves `type` for the downsampling method, so the block has no `type` key |
 
-| Key | Required | Type | Description |
-|-----|----------|------|-------------|
-| `version` | Yes | `string` | OME-Zarr NGFF version. `"0.5"` for current Zarr Vectors stores. |
-| `name` | No | `string` | Human-readable name for the dataset. |
-| `type` | Yes | `string` | Must be `"zarr_vectors_multiscale"` for Zarr Vectors stores. OME-Zarr tools ignore unknown `type` values. |
-| `axes` | Yes | `[axis, …]` | D-length array of axis descriptors. See axis schema below. |
-| `datasets` | Yes | `[dataset, …]` | One entry per resolution level, in ascending level-index order. |
-| `coordinateTransformations` | No | `[transform, …]` | Global-level transforms applied to all levels (e.g. a global scale). |
+The block has no top-level `coordinateTransformations` and no
+per-dataset `level`, `bin_ratio`, `bin_shape` or `object_sparsity` key.
 
-#### `axes` schema
+### Transform values
 
-```json
-{
-  "name":  "z",
-  "type":  "space",
-  "unit":  "micrometer"
-}
-```
+For level 0:
 
-`type` must be `"space"` for spatial axes. `"time"` is valid for a temporal
-axis in a 4-D store. `unit` follows the OME-Zarr unit vocabulary
-(`"micrometer"`, `"nanometer"`, `"millimeter"`, `"voxel"`, etc.).
+- `scale` is all `1.0`.
+- `translation` is half the root's effective bin shape
+  (`base_bin_shape`, or `chunk_shape` when the store declares no bin
+  shape).
 
-#### `datasets` entry schema
+For a coarser level:
 
-| Key | Required | Type | Description |
-|-----|----------|------|-------------|
-| `path` | Yes | `string` | Path to the level group relative to the store root. |
-| `level` | Yes | `integer` | Level index. Must match the numeric suffix of `path`. |
-| `bin_ratio` | Yes (ZV) | `[int, …]` | D-tuple. Ratio of this level's bin shape to `base_bin_shape`. |
-| `bin_shape` | Yes (ZV) | `[float, …]` | D-tuple. Effective bin shape at this level. |
-| `object_sparsity` | No (ZV) | `float` | Fraction of objects retained. Default `1.0`. |
-| `coordinateTransformations` | Yes | `[transform, …]` | Per-level coordinate transforms. |
+- `scale` is the level's `bin_ratio`; when the level has no `bin_ratio`,
+  `bin_shape / base_bin_shape` per axis; when it has neither, all `1.0`.
+- `translation` is half the level's `bin_shape`, or half the root's
+  effective bin shape when the level has none.
 
-Fields marked `(ZV)` are Zarr Vectors extensions. OME-Zarr-aware tools will ignore
-them; `zarr-vectors-py` requires them.
+A reader recovers a coarser level's bin geometry from its transforms:
+`bin_ratio = scale` and `bin_shape = 2 × translation`.
+`read_level_metadata(root, level)` does this, and for level 0 reports
+neither (level 0 takes `base_bin_shape` from the root).
 
-### Coordinate transforms
+Vertex positions are stored in level-0 coordinates at every level: a
+metavertex is the centroid of the positions it replaces. The transforms
+describe each level's bin grid relative to level 0; a reader of Zarr
+Vectors vertices does not apply them to positions.
 
-Zarr Vectors uses a pair of transforms per level:
+### Writing and reading the block
 
-```
-[scale, translation]
-```
-
-Applied in order (scale first, then translation):
-
-```
-physical_position = metanode_position × scale + translation
-```
-
-**Scale:** encodes the bin ratio. For level `N` with `bin_ratio = [r_0, …, r_{D-1}]`:
-
-```json
-{"type": "scale", "scale": [r_0, r_1, ..., r_{D-1}]}
-```
-
-A viewer multiplies metanode coordinates by the scale to recover physical
-coordinates.
-
-**Translation:** encodes the bin centroid offset. For level `N` with
-`bin_shape = [b_0, …, b_{D-1}]`:
-
-```json
-{"type": "translation", "translation": [b_0/2, b_1/2, ..., b_{D-1}/2]}
-```
-
-A metanode at a bin's origin has its reported coordinate at the bin centre
-after applying the translation.
-
-**Combined for level 1, `bin_ratio=[2,2,2]`, `bin_shape=[100,100,100]`:**
-
-A metanode at position `[50.0, 100.0, 75.0]` in level-1 coordinates maps to
-physical position `[50.0×2 + 50.0, 100.0×2 + 50.0, 75.0×2 + 50.0]` =
-`[150.0, 250.0, 200.0]` µm.
-
-### OME-Zarr compatibility notes
-
-Zarr Vectors `multiscales` blocks are valid OME-Zarr NGFF 0.5 multiscales. An
-OME-Zarr reader will:
-
-- Correctly read `axes`, `datasets[].path`, and `coordinateTransformations`.
-- Ignore `type: "zarr_vectors_multiscale"` (not a standard OME-Zarr type).
-- Ignore `bin_ratio`, `bin_shape`, `object_sparsity` (Zarr Vectors extensions).
-- Attempt to open the `vertices/` array at each level as an image array
-  (it will find a 5-D float32 array, which is valid but may not render
-  sensibly in a volume viewer).
-
-This compatibility allows Zarr Vectors stores to be indexed and discovered by OME-Zarr
-metadata tools and registries, improving interoperability with the broader
-NGFF ecosystem.
-
-### Writing and updating multiscale metadata
-
-`zarr-vectors-py` writes the `multiscales` block automatically during
-`write_*` and `build_pyramid` calls. To regenerate after manual modifications:
+The `write_*` functions and `build_pyramid` write the block. To rewrite
+it from the levels' current metadata:
 
 ```python
 from zarr_vectors.core.multiscale import (
-    write_multiscale_metadata,
     get_level_scale,
     get_level_translation,
+    write_multiscale_metadata,
 )
 from zarr_vectors.core.store import open_store
 
 root = open_store("scan.zarrvectors", mode="r+")
 write_multiscale_metadata(root)
 
-# Inspect individual level transforms
 print(get_level_scale(root, level=1))        # [2.0, 2.0, 2.0]
 print(get_level_translation(root, level=1))  # [50.0, 50.0, 50.0]
 ```
 
+`read_multiscale_metadata(root)` returns the block, or `None` when the
+root has none.
+
 ### Validation
 
-L2 validation checks:
-
-- `multiscales` is a non-empty list.
-- Exactly one entry has `level == 0` and `bin_ratio == [1,…,1]`.
-- `datasets` entries are ordered by ascending `level`.
-- For each entry: `path` references an existing group; `bin_ratio`,
-  `bin_shape`, and `coordinateTransformations` are present and consistent.
-- `coordinateTransformations` contains exactly one `scale` and one
-  `translation` transform in that order.
-- `scale[d] == bin_ratio[d]` for all `d`.
-- `translation[d] == bin_shape[d] / 2` for all `d` (within tolerance).
+The validators in `zarr_vectors.validate` do not read the `multiscales`
+block.

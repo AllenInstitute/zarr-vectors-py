@@ -1,75 +1,39 @@
 # Directory structure
 
+This page shows the on-disk tree of a Zarr Vectors store for each geometry
+type, and says which paths each writer creates.
+
 ## Terms
 
 **Store root**
-: The top-level directory (or object-store prefix) of a Zarr Vectors store.
-  Contains the root `zarr.json` and all resolution level groups.
+: The directory (or object-store prefix) holding the root `zarr.json`, the
+  level groups and, optionally, `parametric/`.
 
-  **File extension.** `.zarrvectors` is the canonical extension and the one
-  to prefer in documentation, examples and generated output. `.zv` is an
-  accepted short form, useful where path length matters — deep scratch
-  hierarchies on HPC filesystems, say. The two are interchangeable: nothing
-  in the format reads the extension, and a store opens the same either way.
-  A store with no extension at all is still a valid store.
+  **File extension.** `.zarrvectors` is the extension to use in
+  documentation, examples and generated output. `.zv` is an accepted short
+  form, for places where path length matters. Nothing in the format reads
+  the extension, and a store without one is still a store.
 
-**Resolution level group**
-: A Zarr group at path `<N>/` within the store root, where `N`
-  is a non-negative integer. Level 0 is always the full-resolution level.
-  Higher levels are progressively coarser.
+**Level group**
+: The group `<N>/` holding one resolution level; `0/` is full resolution.
+  See [Level groups](level_groups.md).
 
 **Per-chunk array**
-: Every per-spatial-chunk array (`vertices/`, `vertex_fragments/`,
-  `links/<delta>/<offsets>/`, `vertex_attributes/<name>/`, …) is a
-  **single** Zarr v3 vlen-bytes array whose shape is the level's chunk
-  grid. One cell holds one spatial chunk's payload bytes; the chunk files
-  live under the `c/` sub-tree (`c/i/j/k`). A spatial chunk at absolute
-  coord `c` maps to cell `c - origin`, where
-  `origin = floor(min_corner / chunk_shape)` is stored in the array's
-  `chunk_grid_origin` attribute (absent ⇒ zero origin). The set of
-  non-empty cells is listed in the array's `nonempty_chunks` attribute
-  (absent ⇒ taken from the store, while a level's presence is deferred).
+: An array with one cell per spatial chunk, whose cells are files under
+  `c/` (`c/i/j/k` in 3-D). See [Chunk arrays](chunk_arrays.md).
 
-  This pattern is now **universal — there is no exception.** Before 0.9.0
-  `cross_chunk_links/<delta>/` was one: its cells were keyed by
-  endpoint-chunk tuples rather than a spatial grid, so each cell was its
-  own small array under a group. That family is gone. Connectivity is a
-  single family whose arrays are ordinary rank-D grids over the chunk
-  grid, one cell per **source** chunk — so every per-chunk array in a
-  store now shares the same shape, the same `c/i/j/k` key scheme, and the
-  same sharding behaviour. See [Links](../object_model/links.md).
-
-**Family group**
-: `links/<delta>/` and `link_attributes/<name>/<delta>/` are **groups**,
-  not arrays. Their children are one per-chunk array per distinct
-  relative-offset segment (`links/<delta>/<offsets>/`). The group carries
-  the family-wide policy (`link_width`, `sid_ndim`, `directed`, `store`);
-  the arrays carry only what decodes their own cells.
-
-**`metadata.json`**
-: A plain-text JSON file at the store root containing human-readable
-  summary information about the store (total vertex count, bounding box,
-  creation timestamp). Not used by the read/write API; present for
-  inspection and provenance.
-
-**`parametric/`**
-: An optional sub-group at the store root for algebraic (non-vertex-based)
-  geometry objects such as planes, spheres, and ellipsoids. Not chunked
-  spatially; stores a single array of object parameter tuples.
-
----
+**Link family**
+: The group `links/<delta>/` (or `link_attributes/<name>/<delta>/`) whose
+  children are one per-chunk array per offsets segment. See
+  [Links](../object_model/links.md).
 
 ## Introduction
 
-The on-disk layout of a Zarr Vectors store follows a clear hierarchy: store root →
-resolution levels → array groups → chunk files. Every path in the hierarchy
-has a defined meaning; there are no opaque binary blobs. This page documents
-every node in the tree for each supported geometry type.
-
-Understanding the directory structure is essential for contributors
-implementing new geometry types, validation tools, or custom readers. It is
-also useful for debugging: if a store fails validation, the first step is
-often to inspect the directory tree directly.
+A store is a Zarr v3 hierarchy: the root group, one group per resolution
+level, and in each level the arrays for that level. All Zarr Vectors
+metadata is in the `attributes` of the `zarr.json` files; there are no other
+metadata files. Every array and group has its own `zarr.json`, omitted from
+the trees below except where it matters.
 
 ```{figure} ../../_static/figures/zarr-vectors-store-structure.png
 :alt: Panel a, the directory tree of a three-level Zarr Vectors store with the base level expanded into vertices, vertex_attributes, links by level and chunk offset, vertex_fragments, link_fragments, object_index and groups. Panel b, vertices and links drawn across levels 0, 1 and 2, showing links that stay within a chunk, links carrying a chunk offset, links carrying a level offset, and objects split into fragments across chunks.
@@ -85,250 +49,200 @@ and between resolution levels, and objects and object fragments, across the
 same three-level store.
 ```
 
----
-
 ## Technical reference
 
-### Full annotated tree (point cloud)
+The trees below come from stores written with the writers in
+`zarr_vectors.types`, with `chunk_shape=(200, 200, 200)` over bounds
+`[0, 400]` on each axis (a 3 × 3 × 3 chunk grid).
 
-```
-dataset.zarrvectors/
-│
-├── zarr.json                    # Zarr v3 root group metadata
-├── .zattrs                      # Zarr Vectors root metadata (see root_metadata.md)
-├── metadata.json                # human-readable summary
-│
-├── 0/                # full-resolution level
-│   ├── zarr.json                # Zarr v3 group metadata
-│   ├── .zattrs                  # per-level metadata (bin_ratio, sparsity)
-│   │
-│   ├── vertices/                # single vlen-bytes array; shape = chunk grid
-│   │   ├── zarr.json            # codecs=[vlen-bytes(, compressor)]; attrs:
-│   │   │                        #   nonempty_chunks, chunk_grid_origin
-│   │   └── c/
-│   │       ├── 0/0/0            # chunk at grid coord (0,0,0)
-│   │       ├── 0/0/1            # chunk at grid coord (0,0,1)
-│   │       └── …
-│   │
-│   ├── vertex_fragments/        # fragment index — one vlen array, cell/chunk
-│   │   ├── zarr.json
-│   │   └── c/ …
-│   │
-│   ├── vertex_attributes/       # per-vertex attribute arrays
-│   │   ├── intensity/           # one single vlen array per named attribute
-│   │   │   ├── zarr.json
-│   │   │   └── c/ …
-│   │   └── label/
-│   │       ├── zarr.json
-│   │       └── c/ …
-│   │
-│   └── fragment_attributes/     # per-fragment attribute arrays (opt-in)
-│       └── object_id/           # e.g. OID owning each fragment
-│           ├── zarr.json
-│           └── c/ …
-│
-└── 1/                # coarser level (bin_ratio declared in .zattrs)
-    └── [same structure as 0]
-```
+### Point cloud
 
-### Full annotated tree (streamline / polyline)
+`write_points(..., vertex_attributes={"intensity": ..., "label": ...})`:
 
-The streamline tree adds connectivity and object-model arrays. Every
-link-family path carries two segments: a signed `<delta>` saying how many
-pyramid levels its records span (`0` = intra-level, `+N` / `-N` = N levels
-coarser / finer), and an `<offsets>` segment saying where the record's
-other endpoints sit relative to its **source** chunk. An intra-chunk link
-is simply one whose offsets are all zero (`0.0.0` for an edge in a 3-D
-store) — there is no separate cross-chunk family. See
-[Links](../object_model/links.md).
-
-```
-tracts.zarrvectors/
-│
-├── zarr.json
-├── .zattrs
-├── metadata.json
-│
+```text
+points.zarrvectors/
+├── zarr.json                 # root attributes: see root_metadata.md
 └── 0/
-    ├── zarr.json
-    ├── .zattrs
-    │
-    ├── vertices/                # vertex positions
-    ├── vertex_fragments/        # fragment index over vertices/ rows
-    │
-    ├── links/                   # connectivity — ONE family
-    │   └── 0/                   # <delta>=0 GROUP; zarr.json carries the
-    │       │                    #   family policy: link_width=2, sid_ndim,
-    │       │                    #   directed, store (+ counts after finalize)
-    │       ├── 0.0.0/           # <offsets> all-zero → intra-chunk edges
-    │       │   ├── zarr.json    #   has_perm=false; flat rows + link_fragments
-    │       │   └── c/ …         #   one file per SOURCE chunk
-    │       ├── 0.0.+1/          # edges to the +z neighbour
-    │       │   ├── zarr.json    #   has_perm=true (undirected canonical)
-    │       │   └── c/ …         #   inline ragged blob; no sidecar
-    │       └── 0.+1.0/          # edges to the +y neighbour
-    │           ├── zarr.json
-    │           └── c/ …
-    │
-    ├── link_fragments/          # fragment index over links/0/0.0.0/ rows ONLY
-    │   ├── zarr.json            #   (keyed by chunk alone — no delta/offsets)
-    │   └── c/ …
-    │
-    ├── link_attributes/         # per-record attrs, mirroring links/ cell-for-cell
-    │   └── weight/
-    │       └── 0/               # <delta> GROUP
-    │           ├── 0.0.0/       # same <offsets> segments as links/0/
-    │           │   ├── zarr.json
-    │           │   └── c/ …
-    │           └── 0.0.+1/
-    │               ├── zarr.json
-    │               └── c/ …
-    │
-    ├── attributes/              # per-vertex attributes (e.g. FA, MD)
-    │
-    ├── fragment_attributes/     # per-fragment attributes (opt-in)
-    │   └── object_id/           # e.g. OID owning each fragment in a chunk
-    │
-    ├── object_index/            # per-object manifest blobs
-    │   ├── data                 # concatenated manifest bytes
-    │   └── offsets              # int64 array of per-object byte offsets
-    │
-    ├── object_attributes/       # per-object scalars (e.g. mean FA)
-    │   ├── mean_fa/
-    │   └── tract_length/
-    │
-    ├── groupings/               # group ID → [object IDs]
-    │
-    └── groupings_attributes/    # per-group metadata
-```
-
-Pyramids built with `cross_level_depth >= 1` add `<delta>` siblings
-to the link arrays. A typical level-0 tree under
-`build_pyramid(..., cross_level_depth=1, cross_level_storage="explicit")`:
-
-```
-0/
-└── links/
-    ├── 0/                   # intra-level records
-    │   ├── 0.0.0/           #   both endpoints in the source chunk
-    │   └── 0.0.+1/          #   endpoint one chunk along +z
-    └── +1/                  # cross-level: source → level+1
-        ├── 0.0.0/           #   parent in the anchored chunk
-        └── 0.0.+1/          #   parent one COARSE chunk along +z
-```
-
-Under `<delta> != 0` the offsets are measured against the source chunk
-**re-anchored into the target level's grid**, not against the raw
-coordinate difference — see
-[the anchor](../object_model/links.md#cross-level-placement-the-anchor).
-Every `<delta> != 0` array has `has_perm=false` and uses the inline blob
-encoding with no `link_fragments/` sidecar.
-
-At an intermediate level (e.g. `1`), both `+1` (drill up to
-level 2) and `-1` (drill down to level 0) appear. See
-[`examples/07_multiscale_links.ipynb`](../../../examples/07_multiscale_links.ipynb).
-
-### Full annotated tree (graph / skeleton)
-
-```
-neuron.zarrvectors/
-├── zarr.json
-├── .zattrs
-├── metadata.json
-└── 0/
+    ├── zarr.json             # level attributes: see level_groups.md
     ├── vertices/
-    ├── vertex_fragments/
-    ├── links/
-    │   └── 0/                   # GROUP — link_width=2 for graphs / skeletons
-    │       ├── 0.0.0/           #   intra-chunk edges
-    │       ├── 0.0.+1/          #   edges crossing into the +z neighbour
-    │       └── 0.+1.0/          #   … one array per distinct offset
-    ├── link_fragments/          # fragment index over links/0/0.0.0/ rows
-    ├── link_attributes/
-    │   └── weight/
-    │       └── 0/
-    │           ├── 0.0.0/
-    │           └── 0.0.+1/
-    ├── attributes/
-    ├── object_index/
-    └── object_attributes/
-```
-
-A skeleton's parent references use `link_width=1`, whose single endpoint
-leaves no offsets to encode — those arrays are named by the literal
-segment `links/<delta>/self/`.
-
-### Full annotated tree (mesh)
-
-```
-brain.zarrvectors/
-├── zarr.json
-├── .zattrs
-├── metadata.json
-└── 0/
-    ├── vertices/
-    ├── vertex_fragments/
-    ├── links/
-    │   └── 0/                       # GROUP — link_width=3 for triangle meshes
-    │       ├── 0.0.0_0.0.0/         #   face wholly inside the source chunk
-    │       ├── 0.0.+1_0.0.+1/       #   face straddling the +z boundary
-    │       └── 0.0.+1_0.+1.0/       #   face spanning source, +z and +y
-    ├── link_fragments/              # fragment index over links/0/0.0.0_0.0.0/ rows
-    ├── attributes/
-    ├── object_index/
-    └── object_attributes/
-```
-
-A face carries `link_width - 1 = 2` offsets, joined by `_` — so a mesh's
-offsets segments are twice as long as an edge's.
-
-### Parametric objects
-
-The optional `parametric/` group is not spatially chunked. It holds
-algebraic objects (planes, spheres, ellipsoids) as a flat array of parameter
-tuples:
-
-```
-dataset.zarrvectors/
-├── …
-└── parametric/
-    ├── zarr.json
-    ├── objects/                 # (n_parametric, param_dim) float64
     │   ├── zarr.json
-    │   └── c/0
-    └── object_attributes/
+    │   └── c/0/0/0, c/0/0/1, …   # one file per non-empty chunk
+    ├── vertex_fragments/     # fragment index over vertices/ rows
+    └── vertex_attributes/
+        ├── intensity/
         └── label/
 ```
 
-### Naming rules
+`fragment_attributes={"<name>": {chunk: values}}` adds
+`fragment_attributes/<name>/`. Passing `object_ids` adds the object arrays
+shown in the next tree.
 
-Resolution level directories must be named `<N>` where `N` is a
-non-negative integer. There is no requirement that levels be contiguous (a
-store may have `0` and `2` without `1`),
-but contiguous numbering from 0 is strongly recommended.
+### Streamline, polyline and line
 
-Array group names within a level are fixed by this specification. Custom
-arrays may not be added at the array group level without a spec extension.
-Per-vertex and per-object custom attributes must be placed under
-`attributes/` and `object_attributes/` respectively.
+`write_polylines(..., object_attributes={"length": ...}, groups=...,
+group_attributes={"score": ...})`. `write_lines` writes the same tree:
 
-### Required vs optional nodes
+```text
+streamline.zarrvectors/
+├── zarr.json
+└── 0/
+    ├── zarr.json
+    ├── vertices/
+    ├── vertex_fragments/
+    ├── links/
+    │   └── 0/                # level delta 0; group attributes hold the family policy
+    │       ├── +1.0.0/       # segments whose next vertex is one chunk along +x
+    │       ├── 0.+1.0/
+    │       └── 0.0.+1/
+    ├── object_index/
+    │   ├── manifests/
+    │   └── object_ids/
+    ├── object_attributes/
+    │   └── length/
+    ├── groups/
+    └── group_attributes/
+        └── score/
+```
 
-| Path | Required for | Notes |
-|------|-------------|-------|
-| `zarr.json` (root) | All types | Zarr v3 group node |
-| `.zattrs` (root) | All types | Zarr Vectors root metadata |
-| `metadata.json` | All types | Recommended; not read by API |
-| `0/` | All types | At least one level required |
-| `vertices/` | All types | |
-| `vertex_fragments/` | All types | Required for spatial queries; see [Fragment-index arrays](fragment_index_arrays.md) |
-| `link_fragments/` | polyline, streamline, graph, skeleton, mesh | Pairs with `links/0/<all-zero offsets>/` **only**; keyed by chunk alone. See [Fragment-index arrays](fragment_index_arrays.md) |
-| `links/<delta>/` | polyline, streamline, graph, skeleton (`link_width=2`); mesh (`link_width=3`) | A **group**, not an array. Carries the family policy; `<delta>=0` intra-level, `±N` cross-pyramid-level |
-| `links/<delta>/<offsets>/` | as above | One per-chunk array per distinct offset. All-zero offsets = intra-chunk; `self` when `link_width=1` |
-| `link_attributes/<name>/<delta>/` | Any geometry that wrote `edge_attributes` | A **group**, mirroring `links/<delta>/` |
-| `link_attributes/<name>/<delta>/<offsets>/` | as above | Mirrors `links/<delta>/<offsets>/` cell-for-cell |
-| `attributes/` | All types | Optional if no per-vertex attributes |
-| `object_index/` | polyline, streamline, graph, skeleton, mesh | |
-| `object_attributes/` | Any type | Optional |
-| `groupings/` | Any discrete-object type | Optional |
-| `parametric/` | Any type | Optional |
+Consecutive vertices within a chunk are linked by their order
+(`links_convention` `implicit_sequential`), so these stores write only the
+link arrays for segments that cross a chunk boundary: no
+`links/0/0.0.0/` and no `link_fragments/`.
+
+### Graph and skeleton
+
+`write_graph(..., link_attributes={"weight": ...})`:
+
+```text
+graph.zarrvectors/
+├── zarr.json
+└── 0/
+    ├── zarr.json
+    ├── vertices/
+    ├── vertex_fragments/
+    ├── links/
+    │   └── 0/
+    │       ├── 0.0.0/        # edges with both ends in the cell
+    │       ├── 0.0.+1/       # edges to the neighbour along +z
+    │       ├── +1.-1.0/
+    │       └── …             # one array per offset that occurs
+    ├── link_fragments/       # fragment index over links/0/0.0.0/ rows only
+    ├── link_attributes/
+    │   └── weight/
+    │       └── 0/
+    │           ├── 0.0.0/    # same segments as links/0/
+    │           └── …
+    └── object_index/
+        ├── manifests/
+        └── object_ids/
+```
+
+`write_graph(..., kind="skeleton")` writes the same tree with
+`link_width` 2; `vertex_attributes={"radius": ...}` adds
+`vertex_attributes/radius/`.
+
+### Mesh
+
+`write_mesh`:
+
+```text
+mesh.zarrvectors/
+├── zarr.json
+└── 0/
+    ├── zarr.json
+    ├── vertices/
+    ├── vertex_fragments/
+    ├── links/
+    │   └── 0/                # link_width 3: one row per triangle
+    │       ├── 0.0.0_0.0.0/  # triangle wholly inside the cell
+    │       ├── 0.0.0_0.0.+1/ # third vertex one chunk along +z
+    │       ├── 0.0.+1_0.+1.0/
+    │       └── …
+    ├── link_fragments/       # fragment index over links/0/0.0.0_0.0.0/ rows
+    └── object_index/
+        ├── manifests/
+        └── object_ids/
+```
+
+A triangle's segment has two offsets, one per non-source vertex, joined by
+`_`.
+
+### Pyramid
+
+`build_pyramid(..., factors=[(2, 2), (2, 2)])` on the streamline store adds
+levels `1/` and `2/`, each with `vertices/`, `vertex_fragments/` and
+`object_index/`, and cross-level link families:
+
+```text
+streamline_pyr.zarrvectors/
+├── zarr.json                 # multiscales and ome list all three levels
+├── 0/
+│   └── links/
+│       ├── 0/                # as in the single-level store
+│       └── +1/0.0.0/         # each level-0 vertex to its level-1 vertex
+├── 1/
+│   └── links/
+│       ├── +1/0.0.0/         # to level 2
+│       └── -1/0.0.0/         # to level 0
+└── 2/
+    └── links/
+        └── -1/0.0.0/
+```
+
+Coarser streamline levels have no `links/0/`. Cross-level offsets are
+measured from the source chunk re-anchored in the target level's grid; see
+[Links](../object_model/links.md#cross-level-placement-the-anchor) and the
+[multiscale links example](../../../examples/07_multiscale_links.ipynb).
+
+### Sharded store
+
+With a root `shard_shape` (for example `write_points(..., shard_shape=2)`)
+the tree is the same, but each file under an array's `c/` is a shard
+holding a block of cells; see [Sharding](../chunking/sharding.md).
+
+### Parametric objects
+
+`write_parametric_objects` adds a `parametric/` group at the store root,
+outside the levels and not chunked:
+
+```text
+param.zarrvectors/
+├── zarr.json
+├── 0/ …
+└── parametric/
+    ├── zarr.json             # attributes: parametric_types (the type registry)
+    ├── objects/              # float64, [num_objects, max_row_length]: type ID, then coefficients
+    ├── names/                # variable_length_bytes, one name per object
+    ├── object_attributes/
+    │   └── score/
+    ├── groups/
+    └── group_attributes/
+        └── w/
+```
+
+The `parametric_types` attribute maps each type ID to its name and
+coefficient names; the built-in types are `0` plane, `1` line and
+`2` sphere.
+
+### Names and presence
+
+- Level groups are named `0`, `1`, `2`, … . Root children whose names are
+  not integers, other than `parametric/`, are not part of the format.
+  [L5 validation](../validation/overview.md) requires the levels to run
+  from `0` without gaps.
+- Array and group names within a level are fixed. Named attributes go under
+  `vertex_attributes/`, `fragment_attributes/`, `link_attributes/`,
+  `object_attributes/` and `group_attributes/`.
+
+| Path | Present in |
+|------|------------|
+| `zarr.json` (root) | Every store |
+| `0/` | Every store |
+| `vertices/`, `vertex_fragments/` | Every level |
+| `links/0/<offsets>/` | Lines, polylines and streamlines (cross-chunk segments only); graphs, skeletons and meshes |
+| `links/0/<all-zero offsets>/`, `link_fragments/` | Graphs, skeletons and meshes |
+| `links/+1/`, `links/-1/` | Pyramids with `cross_level_storage` `"explicit"` |
+| `object_index/` | Every type except a point cloud written without `object_ids` |
+| `vertex_attributes/`, `fragment_attributes/`, `link_attributes/`, `object_attributes/` | When the writer is given that kind of attribute |
+| `groups/`, `group_attributes/` | When the writer is given `groups` |
+| `parametric/` | When parametric objects are written |

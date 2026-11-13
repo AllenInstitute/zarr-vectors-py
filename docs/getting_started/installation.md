@@ -1,8 +1,7 @@
 # Installation
 
-`zarr-vectors` requires Python 3.11 or later and depends on `zarr>=3.0`,
-`numpy>=1.24`, and `numcodecs`. All mandatory dependencies are installed
-automatically by `pip`.
+`zarr-vectors` requires Python 3.11 or later. `pip` installs its required
+dependencies, `zarr>=3.0`, `numpy>=1.24` and `numcodecs>=0.12`.
 
 ## Standard install
 
@@ -10,18 +9,18 @@ automatically by `pip`.
 pip install zarr-vectors
 ```
 
-This installs the core read/write/validate API for all seven geometry types.
-It does not include format converters, cloud-store drivers, or Draco mesh
-compression — those are available as optional extras described below.
+This installs reading, writing and validation for all seven geometry types.
+Cloud-store drivers, Draco mesh compression and GPU support are optional
+extras, described below. Format converters are in a separate package.
 
 ## Optional extras
 
 ### Ingest and export formats
 
-Format converters and the `zarr-vectors` CLI live in the companion
-package **`zarr-vectors-tools`** — install that separately if you need
-to read/write LAS, PLY, CSV/XYZ, TRK, TCK, TRX, SWC, GraphML, OBJ, or
-STL files.
+Format converters and the `zvtools` command-line tool are in the companion
+package `zarr-vectors-tools`. Install it separately to read or write LAS,
+PLY, CSV/XYZ, TRK, TCK, TRX, SWC, GraphML, OBJ or STL files; see
+[Ingesting other formats](../tutorials/io/ingest_formats.md).
 
 ### Draco mesh compression
 
@@ -29,19 +28,33 @@ STL files.
 pip install "zarr-vectors[draco]"
 ```
 
-Enables Google Draco encoding and decoding for the `mesh` geometry type.
-Requires `DracoPy`. Draco-compressed stores are not readable without this
-extra installed.
+Installs `DracoPy` for Google Draco encoding and decoding of meshes. You need
+it to read a Draco-compressed store.
 
 ### Cloud object-store backends
 
 ```bash
-pip install "zarr-vectors[cloud]"
+pip install "zarr-vectors[obstore]"
 ```
 
-Enables reading from and writing to Amazon S3, Google Cloud Storage, and
-Azure Blob Storage via `s3fs` and `gcsfs`. See
-[Cloud stores](../tutorials/io/cloud_stores.md) for configuration details.
+Reads and writes Amazon S3, Google Cloud Storage and Azure Blob Storage
+through `obstore`. `[cloud]` is another name for the same extra.
+
+```bash
+pip install "zarr-vectors[fsspec]"
+```
+
+Uses the `fsspec` backends instead: `s3fs`, `gcsfs` and `adlfs`.
+
+```bash
+pip install "zarr-vectors[icechunk]"
+```
+
+Adds the Icechunk transactional store, selected with
+`StorageOptions(backend="icechunk")`; it is never chosen from a URL. It needs
+Python 3.12 or later.
+
+See [Cloud stores](../tutorials/io/cloud_stores.md) for configuration.
 
 ### GPU arrays
 
@@ -49,13 +62,13 @@ Azure Blob Storage via `s3fs` and `gcsfs`. See
 pip install "zarr-vectors[gpu]"
 ```
 
-Lets the array-form readers and writers take and return device (cupy)
-arrays: `device="cuda"` on a reader, or a cupy array passed to a writer.
-With it, `read_cells` decodes uncompressed cells on the device, and
-writers encode device arrays there. Linux only; it installs
-`cupy-cuda12x`. In a conda environment install cupy from conda-forge
-instead (`conda install -c conda-forge cupy`): the extra would add a
-second, pip-built cupy.
+Lets the array-form readers and writers in `zarr_vectors.building` take and
+return device (cupy) arrays: `device="cuda"` on a reader, or a cupy array
+passed to a writer. With it, `read_cells` decodes uncompressed cells on the
+device, and writers encode device arrays there. It is Linux only and installs
+`cupy-cuda12x`. In a conda environment, install cupy from conda-forge instead
+(`conda install -c conda-forge cupy`), because the extra would add a second,
+pip-built cupy.
 
 Two more extras build on it:
 
@@ -67,9 +80,8 @@ Two more extras build on it:
   environments only; its wheel pins its own cupy, so in conda install
   kvikio from the `rapidsai` channel instead.
 
-Nothing needs any of them: every call works with numpy, and a store
-written from device arrays is byte-identical to one written from numpy.
-See [GPU arrays](../how_to/gpu.md).
+Every call also works with numpy, and a store written from device arrays is
+byte-identical to one written from numpy. See [GPU arrays](../how_to/gpu.md).
 
 ### Everything
 
@@ -77,47 +89,40 @@ See [GPU arrays](../how_to/gpu.md).
 pip install "zarr-vectors[all]"
 ```
 
-Installs all optional extras in a single command, except the GPU ones
-(`[gpu]`, `[gpu-codecs]`, `[gpu-io]`), which are tied to a CUDA version
-and so are always asked for explicitly.
+Installs `[draco]`, `[obstore]`, `[fsspec]` and `[icechunk]`. The GPU extras
+are tied to a CUDA version, so you always ask for them by name.
 
 ## Development install
 
-To install from source with all development dependencies:
+To install from source with the test and lint tools:
 
 ```bash
 git clone https://github.com/AllenInstitute/zarr-vectors-py.git
 cd zarr-vectors-py
-pip install -e ".[all]"
+pip install -e ".[all,dev]"
 pip install -r docs/requirements-docs.txt   # if building the docs locally
 ```
 
-Run the test suite to verify the install:
+Run the test suite to check the install:
 
 ```bash
-pytest tests/ -v
+pytest tests/
 ```
-
-All tests should pass. The suite does not require network access or external
-data files.
 
 ## Verifying the install
 
 ```python
 import zarr_vectors
-print(zarr_vectors.__version__)
-
-# Confirm geometry type constants are available
 from zarr_vectors.constants import GEOM_POINT_CLOUD, GEOM_STREAMLINE
+
+print(zarr_vectors.__version__)
 print(GEOM_POINT_CLOUD, GEOM_STREAMLINE)
 ```
 
-## Dependency notes
+The first line prints the installed version; the second prints
+`point_cloud streamline`.
 
-`zarr-vectors` targets **Zarr v3** exclusively. Zarr v2 stores are not
-supported and cannot be opened with this package. If you have an existing
-v2 workflow, migrate the store using `zarr`'s built-in conversion utilities
-before ingesting into the Zarr Vectors format.
+## Zarr version
 
-NumPy 2.x is supported from `zarr-vectors` 0.2 onward. Earlier releases
-require NumPy 1.x.
+`zarr-vectors` reads and writes Zarr v3 only; it cannot open Zarr v2
+stores.

@@ -3,186 +3,115 @@
 ## Terms
 
 **Line segment**
-: A pair of vertices `(A, B)` connected by a straight edge. A `line` store
-  holds an unordered collection of such pairs. Unlike polylines, there is
-  no sequential ordering between segments; each segment is independent.
+: A pair of vertices `(A, B)` joined by a straight edge. A `line` store holds
+  a collection of independent segments; each segment is one object.
 
 **`GEOM_LINE`**
-: The geometry type constant `"line"`. Stored in root `.zattrs` under
-  `"geometry_type"`.
+: The geometry type constant `"line"`, stored in the `geometry_types` list
+  of the root attributes.
 
-**`links/<delta>/<offsets>/`**
-: The link family. For `line` it holds only the segments that were
-  **split across a chunk boundary**: one record per split segment,
-  filed under the `<offsets>` naming where the far endpoint's chunk
-  sits relative to the near one. Segments contained in one chunk emit
-  no record — their fragment's vertex order carries the topology. See
-  *Segments that span chunks* below, and [Links](../object_model/links.md)
-  for the family's layout.
-
----
+**Split segment**
+: A segment whose two endpoints fall in different chunks. It is stored as
+  two single-vertex fragments joined by one link record.
 
 ## Introduction
 
-The `line` type stores independent line segments: pairs of vertices with
-no sequential relationship between segments. It is appropriate for contact
-sites (two endpoints of a synapse), short connectors in circuit diagrams,
-pairwise distance annotations, or any other dataset where the fundamental
-unit is a two-point segment rather than an ordered path.
+The `line` type stores independent two-point segments: contact sites (the two
+ends of a synapse), connectors, pairwise distance annotations. Each segment is
+an object with its own manifest, so segments can be read by id.
 
-`line` is simpler than `polyline` because each object is exactly two
-vertices with no ordered path to reconstruct. It is therefore faster to
-write and read than `polyline` for data that genuinely consists of
-independent segments. It does carry an object model (`object_index/`),
-and it does support segments that span chunks — see *Segments that span
-chunks* below.
-
----
+Connectivity follows `links_convention: implicit_sequential`: within a
+fragment, vertex order carries the segment. A segment inside one chunk needs
+no link record; only split segments are stored in `links/`. For ordered paths
+of any length, use [`polyline`](polyline.md).
 
 ## Technical reference
 
 ### Arrays present
 
-| Array path | Required | Description |
-|-----------|----------|-------------|
-| `vertices/` | Yes | Endpoint positions, shape `(N, D)` float32 per chunk |
-| `vertex_fragments/` | Yes | Fragment index over `vertices/` rows |
-| `object_index/` | Yes | Per-line manifest of `(chunk, fragment_index)` |
-| `links/0/<offsets>/` | Only when a segment spans chunks | Non-zero-offset links joining a split segment's two halves |
-| `attributes/<name>/` | No | Per-vertex attributes |
-| `object_attributes/<name>/` | No | Per-line attributes |
+At level 0 of a store written by `write_lines`:
 
-There is no `cross_chunk_links/` array: that family was merged into
-`links/`. A cross-chunk segment is simply a link whose offsets are
-non-zero.
+| Path | Present | Description |
+|------|---------|-------------|
+| `vertices/` | Always | Endpoint positions |
+| `vertex_fragments/` | Always | Fragment index over `vertices/` rows |
+| `object_index/` | Always | One manifest per segment |
+| `links/0/<offsets>/` | When a segment is split | One record per split segment, in a non-zero-offset array |
+| `vertex_attributes/<name>/` | With `vertex_attributes=` | One row per endpoint |
+| `object_attributes/<name>/` | With `object_attributes=` | One row per segment |
 
-`links_convention` is `implicit_sequential` and
-`object_index_convention` is `standard`.
-
-### Segments that span chunks
-
-Segments crossing a chunk boundary **are** supported. `write_lines`
-does not reject them and has no `split_cross_chunk` option; it always
-handles both cases, and reports how many it split in the returned
-summary's `cross_chunk_count`.
-
-The two cases are written differently:
+The two cases are written as follows:
 
 | Case | Fragments | Manifest | Link |
 |------|-----------|----------|------|
-| Both endpoints in one chunk | One fragment holding both vertices | `[(c, f)]` | **None** — the fragment's vertex order carries the segment |
-| Endpoints in different chunks | Two fragments, one vertex each | `[(c_a, f_a), (c_b, f_b)]` | One record in `links/0/<offsets>/`, offsets naming `c_b` relative to `c_a` |
+| Both endpoints in one chunk | One fragment holding both vertices | `[(c, f)]` | None |
+| Endpoints in chunks `c_a` and `c_b` | One single-vertex fragment in each chunk | `[(c_a, f_a), (c_b, f_b)]` | One record in `links/0/<offsets>/` |
 
-This is why `line` emits **no intra-chunk links**. Connectivity is
-`implicit_sequential` — within a fragment, vertex order *is* the
-topology, so a same-chunk segment needs no link record and the
-all-zero-offsets array would never hold a row. `write_lines` therefore
-does not create a links array up front; `write_links` creates exactly
-the non-zero-offset arrays the split segments land in. A `line` store
-whose segments all sit within one chunk has **no `links/` group at
-all**.
+Within each chunk, fragments are assigned in segment order. A store whose
+segments all sit in one chunk has no `links/` group. The link family is
+undirected with `store: "canonical"`, so each split segment is stored once,
+under the lexicographically positive offset; see
+[Links](../object_model/links.md).
 
-The link family is written with the default policy — undirected,
-`store="canonical"` — so a split segment is stored once, under the
-lexicographically positive offset.
+### Root attributes
 
-### Vertex ordering
+A line store has no type-specific root keys. The writer sets these values in
+the `zarr_vectors` block (see [Root metadata](../layout/root_metadata.md)):
 
-Within a fragment, vertex order is the topology: index 0 is the
-segment's first endpoint and index 1 its second. Fragments are assigned
-in line-id order within each chunk, so `fragment_index` is stable
-across a rewrite of the same input.
+```json
+{
+  "geometry_types": ["line"],
+  "links_convention": "implicit_sequential",
+  "object_index_convention": "standard",
+  "cross_chunk_strategy": "explicit_links"
+}
+```
 
-### Write API
+### Write and read API
 
 ```python
 import numpy as np
-from zarr_vectors.types.lines import write_lines
-
-# n_segments × 2 × D array: each row is a segment, columns are endpoints
-segments = np.random.default_rng(0).uniform(0, 500, (10_000, 2, 3)).astype(np.float32)
-
-# Reshape to flat vertices and edge pairs
-n = len(segments)
-verts = segments.reshape(n * 2, 3)            # (2n, D)
-edges = np.column_stack([                      # (n, 2)
-    np.arange(0, 2*n, 2),
-    np.arange(1, 2*n, 2),
-]).astype(np.int32)
-
-write_lines(
-    "contacts.zarrvectors",
-    vertices=verts,
-    edges=edges,
-    chunk_shape=(200.0, 200.0, 200.0),
-    bin_shape=(50.0, 50.0, 50.0),
-)
-```
-
-Alternatively, pass a list of `(A, B)` tuples:
-
-```python
-from zarr_vectors.types.lines import write_line_pairs
-
-pairs = [(rng.uniform(0, 500, 3), rng.uniform(0, 500, 3)) for _ in range(10_000)]
-write_line_pairs("contacts.zarrvectors", pairs,
-                 chunk_shape=(200., 200., 200.))
-```
-
-### Read API
-
-```python
+from zarr_vectors.building import write_lines
 from zarr_vectors.types.lines import read_lines
 
+rng = np.random.default_rng(0)
+starts = rng.uniform(0, 500, (1000, 3))
+endpoints = np.stack([starts, starts + rng.normal(0, 20, (1000, 3))], axis=1).astype(np.float32)
+strength = rng.uniform(0, 1, 1000).astype(np.float32)
+
+summary = write_lines(
+    "contacts.zarrvectors",
+    endpoints,                     # (N, 2, D): one row per segment
+    chunk_shape=(100.0, 100.0, 100.0),
+    object_attributes={"strength": strength},
+)
+print(summary)
+# {'line_count': 1000, 'chunk_count': 192, 'cross_chunk_count': 388}
+
 result = read_lines("contacts.zarrvectors")
-print(result["segment_count"])       # int
-print(result["vertices"].shape)      # (2N, D)
-print(result["edges"].shape)         # (N, 2)
+print(result["line_count"], result["endpoints"].shape)   # 1000 (1000, 2, 3)
 
-# Return as (N, 2, D) array of segment endpoint pairs
-result = read_lines("contacts.zarrvectors", return_pairs=True)
-print(result["pairs"].shape)         # (N, 2, D)
+result = read_lines("contacts.zarrvectors", object_ids=[0, 5, 42])
+print(result["line_count"])   # 3
 
-# Spatial query
 result = read_lines(
     "contacts.zarrvectors",
-    bbox=(np.array([0., 0., 0.]), np.array([200., 200., 200.])),
+    bbox=(np.array([0.0, 0.0, 0.0]), np.array([100.0, 100.0, 100.0])),
 )
+print(result["line_count"])   # 6
 ```
 
-### Relationship to `polyline`
-
-`line` and `polyline` share the `links/<delta>/<offsets>/` schema and
-both use `links_convention: implicit_sequential`. The distinction is:
-
-| Property | `line` | `polyline` |
-|----------|--------|-----------|
-| Object shape | Exactly 2 vertices | Ordered path of any length |
-| Vertices per object per chunk | At most 1 when split | Any number (a run) |
-| Cross-chunk links | One per split segment | One per boundary crossing |
-| Object index | Yes | Yes |
-
-If your data has ordered paths (e.g. vessel centrelines from which individual
-segment pairs were extracted), `polyline` preserves the ordering and enables
-object-level queries. Use `line` only for genuinely unordered, independent
-segment pairs.
+`cross_chunk_count` is the number of split segments. `read_lines` takes
+`level=`, `object_ids=`, `bbox=` and `attribute_filter=`, and returns
+`endpoints` `(M, 2, D)`, `vertex_attributes` and `line_count`. A bounding-box
+read keeps a segment when either endpoint is inside the box.
 
 ### Validation
 
-L1: `vertices/` exists at every level. `links/` is **not** required —
-a `line` store with no split segments legitimately has none.
+- L1: `vertices/` missing at a level is an error. `links/` is not required.
+- L3: each `links/0/` offsets name parses and, because the family is
+  undirected and canonical, no offset is lexicographically negative and the
+  offsets are non-decreasing. Each record's chunks exist at the level.
+- L4: `links_convention` other than `implicit_sequential` is an error.
 
-L2: `links_convention` is a recognised token; `sid_ndim`, `chunk_shape`,
-and any `bin_shape` agree dimensionally.
-
-L3: every `links/0/` offsets segment parses; because the family is
-undirected, canonical, and intra-level, every offset must be
-lexicographically non-negative and non-decreasing. Every record's
-source chunk exists at the level, as does every other endpoint's chunk
-(`delta == 0`).
-
-L4: `links_convention` MUST be `implicit_sequential` for `line`
-([`GEOMETRY_LINK_REQ`](../../../zarr_vectors/validate/conformance.py)).
-
-See [Validation overview](../validation/overview.md) for what each level
-does and does not cover.
+See [Validation overview](../validation/overview.md).

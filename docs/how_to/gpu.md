@@ -2,8 +2,8 @@
 
 zarr-vectors can take device (cupy) arrays in and hand them back, and it
 has array-form versions of the per-object writers a pipeline calls in its
-inner loop. Neither needs a GPU: the core is numpy-only, every call works
-with numpy arrays, and the GPU support is an optional extra.
+inner loop. Neither needs a GPU: the core uses numpy only, every call works
+with numpy arrays, and GPU support is an optional extra.
 
 ## What happens on the device, and what does not
 
@@ -17,8 +17,8 @@ optionally sharded.
   element for element; see [Decoding on the device](#decoding-on-the-device).
 - **Writing** from device arrays: the fragment, manifest and link-partition
   encoders run on the device, and only the encoded form is copied to the
-  host, often much less than the input (a run of consecutive indices
-  becomes one 16-byte range row).
+  host. It is often much smaller than the input: a run of consecutive
+  indices becomes one 16-byte range row.
 - **Compression and the write itself** always happen on the host, with
   libzstd. That is what keeps a store written from device arrays
   byte-identical to one written from numpy, and readable anywhere.
@@ -41,7 +41,7 @@ the `gpu` extra, which would add a second, pip-built cupy. The
 wheel pins its own cupy, so in conda install kvikio from the `rapidsai`
 channel at the version matching your RAPIDS stack.
 
-Asking for `device="cuda"` without cupy raises an error naming the extra;
+Asking for `device="cuda"` without cupy raises `ZVError` naming the extra;
 it never returns host arrays in its place. None of the extras is part of
 `[all]`.
 
@@ -54,9 +54,9 @@ caps = zv.runtime_capabilities()                   # never touches CUDA
 caps = zv.runtime_capabilities(probe_device=True)  # also checks for a device
 ```
 
-Probe instead of parsing version strings: a shared checkout can change
-branch under a running process. `probe_device=True` initialises the CUDA
-driver, so a process that forks workers should probe in the workers.
+Probe instead of parsing version strings. `probe_device=True` initialises
+the CUDA driver, so a process that forks workers should probe in the
+workers. Every value is a bool.
 
 | Key | True when |
 |---|---|
@@ -73,13 +73,17 @@ driver, so a process that forks workers should probe in the workers.
 | `dense_manifests` | object indexes can use the dense layout (below) |
 | `object_attribute_columns` | `write_object_attribute_columns` is available |
 | `array_link_cells` | `write_link_cells(chunks=, vids=, attributes=)` is available |
-| `defer_presence`, `append_safe_sharding` | presence can be deferred; appends into shared per-chunk shards keep what is there (not the object layer's `at=` writes) |
-| `concurrency_contract` | `zv.concurrency_contract()` states which writes may run at once; object-layer rows reserved with `reserve_object_rows` and written with `mode="place"` |
-| `link_cells_append` | a second write into a link cell appends records and attribute rows, mirrored seam records included; serial writes only |
+
+The other keys (`defer_presence`, `append_safe_sharding`,
+`concurrency_contract`, `link_cells_append`, `shard_transaction_io_threads`,
+`transaction_sweep`, `object_count_unbounded`, `spec_without_presence`)
+describe guarantees for parallel writes; see
+[HPC pipelines](hpc_pipelines.md).
 
 ## Reading
 
 ```python
+import numpy as np
 from zarr_vectors import building as zb
 
 lg = zb.get_resolution_level(zb.open_store(path), 0)
@@ -93,7 +97,7 @@ col.offsets   # (cells + 1,) CSR offsets over batch.chunk_coords
 col.cell      # the cell index of every row
 
 # Any cells, any per-chunk arrays.
-batch = zb.read_cells(lg, cells, ["vertices", "links/0/0.0.0_1.0.0"])
+batch = zb.read_cells(lg, cells, ["vertices", "links/0/0.0.0_+1.0.0"])
 ```
 
 `fragments=True` also returns each cell's vertex fragment index, read in
@@ -128,14 +132,10 @@ Explicit fragments (`starts == -1`) list their rows in `fr.indices`,
 zstd is decoded on the device only when asked for outright, because
 nvCOMP trusts its input. Every frame's structure is checked on the
 device before nvCOMP sees it, which catches truncation and damaged block
-headers. It cannot check inside a block, though. Tested on 40 frames,
-each corrupted by one byte inside a block:
-- **libzstd** raised on 32 and returned wrong bytes on 8;
-- **nvCOMP** returned wrong bytes on 9, hung on 10, and hit an illegal
-  memory access on 21. That last failure kills the process's CUDA
-  context.
-
-Use `decode="device"` on stores you trust.
+headers, but not damage inside a block. Given such damage, libzstd
+usually raises; nvCOMP can return wrong bytes, hang, or hit an illegal
+memory access, which kills the process's CUDA context. Use
+`decode="device"` only on stores you trust.
 
 Local files are read into pinned host memory and copied up once, or
 straight into device memory with kvikio. "Local" means any store zarr
@@ -154,7 +154,7 @@ or `=host` for every call left at `io="auto"`. kvikio 25.x
 and 26.x both work, and anything unexpected from kvikio means the host
 path rather than an error. kvikio's default thread pool is one thread,
 which would read cells one after another, so reads through it run on up
-to 16 threads unless `KVIKIO_NTHREADS` or the process has set a count.
+to 16 threads unless `KVIKIO_NTHREADS` or the process sets a count.
 Any other zarr store (fsspec, obstore, icechunk) is read through its own
 byte-range `get`, then copied up once.
 
@@ -162,7 +162,7 @@ Every batch says how it was read, so a benchmark can tell which path it
 measured without asking the system separately:
 
 ```python
-batch = read_cells(level, cells, ["vertices"], device="cuda")
+batch = zb.read_cells(lg, cells, ["vertices"], device="cuda")
 for r in batch.io:          # ArrayRead(array, path, cells, stored_bytes)
     print(r.array, r.path, r.stored_bytes)
 batch.io_seconds            # {"fetch": ..., "decode": ...} and/or {"host": ...}
@@ -173,19 +173,6 @@ buffer), `pinned-host`, `store`, or `host` for an array read and decoded
 on the host. A read that decodes on the device waits for its last kernel
 before returning, so `decode` covers the whole decode.
 
-Measured on 4,097 cells (5 million points, vertices plus one attribute,
-warm cache, RTX A2000):
-
-| Store | Host decode + upload | Device decode |
-|---|---:|---:|
-| flat, uncompressed | 380–720 ms | 170–310 ms |
-| flat, zstd | 480–780 ms | 390–420 ms |
-| sharded, uncompressed | 220 ms | 125–165 ms |
-| sharded, zstd | 285 ms | 230 ms |
-
-The spreads are run-to-run variation on this machine. Sharded stores
-read a shard's index once on both paths.
-
 ### Other readers
 
 `device=` also works on the flat readers (`read_chunk_vertex_buffer`,
@@ -193,7 +180,6 @@ read a shard's index once on both paths.
 `read_chunk_fragment_attributes`, `read_link_arrays`,
 `read_link_attributes`), on `read_all_object_manifests_csr`, and on a
 query result through `ReadResult.to_device("cuda")`.
-
 
 ### Decoding your own zstd bytes on the device
 
@@ -211,11 +197,11 @@ Each frame's structure is walked on the device before nvCOMP sees it, so
 a truncated or malformed frame comes back in `errors` rather than
 hanging nvCOMP's kernel or killing the CUDA context, and an output is
 kept only when its length is what the frame declares. Damage inside a
-compressed block is still not caught; decode data you trust. `out=`
-decodes into your buffers (nvCOMP 5 writes there directly; 4.x decodes
-and copies), and everything runs on `stream`, which is synchronised
-before the call returns. The frames zarr and numcodecs write declare
-their content size, which the check needs.
+compressed block is not caught; decode data you trust. `out=` decodes
+into your buffers, and everything runs on `stream`, which is synchronised
+before the call returns. The check needs each frame to declare its content
+size, as the frames zarr and numcodecs write do. `decode_zstd` needs the
+`gpu-codecs` extra.
 
 ## Writing from arrays
 
@@ -223,16 +209,7 @@ Each array-form writer leaves the store its per-object counterpart leaves,
 byte for byte, and accepts numpy or device arrays. Device arrays (cupy,
 or anything exporting DLPack, such as a torch tensor) are encoded on the
 device; set `ZARR_VECTORS_GPU_ENCODE=0` to encode them on the host
-instead, which writes the same bytes. At a million items, encoding
-cupy input on the device against on the host:
-
-| Encoder | Host | Device |
-|---|---:|---:|
-| fragments | 116 ms | 54 ms |
-| manifests | 122 ms | 83 ms |
-| link partition | 1,181 ms | 416 ms |
-
-
+instead, which writes the same bytes.
 
 ```python
 # Fragments as CSR: fragment f is indices[offsets[f]:offsets[f + 1]].
@@ -270,6 +247,6 @@ zb.write_object_manifests(lg, chunk_coords=cc, fragment_idx=frags,
 ```
 
 Every manifest reader and writer handles both layouts, and an index keeps
-the layout it was created with. The layout is format 0.9.4: a 0.9.3 build
-refuses such an index with an error rather than misreading it. See the
+the layout it was created with. A store that uses it declares the
+`dense_manifests` capability. See the
 [object manifest spec](../spec/object_model/object_manifest.md).

@@ -1,207 +1,169 @@
 # Level groups
 
+This page specifies the group that holds one resolution level, `<N>/`, and
+every key of its attributes.
+
 ## Terms
 
 **Level group**
-: The Zarr group at path `<N>/` representing one resolution level.
-  Contains all array groups for that level plus a `zarr.json` and `.zattrs`.
+: The Zarr group `<N>/` at the store root holding one resolution level's
+  arrays. `N` is the **level index**: `0` is the full-resolution level, and
+  larger indices are coarser.
 
-**Level index (N)**
-: The integer suffix of a level group name. Level 0 is
-  always the full-resolution (finest) level. Higher indices correspond to
-  progressively coarser representations.
-
-**Per-level `.zattrs`**
-: The `.zattrs` file inside `<N>/`. Stores the parameters of the
-  coarsening operation applied to produce this level from level 0:
-  `bin_ratio`, `object_sparsity`, `sparsity_strategy`, and the actual
-  `bin_shape` in effect at this level.
-
-**`bin_ratio`**
-: A D-tuple of positive integers declaring how much larger the bin shape is
-  at this level relative to the `base_bin_shape` at level 0. A `bin_ratio`
-  of `[2, 2, 2]` means the bin shape is `2 × base_bin_shape` in every
-  dimension.
-
-**`object_sparsity`**
-: A float in `(0, 1]` declaring what fraction of objects from level 0 are
-  retained at this level. Only meaningful for geometry types with discrete
-  objects (polyline, streamline, graph, skeleton, mesh). Point cloud stores
-  always have `object_sparsity = 1.0`.
-
----
+**Level attributes**
+: The `attributes` of the level group's `zarr.json`. Zarr Vectors keys are
+  under `zarr_vectors_level`; `LevelMetadata` in
+  `zarr_vectors.core.metadata` is the in-memory form.
 
 ## Introduction
 
-Each resolution level is self-contained: a reader can open and query any
-single level without needing to open any other level. The per-level `.zattrs`
-declares how the level was produced, enabling a reader to correctly interpret
-coordinate transforms and to infer the effective bin shape without re-reading
-the root metadata.
-
-This page documents the per-level metadata schema, the naming rules for level
-groups, and the relationship between level index and coarsening factor.
-
----
+A level group is a plain Zarr v3 group named by its index. Its attributes
+say how many vertices it holds, which array families it has, and how it was
+made from its parent level. A level's bin geometry (`bin_ratio`,
+`bin_shape`) is not in its attributes: it is the level's entry in the root
+`multiscales` block (see [Multiscale metadata](../multiscale/multiscale_metadata.md)),
+and `read_level_metadata` rebuilds both from there.
 
 ## Technical reference
 
-### Per-level `.zattrs` schema
+### Example
 
-Full example for level 1, produced from a 3-D streamline store:
-
-```json
-{
-  "level":              1,
-  "bin_ratio":          [2, 2, 2],
-  "bin_shape":          [100.0, 100.0, 100.0],
-  "object_sparsity":    0.5,
-  "sparsity_strategy":  "spatial_coverage",
-  "vertex_count":       1280450,
-  "object_count":       25000,
-  "chunk_count":        3200
-}
-```
-
-#### Required keys
-
-| Key | Type | Description |
-|-----|------|-------------|
-| `level` | `integer` | Must equal `N` in `<N>`. |
-| `bin_ratio` | `[int, …]` | D-tuple. Ratio of this level's bin shape to `base_bin_shape`. Level 0 must have `[1, 1, …, 1]`. |
-| `bin_shape` | `[float, …]` | D-tuple. Effective bin shape: `base_bin_shape[i] × bin_ratio[i]`. Redundant given `base_bin_shape` and `bin_ratio` but stored explicitly for readers that do not access the root metadata. |
-
-#### Recommended keys
-
-| Key | Type | Description |
-|-----|------|-------------|
-| `object_sparsity` | `float` | Fraction of objects retained. Defaults to `1.0` if absent. Must be in `(0.0, 1.0]`. |
-| `sparsity_strategy` | `string` | One of `"spatial_coverage"`, `"length"`, `"attribute"`, `"random"`. |
-| `vertex_count` | `integer` | Total vertex count across all chunks at this level. |
-| `object_count` | `integer` | Total object count at this level. |
-| `chunk_count` | `integer` | Number of non-empty chunks at this level. |
-
-#### Build-time keys
-
-Carried only while a level is being written, and absent from a finished
-store.
-
-| Key | Type | Description |
-|-----|------|-------------|
-| `zarr_vectors_presence` | `"deferred"` | The level's presence is deferred to one coordinator rebuild. Its per-chunk arrays carry no `nonempty_chunks`, so concurrent writers share no state between cells, and a reader takes presence from the store (see [Chunk arrays](chunk_arrays.md)). A writer allocating an array in such a level creates it without a manifest, and a write into an array without one records nothing. Removed by the rebuild. Since 0.9.3. |
-
-### Level 0 special case
-
-Level 0 is always the full-resolution level. Its per-level `.zattrs` must
-satisfy:
-
-- `"level": 0`
-- `"bin_ratio": [1, 1, …, 1]` (D ones)
-- `"bin_shape"` equals `base_bin_shape` from root `.zattrs`
-- `"object_sparsity": 1.0` (all objects present)
-
-### Naming convention and ordering
-
-Level directories are named `0`, `1`, …,
-`N`. The naming convention encodes the level index; the
-directory listing order on the file system is not relied upon.
-
-The `list_resolution_levels()` function returns levels sorted by index:
-
-```python
-from zarr_vectors.core.store import open_store, list_resolution_levels
-
-root   = open_store("scan.zarrvectors", mode="r")
-levels = list_resolution_levels(root)
-# Returns: [0, 1, 2]
-```
-
-### Relationship between level index and coarsening factor
-
-The coarsening factor at level `N` is the product of the `bin_ratio`
-components: `product(bin_ratio[i] for i in range(D))`. For isotropic
-ratios this equals `bin_ratio[0] ** D`.
-
-| Level | `bin_ratio` | Coarsening factor (3-D) |
-|-------|-------------|------------------------|
-| 0 | [1, 1, 1] | 1× |
-| 1 | [2, 2, 2] | 8× |
-| 2 | [4, 4, 4] | 64× |
-| 3 | [8, 8, 8] | 512× |
-
-There is no requirement that bin ratios double at each level. Any positive-
-integer ratio is valid, including anisotropic ratios:
-
-```json
-{"bin_ratio": [1, 2, 2], "bin_shape": [50.0, 100.0, 100.0]}
-```
-
-### Level group `zarr.json`
-
-The `zarr.json` at a level group path is a plain Zarr v3 group node:
+The `zarr.json` of level 1 of a streamline pyramid built with
+`build_pyramid(..., factors=[(2, 2), (2, 2)])` from 20 streamlines:
 
 ```json
 {
+  "attributes": {
+    "zarr_vectors_level": {
+      "level": 1,
+      "object_sparsity": 0.5,
+      "vertex_count": 23,
+      "coarsening_method": "per_object",
+      "parent_level": 0,
+      "arrays_present": ["vertices", "object_index"],
+      "preserves_object_ids": true,
+      "inherited_num_objects": 20,
+      "shared_fragments": true
+    }
+  },
   "zarr_format": 3,
   "node_type": "group"
 }
 ```
 
-No Zarr Vectors-specific keys are placed in the group's `zarr.json`; all Zarr Vectors
-metadata lives in `.zattrs`.
+Level 0 of the same store:
 
-### Adding and removing levels at runtime
+```json
+{
+  "zarr_vectors_level": {
+    "level": 0,
+    "object_sparsity": 1.0,
+    "vertex_count": 1200,
+    "coarsening_method": "none",
+    "parent_level": null,
+    "arrays_present": ["vertices", "object_index"],
+    "fragments_tile": true
+  }
+}
+```
+
+### `zarr_vectors_level` keys
+
+Always written:
+
+| Key | Type | Meaning |
+|-----|------|---------|
+| `level` | integer | The level index, equal to the group name |
+| `vertex_count` | integer | Vertices at this level |
+| `arrays_present` | list of strings | Array families at this level, by family name (`vertices`, `vertex_attributes`, `links`, `object_index`, …), never `<family>/<name>` |
+| `object_sparsity` | number in `(0, 1]` | Fraction of the parent level's objects kept; `1.0` at level 0 |
+| `coarsening_method` | string | `none` at level 0; `per_object` from `build_pyramid`; `manual` from `add_resolution_level` |
+| `parent_level` | integer or `null` | Level this one was made from; `null` at level 0 and required above it |
+
+Written only when set:
+
+| Key | Type | Meaning |
+|-----|------|---------|
+| `chunk_shape` | list of numbers | This level's chunk extent, when it differs from the root's; each entry a whole multiple of the root's |
+| `chunk_dims` | list of strings | Names of the chunk-key axes, leading non-spatial axis first, on a level [chunked by an attribute](../chunking/attribute_chunking.md) |
+| `chunk_attribute_name` | string | The vertex attribute that forms the leading chunk axis |
+| `chunk_attribute_values` | list | One label per bin of that axis, in bin order |
+| `chunk_sources` | list of objects | The stores each value of a leading `source` axis reads from; see [Chunk sources](../chunking/chunk_sources.md) |
+| `preserves_object_ids` | `true` | Dropped objects keep their ID as an empty manifest, so IDs match across levels |
+| `inherited_num_objects` | integer | Size of the object ID space taken from the parent level |
+| `shared_fragments` | `true` | A fragment may be named by more than one object's manifest |
+| `fragments_tile` | `true` | In every chunk, the vertex fragments are ranges that cover the `vertices/` cell in order, so the cell can be read without its fragment index |
+| `link_fragments_aligned` | `true` | In every chunk, link fragment `k` of the intra-chunk link array holds exactly the records whose first endpoint is in vertex fragment `k` |
+| `octree_chunks` | object | The level has [octree chunks](../chunking/octree_chunks.md) |
+
+`fragments_tile` and `link_fragments_aligned` are set by the bulk writers
+after their chunk writes and removed by any later write to the arrays they
+describe. Absent means unknown, not false.
+
+A reader treats an absent `object_sparsity` as `1.0`, `coarsening_method`
+as `"none"`, and `parent_level` as `null`.
+
+### Build-time keys
+
+One key sits at the top level of the level attributes, beside
+`zarr_vectors_level`, and only while the level is being written:
+
+| Key | Value | Meaning |
+|-----|-------|---------|
+| `zarr_vectors_presence` | `"deferred"` | The level's per-chunk arrays carry no `nonempty_chunks`, so concurrent writers share no state; a reader takes presence from the store (see [Chunk arrays](chunk_arrays.md)) |
+
+`zarr_vectors.building.defer_presence` sets it, and
+`zarr_vectors.building.rebuild_presence` writes every array's
+`nonempty_chunks` and removes it.
+
+### Naming and order
+
+Level groups are named `0`, `1`, `2`, … with no prefix. Root children whose
+names are not integers, such as `parametric/`, are not levels.
+`list_resolution_levels(root)` returns the level indices in ascending
+order.
+
+### Adding and removing levels
 
 ```python
 from zarr_vectors.core.store import (
-    open_store,
-    add_resolution_level,
-    remove_resolution_level,
-    list_available_ratios,
+    open_store, list_resolution_levels, list_available_ratios,
+    add_resolution_level, remove_resolution_level, read_level_metadata,
 )
 
-root = open_store("scan.zarrvectors", mode="r+")
-
-# Inspect existing levels
-print(list_available_ratios(root))   # [(1,1,1), (2,2,2)]
-
-# Create an empty level shell (arrays are not populated)
-level_group = add_resolution_level(root, level_index=2, bin_ratio=(4, 4, 4))
-
-# Remove a level (deletes all arrays within it)
-remove_resolution_level(root, level_index=2)
+root = open_store("tracts.zarrvectors", mode="r+")
+list_available_ratios(root)          # [(1, 1, 1)]
+add_resolution_level(root, level_index=1, bin_ratio=(2, 2, 2))
+list_resolution_levels(root)         # [0, 1]
+read_level_metadata(root, 1).bin_shape   # (100.0, 100.0, 100.0)
+remove_resolution_level(root, level_index=1)
 ```
 
-`add_resolution_level` creates the level group and its `.zattrs` with the
-declared `bin_ratio` and `bin_shape`, but does not populate any arrays.
-To populate, call `coarsen_level()` afterwards:
-
-```python
-from zarr_vectors.multiresolution.coarsen import coarsen_level
-
-coarsen_level(
-    "scan.zarrvectors",
-    source_level=0,
-    target_level=2,
-    bin_ratio=(4, 4, 4),
-    object_sparsity=0.25,
-)
-```
+`add_resolution_level` writes an empty level (`vertex_count` 0,
+`arrays_present` `[]`, `coarsening_method` `"manual"`) and its
+`multiscales` entry; it writes no arrays. Level 0 cannot be removed.
+To build populated levels, use `build_pyramid` or `coarsen_level` in
+`zarr_vectors.multiresolution.coarsen`; see
+[Pyramid construction](../multiscale/pyramid_construction.md).
 
 ### Validation
 
-Level group validation (L1):
+`LevelMetadata.validate()`, run whenever a level is written, requires:
 
-- `0/` must exist.
-- Each `<N>/` must contain a `zarr.json` identifying a group node.
-- Each `<N>/` must contain a `.zattrs` with the required keys.
+- `level` and `vertex_count` of at least 0;
+- `object_sparsity` in `(0, 1]`;
+- at level 0, no `bin_shape` and no `parent_level`;
+- above level 0, a `bin_shape` and a `parent_level`, and `bin_ratio`
+  entries of at least 1;
+- positive `chunk_shape` entries, and attribute-chunking and
+  `chunk_sources` keys that agree with each other.
 
-Level group validation (L2):
+Writing a level also checks that its `chunk_shape` is a whole multiple of
+the root's and that its bins divide it.
 
-- `level` in `.zattrs` equals `N` in the directory name.
-- `bin_shape[i] == base_bin_shape[i] × bin_ratio[i]` for all `i`
-  (within floating-point tolerance).
-- `bin_ratio` components are all positive integers.
-- `object_sparsity` is in `(0.0, 1.0]`.
-- Bin ratios are non-decreasing across levels (level 0 ≤ level 1 ≤ …
-  component-wise).
+[L1](../validation/l1_structural.md) fails a store with no level groups,
+fails a level without `vertices/`, and warns on a level with empty
+attributes. [L2](../validation/l2_metadata.md) parses each level with
+`read_level_metadata`, repeats the chunk-shape check, and warns when a
+level's presence is deferred. [L3](../validation/l3_consistency.md)
+checks `fragments_tile` and `link_fragments_aligned` against the data.

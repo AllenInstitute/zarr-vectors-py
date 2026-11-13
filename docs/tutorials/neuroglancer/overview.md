@@ -1,208 +1,101 @@
-# Neuroglancer integration overview
+# View stores in Neuroglancer with ngplatform
 
-[Neuroglancer](https://github.com/google/neuroglancer) is a WebGL-based
-viewer for petascale volumetric data, widely used in connectomics, brain
-imaging, and synchrotron science. It natively understands several data
-formats (OME-Zarr image volumes, Neuroglancer precomputed, N5), but does
-not have native support for the Zarr Vectors.
+This page shows how to open a Zarr Vectors store in
+[ngplatform](https://github.com/AllenInstitute/ngplatform), what each
+geometry type looks like there, and how it uses a store's levels.
 
-[`zv-ngtools`](https://github.com/AllenInstitute/zv-ngtools) bridges
-this gap. It is a fork of
-[`ngtools`](https://github.com/neuroscales/ngtools) — a collection of
-Neuroglancer utilities — extended with a `zarr_vectors` layer type that
-translates Zarr Vectors stores into Neuroglancer layers on the fly.
+ngplatform is a browser workspace around an unchanged
+[Neuroglancer](https://github.com/google/neuroglancer), extended by
+plugins. Its Zarr Vectors plugin, on by default, reads a store into a
+Neuroglancer segmentation layer with one segment per object. Stock
+Neuroglancer cannot read a store; for it, export to the precomputed format
+([Precomputed export](precomputed_export.md)).
 
----
+## Start ngplatform
 
-## Why Neuroglancer cannot read Zarr Vectors natively
+ngplatform runs in the browser with nothing to install: open
+<https://alleninstitute.github.io/ngplatform/>.
 
-Neuroglancer's data source plugins expect data in specific binary formats
-(precomputed, N5, OME-Zarr). Zarr Vectors stores vertex data as spatially chunked
-Zarr arrays — `vertices/` cells addressed by chunk coordinate, with a
-`vertex_fragments/` index that slices each cell into per-bin or per-object
-runs — a structure Neuroglancer does not understand without a mediating
-translation layer.
+To run it on your own computer instead, build it with its Neuroglancer
+branch, then start the development server:
 
-`zv-ngtools` provides that layer: it runs a local HTTP file server that
-intercepts Neuroglancer's chunk requests, reads the requested spatial
-region from a Zarr Vectors store using `zarr-vectors-py`, and returns the data in
-a format Neuroglancer expects.
-
----
-
-## Two integration paths
-
-### Path A — Local serving via `LocalNeuroglancer`
-
-A Python process (`zv-ngtools`) runs a local Tornado HTTP server alongside
-a Neuroglancer browser tab. The server:
-
-1. Receives chunk requests from Neuroglancer (HTTP range requests).
-2. Uses `zarr-vectors-py` to read the requested fragment slices.
-3. Translates the Zarr Vectors data to the Neuroglancer layer protocol.
-4. Returns the response to the browser.
-
-LOD is driven by the Zarr Vectors resolution pyramid: as the user zooms out in
-Neuroglancer, the server switches to coarser levels automatically, using
-each level's bin shape to select the appropriate resolution. That number is
-`ds.level(i).resolution` on the supported api; see
-[LOD and resolution level control](local_viewer.md#lod-and-resolution-level-control).
-
-```
-Python process                         Browser
-┌───────────────────────────────┐     ┌─────────────────────────────┐
-│  LocalNeuroglancer             │     │  Neuroglancer (WebGL)        │
-│  ├─ Tornado HTTP server        │◄────│  chunk requests              │
-│  │   (port 9123)               │────►│  rendered layers             │
-│  └─ zarr-vectors reader        │     │                              │
-│      ├─ scan.zarrvectors       │     └─────────────────────────────┘
-│      └─ tracts.zarrvectors     │
-└───────────────────────────────┘
+```bash
+git clone -b ngplatform-upstream https://github.com/Andrew-Keenlyside/neuroglancer ../neuroglancer
+(cd ../neuroglancer && npm ci && node build_tools/postpack.ts && rm -rf lib)
+git clone https://github.com/AllenInstitute/ngplatform && cd ngplatform
+npm install
+npm run dev        # http://localhost:5173
 ```
 
-This path is best for local analysis and collaborative review sessions
-where the data lives on local disk or a mounted network share.
+## Open a store
 
-### Path B — Precomputed export for static hosting
+**A store on your computer.** Use **Open → Open from device** or
+**Add → Local**, or drop the `.zarrvectors` folder on the window. It is read
+in place in the browser; nothing is uploaded.
 
-Convert a Zarr Vectors store to the Neuroglancer precomputed format and upload to
-a public HTTP server (S3, GCS, nginx). Neuroglancer fetches the data
-directly without any intermediary Python process.
+**A store at a URL.** Use **Add → URL**, or paste the source anywhere on
+the window outside a text field. The source is the store's URL followed by
+`/|zarr-vectors:`:
 
-This path is best for sharing published datasets with collaborators who
-will not install `zv-ngtools`, or for embedding Neuroglancer links in
-publications and websites.
-
-See [Precomputed export](precomputed_export.md) for the conversion
-workflow.
-
----
-
-## What `zv-ngtools` adds over upstream `ngtools`
-
-`zv-ngtools` is a fork of `ngtools` (neuroscales/ngtools). All upstream
-`ngtools` functionality is preserved; the fork adds:
-
-| Feature | Upstream `ngtools` | `zv-ngtools` |
-|---------|-------------------|-------------|
-| Load OME-Zarr image volumes | ✓ | ✓ |
-| Load TRK / TCK tractography | ✓ | ✓ |
-| Load NIfTI, MGH, TIFF | ✓ | ✓ |
-| Load `.zarrvectors` stores | ✗ | ✓ |
-| Zarr Vectors-aware LOD selection | ✗ | ✓ |
-| `zarr_vectors` layer type | ✗ | ✓ |
-| Precomputed export from Zarr Vectors | ✗ | ✓ |
-| Point cloud layer rendering | ✗ | ✓ |
-| Streamline layer rendering | ✗ (only TRK/TCK) | ✓ (from Zarr Vectors) |
-
-The `zarr://` URL scheme (for OME-Zarr stores) works identically in both
-forks. Only the `zarr_vectors://` scheme is new.
-
----
-
-## Layer type mapping
-
-| Zarr Vectors geometry type | Neuroglancer layer type | Notes |
-|------------------|------------------------|-------|
-| `point_cloud` | `annotation` (point) | Rendered as 3-D points; size and colour from attributes |
-| `line` | `annotation` (line) | Rendered as line segments |
-| `polyline` / `streamline` | `annotation` (line) | Rendered as connected line sequences |
-| `graph` / `skeleton` | `segmentation` (mesh-less) or custom skeleton layer | SWC-style rendering |
-| `mesh` | `segmentation` (mesh) or `annotation` (surface) | Draco-compressed meshes supported |
-
-For types without a perfect Neuroglancer native equivalent (e.g. general
-graphs), `zv-ngtools` uses the closest Neuroglancer layer type and adds a
-server-side translation step.
-
----
-
-## Coordinate system alignment
-
-Zarr Vectors stores and Neuroglancer image volumes can be displayed together when
-they share a coordinate system. Neuroglancer uses a global coordinate space
-for all layers; each layer specifies its own coordinate transform.
-
-A Zarr Vectors store is a Zarr **v3** group, so its root document is `zarr.json`.
-There is no `.zattrs` — that is the Zarr v2 spelling — and no `metadata.json`.
-Everything a viewer needs sits in that one file, under two attribute keys:
-
-- `attributes.zarr_vectors` — the store-level fields: `zv_version`, `bounds`,
-  `chunk_shape`, `base_bin_shape`, `geometry_types`, the convention flags, and
-  an optional `crs` naming the coordinate system. `crs` is written only when
-  one was declared, so a reader must treat it as absent by default.
-- `attributes.multiscales` — an OME-NGFF 0.4 block. `axes` names and types each
-  axis (plus a `unit` when the schema declared one), and
-  **`datasets[i].coordinateTransformations` is the key that carries the `scale`
-  and `translation` a viewer needs for the layer transform.**
-
-```python
-import json, pathlib
-
-root = json.loads(pathlib.Path("scan.zarrvectors/zarr.json").read_text())
-multiscales = root["attributes"]["multiscales"][0]
-
-print([axis["name"] for axis in multiscales["axes"]])
-for dataset in multiscales["datasets"]:
-    print(dataset["path"], dataset["coordinateTransformations"])
+```text
+https://example.org/tracts.zarrvectors/|zarr-vectors:
+gs://bucket/tracts.zarrvectors/|zarr-vectors:
+s3://bucket/tracts.zarrvectors/|zarr-vectors:
+https://example.org/tracts.zarrvectors/|zarr-vectors:#attributes=fa,z
+https://example.org/tracts.zarrvectors/|zarr-vectors:#attributes=fa,obj:kind
 ```
 
-```
-['x', 'y', 'z']
-0 [{'type': 'scale', 'scale': [1.0, 1.0, 1.0]}, {'type': 'translation', 'translation': [15.625, 15.625, 15.625]}]
-1 [{'type': 'scale', 'scale': [2.0, 2.0, 2.0]}, {'type': 'translation', 'translation': [31.25, 31.25, 31.25]}]
-```
+`#attributes=` chooses which vertex attributes to load; names with an `obj:`
+prefix are object attribute columns, for use in shaders. `gs://` and `s3://`
+buckets are read directly. A private Google Cloud bucket needs a sign-in
+from the **Auth** tab.
 
-`scale` is a multiplier on the root's `base_bin_shape`, not an absolute size:
-level 1's `[2, 2, 2]` against a `base_bin_shape` of `31.25` is a bin shape of
-`62.5` world units, and `translation` is half of that — the offset of the bin
-centre. The supported api assembles the same number, so a tool reading through
-`zarr-vectors-py` never has to multiply the two out itself:
+The server must allow cross-origin requests and answer byte-range requests,
+and should list directories: without a listing, edges that cross chunk
+boundaries are found by probing the 26 neighbouring chunks, and faces that
+cross them are missing. zarr-vectors-tools'
+[Visualise](https://zarr-vectors-tools.readthedocs.io/en/latest/visualise.html)
+page covers serving stores and preparing them for the viewer, and
+`zvtools virtual serve` serves tractograms, meshes and point tables as
+virtual stores without converting them.
 
-```python
-import zarr_vectors as zv
+A store opens with level 0's `vertices` and `vertex_fragments`. With an
+object index it also gets the object subsources and segment properties
+described below.
 
-ds = zv.open("scan.zarrvectors")
-print(ds.axes)
-for index in ds.levels:
-    print(index, ds.level(index).resolution)
-```
+## What each geometry type looks like
 
-```
-({'name': 'x', 'type': 'space'}, {'name': 'y', 'type': 'space'}, {'name': 'z', 'type': 'space'})
-0 (31.25, 31.25, 31.25)
-1 (62.5, 62.5, 62.5)
-```
+| Geometry type | Drawn as | Default colour |
+|---|---|---|
+| `point_cloud` | Points | Per object |
+| `line`, `streamline`, `polyline` | Lines | Direction (absolute unit tangent as RGB) |
+| `graph` | Lines along the stored edges | Direction |
+| `skeleton` | Lines, including branches | Per object |
+| `mesh` | Triangles: filled and lit in 3-D, the outline where faces cross a section in 2-D | Per object |
 
-Stores that declare a `crs` of `RAS` (Right-Anterior-Superior) are automatically
-aligned with Neuroglancer's default RAS coordinate system.
+The layer's shader reads a vertex attribute `<name>` as `prop_<name>()`, an
+object attribute column `<column>` as `prop_obj_<column>()`, and the tangent
+as `prop_tangent()`. Object attributes appear as segment properties in the
+layer's **Segments** tab, where they can be searched (for example
+`length>50`), and groups appear as tags. Selected objects are drawn at full
+resolution: curves, skeletons and graphs as Neuroglancer skeletons, mesh
+objects as Neuroglancer meshes.
 
-For stores in voxel space, pass an explicit affine when loading:
+## Levels of detail
 
-```python
-viewer.add(
-    "scan.zarrvectors",
-    transform=np.array([
-        [0.004, 0,     0,     0],     # 4 µm per voxel
-        [0,     0.004, 0,     0],
-        [0,     0,     0.025, 0],     # 25 µm z-step
-        [0,     0,     0,     1],
-    ]),
-)
-```
+Each view draws one level of the store's pyramid: the finest level whose
+vertices, for the region in view, fit about one vertex per
+`renderScale`² pixels. The coarsest level is drawn while a finer one loads.
+The **Render** tab's **Resolution (slice)** and **Resolution (mesh)**
+sliders set the target.
 
----
+- A store with only level 0 is drawn from level 0 at every zoom, so build a
+  pyramid for a large store (for example with
+  `ds.build_pyramid(factors=[(2.0, 1.0)])`).
+- Selected mesh objects use the store's levels as mesh levels of detail
+  when each level's chunks are twice the previous level's and the level
+  stores faces; otherwise they are drawn from level 0.
 
-## Quick-start checklist
-
-Before working through the detailed tutorials:
-
-- [ ] `pip install git+https://github.com/AllenInstitute/zv-ngtools.git`
-- [ ] A web browser that supports WebGL 2 (Chrome, Firefox, Edge)
-- [ ] A `.zarrvectors` store with at least a base level (level 0)
-
-Optionally, for best performance:
-
-- [ ] A multi-level pyramid (run `ds.build_pyramid(factors=[(2.0, 1.0)])` first)
-- [ ] Consolidated metadata (`zarr.consolidate_metadata`) — this works on a Zarr Vectors
-      store, but zarr-python warns as it writes that consolidated metadata is not
-      part of the Zarr v3 specification and other implementations may ignore it
+The store's levels and their bin shapes are in the root attributes, under
+`multiscales` and `zarr_vectors`; see
+[Multiscale metadata](../../spec/multiscale/multiscale_metadata.md).

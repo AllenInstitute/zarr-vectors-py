@@ -1,34 +1,24 @@
 # HPC pipelines
 
-This guide covers writing Zarr Vectors stores from HPC (High Performance Computing)
-environments: SLURM job arrays, MPI parallel writes, Lustre/GPFS file system
-optimisation, and sharding read work across ranks.
+This guide shows how to write one store from many processes, such as SLURM
+array tasks or MPI ranks, and how to divide read work between ranks.
 
-Parallel writing has a fixed shape in `zarr-vectors`, and every pattern below
-is the same three phases:
+Every parallel write has three phases:
 
-1. **A coordinator creates the store and allocates its arrays — once.**
-2. **Workers write disjoint sets of grid cells**, each skipping the shared
+1. One process creates the store and allocates its arrays.
+2. Workers write disjoint sets of grid cells without touching the shared
    presence manifest.
-3. **A coordinator rebuilds that manifest** and writes the multiscale
-   metadata.
+3. One process writes the manifest and the level metadata.
 
-All three use `zarr_vectors.building`, the supported surface for code that
-constructs stores. `zarr_vectors.api` (`zv.create` / `add_points`) has no
-partitioned writer: `add_points` is a one-shot write that re-derives the grid
-from its own batch, so calling it once per task leaves you with one task's
-data. See [Memory-efficient writes](memory_efficient_writes.md) for the
-single-process version of the same pattern, and for what each per-chunk verb
-does.
-
----
+All three use `zarr_vectors.building`. `Dataset.add_points` is a one-shot
+write, so calling it from each task keeps only one task's data.
+[Memory-efficient writes](memory_efficient_writes.md) walks through the same
+pattern in one process and explains each call.
 
 ## Plan the grid before you submit
 
-The chunk grid decides how many cells there are to divide among tasks, and it
-is fixed at store creation. `Grid.plan` answers both questions without
-creating anything — which is the only moment either answer can still change
-the job script.
+The grid is fixed when the store is created and decides how many cells there
+are to divide among tasks. `Grid.plan` computes it without creating anything:
 
 ```python
 import zarr_vectors as zv
@@ -44,41 +34,37 @@ Grid(21x21x21 cells of (500.0, 500.0, 500.0)) 9261
 21x21x21 = 9261 cells, ~0.6 MB/cell -- fits
 ```
 
-9261 cells and ~0.6 MB each: that sizes the `--array` range and tells you a
-task holding a few hundred cells stays well inside a modest `--mem`.
+The cell count sizes the task range; the bytes per cell, times the cells a
+task holds, sizes its memory request.
 
 ### Partitions must be disjoint
 
-Two tasks writing the same cell is a lost-update race, not a merge. The
-reliable way to divide the work is to enumerate the grid and slice it —
-disjoint by construction:
+Two tasks writing the same cell is a lost update: the second writer wins and
+nothing detects it. Enumerate the grid and slice it, which is disjoint by
+construction:
 
 ```python
+task_id, n_tasks = 3, 16                          # e.g. from the scheduler
 cells = sorted(grid, key=lambda c: c.coords)      # every CellRef, ordered
-n_tasks = 16
 partition = zv.CellSet(cells[task_id::n_tasks])   # this task's cells
 ```
 
 ```{warning}
-Do **not** cut partitions with `Grid.cells_in`. It is inclusive on the upper
-boundary, so slabs cut on chunk boundaries share a whole plane of cells:
-four 250 µm z-slabs of a 4×4×4 grid return 50 cells each — 200 in total for
-a 64-cell grid — with 25 cells shared between each adjacent pair. That is
-correct for a *read* (a box touching a boundary really does touch both
-cells) and silently wrong for a parallel write.
+Do not cut partitions with `Grid.cells_in`. It includes cells on the upper
+boundary of the box, so slabs cut on cell boundaries share a plane of cells.
+For a 1 000 µm cube in 250 µm cells, four z-slabs return 50 cells each, 200 in
+total, and adjacent slabs share 25. That is right for a read and wrong for a
+parallel write.
 ```
 
-Slicing coordinates rather than cells has the same trap: give each task a
-half-open range (`z_lo <= z < z_hi`), never a closed one.
+If you split by coordinates instead, give each task a half-open range
+(`z_lo <= z < z_hi`).
 
----
+## SLURM job array
 
-## SLURM job array pattern
-
-### `init_store.py` — runs once, before the array
+### `init_store.py`: runs once, before the array
 
 ```python
-import numpy as np
 from zarr_vectors.building import (
     LevelMetadata, create_store, create_resolution_level,
     create_vertices_array, create_attribute_array, defer_presence,
@@ -100,35 +86,24 @@ with open_write_session(level, bounds=BOUNDS, chunk_shape=CHUNK):
     create_vertices_array(level, dtype="float32")
     create_attribute_array(level, "intensity", dtype="float32")
 
-defer_presence(level)        # tasks write no state shared between cells
-```
-
-```{warning}
-This step is not optional and must not be folded into the array tasks. The
-`create_*_array` calls rewrite each array's `zarr.json`, and inside a write
-session that drops every cell already on disk — so a task that re-creates
-the arrays erases whatever its siblings have written. Tasks write cells;
-they never create arrays.
+defer_presence(level)        # no task writes nonempty_chunks
 ```
 
 ### Submit script
 
 ```bash
 #!/bin/bash
-#SBATCH --job-name=zvf_write
-#SBATCH --array=0-19          # 20 z-slabs
+#SBATCH --array=0-19
 #SBATCH --ntasks=1
-#SBATCH --cpus-per-task=4
-#SBATCH --mem=32G
-#SBATCH --time=02:00:00
 
-python write_partition.py \
-    --slab-index ${SLURM_ARRAY_TASK_ID} \
-    --n-slabs 20 \
+python write_partition.py --slab-index ${SLURM_ARRAY_TASK_ID} --n-slabs 20 \
     --output /scratch/scan.zarrvectors
 ```
 
 ### `write_partition.py`
+
+`load_slab` stands for your reader; it must return the points with
+`z_lo <= z < z_hi` and their intensities.
 
 ```python
 import argparse
@@ -137,8 +112,10 @@ from zarr_vectors.building import (
     open_store, get_resolution_level, open_write_session,
     write_chunk_vertices, write_chunk_attributes,
 )
-# Internal import -- see the note below.
+# Internal module: building has no bin-level equivalent.
 from zarr_vectors.spatial.chunking import assign_bins, group_bins_by_chunk
+
+from my_reader import load_slab
 
 BOUNDS = ([0., 0., 0.], [1000., 1000., 1000.])
 CHUNK  = (250., 250., 250.)
@@ -146,91 +123,58 @@ BIN    = (125., 125., 125.)
 BINS_PER_CHUNK = tuple(int(round(c / b)) for c, b in zip(CHUNK, BIN))
 N_BINS = int(np.prod(BINS_PER_CHUNK))
 
-def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--slab-index", type=int)
-    parser.add_argument("--n-slabs", type=int)
-    parser.add_argument("--output", type=str)
-    args = parser.parse_args()
+parser = argparse.ArgumentParser()
+parser.add_argument("--slab-index", type=int)
+parser.add_argument("--n-slabs", type=int)
+parser.add_argument("--output")
+args = parser.parse_args()
 
-    # Half-open slab: [z_lo, z_hi).  Adjacent slabs must not share a cell.
-    dz = (BOUNDS[1][2] - BOUNDS[0][2]) / args.n_slabs
-    z_lo = BOUNDS[0][2] + args.slab_index * dz
+dz = (BOUNDS[1][2] - BOUNDS[0][2]) / args.n_slabs
+z_lo = BOUNDS[0][2] + args.slab_index * dz
+positions, intensity = load_slab(z_lo, z_lo + dz)
 
-    positions = load_slab_positions(z_lo, z_lo + dz)
-    intensity = load_slab_intensity(z_lo, z_lo + dz)
+level = get_resolution_level(open_store(args.output, mode="r+"), 0)
+written = 0
+with open_write_session(level, bounds=BOUNDS, chunk_shape=CHUNK):
+    per_chunk = group_bins_by_chunk(assign_bins(positions, BIN), BINS_PER_CHUNK)
+    for cell, fragments in per_chunk.items():
+        verts = [np.zeros((0, 3), "float32") for _ in range(N_BINS)]
+        attrs = [np.zeros((0,), "float32") for _ in range(N_BINS)]
+        for fragment_index, rows in fragments.items():
+            verts[fragment_index] = positions[rows]
+            attrs[fragment_index] = intensity[rows]
+        write_chunk_vertices(level, cell, verts, dtype="float32",
+                             record_presence=False)
+        write_chunk_attributes(level, "intensity", cell, attrs,
+                               dtype="float32", record_presence=False)
+        written += sum(len(v) for v in verts)
 
-    level = get_resolution_level(open_store(args.output, mode="r+"), 0)
-    written = 0
-    with open_write_session(level, bounds=BOUNDS, chunk_shape=CHUNK):
-        per_chunk = group_bins_by_chunk(assign_bins(positions, BIN),
-                                        BINS_PER_CHUNK)
-        for cell, fragments in per_chunk.items():
-            verts = [np.zeros((0, 3), "float32") for _ in range(N_BINS)]
-            attrs = [np.zeros((0,), "float32") for _ in range(N_BINS)]
-            for fragment_index, rows in fragments.items():
-                verts[fragment_index] = positions[rows]
-                attrs[fragment_index] = intensity[rows]
-
-            write_chunk_vertices(level, cell, verts, dtype="float32",
-                                 record_presence=False)
-            write_chunk_attributes(level, "intensity", cell, attrs,
-                                   dtype="float32", record_presence=False)
-            written += sum(len(v) for v in verts)
-
-    print(f"Slab {args.slab_index} done: {written} vertices")
-
-if __name__ == "__main__":
-    main()
+print(f"Slab {args.slab_index} done: {written} vertices")
 ```
 
-`defer_presence` in `init_store.py` is what makes this safe to run in
-parallel. `nonempty_chunks` is one attribute shared by every cell of an array,
-so a task that stamps it races every other task, and each stamp rewrites the
-whole list. A deferred level's arrays carry no manifest at all, so no write
-stamps one — whatever `record_presence` says, and including writers that do
-not take the flag. The finalisation step writes each manifest once.
+`nonempty_chunks` is one attribute shared by every cell of an array, so tasks
+that each update it race. On a level declared with `defer_presence`, no write
+updates it, whatever `record_presence` says; on an undeclared level,
+`record_presence=False` does the same per call.
 
-`record_presence=False` says the same thing one call at a time, and is what to
-use on a level nobody declared. It is harmless alongside the declaration.
-
-```{note}
 A cell in a deferred level is visible as soon as its payload lands:
-`list_chunks` lists the array and `chunk_exists` reads the cell, so a stage
-that reads what a worker just wrote sees it without waiting for the
-coordinator. That costs a listing per array, so the rebuild is still what a
-finished store wants. An offline-read session and a zarr-vectors older than
-0.9.3 see the cells only after the rebuild; neuroglancer's datasource probes
-every cell of an array with no manifest, which finds them, slowly. If one of
-those has to run mid-build, see
-[Stamping under your own lock](#stamping-under-your-own-lock) below.
+`list_chunks` and `chunk_exists` find it by listing the store, so a stage that
+reads what a task just wrote sees it before the finalisation step. Readers
+that take `nonempty_chunks` straight from `zarr.json` do not; for those, see
+[Stamping under your own lock](#stamping-under-your-own-lock). On an
+undeclared level, cells written with `record_presence=False` stay invisible to
+`list_chunks` until the manifest is rebuilt.
 
-Without the declaration, `record_presence=False` alone leaves the cells
-invisible to `list_chunks` until the rebuild runs.
-```
+Write one fragment per bin, as above: a cell written as a single fragment on a
+store with `base_bin_shape` gives wrong bounding-box results (see
+[Memory-efficient writes](memory_efficient_writes.md)).
 
-Write the vertices of a cell as one fragment **per bin**, as above, rather
-than one fragment for the whole cell. Fragments are what a coarsener draws
-representatives from, so a single-fragment cell produces a nearly empty
-pyramid — see
-[Memory-efficient writes](memory_efficient_writes.md#one-fragment-per-bin-not-one-per-cell).
-
-```{note}
-`assign_bins` and `group_bins_by_chunk` come from
-`zarr_vectors.spatial.chunking`, which is **internal**: this import reaches
-past the contract and may break between releases.
-`zarr_vectors.building` exports `assign_chunks` (vertices → cells) but no
-bin-level equivalent. That is a gap to report rather than a reason to treat
-`spatial` as public.
-```
-
-### Finalisation step (after all array jobs complete)
+### Finalisation, after all array tasks
 
 ```bash
 #!/bin/bash
 #SBATCH --dependency=afterok:${ARRAY_JOB_ID}
 #SBATCH --ntasks=1
-#SBATCH --mem=8G
 
 python finalise_store.py --output /scratch/scan.zarrvectors --vertices 80000000
 ```
@@ -252,8 +196,8 @@ args = parser.parse_args()
 root = open_store(args.output, mode="r+")
 level = get_resolution_level(root, 0)
 
-rebuild_presence(level)                      # every manifest, once; ends the deferral
-print(refresh_arrays_present(level))         # what is actually on disk
+rebuild_presence(level)                      # every manifest; ends the deferral
+print(refresh_arrays_present(level))         # the arrays actually on disk
 update_level_metadata(level, vertex_count=args.vertices)
 write_multiscale_metadata(root)
 
@@ -267,90 +211,70 @@ print("Store finalised.")
 Store finalised.
 ```
 
-`refresh_arrays_present` walks the level rather than trusting what the writers
-declared, which is why `vertex_fragments` shows up even though `init_store.py`
-never listed it. Both it and `rebuild_presence` are coordinator verbs — never
-run either while tasks are still writing.
+Never run this while tasks are still writing. `build_pyramid` needs the whole
+store, so it belongs here rather than in a task.
 
-`rebuild_presence` finds the cells by reading the store back: a listing and a
-read of every shard of every array. If your tasks already report the cells they
-wrote, the coordinator can record those instead and skip the read:
+`rebuild_presence` finds the cells by listing and reading the store. If your
+tasks report the cells they wrote, record those instead:
 
 ```python
-set_presence(level, {"vertices": cells, "vertex_fragments": cells, ...},
-             end_deferral=True)
+set_presence(level, {"vertices": cells, "vertex_fragments": cells,
+                     "vertex_attributes/intensity": cells}, end_deferral=True)
 ```
 
 Each named array's manifest becomes exactly the cells given, so name every
-array the tasks wrote, and pass the union for a cell more than one task wrote.
-`end_presence_deferral` ends the declaration on its own, and refuses while any
-array is still without a manifest unless told `missing="derive"`.
+array the tasks wrote and pass the union of their cells.
+`end_presence_deferral(level)` ends the declaration on its own; it raises
+`StoreError` while any array has no manifest, unless you pass
+`missing="derive"`, which rebuilds those from the store.
 
 ### Stamping under your own lock
 
-A deferred level keeps every cell visible to current zarr-vectors readers, but
-not to an offline-read session or a zarr-vectors older than 0.9.3, and a viewer
-reading `nonempty_chunks` straight from `zarr.json` has to fall back to probing
-every cell. Without the declaration, `record_presence=False` hides the cells
-from everyone until `rebuild_presence` runs, and a stage that reads the chunks a
-worker just wrote sees nothing and silently does no work.
-
-If your workers already serialise *something* (a file lock, a queue, a
-database row), you can keep the payloads unlocked and move only the manifest
-update inside that section. `collect_presence` holds the stamps back;
-`apply_presence` lands them, coalesced to one attribute write per array:
+If a consumer that reads `nonempty_chunks` directly must run before the
+finalisation step, and your workers already serialise something (a file lock,
+a queue, a database row), write the payloads unlocked and apply only the
+manifest update under the lock. On a level without `defer_presence`,
+`collect_presence` holds the stamps back and `apply_presence` writes them, one
+attribute write per array:
 
 ```python
 with level.collect_presence() as pending:
-    flush(level)                    # payloads -- the bulk of the I/O, unlocked
-with store_write_lock(path):        # short, and the only thing serialised
+    for cell, groups in my_cells:                # payloads, unlocked
+        write_chunk_vertices(level, cell, groups, dtype="float32")
+with store_write_lock(path):                     # your lock
     level.apply_presence(pending)
 ```
 
-Unlike `batched_writes`, the cell payloads are **not** deferred — they land
-inline, exactly as they would otherwise. Only the stamp waits. By the time
-`apply_presence` returns, `list_chunks` reports every cell in the block, so a
-consumer running immediately afterwards sees the work.
-
-Pick by what follows the write:
+The payloads land as they are written; only the stamps wait. When
+`apply_presence` returns, `list_chunks` reports every cell. `collect_presence`
+cannot be combined with `batched_writes` in either order, and
+`open_write_session` opens a `batched_writes` block, so write outside a session
+here; nesting them raises `StoreError`. A `pending` token belongs to the thread
+that collected it.
 
 | Situation | Use |
 |---|---|
-| A coordinator pass follows | `defer_presence` + `rebuild_presence` |
-| Consumers run before the coordinator, and read through zarr-vectors | the same — they ask the store while the level is deferred |
-| Consumers that cannot ask the store run before the coordinator, and you hold a lock | `collect_presence` / `apply_presence` |
-| Single writer, no concurrency | the default — stamp inline |
+| A finalisation step follows, and early readers go through zarr-vectors | `defer_presence`, then `rebuild_presence` or `set_presence` |
+| Readers that take `nonempty_chunks` from `zarr.json` run before finalisation, and you hold a lock | `collect_presence` and `apply_presence` |
+| One writer | The default: each write updates the manifest |
 
-`collect_presence` cannot be combined with `batched_writes`, which defers the
-payloads too and stamps its own manifest when it flushes; nesting the two
-raises `StoreError`. A `pending` token belongs to the thread that collected it.
+## MPI
 
-`build_pyramid` needs the whole store, so it belongs here rather than in a
-task. Coarsening a single level in isolation is not on the supported surface;
-if that is what you need, report it rather than importing
-`zarr_vectors.multiresolution` or `zarr_vectors.ops`, which are internal.
-
----
-
-## MPI parallel writes
-
-The same three phases, with `Barrier` where the job dependency was. Rank 0
-allocates, every rank writes its own cells, rank 0 finalises:
+The same three phases, with `Barrier` where the job dependency was:
 
 ```python
 from mpi4py import MPI
 import numpy as np
-import zarr_vectors as zv
 from zarr_vectors.building import (
     LevelMetadata, create_store, create_resolution_level,
-    create_vertices_array, create_attribute_array, open_write_session,
-    open_store, get_resolution_level, write_chunk_vertices,
-    write_chunk_attributes, rebuild_presence, refresh_arrays_present,
-    update_level_metadata, write_multiscale_metadata,
+    create_vertices_array, create_attribute_array, defer_presence,
+    open_write_session, open_store, get_resolution_level,
+    write_chunk_vertices, write_chunk_attributes, rebuild_presence,
+    refresh_arrays_present, update_level_metadata, write_multiscale_metadata,
 )
-# Internal import -- bin-level assignment has no supported equivalent; see the
-# note under `write_partition.py` above.
 from zarr_vectors.spatial.chunking import assign_bins, group_bins_by_chunk
+
+from my_reader import load_x_range   # points with x_lo <= x < x_hi, intensities
 
 STORE  = "/scratch/scan.zarrvectors"
 BOUNDS = ([0., 0., 0.], [10_000., 10_000., 10_000.])
@@ -360,11 +284,9 @@ BINS_PER_CHUNK = tuple(int(round(c / b)) for c, b in zip(CHUNK, BIN))
 N_BINS = int(np.prod(BINS_PER_CHUNK))
 
 comm = MPI.COMM_WORLD
-rank = comm.Get_rank()
-size = comm.Get_size()
+rank, size = comm.Get_rank(), comm.Get_size()
 
-# --- phase 1: rank 0 allocates -----------------------------------------
-if rank == 0:
+if rank == 0:                                     # phase 1
     root = create_store(STORE, bounds=BOUNDS, chunk_shape=CHUNK,
                         base_bin_shape=BIN, geometry_types=["point_cloud"])
     level = create_resolution_level(root, 0, LevelMetadata(
@@ -373,14 +295,11 @@ if rank == 0:
     with open_write_session(level, bounds=BOUNDS, chunk_shape=CHUNK):
         create_vertices_array(level, dtype="float32")
         create_attribute_array(level, "intensity", dtype="float32")
+    defer_presence(level)
 comm.Barrier()
 
-# --- phase 2: every rank writes a half-open x-slab ---------------------
-dx = (BOUNDS[1][0] - BOUNDS[0][0]) / size
-x_lo = BOUNDS[0][0] + rank * dx
-positions = load_positions_x_range(x_lo, x_lo + dx)   # [x_lo, x_lo + dx)
-intensity = load_intensity_x_range(x_lo, x_lo + dx)
-
+dx = (BOUNDS[1][0] - BOUNDS[0][0]) / size        # phase 2
+positions, intensity = load_x_range(rank * dx, (rank + 1) * dx)
 level = get_resolution_level(open_store(STORE, mode="r+"), 0)
 written = 0
 with open_write_session(level, bounds=BOUNDS, chunk_shape=CHUNK):
@@ -400,36 +319,23 @@ with open_write_session(level, bounds=BOUNDS, chunk_shape=CHUNK):
 total = comm.reduce(written, op=MPI.SUM, root=0)
 comm.Barrier()
 
-# --- phase 3: rank 0 finalises -----------------------------------------
-if rank == 0:
+if rank == 0:                                     # phase 3
     root = open_store(STORE, mode="r+")
     level = get_resolution_level(root, 0)
     rebuild_presence(level)
     refresh_arrays_present(level)
     update_level_metadata(level, vertex_count=total)
     write_multiscale_metadata(root)
-    print(f"Wrote {total} vertices from {size} ranks.")
 ```
 
-Run with:
-
-```bash
-mpirun -n 16 python mpi_write.py
-```
-
-Ranks do not need MPI-IO or a parallel HDF5 build: each writes ordinary files
-under its own cell keys, and the file system does the rest. The only shared
-mutable state is the presence manifest, which is exactly what
-`record_presence=False` keeps them out of.
-
----
+Run it with `mpirun -n 16 python mpi_write.py`. Ranks need neither MPI-IO nor
+parallel HDF5: each writes ordinary files under its own cell keys.
 
 ## Workers that append objects
 
-A pipeline that builds objects chunk by chunk (skeleton paths, say, with
-seam links between neighbouring chunks) flushes in a fixed order. Each call
-takes whole arrays, numpy or device, and leaves the same bytes as its
-per-object counterpart:
+A pipeline that builds objects cell by cell (skeleton paths with seam links
+between neighbouring cells, for example) writes four things per batch, in this
+order. Each call takes whole arrays:
 
 ```python
 from zarr_vectors import building as zb
@@ -447,111 +353,93 @@ zb.write_link_cells(                        # 4. seams and their attributes
 # the coordinator then commits num_objects = n0 + k
 ```
 
-If the store was created with `manifest_layout="dense"`, step 2 writes the
-arrays as they are, with no blob per object, and a later
-`read_all_object_manifests_csr` is a gather rather than a decode; see
-[Dense object indexes](gpu.md#dense-object-indexes).
+On a store created with `manifest_layout="dense"`, step 2 stores the arrays as
+given; see [Dense object indexes](gpu.md#dense-object-indexes).
 
-When every worker has finished, the coordinator runs `zb.finalize_links(lg,
-delta=0)` once. It rebuilds presence for the link, link-attribute and
-link-fragment arrays, which the array-form link writer does not record. In a
-deferred level it leaves presence alone, for the level's `rebuild_presence` or
-`set_presence`: a manifest written there would put the stamps of any task still
-writing back to racing.
+When every worker has finished, the coordinator runs
+`zb.finalize_links(lg, delta=0)` once. It rebuilds presence for the link,
+link-attribute and link-fragment arrays; in a deferred level it leaves presence
+to `rebuild_presence` or `set_presence`.
 
-Two things are shared between workers here, unlike the cell writes in the
-patterns above:
+Two things are shared between workers here:
 
-- **The object index and object attribute columns.** An `at=` append is a
-  resume cursor for one writer: below the current length it truncates what
-  follows, above it pads, and every call resizes. Several processes must not
-  append at once. To fill the object layer in parallel, reserve it and place
-  rows instead (below).
-- **Seam link cells.** A seam is stored in the cell of its anchor chunk,
-  which may belong to another worker's partition. Either route each seam to
-  the worker that owns its anchor, or serialise these writes too.
+- The object index and object attribute columns. An `at=` append resizes the
+  arrays and truncates or pads to `at`, so only one process may append. To fill
+  them in parallel, reserve the rows and place them (below).
+- Seam link cells. A seam is stored in the cell of its anchor chunk, which may
+  belong to another worker. Route each seam to the worker that owns its anchor,
+  or serialise these writes.
 
 ### One shard per task, published at the end
 
-When each task owns a shard of a sharded store, a retry should not start from
-its failed attempt's cells. Inside `zb.shard_transaction(level, shard)` every
-cell write -- through any writer -- is staged, and must fall inside the shard;
-reads of the task's cells see the staging (under the default `mode="replace"`
-a cell not yet written reads empty, so an append does not re-read old rows).
-On exit each changed shard object is written as a `.partial` file, fsynced,
-and renamed into place; an exception publishes nothing.
+On a sharded store, `zb.shard_transaction(level, shard)` stages every cell
+write inside the block. Each write must fall inside the shard, and reads of
+the task's cells see the staged data. Under the default `mode="replace"` the
+shard is rebuilt from the cells written in the block alone; `mode="merge"`
+keeps the cells already there. On exit each changed shard object is written as
+a `.partial` file, fsynced and renamed into place; an exception publishes
+nothing. Presence must be deferred.
 
 ```python
-shard = zb.shard_of(lg, first_chunk_of_task)       # the shard's grid index
-with zb.shard_transaction(lg, shard) as tx:        # presence must be deferred
-    for cc in task_chunks:
-        zb.write_chunk_vertices(lg, cc, groups)
-        zb.write_chunk_attributes(lg, "intensity", cc, values)
-report(tx.written)                                 # {array: [chunk_key, ...]}
+shard = zb.shard_of(lg, task_cells[0])             # the shard's grid index
+with zb.shard_transaction(lg, shard) as tx:
+    for cc in task_cells:
+        zb.write_chunk_vertices(lg, cc, groups[cc])
+        zb.write_chunk_attributes(lg, "intensity", cc, values[cc])
+report(tx.written)                                 # {array: ["i.j.k", ...]}
 ```
 
-The coordinator allocates every array beforehand, and afterwards records
+The coordinator allocates every array beforehand and afterwards records
 presence from the tasks' reports with `zb.set_presence(..., end_deferral=True)`.
-A crash while renaming leaves some of the task's shards new and some old;
-re-running the task converges, since the same cells encode to the same bytes.
+A crash during the renames leaves some of the task's shards new and some old;
+re-running the task converges. `io_threads=` encodes, writes and fsyncs the
+shard objects from a thread pool. On entry the transaction removes `.partial`
+files a failed attempt left; `sweep=False` skips that listing.
 
-On a network filesystem every create, fsync and rename is a round trip, and a
-task touching a hundred arrays publishes a hundred objects. Pass
-`io_threads=16` to encode, write and fsync them from a pool; the renames still
-wait for every object to be on disk, and a failure on any thread publishes
-nothing. On entry the transaction removes the `.partial` files a failed
-attempt left, which lists each owned shard's directory; a task that knows the
-shard's last transaction completed can pass `sweep=False`.
+### Placing object rows in parallel
 
-`zv.concurrency_contract()` states what may be written at once: cells or
-shards owned by one process each, and object-layer rows placed in disjoint,
-aligned ranges after one reservation.
+`zv.concurrency_contract(level)` states what may be written at once: cells or
+shards owned by one process each, and object rows placed in disjoint, aligned
+ranges after one reservation.
 
 ```python
 # Coordinator, before the workers:
 contract = zv.concurrency_contract(lg)       # at_alignment: 65,536 unsharded
-zb.reserve_object_rows(
-    lg, n_objects, sid_ndim=3,
-    n_blocks=block_starts[-1],               # dense index: see aligned_regions
-    columns={"length": "float32", "rgb": ("uint8", (3,))},
-    shard_rows=None,                         # or a multiple of 65,536
-)
+zb.reserve_object_rows(lg, n_objects, sid_ndim=3,
+                       columns={"length": "float32"})
 
-# Each worker, rows [lo, hi) with lo and hi multiples of at_alignment
-# (the last range may end at n_objects):
+# Each worker, rows [lo, hi); lo and hi are multiples of at_alignment,
+# except that the last range ends at n_objects:
 zb.write_object_manifests(lg, chunk_coords=cc, fragment_idx=fi,
-                          manifest_offsets=off, mode="place", at=lo,
-                          block_at=block_starts[worker])   # dense only
+                          manifest_offsets=off, mode="place", at=lo)
 zb.write_object_attribute_columns(lg, {"length": lengths}, mode="place", at=lo)
 
 # Coordinator, once every worker has finished:
 zb.commit_object_index(lg, n_objects)
 ```
 
-`mode="place"` writes only rows `[at, at + n)`: no resize, no padding, no
-metadata. A dense index also needs each worker's fragments at its own
-aligned block region: `zb.aligned_regions(counts, contract["block_alignment"])`
-turns per-worker fragment counts into region starts, and the last start is
-the `n_blocks` to reserve. Every reserved row must be written, an object with
-no fragments as an empty manifest; `commit_object_index` refuses rows nobody
-wrote where it can tell.
+`mode="place"` writes only rows `[at, at + n)`, with no resize, padding or
+metadata. A dense index also needs each worker's fragments in its own aligned
+block region: `zb.aligned_regions(counts, contract["block_alignment"])` turns
+per-worker fragment counts into region starts, the last start is the
+`n_blocks=` to reserve, and each worker passes its start as `block_at=`. Every
+reserved row must be written, an object with no fragments as an empty
+manifest.
 
-A worker that needs a halo around its own chunk reads it in one prefetch
-with `zb.read_neighbourhood(lg, cc, arrays, halo=1)`. See
-[GPU arrays and array-form I/O](gpu.md) for the read side and the device
-model.
+A worker that needs a halo around its cell reads it in one prefetch with
+`zb.read_neighbourhood(lg, cc, arrays, halo=1)`; see
+[GPU arrays and array-form I/O](gpu.md).
 
----
+## Divide read work across ranks
 
-## Sharding read work across ranks
-
-Reading back is easier than writing, because `Query.cells()` computes which
-grid cells a query touches from metadata alone — it reads nothing — and the
-result feeds straight back into `select(cells=...)`:
+`Query.cells()` lists the grid cells a query touches, and `select(cells=...)`
+restricts the query to some of them. Every rank can compute the same split
+independently:
 
 ```python
 import zarr_vectors as zv
 
+rank, size = 0, 4                          # e.g. from MPI
 ds = zv.open("/scratch/scan.zarrvectors")
 q  = ds.select(bbox=((0., 0., 0.), (1000., 1000., 1000.)))
 
@@ -563,170 +451,75 @@ print(len(mine), q.select(cells=mine).count())
 ```
 
 ```text
-125
-32 3929
+64
+16 4000
 ```
 
-Each rank reads only its own cells, and the per-rank counts sum exactly to the
-whole query — 16 000 across four ranks in the store above. Because `cells()`
-is metadata arithmetic, every rank can compute the same partition
-independently, with no communication and no coordinator.
+On the 16 000-point store written by the SLURM example, the four ranks' counts
+sum to the query's 16 000. To check that an install has this feature, call
+`zv.require_api(features=["query-cells"])`.
 
-`select(cells=...)` is the supported replacement for the old
-`chunks=[(3, 1, 2), ...]` argument: a `CellRef` is opaque, so a change in how
-cells are addressed on disk is not a downstream break. Guard on the feature if
-you need to:
+## Lustre and GPFS
 
-```python
-zv.require_api(features=["query-cells"])
-```
-
----
-
-## Lustre / GPFS optimisation
-
-### Striping
-
-Stripe the output directory across multiple OSTs before writing:
+Stripe the output directory before writing (Lustre shown; adjust the count for
+your system):
 
 ```bash
-# Lustre: stripe across 8 OSTs (adjust for your system)
 mkdir /scratch/scan.zarrvectors
 lfs setstripe -c 8 /scratch/scan.zarrvectors
 ```
 
-For stores with many cells per directory, keep the metadata documents on a
-narrow stripe and the cell files on a wide one:
+Cell files live at `<level>/<array>/c/i/j/k`; `0/vertices/c/` and
+`0/vertex_attributes/<name>/c/` carry most of the bytes.
+
+- Declare `shard_shape` on `create_store`, not on each writer: arrays a task
+  creates on first write take the store's declaration. With sharding, many
+  cells share one object, so two tasks writing disjoint cells may write
+  the same file; give each task whole shards, as in
+  [One shard per task](#one-shard-per-task-published-at-the-end).
+- Use few, large write sessions. Each `open_write_session` block flushes its
+  cells together, so one session covering many cells costs fewer round trips
+  than one session per cell.
+- Memory per task is roughly `cells_per_task × vertices_per_cell ×
+  bytes_per_vertex`, plus encode buffers.
+
+If a whole store is written by one task, you can write it to node-local
+storage and copy it to the shared file system at the end:
 
 ```bash
-lfs setstripe -c 1 -S 1m /scratch/scan.zarrvectors        # metadata stripe
-lfs setstripe -c 8 -S 4m /scratch/scan.zarrvectors/0/vertices/c/
-```
-
-Cell files live at `<array>/c/i/j/k` — one file per grid cell, per array
-family. `0/vertices/c/` and `0/vertex_attributes/<name>/c/` are the two that
-carry the bulk of the bytes.
-
-### Parallel I/O considerations
-
-- **Never write the same cell from two tasks.** Partition the grid, not the
-  coordinate space, or use half-open coordinate ranges — see
-  [Partitions must be disjoint](#partitions-must-be-disjoint). Nothing in the
-  format detects the collision; the second writer simply wins.
-- **Skip the presence manifest in tasks.** Pass `record_presence=False` to
-  every per-chunk write and rebuild once, afterwards. This is the one piece of
-  genuinely shared state. If a consumer runs before that rebuild, collect the
-  stamps and apply them under your own lock instead — see
-  [Stamping under your own lock](#stamping-under-your-own-lock).
-- **Declare `shard_shape` on the store if you need one.** Pass it to
-  `create_store`, not to each writer: tasks allocate attribute arrays and link
-  segments on first write, and a task never sees the coordinator's arguments.
-  Declared on the store, those arrays are born sharded too; passed per call,
-  only the arrays that call creates are, and the store comes out half sharded.
-  Sharding also changes the locking you need — many cells share one object, so
-  two tasks writing *disjoint* cells are no longer writing disjoint files.
-- **Use a large `chunk_shape` on Lustre.** Stripe granularity is typically
-  1–4 MB; cells smaller than that see no parallelism benefit.
-  `Grid.plan(...).capacity(n_vertices=...)` gives the per-cell figure before
-  you commit to a shape.
-- **Fewer, larger write sessions.** Each `open_write_session` block flushes
-  its cells in one concurrent gather, so a task covering many cells in one
-  session costs far fewer round-trips than one session per cell.
-- **Avoid `O_SYNC` writes.** Zarr v3 does not use synchronous writes by
-  default. If your Lustre mount forces `O_SYNC`, contact your sysadmin.
-
-### Temporary local SSD → copy to Lustre
-
-On clusters with local NVMe scratch (e.g. `/local/scratch`), write to local
-storage first and copy to Lustre at the end. This works only when a whole
-store is written by one task — tasks on different nodes cannot share a local
-scratch directory, so each needs its own store, and there is no merge step.
-
-```bash
-# SLURM: write to local NVMe, copy to Lustre at job end
 python write_whole_store.py --output /local/scratch/scan_${SLURM_JOB_ID}.zarrvectors
-
-# After job
-rsync -a /local/scratch/scan_${SLURM_JOB_ID}.zarrvectors/ \
-         /lustre/project/scan.zarrvectors/
+rsync -a /local/scratch/scan_${SLURM_JOB_ID}.zarrvectors/ /lustre/project/scan.zarrvectors/
 ```
 
----
+## Write to object storage
 
-## Writing to S3 from HPC
-
-For cloud-destined datasets, write directly to S3 from the compute nodes (if
-outbound internet is available):
+Install the cloud extra:
 
 ```bash
-# Install cloud extras in your conda environment
 pip install "zarr-vectors[cloud]"
 ```
 
-Every function above takes a URL wherever it takes a path; the backend layer
-routes `s3://`, `gs://` and `az://` to obstore or fsspec by scheme. Nothing
-else about the pattern changes:
+The functions above take a URL wherever they take a path; `s3://`, `gs://`
+and `az://` URLs go to obstore if it is installed, else fsspec. Pass
+credentials and endpoints as `storage_options=` to `create_store` and
+`open_store`, or as `zv.StorageOptions(backend=..., options=...)` to
+`zv.create` and `zv.open`.
 
-```python
-import zarr_vectors as zv
-from zarr_vectors.building import create_store, open_store
+Each cell written to object storage is a request, so large write sessions
+matter more there. `building.shard_store` and `building.reshard` pack the
+cells of a finished store into shard objects.
 
-print(zv.detect_scheme("s3://my-bucket/scan.zarrvectors"))
-
-STORE = "s3://my-bucket/scan.zarrvectors"
-root  = create_store(STORE, bounds=BOUNDS, chunk_shape=CHUNK,
-                     base_bin_shape=BIN, geometry_types=["point_cloud"])
-# ... tasks: open_store(STORE, mode="r+") exactly as above
-```
-
-```text
-s3
-```
-
-Credentials and endpoint overrides go through `storage_options` on
-`create_store` / `open_store`, or `zv.StorageOptions(backend=..., options=...)`
-on the `zv.create` / `zv.open` side.
-
-Cell-per-cell writes to object storage are latency-bound, so the "fewer,
-larger write sessions" advice above matters much more here than on Lustre.
-Consider sharding the finished store — `zv.sharding` is internal, but
-`building.shard_store` and `building.reshard` are the supported entry points —
-so many cells pack into one storage object. Sharding does not change the key
-layout: keys stay `c/i/j/k`, each file just covers several cells.
-
-On clusters without outbound internet, write to Lustre first, then copy to S3
-as a post-processing step:
+Without outbound network access from compute nodes, write to the shared file
+system and copy afterwards:
 
 ```bash
-# After all SLURM partitions complete
-aws s3 sync /lustre/project/scan.zarrvectors/ \
-            s3://my-bucket/scan.zarrvectors/ \
-            --no-progress
+aws s3 sync /lustre/project/scan.zarrvectors/ s3://my-bucket/scan.zarrvectors/
 ```
-
----
-
-## Recommended job sizing
-
-| Dataset size | Strategy | SLURM resources |
-|-------------|----------|-----------------|
-| < 10M vertices | Single job, `zv.create` + `add_points` | 1 node, 32 GB RAM, 4 CPU |
-| 10M–1B vertices | Job array over disjoint grid partitions | 16–64 tasks, 16–32 GB each |
-| > 1B vertices | MPI over disjoint grid partitions, smaller partitions per rank | 64–256 ranks, 8 GB each |
-| Any size, S3 destination | As above; add the `[cloud]` extra, fewer and larger write sessions | As above |
-
-Per-task memory is set by the partition, not by the dataset: roughly
-`cells_per_task × vertices_per_cell × bytes_per_vertex`, doubled for the
-encode buffer. Shrinking partitions lowers memory at the cost of more round
-trips, so tune the two together rather than raising `--mem`.
-
----
 
 ## Next steps
 
-- **[Memory-efficient writes](memory_efficient_writes.md)** — the same
-  partitioned write in one process, and what each per-chunk verb does.
-- **[Choosing a layout](choose_chunk_and_bin.md)** — how to
-  pick the numbers `Grid.plan` takes.
-- **{doc}`Building stores <../api/building>`** — the full reference for the
-  surface every example here uses.
+- [Memory-efficient writes](memory_efficient_writes.md): the same partitioned
+  write in one process.
+- [Choosing a layout](choose_chunk_and_bin.md): how to pick the cell size.
+- {doc}`Building stores <../api/building>`: reference for every call used
+  here.

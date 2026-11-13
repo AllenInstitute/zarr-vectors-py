@@ -1,28 +1,27 @@
 Building stores
 ===============
 
-This surface is for code that *writes* a store: ingest converters, pyramid
-builders, exporters, repair tools. It is deliberately physical — chunk shapes,
-fragments, shard layouts, manifests — because that is what such code is for.
+This surface is for code that writes a store: ingest converters, pyramid
+builders, exporters, repair tools. It names the physical layout (chunk shapes,
+fragments, shard layouts, manifests) because that is what such code works on.
 Applications that only read should use the :doc:`api` surface instead.
 
-The alternative to this page is reaching into ``zarr_vectors.core``, which is
-internal: a name imported from there is a name nobody knows is load-bearing,
-which is exactly how the last few layout refactors turned into downstream
-breaks. Everything listed below is promised. If something you need is missing,
-that is a gap to report rather than a reason to import from ``core``.
+Everything on this page is supported. ``zarr_vectors.core`` is internal: if
+something you need is only there, ask for it to be added here rather than
+importing it.
 
 .. automodule:: zarr_vectors.building
    :no-members:
+   :no-special-members:
 
 Format constants and array names
 --------------------------------
 
-The array-family names and layout sentinels the on-disk format is spelled
-in.  Import these rather than writing the strings, so code keeps working if
-a name moves.  All of them are importable from ``zarr_vectors.building``.
-The :doc:`constants` page documents the values of some but not all of them —
-``constants.rst`` renders only the constants that carry their own docstring.
+The array-family names and layout values of the on-disk format, all
+importable from ``zarr_vectors.building``. Import them rather than typing the
+strings. The four ``OBJECT_INDEX_LAYOUT_*`` and ``OBJECT_INDEX_MANIFEST_BUCKET``
+names are defined in the building surface; the others are also in
+``zarr_vectors.constants``, and the :doc:`constants` page lists their values.
 
 .. hlist::
    :columns: 3
@@ -53,6 +52,8 @@ The :doc:`constants` page documents the values of some but not all of them —
    * ``CAP_MULTISCALE_LINKS``
    * ``CAP_PRESERVED_OBJECT_IDS``
    * ``CAP_SHARED_FRAGMENTS``
+   * ``OBJECT_SHARD_ROW_MULTIPLE``
+   * ``SOURCE_AXIS``
 
 Stores, resolution levels and transactions
 ------------------------------------------
@@ -94,6 +95,8 @@ promised.
 .. autofunction:: zarr_vectors.building.read_level_metadata
 
 .. autofunction:: zarr_vectors.building.update_level_metadata
+
+.. autofunction:: zarr_vectors.building.stamp_ome_node
 
 Metadata records and grid arithmetic
 ------------------------------------
@@ -217,6 +220,8 @@ ingest worker runs in parallel.
 
 .. autofunction:: zarr_vectors.building.write_chunk_fragment_attributes
 
+.. autofunction:: zarr_vectors.building.stored_objects
+
 Links
 -----
 
@@ -248,6 +253,8 @@ per-cell readers and writers, and the finalisation pass.
 .. autofunction:: zarr_vectors.building.list_link_attribute_offsets
 
 .. autofunction:: zarr_vectors.building.iter_link_cells
+
+.. autofunction:: zarr_vectors.building.link_cells_within
 
 .. autofunction:: zarr_vectors.building.cell_endpoint_chunks
 
@@ -329,6 +336,14 @@ per-object attribute arrays beside it.
 
 .. autofunction:: zarr_vectors.building.write_object_attributes
 
+.. autofunction:: zarr_vectors.building.object_manifest_writer
+
+.. autoclass:: zarr_vectors.building.ObjectManifestWriter
+   :members:
+   :show-inheritance:
+
+.. autofunction:: zarr_vectors.building.build_fragment_owner_index
+
 Object groups
 -------------
 
@@ -373,6 +388,8 @@ consumers cannot ask the store and run before any coordinator pass -- see
 
 .. autofunction:: zarr_vectors.building.end_presence_deferral
 
+.. autoexception:: zarr_vectors.building.PresenceMismatchError
+
 .. autofunction:: zarr_vectors.building.per_chunk_array_paths
 
 .. autofunction:: zarr_vectors.building.array_is_sharded
@@ -387,11 +404,14 @@ consumers cannot ask the store and run before any coordinator pass -- see
 
 .. autofunction:: zarr_vectors.building.shard_of
 
+.. autoexception:: zarr_vectors.building.ShardOwnershipError
+
 .. autofunction:: zarr_vectors.building.object_shard_rows
 
 .. autofunction:: zarr_vectors.building.store_layout
 
 .. autoclass:: zarr_vectors.building.StoreLayout
+   :no-members:
 
 .. autofunction:: zarr_vectors.building.user_metadata
 
@@ -449,10 +469,9 @@ Assigning geometry to cells, and repairing what crosses a cell boundary.
 
 .. note::
 
-   ``zarr_vectors.building.build_vertex_chunk_mapping`` is exported and
-   supported, but is not rendered here: its ``Returns:`` block is malformed
-   and Napoleon mis-parses it. Read its docstring in the source until that is
-   fixed.
+   ``zarr_vectors.building.build_vertex_chunk_mapping`` is supported but not
+   rendered here, because its docstring does not parse; read it in the
+   source.
 
 Store-creating writers
 ----------------------
@@ -532,3 +551,29 @@ return them with ``device="cuda"``. See :doc:`../how_to/gpu`.
 
 .. autofunction:: zarr_vectors.building.write_object_attribute_columns
 
+Meshes by ownership cell
+------------------------
+
+Reading a raw mesh cell by cell, with the vertices its faces reference.
+
+.. autoclass:: zarr_vectors.building.MeshReader
+   :members:
+
+.. autoclass:: zarr_vectors.building.MeshChunkInfo
+
+Composite levels
+----------------
+
+A composite level references the cells of other stores through a leading
+chunk axis named ``SOURCE_AXIS``; value 0 is the store's own cells and each
+other value is a source store's level.
+
+.. autofunction:: zarr_vectors.building.set_chunk_sources
+
+.. autofunction:: zarr_vectors.building.chunk_sources
+
+.. autofunction:: zarr_vectors.building.is_composite
+
+.. autofunction:: zarr_vectors.building.source_fingerprint
+
+.. autofunction:: zarr_vectors.building.verify_chunk_sources

@@ -1,11 +1,13 @@
----
-orphan: true
----
-
 # Precomputed export
 
-Neuroglancer precomputed export has moved to the companion package
-**`zarr-vectors-tools`** alongside other format converters.
+Stock Neuroglancer reads its own precomputed format but not Zarr Vectors
+stores. The companion package `zarr-vectors-tools` exports a store to a
+precomputed layer (`zarr_vectors_tools.convert.export.precomputed`):
 
-This core package no longer ships the `zarr_vectors.export.precomputed`
-module. See the companion package documentation for export workflows.
+```bash
+zvtools convert STORE OUTPUT --format precomputed
+```
+
+`zarr-vectors-py` itself has no precomputed export. See the zarr-vectors-tools
+[Visualise](https://zarr-vectors-tools.readthedocs.io/en/latest/visualise.html)
+page for the geometry types it exports and how to view the result.

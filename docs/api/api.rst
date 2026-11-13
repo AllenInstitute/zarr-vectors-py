@@ -3,6 +3,7 @@ Data API
 
 .. automodule:: zarr_vectors.api
    :no-members:
+   :no-special-members:
 
 The sections below follow the order you meet them in: open a dataset, say what
 you want stored or what you want back, read it, then work with the objects,
@@ -49,9 +50,8 @@ narrowed and passed around before anything is read.
 Read results
 ------------
 
-What comes back, in one shape for all five geometries, with the per-geometry
-views kept as derived properties so existing code still reads
-``result.polylines``.
+What comes back, in one shape for every geometry kind. Per-geometry views,
+such as ``result.polylines``, are derived properties.
 
 .. automodule:: zarr_vectors.api.result
    :members:

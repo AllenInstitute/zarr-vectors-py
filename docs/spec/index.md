@@ -1,61 +1,51 @@
 # Specification
 
-This section is the authoritative reference for the **Zarr Vectors
-(ZV)** as implemented in `zarr-vectors-py`. It is written to serve two
-audiences simultaneously:
+This section is the reference for the Zarr Vectors on-disk format as
+implemented in `zarr-vectors-py`: what a store contains, how it is
+chunked, how resolution levels and objects are recorded, and how a
+store is validated. It is written for people choosing chunk sizes and
+pyramid settings, and for contributors writing readers, writers or
+validators.
 
-- **Users** who want to understand precisely what the format does and why,
-  so they can make informed decisions about chunk sizes, metadata, and
-  resolution pyramids.
-- **Contributors** who want to implement new geometry types, extend the
-  validation suite, or propose changes to the format itself.
-
-Each page follows a consistent structure: a **Terms** section defining all
-vocabulary used on that page, a plain-English **Introduction**, and a
-detailed **Technical reference** section with schemas, pseudocode, and
-worked examples.
+Each page has a **Terms** section defining its vocabulary, an
+**Introduction**, and a **Technical reference** with schemas, worked
+examples and a **Validation** subsection.
 
 ---
 
 ## Design goals
 
-Zarr Vectors was designed to satisfy the following constraints simultaneously:
+**Spatial random access.** A spatial query reads only the chunks it
+overlaps and, within a chunk, only the bins it needs, on a local file
+system or in an object store.
 
-**Cloud-native random access.** Spatial queries should require only the
-minimum number of I/O operations, whether the store is on a local file
-system or in an object store (S3, GCS). This is achieved through spatial
-chunking at the chunk level and sub-chunk indexing at the bin level.
+**Resolution pyramids in the format.** Coarser levels are part of the
+store, described by an OME-Zarr `multiscales` block in the root
+attributes. See [Multiscale metadata](multiscale/multiscale_metadata.md).
 
-**Multi-resolution out of the box.** Viewers that render large-scale 3-D
-data (Neuroglancer, napari, custom WebGL) need coarser representations for
-overview rendering. Zarr Vectors encodes resolution pyramids natively, with
-OME-Zarr-compatible metadata so any NGFF-aware viewer can discover them.
+**One layout for every geometry type.** Points, streamlines, graphs,
+skeletons and meshes share the same chunk layout; types differ only in
+which arrays a level holds. A point cloud has no `links/` group, for
+example, while a mesh stores its faces under `links/`.
 
-**Geometry-type agnostic layout.** Points, streamlines, graphs, and meshes
-all use the same spatial chunking layout. This means a single I/O layer
-handles all types; type-specific logic lives only in the arrays present
-within each chunk group (e.g. meshes have a `links/<delta>` array that point
-clouds do not).
+**Plain Zarr v3.** A store is a Zarr v3 hierarchy that the `zarr`
+library can open; the base format needs no custom codec. See
+[Zarr v3 primer](foundations/zarr_v3_primer.md).
 
-**Format transparency.** A Zarr Vectors store is a plain Zarr v3 directory tree.
-No binary wrapper, no proprietary codec required for the base format. Every
-array can be opened with the standard `zarr` library.
-
-**Contributor-accessible.** The format is fully documented in this spec so
-that an external contributor can implement a compliant reader, writer, or
-validator without access to the original authors.
+**Implementable from this spec.** The pages in this section are meant
+to be enough to write a conforming reader, writer or validator.
 
 ---
 
-## Relationship to upstream specifications
+## Relationship to other specifications
 
 | Specification | Relationship |
 |---------------|-------------|
-| [Zarr v3 core spec](https://zarr-specs.readthedocs.io/en/latest/v3/core/v3.0.html) | Zarr Vectors stores are valid Zarr v3 stores. All array storage, codec, and metadata conventions are inherited from Zarr v3. |
-| [OME-Zarr NGFF](https://ngff.openmicroscopy.org/) | Zarr Vectors borrows the `multiscales` JSON block for resolution pyramid metadata. Zarr Vectors-specific keys are additive extensions. |
-| [Allen Institute Zarr Vectors specification](https://github.com/AllenInstitute/zarr_vectors) | The original specification by Forest Collman. `zarr-vectors-py` implements and extends this spec. |
-| [Neuroglancer precomputed](https://github.com/google/neuroglancer/tree/master/src/datasource/precomputed) | A related format for static Neuroglancer hosting. See [comparison](comparisons/neuroglancer_precomputed.md). |
-| [TRX format](https://tractography-file-format.github.io/) | A streamline-specific format. See [comparison](comparisons/trx_format.md). |
+| [Zarr v3 core spec](https://zarr-specs.readthedocs.io/en/latest/v3/core/v3.0.html) | Every store is a Zarr v3 hierarchy; array storage, codecs and metadata follow Zarr v3. |
+| [OME-Zarr NGFF](https://ngff.openmicroscopy.org/) | The root attributes carry an NGFF `multiscales` block for the pyramid and an RFC 8 `ome` node. See [OME-Zarr comparison](comparisons/ome_zarr.md). |
+| [Allen Institute Zarr Vectors specification](https://github.com/AllenInstitute/zarr_vectors) | The specification by Forrest Collman that `zarr-vectors-py` implements and extends. |
+| [Neuroglancer precomputed](https://github.com/google/neuroglancer/tree/master/src/datasource/precomputed) | A format for static Neuroglancer hosting. See [Neuroglancer precomputed comparison](comparisons/neuroglancer_precomputed.md). |
+| [TRX format](https://tractography-file-format.github.io/) | A streamline exchange format. See [TRX comparison](comparisons/trx_format.md). |
 
 ---
 
@@ -79,6 +69,8 @@ chunking/chunk_vs_bin
 chunking/rechunking
 chunking/sharding
 chunking/chunk_sources
+chunking/attribute_chunking
+chunking/octree_chunks
 multiscale/multiscale_metadata
 multiscale/pyramid_construction
 multiscale/sparsity
@@ -88,10 +80,14 @@ object_model/object_manifest
 object_model/links
 object_model/object_attributes
 validation/overview
+validation/l1_structural
+validation/l2_metadata
+validation/l3_consistency
 comparisons/neuroglancer_precomputed
 comparisons/trx_format
 comparisons/ome_zarr
 contributing/spec_change_process
 contributing/adding_geometry_types
 contributing/test_compliance
+schema
 ```

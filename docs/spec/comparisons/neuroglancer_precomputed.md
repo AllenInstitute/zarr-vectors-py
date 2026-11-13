@@ -1,195 +1,115 @@
 # Zarr Vectors and Neuroglancer precomputed
 
+This page compares Zarr Vectors with the Neuroglancer precomputed
+formats for annotations, skeletons and meshes, and describes how data
+moves between them.
+
 ## Terms
 
 **Neuroglancer precomputed**
-: A family of static binary formats for serving volumetric image data,
-  annotation data, skeleton data, and mesh data to the Neuroglancer 3-D
-  viewer. Data is stored as a directory of binary chunk files served over
-  HTTP. Defined by Google at
-  https://github.com/google/neuroglancer/tree/master/src/datasource/precomputed.
+: A family of formats that the Neuroglancer viewer reads directly over
+  HTTP, defined in the
+  [Neuroglancer repository](https://github.com/google/neuroglancer/tree/master/src/datasource/precomputed).
+  Each layer is a directory or bucket prefix with an `info` JSON file
+  that declares its type and layout.
 
 **Precomputed annotations**
-: A precomputed sub-format for point, line, axis-aligned bounding box, and
-  ellipsoid annotations. Each annotation is a small fixed-size binary record.
-  Annotations are stored in spatial chunks indexed by a regular 3-D grid.
+: Point, line, axis-aligned bounding box and ellipsoid annotations, with
+  typed per-annotation `properties`, related-segment lists, a
+  multi-level spatial index and an index by annotation ID.
 
 **Precomputed skeletons**
-: A precomputed sub-format for neuronal morphology skeletons. Each skeleton
-  object is a binary blob containing vertex positions and edge pairs, stored
-  in a spatially indexed shard file.
+: The `neuroglancer_skeletons` format: one encoded skeleton per segment
+  (vertex positions, edges and optional per-vertex attributes),
+  stored as one file per segment or in shards.
 
 **Precomputed meshes**
-: A precomputed sub-format for triangulated surface meshes. Stored as
-  draco-compressed or raw binary per-fragment files, indexed via a manifest
-  JSON. Two sub-formats exist: the legacy per-fragment format and the newer
-  sharded mesh format.
+: The `neuroglancer_legacy_mesh` format (a JSON manifest per segment
+  naming its fragment files) and the multi-resolution
+  `neuroglancer_multilod_draco` format.
 
-**`info` file**
-: The JSON metadata file at the root of a Neuroglancer precomputed layer
-  that declares the data type, scales, voxel resolution, chunk sizes, and
-  layer-specific configuration. Analogous to Zarr Vectors' root `.zattrs`.
+**Segment properties**
+: The `neuroglancer_segment_properties` format, which attaches labels
+  and numeric values to segment IDs.
 
 ---
 
 ## Introduction
 
-Zarr Vectors and Neuroglancer precomputed share the same fundamental goal —
-spatially indexed, multi-resolution storage of 3-D geometry data — but
-were designed for different constraints. Precomputed is a read-only static
-serving format: data is written once and served over HTTP to Neuroglancer
-clients. Zarr Vectors is a read-write cloud-native format: data can be read and
-written from any Zarr-compatible environment, and the format is not tied
-to any specific viewer.
+Both formats store chunked, spatially organised 3-D geometry for
+viewing at scale. Precomputed is laid out for Neuroglancer to fetch;
+it is written once by an export or pipeline step. A Zarr Vectors store
+is a Zarr v3 hierarchy that a program reads and updates through a
+library, with one chunk layout and object model shared by every
+geometry type, including streamlines and graphs.
 
-Understanding the relationship between the two formats is important for
-users of `zv-ngtools`, which translates Zarr Vectors stores into Neuroglancer layers
-and optionally exports them to precomputed format for static hosting.
+Stock Neuroglancer does not read Zarr Vectors stores. They are viewed
+with ngplatform, a Neuroglancer build with a `zarr-vectors` data source
+that opens a store from its URL followed by `/|zarr-vectors:`, or
+exported to precomputed with `zarr-vectors-tools`. See the
+[Neuroglancer overview](../../tutorials/neuroglancer/overview.md).
 
 ---
 
 ## Technical reference
 
-### Annotation data
+### Geometry types
 
-#### Precomputed annotation format
+| Precomputed | Closest Zarr Vectors type | Notes |
+|-------------|---------------------------|-------|
+| `point` annotation | `point_cloud` | |
+| `line` annotation | `line` | |
+| `axis_aligned_bounding_box`, `ellipsoid` annotations | none | The parametric registry has `plane`, `line` and `sphere` types only |
+| `neuroglancer_skeletons` | `skeleton`, `graph` | |
+| `neuroglancer_legacy_mesh`, `neuroglancer_multilod_draco` | `mesh` | |
+| none | `polyline`, `streamline` | |
 
-Precomputed annotations support four geometric primitives: `point`,
-`line`, `axis_aligned_bounding_box`, and `ellipsoid`. Each annotation
-is serialised as a compact fixed-size binary record:
+See [Geometry types](../geometry_types/index.md) for each Zarr Vectors
+type.
 
-- **Point:** 12 bytes (three float32 x,y,z).
-- **Line:** 24 bytes (two point3).
-- **Bounding box:** 24 bytes (min point3 + max point3).
-- **Ellipsoid:** 36 bytes (centre point3 + radii point3 + angles point3).
+### Structural differences
 
-Annotations are stored in spatial chunks; the chunk grid is declared in
-the `info` file. Multiple spatial scales (levels of detail) are supported
-via separate scale entries in `info`.
+| Property | Zarr Vectors | Precomputed |
+|----------|--------------|-------------|
+| Spatial unit of storage | A per-chunk cell holding every object's vertices in that chunk, with a fragment index | Skeletons and meshes: one object per file or shard entry; annotations: spatially chunked records |
+| Objects that cross chunks | Fragments in each chunk, joined by the object manifest and by links whose cell is the source chunk (see [Links](../object_model/links.md)) | Skeletons are stored whole; legacy meshes are split into fragments named by a manifest |
+| Resolution levels | Coarser levels in the same store (see [Multiscale metadata](../multiscale/multiscale_metadata.md)) | Per format: annotation spatial-index levels, multi-resolution Draco meshes |
+| Per-vertex attributes | Any NumPy dtype | Skeleton `vertex_attributes` |
+| Per-object attributes | `object_attributes/<name>` arrays | Segment properties, annotation `properties` |
+| Metadata | Root, level and array attributes in `zarr.json` | `info` JSON per layer |
 
-Precomputed annotations do not support:
-- Ordered paths (no polyline or streamline type).
-- Per-annotation scalar attributes (only `id`, `type`, and geometry).
-- Discrete object model with per-object retrieval by ID.
+### Mesh faces and chunks
 
-#### Zarr Vectors equivalent
+A Zarr Vectors mesh face whose vertices all lie in one chunk is stored
+with that chunk. A face whose vertices span chunks is stored in a
+links array whose cell is the face's source chunk, with the offsets to
+the other vertices' chunks in the array's path (see
+[Links](../object_model/links.md)). With
+`encoding="draco"`, intra-chunk faces are inside each chunk's Draco
+bitstream instead (see [Codec pipeline](../foundations/codec_pipeline.md)).
 
-| Precomputed type | Closest Zarr Vectors type | Notes |
-|-----------------|-----------------|-------|
-| `point` | `point_cloud` | Zarr Vectors adds per-vertex attributes and multi-resolution |
-| `line` | `line` | Zarr Vectors adds per-vertex attributes |
-| `axis_aligned_bounding_box` | `mesh` (degenerate box) | No native Zarr Vectors bbox type; store as 8-vertex mesh |
-| `ellipsoid` | `parametric/` group | Stored as parameter tuple; no native render in Zarr Vectors viewers |
+### Converting between the formats
 
-Zarr Vectors is strictly richer than precomputed annotations: all precomputed
-annotation types can be represented in Zarr Vectors (with some loss of compactness),
-but not vice versa (streamlines, graphs, and skeletons have no precomputed
-annotation equivalent).
+The converters are in the companion package `zarr-vectors-tools`
+(see its [Visualise](https://zarr-vectors-tools.readthedocs.io/en/latest/visualise.html)
+page):
 
-#### `zv-ngtools` translation
+- **Export** (`zvtools convert STORE OUTPUT --format precomputed`, or
+  `export_precomputed`): skeleton and graph stores become an unsharded
+  `neuroglancer_skeletons` layer; mesh stores become a single-resolution
+  `neuroglancer_legacy_mesh` layer with one fragment per segment.
+  Object attributes become segment properties. Other geometry types,
+  Draco-encoded mesh stores, sharded output and multi-resolution Draco
+  meshes are not written; export a coarser level to a second layer.
+- **Ingest**: precomputed skeleton and mesh layers can be read into
+  Zarr Vectors stores.
 
-`zv-ngtools` serves Zarr Vectors point clouds and line stores as Neuroglancer
-annotation layers by translating fragment slices to annotation chunk binaries
-on the fly:
+`zarr-vectors-py` itself has no precomputed converter; see
+[Precomputed export](../../tutorials/neuroglancer/precomputed_export.md).
 
-```python
-from ngtools.local.viewer import LocalNeuroglancer
+### Validation
 
-viewer = LocalNeuroglancer()
-viewer.add("points.zarrvectors")   # served as Neuroglancer point annotations
-```
-
-### Skeleton data
-
-#### Precomputed skeleton format
-
-Precomputed skeletons are stored in the `skeletons/` sub-directory. Each
-skeleton object has a binary file containing:
-
-- A header with vertex count and edge count.
-- A `(n_vertices, 3)` float32 vertex position array.
-- A `(n_edges, 2)` uint32 edge array (local vertex index pairs).
-
-No spatial indexing: to retrieve one skeleton, fetch its binary file
-directly. Spatial queries require fetching all skeleton files in a region.
-
-Precomputed skeletons also support a sharded format (`sharding_index` +
-shard files) that packs many skeletons into fewer files for cloud efficiency.
-
-Attribute support: precomputed skeletons support per-vertex `vertex_attributes`
-(float scalars and float vectors) stored alongside vertex positions.
-
-#### Zarr Vectors skeleton vs precomputed skeleton
-
-| Property | Zarr Vectors `skeleton` | Precomputed skeleton |
-|----------|---------------|---------------------|
-| Spatial index | Yes (fragment index + chunk grid) | No (direct file per object) |
-| Multi-resolution | Yes | No |
-| Per-vertex attributes | Yes (arbitrary dtypes) | Yes (float32 only) |
-| Per-object attributes | Yes | No |
-| SWC compatibility | Yes (`swc_type`, `radius`) | No |
-| Cloud efficiency | Chunk-level parallelism | Shard-level parallelism |
-| Write API | Yes | No (static format) |
-| Viewer support | Via zv-ngtools | Native Neuroglancer |
-
-#### Export to precomputed skeletons
-
-The precomputed-skeletons exporter (and its CLI subcommand) lives in the
-companion package **`zarr-vectors-tools`**. It translates a Zarr Vectors skeleton
-store to the Neuroglancer sharded skeleton format, writing one shard
-file per chunk. The output can be served directly by any HTTP server;
-add the layer URL to Neuroglancer as a `skeletons` data source.
-
-### Mesh data
-
-#### Precomputed mesh formats
-
-Two precomputed mesh formats exist:
-
-**Legacy per-fragment format:** One binary file per mesh object, stored
-at `meshes/<object_id>:0`. Each file contains:
-- A `(n_vertices, 3)` float32 position array.
-- A `(n_faces * 3,)` uint32 face array (no face structure; flat triplets).
-
-**Sharded mesh format:** Meshes are split into spatial *fragments*, each
-fragment covering one spatial chunk. Fragments are packed into shard files.
-Draco compression is supported. A per-object manifest JSON declares which
-fragment shards contain each object.
-
-#### Zarr Vectors mesh vs precomputed mesh
-
-| Property | Zarr Vectors `mesh` | Precomputed mesh (sharded) |
-|----------|-----------|---------------------------|
-| Spatial indexing | Chunk + fragment index | Fragment grid |
-| Draco compression | Optional | Supported |
-| Multi-resolution | Yes | No (single resolution) |
-| Per-vertex attributes | Yes | No |
-| Write API | Yes | No |
-| Viewer support | Via zv-ngtools | Native Neuroglancer |
-
-The Zarr Vectors mesh fragment model (faces assigned to chunks by centroid) is
-intentionally similar to the Neuroglancer sharded fragment model. The
-`precomputed_export` tool in `zv-ngtools` exploits this similarity to
-produce precomputed shard files directly from Zarr Vectors chunk data with minimal
-transformation.
-
-#### Export to precomputed meshes
-
-The precomputed-meshes exporter (and its CLI subcommand) lives in the
-companion package **`zarr-vectors-tools`**.
-
-### Summary: choosing between Zarr Vectors and precomputed
-
-| Use case | Zarr Vectors | Precomputed |
-|----------|-----|-------------|
-| Cloud-native read-write pipeline | ✓ | ✗ |
-| Static Neuroglancer serving (no write needed) | Via export | ✓ |
-| Multi-resolution with object sparsity | ✓ | ✗ |
-| Per-vertex float attributes (non-float32) | ✓ | ✗ |
-| Streamlines / tractography | ✓ | ✗ |
-| Native Neuroglancer support (no extra tools) | Via zv-ngtools | ✓ |
-| Arbitrary query API (Python, Julia, R) | ✓ | ✗ |
-
-For most new projects that originate data computationally, Zarr Vectors is the
-primary format. Precomputed export is a one-way publication step for
-sharing with Neuroglancer users who do not have `zv-ngtools` installed.
+Precomputed output is not validated by `zarr-vectors-py`. Before
+exporting, `zarr_vectors.validate.validate(store, level=4)` checks the
+geometry rules the exporter relies on, such as a mesh's `link_width`
+of at least 3. See [Validation](../validation/overview.md).

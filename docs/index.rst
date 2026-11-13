@@ -7,29 +7,22 @@
 
 ----
 
-**zarr-vectors** stores three-dimensional spatial geometry — point clouds,
-streamlines, graphs, skeletons, and meshes — in spatially indexed Zarr v3
-stores. Spatial queries touch only the chunks they need, whether the store
-sits on a local filesystem or a cloud object store (S3, GCS). Resolution
-pyramids are encoded natively so viewers like Neuroglancer can stream data
-progressively at any scale.
+**zarr-vectors** stores three-dimensional spatial geometry (point clouds,
+streamlines, graphs, skeletons and meshes) in spatially indexed Zarr v3
+stores. Spatial queries touch only the chunks they need, on a local file
+system or a cloud object store, and resolution pyramids let viewers such as
+Neuroglancer stream data at any scale.
 
 The library implements `Zarr Vectors
-<https://github.com/AllenInstitute/zarr_vectors>`_, originally specified by
-Forest Collman at the Allen Institute for Brain Sciences, extended with
-separated chunk/bin sizes, per-level sparsity, and OME-Zarr-compatible
-multiscale metadata.
+<https://github.com/AllenInstitute/zarr_vectors>`_, specified by Forrest
+Collman at the Allen Institute for Brain Science, with separate chunk and bin
+sizes, per-level object sparsity and OME-Zarr multiscale metadata.
 
-Two module surfaces carry a compatibility promise, split by what the caller is
-doing. ``zarr_vectors.api`` is for **using** data — opening a store, selecting
-a region or a set of objects, reading it back, editing it — and is re-exported
-from the top-level package, so ``zarr_vectors.open(...)`` and
-``zarr_vectors.api.open(...)`` are the same function. ``zarr_vectors.building``
-is for **making** stores: ingest converters, pyramid builders, exporters,
-repair tools. Everything else — ``core``, ``encoding``, ``spatial``, ``lazy``,
-``ops``, ``sharding``, ``multiresolution`` and ``rechunk`` — is internal and
-changes without notice. :func:`zarr_vectors.stability` answers for any dotted
-name at runtime, so nothing here has to be taken on trust.
+``zarr_vectors.api``, re-exported from the top-level package, is for using
+data: opening, selecting and reading. ``zarr_vectors.building`` is for making
+stores. Both carry a compatibility promise; :doc:`api/index` lists which other
+modules do and which are internal, and :func:`zarr_vectors.stability` reports
+the tier of any module at runtime.
 
 .. figure:: _static/figures/zarr-vectors-overview.png
    :width: 100%
@@ -42,7 +35,7 @@ name at runtime, so nothing here has to be taken on trust.
    :figclass: zv-figure
 
    **Overview of Zarr Vectors.**
-   **a** — Complex and detailed derivative datasets now exceed GPU and system
+   **a** — Complex and detailed derivative datasets exceed GPU and system
    memory. **b** — Summary of the Zarr Vectors concept, showing input data
    types, construction, and uses.
 
@@ -112,11 +105,9 @@ Where to start
    tutorials/multiscale/lazy_loading
    tutorials/io/cloud_stores
    tutorials/io/validation_and_repair
+   tutorials/io/ingest_formats
    tutorials/neuroglancer/overview
-   tutorials/neuroglancer/zv_ngtools_install
-   tutorials/neuroglancer/local_viewer
-   tutorials/neuroglancer/shell_console
-   tutorials/neuroglancer/layer_api
+   tutorials/neuroglancer/precomputed_export
 
 .. toctree::
    :maxdepth: 1

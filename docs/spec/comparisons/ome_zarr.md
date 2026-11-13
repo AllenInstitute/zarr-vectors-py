@@ -1,165 +1,151 @@
 # Zarr Vectors and OME-Zarr
 
+This page describes the OME-Zarr metadata a Zarr Vectors store carries,
+what it does and does not mean to an OME-Zarr reader, and how the two
+formats differ.
+
 ## Terms
 
 **OME-Zarr (NGFF)**
-: Open Microscopy Environment Next-Generation File Format — a Zarr v2/v3
-  based format for bioimaging data, primarily volumetric fluorescence and
-  electron microscopy images. Defined at https://ngff.openmicroscopy.org.
+: The Open Microscopy Environment's Zarr-based format for bioimaging
+  data, defined at <https://ngff.openmicroscopy.org>. Its core content
+  is dense multi-resolution image arrays.
 
 **`multiscales` block**
-: A JSON array in a Zarr group's `.zattrs` that declares a multi-resolution
-  image pyramid, with one entry per resolution level. Shared between OME-Zarr
-  and Zarr Vectors.
+: The OME-Zarr metadata that lists the resolution levels of a pyramid,
+  with `axes`, one `datasets` entry per level, and per-level
+  `coordinateTransformations`.
 
-**`coordinateTransformations`**
-: Per-level or per-dataset affine transformations declared within a
-  `multiscales` entry. Used by OME-Zarr-aware tools to map between pixel
-  space and physical space.
-
-**OME-Zarr axes**
-: An array of axis descriptor objects (name, type, unit) that declares
-  the semantic meaning and physical units of each array dimension. Present
-  in the `multiscales` block.
-
-**NGFF label**
-: An OME-Zarr sub-format for integer segmentation label images stored as a
-  multi-resolution Zarr array. Commonly used for cell or nucleus
-  segmentation masks.
+**`ome` node**
+: The `ome` object in the root attributes, written as an OME-Zarr
+  RFC 8 `collection` node so that a store can be listed in an OME
+  collection.
 
 ---
 
 ## Introduction
 
-Zarr Vectors and OME-Zarr target different data types (sparse vector geometry vs
-dense image volumes) but share a common metadata convention: the
-`multiscales` JSON block. Zarr Vectors borrows this block from OME-Zarr 0.5,
-extending it with vector-geometry-specific keys (`bin_ratio`, `bin_shape`,
-`object_sparsity`) while preserving full compatibility with the OME-Zarr
-schema as seen by tools that do not understand the extensions.
-
-This shared metadata convention makes Zarr Vectors stores partially visible to
-OME-Zarr-aware tools, enables joint discovery with image data registered
-in the same coordinate space, and positions Zarr Vectors as a complement to OME-Zarr
-in multi-modal bioimaging workflows.
+Zarr Vectors stores sparse vector geometry, and OME-Zarr stores dense
+images, so the two share no array layout. A store does carry two pieces
+of OME-Zarr metadata in its root attributes: a `multiscales` block
+describing its resolution levels, and an RFC 8 `ome` node. An OME-Zarr
+tool can find both, but it cannot read the arrays as images.
 
 ---
 
 ## Technical reference
 
-### What Zarr Vectors borrows from OME-Zarr
+### The `multiscales` block
 
-| OME-Zarr feature | Zarr Vectors adoption | Notes |
-|-----------------|-------------|-------|
-| `multiscales` block structure | Adopted verbatim | `version`, `name`, `axes`, `datasets`, `coordinateTransformations` |
-| `axes` array (name, type, unit) | Adopted | Zarr Vectors axis order follows OME-Zarr convention (slowest to fastest) |
-| `coordinateTransformations` | Adopted | `scale` and `translation` transforms per level |
-| OME-Zarr `version` field | Adopted | Value `"0.5"` |
-
-### What Zarr Vectors adds to the `multiscales` block
-
-Zarr Vectors adds the following keys to `multiscales` that are not part of the
-OME-Zarr spec. OME-Zarr-aware tools will ignore these unknown keys:
-
-| Key | Level | Description |
-|-----|-------|-------------|
-| `type: "zarr_vectors_multiscale"` | Top-level | Identifies this as a Zarr Vectors multiscales block |
-| `datasets[].bin_ratio` | Per-level | Vector binning ratio (Zarr Vectors-specific) |
-| `datasets[].bin_shape` | Per-level | Effective bin shape (redundant but explicit) |
-| `datasets[].object_sparsity` | Per-level | Object thinning fraction |
-
-### Coordinate transforms: Zarr Vectors encoding
-
-Zarr Vectors uses `scale` and `translation` to encode the physical meaning of coarser
-resolution metanodes. For a level with `bin_ratio = [r_0, r_1, r_2]` and
-`bin_shape = [b_0, b_1, b_2]`:
+`write_multiscale_metadata` (`zarr_vectors/core/multiscale.py`) writes
+one entry. For a 3-D store with one level whose bin shape is
+`[100.0, 100.0, 100.0]`:
 
 ```json
-"coordinateTransformations": [
-  {"type": "scale",       "scale":       [r_0, r_1, r_2]},
-  {"type": "translation", "translation": [b_0/2, b_1/2, b_2/2]}
-]
+"multiscales": [{
+  "version": "0.4",
+  "name": "default",
+  "axes": [
+    {"name": "x", "type": "space"},
+    {"name": "y", "type": "space"},
+    {"name": "z", "type": "space"}
+  ],
+  "datasets": [{
+    "path": "0",
+    "coordinateTransformations": [
+      {"type": "scale", "scale": [1.0, 1.0, 1.0]},
+      {"type": "translation", "translation": [50.0, 50.0, 50.0]}
+    ]
+  }],
+  "metadata": {"format": "zarr_vectors"}
+}]
 ```
 
-**Scale** encodes the bin ratio: a coarser-level metanode position must be
-multiplied by `r_d` to recover physical position. This matches the OME-Zarr
-convention for image downscaling, where `scale[d] = downscale_factor[d]`.
+- `axes` is the store's axis list and the source of its dimensionality
+  (see [Dimensionality](../foundations/dimensionality.md)). Each axis
+  has a `unit` only when one was given.
+- Each `datasets` entry names a level group. Its `scale` is the
+  level's `bin_ratio` and its `translation` is half the level's
+  `bin_shape`; the translation is omitted when it is all zeros.
+- `metadata.format = "zarr_vectors"` marks the block as written by this
+  format. No other key is added to the block. A level's `bin_ratio` and
+  `bin_shape` are read back from these transforms; its other values,
+  such as `object_sparsity`, are in the level's `zarr_vectors_level`
+  attributes (see [Level groups](../layout/level_groups.md)).
 
-**Translation** encodes the centroid offset: metanodes are positioned at
-bin centroids, so they are offset by half a bin width from the bin origin.
-OME-Zarr uses `translation` for the same purpose in image pyramids (the
-centre of a downscaled pixel is offset from the corner).
+The meaning of `scale` differs between the formats. In OME-Zarr,
+`scale` converts array indices to physical units. Zarr Vectors stores
+vertex positions in world coordinates at every level, so its `scale` is
+a dimensionless bin ratio and is not needed to place vertices. A
+reader that applies these transforms to Zarr Vectors positions would
+misplace them. The full block is described in
+[Multiscale metadata](../multiscale/multiscale_metadata.md).
 
-This encoding means that an OME-Zarr-aware viewer correctly positions Zarr Vectors
-metanodes in physical space using the standard `scale → translate` pipeline,
-without any Zarr Vectors-specific code.
+### The `ome` node
 
-### What OME-Zarr tools see when opening a Zarr Vectors store
+The root attributes also hold an `ome` object
+(`zarr_vectors/core/ome.py`):
 
-An OME-Zarr reader (e.g. `ome-zarr-py`, napari with `napari-ome-zarr`,
-`zarr-viewer`) opening a Zarr Vectors store will:
-
-1. Find a valid `multiscales` block in `.zattrs`. ✓
-2. Read `axes`, `datasets`, and `coordinateTransformations`. ✓
-3. Ignore `type: "zarr_vectors_multiscale"` (unknown type, skipped). ✓
-4. Attempt to open `0/vertices/` as an image array.
-   - The array is `(Cx, Cy, Cz, N_max, D)` float32 — 5-D.
-   - Most image viewers expect 2–4-D arrays. The viewer may reject the
-     array or display it as a meaningless 5-D volume. ✗
-
-The practical result: OME-Zarr metadata tools (validators, metadata
-registries, data portals) can index and discover Zarr Vectors stores. Interactive
-image viewers will not render the data usefully but will not crash on the
-metadata.
-
-### What Zarr Vectors does not borrow from OME-Zarr
-
-**Image arrays.** OME-Zarr image arrays are dense (C × Z × Y × X) arrays
-where every pixel has a value. Zarr Vectors vertex arrays are ragged (one array per
-chunk, variable number of vertices). There is no compatibility at the array
-data level.
-
-**Label format.** OME-Zarr labels (segmentation masks) are stored as
-integer image arrays with OME-Zarr conventions. Zarr Vectors does not adopt this
-convention; semantic labels in Zarr Vectors are stored as per-vertex or per-object
-attributes.
-
-**Plate/Well convention.** OME-Zarr has HCS (High Content Screening)
-conventions for plate/well/field data. Zarr Vectors has no equivalent.
-
-### Using Zarr Vectors alongside OME-Zarr image data
-
-A common workflow in connectomics and neuroscience registers Zarr Vectors
-data against an OME-Zarr image volume in the same physical coordinate space:
-
-```
-experiment/
-├── image.zarr/               ← OME-Zarr image (EM, light microscopy)
-│   ├── .zattrs               ← multiscales with spatial calibration
-│   └── 0/ 1/ 2/              ← resolution levels
-└── tracts.zarrvectors/       ← Zarr Vectors streamlines in the same RAS space
-    ├── .zattrs               ← multiscales with matching axes/units
-    └── 0/ 1/
+```json
+"ome": {
+  "version": "0.6",
+  "type": "collection",
+  "name": "example",
+  "attributes": {
+    "scene": {
+      "coordinateSystems": [{
+        "id": "world",
+        "name": "world",
+        "axes": [
+          {"name": "x", "type": "space"},
+          {"name": "y", "type": "space"},
+          {"name": "z", "type": "space"}
+        ]
+      }],
+      "coordinateTransformations": []
+    }
+  },
+  "nodes": [{"type": "zv:level", "name": "0"}]
+}
 ```
 
-Both stores declare `"axes": [{"name": "z", "unit": "micrometer"}, …]`.
-A viewer that understands both formats (such as Neuroglancer via
-`zv-ngtools`) can overlay them in physical space using the coordinate
-transforms from each store's `multiscales` block.
+- `name` is the store's directory name without its suffix.
+- `nodes` has one `zv:level` leaf per resolution level. The `zv:`
+  prefix marks a node type defined by this format, whose structure
+  RFC 8 does not constrain. Nodes added by other tools are kept when
+  the levels are refreshed.
+- The `world` coordinate system carries the store's axes and units.
+  `coordinateTransformations` is empty because vertices are already in
+  world coordinates.
 
-### OME-Zarr compatibility checklist
+The `zarr_vectors` and `multiscales` blocks remain the source of every
+value the package reads; the `ome` node repeats information for RFC 8
+readers. `zarr_vectors.building.stamp_ome_node(store)` adds the node to
+a store that lacks one.
 
-To maximise compatibility of a Zarr Vectors store with OME-Zarr tools:
+### What OME-Zarr content has no counterpart
 
-- [ ] Include `multiscales` block with `version: "0.5"`.
-- [ ] Include `axes` with `name`, `type`, and `unit` for all D axes.
-- [ ] Ensure `coordinateTransformations` has exactly one `scale` and one
-      `translation` per level, in that order.
-- [ ] Set `axis_units` in root `.zattrs` consistently with the `axes` unit
-      declarations.
-- [ ] Run `zarr.consolidate_metadata(store)` after writing for fast
-      metadata discovery.
+- **Image arrays.** OME-Zarr images are dense arrays with a value at
+  every index. Zarr Vectors per-chunk arrays hold one variable-length
+  byte cell per spatial chunk (see
+  [Zarr v3 primer](../foundations/zarr_v3_primer.md)), so an image
+  reader cannot display them.
+- **Labels.** OME-Zarr labels are integer image arrays. Zarr Vectors
+  stores labels as vertex or object attributes (see
+  [Object attributes](../object_model/object_attributes.md)).
+- **High-content screening.** OME-Zarr's plate and well layout has no
+  equivalent.
 
-Stores passing these checks will be correctly indexed by OME-Zarr metadata
-tools and will display correct physical coordinates in viewers that read
-the transforms.
+### Placing a store beside an image
+
+To overlay a Zarr Vectors store on an OME-Zarr image, give the store
+the same axis names, order and units as the image's physical space
+(through `axes` at creation, see
+[Dimensionality](../foundations/dimensionality.md)) and write vertex
+positions in those physical units. An RFC 8 collection elsewhere can
+then reference the store's `world` coordinate system by its `id`.
+
+### Validation
+
+Level 1 (`validate/structure.py`) warns when the root attributes have
+no `ome` node. No level reads the `multiscales` block itself. See [Validation](../validation/overview.md).

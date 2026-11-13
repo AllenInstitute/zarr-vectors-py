@@ -1,37 +1,45 @@
 # Memory-efficient writes
 
-A chunk is written whole. Every vertex that lands in one chunk — positions
-and per-vertex attributes together — must be in memory at the moment that
-chunk is encoded, because its fragment index describes rows of one packed
-buffer. For a dataset that does not fit in RAM, the question is therefore not
-*"how do I stream vertices?"* but *"how do I write one chunk at a time, and
-how big is a chunk?"*
+This page shows how to write a point set that does not fit in memory: you size
+the grid, allocate the store once, write it one partition of whole cells at a
+time, then finalise it. Peak memory is one partition, whatever the size of the
+dataset.
 
-Two facts shape everything below:
+A cell is written whole: every vertex in it, with its attributes, must be in
+memory when the cell is encoded. So the unit you stream is the cell, not the
+vertex.
 
-- **`Dataset.add_points` is a one-shot write, not an append.** A second call
-  into the same store re-derives the grid from its own batch and overwrites
-  what was there. Looping `add_points` over slabs does not accumulate — it
-  leaves you with the last slab. See
-  [Quickstart](../getting_started/quickstart.md#writing-points).
-- **Chunk size is a decision you make before the store exists.** Once
-  written, changing it means rewriting the store.
+`Dataset.add_points` is not an append. A second call into the same store
+replaces what the first wrote (or raises `StoreError` if its batch reaches
+cells the first did not allocate), so looping it over slabs keeps only the last
+slab. Use it when the whole batch fits in memory; use `zarr_vectors.building`,
+as below, when it does not.
 
-So a partitioned write uses `zarr_vectors.building` — the supported surface
-for code that *constructs* stores, whose per-chunk verbs are exactly "the
-per-chunk verbs an ingest worker runs in parallel". `zarr_vectors.api`
-(`zv.create` / `add_points`) is the right surface when the batch fits in
-memory; it does not have a partitioned writer.
+## What you need
 
----
+- The bounds of the whole dataset before you write anything.
+- A way to load one spatial slab of the input at a time. The examples use a
+  synthetic `load_slab`:
 
-## Step 0: size the grid before writing anything
+```python
+import numpy as np
 
-`Grid.plan` computes the grid a store with those bounds *would* get, without
-creating one, and `capacity()` turns a vertex count into bytes per cell. This
-is the only moment the answer can still change a decision — a pipeline that
-discovers its chunks are 750 MB after the fact has already written a store it
-must throw away.
+rng = np.random.default_rng(0)
+
+def load_slab(z_lo, z_hi, n=4000):
+    """Synthetic stand-in for your reader: points with z_lo <= z < z_hi."""
+    p = rng.uniform(0., 1000., size=(n, 3)).astype("float32")
+    p[:, 2] = rng.uniform(z_lo, z_hi, size=n).astype("float32")
+    p[:, 2] = np.minimum(p[:, 2], np.nextafter(np.float32(z_hi), np.float32(0)))
+    return p, rng.uniform(size=n).astype("float32")
+```
+
+## Step 1: size the grid
+
+`Grid.plan` computes the grid a store with these bounds would get, without
+creating one, and `capacity()` turns a vertex count into bytes per cell. Do
+this before writing: changing the cell size afterwards means rewriting the
+store.
 
 ```python
 import zarr_vectors as zv
@@ -52,34 +60,20 @@ Grid(21x21x21 cells of (500.0, 500.0, 500.0)) 9261
 3x3x3 = 27 cells, ~222.2 MB/cell -- does not fit: ~222 MB per cell exceeds the 67 MB target; use more cells
 ```
 
-`est_bytes_per_cell` counts coordinates only (`n_vertices / cells × ndim ×
-4`). Add your per-vertex attributes to it by hand: five float32 attributes
-alongside three float32 coordinates makes the real figure ⅔ larger again.
-Peak memory during the write is roughly one *partition* — which is one or
-more whole cells — not one cell, so size partitions with that headroom.
+The estimate counts coordinates only (`n_vertices / cells × ndim × 4`
+bytes) and spreads them over every allocated cell, including the extra row of
+cells a bound on a cell boundary adds. Add your per-vertex attributes by hand:
+five float32 attributes beside three float32 coordinates make the real figure
+8/3 of the estimate. [Choosing a layout](choose_chunk_and_bin.md) covers the choice of
+cell size.
 
-See [Choosing a layout](choose_chunk_and_bin.md) for what
-else pulls the number around.
-
----
-
-## Strategy 1: write in spatial partitions
-
-The general shape of a bounded-memory write: a coordinator allocates the
-store's arrays once, then each partition is loaded, written cell by cell, and
-freed. Peak memory is one partition, whatever the size of the dataset.
-
-### The coordinator allocates
+## Step 2: allocate the store once
 
 ```python
-import numpy as np
-import zarr_vectors as zv
 from zarr_vectors.building import (
     LevelMetadata, create_store, create_resolution_level,
     create_vertices_array, create_attribute_array, defer_presence,
-    open_write_session, open_store, get_resolution_level, write_chunk_vertices,
-    write_chunk_attributes, rebuild_presence, refresh_arrays_present,
-    update_level_metadata, write_multiscale_metadata,
+    open_write_session,
 )
 
 STORE  = "large_scan.zarrvectors"
@@ -98,34 +92,35 @@ with open_write_session(level, bounds=BOUNDS, chunk_shape=CHUNK):
     create_vertices_array(level, dtype="float32")
     create_attribute_array(level, "intensity", dtype="float32")
 
-defer_presence(level)        # partitions write no state shared between cells
+defer_presence(level)
 ```
 
-```{warning}
-**Allocate exactly once, in the coordinator.** `create_vertices_array` and
-`create_attribute_array` rewrite the array's `zarr.json`, and inside a write
-session that drops every cell already on disk. Calling them again from each
-partition looks harmless and silently reduces a four-slab write to its last
-slab. Workers write cells; they never create arrays.
-```
+`open_write_session` requires `bounds` and `chunk_shape`: they set the extent
+and origin of the cell grid each array is sized to. Every partition must pass
+the same two values.
 
-`bounds` and `chunk_shape` are required by `open_write_session` because the
-chunk grid's extent — and its origin, for data with negative coordinates — is
-the shape of each vlen array, and has to be sized up front. Every partition
-must pass the same two values as the coordinator did, or their grids disagree.
+`defer_presence` declares that no write on this level will update the presence
+manifest, `nonempty_chunks`. The manifest is one attribute shared by every cell
+of an array, so partitions that each update it race one another. While the
+level is deferred, zarr-vectors readers find the cells by listing the store;
+[Stamping under your own lock](hpc_pipelines.md#stamping-under-your-own-lock)
+covers readers that cannot.
 
-### Each partition writes its own cells
+## Step 3: write one partition at a time
+
+Each partition loads its slab, writes the cells it covers, and frees the slab:
 
 ```python
-# NOTE: internal import -- see the admonition below.
+from zarr_vectors.building import (
+    open_store, get_resolution_level, write_chunk_vertices,
+    write_chunk_attributes,
+)
+# Internal module: building has no bin-level equivalent (see below).
 from zarr_vectors.spatial.chunking import assign_bins, group_bins_by_chunk
 
-rng = np.random.default_rng(0)
 written = 0
-
-for slab in range(4):                      # 4 z-slabs, one chunk deep each
-    z_lo, z_hi = slab * 250., (slab + 1) * 250.
-    positions, intensity = load_slab(z_lo, z_hi)   # only this slab in memory
+for slab in range(4):                      # 4 z-slabs, one cell deep each
+    positions, intensity = load_slab(slab * 250., (slab + 1) * 250.)
 
     level = get_resolution_level(open_store(STORE, mode="r+"), 0)
     with open_write_session(level, bounds=BOUNDS, chunk_shape=CHUNK):
@@ -147,52 +142,46 @@ for slab in range(4):                      # 4 z-slabs, one chunk deep each
     del positions, intensity
 ```
 
-Deferring presence is not an optimisation. `nonempty_chunks` is a single
-attribute shared by every cell of an array, so a partition that stamps it
-races every other partition. After `defer_presence` the arrays carry no
-manifest, no write stamps one, and the coordinator writes each once, below.
-`record_presence=False` says the same per call; with the declaration it is
-redundant but harmless, and without it it is the only thing keeping the
-partitions apart.
+`record_presence=False` repeats the deferral per call. With `defer_presence` it
+is redundant; without it, it is what keeps the partitions from racing.
 
-While the level is deferred, zarr-vectors readers find the cells by asking the
-store, so something downstream that reads before the coordinator gets there
-still sees them. An offline-read session or an older zarr-vectors does not —
-see [Stamping under your own lock](hpc_pipelines.md#stamping-under-your-own-lock).
+Write one fragment per bin, as above, whenever the store declares
+`base_bin_shape`. Readers use the fragment index to pick the bins a bounding
+box touches, so a cell written as a single fragment returns wrong results:
+on a test store with 4 × 4 × 4 bins per cell, a bounding-box query returned 73
+of the 674 points inside the box, and `validate()` only warns. `assign_bins`
+and `group_bins_by_chunk` come from `zarr_vectors.spatial.chunking`, which is
+internal; `zarr_vectors.building.assign_chunks` maps vertices to cells only,
+which is correct only when each cell is one bin.
 
-### One fragment per bin, not one per cell
+Partitions do not have to be slabs. Any set of whole cells works, as long as no
+two partitions share a cell. Peak memory is roughly
 
-The `verts` list above has one entry per *bin*, most of them empty. That is
-deliberate. A fragment is the unit a coarsener picks representatives from, so
-collapsing a cell into a single fragment — `write_chunk_vertices(level, cell,
-[positions_in_cell])`, which is the tempting one-liner — throws away the bin
-structure that `build_pyramid` later needs. The same 16 000 vertices in the
-same 4×4×4 grid:
-
-| fragments per cell | level 1 | level 2 |
-|--------------------|---------|---------|
-| 64 (one per bin)   | 512     | 64      |
-| 1 (whole cell)     | 8       | 1       |
-
-```{note}
-`assign_bins` and `group_bins_by_chunk` are imported from
-`zarr_vectors.spatial.chunking`, which is **internal** — the import above
-reaches past the contract, and may break between releases.
-`zarr_vectors.building` exports `assign_chunks` (vertices → cells) but no
-bin-level equivalent. That is a gap to report rather than a reason to treat
-`spatial` as public. If you do not need per-bin fragments, use
-`building.assign_chunks` and pass one fragment per cell, accepting the
-coarsening cost above.
+```text
+cells_per_partition × vertices_per_cell × bytes_per_vertex
 ```
 
-### The coordinator finalises
+plus the encode buffers. For example, 8 cells of 50 000 vertices at 32 bytes
+each (three float32 coordinates and five float32 attributes) is 12.8 MB of
+payload. Smaller partitions cost round trips rather than correctness: each one
+reopens the store and opens its own write session.
+
+## Step 4: finalise
+
+After every partition has finished, one process writes the manifests and the
+level metadata:
 
 ```python
+from zarr_vectors.building import (
+    rebuild_presence, refresh_arrays_present, update_level_metadata,
+    write_multiscale_metadata,
+)
+
 root = open_store(STORE, mode="r+")
 level = get_resolution_level(root, 0)
 
-rebuild_presence(level)                    # every manifest, once; ends the deferral
-print(refresh_arrays_present(level))       # what is actually on disk
+rebuild_presence(level)                    # every manifest; ends the deferral
+print(refresh_arrays_present(level))       # the arrays actually on disk
 update_level_metadata(level, vertex_count=written)
 write_multiscale_metadata(root)
 
@@ -207,14 +196,13 @@ print(ds.read())
 ReadResult(kind='point_cloud', vertices=16000, attributes=['intensity'])
 ```
 
-`refresh_arrays_present` walks the level rather than trusting the list the
-writers declared, which is why `vertex_fragments` appears even though the
-`LevelMetadata` above never mentioned it. Both verbs are coordinator-only:
-never run either while partitions are still writing. A writer that has no
-coordinator to wait for should use `collect_presence` / `apply_presence`
-instead of `rebuild_presence`.
+`refresh_arrays_present` lists the arrays found on disk, so `vertex_fragments`
+appears although `LevelMetadata` did not name it. Never run either call while
+partitions are still writing. Writers with no finalising process use
+`collect_presence` and `apply_presence` instead; see
+[Stamping under your own lock](hpc_pipelines.md#stamping-under-your-own-lock).
 
-Coarser levels come afterwards, from the finished store:
+Build coarser levels from the finished store:
 
 ```python
 report = zv.open(STORE, mode="r+").build_pyramid(
@@ -226,57 +214,21 @@ print(report["levels_created"], [s["vertex_count"] for s in report["level_specs"
 2 [512, 64]
 ```
 
----
+## Change the cell size of an existing store
 
-## Strategy 2: bound peak memory by partition size
-
-There is no streaming-writer class. The bound on peak memory is the partition,
-and you set it by choosing how much of the volume each iteration loads:
-
-```text
-peak ≈ cells_per_partition × vertices_per_cell × bytes_per_vertex
-```
-
-At 8 cells per partition, 50 000 vertices per cell and 32 bytes per vertex
-(three float32 coordinates plus five float32 attributes) that is about 13 MB
-of payload — call it double, for the encode buffer the write allocates
-alongside it. Partitions do not have to be slabs; any set of whole cells
-works, as long as no two partitions share one. Chunk-aligned partitions are
-the cheapest, because no cell is ever written twice.
-
-Smaller partitions cost round-trips rather than correctness: each one reopens
-the store and opens its own write session. Against a high-latency object
-store that matters, and a partition covering a few hundred cells amortises it.
-
----
-
-## Strategy 3: generator-based ingest
-
-For formats read by external libraries (LAS, TRX, SWC, …), the companion
-package **`zarr-vectors-tools`** provides streaming converters that yield
-vertex batches without loading the whole file. They drive the same
-`zarr_vectors.building` per-chunk verbs shown in Strategy 1, so the memory
-argument above applies to them unchanged.
-
----
-
-## Strategy 4: rechunk after the initial write
-
-If your data is already in a format that can be read block by block, the
-smallest change to an existing pipeline is to write it once with a coarse
-chunk shape and re-cut the grid afterwards. `rechunk` with
-`RechunkSpec(by="spatial")` changes the spatial chunk shape. It copies
-level 0's vertices and object index only, which is lossless for a point
-cloud. Links, attributes and coarser levels are not carried over, and the
-grid gains a leading axis of extent 1. For any other geometry kind, use
-`rechunk_spatial`, which keeps links, levels, object ids and attributes:
+If the data already fits in memory and only the cell size is wrong, write it
+with one cell and re-cut the grid with `rechunk`. This is the least
+memory-efficient route: the first write holds the whole dataset.
 
 ```python
 import numpy as np
 import zarr_vectors as zv
 from zarr_vectors.building import RechunkSpec, rechunk
 
-# Initial write: one chunk for the whole volume.
+rng = np.random.default_rng(0)
+positions = rng.uniform(0., 1000., size=(20_000, 3)).astype("float32")
+object_ids = np.repeat(np.arange(200), 100)
+
 temp = zv.create("scan_temp.zarrvectors", schema=zv.Schema(
     bounds=((0., 0., 0.), (1000., 1000., 1000.)),
     kind="point_cloud",
@@ -300,37 +252,18 @@ Grid(2x2x2 cells of (1000.0, 1000.0, 1000.0))
 Grid(5x5x5 cells of (250.0, 250.0, 250.0))
 ```
 
-This is the *least* memory-efficient route, and it is worth being explicit
-about why: the initial single-chunk write holds the entire dataset in memory
-at once, which is the problem the rest of this page exists to avoid. Reach
-for it when the dataset already fits and the chunk shape is merely wrong, not
-when it does not fit at all.
+`rechunk` copies level 0's vertices and object index only: links, attributes
+and coarser levels are not carried over, so use it for point clouds. Chunk keys
+in the output gain a leading axis (`c/0/1/3/3` rather than `c/1/3/3`), named in
+`rechunk_dims`. With `output=None` it rewrites the store in place. `RechunkSpec`
+also groups by a non-spatial value (`by="group"`, `by="object_id"` or
+`by="attribute:<name>"`), and `rechunk_by_attribute(store, name)` gives every
+distinct value its own bin. Rechunking rewrites the whole store: never run it
+while anything else is writing to it.
 
-Two things to know about the result:
+## Measure memory use
 
-- **Rechunked stores gain a prefix dimension.** Chunk keys become
-  `(bin, z, y, x)` — `c/0/2/0/0` rather than `c/2/0/0` — because `rechunk`'s
-  output layout is shared with the non-spatial forms below. `rechunk_dims`
-  in the summary names the axes.
-- **`output=None` rechunks in place**, by writing a temporary store and
-  replacing the source. Leave `output` set while you still want the original.
-
-`RechunkSpec` also rechunks along a non-spatial dimension — `by="group"`,
-`by="object_id"`, or `by="attribute:<name>"` — so that all objects sharing a
-value land in one chunk. `building.rechunk_by_attribute(store, "cell_type")` is the
-categorical shorthand: every distinct value gets its own bin, however many
-there are.
-
-```{warning}
-Rechunking rewrites where every byte lives, so it is a coordinator
-operation. Never run it while anything else is writing to the store.
-```
-
----
-
-## Monitoring memory usage
-
-`tracemalloc` measures the write path directly:
+`tracemalloc` measures the write path:
 
 ```python
 import tracemalloc
@@ -351,20 +284,18 @@ tracemalloc.stop()
 ```
 
 ```text
-Peak memory: 8.0 MB
+Peak memory: 7.3 MB
 ```
 
-`tracemalloc` sees Python allocations only. NumPy's own buffers are counted,
-but a compressor's native scratch space is not, so treat the figure as a
-lower bound and leave headroom.
-
----
+`tracemalloc` sees Python allocations, including NumPy buffers, but not a
+compressor's native scratch space. Treat the figure as a lower bound.
 
 ## Next steps
 
-- **[HPC pipelines](hpc_pipelines.md)** — the same partitioned write, run
-  across SLURM array tasks or MPI ranks instead of a `for` loop.
-- **[Choosing a layout](choose_chunk_and_bin.md)** — how to
-  pick the numbers `Grid.plan` takes.
-- **{doc}`Building stores <../api/building>`** — the full reference for the
-  surface Strategy 1 uses.
+- [HPC pipelines](hpc_pipelines.md): the same partitioned write across SLURM
+  array tasks or MPI ranks.
+- [Choosing a layout](choose_chunk_and_bin.md): how to pick the cell size.
+- {doc}`Building stores <../api/building>`: reference for the surface used
+  here.
+- Readers for formats such as LAS, TRX and SWC, which feed the same per-cell
+  writes, are in the companion package zarr-vectors-tools.

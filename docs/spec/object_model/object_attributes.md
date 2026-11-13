@@ -2,268 +2,172 @@
 
 ## Terms
 
-**Per-vertex attribute**
-: A named array stored under `attributes/<name>/` whose length at each
-  chunk equals the number of vertices in that chunk. Attribute `k` in
-  chunk `(cx, cy, cz)` corresponds to vertex `k` in the same chunk (in
-  fragment order).
+**Object attribute**
+: A named array at `object_attributes/<name>` with one row per object of
+  the level.
 
-**Per-fragment attribute**
-: A named array stored under `fragment_attributes/<name>/` whose per-chunk
-  byte length equals `num_fragments_in_chunk × dtype.itemsize × ncols`.
-  Element `k` corresponds to fragment `k` as encoded in
-  `vertex_fragments/<chunk>`. Opt-in; the common use case is materializing
-  the OID owning each fragment without round-tripping the
-  `object_index/manifests` reverse lookup.
+**Absent row**
+: A row of an object attribute that holds the array's fill value, which
+  marks the object as having no value for that attribute.
 
-**Per-object attribute**
-: A named array stored under `object_attributes/<name>/` whose length
-  equals `n_objects`. Element `k` corresponds to object ID `k`.
+**Group**
+: A named set of objects, stored as one row of the `groups` array.
 
-**Attribute dtype**
-: The numeric data type of an attribute array, declared in the array's
-  `zarr.json`. Any dtype supported by Zarr v3 is valid.
-
-**Attribute aggregation**
-: The strategy used to compute a per-vertex attribute value for a metanode
-  during pyramid construction. See
-  [Pyramid construction](../multiscale/pyramid_construction.md).
+**Group attribute**
+: A named array at `group_attributes/<name>` with one row per group.
 
 ---
 
 ## Introduction
 
-Zarr Vectors supports three levels of attribute granularity: per-vertex,
-per-fragment, and per-object. Per-vertex attributes assign one value (or
-vector) to each vertex independently. Per-fragment attributes assign one
-value per fragment within a chunk (opt-in; useful for materializing
-parent-IDs like the OID owning each fragment). Per-object attributes
-assign one value to each discrete object as a whole (a streamline, a
-skeleton, a mesh surface).
-
-All three levels are optional and independent. A store may have any
-subset: only per-vertex, only per-object, only per-fragment, or any
-combination. A store may carry per-object `mean_fa` without any per-vertex
-FA values, or vice versa.
-
-This page documents the array schemas for both attribute types, naming rules,
-dtype recommendations, and behaviour during multi-resolution coarsening.
+A level can carry data at four scopes: per vertex
+(`vertex_attributes/<name>/`), per fragment (`fragment_attributes/<name>/`),
+per link (`link_attributes/<name>/…`) and per object
+(`object_attributes/<name>`). The per-chunk scopes are laid out in
+[Chunk arrays](../layout/chunk_arrays.md) and link attributes in
+[Links](links.md). This page specifies object attributes, groups and
+group attributes: how rows map to objects, how an absent value is
+stored, and what a coarser level keeps. Every attribute is optional and
+independent of the others.
 
 ---
 
 ## Technical reference
 
-### Per-vertex attributes (`attributes/<name>/`)
+### Array layout
 
-#### Array schema
+Each object attribute is a plain Zarr array, readable without
+zarr-vectors-py:
 
+| Property | Value |
+|----------|-------|
+| Path | `<level>/object_attributes/<name>` |
+| Shape | `[num_objects]`, or `[num_objects, K]` for `K` columns |
+| Chunk shape | `[65536]`, or `[65536, K]` |
+| `data_type` | The attribute's dtype |
+| `fill_value` | The absent sentinel (see below) |
+| Attributes | `zv_array: "object_attribute"`, `name`, `dtype`, `shape`, `fill_sentinel_meaning: "absent"` |
+
+For example, a `float32` attribute of five objects has the array
+attributes
+
+```json
+{
+  "zv_array": "object_attribute",
+  "name": "mean_fa",
+  "dtype": "float32",
+  "shape": [5],
+  "fill_sentinel_meaning": "absent"
+}
 ```
-path:        <N>/attributes/<name>/
-shape:       (*chunk_grid_shape, N_max)       for scalar attributes
-             (*chunk_grid_shape, N_max, K)     for K-dimensional vector attributes
-chunk_shape: (1, 1, …, 1, N_max)
-             (1, 1, …, 1, N_max, K)
-fill_value:  0.0  (float types) or  0  (integer types)
-```
 
-`N_max` must match the `N_max` of the corresponding `vertices/` array.
-Attribute element `k` in chunk `(cx, cy, cz)` corresponds to vertex `k`
-in `vertices[cx, cy, cz]`.
+### Rows and object ids
 
-#### Naming rules
+Row `k` of an object attribute belongs to the object at row `k` of the
+level's object index, whose id is row `k` of `object_index/object_ids`
+(or `k` itself in a `vlen_manifests_v1` index; see
+[Object manifest](object_manifest.md)). Rows follow ascending object id
+when the index is written by a `write_*` function, so a store written
+with object ids `3`, `7` and `20` stores their attribute values in rows
+0, 1 and 2.
 
-Attribute names must be valid Python identifiers (alphanumeric and
-underscores, not starting with a digit). Reserved names used by the Zarr Vectors
-spec:
+### Absent values
 
-| Name | Type | Used by |
-|------|------|---------|
-| `swc_type` | int32 | `skeleton` — SWC compartment type |
-| `radius` | float32 | `skeleton` — estimated tube radius |
-| `swc_id` | int64 | `skeleton` — original SWC row ID |
+An absent row holds the array's `fill_value` in every column. The
+default sentinel depends on the dtype:
 
-All other names are available for application-defined attributes.
+| dtype kind | Sentinel |
+|------------|----------|
+| Floating point | `NaN` |
+| Signed integer | The dtype's minimum (`-2147483648` for `int32`) |
+| Unsigned integer | The dtype's maximum |
 
-#### Common per-vertex attributes
+Other dtypes, such as `bool`, have no default; a writer passes
+`fill_value=` explicitly. A chunk that was never written reads as the
+fill value, so it is absent too. A row whose real value equals the
+sentinel is indistinguishable from an absent one.
 
-| Attribute | Dtype | Description |
-|-----------|-------|-------------|
-| `intensity` | float32 | Absorption / fluorescence intensity |
-| `fa` | float32 | Fractional anisotropy (per streamline vertex) |
-| `md` | float32 | Mean diffusivity |
-| `label` | int32 | Semantic segmentation label |
-| `confidence` | float32 | Detection confidence score |
-| `color` | uint8 (N, 3) | RGB colour per vertex |
-| `normal` | float32 (N, 3) | Surface normal per vertex (mesh) |
-| `uv` | float32 (N, 2) | UV texture coordinates (mesh) |
+`read_object_attribute_present_mask(level_group, name)` returns a
+`uint8` mask (`1` present, `0` absent), or `None` when every row is
+present or the attribute does not exist.
 
-#### Writing per-vertex attributes
+### Writing and reading
+
+The `write_*` functions take `object_attributes={name: array}` with one
+row per object. On an existing level,
+`write_object_attributes(level_group, name, data, *, present_mask=None,
+fill_value=None, mode="replace", at=None)` writes one column:
+
+- `present_mask` (one `0`/`1` per row) sets the rows marked `0` to the
+  sentinel.
+- `mode="replace"` writes `data` as the whole column.
+- `mode="append"` adds rows at the end, or from row `at` when given:
+  a column shorter than `at` is padded with absent rows, and one longer
+  is cut back to `at`. Appends to one column must not run concurrently.
+- `mode="place"` writes rows `[at, at + n)` of a column sized in advance
+  by `reserve_object_rows`, so several writers can fill disjoint ranges.
+
+`write_object_attribute_columns(level_group, {name: rows, …})` writes
+several columns with the same modes.
+
+`read_object_attributes(level_group, name)` returns the whole column,
+sentinels included.
 
 ```python
 import numpy as np
-from zarr_vectors.types.points import write_points
 
-n = 100_000
-positions  = np.random.default_rng(0).uniform(0, 1000, (n, 3)).astype(np.float32)
-intensity  = np.random.default_rng(1).uniform(0, 1, n).astype(np.float32)
-color      = np.random.default_rng(2).integers(0, 256, (n, 3)).astype(np.uint8)
-
-write_points(
-    "scan.zarrvectors", positions,
-    chunk_shape=(200., 200., 200.),
-    attributes={
-        "intensity": intensity,   # scalar float32
-        "color":     color,       # vector uint8 (N, 3)
-    },
+from zarr_vectors.building import (
+    read_object_attribute_present_mask,
+    read_object_attributes,
+    write_object_attributes,
 )
-```
+from zarr_vectors.core.store import get_resolution_level, open_store
 
-#### Reading per-vertex attributes
-
-```python
-from zarr_vectors.types.points import read_points
-
-result = read_points("scan.zarrvectors")
-intensity = result["attributes"]["intensity"]   # shape (N,)
-color     = result["attributes"]["color"]       # shape (N, 3)
-
-# Bbox query preserves attribute alignment
-result = read_points("scan.zarrvectors",
-                     bbox=(lo, hi),
-                     attributes=["intensity"])  # read subset of attributes
-```
-
-### Per-object attributes (`object_attributes/<name>/`)
-
-#### Array schema
-
-```
-path:        <N>/object_attributes/<name>/
-shape:       (n_objects,)     for scalar attributes
-             (n_objects, K)   for K-dimensional vector attributes
-chunk_shape: (65536,)  or  (65536, K)
-fill_value:  0.0  or  0
-```
-
-`n_objects` equals `object_index.shape[0]`. Element `k` corresponds to
-object ID `k`.
-
-#### Writing per-object attributes
-
-```python
-from zarr_vectors.types.polylines import write_polylines
-import numpy as np
-
-n_polylines = 500
-polylines   = [...]   # list of (N_i, 3) arrays
-lengths     = np.array([p.shape[0] for p in polylines], dtype=np.int32)
-mean_fa     = np.random.default_rng(0).uniform(0.2, 0.8, n_polylines).astype(np.float32)
-
-write_polylines(
-    "tracts.zarrvectors", polylines,
-    chunk_shape=(200., 200., 200.),
-    object_attributes={
-        "length":  lengths,    # int32 per polyline
-        "mean_fa": mean_fa,    # float32 per polyline
-    },
+lg = get_resolution_level(open_store("tracts.zarrvectors", mode="r+"), 0)
+write_object_attributes(
+    lg, "cls", np.array([1, 2, 3, 4, 5], dtype=np.int32),
+    present_mask=np.array([1, 0, 1, 1, 0], dtype=np.uint8),
 )
+print(read_object_attributes(lg, "cls"))
+# [          1 -2147483648           3           4 -2147483648]
+print(read_object_attribute_present_mask(lg, "cls"))
+# [1 0 1 1 0]
 ```
 
-#### Reading per-object attributes
+### Object attributes at coarser levels
 
-```python
-from zarr_vectors.types.polylines import read_polylines
+A level built by the core `per_object` coarsener has a row for every
+object id of its source level. A kept object's row is copied from the
+source; a dropped object's row is absent. See
+[Pyramid construction](../multiscale/pyramid_construction.md) and
+[Object sparsity](../multiscale/sparsity.md).
 
-# Read object attributes without fetching vertex data
-from zarr_vectors.core.store import open_store
-root = open_store("tracts.zarrvectors", mode="r")
-mean_fa = root["0"]["object_attributes"]["mean_fa"][:]
+### Groups and group attributes
 
-# Read object attributes alongside vertices
-result = read_polylines(
-    "tracts.zarrvectors",
-    object_ids=[0, 5, 10],
-    include_object_attributes=True,
-)
-print(result["object_attributes"]["mean_fa"])   # shape (3,)
-```
+`groups` is a `variable_length_bytes` array of shape `[num_groups]`;
+cell `g` holds group `g`'s object ids as `int64`. Its attributes are
+`zv_array: "groups"` and `num_groups`.
 
-#### Adding attributes to an existing store
-
-Per-object attributes can be added to an existing store without rewriting
-vertex data:
-
-```python
-from zarr_vectors.core.attributes import add_object_attribute
-
-add_object_attribute(
-    "tracts.zarrvectors",
-    name="cluster_id",
-    values=cluster_ids,   # shape (n_objects,) int32
-    level=0,
-)
-```
-
-Per-vertex attributes require rewriting the entire `attributes/` sub-group
-for the affected level (because vertex ordering is fixed at write time).
-
-### Attribute alignment at all resolution levels
-
-Per-vertex attributes must be present at every resolution level where they
-are declared. When building a pyramid:
-
-```python
-from zarr_vectors.multiresolution.coarsen import build_pyramid
-
-build_pyramid(
-    "scan.zarrvectors",
-    factors=[(2.0, 1.0)],
-    agg_mode="mean",  # 0.4+: a single global mode (per-attribute via manual coarsen_level)
-)
-```
-
-The `attribute_aggregation` dict specifies the per-attribute aggregation
-strategy. Attributes not listed use `mean` for float types and `majority`
-for integer types.
-
-For per-object attributes at levels with `object_sparsity < 1.0`, only
-the retained objects' attribute values are stored. The mapping from
-coarse-level object IDs to level-0 IDs is stored in
-`object_attributes/level0_object_id/`.
-
-### Groupings and group attributes
-
-Groupings assign objects to named sets (e.g. tract bundles, cell types).
-The `groupings/` array stores a 2-D padded array mapping group ID →
-object IDs. The `groupings_attributes/` sub-group stores per-group metadata:
+`group_attributes/<name>` is an array of shape `[num_groups]` with
+attributes `zv_array: "groupings_attribute"`, `name`, `dtype` and
+`shape`.
 
 ```python
 write_polylines(
     "tracts.zarrvectors", polylines,
-    chunk_shape=(200., 200., 200.),
-    groups={
-        "corticospinal": cst_ids,
-        "arcuate":       af_ids,
-    },
-    groupings_attributes={
-        "tract_name": ["corticospinal", "arcuate"],   # stored as string array
-        "n_objects":  [len(cst_ids), len(af_ids)],
-    },
+    chunk_shape=(200.0, 200.0, 200.0),
+    groups={0: [0, 1, 2], 1: [3, 4]},
+    group_attributes={"n_objects": np.array([3, 2], dtype=np.int32)},
 )
 ```
 
-Group names are stored in `groupings_attributes/name/` as a UTF-8 string
-array. Group IDs are integer indices into this array.
+`read_all_groupings(level_group)` returns every group's object ids,
+`read_group_object_ids(level_group, g)` one group's, and
+`read_groupings_attributes(level_group, name)` a group attribute. The
+`read_*` functions select the objects of some groups with
+`group_ids=[…]`.
 
 ### Validation
 
-L1: Each declared attribute group (`attributes/`, `object_attributes/`)
-has a `zarr.json` and at least one named sub-array.
-
-L3:
-- For each per-vertex attribute at level `N`: shape is consistent with
-  the `vertices/` array at the same level.
-- For each per-object attribute at level `N`: shape is `(n_objects,)` or
-  `(n_objects, K)` where `n_objects == object_index.shape[0]`.
-- Attribute values are finite (no NaN or Inf unless explicitly declared
-  as the fill value).
+L1 reports which of `object_attributes/` and `groups` a level has. The
+validators do not check object attribute shapes or values.

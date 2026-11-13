@@ -3,173 +3,154 @@
 ## Terms
 
 **Consistency check**
-: A validation check that reads array data and verifies that the values
-  in one array are logically consistent with values in another. L3 checks
-  read all chunks of all arrays at each level.
+: A check that reads array data and verifies that one array agrees with
+  another. L3 reads every chunk of every level.
 
 **Decode check**
-: Verification that a chunk's blob decodes at all. L3 does not
-  independently re-derive the fragment-index byte arithmetic; it decodes
-  each chunk through the normal reader and reports any decoder exception
-  as an error. Malformed magic, version, or offsets therefore surface as
-  a decode failure rather than as a named per-field check.
+: Decoding each chunk through the normal reader. L3 does not re-derive the
+  fragment-index byte layout; a malformed blob surfaces as a decode error.
 
 **Manifest integrity**
-: Verification that every `(chunk_coords, fragment_index)` pair in a
-  decoded object manifest names a chunk present at the level and a
-  fragment index below that chunk's fragment count.
+: Every `(chunk, fragment_index)` pair in an object manifest names a chunk
+  present at the level and a fragment index below that chunk's fragment
+  count.
 
 **Directory-name invariant**
-: An invariant that L3 checks by parsing an *array path segment* rather
-  than by reading cell contents. Under the offset layout the
-  canonical-sort property of a link family is a property of its
-  `<offsets>` directory name, so checking it costs one parse per offset
-  array rather than one per record.
-
----
+: A property L3 checks by parsing an `<offsets>` array name instead of
+  reading records. For a canonical link family, the sort order of its
+  records shows in the names, so the check costs one parse per offsets
+  array.
 
 ## Introduction
 
-L3 validation reads array data and checks that the store's internal
-structure is logically consistent. It is the first level that can detect
-bugs introduced by incorrect writer implementations, rechunking errors, or
-manual store modifications.
-
-L3 is substantially more expensive than L1–L2 because it reads all chunks.
-For a 100 GB store, L3 may take 5–30 minutes depending on storage bandwidth.
-For development and CI, run L3 on small synthetic stores; run L1–L2 on
-full-size production stores unless a specific consistency issue is suspected.
-
----
+L3 reads array data and checks that the store's arrays agree with one
+another. It is the first level that catches writer bugs, rechunking errors
+and hand edits. It reads every chunk, so its cost grows with the store; run
+it on small stores in development and CI.
 
 ## Technical reference
 
-L3 is implemented by
-[`validate_consistency`](../../../zarr_vectors/validate/consistency.py).
-It walks every resolution level and, within each, performs the checks
-below. Checks are reported as free-text messages on a
-`ValidationResult`; they do not carry stable machine-readable check IDs
-(see [Validation overview](overview.md#validationresult-api)).
+L3 is `validate_consistency` in `zarr_vectors/validate/consistency.py`. It
+walks every level; a level that cannot be opened is an error
+(`resolution_N: cannot open`). Levels with octree chunks get their own checks
+([below](#octree-levels)). Each check adds a message to the
+`ValidationResult` (see
+[Validation overview](overview.md#validationresult-api)).
 
 ### Chunk decode and vertex checks
 
-For every chunk key at the level:
+A level with no chunks is a warning (`no chunk data`) and is otherwise
+skipped. For every chunk:
 
-| Rule | Failure type |
-|------|--------------|
-| The chunk's vertex blob decodes via `read_chunk_vertices` | Error |
-| Each decoded fragment is 2-D with `shape[1] == sid_ndim` | Error |
-| No fragment contains NaN / Inf | Warning |
-| The level's `vertex_count` attribute, **if present**, equals the total decoded vertex count | Error |
+| Rule | Failure |
+|------|---------|
+| The chunk's vertices decode | Error |
+| When the level claims `fragments_tile`, the chunk's fragments tile its vertex buffer | Error, once per level |
+| When the level claims `link_fragments_aligned`, the chunk's intra-chunk links are filed by vertex fragment | Error, once per level |
+| Each fragment is 2-D with `shape[1] == sid_ndim` | Error |
+| No fragment contains NaN or Inf | Warning |
 
-A level with no chunk keys emits a warning (`no chunk data`) and is
-otherwise skipped.
+L3 also compares a level's `vertex_count` with the decoded total, but reads
+it from the top level of the level's attributes, where a store keeps only
+the `zarr_vectors_level` block. The comparison therefore does not run on
+stores written by this package (the octree branch reads it correctly).
 
-### Bin-layout checks (point-cloud stores only)
+### Bin-layout checks (point clouds only)
 
-These run **only** when the store's `geometry_types` contains
-`point_cloud` and none of `polyline`, `streamline`, `line`, `graph`,
-`skeleton`, `mesh`, **and** the level has no `object_index` — i.e. only
-for undifferentiated point clouds where fragments really do correspond
-to bins. Other types use fragments for segments, endpoints, or
-per-object partitions, so a fragment-per-bin rule does not apply to
-them. They also require at least one axis with `bins_per_chunk > 1`.
+These run only when the store's `geometry_types` contains `point_cloud` and
+no other type, the level has no `object_index/`, and at least one axis has
+more than one bin per chunk:
 
-| Rule | Failure type |
-|------|--------------|
-| A chunk's fragment count does not exceed the product of `bins_per_chunk` | Error |
-| Each fragment's points lie within their bin's bounds (tolerance `1e-4`) | Warning |
+| Rule | Failure |
+|------|---------|
+| A chunk has no more fragments than bins | Error |
+| Each fragment's points lie inside its bin (tolerance `1e-4`) | Warning |
 
-The bin-bounds check is a **spot check**: it examines at most the first
-3 chunks per level, not every chunk.
+The bin-bounds check examines only the first three chunks of each level.
+Bins per chunk come from the level's effective chunk shape and, at level 0,
+the root `base_bin_shape`; coarser levels skip both checks.
 
-`bins_per_chunk` is computed from the level's *effective* chunk shape
-(honouring a per-level `chunk_shape` override) and the level's
-effective bin shape.
+### Object index checks
 
-### Object manifest checks
+| Rule | Failure |
+|------|---------|
+| A dense object index has its arrays, dtypes and shapes as stamped, and no vlen `manifests` array beside them | Error per problem |
+| Every manifest entry names a chunk present at the level | Error |
+| Every manifest entry's fragment index is below that chunk's fragment count | Error |
 
-Read via `read_all_object_manifests`. Failures to read the manifests at
-all are silently skipped (the store may legitimately have none).
-
-| Rule | Failure type |
-|------|--------------|
-| Every manifest entry's `chunk_coords` names a chunk present at this level | Error |
-| Every manifest entry's `fragment_index` is `<` that chunk's decoded fragment count | Error |
+A level whose manifests cannot be read is passed over without a message.
 
 ### Link checks
 
-The walker enumerates every `<delta>` under `links/` via
-`list_link_deltas` and validates each family independently. A family
+Every `links/<delta>/` family is checked. Family policy (`link_width`,
+`sid_ndim`, `directed`, `store`) is read from the family group; a family
 whose metadata cannot be read, or whose `sid_ndim` is `0`, is skipped.
-Family-wide policy (`link_width`, `sid_ndim`, `directed`, `store`) is
-read from the `links/<delta>/` **group**.
 
-#### Offsets-segment checks (directory names)
+For every `<offsets>` array:
 
-For every `<offsets>` array in the family:
+| Rule | Failure |
+|------|---------|
+| The name parses under the family's `sid_ndim` and `link_width` | Error |
 
-| Rule | Failure type |
-|------|--------------|
-| The segment parses under the family's `sid_ndim` / `link_width` (`parse_offsets`) | Error |
-
-The remaining segment checks are **gated** on the family being
-undirected, single-copy, and intra-level:
+The next two checks run only when the family is undirected, single-copy and
+within one level:
 
 ```python
 enforce_canonical = (not directed) and store == "canonical" and delta == 0
 ```
 
-| Rule (only when `enforce_canonical`) | Failure type |
-|------|--------------|
-| Each offset is lexicographically non-negative — its first non-zero component is `> 0` | Error |
-| The offsets within a segment are non-decreasing | Error |
+| Rule (only when `enforce_canonical`) | Failure |
+|------|---------|
+| No offset is lexicographically negative: its first non-zero component is `> 0` | Error |
+| The offsets in a name are non-decreasing | Error |
 
-The all-zero offsets segment (the intra-chunk array) is **legal** and
-passes both: its lex-sign is `0`, not negative. Intra-chunk records are
-deduplicated by the vertex-index tie-break in the canonical sort, not
-by the offset sign.
+The all-zero offsets array (intra-chunk records) passes both. The excluded
+families can carry negative offsets legitimately: a directed family keeps
+endpoint order, so `A→B` and `B→A` file under opposite offsets; a duplicate
+family stores a copy led by each incident chunk; a cross-level family is
+never sorted. See [Links](../object_model/links.md).
 
-The gate matters, because all three excluded cases legitimately carry
-lexicographically negative offsets:
+For the records:
 
-- **`directed=True`** — endpoint order is data, so `A→B` and `B→A` file
-  under opposite offsets (`0.0.+1` vs `0.0.-1`).
-- **`store="duplicate"`** — each incident chunk leads in its own copy.
-- **`delta != 0`** — cross-level records are never sorted; their source
-  is always input endpoint 0.
+| Rule | Failure |
+|------|---------|
+| `num_physical_records`, when recorded, equals the rows on disk | Error |
+| Every record's source chunk (endpoint 0) is present at the level | Error |
+| For `delta == 0`, every other endpoint's chunk is present at the level | Error |
 
-#### Record checks
+The row count includes every copy in a duplicate family. For `delta != 0`,
+the other endpoints live at another level and are not checked here.
 
-| Rule | Failure type |
-|------|--------------|
-| `num_physical_records` in the family metadata, **if present**, equals the number of rows `read_links` returns | Error |
-| Every record's endpoint-0 (source) chunk is present at this level | Error |
-| For `delta == 0` only: every other endpoint's chunk is present at this level | Error |
+### Octree levels
 
-`read_links` returns one row per **physical** record, so a
-`store="duplicate"` family counts each copy — which is exactly what
-`num_physical_records` records.
+A level with octree chunks (each leaf is one chunk at its anchor cell)
+replaces the checks above with these, all errors unless noted:
 
-For `delta != 0` only endpoint 0 is constrained here: the other
-endpoints live at level `owning + delta` and are validated against that
-level's own grid when the walker reaches it.
+- the level is not part way through a conversion;
+- the leaf and cell tables read; every leaf, and nothing else, has a vertex
+  chunk at its anchor, holding the vertex and fragment counts both tables
+  give; the cell table names only existing leaves;
+- the level's `vertex_count` matches the leaves;
+- object manifests name a leaf's anchor and a fragment it holds;
+- there is no cross-level link family; each link joins stored leaves at rows
+  they hold, and the family's `num_physical_records` matches;
+- `vertices/` carries the octree marker codec (a warning if not);
+- on a sharded level, no leaf is wider than `max_leaf_cells` and every leaf
+  lies inside one shard (a straddling leaf is a warning when no
+  `max_leaf_cells` is set).
 
-### Example L3 report (abbreviated)
+### Example L3 report
+
+A line store with one vertex chunk deleted and a wrong
+`num_physical_records`:
 
 ```
 Level 3 validation: FAIL
-  4 passed, 1 warnings, 2 errors
-  ERROR: resolution_0: links[delta=0] segment '0.0.-1' offset 1 is
-         lexicographically negative; a canonical family stores each
-         record once, under the positive offset
-  ERROR: resolution_0: links[delta=0] refs non-existent source chunk (7, 2, 1)
-  WARN:  resolution_0: chunk (3, 0, 0) fragment[2] NaN/Inf
+  23 passed, 0 warnings, 2 errors
+  ERROR: resolution_0: fragments_tile is set but chunk (-1, -1, 2) does not tile its buffer
+  ERROR: resolution_0: links[delta=0] num_physical_records=400 != 388 rows on disk
 ```
 
-The first error is the characteristic cross-chunk-link writer bug under
-the offset layout: an undirected canonical family must store each
-record exactly once, under the lexicographically positive offset. Both
-`0.0.+1` and `0.0.-1` existing means the writer canonicalised
-inconsistently. See [Links](../object_model/links.md) for the correct
-generation algorithm.
+L3 pass messages read like `resolution_0: 192 chunks decoded, 1999 vertices`,
+`resolution_0: object_index validated (1000 objects)` and
+`resolution_0: links[delta=0] validated (388 links across 11 offset arrays)`.

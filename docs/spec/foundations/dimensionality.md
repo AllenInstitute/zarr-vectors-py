@@ -1,52 +1,35 @@
 # Dimensionality
 
+This page describes how a store's number of spatial dimensions is
+declared, where it appears on disk, and what the validator checks
+against it.
+
 ## Terms
 
 **Spatial dimensionality (D)**
-: The number of spatial axes in the coordinate system of a Zarr Vectors store. The
-  most common value is `D = 3` (x, y, z). Values of `D = 2` (planar data)
-  and `D = 4` (e.g. x, y, z, t for time-series tractography) are also valid.
-  `D` is declared in the store's root `.zattrs` metadata and must be
-  consistent across all arrays and all resolution levels.
+: The number of axes vertices are positioned and chunked in. It is the
+  length of `multiscales[0].axes` in the root attributes; the Python
+  package exposes it as `RootMetadata.sid_ndim`. `D` is fixed for the
+  store and shared by every level.
 
-**Position array shape**
-: The shape of the `vertices/` array within a single chunk group: `(N, D)`,
-  where `N` is the number of vertices in that chunk and `D` is the spatial
-  dimensionality. `N` varies per chunk (ragged); `D` is fixed for the store.
+**Axis**
+: One entry of `multiscales[0].axes`: a `name`, a `type` (such as
+  `"space"` or `"time"`) and an optional `unit`.
 
-**`chunk_shape` / `bin_shape` tuple length**
-: Both `chunk_shape` and `bin_shape` are D-tuples. They must have exactly
-  `D` elements, one per spatial axis.
-
-**Axis names**
-: Optional string labels for each spatial dimension, stored in the
-  OME-Zarr-compatible `axes` field of the `multiscales` metadata block.
-  Typical values: `["x", "y", "z"]`, `["r", "a", "s"]` (RAS), `["col",
-  "row", "slice"]` (voxel index).
-
-**Axis units**
-: Optional physical unit strings associated with each axis (e.g.
-  `"micrometer"`, `"nanometer"`, `"voxel"`). Stored in the `axes` field
-  alongside axis names.
+**`chunk_shape`, `bin_shape`, `bounds`**
+: Per-axis values, each with exactly `D` entries. See
+  [Chunk shape](../chunking/chunk_shape.md) and
+  [Bin shape](../chunking/bin_shape.md).
 
 ---
 
 ## Introduction
 
-The Zarr Vectors is not inherently three-dimensional. The spatial
-dimensionality `D` is a property of each individual store, declared at
-write time and embedded in the root metadata. All format rules (chunk grid,
-bin grid, fragment index addressing, bounding-box queries) generalise
-straightforwardly to arbitrary `D`.
-
-In practice, the vast majority of Zarr Vectors stores are three-dimensional (x, y,
-z), matching the dimensionality of the volumetric image data they are
-registered against. Two-dimensional stores arise in planar microscopy
-contexts. Four-dimensional stores (`x, y, z, t`) are an emerging use case
-for time-series tractography and dynamic cell tracking.
-
-This page documents how dimensionality is declared, enforced, and used
-throughout the format.
+A store is not tied to three dimensions. `D` is set when the store is
+created, and every spatial rule (chunk assignment, bins, cell
+addressing, bounding-box queries) is written for `D` axes. Most stores
+are 3-D; 2-D stores and stores with a fourth axis such as time use the
+same layout and code paths.
 
 ---
 
@@ -54,181 +37,121 @@ throughout the format.
 
 ### Declaring dimensionality
 
-`D` is inferred from the length of `chunk_shape` at write time and stored in
-the root `.zattrs` under the key `"spatial_dims"`:
+`create_store` takes `D` from `ndim`, or from the length of `axes`,
+`bounds` or `chunk_shape`, whichever is given; if none is given, `D`
+is 3. The type writers such as `write_points` take it from
+`chunk_shape` and the positions. If the inputs disagree,
+`MetadataError` is raised, for example
+`Inconsistent dimensionality: ndim=3, chunk_shape=2`.
+
+When no `axes` are given, they are generated from the names `x`, `y`,
+`z`, `w` in that order, each with `"type": "space"` and no unit. A 2-D
+point cloud written with `chunk_shape=(500.0, 500.0)` records:
 
 ```json
-{
-  "zarr_vectors_version": "1.0",
-  "geometry_type": "point_cloud",
-  "spatial_dims": 3,
-  "base_bin_shape": [50.0, 50.0, 50.0],
-  "chunk_shape": [200.0, 200.0, 200.0]
-}
+"axes": [
+  {"name": "x", "type": "space"},
+  {"name": "y", "type": "space"}
+]
 ```
 
-There is no mechanism to change `D` after a store is created. Adding a
-resolution level with a different dimensionality will raise `ValueError`.
+The axis order is the column order of the positions and the order of
+every per-axis list (`chunk_shape`, `bin_shape`, `bounds`).
 
-### Effect on array shapes
+### Where `D` appears on disk
 
-Every dimensionality-dependent array shape in the format uses `D`
-explicitly. The table below shows how shapes vary with `D`:
+`D` is not stored as a separate key. It is implied by:
 
-| Array | Shape | Notes |
-|-------|-------|-------|
-| `vertices/` (per chunk) | `(N, D)` | N varies per chunk |
-| `vertex_fragments/` (per chunk) | opaque `uint8` blob, length depends on `F` | Fragment-index binary blob; size grows with the number of fragments in the chunk, independent of D |
-| `link_fragments/` (per chunk) | opaque `uint8` blob, length depends on `F` | Same structure as `vertex_fragments/` but indexes `links/0/<chunk>` rows |
-| `links/<delta>/<offsets>/` (per source chunk) | `(R, L)` | R varies; `L` = `link_width` (2 for edges, ≥ 3 for faces); independent of D |
-| `object_index/data` | ragged `uint8` (concatenated manifest blobs) | Each blob's `chunk_coords` words have `D` int64s; total size grows with manifest count and complexity |
-| `object_index/offsets` | `(n_objects,)` `int64` | Independent of D |
+| Item | Shape |
+|------|-------|
+| `multiscales[0].axes` (root attributes) | `D` entries |
+| `chunk_shape`, `bounds[0]`, `bounds[1]`, `base_bin_shape` (root `zarr_vectors` block) | `D` entries each |
+| `bin_shape`, `bin_ratio` (each level's `zarr_vectors_level` block) | `D` entries each |
+| Per-chunk arrays (`vertices`, `vertex_fragments`, `links/<delta>/<offsets>`, attributes) | rank `D`, one cell per spatial chunk; rank `D + 1` when the level is [chunked by an attribute](../chunking/attribute_chunking.md) |
+| Positions inside a `vertices` cell | rows of `D` values |
+| The `<offsets>` path segment of a links array | `link_width - 1` offsets of `D` signed components each (see [Links](../object_model/links.md)) |
+| Dense object-index `manifest_spans` / `manifest_blocks` | `D + 1` columns (see [Object manifest](../object_model/object_manifest.md)) |
 
-The `<offsets>` **path segment** does depend on D: it carries
-`link_width - 1` offsets, each of `sid_ndim` signed components (see
-[Links](../object_model/links.md)). The array *contents* do not.
+The cell layouts are in [Chunk arrays](../layout/chunk_arrays.md).
 
-The `chunk_grid` of the `vertices/` Zarr array reflects `D`:
+### Chunk and cell addressing
 
-```json
-{
-  "chunk_grid": {
-    "name": "regular",
-    "configuration": { "chunk_shape": [65536, 3] }
-  }
-}
-```
-
-Here `65536` is a soft cap on vertices per chunk (the actual number is
-ragged; the array is extended as needed); `3` is `D`.
-
-### Effect on chunk and bin addressing
-
-The chunk coordinate of a vertex with position `(p_0, p_1, …, p_{D-1})`
-is:
+A vertex at position `p` is in the spatial chunk
 
 ```
-chunk_coord[i] = floor(p[i] / chunk_shape[i])   for i in 0..D-1
+chunk[i] = floor(p[i] / chunk_shape[i])     for i in 0 .. D-1
 ```
 
-The bin coordinate within a chunk is:
+and that chunk is stored in the per-chunk array's cell
+`chunk - origin`, where `origin[i] = floor(bounds_min[i] / chunk_shape[i])`
+is recorded in the array's `chunk_grid_origin` attribute (absent means
+zero). This lets stores with negative coordinates use a 0-indexed
+array. A bounding-box query reads the cells from
+`floor(lo / chunk_shape)` to `floor(hi / chunk_shape)` on each axis.
+Bin addressing within a chunk follows the same per-axis rule; see
+[Bin shape](../chunking/bin_shape.md).
 
-```
-bin_coord[i] = floor((p[i] % chunk_shape[i]) / bin_shape[i])   for i in 0..D-1
-```
+### A store with a time axis
 
-The number of bins per chunk is:
-
-```
-bins_per_chunk = product(chunk_shape[i] / bin_shape[i]   for i in 0..D-1)
-```
-
-For `D = 3` with `chunk_shape = (200, 200, 200)` and
-`bin_shape = (50, 50, 50)`: `bins_per_chunk = 4 × 4 × 4 = 64`.
-
-For `D = 2` with `chunk_shape = (500, 500)` and `bin_shape = (100, 100)`:
-`bins_per_chunk = 5 × 5 = 25`.
-
-The fragment index array is always `(bins_per_chunk, 2)` regardless of `D`; the
-bin coordinate is flattened to a scalar index using C-order (row-major)
-ravelling:
-
-```
-bin_flat_index = ravel_multi_index(bin_coord, bins_per_chunk_shape)
-```
-
-where `bins_per_chunk_shape = tuple(chunk_shape[i] / bin_shape[i] for i in range(D))`.
-
-### Bounding-box queries
-
-A bounding box is specified as a pair of D-dimensional arrays:
+A fourth axis is chunked and binned like the others. This example
+declares units on the axes with `create_store`, writes 1000 points,
+and reads the first spatial chunk for `0 <= t < 5`:
 
 ```python
-bbox = (
-    np.array([100.0, 100.0, 100.0]),   # lower corner, shape (D,)
-    np.array([300.0, 300.0, 200.0]),   # upper corner, shape (D,)
-)
-```
+import numpy as np
+from zarr_vectors.core.store import create_store
+from zarr_vectors.types.points import read_points, write_points
 
-For `D = 2`:
+rng = np.random.default_rng(0)
+positions = np.column_stack([
+    rng.uniform(0, 400, (1000, 3)),     # x, y, z in micrometres
+    rng.uniform(0, 20, 1000),           # t in seconds
+]).astype(np.float32)
 
-```python
-bbox = (np.array([0.0, 0.0]), np.array([500.0, 500.0]))
-```
-
-The query engine computes the chunk range as:
-
-```
-chunk_min[i] = floor(bbox[0][i] / chunk_shape[i])
-chunk_max[i] = floor(bbox[1][i] / chunk_shape[i])
-```
-
-and then the bin range within each overlapping chunk. All arithmetic is
-D-dimensional throughout.
-
-### Axis metadata
-
-For stores that will be visualised or processed by OME-Zarr-aware tools,
-axis names and units should be provided via the `multiscales` metadata
-block. Example for a 3-D RAS store in micrometres:
-
-```json
-{
-  "multiscales": [
-    {
-      "version": "0.5",
-      "axes": [
-        {"name": "z", "type": "space", "unit": "micrometer"},
+create_store(
+    "timeseries.zarrvectors",
+    axes=[
+        {"name": "x", "type": "space", "unit": "micrometer"},
         {"name": "y", "type": "space", "unit": "micrometer"},
-        {"name": "x", "type": "space", "unit": "micrometer"}
-      ],
-      "datasets": [...]
-    }
-  ]
-}
-```
-
-Axis order in the `axes` array must match the axis order of `chunk_shape`,
-`bin_shape`, and vertex coordinates. `zarr-vectors-py` defaults to `z, y,
-x` order (slowest to fastest varying), matching the OME-Zarr convention for
-volumetric image data.
-
-### Four-dimensional stores
-
-For time-series data (`D = 4`, axes `t, z, y, x`), the temporal axis is
-treated identically to the spatial axes for chunking and binning purposes.
-`chunk_shape` and `bin_shape` include a temporal component:
-
-```python
+        {"name": "z", "type": "space", "unit": "micrometer"},
+        {"name": "t", "type": "time", "unit": "second"},
+    ],
+    chunk_shape=(200.0, 200.0, 200.0, 10.0),
+    bounds=([0.0, 0.0, 0.0, 0.0], [400.0, 400.0, 400.0, 20.0]),
+    geometry_types=["point_cloud"],
+)
 write_points(
     "timeseries.zarrvectors",
-    positions_4d,                        # shape (N, 4): (t, z, y, x)
-    chunk_shape=(10.0, 200.0, 200.0, 200.0),   # 10 time units × 200³ space
-    bin_shape=(5.0, 50.0, 50.0, 50.0),
+    positions,
+    chunk_shape=(200.0, 200.0, 200.0, 10.0),
+    bin_shape=(50.0, 50.0, 50.0, 5.0),
 )
-```
 
-Bounding-box queries may include a temporal range:
-
-```python
 result = read_points(
     "timeseries.zarrvectors",
     bbox=(np.array([0.0, 0.0, 0.0, 0.0]),
-          np.array([5.0, 200.0, 200.0, 200.0])),   # t in [0, 5)
+          np.array([200.0, 200.0, 200.0, 5.0])),
 )
+print(result["positions"].shape)
 ```
 
-There are no special-case code paths for `D = 4`; the general D-dimensional
-logic handles it uniformly.
+```
+(33, 4)
+```
+
+The `vertices` array of this store has shape `[2, 2, 2, 2]`.
 
 ### Validation
 
-The validator enforces:
+Checks that involve `D`, by level (see
+[Validation](../validation/overview.md)):
 
-- `spatial_dims` in `.zattrs` equals the length of `base_bin_shape` and
-  `chunk_shape` (L2).
-- Every `vertices/` array's second dimension equals `spatial_dims` (L3).
-- Every `bin_shape` and `chunk_shape` tuple at every resolution level has
-  length `spatial_dims` (L2).
-- Bounding-box arguments passed to read functions have shape `(D,)` (runtime
-  assertion, not a stored validation level).
+- **Level 1** (`validate/structure.py`): every per-chunk array in a
+  level has the same rank as `vertices`, and every stored cell key has
+  that many components; a level chunked by an attribute must have rank
+  `D + 1`.
+- **Level 2** (`validate/metadata.py`): `D >= 1`; `chunk_shape`, both
+  `bounds` corners and `base_bin_shape` have `D` entries; each level's
+  `bin_shape` and `bin_ratio` have `D` entries.
+- **Level 3** (`validate/consistency.py`): every decoded vertex
+  fragment has `D` columns.

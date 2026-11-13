@@ -1,20 +1,19 @@
 # Quickstart
 
-This page covers the most common operations in `zarr-vectors`: creating a
-point-cloud store, writing to it, reading it back, running a spatial
-bounding-box query, adding coarser resolution levels, and writing a set of
-streamlines with group labels. All examples use synthetic data and require
+In this tutorial you create a point-cloud store, write to it, read it back,
+query a bounding box, add coarser resolution levels, and write a set of
+streamlines with group labels. Every example uses synthetic data and needs
 only the base install.
 
-The page is one continuous session — later blocks reuse the stores that
-earlier blocks create.
+Run the blocks in order in one Python session: later blocks reuse the stores
+that earlier blocks create.
 
 ---
 
 ## The two supported surfaces
 
-`zarr-vectors` promises two public surfaces and reserves the right to change
-everything else. The package will tell you which is which:
+`zarr-vectors` promises a small set of public modules and may change
+everything else. The package reports which is which:
 
 ```python
 import zarr_vectors as zv
@@ -39,23 +38,16 @@ types -> undecided
 - **`zarr_vectors.building`** — the surface for tools that *build* stores:
   converters, ingest pipelines, and anything that needs the writers and
   encoders underneath `add_points`.
-- Everything reported `internal` (`core`, `lazy`, `spatial`, `encoding`, …) is
-  an implementation detail and may change without notice. `undecided` means
-  exactly that: still supported in practice, not yet promised.
+- `constants`, `exceptions`, `headers` and `typing` are supported too; they
+  hold names the two surfaces use.
+- Modules reported `internal` (`core`, `lazy`, `spatial`, `encoding`, …) are
+  implementation details and may change without notice. `undecided` modules
+  work but carry no promise yet.
 
 `import zarr_vectors as zv` is the spelling used throughout. `zv.open_dataset`
 and `zv.create_dataset` are aliases — the same function objects as `zv.open`
 and `zv.create` — for code that imports the names bare and would rather not
 shadow the builtin `open`.
-
-### The older `zarr_vectors.types` functions
-
-Earlier versions of this page used `zarr_vectors.types.write_points` /
-`read_points` and their per-geometry siblings. They still work, but they are
-superseded: they are storage-shaped rather than data-shaped — every call takes
-the chunk and bin geometry — and each geometry's reader hands back its own
-differently-shaped dict, so no two of them compose. The API below takes a
-schema once and returns one `ReadResult` for every geometry.
 
 ---
 
@@ -96,7 +88,7 @@ print(ds.level(0).scale, ds.level(0).resolution)
 ```text
 Dataset('file:///.../scan.zarrvectors', point_cloud, levels=[0])
 (array([0., 0., 0.]), array([1000., 1000., 1000.]))
-('point_cloud',) 3 (0, 9, 1)
+('point_cloud',) 3 (0, 9, 4)
 (200.0, 200.0, 200.0) (50.0, 50.0, 50.0)
 ```
 
@@ -104,23 +96,21 @@ The store is written as a directory tree called `scan.zarrvectors/`. A
 relative path is normalised to an absolute `file://` URL, which is what the
 repr shows.
 
-`vertex_attributes` and `expected` are declarative: they document the store
-and size its arrays, but nothing enforces them at write time.
+Declared `vertex_attributes` are checked at write time: an attribute passed
+with a different dtype or channel count raises `SchemaConflict`, and an
+undeclared attribute is accepted as given. `expected` is a size hint that only
+steers the automatic layout.
 
-### Where `chunk_shape` and `bin_shape` went
+### Chunks, bins and the layout
 
-Nothing about the format changed. A **chunk** is still the I/O unit — one file
-on disk — and a **bin** is still the spatial index unit inside it. They are
-now layout concerns with working defaults instead of mandatory arguments to
-every call.
+A **chunk** is the I/O unit, one file on disk, and a **bin** is the spatial
+index unit inside it (see [Core concepts](concepts.md)). Both come from the
+schema's `Layout`; no read or write call takes them.
 
 `zv.Layout(cells=5)` divides the 1000 µm bounds into five cells per axis,
 which is where the numbers printed above come from: `Level.scale` is the chunk
-shape (200 µm) and `Level.resolution` is the bin shape (50 µm, i.e. four bins
-per axis, 64 bins per chunk). Those are exactly the values earlier versions of
-this page passed by hand as `chunk_shape=(200., 200., 200.)` and
-`bin_shape=(50., 50., 50.)` — derived now instead of dictated. The resulting
-grid is a first-class object:
+shape (200 µm) and `Level.resolution` is the bin shape (50 µm, four bins per
+axis, 64 bins per chunk). The level's grid is an object of its own:
 
 ```python
 grid = ds.level(0).grid
@@ -133,17 +123,11 @@ Grid(6x6x6 cells of (200.0, 200.0, 200.0))
 (6, 6, 6) (200.0, 200.0, 200.0)
 ```
 
-Storage geometry is no longer accepted anywhere on this surface:
+The grid has six cells per axis rather than five because bounds are
+inclusive: a point at exactly 1000 µm falls in a sixth plane of cells.
 
-```pycon
->>> zv.Schema(bounds=((0., 0., 0.), (1., 1., 1.)), chunk_shape=(1., 1., 1.))
-TypeError: Schema.__init__() got an unexpected keyword argument 'chunk_shape'
->>> zv.create("nope.zarrvectors", schema=schema, chunk_shape=(1., 1., 1.))
-TypeError: create() got an unexpected keyword argument 'chunk_shape'
-```
-
-`layout=` is itself optional. `bounds` is not — without it the layout cannot
-be resolved:
+`layout=` is optional. `bounds` is not: without it the layout cannot be
+resolved.
 
 ```python
 ds_min = zv.create(
@@ -157,8 +141,10 @@ print(ds_min.level(0).scale, ds_min.level(0).resolution)
 (1000.0, 1000.0, 1000.0) (250.0, 250.0, 250.0)
 ```
 
-That is the honest default — `Layout()` means `cells="auto"`, one chunk for
-the whole volume — and it is almost never what you want. Pass `cells=`.
+With neither `layout=` nor `expected=`, `cells="auto"` makes one chunk for the
+whole volume. Given `expected=zv.SizeHints(n_vertices=...)`, it sizes cells to
+about 64 MB each instead. Pass `cells=` when you know the chunk size you
+want.
 
 For the reasoning behind a particular chunk and bin size, see
 [Core concepts](concepts.md) and
@@ -197,22 +183,14 @@ print(report)
 ```
 
 **`add_points` is a one-shot write, not an append.** A second call into the
-same store re-derives the grid from its own batch and overwrites what was
-there. A batch that lands inside the first batch's extent silently replaces it.
-A batch that lands outside may raise, as below — but only when the new grid is
-smaller than the coordinates require; it is not a guarantee, so do not rely on
-an error to catch this:
+same store replaces the chunks its points fall in and keeps the others, so the
+store holds a mix of the two batches and its recorded vertex count is the
+second batch's. Assemble the full array first, or write each batch to its own
+store.
 
-```pycon
->>> ds2.add_points(first_1000_points)       # 1 000 points
->>> ds2.add_points(another_500_points)      # 500 more, same region
->>> ds2.read().vertex_count                 # not 1 500
-500
->>> ds2.add_points(points_somewhere_else)   # a batch outside the first extent
-StoreError: Chunk coords (3, 3, 3) out of grid (2, 2, 2) for array 'vertices'
-```
-
-Assemble the full array first, or write each batch to its own store.
+Points outside the store's bounds raise `MetadataError`. Pass
+`on_out_of_bounds="ignore"` to drop them or `on_out_of_bounds="expand"` to
+grow the bounds.
 
 ### Reading everything back
 
@@ -237,12 +215,11 @@ True True ()
 1
 ```
 
-`attributes_read` is not decoration: an empty `r.attributes` with
-`attributes_read == False` means *nobody looked*, not *there are none*. It
-comes back `False` on narrowed reads whose reader could not carry the
-attributes.
+An empty `r.attributes` with `attributes_read == False` means the reader did
+not look for attributes, not that there are none. It comes back `False` on
+narrowed reads whose reader cannot carry attributes.
 
-Counting does not have to read anything. `Level` answers from metadata:
+`Level` answers counts from metadata, without reading data:
 
 ```python
 print(ds.level(0).vertex_count, ds.level(0).attribute_names("vertex"))
@@ -293,15 +270,15 @@ ReadResult(kind='point_cloud', vertices=109, attributes=['intensity', 'label'])
 CellSet(8 cell(s))
 ```
 
-For a point cloud the box is vertex-exact: 109 is the true number of points in
-it, not the contents of the chunks it overlaps. `q.cells()` reads nothing and
-returns the grid cells the query touches — eight of them, because a 100–200 µm
-box straddles the 200 µm chunk boundary on every axis.
+For a point cloud the box is vertex-exact: 109 is the number of points in it,
+not the contents of the chunks it overlaps. `q.cells()` reads nothing and
+returns the grid cells the query touches: eight, because the box's upper
+corner lies on the 200 µm chunk boundary on every axis.
 
 ### Narrowing a query
 
-Chaining returns a **new** query; the original is untouched, and two boxes
-intersect geometrically (note the max corner clamped to 200, not 400):
+Chaining returns a new query and leaves the original unchanged. Two boxes
+intersect, so the upper corner below is clamped to 200, not 400:
 
 ```python
 inner = q.select(bbox=((150.0, 150.0, 150.0), (400.0, 400.0, 400.0)))
@@ -340,14 +317,14 @@ point_cloud read: level 0, within 50.0 of [500.0, 500.0, 500.0]
 10 True False
 ```
 
-The sphere really is enforced — the farthest of those 59 points is 49.895 µm
-from the centre — but `explain()` is honest that it costs a bounding-box read
-plus an in-memory filter. `limit()` sets `truncated`, and `complete` goes
-`False` to say the result is not the whole answer.
+The sphere is exact (the farthest of the 59 points is 49.895 µm from the
+centre), and `explain()` shows that it costs a bounding-box read plus an
+in-memory filter. `limit()` sets `truncated`, and `complete` is `False` to say
+the result is not the whole answer.
 
 Two narrowings need a store built for them. `select(objects=…)` needs object
 ids in the store (see [Reading one object by ID](#reading-one-object-by-id));
-against a plain point cloud written without them it fails with a bare
+against a point cloud written without them it fails with
 `KeyError: 'sid_ndim'`. `select(where=…)` needs a store written with
 attribute chunking:
 
@@ -359,8 +336,8 @@ ArrayError: attribute_filter requires a store written with chunk_by_attribute (l
 ### Adding coarser levels
 
 `build_pyramid` adds decimated levels for level-of-detail rendering. Pass
-`chunk_scale_factors=` alongside `factors=`, or every level inherits the root
-chunk shape and `resolution(scale=)` has nothing to distinguish them by:
+`chunk_scale_factors=` alongside `factors=`; without it every level keeps the
+base chunk shape and `resolution(scale=)` cannot tell them apart:
 
 ```python
 ds = zv.open("scan.zarrvectors", mode="r+")
@@ -376,12 +353,9 @@ print(ds.levels)
 (0, 1, 2)
 ```
 
-Re-open the dataset afterwards. The handle that built the pyramid keeps stale
-level metadata — vertex counts are right, but `resolution` still reports the
-base bin size until the store is opened again:
+Each level has its own chunk and bin shape:
 
 ```python
-ds = zv.open("scan.zarrvectors")
 for index in ds.levels:
     level = ds.level(index)
     print(index, level.vertex_count, level.scale, level.resolution)
@@ -423,12 +397,11 @@ print(ds.resolution(scale=200.0).index)
 0
 ```
 
-Whole-level reads at coarse levels are exact. Bounding-box queries against
-coarsened levels currently under-report, so read the level whole and filter in
-memory if you need a region at low resolution.
-
-See [Building pyramids](../tutorials/multiscale/building_pyramids.md) for the
-coarsening strategies and what they preserve.
+:::{warning}
+Bounding-box queries against coarsened levels under-report: they can miss
+points that are inside the box. Whole-level reads are exact, so read the level
+whole and filter in memory when you need a region at low resolution.
+:::
 
 ---
 
@@ -479,8 +452,8 @@ ndarray (40,)
 {'polyline_count': 500, 'vertex_count': 20000, 'chunk_count': 92, 'cross_chunk_link_count': 1878, 'group_count': 2}
 ```
 
-Passing one flat per-vertex array instead of a list fails, and the message
-names nothing useful — if you see this, check the shape of your attributes:
+Passing one flat per-vertex array instead of a list fails with an error that
+does not name the cause. If you see it, check the shape of your attributes:
 
 ```pycon
 >>> flat = rng.uniform(0.0, 1.0, size=20_000).astype(np.float32)   # (20000,) — wrong
@@ -492,9 +465,9 @@ IndexError: invalid index to scalar variable.
 declared geometry kinds — it does not replace `"polyline"`. A store created with
 `kind="polyline"` and written with the flag reports
 `ds.kinds == ('polyline', 'streamline')`, while `ReadResult.kind` and
-`Level.kind` both stay `"polyline"`. Note also that `Schema(kind=...)` is
-recorded, not validated: `zv.create` accepts any string, so a typo becomes a
-store whose declared kind no reader dispatches on.
+`Level.kind` both stay `"polyline"`. `Schema(kind=...)` is recorded, not
+validated: `zv.create` accepts any string, so a typo becomes a store whose
+declared kind no reader dispatches on.
 
 ### Reading a group
 
@@ -514,7 +487,7 @@ print(group.read())
 GroupCatalog(['group_0', 'group_1'])
 ObjectGroup('group_0', id=0, members=250)
 250 [0 1 2 3 4]
-ReadResult(kind='polyline', vertices=10000, parts=250)
+ReadResult(kind='polyline', vertices=10000, parts=250, attributes=['fa'])
 ```
 
 Naming the rows is additive, and makes the store self-describing:
@@ -531,7 +504,7 @@ print(tracts.groups["right"].members[:5])
 ```text
 GroupCatalog(['left', 'right'])
 ['left', 'right']
-ReadResult(kind='polyline', vertices=10000, parts=250)
+ReadResult(kind='polyline', vertices=10000, parts=250, attributes=['fa'])
 [250 251 252 253 254]
 ```
 
@@ -549,16 +522,15 @@ print(tracts.level(0).objects[[42, 43]].part_count)
 ```
 
 ```text
-ReadResult(kind='polyline', vertices=40)
+ReadResult(kind='polyline', vertices=40, attributes=['fa'])
 1 40 (40, 3)
 True
 ObjectCatalog(level=0, count=500, slots=500)
 2
 ```
 
-`polylines[0]` is a real `(40, 3)` array that round-trips the input
-streamline, not a list of per-chunk segments: the result object reassembles
-each streamline before handing it back.
+`polylines[0]` is a `(40, 3)` array equal to the input streamline: the result
+reassembles each streamline from its per-chunk segments.
 
 ### One result type, two geometries
 
@@ -587,16 +559,15 @@ point_cloud (100000, 3) 1 1
 polyline (20000, 3) 500 500
 ```
 
-That last pair of lines is the point: `.positions` is `(N, D)` for both kinds
-and `.polylines` is the derived per-part view — one whole-store part for the
-point cloud, 500 for the tracts. `.part_objects` is one object id *per part*,
-not per vertex.
+In the last two lines, `.positions` is `(N, D)` for both kinds and
+`.polylines` is the per-part view: one whole-store part for the point cloud,
+500 for the tracts. `.part_objects` holds one object id per part, not per
+vertex.
 
 ### Region queries on streamlines
 
-A bounding-box read of a polyline store is chunk-granular and returns **whole**
-streamlines — read it as *"give me the streamlines passing through this
-region"*:
+A bounding-box read of a polyline store is chunk-granular and returns whole
+streamlines: the streamlines that pass through the region.
 
 ```python
 q = tracts.select(bbox=((410.0, 410.0, 410.0), (590.0, 590.0, 590.0)))
@@ -612,17 +583,17 @@ print(int(inside.sum()))
 ```text
 polyline read: level 0, bbox [410.0, 410.0, 410.0]..[590.0, 590.0, 590.0]
   via read_polylines(bbox, level)
-ReadResult(kind='polyline', vertices=1800, parts=45)
+ReadResult(kind='polyline', vertices=1800, parts=45, attributes=['fa'])
 1800 45
 631
 ```
 
 45 streamlines × 40 vertices = 1800 vertices, of which 631 are actually inside
-the box; filter in memory as above if you need vertex-exact geometry. Note
-also that `count()` counts *vertices* for every geometry — use `.part_count`
-or `len(r.polylines)` for a streamline count.
+the box; filter in memory as above if you need vertex-exact geometry.
+`count()` counts vertices for every geometry; use `.part_count` or
+`len(r.polylines)` for a streamline count.
 
-Object ids narrow a region query, and `object_ids()` is a terminal — it reads:
+Object ids narrow a region query. `object_ids()` is a terminal, so it reads:
 
 ```python
 ids = q.object_ids()[:3].tolist()
@@ -639,62 +610,56 @@ print(q.count(), narrow.count())
 [2, 14, 21]
 polyline read: level 0, bbox [410.0, 410.0, 410.0]..[590.0, 590.0, 590.0], 3 object id(s)
   via read_polylines(bbox, level, object_ids)
-ReadResult(kind='polyline', vertices=120, parts=3)
+ReadResult(kind='polyline', vertices=120, parts=3, attributes=['fa'])
 [2, 14, 21]
 1800 120
 ```
 
-An `objects=` id that does not intersect the bbox is dropped rather than
-raising — correct intersection semantics, occasionally surprising.
+An `objects=` id whose object does not cross the box is dropped without an
+error, because the two selections intersect.
 
 ---
 
 ## Format converters
 
-Ingesting from third-party formats (LAS, PLY, CSV, TRK, TCK, TRX, SWC,
-GraphML, OBJ, STL) and exporting back to them lives in the companion
-package **`zarr-vectors-tools`**, alongside the `zarr-vectors` CLI.
+Reading from and writing to third-party formats (LAS, PLY, CSV, TRK, TCK,
+TRX, SWC, GraphML, OBJ, STL) is in the companion package `zarr-vectors-tools`,
+together with its `zvtools` command-line tool. See
+[Ingesting other formats](../tutorials/io/ingest_formats.md).
 
 ---
 
 ## Validation
 
-Validation levels 1–5 check progressively deeper properties of the store. Call
-the module function with a filesystem path:
+Validation levels 1 to 5 check progressively deeper properties of the store:
 
 ```python
-from zarr_vectors.validate import validate
-
-result = validate("scan.zarrvectors", level=3)
+result = ds.validate(level=3)
 print(result.summary())
 print(result.ok, len(result.passed), len(result.warnings), len(result.errors))
 ```
 
 ```text
 Level 3 validation: PASS
-  36 passed, 0 warnings, 0 errors
-True 36 0 0
+  40 passed, 0 warnings, 0 errors
+True 40 0 0
 ```
 
 ```python
-print(validate("scan.zarrvectors", level=5).summary())
-print(validate("tracts.zarrvectors", level=5).summary())
+print(ds.validate(level=5).summary())
+print(tracts.validate(level=5).summary())
 ```
 
 ```text
 Level 5 validation: PASS
-  40 passed, 1 warnings, 0 errors
+  44 passed, 1 warnings, 0 errors
   WARN:  Point cloud but links array exists
 Level 5 validation: PASS
-  26 passed, 0 warnings, 0 errors
+  28 passed, 0 warnings, 0 errors
 ```
 
-(That warning appears because `build_pyramid` wrote a links array into the
-point-cloud store; a freshly written point cloud has none.)
-
-`Dataset.validate(level=...)` is the same check reached from an open dataset —
-it passes its own handle, so it works on any backend. Note that
-`zarr_vectors.validate` is one of the `undecided` modules above. See
+The warning appears because `build_pyramid` wrote a links array into the
+point-cloud store; a freshly written point cloud has none. See
 [Validation](../tutorials/io/validation_and_repair.md) for what each level
 checks.
 
@@ -702,8 +667,8 @@ checks.
 
 ## Versions and capabilities
 
-Three versions matter, and they move independently: the package, the API
-surface, and the on-disk format.
+Three versions move independently: the package, the API surface and the
+on-disk format.
 
 ```python
 ds = zv.open("scan.zarrvectors")
@@ -713,43 +678,41 @@ print(sorted(ds.capabilities), ds.supports("nonempty_chunks"))
 ```
 
 ```text
-(1, 0)
-(0, 9, 1)
+(1, 5)
+(0, 9, 4)
 ['multiscale_links', 'shared_fragments'] False
 ```
 
 The third is `zv.__version__`, the installed package version. It comes from
 setuptools-scm and moves with every commit, so never assert against it.
 
-`capabilities` describes what this particular store can do — the two above
-were added by `build_pyramid`. Assert what you need rather than testing
-version numbers by hand:
+`capabilities` describes what this store can do; `build_pyramid` added the two
+above. Assert what you need instead of comparing version numbers by hand:
 
 ```pycon
 >>> zv.require_format(ds, ">=0.9")     # returns None
 >>> zv.require_format(ds, ">=1.0")
-FormatError: file:///.../scan.zarrvectors is on-disk format 0.9.1, which does not satisfy '>=1.0'. There is no backward-compatible reader: an older store must be rewritten from source, and a newer one needs a newer zarr-vectors.
+FormatError: file:///.../scan.zarrvectors is on-disk format 0.9.4, which does not satisfy '>=1.0'. There is no backward-compatible reader: an older store must be rewritten from source, and a newer one needs a newer zarr-vectors.
 >>> zv.require_api(">=1.0", features=["surfaces", "query-cells"])   # returns None
 >>> zv.require_api(features=["streaming-reads"])
-ImportError: zarr-vectors 1.0 does not provide: streaming-reads. Known features: coarsen-strategy-options, presence-rebuild, query-cells, selection-level-optional, sharded-presence-guard, surfaces, vertex-attributes-on-read.
+ImportError: zarr-vectors 1.5 does not provide: streaming-reads. Known features: array-link-cells, array-manifests, ...
 ```
 
-`require_format` raises a `FormatError` (a `zarr-vectors` exception — the data
-is wrong), while `require_api` raises `ImportError` deliberately: the
-*installation* is wrong, and that is what import machinery reports.
-`zv.FEATURES` lists the feature names it knows.
+`require_format` raises `FormatError`, a `zarr-vectors` exception, because the
+data is wrong. `require_api` raises `ImportError` because the installation is
+wrong. `zv.FEATURES` lists the known feature names.
 
 ---
 
 ## Next steps
 
-- **[Concepts](concepts.md)** — understand chunks, bins, fragments, and
-  the multiscale pyramid before working with larger datasets.
-- **[Choosing a layout](../how_to/choose_chunk_and_bin.md)** —
-  what to pass when the defaults behind `Layout` are not right for your data.
-- **[Data type tutorials](../tutorials/data_types/point_clouds.md)** — deeper
-  walkthroughs for each geometry type.
-- **[Building pyramids](../tutorials/multiscale/building_pyramids.md)** — add
-  multi-resolution levels for level-of-detail rendering.
-- **[Neuroglancer integration](../tutorials/neuroglancer/overview.md)** — visualise
-  your stores in Neuroglancer using `zv-ngtools`.
+- [Core concepts](concepts.md): chunks, bins, fragments and the multiscale
+  pyramid.
+- [Choosing a layout](../how_to/choose_chunk_and_bin.md): what to pass when the
+  `Layout` defaults do not suit your data.
+- [Point clouds](../tutorials/data_types/point_clouds.md) and the other
+  data-type tutorials: each geometry in depth.
+- [Building pyramids](../tutorials/multiscale/building_pyramids.md): the
+  coarsening strategies and what they keep.
+- [View stores in Neuroglancer](../tutorials/neuroglancer/overview.md):
+  open stores in ngplatform.

@@ -3,208 +3,146 @@
 ## Terms
 
 **Polyline**
-: An ordered sequence of vertices connected by consecutive edges:
-  `V_0 — V_1 — V_2 — … — V_{n-1}`. A polyline store holds a collection
-  of such sequences, each identified by an integer object ID.
+: An ordered sequence of vertices joined by consecutive edges,
+  `V_0 — V_1 — … — V_{n-1}`. A polyline store holds a collection of such
+  sequences; each is one object, identified by its index in the input list.
 
 **`GEOM_POLYLINE`**
-: The geometry type constant `"polyline"`.
-
-**Object ID**
-: A non-negative integer uniquely identifying a polyline within the store.
-  Object IDs are assigned at write time and are stable across reads.
+: The geometry type constant `"polyline"`, stored in the `geometry_types`
+  list of the root attributes.
 
 **Object manifest**
-: The set of `(chunk_coord, fragment_indices)` pairs that together contain all
-  vertices of a given object. Encoded in the `object_index/` array. See
+: The list of `(chunk, fragment_index)` pairs that together hold one
+  object's vertices, stored in `object_index/`. See
   [Object manifest](../object_model/object_manifest.md).
 
-**Bridge**
-: A stored connection between the last vertex of a polyline segment in
-  chunk A and the first vertex of the continuation segment in chunk B.
-  Written when a polyline spans multiple chunks. A bridge is an ordinary
-  record in the one link family, distinguished only by having non-zero
-  offsets — see [Links](../object_model/links.md).
-
----
+**Cross-chunk link**
+: A link record joining the last vertex of a polyline's run in one chunk to
+  the first vertex of its next run in another chunk.
 
 ## Introduction
 
-The `polyline` type extends `line` with an ordered path of arbitrary
-length: each polyline is a named, addressable entity that can be
-retrieved by ID. Polylines may span multiple spatial chunks; links with
-non-zero offsets preserve inter-chunk connectivity.
+The `polyline` type stores ordered paths of any length. Each path is an
+object that can be read by id, assigned to groups and given per-path
+attributes (length, label, confidence).
 
-Use `polyline` over `line` whenever you need to:
-- Retrieve individual paths by ID.
-- Assign paths to named groups.
-- Preserve path topology across chunk boundaries.
-- Store per-path metadata (length, label, confidence).
+Connectivity follows `links_convention: implicit_sequential`: within a
+fragment, consecutive vertices are joined by definition, so no link record
+is stored for them. The writer splits each polyline where it crosses a chunk
+boundary; each run of consecutive vertices in one chunk becomes one fragment,
+and consecutive runs are joined by a cross-chunk link. A polyline that crosses
+chunk boundaries *n* times has *n + 1* fragments, listed in path order in its
+manifest, and *n* cross-chunk links.
 
-Use `streamline` instead of `polyline` when the paths are MRI tractography
-streamlines and you need to store tractography-specific metadata (step size,
-seeding strategy, propagation algorithm).
-
----
+[`streamline`](streamline.md) stores the same layout under a different
+geometry type.
 
 ## Technical reference
 
 ### Arrays present
 
-| Array path | Required | Description |
-|-----------|----------|-------------|
-| `vertices/` | Yes | Vertex positions |
-| `vertex_fragments/` | Yes | Fragment index over `vertices/` rows |
-| `object_index/` | Yes | Per-object manifest blobs naming fragments |
-| `links/0/<offsets>/` | Only when a polyline spans chunks | Bridges joining consecutive segments; offsets always non-zero |
-| `attributes/<name>/` | No | Per-vertex attributes |
-| `object_attributes/<name>/` | No | Per-polyline attributes |
-| `groupings/` | No | Group ID → [object IDs] |
+At level 0 of a store written by `write_polylines`:
 
-There is no `cross_chunk_links/` array — that family was merged into
-`links/`. A store whose polylines each sit within one chunk has **no
-`links/` group at all**; see *Why polylines have no intra-chunk links*
-below.
+| Path | Present | Description |
+|------|---------|-------------|
+| `vertices/` | Always | Vertex positions, each fragment in path order |
+| `vertex_fragments/` | Always | Fragment index over `vertices/` rows |
+| `object_index/` | Always | One manifest per polyline |
+| `links/0/<offsets>/` | When a polyline crosses a chunk | Cross-chunk links, in non-zero-offset arrays only |
+| `vertex_attributes/<name>/` | With `vertex_attributes=` | One row per vertex |
+| `object_attributes/<name>/` | With `object_attributes=` | One row per polyline |
+| `fragment_attributes/<name>/` | With `fragment_attributes=` | One row per fragment |
+| `groups/` | With `groups=` | Group id → object ids |
+| `group_attributes/<name>/` | With `group_attributes=` | One row per group |
 
-### Vertex ordering within a chunk
+A store whose polylines each sit in one chunk has no `links/` group. The link
+family is undirected with `store: "canonical"`, so each cross-chunk link is
+stored once, under the lexicographically positive offset; see
+[Links](../object_model/links.md).
 
-For a polyline that contributes vertices to multiple bins within a chunk,
-its vertices appear in multiple fragments. Within each fragment, vertices are stored in
-traversal order (from the start of the polyline toward the end).
+### Root attributes
 
-Across fragments within the same chunk, vertices from different
-polylines may be interleaved. A fragment holds one contiguous run of a
-single polyline's vertices, in traversal order.
+A polyline store has no type-specific root keys. The writer sets these values
+in the `zarr_vectors` block (see [Root metadata](../layout/root_metadata.md)):
 
-### Why polylines have no intra-chunk links
+```json
+{
+  "geometry_types": ["polyline"],
+  "links_convention": "implicit_sequential",
+  "object_index_convention": "standard",
+  "cross_chunk_strategy": "explicit_links"
+}
+```
 
-`polyline` uses `links_convention: implicit_sequential`. Within a
-fragment, **vertex order is the topology**: consecutive vertices are
-connected by definition, so a consecutive pair needs no link record.
-
-The all-zero-offsets (intra-chunk) array would therefore never hold a
-row, and `write_polylines` does not create a links array up front.
-`write_links` creates exactly the non-zero-offset arrays the bridges
-land in. **Every link record in a `polyline` store has non-zero
-offsets.**
-
-### Bridges in `links/0/<offsets>/`
-
-A bridge is written when a polyline's traversal leaves one chunk and
-enters another. Each record is two `(chunk, vertex_index)` endpoints:
-the last vertex of the segment in chunk A and the first vertex of the
-continuation in chunk B. `vi_k` is local to chunk `src + o_k`, so the
-second endpoint's index is local to the chunk the offsets name — not to
-the source.
-
-The family is written with the default policy — undirected,
-`store="canonical"` — so each bridge is stored once, under the
-lexicographically positive offset, with `perm_idx` recovering the
-original traversal direction.
-
-A polyline crossing chunks *n* times yields *n* bridges; its vertices
-are distributed across *n + 1* fragments, which `object_index/` lists in
-traversal order.
-
-### Write API
+### Write and read API
 
 ```python
 import numpy as np
-from zarr_vectors.types.polylines import write_polylines
+from zarr_vectors.building import write_polylines
+from zarr_vectors.types.polylines import read_polylines
 
 rng = np.random.default_rng(0)
 polylines = [
-    rng.normal(0, 50, (rng.integers(10, 60), 3)).cumsum(0).astype(np.float32)
-    for _ in range(1000)
+    (rng.uniform(100, 400, 3) + rng.normal(0, 5, (rng.integers(10, 60), 3)).cumsum(0)).astype(np.float32)
+    for _ in range(100)
 ]
+lengths = np.array(
+    [np.linalg.norm(np.diff(p, axis=0), axis=1).sum() for p in polylines], dtype=np.float32,
+)
 
-write_polylines(
+summary = write_polylines(
     "paths.zarrvectors",
     polylines,
-    chunk_shape=(200.0, 200.0, 200.0),
-    bin_shape=(50.0, 50.0, 50.0),
-    # Optional group assignment
-    groups={
-        "group_A": list(range(500)),
-        "group_B": list(range(500, 1000)),
-    },
-    # Optional per-polyline attributes
-    object_attributes={
-        "length": np.array([np.sum(np.linalg.norm(np.diff(p, axis=0), axis=1))
-                            for p in polylines], dtype=np.float32),
-    },
+    chunk_shape=(100.0, 100.0, 100.0),
+    geometry_type="polyline",          # the default is "streamline"
+    groups={0: list(range(50)), 1: list(range(50, 100))},
+    group_attributes={"label": np.array([7, 9], dtype=np.int32)},
+    object_attributes={"length": lengths},
 )
-```
+print(summary)
+# {'polyline_count': 100, 'vertex_count': 3180, 'chunk_count': 63,
+#  'cross_chunk_link_count': 344, 'group_count': 2}
 
-### Read API
-
-```python
-from zarr_vectors.types.polylines import read_polylines
-
-# All polylines
 result = read_polylines("paths.zarrvectors")
-print(result["polyline_count"])        # 1000
-print(len(result["polylines"]))        # list of (N_i, D) arrays
+print(result["polyline_count"], result["vertex_count"])   # 100 3180
+first = np.concatenate(result["polylines"][0])     # one array per run
+print(len(result["polylines"][0]), np.array_equal(first, polylines[0]))   # 3 True
 
-# By object ID
-result = read_polylines("paths.zarrvectors", object_ids=[0, 5, 42])
-print(result["polyline_count"])        # 3
-
-# By group
-result = read_polylines("paths.zarrvectors", group_ids=["group_A"])
-print(result["polyline_count"])        # 500
-
-# Spatial bbox
-result = read_polylines(
+print(read_polylines("paths.zarrvectors", object_ids=[0, 5, 42])["polyline_count"])   # 3
+print(read_polylines("paths.zarrvectors", group_ids=[0])["polyline_count"])           # 50
+print(read_polylines(
     "paths.zarrvectors",
-    bbox=(np.array([0., 0., 0.]), np.array([100., 100., 100.])),
-)
-# Returns all polylines that have at least one vertex in the bbox.
-# Full polyline geometry is returned (not clipped to bbox).
+    bbox=(np.array([0.0, 0.0, 0.0]), np.array([200.0, 200.0, 200.0])),
+)["polyline_count"])   # 38
 ```
 
-### Spatial query semantics
+`read_polylines` takes `level=`, `object_ids=`, `group_ids=`, `bbox=`,
+`chunks=` and `attribute_filter=`, and returns:
 
-A bbox query on a polyline store returns the complete geometry of every
-polyline that has at least one vertex in the bbox. The full vertex sequence
-(including portions outside the bbox) is returned. This is necessary to
-preserve path continuity.
+| Key | Type | Description |
+|-----|------|-------------|
+| `polylines` | `list[list[ndarray]]` | Per polyline, its runs in path order; concatenate them for the whole path |
+| `object_ids` | `ndarray` | Object id of each returned polyline |
+| `vertex_attributes` | `dict[str, ndarray]` | Per-vertex attributes, concatenated over the result |
+| `ndim` | `int` | Spatial dimensionality |
+| `polyline_count` | `int` | Polylines returned |
+| `vertex_count` | `int` | Vertices returned |
 
-To clip polylines to the bbox (return only the vertices inside), pass
-`clip=True`:
-
-```python
-result = read_polylines("paths.zarrvectors",
-                        bbox=(lo, hi), clip=True)
-```
-
-Clipped polylines that cross the bbox boundary are split at the boundary;
-the result may contain more polylines than the input if a single path
-enters and exits the bbox multiple times.
-
-### Groupings
-
-Groups are named collections of object IDs. The `groupings/` array stores
-the group → object mapping. Group IDs may be integers or strings (stored
-as a separate string lookup table in `groupings_attributes/name/`).
+A `bbox=` read returns the whole of every polyline with a run in a chunk
+the box touches, so paths are not cut at the box. A `chunks=` read returns
+only the runs stored in the named chunks, and each unbroken stretch of them
+comes back as its own polyline, so `polyline_count` can exceed the number of
+objects.
 
 ### Validation
 
-L1: `vertices/` exists at every level. `object_index/` and `links/` are
-recorded when present but are **not** required at L1.
+- L1: `vertices/` missing at a level is an error. `object_index/` and
+  `links/` are not required.
+- L3: each manifest entry names a chunk present at the level and a fragment
+  index below that chunk's fragment count. Each `links/0/` offsets name
+  parses, no offset is lexicographically negative and the offsets are
+  non-decreasing. Each record's chunks exist at the level.
+- L4: `links_convention` other than `implicit_sequential` is an error.
 
-L3:
-- Every manifest entry names a chunk present at the level and a
-  `fragment_index` below that chunk's fragment count.
-- Every `links/0/` offsets segment parses, and — the family being
-  undirected, canonical, and intra-level — each offset is
-  lexicographically non-negative and offsets are non-decreasing.
-- Every record's endpoints name chunks present at the level.
-
-L4: `links_convention` MUST be `implicit_sequential` for `polyline`.
-
-Gap detection (a vertex with no outgoing edge that is not a polyline's
-last vertex) is **not** implemented at any level. Neither is a check
-that bridges reference valid vertex indices *within* the endpoint
-chunk — only the chunk's existence is checked. See
-[Validation overview](../validation/overview.md).
+No level checks that a link's vertex index exists within its chunk, or that
+a polyline's runs join up. See [Validation overview](../validation/overview.md).

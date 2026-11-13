@@ -1,27 +1,12 @@
 # Links
 
-```{admonition} Format change in Zarr Vectors 0.9.0
-:class: note
-
-Prior to 0.9.0 connectivity was split across two families:
-`links/<delta>/` (intra-chunk) and `cross_chunk_links/<delta>/`
-(inter-chunk, keyed by endpoint-chunk tuples), each with its own
-parallel attribute family. **Both `cross_chunk_links/` and
-`cross_chunk_link_attributes/` are gone.** Connectivity is now one
-family, `links/<delta>/<offsets>/`, in which an intra-chunk link is
-simply a link whose relative offsets are all zero.
-
-Stores written before 0.9.0 are not readable by 0.9+ readers; rewrite
-from source.
-```
-
 ## Terms
 
 **Link**
 : A record of `link_width` (`L`) endpoints. `L = 2` is an edge, `L = 3`
-  a triangle face, `L = 1` a parent→child reference used by pyramid
-  metanode drill-down. Endpoints may live in different spatial chunks
-  and, when `delta != 0`, at different resolution levels.
+  a triangle face, `L = 1` a single-vertex reference. Endpoints may live
+  in different spatial chunks and, when `delta != 0`, at different
+  resolution levels.
 
 **Source chunk**
 : The chunk of the endpoint a record is *filed under* — the array cell
@@ -53,7 +38,7 @@ from source.
 
 ## Introduction
 
-Connectivity lives in exactly one family per resolution level:
+Each level stores its connectivity in one family per level delta:
 
 ```
 links/<delta>/                             GROUP  — family-wide policy
@@ -68,10 +53,8 @@ endpoints sit, each array is a plain rank-D vlen array over the level's
 chunk grid — one cell per source chunk — and each stored `vi_k` is a
 vertex index *local to chunk* `src + o_k`.
 
-That factoring is what collapses the old two-family design. An
-intra-chunk link is a link whose offsets are all zero; a cross-chunk
-link is one whose offsets are not. They differ in a directory name, not
-in kind.
+An intra-chunk link and a cross-chunk link differ only in the
+`<offsets>` directory they are filed under.
 
 This page documents:
 
@@ -144,10 +127,11 @@ name invariants, enforced by the L3 validator — see
 
 ### Placement: the source-anchored cell
 
-Where a record goes is decided in exactly one place:
-[`partition_records_by_offset`](../../../zarr_vectors/spatial/boundary.py),
-which for each record consults `_cell_placements` for the storage
-permutations `sigma` it is filed under. For each `sigma`:
+Where a record goes is defined by `_cell_placements` in
+[`zarr_vectors/spatial/boundary.py`](../../../zarr_vectors/spatial/boundary.py),
+which gives the storage permutations `sigma` a record is filed under
+(`partition_records_by_offset` applies it to records,
+`partition_link_arrays` to records held as arrays). For each `sigma`:
 
 - the **source** is endpoint `sigma[0]`; its chunk is the array cell;
 - the **offsets** are `chunk(sigma[k]) - anchor(source)` for `k > 0`
@@ -188,17 +172,11 @@ So `has_perm` is true exactly when the record is **non-intra AND
 The three false cases are forced identity placements:
 
 - **Intra-chunk** — all endpoints share the source chunk, so there is
-  nothing to canonicalise. Sorting would reorder endpoints and cost a
-  column that is always `0`. Preserving input order here is also what
-  keeps the all-zero-offsets array byte-identical to the pre-merge
-  `links/<delta>/` (polyline traversal order is data).
+  nothing to canonicalise, and input order is kept (polyline
+  traversal order is data).
 - **Cross-level (`delta != 0`)** — endpoints are distinguished by
   *level*, not by coord order, so the source is always input endpoint 0.
 - **Directed canonical** — input order is data and is preserved as-is.
-
-Storing `perm_idx` unconditionally would add 8 bytes to every
-intra-chunk link — the overwhelming majority of rows — for a value that
-is always zero.
 
 ### Cell encoding: two branches, one condition
 
@@ -209,10 +187,6 @@ cell encoding on exactly one condition — `delta == 0 and is_intra(offsets)`:
 |-----------|----------|---------|
 | `delta == 0` **and** offsets all zero | flat concatenated rows (`encode_ragged_ints`) | `link_fragments/<chunk>` |
 | otherwise | inline self-describing ragged blob (`encode_ragged_blob`) | none |
-
-That single condition reproduces **both** pre-merge layouts: the
-all-zero array is byte-identical to the old `links/<delta>/`, and every
-other offsets array matches the old `cross_chunk_links/<delta>/` cells.
 
 The flat branch's per-group row ranges live in the sibling
 [`link_fragments/<chunk>`](../layout/fragment_index_arrays.md) index.
@@ -238,8 +212,8 @@ corrupt them. Appending with a conflicting policy raises `ArrayError`.
   endpoints are canonical-sorted by `(chunk_coords, vi)`, which is what
   makes the stored offset lexicographically positive — so each record is
   stored exactly once. `perm_idx` recovers input order.
-- `true` (directed): endpoint order **is** data — streamline
-  predecessor→successor, skeleton child→parent. No sort: input order is
+- `true` (directed): endpoint order **is** data, as in a pyramid's
+  fine→coarse links. No sort: input order is
   kept, so `A→B` and `B→A` file under **opposite offsets** (`0.0.+1` vs
   `0.0.-1`) at **different cells**, and `perm_idx` is absent (implicitly 0).
 
@@ -267,6 +241,16 @@ All four combinations are valid:
 Note the bottom-right row: `duplicate` implies `perm_idx` **even when
 directed**, because each copy leads with a different endpoint, so `sigma`
 varies per copy and input order must still be recoverable.
+
+### Endpoint order of skeleton links
+
+The two skeleton writers store `delta == 0` links with different
+policies and endpoint orders:
+
+| Writer | Family policy | Intra-chunk rows | Cross-chunk records |
+|--------|---------------|------------------|---------------------|
+| `write_graph(..., kind="skeleton")` | `directed: false`, `canonical` | `[child, parent]` | canonical-sorted with `perm_idx`; `read_links` returns `[child, parent]` |
+| `write_skeleton_chunk` and `write_skeleton_cross_chunk_links` | `directed: true`, `canonical` | `[child, parent]` | `[parent, child]`, no `perm_idx` |
 
 ### Cross-level placement: the anchor
 
@@ -310,7 +294,7 @@ o      = c_trg - anchor              # decode: c_trg = anchor + o
 
 where `r_L` is level `L`'s `chunk_shape` as an integer multiple of the
 root `chunk_shape` (see
-[`chunk_scale_factor`](../../../zarr_vectors/core/metadata.py)).
+[`chunk_scale_from_root`](../../../zarr_vectors/core/metadata.py)).
 
 This is a **strict generalisation, not a branch**: when `r_src == r_trg`
 — same level, or any pyramid built with the default
@@ -354,7 +338,7 @@ records.
 **`links/<delta>/` — family group.** Policy every offsets array under it
 must agree on:
 
-```jsonc
+```javascript
 {
   "zv_array":    "links_family",
   "level_delta": 0,
@@ -362,8 +346,6 @@ must agree on:
   "directed":    false,
   "store":       "canonical",
   "sid_ndim":    3,
-
-  // Added by finalize_links (absent until it runs):
   "num_links":            12,   // logical record count
   "num_physical_records": 12    // on-disk rows; > num_links under "duplicate"
 }
@@ -372,8 +354,9 @@ must agree on:
 **`links/<delta>/<offsets>/` — array.** Only what decodes this array's
 own cells:
 
-```jsonc
+```javascript
 {
+  "nonempty_chunks": ["0.0.0", "1.0.0"],  // cells that hold data
   "zv_array":    "links",
   "dtype":       "int64",
   "offsets":     [[0, 0, 1]],   // parsed form of the path segment
@@ -383,55 +366,48 @@ own cells:
 }
 ```
 
-Readers trust the stored `has_perm`, falling back to recomputing it from
-the family policy for an array written before it was stamped — guessing
-would mis-parse every row in the cell. The `offsets` field and the path
+`read_links` trusts the stored `has_perm` and recomputes it from the
+family policy only for an array that does not state it. The `offsets` field and the path
 segment agree; the field is preferred because decoding it needs no
 `sid_ndim`.
 
 **`link_attributes/<name>/<delta>/` — family group:**
 
-```jsonc
-{ "zv_array": "link_attribute_family", "name": "weight", "level_delta": 0 }
+```javascript
+{ "zv_array": "link_attribute_family", "name": "weight", "level_delta": 0, "num_links": 8 }
 ```
 
 **`link_attributes/<name>/<delta>/<offsets>/` — array:**
 
-```jsonc
+```javascript
 {
+  "nonempty_chunks": ["0.0.0", "1.0.0"],
   "zv_array":    "link_attribute",
   "name":        "weight",
   "dtype":       "float32",
-  "offsets":     [[0, 0, 1]],
-  "level_delta": 0
+  "offsets":     [[1, 0, 0]],
+  "level_delta": 0,
+  "row_shape":   []             // per-record shape; [] for a scalar
 }
 ```
 
-### Counts and finalization
+### Counts and finalisation
 
 `num_links` is the **logical** record count (one per input record);
 `num_physical_records` is the on-disk row count. They are equal for a
 `canonical` family and differ under `duplicate`.
 
 [`write_links`](../../../zarr_vectors/core/arrays.py) maintains both.
-The decentralized per-cell writers (`write_link_cells`) do not: they
-leave the counts absent for a single
+The decentralised per-cell writers (`write_link_cells`) do not: they
+leave the counts for a single
 [`finalize_links`](../../../zarr_vectors/core/arrays.py) pass to
 reconcile. `finalize_links` recovers the logical count under `duplicate`
 by deduplicating decoded records, since every physical copy decodes to
 the same input-order endpoints.
 
-```{important}
-`finalize_links` must run **before** `shard_store`. It rebuilds each
-array's `nonempty_chunks` manifest via `derive_nonempty_chunks`, which
-is unsharded-only — a shard packs many cells into one object whose inner
-index is not derivable from key names. See
-[Sharding](../chunking/sharding.md).
-```
-
-**Decentralized writes.** Race-freedom rests on the flat layout: each
-cell is its own object, so workers writing **disjoint** cells never touch
-the same file. A cell *is* a source chunk, so giving each worker
+**Decentralised writes.** In an unsharded array each cell is its own
+object, so workers writing **disjoint** cells never touch the same
+object. A cell *is* a source chunk, so giving each worker
 ownership of a disjoint set of source chunks makes every cell the
 property of exactly one worker. Per-cell RMW is **not** safe for two
 workers hitting the same cell. Workers pass `record_presence=False` —
@@ -445,7 +421,7 @@ offsets array.
 
 ```python
 from zarr_vectors.core.store import get_resolution_level, open_store
-from zarr_vectors.core.arrays import (
+from zarr_vectors.building import (
     read_links,               # every record under links/<delta>/
     read_links_for_tuple,     # only records spanning an exact L-chunk tuple
     read_link_attributes,
@@ -461,7 +437,7 @@ records = read_links(lg, delta=0)                       # intra + cross, one fam
 weights = read_link_attributes(lg, "weight", delta=0)   # row-aligned to records
 
 # Which deltas / offset arrays exist?
-print(list_link_deltas(lg))            # e.g. [0, +1]
+print(list_link_deltas(lg))            # e.g. [0, 1]
 print(list_link_offsets(lg, 0))        # intra sorts LAST — see Enumeration order
 ```
 
@@ -482,14 +458,12 @@ loudly with `ArrayError`. Chunk *spacing* may differ between levels —
 that is exactly what [the anchor](#cross-level-placement-the-anchor)
 handles — but the chunk-key arity does not.
 
-### Mixed-resolution records — current limitation
+### One level delta per record
 
-`<delta>` is **uniform** across the non-source endpoints of a record:
-endpoints `1..L-1` all live at `owning_level + delta`. A triangle with
-vertices at levels `(N, N, N+1)` cannot be expressed. A future revision
-could promote each endpoint to a `(level_delta, chunk_offset, vi)`
-triple, extending the offsets segment by one component per endpoint; the
-`perm_idx` and blob conventions carry over unchanged.
+`<delta>` is uniform across the non-source endpoints of a record:
+endpoints `1..L-1` all live at `owning_level + delta`. A record whose
+endpoints span three levels, such as a triangle at levels `(N, N, N+1)`,
+cannot be stored.
 
 ### Validation
 

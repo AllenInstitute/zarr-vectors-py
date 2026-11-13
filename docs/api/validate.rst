@@ -1,13 +1,12 @@
 Validation
 ==========
 
-Five-level conformance validator for Zarr Vectors stores. See
-:doc:`/spec/validation/overview` for a full description of each level.
+Conformance validator for Zarr Vectors stores, with levels 1 to 5, each
+including the ones below it. See :doc:`/spec/validation/overview` for what each
+level checks.
 
-``zarr_vectors.validate`` is *undecided* tier in
-``zarr_vectors/_stability.py``: "Stable in practice and widely used, but its
-result objects have never been given a compatibility promise." Treat it as
-internal until that promise is made.
+``zarr_vectors.validate`` is in the *undecided* tier: its result objects have
+no compatibility promise, so treat it as internal.
 
 .. automodule:: zarr_vectors.validate
    :members:
@@ -28,6 +27,7 @@ Individual validation modules
 .. automodule:: zarr_vectors.validate.structure
    :members:
    :undoc-members:
+   :exclude-members: ValidationResult
 
 .. automodule:: zarr_vectors.validate.metadata
    :members:

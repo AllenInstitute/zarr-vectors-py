@@ -1,157 +1,144 @@
 # Spec change process
 
+This page describes how a change to the Zarr Vectors format is
+proposed, what a format change has to update in this repository, and
+the standard every spec page follows.
+
 ## Terms
 
-**RFC (Request for Comments)**
-: A structured discussion issue proposing a change to the Zarr Vectors specification.
-  An RFC is required before opening a PR that changes the format
-  (`.zattrs` schema, array schemas, validation rules, or geometry type
-  definitions). Code-only changes (bug fixes, new ingest formats, new
-  export targets) do not require an RFC.
+**Format change**
+: A change to what a store contains or means: a key in the root, level
+  or array attributes, an array's layout or cell encoding, a geometry
+  type, or a validation rule.
+
+**RFC (request for comments)**
+: A GitHub issue, titled with the prefix `[RFC]`, that proposes a
+  format change before it is implemented.
+
+**Format version**
+: The `zv_version` value in the root `zarr_vectors` block, written from
+  `FORMAT_VERSION` in `zarr_vectors/constants.py` (`"0.9.4"`). It has
+  the form `X.Y` or `X.Y.Z`.
 
 **Breaking change**
-: A spec change that makes existing valid stores invalid, or that changes
-  the semantics of existing keys in a backward-incompatible way. Breaking
-  changes require incrementing the spec version and providing a migration
-  path.
+: A format change after which this package cannot read stores written
+  before it, or reads them with a different meaning.
 
 **Additive change**
-: A spec change that adds new optional keys, new geometry types, or new
-  validation levels without affecting the validity of existing stores.
-  Additive changes do not require a version increment.
-
-**Spec version**
-: The value of `zarr_vectors_version` in root `.zattrs`. Current version:
-  `"1.0"`. Spec versions follow semantic versioning: `MAJOR.MINOR`.
-  Breaking changes increment `MAJOR`; additive changes increment `MINOR`.
+: A format change that adds something optional, such as a new key or a
+  new [format capability](../layout/root_metadata.md), and leaves
+  existing stores readable with their meaning unchanged.
 
 ---
 
 ## Introduction
 
-The Zarr Vectors specification is a living document. The format will evolve as new
-use cases emerge, as implementation experience reveals design issues, and
-as the broader Zarr and OME-Zarr ecosystems change. This page documents
-the process for proposing, discussing, and ratifying specification changes.
-
-The process is designed to balance agility (changes should be possible without
-months of committee process) with stability (existing stores should not
-silently break after a spec update). The RFC step ensures that non-trivial
-changes are discussed before implementation, catching design issues early.
+Format changes are discussed in an RFC before code is written, so that
+design problems are found while they are cheap to fix and so that
+existing stores do not change meaning without notice. Changes that do
+not touch the format go straight to a pull request.
 
 ---
 
 ## Technical reference
 
-### When an RFC is required
+### When an RFC is needed
 
-**RFC required:**
-- Adding, renaming, or removing a required or optional key in root `.zattrs`
-  or per-level `.zattrs`.
-- Changing the dtype, shape, or semantics of any array defined in the spec.
-- Adding a new geometry type.
-- Adding or modifying validation rules.
-- Changing the coordinate transform encoding or multiscale metadata schema.
-- Any change that would cause existing L1–L3 validators to produce different
-  results on existing stores.
+An RFC is needed for:
 
-**RFC not required (direct PR acceptable):**
-- Bug fixes in `zarr-vectors-py` that do not change the format.
-- New ingest formats (TRK, TRX, LAS variants, etc.).
-- New export targets.
-- Documentation improvements (including this spec).
-- New CLI commands or API convenience functions.
-- Performance improvements that do not change the on-disk format.
+- adding, renaming or removing a key in the root, level or array
+  attributes;
+- changing an array's data type, shape, cell encoding or meaning;
+- adding a geometry type (see
+  [Adding a geometry type](adding_geometry_types.md));
+- adding or changing a validation rule, or any change that makes the
+  validator give a different result on an existing store;
+- changing the `multiscales` block or the `ome` node.
+
+No RFC is needed for bug fixes that leave the format unchanged, new
+ingest or export formats, new API functions, performance work that
+leaves the stored bytes unchanged, or documentation.
 
 ### RFC process
 
-**Step 1 — Open a discussion issue.**
+1. **Open an issue** in the
+   [`zarr-vectors-py` repository](https://github.com/AllenInstitute/zarr-vectors-py)
+   with the title prefix `[RFC]` and these sections:
 
-Open an issue in the `zarr-vectors-py` GitHub repository with title prefix
-`[RFC]`. The issue body should include:
+   ```markdown
+   ## Motivation
+   What use case needs the change.
 
-```markdown
-## Motivation
-Why is this change needed? What use case does it address?
+   ## Proposed change
+   What changes in the format, with example JSON or pseudocode.
 
-## Proposed change
-What exactly should change in the spec? Include proposed JSON examples,
-schema diffs, or pseudocode.
+   ## Compatibility
+   Whether existing stores stay readable, and what happens to them if not.
 
-## Backward compatibility
-Is this a breaking change? If so, how will existing stores be migrated?
+   ## Alternatives considered
+   Other designs and why they were not chosen.
+   ```
 
-## Alternatives considered
-What other approaches were considered and why were they rejected?
-```
+2. **Discussion.** The issue stays open for at least 14 days for an
+   additive change and 30 days for a breaking change.
+3. **Acceptance.** The RFC is accepted when at least two maintainers
+   approve it in the issue, and is labelled `accepted`.
+4. **Implementation pull request** (see below).
+5. **Merge** after approval from at least two maintainers and a passing
+   test workflow.
 
-**Step 2 — Discussion period.**
+### What an implementation pull request updates
 
-The discussion period is a minimum of **14 days** for additive changes
-and **30 days** for breaking changes. During this period, maintainers and
-community members may propose modifications or raise concerns.
+- The code that writes and reads the change, under `zarr_vectors/`.
+- `FORMAT_VERSION` in `zarr_vectors/constants.py`, and the test that
+  pins it (`test_format_version_is_0_9_4` in
+  `tests/test_linkml_schema.py`).
+- The validator in `zarr_vectors/validate/`, when a rule changes.
+- The LinkML schema `schema/zarr_vectors.linkml.yaml`, followed by
+  `python schema/regen.py` to regenerate the JSON Schema and Markdown
+  reference (see the [machine-readable schema](../schema.md)).
+- Tests under `tests/` (see [Compliance testing](test_compliance.md)).
+- The spec pages under `docs/spec/` that describe the changed part.
 
-**Step 3 — Ratification.**
+### Breaking changes
 
-An RFC is ratified when at least two maintainers have explicitly approved
-it (GitHub 👍 reaction or comment). Once ratified, the RFC is labelled
-`accepted` and a PR may be opened.
+`RootMetadata.validate` (`zarr_vectors/core/metadata.py`) refuses a
+store whose `zv_version` is older than the oldest layout this package
+reads (`0.9.0`) with a `MetadataError` that names the
+version. A breaking change moves that bound and must say, in the RFC,
+how users rewrite their stores.
 
-**Step 4 — Implementation PR.**
+A change that only some readers can handle can instead be declared as
+a format capability: a store lists it in `format_capabilities`, and in
+`required_capabilities` when a reader that does not implement it must
+refuse the store. See [Root metadata](../layout/root_metadata.md).
 
-The implementation PR must:
-- Update the relevant spec pages in `docs/spec/`.
-- Update the validator to reflect new rules.
-- Add or update reference fixtures (see
-  [Compliance testing](test_compliance.md)).
-- Update the write functions to produce conforming stores.
-- Include a changelog entry.
+### Pull request conventions
 
-**Step 5 — Merge.**
-
-The PR requires approval from at least two maintainers and passing CI
-(all tests, including compliance tests against reference fixtures).
-
-### Breaking changes and migration
-
-When a breaking change is ratified, the spec version `MAJOR` component
-is incremented. The implementation PR must also:
-
-- Add a migration guide to `docs/how_to/migrate_v<old>_to_v<new>.md`.
-- Add a `zarr-vectors migrate` CLI command that upgrades existing stores.
-- Ensure the validator produces a clear, actionable error message for
-  stores at the old version.
-
-Stores at version `1.x` are not required to be readable by a `2.x`
-implementation without explicit migration.
-
-### PR etiquette
-
-- Reference the RFC issue number in the PR description.
-- Keep format changes and code changes in separate commits for clarity.
-- Do not mix spec changes with unrelated bug fixes in the same PR.
-- Respond to review comments within a reasonable time (one week is a
-  reasonable expectation for active contributors).
-- If a PR is stalled (no activity for 30 days), a maintainer may close it
-  with an invitation to reopen when the contributor is available.
+- Link the RFC issue from the pull request.
+- Keep format changes and unrelated fixes in separate pull requests.
+- The test workflow runs on a pull request from an author who is not
+  a repository owner, member or collaborator only after a maintainer
+  adds the `ci-approved` label.
 
 ### Spec documentation standards
 
-All spec pages follow the template documented in the
-[spec overview](../index.md): Terms → Introduction → Technical reference.
-When adding a new spec page:
+Every page in `docs/spec/` follows the same template:
 
-- Define all terms used on the page in the Terms section.
-- Write the Introduction at a level accessible to a competent Python
-  developer who is new to Zarr Vectors.
-- Include full JSON examples, pseudocode, or worked numerical examples
-  in the Technical reference.
-- Add a Validation subsection listing which checks apply and at which level.
-- Cross-link to related pages using relative Markdown links.
+- **Terms**: defines each term the page uses.
+- **Introduction**: what the part of the format is for, written for a
+  Python developer new to Zarr Vectors.
+- **Technical reference**: JSON examples of the stored metadata, the
+  rules, worked examples, and a **Validation** subsection that lists
+  the checks that apply and their level, checked against
+  `zarr_vectors/validate/`.
 
-### Contacting the maintainers
+Link to related pages with relative Markdown links, describe the format
+as it is, and run every code example against the package before
+publishing it.
 
-For questions about whether a change requires an RFC, or to discuss a
-potential contribution before writing a full RFC, open a
-[GitHub Discussion](https://github.com/AllenInstitute/zarr-vectors-py/discussions)
-in the "Ideas" or "Q&A" category.
+### Contact
+
+To ask whether a change needs an RFC, or to discuss an idea first, open
+an issue in the
+[`zarr-vectors-py` repository](https://github.com/AllenInstitute/zarr-vectors-py).
