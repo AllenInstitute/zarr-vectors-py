@@ -70,3 +70,33 @@ def test_draco_quads_rejected_before_creation(tmp_path):
         write_mesh(path, v, np.array([[0, 1, 2, 3]]), chunk_shape=(50.0,) * 3,
                    encoding="draco")
     assert not path.exists()
+
+
+# --- iter_link_cells reads the stored has_perm stamp ---------------------
+
+def test_iter_link_cells_trusts_stored_has_perm(tmp_path, monkeypatch):
+    import zarr_vectors.core.arrays as arrays
+    from zarr_vectors.core.store import get_resolution_level, open_store
+    from zarr_vectors.types.graphs import write_graph
+
+    rng = np.random.default_rng(4)
+    pos = rng.random((40, 3)).astype("f4") * 100
+    edges = rng.integers(0, 40, size=(60, 2))
+    edges = edges[edges[:, 0] != edges[:, 1]]
+    path = tmp_path / "g.zv"
+    write_graph(path, pos, edges, chunk_shape=(30.0, 30.0, 30.0))
+    level = get_resolution_level(open_store(path), 0)
+
+    def widths():
+        return {
+            (seg, cc): tuple(np.asarray(g).shape[1] for g in groups)
+            for seg, _off, cc, groups in arrays.iter_link_cells(level, 0)
+        }
+
+    before = widths()
+    assert any(w and w[0] == 3 for w in before.values())  # perm column present
+    expected = len(arrays.read_links(level))
+    # A policy that disagrees with the stamps must not change the decode.
+    monkeypatch.setattr(arrays, "links_has_perm", lambda *a, **k: False)
+    assert widths() == before
+    assert len(arrays.read_links(level)) == expected

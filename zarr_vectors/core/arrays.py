@@ -4915,7 +4915,9 @@ def iter_link_cells(
 
     Offsets come from each array's own ``offsets`` meta when present,
     falling back to parsing the path segment; the two agree, but the
-    meta needs no ``sid_ndim`` to decode.
+    meta needs no ``sid_ndim`` to decode.  The row width likewise comes
+    from the array's ``has_perm`` stamp, as :func:`read_links` reads it,
+    with :func:`links_has_perm` only as the fallback for unstamped arrays.
     """
     policy = link_family_policy(level_group, delta)
     if policy is None:
@@ -4935,9 +4937,14 @@ def iter_link_cells(
         else:
             continue
         dtype = np.dtype(meta.get("dtype", "int64"))
-        has_perm = links_has_perm(
-            offsets, delta=delta, directed=directed, store=store,
-        )
+        # The array's own stamp wins, as in read_links; the policy is
+        # only the fallback for an array written before it was stamped.
+        has_perm = bool(meta.get(
+            "has_perm",
+            links_has_perm(
+                offsets, delta=delta, directed=directed, store=store,
+            ),
+        ))
         width = link_width + (1 if has_perm else 0)
         for key in sorted(level_group.list_chunks(full_name)):
             try:
