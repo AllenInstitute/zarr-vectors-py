@@ -119,6 +119,18 @@ class Grid:
     :attr:`anchor` is the cell this corner falls in.
     """
 
+    extent: tuple[float, ...] = ()
+    """Physical span of the bounds the grid was planned from, per axis.
+
+    Recorded by :meth:`plan` so :meth:`capacity` can divide the data by
+    the cells its volume actually covers.  The allocation has an extra
+    plane per axis whenever the bounds do not start and end on cell
+    boundaries (see :meth:`plan`), and those edge cells hold only a
+    sliver of the data; dividing by the allocated count underestimated
+    the bytes in a full cell by up to ``((n+1)/n)**ndim``.  Empty when
+    unknown, in which case the allocated count is used.
+    """
+
     @classmethod
     def plan(
         cls,
@@ -167,7 +179,10 @@ class Grid:
         from zarr_vectors.spatial.chunking import grid_layout
 
         _origin, shape = grid_layout((lo, hi), size)
-        return cls(shape=shape, cell_shape=size, origin=tuple(lo))
+        return cls(
+            shape=shape, cell_shape=size, origin=tuple(lo),
+            extent=tuple(float(e) for e in extent),
+        )
 
     # ---------------- geometry ----------------
 
@@ -263,7 +278,7 @@ class Grid:
         """
         cells = self.cells
         per_cell = (
-            (n_vertices / cells) * ndim * bytes_per_coordinate
+            (n_vertices / self._covered_cells()) * ndim * bytes_per_coordinate
             if n_vertices and cells else 0.0
         )
         reason = None
@@ -280,6 +295,24 @@ class Grid:
             cells=cells, shape=self.shape, est_bytes_per_cell=per_cell,
             fits=fits, reason=reason,
         )
+
+    def _covered_cells(self) -> float:
+        """How many cells' worth of volume the data spans.
+
+        A uniformly spread dataset puts ``n_vertices / covered`` vertices
+        in each full cell, which is the figure a capacity check has to
+        judge.  Per axis that is ``extent / cell_shape``, clamped to at
+        least one cell (a span narrower than a cell can still land wholly
+        in one) and at most the allocated count.  Falls back to the
+        allocated count when the extent is unknown.
+        """
+        if len(self.extent) != len(self.shape) or not self.shape:
+            return float(self.cells)
+        covered = 1.0
+        for e, c, s in zip(self.extent, self.cell_shape, self.shape):
+            per_axis = (float(e) / float(c)) if c else float(s)
+            covered *= min(float(s), max(1.0, per_axis))
+        return covered
 
     def holds(self, ref: CellRef) -> bool:
         """Whether ``ref`` is inside this grid's allocation.
