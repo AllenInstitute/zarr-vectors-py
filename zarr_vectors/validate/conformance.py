@@ -24,6 +24,7 @@ from zarr_vectors.core.store import (
     open_store,
     read_root_metadata,
 )
+from zarr_vectors.validate.metadata import level_fields
 from zarr_vectors.validate.structure import ValidationResult
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
@@ -160,9 +161,10 @@ def validate_multiresolution(store_path: str | Path | Group) -> ValidationResult
     for li in levels:
         try:
             lg = get_resolution_level(root, li)
-            attrs = lg.attrs
+            attrs = level_fields(root, li, lg)
             vc = attrs.get("vertex_count")
-            if vc is None:
+            if not vc:
+                # Absent, or the 0 placeholder a build path left unrefreshed.
                 vc = 0
                 for ck in list_chunk_keys(lg):
                     try:

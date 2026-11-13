@@ -31,6 +31,52 @@ VALID_OBJIDX = {OBJIDX_STANDARD, OBJIDX_IDENTITY}
 VALID_CROSS = {CROSS_CHUNK_EXPLICIT, CROSS_CHUNK_DEDUP, CROSS_CHUNK_BOTH}
 
 
+#: Level fields the validators check, and the legacy top-level spellings
+#: some old stores used before they moved under ``zarr_vectors_level``.
+_LEVEL_FIELDS = (
+    "vertex_count", "bin_shape", "bin_size", "bin_ratio", "object_sparsity",
+)
+
+
+def level_fields(root: Group, li: int, lg: Group) -> dict:
+    """The level's metadata fields as stored, for checking.
+
+    The writer keeps per-level fields under the ``zarr_vectors_level``
+    block, and ``bin_shape`` / ``bin_ratio`` only in the NGFF
+    ``multiscales`` block (see :func:`read_level_metadata`).  Reading
+    them off the level's top-level attributes -- as the validators once
+    did -- found nothing, so every per-level check silently passed.
+
+    Values are returned raw (not coerced through :class:`LevelMetadata`)
+    so a malformed value reaches the check that reports it.  Precedence:
+    NGFF transform > ``zarr_vectors_level`` > legacy top-level keys.
+    """
+    attrs = lg.attrs.to_dict()
+    out = {k: attrs[k] for k in _LEVEL_FIELDS if k in attrs}
+    block = attrs.get("zarr_vectors_level")
+    if isinstance(block, dict):
+        out.update({k: block[k] for k in _LEVEL_FIELDS if k in block})
+    if out.get("bin_shape") is None and out.get("bin_size") is not None:
+        out["bin_shape"] = out["bin_size"]
+    out.pop("bin_size", None)
+    try:
+        from zarr_vectors.core.multiscale import read_level_transform
+        scale, translation = read_level_transform(root, li)
+    except Exception:
+        scale, translation = None, None
+    if scale is not None:
+        # Mirrors read_level_metadata: level 0 is the identity by
+        # convention and inherits the root's base_bin_shape.
+        if li == 0:
+            out.pop("bin_shape", None)
+            out.pop("bin_ratio", None)
+        else:
+            out["bin_ratio"] = list(scale)
+            if translation is not None:
+                out["bin_shape"] = [2.0 * t for t in translation]
+    return out
+
+
 def validate_metadata(store_path: str | Path | Group) -> ValidationResult:
     """Level 2: verify all metadata is well-formed."""
     result = ValidationResult(level=2)
@@ -127,7 +173,7 @@ def validate_metadata(store_path: str | Path | Group) -> ValidationResult:
     for li in levels:
         try:
             lg = get_resolution_level(root, li)
-            la = lg.attrs
+            la = level_fields(root, li, lg)
             result.add_pass(f"resolution_{li} metadata parsed")
             if lg.presence_deferred():
                 # Legal -- readers derive presence from the store -- but a
@@ -176,8 +222,16 @@ def validate_metadata(store_path: str | Path | Group) -> ValidationResult:
                 if level_meta is not None else meta.chunk_shape
             )
             bin_shape = la.get("bin_shape")
-            if bin_shape is None:
-                bin_shape = la.get("bin_size")  # legacy fallback
+            # A coarse level that inherits the root grid takes its bin
+            # from the coarsen factor and is not required to tile the
+            # chunk (bin 20 in a chunk of 50 is what the coarsener writes);
+            # see validate_level_chunk_shape_against_root, the writer's
+            # rule.  Divisibility is checked where the level declares its
+            # own chunk_shape, or on a legacy level we could not parse.
+            inherits_grid = (
+                li > 0 and level_meta is not None
+                and level_meta.chunk_shape is None
+            )
             if bin_shape is not None:
                 if len(bin_shape) != sid_ndim:
                     result.add_error(
@@ -189,6 +243,12 @@ def validate_metadata(store_path: str | Path | Group) -> ValidationResult:
                             result.add_error(
                                 f"resolution_{li}: bin_shape[{i}]={bs} not > 0"
                             )
+                        elif inherits_grid or bs > cs:
+                            # A coarse level's bin may span several chunks
+                            # (bin 200 in a chunk of 100); tiling is only
+                            # required while bins are the finer of the two,
+                            # as validate_level_chunk_shape_against_root says.
+                            continue
                         else:
                             ratio = cs / bs
                             if abs(ratio - round(ratio)) > 1e-9:
@@ -213,7 +273,11 @@ def validate_metadata(store_path: str | Path | Group) -> ValidationResult:
 
             # Validate object_sparsity in (0, 1]
             sparsity = la.get("object_sparsity", 1.0)
-            if not (0.0 < sparsity <= 1.0):
+            if (
+                isinstance(sparsity, bool)
+                or not isinstance(sparsity, (int, float))
+                or not (0.0 < sparsity <= 1.0)
+            ):
                 result.add_error(
                     f"resolution_{li}: object_sparsity={sparsity} not in (0, 1]"
                 )
