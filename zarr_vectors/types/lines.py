@@ -314,6 +314,9 @@ def write_lines(
     cross_b_chunk: list[ChunkCoords] = []
     cross_a_vi: list[int] = []
     cross_b_vi: list[int] = []
+    # Vertices appended to each chunk so far: a split endpoint's
+    # chunk-local index is this count when its fragment is appended.
+    chunk_nverts: dict[ChunkCoords, int] = {}
 
     # One Python pass over lines is unavoidable to preserve line-id-
     # ordered fragment_idx assignment, but each iteration is now just
@@ -325,28 +328,31 @@ def write_lines(
             fragment_idx = len(bucket)
             bucket.append((i, endpoints[i], (0, 1)))  # (N=2, D)
             object_manifests[i] = [(ca, fragment_idx)]
+            chunk_nverts[ca] = chunk_nverts.get(ca, 0) + 2
         else:
             cb = cb_tuples[i]
             bucket_a = chunk_groups.setdefault(ca, [])
             fragment_idx_a = len(bucket_a)
             bucket_a.append((i, endpoints[i, 0:1], (0,)))  # (1, D)
+            vi_a = chunk_nverts.get(ca, 0)
+            chunk_nverts[ca] = vi_a + 1
 
             bucket_b = chunk_groups.setdefault(cb, [])
             fragment_idx_b = len(bucket_b)
             bucket_b.append((i, endpoints[i, 1:2], (1,)))  # (1, D)
+            vi_b = chunk_nverts.get(cb, 0)
+            chunk_nverts[cb] = vi_b + 1
 
             object_manifests[i] = [(ca, fragment_idx_a), (cb, fragment_idx_b)]
             # Link endpoints are chunk-local vertex indices, not
-            # fragment-local ones.  Each endpoint above is appended as its
-            # own single-vertex fragment, and a chunk's vertices are the
-            # concatenation of its fragments in order — so the k-th
-            # fragment's only vertex sits at chunk-local index k.
-            # Hardcoding 0 here made every line in a chunk link to that
-            # chunk's *first* vertex.
+            # fragment-local ones, and not fragment indices either: a
+            # chunk's vertices are the concatenation of its fragments,
+            # and a whole line in the same chunk is a TWO-vertex fragment
+            # ahead of this one, so the fragment index undercounts.
             cross_a_chunk.append(ca)
             cross_b_chunk.append(cb)
-            cross_a_vi.append(fragment_idx_a)
-            cross_b_vi.append(fragment_idx_b)
+            cross_a_vi.append(vi_a)
+            cross_b_vi.append(vi_b)
     cross_links = cross_a_vi
 
     idx_ndim = ndim + 1 if line_attr_bins is not None else ndim
