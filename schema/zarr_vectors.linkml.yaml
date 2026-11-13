@@ -1,20 +1,19 @@
-id: https://w3id.org/zarr-vectors/schema/0.5
+id: https://w3id.org/zarr-vectors/schema/0.9
 name: zarr_vectors
 title: Zarr Vectors (ZV) format
 description: >
-  Reference schema for the Zarr Vectors (ZV) on-disk metadata (0.5.0).
-  Covers the root-level ``.zattrs`` block (``zarr_vectors`` envelope),
-  the NGFF ``multiscales`` block (which now carries the canonical axes
-  list — ZV no longer duplicates them under ``spatial_index_dims``),
-  the per-resolution-level ``.zattrs`` block (``zarr_vectors_level``
-  envelope), and the per-array ``.zattrs`` shapes emitted by the
+  Reference schema for the Zarr Vectors (ZV) on-disk metadata (0.9.4).
+  Covers the root ``zarr.json`` attributes block (``zarr_vectors`` envelope),
+  the NGFF ``multiscales`` block (which carries the canonical axes list),
+  the per-resolution-level attributes block (``zarr_vectors_level``
+  envelope), and the per-array attributes shapes emitted by the
   writers in ``zarr_vectors/core/arrays.py`` (discriminator slot
   ``zv_array``).
 license: BSD-3-Clause
 
 prefixes:
   linkml: https://w3id.org/linkml/
-  zv: https://w3id.org/zarr-vectors/schema/0.5/
+  zv: https://w3id.org/zarr-vectors/schema/0.9/
   ngff: https://ngff.openmicroscopy.org/0.4/
   schema: http://schema.org/
 
@@ -89,8 +88,7 @@ enums:
         description: >
           Links with a non-zero offsets segment bridge the boundary.
           This value is semantic — it records the authoring intent, not a
-          distinct physical family: since 0.9.0 a boundary-crossing link
-          is an ordinary record in ``links/<delta>/<offsets>/`` whose
+          distinct physical family: a boundary-crossing link is an ordinary record in ``links/<delta>/<offsets>/`` whose
           offsets are not all zero.
       both:
         description: Both boundary duplication and explicit links are present.
@@ -165,12 +163,10 @@ enums:
       shared_fragments:
         description: >
           At least one level stores per-chunk fragments that may be
-          referenced by multiple objects' manifests (the v0.6 successor
-          to ``shared_vertex_groups``; the sharing primitive is now a
-          fragment rather than a contiguous-byte vertex group).
+          referenced by multiple objects' manifests (the sharing primitive is a fragment, not a contiguous-byte vertex group).
       fragment_index:
         description: >
-          The store uses the v0.6 fragment-index encoding for
+          The store uses the fragment-index encoding for
           ``vertex_fragments`` and ``link_fragments`` (a single uint8
           blob per chunk with a tagged-bitmap header + range table +
           explicit CSR; see :mod:`zarr_vectors.encoding.fragments`).
@@ -179,22 +175,18 @@ enums:
           Store uses the multiscale links layout
           (``links/<delta>/<offsets>/`` and
           ``link_attributes/<name>/<delta>/<offsets>/``) and may contain
-          cross-pyramid-level edges (``delta != 0``).  Since 0.9.0 there
-          is no separate cross-chunk family — a cross-chunk link is a
-          link with a non-zero offsets segment — so this token now marks
-          only the presence of ``delta != 0`` arrays.
+          cross-pyramid-level edges (``delta != 0``).  There is no separate cross-chunk family — a cross-chunk link is a link with a non-zero offsets segment — so this token marks only the presence of ``delta != 0`` arrays.
 
   ZvArrayTag:
     description: >
-      Discriminator value for per-array ``.zattrs`` blocks (slot
+      Discriminator value for per-array attributes blocks (slot
       ``zv_array``).  Each writer in ``zarr_vectors/core/arrays.py``
       stamps the corresponding tag.
     permissible_values:
       vertices:
       vertex_fragments:
         description: >
-          Per-chunk fragment-index group for ``vertices/<chunk>`` (v0.6+).
-          Replaces the v0.5 ``vertex_group_offsets``.
+          Per-chunk fragment-index group for ``vertices/<chunk>``.
       link_fragments:
         description: >
           Per-chunk fragment-index group for the intra-chunk link array
@@ -292,7 +284,7 @@ classes:
 
   RootMetadata:
     description: >
-      Root-level ``.zattrs`` payload, persisted under the key
+      Root-level attributes payload, persisted under the key
       ``zarr_vectors``.  Validates the runtime
       :class:`zarr_vectors.core.metadata.RootMetadata` dataclass.
       Note: the canonical axis list lives in
@@ -319,7 +311,7 @@ classes:
 
   LevelMetadata:
     description: >
-      Per-resolution-level ``.zattrs`` payload, persisted under the key
+      Per-resolution-level attributes payload, persisted under the key
       ``zarr_vectors_level``.  Validates the runtime
       :class:`zarr_vectors.core.metadata.LevelMetadata` dataclass.
     slots:
@@ -348,10 +340,10 @@ classes:
           each axis must be a positive integer multiple of the root
           chunk_shape (nested chunk grids).
 
-  # ----- per-array .zattrs shapes (zv_array discriminator) --------------
+  # ----- per-array attributes shapes (zv_array discriminator) --------------
 
   VerticesMeta:
-    description: "``.zattrs`` for the ``vertices/`` array."
+    description: "Attributes for the ``vertices/`` array."
     slots: [zv_array, dtype, encoding]
     slot_usage:
       zv_array:
@@ -360,12 +352,11 @@ classes:
 
   LinksFamilyMeta:
     description: >
-      ``.zattrs`` for a ``links/<delta>/`` **group** — the family-wide
+      Attributes for a ``links/<delta>/`` **group** — the family-wide
       policy every offsets array beneath it decodes against, which is why
       it lives on the group rather than being repeated per array.
 
-      Since 0.9.0 connectivity is one family: there is no separate
-      ``cross_chunk_links/``.  An intra-chunk link is a link whose
+      Connectivity is one family.  An intra-chunk link is a link whose
       relative offsets are all zero; a cross-chunk link is one whose
       offsets are non-zero.
 
@@ -400,7 +391,7 @@ classes:
 
   LinksMeta:
     description: >
-      ``.zattrs`` for a single ``links/<delta>/<offsets>/`` array: a
+      Attributes for a single ``links/<delta>/<offsets>/`` array: a
       rank-D vlen array over the level's chunk grid, one cell per
       **source** chunk, holding the records whose source chunk is that
       cell.
@@ -430,7 +421,7 @@ classes:
         required: true
 
   AttributeMeta:
-    description: "``.zattrs`` for each ``attributes/<name>/`` array."
+    description: "Attributes for each ``attributes/<name>/`` array."
     slots: [zv_array, name, dtype, channel_names]
     slot_usage:
       zv_array:
@@ -439,7 +430,7 @@ classes:
 
   FragmentAttributeMeta:
     description: >
-      ``.zattrs`` for each ``fragment_attributes/<name>/`` array.  Stored
+      Attributes for each ``fragment_attributes/<name>/`` array.  Stored
       as a dense per-chunk byte blob; each chunk holds a row per
       fragment, with shape ``(num_fragments_in_chunk,)`` or
       ``(num_fragments_in_chunk, len(channel_names))``.  Per-chunk
@@ -452,7 +443,7 @@ classes:
         required: true
 
   ObjectIndexMeta:
-    description: "``.zattrs`` for ``object_index/``."
+    description: "Attributes for ``object_index/``."
     slots: [zv_array, num_objects, sid_ndim, layout]
     slot_usage:
       zv_array:
@@ -460,7 +451,7 @@ classes:
         required: true
 
   ObjectAttributeMeta:
-    description: "``.zattrs`` for each ``object_attributes/<name>/`` array."
+    description: "Attributes for each ``object_attributes/<name>/`` array."
     slots: [zv_array, name, dtype, shape]
     slot_usage:
       zv_array:
@@ -468,7 +459,7 @@ classes:
         required: true
 
   GroupingsMeta:
-    description: "``.zattrs`` for ``groupings/``."
+    description: "Attributes for ``groupings/``."
     slots: [zv_array, num_groups]
     slot_usage:
       zv_array:
@@ -476,7 +467,7 @@ classes:
         required: true
 
   GroupingsAttributeMeta:
-    description: "``.zattrs`` for each ``groupings_attributes/<name>/`` array."
+    description: "Attributes for each ``groupings_attributes/<name>/`` array."
     slots: [zv_array, name, dtype, shape]
     slot_usage:
       zv_array:
@@ -485,7 +476,7 @@ classes:
 
   LinkAttributeFamilyMeta:
     description: >
-      ``.zattrs`` for a ``link_attributes/<name>/<delta>/`` **group**.
+      Attributes for a ``link_attributes/<name>/<delta>/`` **group**.
       There is no separate cross-chunk attribute family: an intra-chunk
       link's attributes live under the all-zero offsets segment, exactly
       like the links themselves.
@@ -502,7 +493,7 @@ classes:
 
   LinkAttributeMeta:
     description: >
-      ``.zattrs`` for one ``link_attributes/<name>/<delta>/<offsets>/``
+      Attributes for one ``link_attributes/<name>/<delta>/<offsets>/``
       array.  Mirrors the ``links/<delta>/<offsets>/`` array of the same
       ``<delta>`` and ``<offsets>`` cell-for-cell — same cells, same
       per-cell row order — so attribute rows align 1:1 with link records
@@ -558,9 +549,7 @@ slots:
 
   zv_version:
     description: >
-      ZV spec version this store was written against (e.g. "0.5.0").
-      Renamed from ``format_version`` in 0.5.0 to disambiguate from
-      Zarr v3's ``zarr_format`` field.
+      ZV spec version this store was written against (e.g. "0.9.4"). Distinct from Zarr v3's ``zarr_format`` field.
     range: string
     required: true
     slot_uri: schema:version
@@ -763,7 +752,7 @@ slots:
     description: >
       True when per-chunk fragments may be referenced by multiple
       objects' manifests (shared metavertices in the per-object pyramid
-      regime).  v0.6 successor to ``shared_vertex_groups``.  Readers
+      regime).  Readers
       MAY use this to short-circuit dedup work.
     range: boolean
   fragments_tile:
@@ -777,11 +766,11 @@ slots:
       Readers MUST treat an absent value as False.
     range: boolean
 
-  # -- per-array .zattrs ------------------------------------------------
+  # -- per-array attributes ------------------------------------------------
 
   zv_array:
     description: >
-      Discriminator slot identifying the kind of per-array ``.zattrs``
+      Discriminator slot identifying the kind of per-array attributes
       block.  Each writer in ``core/arrays.py`` stamps the
       corresponding token from :class:`ZvArrayTag`.
     range: ZvArrayTag
@@ -808,7 +797,7 @@ slots:
     description: >
       Pyramid-level delta between the source side (the level that owns
       this array) and the target side of the edges.  ``0`` for
-      intra-level arrays (the only kind written pre-0.4), ``+N`` for
+      intra-level arrays, ``+N`` for
       edges from this level to ``this_level + N`` (coarser), ``-N``
       for edges to ``this_level - N`` (finer).
     range: integer

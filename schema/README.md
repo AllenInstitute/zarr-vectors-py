@@ -44,7 +44,7 @@ generated diffs between contributors quiet.
 |---|---|
 | `RootMetadata`            | `zarr_vectors.core.metadata.RootMetadata` |
 | `LevelMetadata`           | `zarr_vectors.core.metadata.LevelMetadata` |
-| 12 per-array `.zattrs` shapes | `zarr_vectors.core.arrays.write_array_meta` call-sites — discriminator slot `zv_array` |
+| 12 per-array attribute shapes | `zarr_vectors.core.arrays.write_array_meta` call-sites — discriminator slot `zv_array` |
 | Enums                     | `zarr_vectors.constants.VALID_*` frozensets and `CAP_*` tokens |
 
 The `ParametricTypeDef` registry (plane/line/sphere) is implemented in
@@ -56,7 +56,7 @@ schema is a follow-up.
 ## Representation bridge
 
 A handful of slots have a different representation in the LinkML
-object model than in the wire-format `.zattrs` dict:
+object model than in the wire-format attributes dict:
 
 - **`bounds`** — on disk it is the two-element list `[[min...],
   [max...]]`; the LinkML schema models it as a `BoundingBox` class
@@ -76,7 +76,7 @@ The schema declares prefixes for [OME-Zarr NGFF] and [Schema.org] and
 attaches `class_uri` / `slot_uri` to the obvious slots:
 
 - `Axis` → `ngff:Axis` (mirrors OME-Zarr RFC 4/5 axis objects).
-- `format_version` → `schema:version`.
+- `zv_version` → `schema:version`.
 - `crs` → `schema:coordinateReferenceSystem` (loose match).
 
 Wider ontology mapping (OBO / EFO / BIDS) is intentionally out of
@@ -84,8 +84,8 @@ scope for v1.
 
 ## Cross-language consumers
 
-The generated JSON Schema is the public contract.  To validate a
-`.zattrs` dict from any JSON-Schema-capable language:
+The generated JSON Schema is the public contract.  To validate an
+attributes dict from any JSON-Schema-capable language:
 
 ```python
 import json, jsonschema
