@@ -48,6 +48,15 @@ import numpy.typing as npt
 
 __all__ = ["rechunk_spatial", "suggest_chunk_shape"]
 
+#: Vertex-attribute array keys the writer owns: the core fields
+#: create_attribute_array sets, and the presence bookkeeping that names
+#: the SOURCE grid's chunks.  Everything else (dictionary encoding,
+#: user extensions) is copied to the output array.
+_ATTR_META_OWNED = frozenset({
+    "zv_array", "name", "dtype", "channel_names", "row_shape",
+    "nonempty_chunks", "zarr_vectors_presence",
+})
+
 
 def suggest_chunk_shape(
     store_path: str | Path,
@@ -357,8 +366,7 @@ def _write_level(level_group, lv: _Level, chunk_shape, ndim: int,
         rs = meta.get("row_shape") or []
         ncols = int(rs[0]) if rs else None
         extra = {k: v for k, v in meta.items()
-                 if k not in ("zv_array", "name", "dtype", "channel_names",
-                              "row_shape")}
+                 if k not in _ATTR_META_OWNED}
         create_attribute_array(level_group, name,
                                dtype=str(meta.get("dtype", "float32")),
                                channel_names=meta.get("channel_names"),
