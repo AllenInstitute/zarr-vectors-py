@@ -13,11 +13,13 @@ from zarr_vectors.constants import (
     GEOM_POLYLINE,
     GEOM_SKELETON,
     GEOM_STREAMLINE,
+    LINKS,
     LINKS_EXPLICIT,
     LINKS_IMPLICIT_BRANCHES,
     LINKS_IMPLICIT_SEQUENTIAL,
 )
 from zarr_vectors.core.arrays import list_chunk_keys, read_chunk_vertices
+from zarr_vectors.core.paths import links_group_path
 from zarr_vectors.core.store import (
     get_resolution_level,
     list_resolution_levels,
@@ -94,9 +96,13 @@ def validate_conformance(store_path: str | Path | Group) -> ValidationResult:
 
     if GEOM_MESH in geom_types:
         # Check mesh link_width — in composite stores, look at links_mesh/
+        # ``read_array_meta`` answers {} for a missing path rather than
+        # raising, so existence is asked explicitly.
         found_mesh_links = False
         try:
-            lmeta = lg.read_array_meta("links/0")
+            if not lg.array_exists(links_group_path(0)):
+                raise LookupError("no links/0")
+            lmeta = lg.read_array_meta(links_group_path(0))
             lw = lmeta.get("link_width", 0)
             if lw >= 3:
                 result.add_pass(f"Mesh link_width={lw}")
@@ -123,10 +129,11 @@ def validate_conformance(store_path: str | Path | Group) -> ValidationResult:
     if GEOM_POINT_CLOUD in geom_types and not any(
         gt in geom_types for gt in [GEOM_GRAPH, GEOM_SKELETON, GEOM_MESH]
     ):
-        try:
-            lg.read_array_meta("links/0")
+        # Not read_array_meta: it returns {} for a missing path instead
+        # of raising, so this warned on every point cloud.
+        if lg.array_exists(LINKS):
             result.add_warning("Point cloud but links array exists")
-        except Exception:
+        else:
             result.add_pass("Point cloud: no links (correct)")
 
     return result
