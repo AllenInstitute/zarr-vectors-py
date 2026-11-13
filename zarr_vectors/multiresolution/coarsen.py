@@ -194,10 +194,32 @@ def coarsen_level(
                 f"{sorted(options)}. Those keywords belong to a registered "
                 f"strategy — pass method= as well."
             )
-        return _per_object_coarsen(**kwargs)
+        summary = _per_object_coarsen(**kwargs)
+        _refresh_arrays_present(store_path, (source_level, target_level))
+        return summary
     # Advanced coarsening methods live in zarr-vectors-tools.
     from zarr_vectors.multiresolution.registry import require_coarsen_strategy
     return require_coarsen_strategy(method)(**kwargs, **(options or {}))
+
+
+def _refresh_arrays_present(
+    store_path: str | Path | Group, levels,
+) -> None:
+    """Re-derive ``arrays_present`` on ``levels`` from what is on disk.
+
+    A coarsen step writes more than the level it creates declares: the
+    coarse level's ``vertex_fragments``, ``object_attributes`` and link
+    families, and a ``links/+1`` family on the source level.  The list was
+    hand-written as ``[vertices, object_index]`` and never revisited, so a
+    reader gating on it could not see arrays that exist.
+    """
+    from zarr_vectors.building import refresh_arrays_present
+
+    root = open_store(store_path, mode="r+")
+    present = set(list_resolution_levels(root))
+    for level in levels:
+        if level in present:
+            refresh_arrays_present(get_resolution_level(root, level))
 
 
 def _per_object_coarsen(
@@ -1481,6 +1503,10 @@ def build_pyramid(
         cross_level_depth=cross_level_depth,
         cross_level_storage=cross_level_storage,
     )
+    # The finalize pass adds the deeper ``+N`` / ``-N`` link families to
+    # levels the per-step refresh has already seen.
+    if cross_level_depth not in (0, 1) and cross_level_storage != XLEVEL_NONE:
+        _refresh_arrays_present(store_path, range(len(factors) + 1))
 
     return {
         "levels_created": len(summaries),
