@@ -375,8 +375,14 @@ class Dataset:
         first, rather than on whatever grid the caller happened to pass.
         """
         schema = Schema.from_store(self._root_meta)
-        effective = layout or schema.layout
+        self._refuse_overwrite()
+        effective = (
+            schema.layout if layout is None
+            else _inherit_grid(layout, schema.layout)
+        )
         resolved = effective.resolve(schema, store_kind=self._store_kind())
+        if layout is not None:
+            _check_layout_matches_store(self.url, schema, resolved)
         kwargs = {k: v for k, v in kwargs.items() if v is not None}
         # The position dtype the store was created with.  ``create``
         # stamps Schema.position_dtype on level 0's vertices array, but
@@ -398,6 +404,33 @@ class Dataset:
         )
         _stamp_declared(self, schema, kwargs)
         return report
+
+    def _refuse_overwrite(self) -> None:
+        """Raise if level 0 already holds geometry.
+
+        The writers behind ``add_*`` create a store's level 0; they do not
+        append to one.  Called a second time they rewrote the cells the
+        new batch touched, left the rest of the first batch in place and
+        stamped the level's vertex count with the new batch alone -- 1,000
+        points then 500 read back as some mix of the two -- and a batch
+        reaching cells the first never allocated failed with a bare
+        StoreError.  Refusing is the only honest answer until a real
+        append path exists.
+        """
+        if 0 not in self.levels:
+            return
+        try:
+            count = int(self.level(0).vertex_count)
+        except (MetadataError, StoreError, KeyError):
+            return
+        if count > 0:
+            raise StoreError(
+                f"{self.url} already holds {count} vertices at level 0. "
+                f"Dataset.add_* writes a store's geometry once; it cannot "
+                f"append, and calling it again would partly overwrite what "
+                f"is there. Concatenate the batches and write them in one "
+                f"call, or write each batch to its own store."
+            )
 
     def _position_dtype(self) -> str:
         """The vertex dtype level 0 declares; ``float32`` when it has none."""
@@ -732,6 +765,55 @@ def _stamp_declared(
                     level.write_array_meta(path, extra)
             except Exception:  # noqa: BLE001 - annotation, never fatal
                 continue
+
+
+def _inherit_grid(layout: Layout, stored: Layout) -> Layout:
+    """``layout`` with every grid field it leaves on "auto" taken from the
+    store, so a caller passing ``Layout(compression=...)`` alone is not
+    read as asking for a one-cell grid."""
+    from dataclasses import replace
+
+    changes: dict[str, Any] = {}
+    if layout.cell_size is None and layout.cells == "auto":
+        changes["cell_size"] = stored.cell_size
+    if layout.subcells == "auto":
+        changes["subcells"] = stored.subcells
+    if layout.shard_cells == "auto":
+        changes["shard_cells"] = stored.shard_cells
+    return replace(layout, **changes) if changes else layout
+
+
+def _check_layout_matches_store(
+    url: str, schema: Schema, resolved: Any,
+) -> None:
+    """Refuse a ``layout=`` whose grid differs from the store's.
+
+    A store has one grid, recorded on its root when it is created; the
+    writers place vertices on the grid they are handed but leave the
+    root's declaration alone.  Writing on a different grid produced chunk
+    keys the store's own metadata contradicts, and a bbox read then looked
+    in the wrong cells and returned almost nothing, with no error.
+    """
+    stored = schema.layout.resolve(schema)
+    problems = []
+    for name, mine, theirs in (
+        ("cell size", resolved.chunk_shape, stored.chunk_shape),
+        ("subcell size", resolved.bin_shape, stored.bin_shape),
+    ):
+        if not np.allclose(
+            np.asarray(mine, dtype=np.float64),
+            np.asarray(theirs, dtype=np.float64),
+            rtol=1e-9, atol=0.0,
+        ):
+            problems.append(f"{name}: {list(mine)} != store's {list(theirs)}")
+    if problems:
+        raise SchemaConflict(
+            f"layout= asks for a grid {url} was not created with:\n  "
+            + "\n  ".join(problems)
+            + "\nA store has one grid, fixed when it is created. Omit "
+            "layout= (or leave its grid fields on 'auto') to write on the "
+            "store's grid, or create a new store with the layout you want."
+        )
 
 
 def _kind_of_url(url: str) -> str:

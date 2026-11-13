@@ -6,7 +6,7 @@ import numpy as np
 import pytest
 
 import zarr_vectors as zv
-from zarr_vectors.exceptions import MetadataError
+from zarr_vectors.exceptions import MetadataError, StoreError
 
 BOUNDS = ((0.0, 0.0, 0.0), (100.0, 100.0, 100.0))
 
@@ -100,3 +100,57 @@ def test_position_dtype_float64_is_honoured(tmp_path, kind, write):
         order = np.lexsort(got.T)
         want = pts[np.lexsort(pts.T)]
         assert np.array_equal(got[order], want)
+
+
+# ---------------- add_* layout= and repeat writes ----------------
+
+
+def _store(tmp_path, kind="point_cloud", cells=4):
+    return zv.create(
+        tmp_path / "s.zv",
+        schema=zv.Schema(bounds=BOUNDS, kind=kind, layout=zv.Layout(cells=cells)),
+    )
+
+
+def test_layout_with_a_different_grid_is_refused(tmp_path):
+    ds = _store(tmp_path)
+    with pytest.raises(zv.SchemaConflict, match="cell size"):
+        ds.add_points(_pts(), layout=zv.Layout(cells=8))
+    assert 0 not in ds.levels or ds.level(0).vertex_count == 0
+
+
+def test_layout_that_only_changes_storage_is_written_on_the_store_grid(tmp_path):
+    ds = _store(tmp_path)
+    pts = _pts()
+    ds.add_points(pts, layout=zv.Layout(compression="zstd"))
+    lo, hi = np.zeros(3), np.full(3, 50.0)
+    want = int(np.all((pts >= lo) & (pts <= hi), axis=1).sum())
+    assert len(ds.select(bbox=(lo, hi)).read().positions) == want
+
+
+def test_layout_matching_the_store_grid_is_accepted(tmp_path):
+    ds = _store(tmp_path)
+    ds.add_points(_pts(), layout=zv.Layout(cells=4))
+    assert ds.level(0).vertex_count == 1000
+
+
+@pytest.mark.parametrize("second", [
+    lambda ds: ds.add_points(_pts(500, seed=1)),
+    lambda ds: ds.add_points(_pts(500, 50, 100, seed=2)),
+])
+def test_a_second_add_points_is_refused_and_leaves_the_first(tmp_path, second):
+    ds = _store(tmp_path)
+    ds.add_points(_pts())
+    with pytest.raises(StoreError, match="cannot append"):
+        second(ds)
+    assert len(ds.read().positions) == 1000
+    assert ds.level(0).vertex_count == 1000
+
+
+def test_a_second_add_polylines_is_refused(tmp_path):
+    ds = _store(tmp_path, kind="polyline")
+    lines = [_pts(5, seed=i) for i in range(3)]
+    ds.add_polylines(lines)
+    with pytest.raises(StoreError, match="cannot append"):
+        ds.add_polylines(lines)
+    assert ds.read().part_count == 3
