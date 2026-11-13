@@ -6,6 +6,7 @@ import numpy as np
 import pytest
 
 import zarr_vectors as zv
+from zarr_vectors.exceptions import MetadataError
 
 BOUNDS = ((0.0, 0.0, 0.0), (100.0, 100.0, 100.0))
 
@@ -59,3 +60,18 @@ def test_a_missing_name_under_a_supported_prefix_raises():
     with pytest.raises(KeyError, match="no module or exported name"):
         zv.stability("zarr_vectors.api.nonexistent")
     assert zv.stability("zarr_vectors.api.Dataset") == "supported"
+
+
+# ---------------- Schema(kind=...) ----------------
+
+
+def test_schema_rejects_an_unknown_kind():
+    with pytest.raises(MetadataError, match="not a geometry type"):
+        zv.Schema(kind="banana")
+
+
+@pytest.mark.parametrize("kind", [
+    "point_cloud", "line", "polyline", "streamline", "skeleton", "graph", "mesh",
+])
+def test_schema_accepts_every_geometry_type(kind):
+    assert zv.Schema(kind=kind).kind == kind

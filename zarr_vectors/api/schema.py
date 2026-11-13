@@ -27,7 +27,7 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from typing import TYPE_CHECKING, Any, Literal
 
-from zarr_vectors.constants import GEOM_POINT_CLOUD
+from zarr_vectors.constants import GEOM_POINT_CLOUD, VALID_GEOMETRY_TYPES
 from zarr_vectors.exceptions import MetadataError
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
@@ -405,6 +405,13 @@ class Schema:
     layout: Layout = field(default_factory=Layout)
 
     def __post_init__(self) -> None:
+        # A misspelt kind used to be accepted and recorded as the store's
+        # geometry type, after which no reader could decode the store.
+        if self.kind and self.kind not in VALID_GEOMETRY_TYPES:
+            raise MetadataError(
+                f"Schema.kind={self.kind!r} is not a geometry type; expected "
+                f"one of {sorted(VALID_GEOMETRY_TYPES)}."
+            )
         if self.bounds is not None:
             lo, hi = self.bounds
             if len(lo) != len(hi):
