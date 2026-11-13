@@ -46,10 +46,9 @@ from zarr_vectors.core.arrays import (
     create_object_index_array,
     create_vertices_array,
     link_cells_within,
-    link_endpoints_to_rows,
     list_link_offsets,
     read_chunk_vertices,
-    read_link_arrays,
+    read_link_rows,
     resolve_chunk_keys,
     stamp_fragments_tile,
     write_chunk_attributes,
@@ -790,15 +789,18 @@ def _read_graph(
         # touching a chunk outside ``chunk_keys`` has no offset and is
         # dropped, which is what applies the bbox/chunks filter to edges.
         all_edges: list[npt.NDArray] = []
-        # As arrays, not one tuple per edge: the remap is a gather.
-        edge_chunks, edge_vi = read_link_arrays(
-            level_group, delta=0, cells=link_cells,
+        # Each chunk's local rows map to output rows through its offset,
+        # resolved once per link cell rather than per endpoint.
+        row_of = np.arange(running, dtype=np.int64)
+        starts = list(chunk_offsets.items())
+        ends = [start for _, start in starts[1:]] + [running]
+        rows = read_link_rows(
+            level_group,
+            {cc: row_of[start:end] for (cc, start), end in zip(starts, ends)},
+            delta=0, cells=link_cells,
         )
-        if edge_vi.shape[0] and edge_vi.shape[1] == 2:
-            rows = link_endpoints_to_rows(edge_chunks, edge_vi, chunk_offsets)
-            keep = (rows >= 0).all(axis=1)
-            if keep.any():
-                all_edges.append(np.ascontiguousarray(rows[keep]))
+        if rows.shape[0] and rows.shape[1] == 2:
+            all_edges.append(np.ascontiguousarray(rows))
 
         # For skeletons: reconstruct full edge set from implicit sequential + branch links
         if is_tree:

@@ -42,7 +42,6 @@ from zarr_vectors.core.arrays import (
     create_object_index_array,
     create_vertices_array,
     link_cells_within,
-    link_endpoints_to_rows,
     link_range_requests,
     list_link_offsets,
     read_chunk_vertices,
@@ -693,41 +692,30 @@ def _read_mesh(
         # call, with winding restored from ``perm_idx``.  A face touching a
         # chunk outside ``chunk_keys`` has no rows and is dropped, which is
         # what applies the bbox/chunks filter to faces.
-        if link_cells is None:
-            # Whole level: every row is taken, so a chunk offset is the
-            # whole remap.  As arrays, not one tuple per face: it is a
-            # gather.
-            face_chunks, face_vi = read_link_arrays(level_group, delta=0)
-            faces_out = np.zeros((0, link_width), dtype=np.int64)
-            if face_vi.shape[0] and face_vi.shape[1] == link_width:
-                rows = link_endpoints_to_rows(face_chunks, face_vi, chunk_offsets)
-                keep = (rows >= 0).all(axis=1)
-                if keep.any():
-                    faces_out = rows[keep]
+        # The bbox mask is known before any face is read, so each chunk's
+        # rows map straight to output rows (``-1`` where dropped) and faces
+        # go through that map once, per cell.  A whole-level read maps
+        # every row to its chunk offset plus itself.
+        if bbox is not None:
+            bbox_min, bbox_max = np.asarray(bbox[0]), np.asarray(bbox[1])
+            node_mask = np.all(
+                (positions_out >= bbox_min) & (positions_out <= bbox_max),
+                axis=1,
+            )
+            row_of = np.cumsum(node_mask, dtype=np.int64) - 1
+            row_of[~node_mask] = -1
+            if not node_mask.all():
+                positions_out = positions_out[node_mask]
         else:
-            # Scoped: the bbox mask is known before any face is read, so
-            # each chunk's rows map straight to output rows (``-1`` where
-            # dropped) and faces go through that map once, per cell.
-            if bbox is not None:
-                bbox_min, bbox_max = np.asarray(bbox[0]), np.asarray(bbox[1])
-                node_mask = np.all(
-                    (positions_out >= bbox_min) & (positions_out <= bbox_max),
-                    axis=1,
-                )
-                row_of = np.cumsum(node_mask, dtype=np.int64) - 1
-                row_of[~node_mask] = -1
-                if not node_mask.all():
-                    positions_out = positions_out[node_mask]
-            else:
-                row_of = np.arange(running, dtype=np.int64)
-            starts = list(chunk_offsets.items())
-            ends = [start for _, start in starts[1:]] + [running]
-            row_maps = {
-                cc: row_of[start:end] for (cc, start), end in zip(starts, ends)
-            }
-            faces_out = read_link_rows(level_group, row_maps, cells=link_cells)
-            if faces_out.shape[1] != link_width:
-                faces_out = np.zeros((0, link_width), dtype=np.int64)
+            row_of = np.arange(running, dtype=np.int64)
+        starts = list(chunk_offsets.items())
+        ends = [start for _, start in starts[1:]] + [running]
+        row_maps = {
+            cc: row_of[start:end] for (cc, start), end in zip(starts, ends)
+        }
+        faces_out = read_link_rows(level_group, row_maps, cells=link_cells)
+        if faces_out.shape[1] != link_width:
+            faces_out = np.zeros((0, link_width), dtype=np.int64)
 
         return {
             "vertices": positions_out,
