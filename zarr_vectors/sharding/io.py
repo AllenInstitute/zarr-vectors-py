@@ -40,8 +40,8 @@ Public API
     Status queries — checks whether any array in the store uses the
     ``sharding_indexed`` codec.
 
-The Morton / Hilbert curve indirection of older versions is gone; the
-native sharding codec already clusters spatially-adjacent inner chunks
+There is no Morton / Hilbert curve indirection: the native sharding
+codec already clusters spatially-adjacent inner chunks
 into the same shard via its C-order outer grid, giving the same
 read-locality benefit without a custom mapping.
 
@@ -54,13 +54,10 @@ every array allocated afterwards honours it, including the ones created
 lazily in workers.  That is cheaper than writing flat and repacking, and
 it is what a pipeline that knows its own object budget should do.
 
-This module used to document the opposite as a contract: sharding had to
-be the LAST coordinator pass, because ``nonempty_chunks`` could only be
-rebuilt from a per-cell store listing and a sharded array does not have
-one.  :meth:`~zarr_vectors.core.group.Group.derive_nonempty_chunks` now
-reads a sharded array's cells out of its shard objects, so that ordering
-is no longer forced.  What remains true is narrower: ``shard_store``
-selects cells through the presence manifest, so a store whose workers
+Sharding need not be the last coordinator pass:
+:meth:`~zarr_vectors.core.group.Group.derive_nonempty_chunks` reads a
+sharded array's cells out of its shard objects.  One ordering does
+hold: ``shard_store`` selects cells through the presence manifest, so a store whose workers
 wrote with ``record_presence=False`` still needs its rebuild before it
 is repacked -- otherwise there is nothing to migrate and the pass
 silently does nothing.
@@ -197,7 +194,7 @@ def shard_store(
     """Repack every per-chunk array in the store with the
     ``sharding_indexed`` codec.
 
-    The new layout uses Zarr v3's built-in ``sharding_indexed`` codec
+    The sharded layout uses Zarr v3's built-in ``sharding_indexed`` codec
     — readable by any standards-compliant Zarr v3 implementation
     (zarrs, tensorstore, neuroglancer-precomputed/zarr3, ...).  No
     ZV-specific metadata is needed; the sharding configuration lives
@@ -625,16 +622,6 @@ def get_shard_info(store_path: str | Path | Group) -> dict[str, Any]:
     }
 
 
-# ===================================================================
-# Back-compat shims (deprecation path for old positional API)
-# ===================================================================
-
-
-# Older versions accepted ``ShardLayout`` + ``shard_size`` positional
-# args; these alias to the new ``shard_shape``-driven API.  The
-# layout-curve (Morton / Hilbert) distinction has been removed because
-# Zarr's native ``sharding_indexed`` codec clusters spatially-adjacent
-# inner chunks into the same shard automatically.
 __all__ = [
     "shard_store",
     "unshard_store",

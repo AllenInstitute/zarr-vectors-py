@@ -1,6 +1,6 @@
 """HeaderRegistry — manages format-specific headers within a store.
 
-Headers are stored under ``/headers/<format>/.zattrs`` as raw
+Headers are stored in the attributes of ``/headers/<format>/`` as raw
 JSON-compatible dicts.  The registry provides ``add``, ``get``,
 ``remove``, and ``available_formats`` for managing them.
 

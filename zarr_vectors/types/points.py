@@ -585,7 +585,7 @@ def read_points(
     Returns:
         Dict with keys:
         - ``positions``: ``(M, D)`` array of vertex positions
-        - ``attributes``: ``{name: array}`` of per-vertex attributes
+        - ``vertex_attributes``: ``{name: array}`` of per-vertex attributes
         - ``object_ids``: ``(M,)`` array of object IDs per vertex (if objects exist)
         - ``vertex_count``: total vertices returned
     """

@@ -1,7 +1,7 @@
 """OME-Zarr compatible multiscale metadata for zarr vectors stores.
 
 Generates and reads ``multiscales`` metadata blocks in the root
-``.zattrs``, following the OME-NGFF spec (v0.4).  This allows
+``zarr.json`` attributes, following the OME-NGFF spec (v0.4).  This allows
 OME-Zarr-aware viewers to discover the resolution pyramid structure.
 
 NGFF v0.5 nests OME metadata under ``attributes.ome`` inside Zarr v3
@@ -40,7 +40,7 @@ def upsert_level_transform(
     """Upsert one level's entry in the NGFF ``multiscales[0].datasets`` list.
 
     This is the **authoritative** writer for per-level spatial transforms
-    under the 0.5+ format: ``bin_ratio`` lives as the ``scale`` factor
+    in a store: ``bin_ratio`` lives as the ``scale`` factor
     and ``bin_shape / 2`` lives as the ``translation`` offset.  Callers
     in :mod:`zarr_vectors.core.store` invoke this inside
     :func:`create_resolution_level` and :func:`add_resolution_level`
@@ -121,7 +121,7 @@ def read_level_transform(
 
 
 def write_multiscale_metadata(root: FsGroup) -> list[dict[str, Any]]:
-    """Generate and write OME-Zarr multiscale metadata to root .zattrs.
+    """Generate and write OME-Zarr multiscale metadata to the root attributes.
 
     Reads all existing resolution levels and their bin shapes to
     compute scale and translation transforms.
@@ -130,7 +130,7 @@ def write_multiscale_metadata(root: FsGroup) -> list[dict[str, Any]]:
         root: Root store group.
 
     Returns:
-        The ``multiscales`` list written to ``.zattrs``.
+        The ``multiscales`` list written to the root attributes.
     """
     meta = read_root_metadata(root)
     base_bin = meta.effective_bin_shape
@@ -221,7 +221,7 @@ def write_multiscale_metadata(root: FsGroup) -> list[dict[str, Any]]:
 
 
 def read_multiscale_metadata(root: FsGroup) -> list[dict[str, Any]] | None:
-    """Read OME-Zarr multiscale metadata from root .zattrs.
+    """Read OME-Zarr multiscale metadata from the root attributes.
 
     Args:
         root: Root store group.

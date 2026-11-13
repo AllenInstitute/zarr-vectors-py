@@ -39,21 +39,19 @@ def _time(fn, *args, **kwargs) -> tuple[float, object]:
     return time.perf_counter() - t0, out
 
 
-# Upper bounds (seconds, local FS).  Set ~3× over expected times measured
-# after the vectorization sweep so the gates catch O(N²) regressions
-# without flaking under load.  The cross_chunk_links arrays switched to a
-# per-tuple cell layout in 0.8 (one tiny Zarr array per chunk-tuple cell);
-# write budgets for geometry types with many cross-chunk records are
-# loosened to reflect the per-cell write overhead — sharding (planned)
-# will amortise this back down.
+# Upper bounds (seconds, local FS).  Set ~3× over expected times so the
+# gates catch O(N²) regressions without flaking under load.  Write budgets
+# for geometry types with many cross-chunk records are looser, to cover
+# the per-cell write overhead of the ``links/<delta>/<offsets>`` segments
+# on an unsharded store.
 PERF_BUDGET = {
     "write_lines": 8.0,      # ~5s with thousands of cross-chunk cells
     "read_lines": 8.0,       # ~3-5s walking per-cell reads
-    "write_polylines": 6.0,  # measured ~0.6s pre-0.8
+    "write_polylines": 6.0,  # measured ~0.6s
     "read_polylines": 6.0,   # ~3s walking per-cell reads
     "write_graph": 12.0,     # ~8-9s with thousands of cross-chunk cells
-    "read_graph": 25.0,      # ~17s walking thousands of CCL cells; sharding will amortise
-    "write_mesh": 4.0,       # measured ~0.3s pre-0.8
+    "read_graph": 25.0,      # ~17s walking thousands of link cells
+    "write_mesh": 4.0,       # measured ~0.3s
     "read_mesh": 4.0,        # ~1s per-cell reads (mesh has fewer cross-chunk records)
 }
 

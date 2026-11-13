@@ -464,10 +464,10 @@ OME_ATTRS_KEY: str = "ome"
 OME_VERSION: str = "0.6"
 """NGFF version stamped on the node.
 
-The one field here that cannot yet be got right.  RFC 8 is a proposal, so
-the version it lands under is not settled; ``"0.5"`` is the current NGFF
-release and the version RFC 8's own examples carry.  It is a single
-constant precisely so that correcting it is a one-line change.
+``"0.6"``: RFC 8 is a proposal and is not part of NGFF 0.5, so the node
+declares the next NGFF version, the one RFC 8 targets.  Until RFC 8 lands
+that version is not settled; it is a single constant so that correcting
+it is a one-line change.
 
 RFC 8 requires ``version`` on the root node of a document and forbids it
 on any other, so it appears here and nowhere else in the store.
