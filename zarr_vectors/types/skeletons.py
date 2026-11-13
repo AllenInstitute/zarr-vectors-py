@@ -467,17 +467,22 @@ def finalize_skeleton_store(root) -> None:
     """Finish a streamed skeleton store: stamp counts, then commit.
 
     ``init_skeleton_store`` creates level 0 before any vertex exists, so
-    it records ``vertex_count: 0``; the per-chunk writers never touch the
-    shared level metadata (concurrent workers would race on it).  Here,
-    on the coordinator, every level's ``vertex_count`` is set from its
-    chunks' fragment indices -- kilobytes per chunk, no vertex decoding.
+    it records ``vertex_count: 0`` and only the families it can foresee in
+    ``arrays_present``; the per-chunk writers never touch the shared
+    level metadata (concurrent workers would race on it).  Here, on the
+    coordinator, every level's ``vertex_count`` is set from its chunks'
+    fragment indices -- kilobytes per chunk, no vertex decoding -- and its
+    ``arrays_present`` from the families on disk.
     """
+    from zarr_vectors.building import refresh_arrays_present
+
     for level in list_resolution_levels(root):
         lg = get_resolution_level(root, level)
         total = sum(
             chunk_vertex_count(lg, cc) for cc in list_chunk_keys(lg, VERTICES)
         )
         update_level_metadata(lg, vertex_count=int(total))
+        refresh_arrays_present(lg)
     # No ``fragments_tile`` stamp here, deliberately.  This finalises a
     # DECENTRALISED write -- many workers, each owning some chunks -- so
     # the layout is exactly the one whose tiling nothing can vouch for

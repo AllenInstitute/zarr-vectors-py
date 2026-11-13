@@ -261,3 +261,13 @@ def test_finalize_stamps_vertex_count(tmp_path: Path) -> None:
 
     path = _two_chunk_tree(tmp_path)  # finalized, 4 vertices in 2 chunks
     assert read_level_metadata(open_store(path), 0).vertex_count == 4
+
+
+def test_finalize_declares_every_family_on_disk(tmp_path: Path) -> None:
+    """init foresees vertices, links and object_index only; the sidecar
+    families the chunk writers add must be declared after finalize."""
+    from zarr_vectors.core.store import open_store, read_level_metadata
+
+    path = _two_chunk_tree(tmp_path)
+    present = set(read_level_metadata(open_store(path), 0).arrays_present)
+    assert {"vertices", "vertex_fragments", "links"} <= present
