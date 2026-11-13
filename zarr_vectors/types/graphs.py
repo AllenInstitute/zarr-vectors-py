@@ -142,7 +142,9 @@ def write_graph(
         vertex_attributes: Per-node attributes ``{name: (N,) or (N,C)}``.
             (Spec name; replaces ``node_attributes``.)
         link_attributes: Per-edge attributes ``{name: (M,) or (M,C)}``.
-            (Spec name; replaces ``edge_attributes``.)
+            (Spec name; replaces ``edge_attributes``.)  With
+            ``kind="skeleton"`` they make every edge an explicit record
+            (implied ones included), so each edge keeps its value.
         fragment_attributes: Per-fragment attributes, keyed per chunk:
             ``{name: {chunk_coords: ndarray}}``.  Each per-chunk ndarray
             has shape ``(num_fragments_in_chunk,)`` or
@@ -408,6 +410,16 @@ def write_graph(
         )
         store_mask = ~implied
         _check_one_root_per_object(edges, object_ids, n_nodes)
+        if edge_attributes:
+            # ``link_attributes/`` mirrors the stored records row for row,
+            # so an implied edge has nowhere to keep its values -- skipping
+            # them silently dropped every attribute row but the branch and
+            # cross-chunk ones.  Store every edge explicitly instead: a
+            # record restating the implied parent is legal under
+            # ``implicit_sequential_with_branches`` (readers apply it as an
+            # override that changes nothing).  Stores written without edge
+            # attributes are unaffected.
+            store_mask = np.ones(n_edges, dtype=bool)
     else:
         store_mask = np.ones(n_edges, dtype=bool)
     store_rows = np.flatnonzero(store_mask)
