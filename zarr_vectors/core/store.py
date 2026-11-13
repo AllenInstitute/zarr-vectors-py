@@ -1919,13 +1919,26 @@ def add_resolution_level(
 
 
 def remove_resolution_level(root: Group, level_index: int) -> None:
-    """Remove a resolution level from the store.
+    """Remove the coarsest resolution level from the store.
 
-    Level 0 cannot be removed.
+    Level 0 cannot be removed, and neither can a level that has a
+    coarser level above it: levels must stay contiguous (validation
+    level 5), and renumbering the levels above would also mean
+    rewriting every cross-level link that names them.  To drop a
+    middle level, remove the levels above it first (coarsest first).
+
+    Everything that refers to the removed level goes with it: its
+    entry in the NGFF ``multiscales`` datasets, and every
+    ``links/+k`` / ``link_attributes/<name>/+k`` family on a finer
+    level that points at it.
 
     Raises:
-        StoreError: If the level does not exist or is level 0.
+        StoreError: If the level does not exist, is level 0, or is not
+            the coarsest level.
     """
+    from zarr_vectors.constants import LINK_ATTRIBUTES, LINKS
+    from zarr_vectors.core.paths import format_delta
+
     if level_index == 0:
         raise StoreError("Cannot remove level 0 (full resolution)")
 
@@ -1933,7 +1946,64 @@ def remove_resolution_level(root: Group, level_index: int) -> None:
     if group_name not in root:
         raise StoreError(f"Resolution level {level_index} not found")
 
+    levels = list_resolution_levels(root)
+    above = [lv for lv in levels if lv > level_index]
+    if above:
+        raise StoreError(
+            f"Cannot remove resolution level {level_index}: levels "
+            f"{above} sit above it and levels must stay contiguous. "
+            f"Remove the coarser levels first (from {max(above)} down)."
+        )
+
+    # Cross-level families on finer levels that point at this level.
+    for lower in levels:
+        if lower >= level_index:
+            continue
+        lg = get_resolution_level(root, lower)
+        families = [LINKS]
+        if lg.array_exists(LINK_ATTRIBUTES):
+            families += [
+                f"{LINK_ATTRIBUTES}/{name}" for name in lg[LINK_ATTRIBUTES]
+            ]
+        emptied: list[str] = []
+        for fam in families:
+            if not lg.array_exists(fam):
+                continue
+            for name in list(lg[fam]):
+                if not name.startswith("+"):
+                    continue
+                try:
+                    delta = int(name)
+                except ValueError:
+                    continue
+                if lower + delta >= level_index:
+                    lg.delete_subtree(f"{fam}/{format_delta(delta)}")
+            if not list(lg[fam]):
+                lg.delete_subtree(fam)
+                emptied.append(fam)
+        if lg.array_exists(LINK_ATTRIBUTES) and not list(lg[LINK_ATTRIBUTES]):
+            lg.delete_subtree(LINK_ATTRIBUTES)
+            emptied.append(LINK_ATTRIBUTES)
+        if emptied:
+            block = dict(lg.attrs.to_dict().get("zarr_vectors_level", {}))
+            present = block.get("arrays_present")
+            if present is not None:
+                kept = [a for a in present if a not in emptied]
+                if kept != list(present):
+                    update_level_metadata(lg, arrays_present=kept)
+
     root.delete_subtree(group_name)
+
+    # Drop the level's NGFF dataset entry.
+    attrs = root.attrs.to_dict()
+    ms = attrs.get("multiscales")
+    if isinstance(ms, list) and ms:
+        entry = dict(ms[0])
+        datasets = list(entry.get("datasets") or [])
+        kept_ds = [d for d in datasets if d.get("path") != group_name]
+        if len(kept_ds) != len(datasets):
+            entry["datasets"] = kept_ds
+            root.attrs.update({"multiscales": [entry] + list(ms[1:])})
 
     from zarr_vectors.core.ome import refresh_root_node
     refresh_root_node(root)

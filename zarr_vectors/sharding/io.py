@@ -149,7 +149,10 @@ def _list_array_names(level_group, requested: list[str] | None) -> list[str]:
             _walk(f"{prefix}{name}/", group[name])
 
     _walk("", level_group.zarr_group)
-    return names
+    # The store lists keys in whatever order it likes (directory order on
+    # a local store), so sort: get_shard_info reports, and the migrations
+    # process, the arrays in one stable order.
+    return sorted(names)
 
 
 # ===================================================================
@@ -344,7 +347,9 @@ def unshard_store(
     storage object per spatial chunk (``<array>/c/i/j/k``).
 
     The logical single-array layout is unchanged; only the Zarr v3
-    ``sharding_indexed`` packing is removed.  Useful for write-heavy
+    ``sharding_indexed`` packing is removed.  Unsharding the whole store
+    (``arrays=None``) also clears the root ``shard_shape``, so arrays
+    created afterwards are unsharded too.  Useful for write-heavy
     workflows where shard read-modify-write contention hurts throughput,
     or when a reader prefers one file per chunk.
     """
@@ -400,6 +405,18 @@ def unshard_store(
 
             arrays_unsharded += 1
             chunks_extracted += len(chunk_payloads)
+
+    # The root's shard_shape is what every array allocated LATER honours
+    # (create_store(shard_shape=) records it for exactly that), so leaving
+    # it behind made the next write -- a pyramid level, a new attribute --
+    # come out sharded again in a store just unsharded.  Only a whole-store
+    # unshard clears it: one limited to some arrays leaves the rest, and
+    # the store's default, as they were.
+    if arrays is None:
+        attrs = root.attrs.to_dict()
+        block = dict(attrs.get("zarr_vectors", {}))
+        if block.pop("shard_shape", None) is not None:
+            root.attrs.update({"zarr_vectors": block})
 
     return {
         "arrays_unsharded": arrays_unsharded,
@@ -581,7 +598,10 @@ def get_shard_info(store_path: str | Path | Group) -> dict[str, Any]:
 
     * ``sharded`` — bool, mirrors :func:`is_sharded`.
     * ``arrays`` — list of ``{name, shard_shape, grid_shape}`` dicts,
-      one per native-sharded array.
+      one per native-sharded array, ordered by level and then by array
+      path.  Every per-chunk array of a level -- ``links/<delta>/<offsets>``
+      included -- is indexed by the level's own chunk grid (a link record
+      sits in its source chunk's cell), so they share ``grid_shape``.
     * ``shard_count`` — total shard files across all arrays.
     """
     import zarr

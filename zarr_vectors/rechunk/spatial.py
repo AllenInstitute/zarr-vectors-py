@@ -16,13 +16,16 @@ This function does the other job -- change the SPATIAL chunk grid, keep
 everything else -- for any geometry kind:
 
 * links of any ``link_width`` are re-split onto the new grid, with the
-  intra-chunk majority written through the numpy path and the cross-chunk
-  remainder through ``write_links`` so endpoint canonicalisation and the
-  ``perm_idx`` that restores winding are handled by the library.
-* every resolution level is rechunked, not just level 0.
+  records written through ``write_links`` so endpoint canonicalisation and
+  the ``perm_idx`` that restores winding are handled by the library.
+* every resolution level is rechunked, not just level 0, with its own
+  ``bin_shape`` and its cross-level ``links/<+-k>`` families.
+* fragments shared between objects (coarse-level metavertices) stay shared,
+  and each object's manifest keeps its order.
 * object ids are preserved exactly, so ``segment_id`` and any other attribute
   still addresses the same object.
-* object attributes and groupings are carried across per level.
+* vertex attributes, object attributes and groupings are carried across per
+  level; a level with fragment or link attributes is refused.
 
 WHY A STORE NEEDS THIS
 ----------------------
@@ -44,6 +47,15 @@ import numpy as np
 import numpy.typing as npt
 
 __all__ = ["rechunk_spatial", "suggest_chunk_shape"]
+
+#: Vertex-attribute array keys the writer owns: the core fields
+#: create_attribute_array sets, and the presence bookkeeping that names
+#: the SOURCE grid's chunks.  Everything else (dictionary encoding,
+#: user extensions) is copied to the output array.
+_ATTR_META_OWNED = frozenset({
+    "zv_array", "name", "dtype", "channel_names", "row_shape",
+    "nonempty_chunks", "zarr_vectors_presence",
+})
 
 
 def suggest_chunk_shape(
@@ -100,46 +112,79 @@ def _max_links_per_chunk(root, level: int) -> float:
 
 
 # ===================================================================
-# reading a level into per-object geometry
+# reading a level as a vertex table plus its fragments
 # ===================================================================
+#
+# A level is read as ONE table of vertices plus the fragments that slice
+# it, not as per-object geometry.  Coarse pyramid levels share fragments
+# between objects -- a metavertex sits in the manifest of every object it
+# aggregates -- and an object's manifest is an ORDERED walk that may visit
+# the same fragment more than once.  A per-object read either has to pick
+# one owner per fragment (and every other object loses that geometry) or
+# copy the vertex once per owner (and the level grows).  Keeping fragments
+# as the unit keeps each vertex once and every manifest's order intact.
 
-def _read_level(src_group, ndim: int, link_width: int):
-    """{oid: (vertices, links)} in object-local index space.
+class _Level:
+    """One level read off disk.
 
-    ``links`` is ``(N, link_width)``; an empty ``(0, link_width)`` array for a
-    point cloud or for an object that happens to carry none.
+    ``pos``: ``(N, ndim)`` vertex positions, source chunks back to back.
+    ``frags``: per source fragment, its table rows in fragment order.
+    ``manifests``: per object row, the ordered list of fragment numbers.
+    ``chunk_base`` / ``chunk_size``: where each source chunk's buffer
+    starts in the table, for turning a stored ``(chunk, local index)``
+    link endpoint into a table row.
+    ``vattrs``: ``{name: (N, ...) array}`` per-vertex attributes.
     """
-    from zarr_vectors.constants import VERTICES
+
+    def __init__(self):
+        self.pos = None
+        self.frags: list[npt.NDArray[np.int64]] = []
+        self.manifests: list[list[int]] = []
+        self.object_ids = np.zeros(0, np.int64)
+        self.chunk_base: dict[tuple, int] = {}
+        self.chunk_size: dict[tuple, int] = {}
+        self.vattrs: dict[str, Any] = {}
+        self.vattr_meta: dict[str, dict] = {}
+        self.dtype = np.dtype(np.float32)
+
+
+def _list_names(group, family: str) -> list[str]:
+    try:
+        return (sorted(group[family].children())
+                if family in group.children() else [])
+    except Exception:  # noqa: BLE001
+        return []
+
+
+def _read_level(src_group, ndim: int) -> _Level:
+    from zarr_vectors.constants import VERTEX_ATTRIBUTES, VERTICES
     from zarr_vectors.core.arrays import (
-        iter_link_cells,
         list_chunk_keys,
+        read_chunk_attributes,
         read_chunk_vertices,
         read_object_manifest_rows,
         read_vertex_fragment_index,
     )
     from zarr_vectors.exceptions import ArrayError
-    from zarr_vectors.spatial.boundary import apply_perm_inverse
 
-    # A store may legitimately carry no object index -- write_points does not
-    # write one -- in which case every vertex belongs to a single implicit
-    # object 0 and each chunk contributes one fragment.
-    try:
-        ids, manifests = read_object_manifest_rows(src_group)
-    except Exception:  # noqa: BLE001
-        ids, manifests = np.zeros(0, dtype=np.int64), []
-    owner: dict[tuple, int] = {}
-    for oid, frags in zip(ids.tolist(), manifests):
-        for cc, f in frags:
-            owner.setdefault((tuple(int(x) for x in cc), int(f)), oid)
-    implicit = not owner
+    lv = _Level()
+    attr_names = _list_names(src_group, VERTEX_ATTRIBUTES)
+    for name in attr_names:
+        lv.vattr_meta[name] = dict(
+            src_group.read_array_meta(f"{VERTEX_ATTRIBUTES}/{name}") or {})
 
-    obj_pos: dict[int, list] = {}
-    obj_n: dict[int, int] = {}
-    chunk_oid: dict[tuple, npt.NDArray] = {}
-    chunk_row: dict[tuple, npt.NDArray] = {}
-
+    frag_no: dict[tuple, int] = {}
+    pos_parts: list = []
+    attr_parts: dict[str, list] = {n: [] for n in attr_names}
+    base = 0
+    dtype = None
     for cc in sorted(tuple(int(x) for x in c)
                      for c in list_chunk_keys(src_group, VERTICES)):
+        if len(cc) != ndim:
+            raise ValueError(
+                f"rechunk_spatial: chunk key {cc} has {len(cc)} axes but the "
+                f"store has {ndim} spatial axes; a store chunked by an "
+                f"attribute or by source cannot be rechunked spatially")
         try:
             fi = read_vertex_fragment_index(src_group, cc)
             groups = read_chunk_vertices(src_group, cc, ndim=ndim)
@@ -147,15 +192,11 @@ def _read_level(src_group, ndim: int, link_width: int):
             continue
         if not groups:
             continue
-        n_rows = sum(int(np.asarray(g).shape[0]) for g in groups)
-        pos = np.zeros((n_rows, ndim), np.float64)
-        oid_of = np.full(n_rows, -1, np.int64)
-        row_of = np.full(n_rows, -1, np.int64)
+        idxs = []
+        n_rows = 0
         at = 0
         for f, g in enumerate(groups):
             g = np.asarray(g)
-            if g.size == 0:
-                continue
             # A link's stored local index addresses the chunk buffer laid out
             # by the FRAGMENT INDEX, which is not necessarily read order.
             if fi.is_range(f):
@@ -165,192 +206,263 @@ def _read_level(src_group, ndim: int, link_width: int):
                 idx = np.asarray(fi.indices(f), np.int64)
             if idx.size != g.shape[0]:
                 idx = np.arange(at, at + g.shape[0], dtype=np.int64)
-            pos[idx] = g
-            o = 0 if implicit else owner.get((cc, f))
-            if o is not None:
-                oid_of[idx] = o
-                base = obj_n.get(o, 0)
-                row_of[idx] = np.arange(base, base + len(idx))
-                obj_pos.setdefault(o, []).append(pos[idx])
-                obj_n[o] = base + len(idx)
             at += g.shape[0]
-        chunk_oid[cc] = oid_of
-        chunk_row[cc] = row_of
+            idxs.append(idx)
+            if idx.size:
+                n_rows = max(n_rows, int(idx.max()) + 1)
+            if dtype is None and g.size:
+                dtype = g.dtype
+        pos = np.zeros((n_rows, ndim), np.float64)
+        for f, (g, idx) in enumerate(zip(groups, idxs)):
+            if idx.size:
+                pos[idx] = np.asarray(g, np.float64).reshape(len(idx), ndim)
+            frag_no[(cc, f)] = len(lv.frags)
+            lv.frags.append(base + idx.astype(np.int64))
+        for name in attr_names:
+            meta = lv.vattr_meta[name]
+            adt = np.dtype(meta.get("dtype", "float32"))
+            rs = meta.get("row_shape") or []
+            ncols = int(rs[0]) if rs else max(1, len(meta.get("channel_names") or []))
+            agroups = read_chunk_attributes(src_group, name, cc, dtype=adt,
+                                            ncols=ncols)
+            buf = np.zeros((n_rows,) + ((ncols,) if ncols > 1 else ()), adt)
+            for a, idx in zip(agroups, idxs):
+                if idx.size:
+                    buf[idx] = np.asarray(a, adt).reshape(buf[idx].shape)
+            attr_parts[name].append(buf)
+        lv.chunk_base[cc] = base
+        lv.chunk_size[cc] = n_rows
+        base += n_rows
+        pos_parts.append(pos)
 
-    out = {o: [np.concatenate(p, axis=0), None] for o, p in obj_pos.items() if p}
+    lv.pos = (np.concatenate(pos_parts) if pos_parts
+              else np.zeros((0, ndim), np.float64))
+    lv.vattrs = {n: np.concatenate(p) for n, p in attr_parts.items() if p}
+    lv.dtype = np.dtype(dtype) if dtype is not None else np.dtype(np.float32)
 
-    links_of: dict[int, list] = {}
+    # A store may legitimately carry no object index -- write_points does not
+    # write one -- in which case every fragment belongs to one implicit
+    # object 0.
     try:
-        cells = list(iter_link_cells(src_group, 0))
+        ids, manifests = read_object_manifest_rows(src_group)
     except Exception:  # noqa: BLE001
-        cells = []
-    for _seg, offsets, source_chunk, groups in cells:
-        src_cc = tuple(int(x) for x in source_chunk)
-        for g in groups:
-            g = np.asarray(g, np.int64)
-            if g.ndim != 2 or g.size == 0:
-                continue
-            perm = None
-            if g.shape[1] == link_width + 1:
-                perm = g[:, 0]
-                g = g[:, 1:]
-            elif g.shape[1] != link_width:
-                continue
-            cols_o, cols_r, bad = [], [], False
-            for k in range(link_width):
-                off = ((0,) * ndim if k == 0
-                       else (offsets[k - 1] if k - 1 < len(offsets)
-                             else (0,) * ndim))
-                cc_k = tuple(int(a) + int(b) for a, b in zip(src_cc, off))
-                oid_of = chunk_oid.get(cc_k)
-                row_of = chunk_row.get(cc_k)
-                if oid_of is None:
-                    bad = True
-                    break
-                col = g[:, k]
-                ok = (col >= 0) & (col < oid_of.size)
-                o = np.full(col.shape, -1, np.int64)
-                rr = np.full(col.shape, -1, np.int64)
-                o[ok] = oid_of[col[ok]]
-                rr[ok] = row_of[col[ok]]
-                cols_o.append(o)
-                cols_r.append(rr)
-            if bad:
-                continue
-            same = cols_o[0] >= 0
-            for k in range(1, link_width):
-                same &= cols_o[k] == cols_o[0]
-            for k in range(link_width):
-                same &= cols_r[k] >= 0
-            if not same.any():
-                continue
-            oids = cols_o[0][same]
-            rec = np.stack([c[same] for c in cols_r], axis=1)
-            if perm is not None:
-                p = np.asarray(perm)[same]
-                res = np.empty_like(rec)
-                for pv in np.unique(p):
-                    sel = p == pv
-                    order = apply_perm_inverse(list(range(link_width)),
-                                               int(pv), link_width)
-                    for j, i in enumerate(order):
-                        res[sel, j] = rec[sel, i]
-                rec = res
-            for o in np.unique(oids):
-                links_of.setdefault(int(o), []).append(rec[oids == o])
+        ids, manifests = np.zeros(0, dtype=np.int64), []
+    if len(manifests):
+        lv.object_ids = np.asarray(ids, np.int64)
+        for man in manifests:
+            seq = []
+            for cc, f in man:
+                k = frag_no.get((tuple(int(x) for x in cc), int(f)))
+                if k is None:
+                    raise ValueError(
+                        f"rechunk_spatial: a manifest names fragment {f} of "
+                        f"chunk {tuple(cc)}, which the level does not hold")
+                seq.append(k)
+            lv.manifests.append(seq)
+    elif lv.frags:
+        lv.object_ids = np.zeros(1, np.int64)
+        lv.manifests = [list(range(len(lv.frags)))]
+    return lv
 
-    for o in list(out):
-        ll = links_of.get(o)
-        out[o][1] = (np.concatenate(ll, axis=0) if ll
-                     else np.zeros((0, link_width), np.int64))
-    return {o: (v, lo) for o, (v, lo) in out.items()}
+
+def _endpoint_rows(lv: _Level, chunks, vi) -> npt.NDArray[np.int64]:
+    """Table rows for ``(chunk, local index)`` endpoints; -1 when unknown."""
+    out = np.full(vi.shape, -1, np.int64)
+    flat_c = chunks.reshape(-1, chunks.shape[-1])
+    res = out.reshape(-1)
+    for i, (c, v) in enumerate(zip(flat_c.tolist(), vi.reshape(-1).tolist())):
+        k = tuple(c)
+        b = lv.chunk_base.get(k)
+        if b is not None and 0 <= v < lv.chunk_size[k]:
+            res[i] = b + v
+    return out
 
 
 # ===================================================================
-# writing per-object geometry onto a chunk grid
+# writing a level onto a chunk grid
 # ===================================================================
 
-def _write_level(level_group, objects: dict, chunk_shape, ndim: int,
-                 link_width: int, total_objects: int, has_links: bool):
+def _write_level(level_group, lv: _Level, chunk_shape, ndim: int,
+                 total_objects: int):
+    """Write vertices, fragments, manifests and vertex attributes.
+
+    Every source fragment is cut into runs of consecutive rows that fall
+    in one new chunk; each run becomes a new fragment, so a manifest that
+    walked fragments ``A, B`` now walks ``A's runs, B's runs`` and the
+    vertex order of every object is unchanged.  A fragment several objects
+    share (or one object visits twice) is written once and referenced from
+    each visit.  A fragment referenced exactly once is private to that
+    visit, so its runs are merged with the neighbouring private runs of the
+    same walk that land in the same chunk -- otherwise level 0, where every
+    fragment is private, would keep one fragment per OLD chunk crossing.
+
+    Returns ``(new_chunk, new_local)`` per table row, for re-addressing
+    links, and the vertex count.
+    """
     from zarr_vectors.core.arrays import (
-        create_links_array,
-        create_links_family,
-        finalize_links,
-        write_chunk_links,
+        create_attribute_array,
+        write_chunk_attributes,
         write_chunk_vertices,
-        write_links,
         write_object_index,
     )
 
+    n = int(lv.pos.shape[0])
     cs = np.asarray(chunk_shape, np.float64)
-    per_chunk: dict[tuple, list] = {}
-    for oid, (v, lo) in sorted(objects.items()):
-        if len(v) == 0:
-            continue
-        cc = np.floor(np.asarray(v, np.float64) / cs).astype(np.int64)
-        uniq, inv = np.unique(cc, axis=0, return_inverse=True)
-        inv = np.asarray(inv).ravel()
-        order = np.argsort(inv, kind="stable")
-        bounds = np.flatnonzero(np.diff(inv[order])) + 1
-        for rows in np.split(order, bounds):
-            if rows.size:
-                key = tuple(int(x) for x in uniq[inv[rows[0]]])
-                per_chunk.setdefault(key, []).append((oid, rows))
+    new_cc = (np.floor(lv.pos / cs).astype(np.int64) if n
+              else np.zeros((0, ndim), np.int64))
+    new_local = np.full(n, -1, np.int64)
 
-    local_of = {oid: np.full(len(v), -1, np.int64)
-                for oid, (v, lo) in objects.items()}
-    chunk_of = {oid: np.zeros((len(v), ndim), np.int64)
-                for oid, (v, lo) in objects.items()}
+    refs = np.zeros(len(lv.frags), np.int64)
+    for seq in lv.manifests:
+        for k in seq:
+            refs[k] += 1
+
+    def runs(k: int):
+        rows = lv.frags[k]
+        if rows.size == 0:
+            return []
+        c = new_cc[rows]
+        # A row may only join the run before it if it lands in the same chunk.
+        cut = np.flatnonzero(np.any(c[1:] != c[:-1], axis=1)) + 1
+        return [(tuple(int(x) for x in new_cc[r[0]]), r)
+                for r in np.split(rows, cut)]
+
+    # chunk -> list of row arrays (one per new fragment), in creation order
+    chunk_frags: dict[tuple, list] = {}
+
+    def new_frag(cc: tuple, rows) -> tuple:
+        lst = chunk_frags.setdefault(cc, [])
+        lst.append(rows)
+        return (cc, len(lst) - 1)
+
+    shared_refs: dict[int, list] = {}
     manifests: dict[int, list] = {}
-
-    for cc in sorted(per_chunk):
-        members = sorted(per_chunk[cc], key=lambda t: t[0])
-        blocks, base = [], 0
-        for frag, (oid, rows) in enumerate(members):
-            blocks.append(np.asarray(objects[oid][0][rows], np.float32))
-            local_of[oid][rows] = np.arange(base, base + len(rows))
-            chunk_of[oid][rows] = np.asarray(cc, np.int64)
-            manifests.setdefault(oid, []).append((cc, frag))
-            base += len(rows)
-        write_chunk_vertices(level_group, cc, blocks, dtype=np.float32)
-
-    n_links = 0
-    if has_links:
-        pending: dict[tuple, list] = {}
-        for oid, (v, lo) in sorted(objects.items()):
-            if len(lo) == 0:
+    for oid, seq in zip(lv.object_ids.tolist(), lv.manifests):
+        out: list = []
+        open_private: tuple | None = None   # (cc, fragment) still growing
+        for k in seq:
+            if refs[k] > 1:
+                if k not in shared_refs:
+                    shared_refs[k] = [new_frag(cc, r) for cc, r in runs(k)]
+                out.extend(shared_refs[k])
+                open_private = None
                 continue
-            loc, ch = local_of[oid], chunk_of[oid]
-            cor_c = [ch[lo[:, k]] for k in range(link_width)]
-            cor_l = [loc[lo[:, k]] for k in range(link_width)]
-            base = cor_c[0]
-            offs = [cor_c[k] - base for k in range(1, link_width)]
-            sig = np.concatenate([base] + offs, axis=1)
-            uniq, inv = np.unique(sig, axis=0, return_inverse=True)
-            inv = np.asarray(inv).ravel()
-            for u in range(len(uniq)):
-                sel = inv == u
-                b = tuple(int(x) for x in uniq[u, :ndim])
-                ok = tuple(tuple(int(x) for x in uniq[u, ndim*(k+1):ndim*(k+2)])
-                           for k in range(link_width - 1))
-                pending.setdefault((b, ok), []).append(
-                    np.stack([c[sel] for c in cor_l], axis=1))
+            for cc, r in runs(k):
+                if open_private is not None and open_private[0] == cc:
+                    lst = chunk_frags[cc]
+                    lst[open_private[1]] = np.concatenate(
+                        [lst[open_private[1]], r])
+                else:
+                    open_private = new_frag(cc, r)
+                    out.append(open_private)
+        if out:
+            manifests[int(oid)] = out
+    # Fragments no object names still hold vertices; keep them.
+    for k in np.flatnonzero(refs == 0).tolist():
+        for cc, r in runs(k):
+            new_frag(cc, r)
 
-        create_links_family(level_group, delta=0, link_width=link_width,
-                            sid_ndim=ndim)
-        zero = (0,) * ndim
-        cross: list[list[tuple]] = []
-        for (b, ok), arrs in sorted(pending.items()):
-            if all(o == zero for o in ok):
-                continue
-            st = np.concatenate(arrs, axis=0)
-            n_links += len(st)
-            ends = [tuple(b)] + [tuple(int(x) + int(y) for x, y in zip(b, o))
-                                 for o in ok]
-            cross.extend([(ends[k], int(r[k])) for k in range(link_width)]
-                         for r in st)
-        if cross:
-            write_links(level_group, cross, ndim, delta=0,
-                        link_width=link_width)
-        for (b, ok), arrs in sorted(pending.items()):
-            if not all(o == zero for o in ok):
-                continue
-            st = np.concatenate(arrs, axis=0)
-            n_links += len(st)
-            create_links_array(level_group, link_width, delta=0, sid_ndim=ndim,
-                               offsets=[zero] * (link_width - 1))
-            write_chunk_links(level_group, b, [st], dtype=np.int64, delta=0,
-                              link_width=link_width)
-        finalize_links(level_group, delta=0)
+    for name, meta in lv.vattr_meta.items():
+        rs = meta.get("row_shape") or []
+        ncols = int(rs[0]) if rs else None
+        extra = {k: v for k, v in meta.items()
+                 if k not in _ATTR_META_OWNED}
+        create_attribute_array(level_group, name,
+                               dtype=str(meta.get("dtype", "float32")),
+                               channel_names=meta.get("channel_names"),
+                               ncols=ncols, extra_meta=extra or None)
+
+    written = 0
+    for cc in sorted(chunk_frags):
+        frs = chunk_frags[cc]
+        at = 0
+        for r in frs:
+            new_local[r] = np.arange(at, at + len(r))
+            at += len(r)
+        written += at
+        write_chunk_vertices(level_group, cc,
+                             [np.asarray(lv.pos[r], lv.dtype) for r in frs],
+                             dtype=lv.dtype)
+        for name, data in lv.vattrs.items():
+            write_chunk_attributes(level_group, name, cc,
+                                   [data[r] for r in frs], dtype=data.dtype)
 
     write_object_index(level_group, manifests, sid_ndim=ndim,
                        total_objects=total_objects)
-    return sum(len(v) for v, _ in objects.values()), n_links
+    return new_cc, new_local, written
+
+
+def _carry_links(out_group, src_group, delta: int, src_lv: _Level,
+                 dst_lv: _Level, src_map, dst_map, ndim: int) -> tuple[int, int]:
+    """Re-address one ``links/<delta>`` family onto the new grids.
+
+    Endpoint 0 lives at the owning level, endpoints k > 0 at
+    ``level + delta``.  Returns ``(written, dropped)``; a record is dropped
+    only when an endpoint did not resolve to a vertex in the SOURCE store.
+    """
+    from zarr_vectors.core.arrays import (
+        create_links_family,
+        link_family_policy,
+        read_link_arrays,
+        write_links,
+    )
+
+    pol = link_family_policy(src_group, delta)
+    if pol is None:
+        return 0, 0
+    link_width, _sid, directed, store = pol
+    create_links_family(out_group, delta=delta, link_width=link_width,
+                        sid_ndim=ndim, directed=directed, store=store)
+    chunks, vi = read_link_arrays(src_group, delta=delta)
+    if vi.shape[0] == 0:
+        return 0, 0
+    rows = np.empty_like(vi)
+    rows[:, :1] = _endpoint_rows(src_lv, chunks[:, :1], vi[:, :1])
+    rows[:, 1:] = _endpoint_rows(dst_lv, chunks[:, 1:], vi[:, 1:])
+    ok = np.all(rows >= 0, axis=1)
+    rows = rows[ok]
+    if store == "duplicate":
+        # read_link_arrays returns one copy per incident chunk; write_links
+        # makes those copies again.
+        _, first = np.unique(rows, axis=0, return_index=True)
+        rows = rows[np.sort(first)]
+    new_c = np.empty(rows.shape + (ndim,), np.int64)
+    new_v = np.empty(rows.shape, np.int64)
+    new_c[:, 0] = src_map[0][rows[:, 0]]
+    new_v[:, 0] = src_map[1][rows[:, 0]]
+    if link_width > 1:
+        new_c[:, 1:] = dst_map[0][rows[:, 1:]]
+        new_v[:, 1:] = dst_map[1][rows[:, 1:]]
+    if len(rows):
+        write_links(out_group, [], ndim, delta=delta, link_width=link_width,
+                    directed=directed, store=store, _arrays=(new_c, new_v))
+    return int(len(rows)), int((~ok).sum())
 
 
 # ===================================================================
 # the public entry point
 # ===================================================================
+
+#: Level families this function carries.  Anything else present with
+#: content makes it refuse rather than write a store that silently lacks it.
+_CARRIED = {"vertices", "vertex_fragments", "object_index", "links",
+            "link_fragments", "vertex_attributes", "object_attributes",
+            "groups", "group_attributes"}
+
+
+def _refuse_uncarried(src_group, lvl: int) -> None:
+    extra = []
+    for name in src_group.children():
+        if name in _CARRIED or name.startswith("_") or name.startswith("."):
+            continue
+        extra.append(name)
+    if extra:
+        raise NotImplementedError(
+            f"rechunk_spatial: level {lvl} carries {sorted(extra)}, which "
+            f"spatial rechunking does not re-address (fragment and link "
+            f"attributes are tied to the source chunking); refusing rather "
+            f"than writing a store without them")
+
 
 def rechunk_spatial(
     store_path: str | Path,
@@ -364,10 +476,20 @@ def rechunk_spatial(
 ) -> dict[str, Any]:
     """Rewrite a store on a different spatial chunk grid, losslessly.
 
-    Works for every geometry kind: the link family is carried across at its own
-    ``link_width`` (3 for triangle meshes, 2 for skeletons, graphs and
-    polylines) and a store with no links at all (a point cloud) simply has none
-    to carry.
+    Works for every geometry kind: every ``links/<delta>`` family -- the
+    intra-level one and the cross-level ``±k`` ones of a pyramid -- is
+    carried across at its own ``link_width`` (3 for triangle meshes, 2 for
+    skeletons, graphs and polylines), and a store with no links at all (a
+    point cloud) simply has none to carry.
+
+    Each vertex is written once.  A fragment shared between objects (the
+    metavertices of a coarse pyramid level) stays shared: vertices are
+    grouped on the new grid by the set of objects that own them, and each
+    group is listed in every owner's manifest.  Object ids, per-vertex,
+    per-object and per-group attributes, groupings, each level's
+    ``bin_shape`` / ``bin_ratio`` and the root's base bin are carried
+    unchanged.  Fragment and link attributes are not: they are tied to the
+    source's fragments and link cells, so a level carrying them is refused.
 
     Args:
         store_path: source store.
@@ -383,22 +505,37 @@ def rechunk_spatial(
             and offers one level. Each shape must be an integer multiple of the
             root chunk shape.
         target_links_per_chunk: used only when ``chunk_shape`` is None.
-        levels: levels to carry across; default all of them.
+        levels: levels to carry across; default all of them.  Cross-level
+            links whose other end is a level left out are not carried.
         force: overwrite ``output`` if it exists.
 
     Returns:
         Summary dict, including per-level vertex and link counts.
     """
+    from zarr_vectors.constants import (
+        CAP_MULTISCALE_LINKS,
+        CAP_PRESERVED_OBJECT_IDS,
+        CAP_SHARED_FRAGMENTS,
+        GROUP_ATTRIBUTES,
+        GROUPS,
+        LINKS,
+        OBJECT_ATTRIBUTES,
+        VERTEX_ATTRIBUTES,
+    )
     from zarr_vectors.core.arrays import (
+        create_groupings_attributes_array,
         create_object_attributes_array,
         create_object_index_array,
         create_vertices_array,
-        link_family_policy,
+        list_link_deltas,
         read_all_groupings,
+        read_groupings_attributes,
         read_object_attributes,
         write_groupings,
+        write_groupings_attributes,
         write_object_attributes,
     )
+    from zarr_vectors.core.metadata import LevelMetadata
     from zarr_vectors.core.store import (
         create_resolution_level,
         create_store,
@@ -407,13 +544,14 @@ def rechunk_spatial(
         open_store,
         read_level_metadata,
         read_root_metadata,
+        update_level_metadata,
     )
 
     src_path, out_path = Path(store_path), Path(output)
-    if out_path.exists():
-        if not force:
-            raise FileExistsError(f"{out_path} exists; pass force=True")
-        shutil.rmtree(out_path)
+    if out_path.resolve() == src_path.resolve():
+        raise ValueError("rechunk_spatial: output must differ from the source")
+    if out_path.exists() and not force:
+        raise FileExistsError(f"{out_path} exists; pass force=True")
 
     root = open_store(str(src_path), mode="r")
     meta = read_root_metadata(root)
@@ -421,144 +559,129 @@ def rechunk_spatial(
     all_levels = sorted(list_resolution_levels(root))
     todo = all_levels if levels is None else [lo for lo in all_levels if lo in levels]
 
+    # Read and check everything BEFORE touching the output, so a refusal
+    # never costs the caller an existing directory.
+    for lvl in todo:
+        _refuse_uncarried(get_resolution_level(root, lvl), lvl)
+
     if chunk_shape is None:
         chunk_shape = suggest_chunk_shape(
             src_path, target_links_per_chunk=target_links_per_chunk)
     chunk_shape = tuple(float(c) for c in chunk_shape)
+
+    if out_path.exists():
+        shutil.rmtree(out_path)
 
     # Carry the conventions across. Creating a store with only bounds/
     # chunk_shape/geometry_types leaves links_convention and friends unset,
     # and a reader with no links_convention cannot resolve the intra-chunk
     # links at all -- only the cross-chunk ones survive, which renders as
     # geometry along chunk boundaries and nothing else.
-    base_bin = getattr(meta, "base_bin_shape", None)
-    if base_bin is None:
-        base_bin = tuple(c / 4.0 for c in chunk_shape)
+    # The base bin is the SOURCE's effective one: it is the level-0
+    # resolution, and every coarse level's bin_ratio is relative to it.
+    base_bin = tuple(float(b) for b in meta.effective_bin_shape)
+    caps = [c for c in (meta.format_capabilities or [])
+            if c in (CAP_PRESERVED_OBJECT_IDS, CAP_SHARED_FRAGMENTS,
+                     CAP_MULTISCALE_LINKS)]
     create_store(str(out_path), bounds=meta.bounds, chunk_shape=chunk_shape,
                  geometry_types=list(meta.geometry_types), ndim=ndim,
-                 base_bin_shape=tuple(float(b) for b in base_bin),
+                 base_bin_shape=base_bin,
                  shard_shape=getattr(meta, "shard_shape", None),
                  links_convention=getattr(meta, "links_convention", None)
                  or "explicit",
                  object_index_convention=getattr(
                      meta, "object_index_convention", None) or "standard",
                  cross_chunk_strategy=getattr(
-                     meta, "cross_chunk_strategy", None) or "explicit_links")
+                     meta, "cross_chunk_strategy", None) or "explicit_links",
+                 cross_level_depth=getattr(meta, "cross_level_depth", None),
+                 cross_level_storage=getattr(meta, "cross_level_storage", None),
+                 format_capabilities=caps or None)
     out_root = open_store(str(out_path), mode="r+")
 
+    read: dict[int, _Level] = {}
+    maps: dict[int, tuple] = {}
     report = []
     for lvl in todo:
         src_g = get_resolution_level(root, lvl)
-        try:
-            pol = link_family_policy(src_g, 0)
-            link_width = int(pol[0] if isinstance(pol, tuple)
-                             else pol.get("link_width", 2))
-            has_links = True
-        except Exception:  # noqa: BLE001
-            link_width, has_links = 2, False
-
         lvl_shape = tuple(float(x) for x in (level_chunk_shapes or {}).get(
             lvl, chunk_shape))
-        objects = _read_level(src_g, ndim, link_width)
-        n_obj_total = max([o for o in objects] + [-1]) + 1
+        lv = _read_level(src_g, ndim)
+        read[lvl] = lv
+        ids = lv.object_ids
+        n_obj_total = int(ids.max()) + 1 if ids.size else (1 if lv.pos.shape[0] else 0)
 
         src_lm = read_level_metadata(root, lvl)
+        has_links = bool(list_link_deltas(src_g))
         arrays = ["vertices", "object_index"] + (["links"] if has_links else [])
+        if lv.vattr_meta:
+            arrays.append(VERTEX_ATTRIBUTES)
         kw: dict[str, Any] = {"level": lvl, "vertex_count": 0,
                               "arrays_present": arrays,
-                              "coarsening_method": getattr(
-                                  src_lm, "coarsening_method", None)}
+                              "object_sparsity": src_lm.object_sparsity,
+                              "coarsening_method": src_lm.coarsening_method}
         if lvl > 0:
-            kw["parent_level"] = getattr(src_lm, "parent_level", lvl - 1)
-            # NOTE: derived from the ROOT bin and the level index, not
-            # from the source level's own bin_shape.  That is right for a
-            # pyramid built with a uniform factor of 2 and wrong for any
-            # other, but rechunking is not the place to change it -- see
-            # metadata.level_factor for the parent-relative quantity.
-            kw["bin_shape"] = tuple(float(b) * (2 ** lvl) for b in base_bin)
-            kw["preserves_object_ids"] = True
+            kw["parent_level"] = (src_lm.parent_level
+                                  if src_lm.parent_level is not None else lvl - 1)
+            # The source level's own bin, not one re-derived from the level
+            # index: a pyramid need not coarsen by 2 per level.
+            kw["bin_shape"] = (tuple(src_lm.bin_shape) if src_lm.bin_shape
+                               else tuple(b * (2 ** lvl) for b in base_bin))
+            if src_lm.bin_ratio is not None:
+                kw["bin_ratio"] = tuple(src_lm.bin_ratio)
+            kw["preserves_object_ids"] = getattr(
+                src_lm, "preserves_object_ids", True)
             kw["inherited_num_objects"] = n_obj_total
         if lvl > 0 and lvl_shape != tuple(chunk_shape):
             kw["chunk_shape"] = lvl_shape
-        out_g = create_resolution_level(out_root, lvl, __import__(
-            "zarr_vectors.core.metadata", fromlist=["LevelMetadata"]
-        ).LevelMetadata(**kw))
-        create_vertices_array(out_g, dtype="float32")
+        out_g = create_resolution_level(out_root, lvl, LevelMetadata(**kw))
+        create_vertices_array(out_g, dtype=str(lv.dtype))
         create_object_index_array(out_g)
 
-        nv, nl = _write_level(out_g, objects, lvl_shape, ndim, link_width,
-                              n_obj_total, has_links)
-
-        # vertex_count is stamped at level creation, before any data exists, so
-        # it has to be corrected once the real total is known. Leaving it at 0
-        # is not cosmetic: it is the field a viewer's LOD picker reads to tell
-        # levels apart, so every level looked identical and only one was
-        # selectable.
-        try:
-            from zarr_vectors.core.store import update_level_metadata
-            update_level_metadata(out_root, lvl, vertex_count=int(nv))
-        except Exception:  # noqa: BLE001
-            import json as _json
-            lj = out_path / str(lvl) / "zarr.json"
-            _d = _json.loads(lj.read_text())
-            _d["attributes"]["zarr_vectors_level"]["vertex_count"] = int(nv)
-            lj.write_text(_json.dumps(_d, indent=2))
+        new_cc, new_local, nv = _write_level(out_g, lv, lvl_shape, ndim,
+                                             n_obj_total)
+        maps[lvl] = (new_cc, new_local)
+        update_level_metadata(out_g, vertex_count=int(nv))
 
         # attributes and groupings ride along per level
         n_attr = 0
-        # LevelMetadata carries no list of attribute names, so enumerate the
-        # object_attributes group itself. Relying on a metadata field that does
-        # not exist made this loop a silent no-op: the rechunked store came out
-        # with no segment_id at all, which is exactly the defect that makes a
-        # store load but show nothing.
-        # Group.children() lists IMMEDIATE children only, so the attribute
-        # names live one level down, under the object_attributes subgroup --
-        # filtering the level's own children for an "object_attributes/" prefix
-        # matches nothing and silently carries no attributes at all.
-        try:
-            from zarr_vectors.constants import OBJECT_ATTRIBUTES
-            attr_names = (list(src_g[OBJECT_ATTRIBUTES].children())
-                          if OBJECT_ATTRIBUTES in src_g.children() else [])
-        except Exception:  # noqa: BLE001
-            attr_names = []
-        for name in attr_names:
-            try:
-                data = np.asarray(read_object_attributes(src_g, name))
-                create_object_attributes_array(out_g, name, dtype=str(data.dtype))
-                write_object_attributes(out_g, name, data)
-                n_attr += 1
-            except Exception:  # noqa: BLE001
-                pass
-        try:
-            gr = read_all_groupings(src_g)
-            if gr:
-                write_groupings(out_g, {i: list(m) for i, m in enumerate(gr)})
-        except Exception:  # noqa: BLE001
-            pass
+        for name in _list_names(src_g, OBJECT_ATTRIBUTES):
+            data = np.asarray(read_object_attributes(src_g, name))
+            create_object_attributes_array(out_g, name, dtype=str(data.dtype))
+            write_object_attributes(out_g, name, data)
+            n_attr += 1
+        gr = (read_all_groupings(src_g)
+              if GROUPS in src_g.children() else None)
+        if gr:
+            write_groupings(out_g, {i: list(m) for i, m in enumerate(gr)})
         # Group ATTRIBUTES are a separate array family from the memberships.
-        # Carrying the memberships alone leaves every group unnamed -- the
-        # source store has n_objects / name / source_column and the rechunked
-        # one had none, so a viewer listing groups has nothing to label them
-        # with.
-        try:
-            from zarr_vectors.constants import GROUP_ATTRIBUTES
-            from zarr_vectors.core.arrays import (
-                create_groupings_attributes_array,
-                read_groupings_attributes,
-                write_groupings_attributes,
-            )
-            gnames = (list(src_g[GROUP_ATTRIBUTES].children())
-                      if GROUP_ATTRIBUTES in src_g.children() else [])
-            for gn in gnames:
-                data = np.asarray(read_groupings_attributes(src_g, gn))
-                create_groupings_attributes_array(out_g, gn, dtype=str(data.dtype))
-                write_groupings_attributes(out_g, gn, data)
-        except Exception:  # noqa: BLE001
-            pass
+        for gn in _list_names(src_g, GROUP_ATTRIBUTES):
+            data = np.asarray(read_groupings_attributes(src_g, gn))
+            create_groupings_attributes_array(out_g, gn, dtype=str(data.dtype))
+            write_groupings_attributes(out_g, gn, data)
 
-        report.append({"level": lvl, "objects": len(objects), "vertices": nv,
-                       "links": nl, "link_width": link_width,
+        report.append({"level": lvl,
+                       "objects": sum(1 for m in lv.manifests if m),
+                       "vertices": nv, "links": 0, "cross_level_links": 0,
+                       "dropped_links": 0, "vertex_attributes": len(lv.vattrs),
                        "attributes": n_attr, "chunk_shape": lvl_shape})
+
+    # Links last: a cross-level family needs both levels' metadata (their
+    # chunk grids anchor its offsets) and both levels' new addresses.
+    by_level = {r["level"]: r for r in report}
+    for lvl in todo:
+        src_g = get_resolution_level(root, lvl)
+        out_g = get_resolution_level(out_root, lvl)
+        for delta in list_link_deltas(src_g):
+            other = lvl + delta
+            if other not in read:
+                continue
+            w, dropped = _carry_links(out_g, src_g, delta, read[lvl],
+                                      read[other], maps[lvl], maps[other], ndim)
+            key = "links" if delta == 0 else "cross_level_links"
+            by_level[lvl][key] += w
+            by_level[lvl]["dropped_links"] += dropped
+        if out_g.array_exists(LINKS):
+            update_level_metadata(out_g, add_arrays_present=LINKS)
 
     return {"output_path": str(out_path), "chunk_shape": chunk_shape,
             "level_chunk_shapes": {r["level"]: r.get("chunk_shape")
