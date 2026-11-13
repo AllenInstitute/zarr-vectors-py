@@ -152,7 +152,10 @@ def _list_array_names(level_group, requested: list[str] | None) -> list[str]:
             _walk(f"{prefix}{name}/", group[name])
 
     _walk("", level_group.zarr_group)
-    return names
+    # The store lists keys in whatever order it likes (directory order on
+    # a local store), so sort: get_shard_info reports, and the migrations
+    # process, the arrays in one stable order.
+    return sorted(names)
 
 
 # ===================================================================
@@ -598,7 +601,10 @@ def get_shard_info(store_path: str | Path | Group) -> dict[str, Any]:
 
     * ``sharded`` — bool, mirrors :func:`is_sharded`.
     * ``arrays`` — list of ``{name, shard_shape, grid_shape}`` dicts,
-      one per native-sharded array.
+      one per native-sharded array, ordered by level and then by array
+      path.  Every per-chunk array of a level -- ``links/<delta>/<offsets>``
+      included -- is indexed by the level's own chunk grid (a link record
+      sits in its source chunk's cell), so they share ``grid_shape``.
     * ``shard_count`` — total shard files across all arrays.
     """
     import zarr
