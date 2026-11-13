@@ -75,3 +75,54 @@ def test_object_sparsity_records_a_selection_that_ran(tmp_path):
     )
     build_pyramid(store, factors=[(1, 4)], sparsity_seed=0)
     assert read_level_metadata(open_store(store), 1).object_sparsity == 0.25
+
+
+@pytest.fixture
+def recording_strategy():
+    from zarr_vectors.multiresolution import registry
+
+    calls: list[tuple[int, int, dict]] = []
+
+    def strategy(n_objects, target_count, **ctx):
+        calls.append((n_objects, target_count, ctx))
+        return np.arange(target_count, dtype=np.int64)
+
+    registry.register_selection_strategy("_test_recording", strategy)
+    yield calls
+    registry._SELECTION_STRATEGIES.pop("_test_recording", None)
+
+
+def test_strategies_receive_their_context(tmp_path, recording_strategy):
+    lines = _lines(n=40)
+    weight = np.arange(40, dtype=np.float64) * 1.5
+    store = str(tmp_path / "l.zarr")
+    write_polylines(
+        store, lines, chunk_shape=(25.0,) * 3, bin_shape=(5.0,) * 3,
+        bounds=([0.0] * 3, [100.0] * 3),
+        object_attributes={"weight": weight},
+    )
+    build_pyramid(
+        store, factors=[(1, 2), (1, 2)],
+        sparsity_strategy="_test_recording",
+        sparsity_attribute="weight", sparsity_attribute_mode="min",
+    )
+    (n0, t0, ctx0), (n1, t1, ctx1) = recording_strategy
+    assert (n0, t0) == (40, 20)
+    # The second level chooses among the first level's 20 survivors.
+    assert (n1, t1) == (20, 10)
+
+    expected_len = [
+        float(np.sqrt((np.diff(p.astype(np.float64), axis=0) ** 2).sum(1)).sum())
+        for p in lines
+    ]
+    np.testing.assert_allclose(ctx0["lengths"], expected_len, rtol=1e-5)
+    np.testing.assert_allclose(
+        ctx0["representative_points"],
+        [p[len(p) // 2] for p in lines], rtol=1e-5,
+    )
+    np.testing.assert_allclose(ctx0["attribute_values"], weight)
+    assert ctx0["attribute_mode"] == "min"
+    assert ctx0["bin_shape"] == (5.0, 5.0, 5.0)
+    # Aligned with the survivors: rows 0..19 were kept at level 1.
+    np.testing.assert_allclose(ctx1["attribute_values"], weight[:20])
+    assert ctx1["representative_points"].shape == (20, 3)
