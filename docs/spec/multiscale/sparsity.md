@@ -20,12 +20,10 @@
 
 ## Introduction
 
-Spatial coarsening merges vertices into metavertices but keeps every
-object. Object sparsity also drops objects at a coarser level, for
-stores whose geometry has discrete objects (an object index). The kept
-objects keep their object ids; a dropped object stays addressable at
-that level with an empty manifest. How the coarsened level is built is
-in [Pyramid construction](pyramid_construction.md).
+Object sparsity drops objects at a coarser level of a store with an
+object index. Kept objects keep their ids; a dropped object keeps its
+row with an empty manifest. The rest of coarsening is in
+[Pyramid construction](pyramid_construction.md).
 
 ---
 
@@ -33,35 +31,28 @@ in [Pyramid construction](pyramid_construction.md).
 
 ### What a sparsified level stores
 
-For a level built with sparsity factor `s > 1` from a source level with
-`n` objects:
+For sparsity factor `s > 1` and a source level with `n` objects:
 
-- The number of kept objects is `max(1, round(n / s))`.
-- The level's attributes record `object_sparsity: 1 / s`.
-- `object_index` has one row per source object id. A dropped object's
-  manifest is empty; `num_present` counts the kept ones (see
-  [Object manifest](../object_model/object_manifest.md)).
-- Each object attribute has a row per source object id. A dropped
-  object's row holds the column's fill value and is absent in the
-  attribute's presence mask (see
-  [Object attributes](../object_model/object_attributes.md)).
-- The root's `format_capabilities` lists `preserved_object_ids`.
+| Item | Value |
+|------|-------|
+| Kept objects | `max(1, round(n / s))` |
+| Level attributes | `object_sparsity: 1 / s` |
+| [`object_index`](../object_model/object_manifest.md) | one row per source id; dropped rows are empty; `num_present` counts kept rows |
+| [Object attributes](../object_model/object_attributes.md) | one row per source id; dropped rows are absent |
+| Root `format_capabilities` | includes `preserved_object_ids` |
 
-A level read from a source with no object index is coarsened as one
-object, and nothing is dropped.
+A source with no object index is coarsened as one object; nothing is
+dropped.
 
 ### Selection strategies
 
-Core provides one strategy, `random`: a uniform sample without
-replacement, reproducible with `sparsity_seed`. Other names (the
-`zarr-vectors-tools` package registers `spatial_coverage`, `length`,
-`attribute` and `point_thinning`) are dispatched through
-`zarr_vectors.building.register_selection_strategy`; asking for a name
-that is not registered raises `ValueError` naming the package to
-install.
+Core provides `random`: a uniform sample without replacement, seeded by
+`sparsity_seed`. Other strategies are added with
+`zarr_vectors.building.register_selection_strategy`; `zarr-vectors-tools`
+adds `spatial_coverage`, `length`, `attribute` and `point_thinning`. An
+unregistered name raises `ValueError` naming the package to install.
 
-`apply_sparsity` runs a strategy on its own and returns the sorted
-indices of the kept objects:
+`apply_sparsity` returns the sorted indices of the kept objects:
 
 ```python
 from zarr_vectors.multiresolution.object_selection import apply_sparsity
@@ -70,16 +61,15 @@ kept = apply_sparsity(10, 0.5, "random", seed=42)
 print(kept)  # [0 3 4 5 7]
 ```
 
-Its signature is
-`apply_sparsity(n_objects, sparsity, strategy="random", *, seed=None,
-lengths=None, attribute_values=None, attribute_mode="max",
+Signature: `apply_sparsity(n_objects, sparsity, strategy="random", *,
+seed=None, lengths=None, attribute_values=None, attribute_mode="max",
 representative_points=None, bin_shape=None)`. `sparsity` is the fraction
-to keep; at `1.0` or more every index is returned. The keyword arguments
-after `seed` are passed unchanged to a registered strategy; `random`
-ignores them.
+to keep; `1.0` or more keeps all. Keywords after `seed` go to registered
+strategies; `random` ignores them.
 
 ### Validation
 
-- L2 and L5: `object_sparsity` is in `(0.0, 1.0]` at every level (absent
-  reads as `1.0`).
-- L5: each level's `vertex_count` is no larger than the level before.
+| Level | Check |
+|-------|-------|
+| L2, L5 | `object_sparsity` is in `(0.0, 1.0]` (absent reads as `1.0`). Does not run on stores this package writes ([L2](../validation/l2_metadata.md)) |
+| L5 | Each level has no more vertices than the level before |

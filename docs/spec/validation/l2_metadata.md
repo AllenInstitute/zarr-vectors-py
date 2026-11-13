@@ -2,101 +2,77 @@
 
 ## Terms
 
-**Schema check**
-: A check that reads the root or a level's attributes and verifies their
-  values: ranges, vocabulary tokens, and agreement with `sid_ndim`.
-
 **Divisibility constraint**
 : Each axis's chunk size must be an integer multiple of its bin size, so
-  bins tile chunks. L2 computes `ratio = chunk_shape[d] / bin_shape[d]` and
-  requires `abs(ratio - round(ratio)) <= 1e-9`; the tolerance applies to the
-  ratio, not to the sizes.
+  bins tile chunks. L2 requires
+  `abs(chunk_shape[d] / bin_shape[d] - round(...)) <= 1e-9`.
 
 ## Introduction
 
-L2 reads the root attributes and each level's attributes and checks that
-their values are consistent. It reads no array data, no array `zarr.json`
-and no link family; link families are first checked at
-[L3](l3_consistency.md). L2 catches unrecognised vocabulary tokens and
-dimensionality mismatches between `sid_ndim`, `chunk_shape` and the bin
-shape.
+L2 reads the root and level attributes and checks their values. It reads
+no array data, no array `zarr.json` and no link family (links are checked
+at [L3](l3_consistency.md)).
 
 ## Technical reference
 
-L2 is `validate_metadata` in `zarr_vectors/validate/metadata.py`. Each check
-adds a message to the `ValidationResult` (see
-[Validation overview](overview.md#validationresult-api)).
+L2 is `validate_metadata` in `zarr_vectors/validate/metadata.py`. Each
+check adds a message to the `ValidationResult` (see
+[Validation overview](overview.md#validationresult-api)). `RootMetadata`
+parses the root attributes and enforces required keys and types. All
+findings below are errors unless marked.
 
-L2 parses the root metadata with `RootMetadata`, so required keys and
-parseable types are enforced by the parser. A store that does not open gives
-`Cannot open store`, and root metadata that does not parse gives
-`Cannot read root metadata`; in either case L2 stops. The checks below apply
-after a successful parse.
+### Root
 
-### Root metadata checks
+| Check | Message |
+|-------|---------|
+| The store opens; L2 stops if not | `Cannot open store: ...` |
+| The root metadata parses; L2 stops if not | `Cannot read root metadata: ...` |
+| `sid_ndim >= 1` | `SID dimensionality is <n>, must be >= 1` |
+| `len(chunk_shape) == sid_ndim` | `chunk_shape has <n> dims, expected <d>` |
+| Every `chunk_shape[i] > 0` | `chunk_shape[i] = <v>, must be > 0` |
+| `bounds` min and max have `sid_ndim` entries | `Bounds dim mismatch: ...` |
+| `links_convention` is empty or one of `explicit`, `implicit_sequential`, `implicit_sequential_with_branches` | `Unknown links_convention: '<v>'` |
+| `object_index_convention` is empty or `standard` or `identity` | `Unknown object_index_convention: '<v>'` |
+| `cross_chunk_strategy` is empty or one of `explicit_links`, `boundary_deduplication`, `both` | `Unknown cross_chunk_strategy: '<v>'` |
+| `geometry_types` is not empty (**warning**) | `No geometry_types specified` |
+| `base_bin_shape`, if set, has `sid_ndim` entries | `base_bin_shape has <n> dims, expected <d>` |
+| Every `base_bin_shape[i] > 0` | `base_bin_shape[i]=<v>, must be > 0` |
+| `chunk_shape[i]` is an integer multiple of `base_bin_shape[i]` | `chunk_shape[i]=<c> not integer multiple of base_bin_shape[i]=<b>` |
 
-| Rule | Failure |
-|------|---------|
-| `sid_ndim >= 1` | Error |
-| `len(chunk_shape) == sid_ndim` | Error |
-| Every `chunk_shape[i] > 0` | Error |
-| `bounds` has `len(min) == len(max) == sid_ndim` | Error |
-| `links_convention` ∈ `{explicit, implicit_sequential, implicit_sequential_with_branches}` | Error |
-| `object_index_convention` ∈ `{standard, identity}` | Error |
-| `cross_chunk_strategy` ∈ `{explicit_links, boundary_deduplication, both}` | Error |
-| `geometry_types` is not empty | Warning |
+### Each level
 
-An empty convention value passes; only a non-empty unrecognised token is an
-error.
+| Check | Message |
+|-------|---------|
+| The level's metadata can be read | `resolution_N: cannot read metadata: ...` |
+| A per-level `chunk_shape` is a positive integer multiple of the root's on every axis | `resolution_N: <MetadataError>` |
+| Presence is not deferred: the arrays carry `nonempty_chunks` (**warning**) | `resolution_N: presence is deferred ...` |
+| `vertex_count` is a non-negative int. Does not run on stores this package writes | `resolution_N: vertex_count=<v> invalid` |
+| `bin_shape` has `sid_ndim` entries, each `> 0`, dividing the level's chunk shape. Does not run on stores this package writes | `resolution_N: bin_shape ...` |
+| `bin_ratio` has `sid_ndim` entries, each `>= 1`. Does not run on stores this package writes | `resolution_N: bin_ratio ...` |
+| `object_sparsity` is in `(0, 1]`. Does not run on stores this package writes | `resolution_N: object_sparsity=<v> not in (0, 1]` |
 
-When `base_bin_shape` is set:
+### Octree capabilities
 
-| Rule | Failure |
-|------|---------|
-| `len(base_bin_shape) == sid_ndim` | Error |
-| Every `base_bin_shape[i] > 0` | Error |
-| `chunk_shape[i]` is an integer multiple of `base_bin_shape[i]` | Error |
+Once per store, for each of the root's `format_capabilities` and
+`required_capabilities`. Both are warnings and suggest
+`zarr_vectors.octree_chunks.refresh_capabilities(store)`.
 
-### Per-level checks
-
-For every level:
-
-| Rule | Failure |
-|------|---------|
-| The level's metadata can be read | Error (`resolution_N: cannot read metadata`) |
-| A per-level `chunk_shape` is a positive integer multiple of the root `chunk_shape` on every axis | Error |
-| The level's presence is not deferred (its arrays carry `nonempty_chunks`) | Warning |
-
-L2 also looks for `vertex_count`, `bin_shape`, `bin_ratio` and
-`object_sparsity` among the level's attributes, but reads them from the top
-level of the attributes, where a store keeps only the `zarr_vectors_level`
-block. These checks therefore do not run on stores written by this package:
-a level with `vertex_count: -3` or `object_sparsity: 1.5` passes L2.
-
-### Octree capability checks
-
-Once per store, for each of `format_capabilities` and
-`required_capabilities` in the root metadata:
-
-| Rule | Failure |
-|------|---------|
-| A level with octree chunks implies the list contains `octree_chunks` | Warning |
-| `octree_chunks` in the list implies some level has octree chunks | Warning |
-
-Both warnings suggest `zarr_vectors.octree_chunks.refresh_capabilities(store)`.
+| Check | Message |
+|-------|---------|
+| A level with octree chunks means the list has `octree_chunks` | `level(s) [...] have octree chunks but the root's <list> lacks 'octree_chunks' ...` |
+| `octree_chunks` in the list means some level has octree chunks | `the root's <list> lists 'octree_chunks' but no level has octree chunks; ...` |
 
 ### Not checked at L2
 
-- Link families: `link_width`, `directed`, `store`, `num_physical_records`,
-  and the row alignment of `link_attributes/` with `links/`.
+- Link families and link attributes.
 - Array metadata: `vertices/` dtype, `vertex_fragments/` encoding.
-- `multiscales` transforms, axis counts, and level-to-group correspondence.
-- Rules per geometry type (those are L4).
+- The `multiscales` block.
+- Rules per geometry type (L4).
 
-### Example L2 report
+### Example
 
-A point-cloud store with an emptied `geometry_types` and a `base_bin_shape`
-that does not divide `chunk_shape`:
+A point-cloud store with empty `geometry_types` and a `base_bin_shape`
+that does not divide `chunk_shape` (the pass count includes L1):
 
 ```
 Level 2 validation: FAIL
@@ -104,8 +80,3 @@ Level 2 validation: FAIL
   ERROR: chunk_shape[0]=200.0 not integer multiple of base_bin_shape[0]=30.0
   WARN:  No geometry_types specified
 ```
-
-The pass count includes the L1 passes. L2 pass messages read like
-`Root metadata parsed`, `SID dimensionality: 3`,
-`links_convention: 'implicit_sequential'`, `bins_per_chunk: (7, 4, 4)` and
-`resolution_0 metadata parsed`.

@@ -5,14 +5,9 @@ Headers
    :no-members:
    :no-special-members:
 
-Source-format headers kept with a store. A store converted from a ``.trk``
-file, an ``.swc`` file or a Neuroglancer precomputed volume can keep that
-format's header, for which the Zarr Vectors format has no field.
-
-Each header is kept whole, one group per format under ``/headers/<format>/``,
-with the header dict stored as that group's attributes. This package stores
-and returns them without interpreting them; parsing a header belongs to the
-package that understands its format.
+Source-format headers (for example from ``.trk``, ``.swc`` or Neuroglancer
+precomputed files) kept with a store. Each is stored whole, uninterpreted,
+as the attributes of ``/headers/<format>/``.
 
 .. autoclass:: zarr_vectors.headers.registry.HeaderRegistry
    :members:

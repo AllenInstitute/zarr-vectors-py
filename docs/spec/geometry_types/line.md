@@ -3,27 +3,19 @@
 ## Terms
 
 **Line segment**
-: A pair of vertices `(A, B)` joined by a straight edge. A `line` store holds
-  a collection of independent segments; each segment is one object.
-
-**`GEOM_LINE`**
-: The geometry type constant `"line"`, stored in the `geometry_types` list
-  of the root attributes.
+: A pair of vertices `(A, B)` joined by a straight edge. Each segment is
+  one object. The type constant is `GEOM_LINE`, `"line"`.
 
 **Split segment**
-: A segment whose two endpoints fall in different chunks. It is stored as
-  two single-vertex fragments joined by one link record.
+: A segment whose endpoints are in different chunks.
 
 ## Introduction
 
-The `line` type stores independent two-point segments: contact sites (the two
-ends of a synapse), connectors, pairwise distance annotations. Each segment is
-an object with its own manifest, so segments can be read by id.
-
-Connectivity follows `links_convention: implicit_sequential`: within a
-fragment, vertex order carries the segment. A segment inside one chunk needs
-no link record; only split segments are stored in `links/`. For ordered paths
-of any length, use [`polyline`](polyline.md).
+The `line` type stores independent two-point segments, such as contact
+sites, connectors or distance annotations. Each segment has its own
+manifest, so segments can be read by ID. For paths of any length, use
+[`polyline`](polyline.md). What every type shares is on
+[Geometry types](index.md#common-to-every-type).
 
 ## Technical reference
 
@@ -33,38 +25,20 @@ At level 0 of a store written by `write_lines`:
 
 | Path | Present | Description |
 |------|---------|-------------|
-| `vertices/` | Always | Endpoint positions |
-| `vertex_fragments/` | Always | Fragment index over `vertices/` rows |
 | `object_index/` | Always | One manifest per segment |
-| `links/0/<offsets>/` | When a segment is split | One record per split segment, in a non-zero-offset array |
+| `links/0/<offsets>/` | When a segment is split | One record per split segment |
 | `vertex_attributes/<name>/` | With `vertex_attributes=` | One row per endpoint |
 | `object_attributes/<name>/` | With `object_attributes=` | One row per segment |
-
-The two cases are written as follows:
 
 | Case | Fragments | Manifest | Link |
 |------|-----------|----------|------|
 | Both endpoints in one chunk | One fragment holding both vertices | `[(c, f)]` | None |
 | Endpoints in chunks `c_a` and `c_b` | One single-vertex fragment in each chunk | `[(c_a, f_a), (c_b, f_b)]` | One record in `links/0/<offsets>/` |
 
-Within each chunk, fragments are assigned in segment order. A store whose
-segments all sit in one chunk has no `links/` group. The link family is
-undirected with `store: "canonical"`, so each split segment is stored once,
-under the lexicographically positive offset; see
-[Links](../object_model/links.md).
+Within each chunk, fragments are in segment order. The root attributes:
 
-### Root attributes
-
-A line store has no type-specific root keys. The writer sets these values in
-the `zarr_vectors` block (see [Root metadata](../layout/root_metadata.md)):
-
-```json
-{
-  "geometry_types": ["line"],
-  "links_convention": "implicit_sequential",
-  "object_index_convention": "standard",
-  "cross_chunk_strategy": "explicit_links"
-}
+```javascript
+{"geometry_types": ["line"], "links_convention": "implicit_sequential", ...}
 ```
 
 ### Write and read API
@@ -88,30 +62,14 @@ summary = write_lines(
 print(summary)
 # {'line_count': 1000, 'chunk_count': 192, 'cross_chunk_count': 388}
 
-result = read_lines("contacts.zarrvectors")
-print(result["line_count"], result["endpoints"].shape)   # 1000 (1000, 2, 3)
-
 result = read_lines("contacts.zarrvectors", object_ids=[0, 5, 42])
-print(result["line_count"])   # 3
-
-result = read_lines(
-    "contacts.zarrvectors",
-    bbox=(np.array([0.0, 0.0, 0.0]), np.array([100.0, 100.0, 100.0])),
-)
-print(result["line_count"])   # 6
+print(result["line_count"], result["endpoints"].shape)   # 3 (3, 2, 3)
 ```
 
-`cross_chunk_count` is the number of split segments. `read_lines` takes
-`level=`, `object_ids=`, `bbox=` and `attribute_filter=`, and returns
-`endpoints` `(M, 2, D)`, `vertex_attributes` and `line_count`. A bounding-box
+`cross_chunk_count` is the number of split segments. `read_lines` returns
+`endpoints` `(M, 2, D)`, `vertex_attributes` and `line_count`. A `bbox=`
 read keeps a segment when either endpoint is inside the box.
 
 ### Validation
 
-- L1: `vertices/` missing at a level is an error. `links/` is not required.
-- L3: each `links/0/` offsets name parses and, because the family is
-  undirected and canonical, no offset is lexicographically negative and the
-  offsets are non-decreasing. Each record's chunks exist at the level.
-- L4: `links_convention` other than `implicit_sequential` is an error.
-
-See [Validation overview](../validation/overview.md).
+Only the [common checks](index.md#validation) apply.

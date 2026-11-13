@@ -10,9 +10,8 @@
 
 **Fragment address**
 : The pair `(chunk_coords, fragment_index)` that identifies a fragment
-  within one level. `chunk_coords` is the chunk's coordinate tuple and
-  `fragment_index` is local to that chunk, in `[0, F)` where `F` is the
-  chunk's fragment count.
+  within a level. `fragment_index` is local to the chunk, in `[0, F)`
+  for a chunk with `F` fragments.
 
 **Shared fragment**
 : A fragment named by more than one object's manifest.
@@ -21,16 +20,9 @@
 
 ## Introduction
 
-Fragments are how a reader takes part of a chunk. A chunk's vertices are
-stored as one cell of `vertices/`; its fragment index divides those rows
-into fragments, and objects name their vertices by fragment address in
-their [manifests](object_manifest.md). A reader that wants one object,
-or one bin of a point cloud, reads the fragment index of each chunk
-involved and takes only the rows it needs.
-
-What a fragment stands for depends on the writer: a spatial bin in a
-point cloud, a piece of one object in other geometry types, and a
-metavertex at a coarser pyramid level.
+Fragments let a reader take part of a chunk. A chunk's fragment index
+divides its `vertices/` rows into fragments. Objects name their vertices
+by fragment address in their [manifests](object_manifest.md).
 
 ---
 
@@ -45,22 +37,18 @@ metavertex at a coarser pyramid level.
 | `write_skeleton_chunk` | Unbranched path of a skeleton piece within the chunk |
 | The core pyramid builder, at coarser levels | Metavertex, one vertex each |
 
-The rows of a range fragment are `[start, start + count)`; an explicit
-fragment lists its rows. Every row index lies in
-`[0, rows in the vertices cell)`.
+A range fragment holds rows `[start, start + count)`; an explicit
+fragment lists its rows. Every row index is within the `vertices` cell.
 
-A level whose attributes say `fragments_tile: true` promises that the
-chunk's fragments are ranges that cover its rows in order with no gaps
-or overlaps, so a reader may take the whole cell without reading the
-fragment index. L3 validation checks the promise.
-
-### Per-chunk data aligned to vertices and fragments
+With `fragments_tile: true` in the level's attributes, each chunk's
+fragments are ranges that cover its rows in order, with no gaps or
+overlaps. A reader may then take the whole cell without the fragment
+index.
 
 Row `k` of a chunk's `vertex_attributes/<name>` cell belongs to vertex
-row `k` of the same `vertices/` cell, so a fragment's attribute rows are
-selected with the same row indices as its vertices. Row `f` of a chunk's
-`fragment_attributes/<name>` cell belongs to fragment `f`. See
-[Chunk arrays](../layout/chunk_arrays.md).
+row `k`, so a fragment's attributes use the same row indices. Row `f` of
+`fragment_attributes/<name>` belongs to fragment `f` (see
+[Chunk arrays](../layout/chunk_arrays.md)).
 
 ### Reading fragments
 
@@ -75,25 +63,21 @@ rows = fidx.indices(4)                              # row indices of fragment 4
 vertices = read_fragment(lg, (0, 0, 0), 4)          # (n, D) vertices of fragment 4
 ```
 
-`ChunkFragmentIndex` (in `zarr_vectors.encoding.fragments`) answers
-`len(fidx)`, `fidx.is_range(f)`, `fidx.range(f)` for a range fragment,
-`fidx.indices(f)` (a new array) and `fidx.indices_view(f)` (a view of the
-stored indices of an explicit fragment). `read_fragment` reads only a
-range fragment's rows where the storage allows a byte-range read, and
-otherwise reads the cell and selects the rows.
-
-To read a whole object, follow its manifest; see
+`ChunkFragmentIndex` (in `zarr_vectors.encoding.fragments`) also has
+`is_range(f)`, `range(f)` for a range fragment, and `indices_view(f)`, a
+view of an explicit fragment's stored indices. `read_fragment` does a
+byte-range read of a range fragment where the storage allows it, and
+otherwise reads the whole cell. To read an object, see
 [Reading an object](object_manifest.md#reading-an-object).
 
 ### Shared fragments
 
-At a level whose attributes say `shared_fragments: true`, one fragment
-may appear in several objects' manifests, and its vertices are stored
-once. The root's `format_capabilities` lists `shared_fragments` when any
-level does. A reader treats a shared fragment like any other, but must
-not assume that the fragment addresses of different objects at such a
-level are disjoint. The core pyramid builder writes every coarser level
-this way (see [Pyramid construction](../multiscale/pyramid_construction.md)).
+At a level with `shared_fragments: true`, one fragment may appear in
+several objects' manifests; its vertices are stored once. Readers must
+not assume different objects have disjoint fragment addresses there.
+The root's `format_capabilities` lists `shared_fragments` when any level
+has it. The core pyramid builder writes every coarser level this way
+(see [Pyramid construction](../multiscale/pyramid_construction.md)).
 
 ### Validation
 
@@ -101,14 +85,14 @@ this way (see [Pyramid construction](../multiscale/pyramid_construction.md)).
 
 **L3**, for each chunk of each level:
 
-- every fragment of the chunk decodes to a `(n, sid_ndim)` array, and a
-  fragment containing `NaN` or infinite values gives a warning;
-- with `fragments_tile: true`, the chunk's fragments tile its rows;
-- with `link_fragments_aligned: true`, the chunk's intra-chunk links are
-  filed by vertex fragment;
-- in a point cloud with bins and no object index, a chunk has no more
-  fragments than bins per chunk, and in up to three chunks a warning is
-  given for a vertex outside its fragment's bin.
+| Check | Severity |
+|-------|----------|
+| Every fragment decodes to a `(n, sid_ndim)` array | error |
+| A fragment holds `NaN` or infinite values | warning |
+| With `fragments_tile: true`, the fragments tile the rows | error |
+| With `link_fragments_aligned: true`, intra-chunk links are filed by vertex fragment | error |
+| Point cloud with bins and no object index: no more fragments than bins per chunk | error |
+| Same: a vertex lies outside its fragment's bin (checked in up to three chunks) | warning |
 
 The byte-level checks of the fragment index are on
 [Fragment-index arrays](../layout/fragment_index_arrays.md#validation).

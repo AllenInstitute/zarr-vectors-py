@@ -1,15 +1,12 @@
 Geometry types
 ==============
 
-Read and write functions for each Zarr Vectors geometry type. Each function
-takes as its first argument a path or URL, a Zarr store object, or an open
-store group. Read functions return a dictionary described on each function's
-entry.
+Read and write functions per geometry type. Each takes a path or URL, a
+Zarr store or an open group, and the readers return a dict.
 
-``zarr_vectors.types`` is in the *undecided* tier: treat it as internal. Its
-five store-creating writers are supported through :doc:`building`, and
-``Level.read()`` and ``ReadResult`` in :doc:`api` cover its readers, except for
-per-vertex attributes on some geometries.
+``zarr_vectors.types`` is *undecided*: treat it as internal. Its writers
+are supported through :doc:`building`. ``Level.read()`` in :doc:`api`
+covers its readers, except per-vertex attributes on some geometries.
 
 Point clouds
 ------------

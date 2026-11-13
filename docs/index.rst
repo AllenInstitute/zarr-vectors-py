@@ -7,22 +7,12 @@
 
 ----
 
-**zarr-vectors** stores three-dimensional spatial geometry (point clouds,
-streamlines, graphs, skeletons and meshes) in spatially indexed Zarr v3
-stores. Spatial queries touch only the chunks they need, on a local file
-system or a cloud object store, and resolution pyramids let viewers such as
-Neuroglancer stream data at any scale.
-
-The library implements `Zarr Vectors
-<https://github.com/AllenInstitute/zarr_vectors>`_, specified by Forrest
-Collman at the Allen Institute for Brain Science, with separate chunk and bin
-sizes, per-level object sparsity and OME-Zarr multiscale metadata.
-
-``zarr_vectors.api``, re-exported from the top-level package, is for using
-data: opening, selecting and reading. ``zarr_vectors.building`` is for making
-stores. Both carry a compatibility promise; :doc:`api/index` lists which other
-modules do and which are internal, and :func:`zarr_vectors.stability` reports
-the tier of any module at runtime.
+**zarr-vectors** stores spatial geometry (point clouds, streamlines, graphs,
+skeletons and meshes) in chunked, multiscale Zarr v3 stores. A spatial query
+reads only the chunks it needs, on local disk or in cloud storage, and
+resolution pyramids let viewers such as Neuroglancer stream data at any scale.
+It implements `Zarr Vectors <https://github.com/AllenInstitute/zarr_vectors>`_,
+specified by Forrest Collman at the Allen Institute for Brain Science.
 
 .. figure:: _static/figures/zarr-vectors-overview.png
    :width: 100%
@@ -56,22 +46,16 @@ Where to start
 .. list-table::
    :widths: 35 65
 
+   * - :doc:`getting_started/installation`
+     - Install the package and its optional extras.
    * - :doc:`getting_started/quickstart`
-     - Write and query your first vector store in a few lines of Python.
+     - Create, write, query and validate your first store.
    * - :doc:`explanation/concepts`
-     - The mental model: chunks, supervoxel bins, fragments, the object model
-       and the resolution pyramid — and how ``Layout`` sets them.
-   * - :doc:`api/api`
-     - The data surface: ``open``, ``Schema``, ``select``, ``ReadResult``,
-       resolution levels and objects.
-   * - :doc:`api/building`
-     - The builder surface, for code that writes stores rather than reads
-       them: arrays, fragments, shards and manifests.
+     - The terms used throughout: chunks, bins, fragments, objects and levels.
    * - :doc:`api/index`
-     - Which modules are supported, which are internal, and how to ask at
-       runtime.
+     - The API reference, and which modules are supported.
    * - :doc:`spec/index`
-     - Full technical specification for Zarr Vectors.
+     - The full Zarr Vectors specification.
 
 
 .. toctree::

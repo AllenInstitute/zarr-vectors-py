@@ -1,14 +1,10 @@
 Building stores
 ===============
 
-This surface is for code that writes a store: ingest converters, pyramid
-builders, exporters, repair tools. It names the physical layout (chunk shapes,
-fragments, shard layouts, manifests) because that is what such code works on.
-Applications that only read should use the :doc:`api` surface instead.
-
-Everything on this page is supported. ``zarr_vectors.core`` is internal: if
-something you need is only there, ask for it to be added here rather than
-importing it.
+The supported surface for code that writes stores: ingest converters,
+pyramid builders, exporters, repair tools. It names the physical layout
+(chunks, fragments, shards, manifests). Code that only reads should use
+:doc:`api`.
 
 .. automodule:: zarr_vectors.building
    :no-members:
@@ -17,11 +13,9 @@ importing it.
 Format constants and array names
 --------------------------------
 
-The array-family names and layout values of the on-disk format, all
-importable from ``zarr_vectors.building``. Import them rather than typing the
-strings. The four ``OBJECT_INDEX_LAYOUT_*`` and ``OBJECT_INDEX_MANIFEST_BUCKET``
-names are defined in the building surface; the others are also in
-``zarr_vectors.constants``, and the :doc:`constants` page lists their values.
+Array names and layout values of the on-disk format. The
+``OBJECT_INDEX_LAYOUT_*`` and ``OBJECT_INDEX_MANIFEST_BUCKET`` names are
+defined here; the others are also in :doc:`constants`.
 
 .. hlist::
    :columns: 3
@@ -58,11 +52,10 @@ names are defined in the building surface; the others are also in
 Stores, resolution levels and transactions
 ------------------------------------------
 
-Opening and creating stores, adding and removing levels, and reading or
-updating the two metadata documents.  :class:`~zarr_vectors.building.Group`
-is the storage handle every other function here takes; only the methods
-named in :data:`~zarr_vectors.building.GROUP_SUPPORTED_METHODS` are
-promised.
+Opening and creating stores, managing levels, and reading or updating
+metadata. :class:`~zarr_vectors.building.Group` is the storage handle the
+other functions take; only the methods in
+:data:`~zarr_vectors.building.GROUP_SUPPORTED_METHODS` are supported.
 
 .. autoclass:: zarr_vectors.building.Group
    :members:
@@ -101,8 +94,8 @@ promised.
 Metadata records and grid arithmetic
 ------------------------------------
 
-The two metadata records, and the functions that derive a level's chunk
-shape, bin shape and grid extent from them.
+The metadata records, and functions that derive a level's chunk shape,
+bin shape and grid from them.
 
 .. autoclass:: zarr_vectors.building.RootMetadata
    :no-members:
@@ -137,8 +130,8 @@ shape, bin shape and grid extent from them.
 Multiscale metadata and coarsening strategies
 ---------------------------------------------
 
-The NGFF-style multiscale document, and the registries a coarsening or
-selection strategy package installs itself into.
+The NGFF multiscale metadata, and the registries for coarsening and
+selection strategies.
 
 .. autofunction:: zarr_vectors.building.read_multiscale_metadata
 
@@ -157,8 +150,7 @@ selection strategy package installs itself into.
 Array allocation
 ----------------
 
-Creating the zarr arrays a level is made of, before anything is written
-into them.
+Creating a level's arrays before writing to them.
 
 .. autofunction:: zarr_vectors.building.create_vertices_array
 
@@ -187,8 +179,7 @@ into them.
 Chunk I/O: vertices, fragments and attributes
 ---------------------------------------------
 
-Reading and writing one grid cell at a time -- the per-chunk verbs an
-ingest worker runs in parallel.
+Reading and writing one grid cell at a time, as an ingest worker does.
 
 .. autofunction:: zarr_vectors.building.open_write_session
 
@@ -225,8 +216,8 @@ ingest worker runs in parallel.
 Links
 -----
 
-Edge storage: the nested ``links/<delta>/<offsets>`` path vocabulary, the
-per-cell readers and writers, and the finalisation pass.
+Link paths (``links/<delta>/<offsets>``), per-cell readers and writers,
+and the finalisation pass.
 
 .. autofunction:: zarr_vectors.building.links_path
 
@@ -291,8 +282,8 @@ per-cell readers and writers, and the finalisation pass.
 Object index, manifests and object attributes
 ---------------------------------------------
 
-The index that says which fragments belong to which object, and the
-per-object attribute arrays beside it.
+The index of which fragments belong to each object, and per-object
+attributes.
 
 .. autoclass:: zarr_vectors.building.ObjectIndexAppender
    :members:
@@ -347,8 +338,7 @@ per-object attribute arrays beside it.
 Object groups
 -------------
 
-Named rows of object ids, and the parallel array of names that makes a
-store self-describing.
+Named sets of object ids and their names.
 
 .. autofunction:: zarr_vectors.building.read_all_groupings
 
@@ -363,19 +353,13 @@ store self-describing.
 Presence manifests and array inventory
 --------------------------------------
 
-The coordinator-side verbs: what is actually on disk, and rebuilding the
-``nonempty_chunks`` and ``arrays_present`` records after a parallel write
-phase that deliberately did not stamp them.
-
-:func:`~zarr_vectors.building.defer_presence` is the other end of that
-phase: a coordinator declares a level deferred before its workers start, so
-they share no state between cells, and :func:`~zarr_vectors.building.rebuild_presence`
-ends the declaration when it writes the manifests.
-
-The worker-side alternative is :meth:`Group.collect_presence
-<zarr_vectors.building.Group.collect_presence>` and
-:meth:`~zarr_vectors.building.Group.apply_presence`, for a writer whose
-consumers cannot ask the store and run before any coordinator pass -- see
+Coordinator functions: what is on disk, and rebuilding the
+``nonempty_chunks`` and ``arrays_present`` records after a parallel write.
+:func:`~zarr_vectors.building.defer_presence` declares a level deferred
+before workers start; :func:`~zarr_vectors.building.rebuild_presence`
+writes the records and ends the deferral. Workers can instead use
+:meth:`Group.collect_presence <zarr_vectors.building.Group.collect_presence>`
+and :meth:`~zarr_vectors.building.Group.apply_presence`. See
 :doc:`/how_to/hpc_pipelines`.
 
 .. autofunction:: zarr_vectors.building.defer_presence
@@ -419,18 +403,16 @@ consumers cannot ask the store and run before any coordinator pass -- see
 
 .. note::
 
-   ``observe_presence_writes`` is an *instrument*, not a data API.  It
-   answers "where did this stamp happen -- under which lock, on which
-   thread", which nothing readable from the store can answer after the
-   fact.  To ask what the manifest says, use
+   ``observe_presence_writes`` is a debugging instrument, not a data API.
+   To read the manifest, use
    :meth:`Group.list_chunks <zarr_vectors.building.Group.list_chunks>`.
 
 Sharding and rechunking
 -----------------------
 
-Re-layout of a store that already exists.  Both rewrite where bytes live,
-so both are coordinator operations -- never run one while workers are
-writing.
+Re-layout of an existing store. These are coordinator operations: never
+run one while workers are writing. See :doc:`/spec/chunking/sharding` and
+:doc:`/spec/chunking/rechunking`.
 
 .. autofunction:: zarr_vectors.building.get_shard_info
 
@@ -451,7 +433,7 @@ writing.
 Spatial partitioning
 --------------------
 
-Assigning geometry to cells, and repairing what crosses a cell boundary.
+Assigning geometry to cells, and handling what crosses cell boundaries.
 
 .. autofunction:: zarr_vectors.building.assign_chunks
 
@@ -470,17 +452,14 @@ Assigning geometry to cells, and repairing what crosses a cell boundary.
 .. note::
 
    ``zarr_vectors.building.build_vertex_chunk_mapping`` is supported but not
-   rendered here, because its docstring does not parse; read it in the
-   source.
+   rendered here; read its docstring in the source.
 
 Store-creating writers
 ----------------------
 
-One call, one store.  These take the full physical vocabulary --
-``chunk_shape``, ``bin_shape``, ``shard_shape``, ``compressor``, ``dtype``
--- which is why they live here rather than behind
-:class:`~zarr_vectors.api.dataset.Dataset`.  The matching *readers* are not promoted:
-:class:`~zarr_vectors.api.result.ReadResult` covers all five geometries.
+One call writes one store, with full control of ``chunk_shape``,
+``bin_shape``, ``shard_shape``, ``compressor`` and ``dtype``. To read,
+use :class:`~zarr_vectors.api.result.ReadResult`.
 
 .. autofunction:: zarr_vectors.building.write_points
 
@@ -495,8 +474,7 @@ One call, one store.  These take the full physical vocabulary --
 Skeletons: the streaming writer
 -------------------------------
 
-The four-call streaming path for tree-structured morphology, which has no
-one-shot counterpart.
+Streaming writes of tree-structured morphology.
 
 .. autofunction:: zarr_vectors.building.init_skeleton_store
 
@@ -518,11 +496,10 @@ one-shot counterpart.
 Array-form I/O and device arrays
 --------------------------------
 
-Many cells, many objects or many records per call, as flat arrays rather
-than a Python object each -- the shape a vectorised or GPU pipeline
-already holds. Each writer leaves the store its per-object counterpart
-leaves, byte for byte; each accepts device (cupy) arrays, and the readers
-return them with ``device="cuda"``. See :doc:`../how_to/gpu`.
+Many cells, objects or records per call, as flat arrays. Each writer
+writes the same bytes as its per-object counterpart and accepts cupy
+arrays; the readers return them with ``device="cuda"``. See
+:doc:`../how_to/gpu`.
 
 .. autofunction:: zarr_vectors.building.read_cells
 
@@ -564,9 +541,8 @@ Reading a raw mesh cell by cell, with the vertices its faces reference.
 Composite levels
 ----------------
 
-A composite level references the cells of other stores through a leading
-chunk axis named ``SOURCE_AXIS``; value 0 is the store's own cells and each
-other value is a source store's level.
+Levels that reference cells of other stores. See
+:doc:`/spec/chunking/chunk_sources`.
 
 .. autofunction:: zarr_vectors.building.set_chunk_sources
 

@@ -1,89 +1,65 @@
 # `schema/`: machine-readable reference
 
-This directory holds a machine-readable schema for the Zarr Vectors
-on-disk metadata, for tools and languages that do not use the Python
-package. The Python source of truth is
-[`zarr_vectors/core/metadata.py`]; the files here describe the same
+A schema for the Zarr Vectors on-disk metadata, for tools that do not
+use the Python package. The source of truth is
+[`zarr_vectors/core/metadata.py`]; these files describe the same
 metadata in [LinkML] and JSON Schema.
-
-## Files
 
 | File | Status | Purpose |
 |---|---|---|
 | `zarr_vectors.linkml.yaml` | hand-edited | [LinkML] source. Edit this to change the schema. |
-| `zarr_vectors.schema.json` | generated | JSON Schema (`$schema` Draft 2019-09). Downstream validators consume this. |
-| `reference.md`             | generated | Markdown reference rendered from the LinkML source. |
-| `regen.py`                 | hand-edited | Command that runs the generators. |
+| `zarr_vectors.schema.json` | generated | JSON Schema (Draft 2019-09), for downstream validators. |
+| `reference.md`             | generated | Markdown reference. |
+| `regen.py`                 | hand-edited | Runs the generators. |
 
 ## Regenerating
 
-Install the development extra, which brings in `linkml>=1.7,<2` and
-`jsonschema>=4.0,<5`:
+From the repository root, with the `dev` extra installed
+(`pip install "zarr-vectors[dev]"`):
 
 ```bash
-pip install "zarr-vectors[dev]"
-```
-
-Then, from the repository root:
-
-```bash
-python schema/regen.py            # regenerate both artefacts in place
+python schema/regen.py            # regenerate both files in place
 python schema/regen.py --check    # exit 1 if the JSON Schema is stale
 ```
 
-`--check` regenerates only the JSON Schema and compares it byte for
-byte with the committed file; it prints `schema artefacts up to date`
-on success. `reference.md` is not compared, because the LinkML
-Markdown generator does not emit its class rows in a fixed order. The
-test workflow (`.github/workflows/tests.yml`) runs `--check` on every
-push to `main` and every pull request; if it fails, run `regen.py`
-without `--check` and commit the regenerated files.
+`--check` compares only the JSON Schema, byte for byte; `reference.md`
+is not compared because its row order is not fixed. The test workflow
+runs `--check`. If it fails, run `regen.py` and commit the result.
 
 ## Coverage
 
 | Schema item | Source |
 |---|---|
-| `RootMetadata` | `zarr_vectors.core.metadata.RootMetadata` (the `zarr_vectors` block in the root attributes) |
-| `LevelMetadata` | `zarr_vectors.core.metadata.LevelMetadata` (the `zarr_vectors_level` block in each level's attributes) |
-| 11 per-array classes (`VerticesMeta` to `LinkAttributeMeta`) | the array and group attributes written by `zarr_vectors/core/arrays.py`; discriminator slot `zv_array` (enum `ZvArrayTag`) |
+| `RootMetadata` | `RootMetadata`: the `zarr_vectors` block in the root attributes |
+| `LevelMetadata` | `LevelMetadata`: the `zarr_vectors_level` block in each level's attributes |
+| 11 per-array classes (`VerticesMeta` to `LinkAttributeMeta`) | array and group attributes written by `zarr_vectors/core/arrays.py`; discriminator slot `zv_array` |
 | Enums | `zarr_vectors.constants` `VALID_*` sets and `CAP_*` tokens |
 
-The parametric object registry (`ParametricTypeDef` and the built-in
-`PARAMETRIC_PLANE`, `PARAMETRIC_LINE` and `PARAMETRIC_SPHERE` in
-`zarr_vectors.core.metadata`) is not modelled in the schema.
+The parametric object registry (`ParametricTypeDef`) is not modelled.
 
-## Representation bridge
+The schema maps three items to outside vocabularies: `Axis` →
+`ngff:Axis` ([OME-Zarr NGFF] 0.4), `zv_version` → `schema:version` and
+`crs` → `schema:coordinateReferenceSystem` ([Schema.org]).
 
-Some slots are shaped differently in the LinkML model than in the
-stored attributes:
+## Stored form and schema form
 
-- **`bounds`**: stored as the two-element list `[[min...], [max...]]`;
-  modelled as a `BoundingBox` class with `min_corner` and `max_corner`.
-- **`shard_shape`**: stored as a single integer when every axis agrees;
-  modelled as a list.
-- **`crs`**: stored as `null` or a free-form value; modelled as the open
-  `CRS` class, so any value validates.
+The schema models the payload inside the `zarr_vectors` or
+`zarr_vectors_level` key. Three slots are shaped differently:
 
-The stored blocks are wrapped in a `zarr_vectors` or
-`zarr_vectors_level` key; the schema models the inner payload.
-`_to_linkml_logical_form` in `tests/test_linkml_schema.py` performs
-this conversion and is the reference for it.
+| Slot | Stored | Schema |
+|---|---|---|
+| `bounds` | `[[min...], [max...]]` | `BoundingBox` with `min_corner`, `max_corner` |
+| `shard_shape` | an integer when every axis agrees | a list |
+| `crs` | `null` or any value | the open `CRS` class |
 
-## Vocabulary mappings
-
-The schema declares prefixes for [OME-Zarr NGFF] (`ngff:`, version 0.4)
-and [Schema.org] (`schema:`) and maps three items:
-
-- `Axis` → `ngff:Axis`
-- `zv_version` → `schema:version`
-- `crs` → `schema:coordinateReferenceSystem`
+`_to_linkml_logical_form` in `tests/test_linkml_schema.py` is the
+reference conversion.
 
 ## Validating from other languages
 
-The generated JSON Schema is the contract for consumers outside Python.
-Every class is under `$defs`. To validate a root block, read the
-`zarr_vectors` entry from the root `zarr.json` attributes, apply the
-bridge above, and validate it against `#/$defs/RootMetadata`:
+Every class is under `$defs`. To validate a root block, read
+`zarr_vectors` from the root `zarr.json` attributes, convert it as
+above, and validate against `#/$defs/RootMetadata`:
 
 ```python
 import json
@@ -106,12 +82,9 @@ jsonschema.validate(
 )
 ```
 
-## Identifier
-
-The schema's `id` (the JSON Schema `$id`) is
-`https://w3id.org/zarr-vectors/schema/0.5`. It identifies the schema
-for downstream tools; no code in this package reads it, and it is not
-the format version, which is `zv_version` in the root attributes.
+The schema `$id` is `https://w3id.org/zarr-vectors/schema/0.5`. It
+names the schema only; the format version is `zv_version` in the root
+attributes.
 
 [LinkML]:                       https://linkml.io/
 [OME-Zarr NGFF]:                https://ngff.openmicroscopy.org/

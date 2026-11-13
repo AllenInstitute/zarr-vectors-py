@@ -16,12 +16,10 @@
 
 ## Introduction
 
-The `multiscales` block lists every resolution level and gives each one
-a `scale` and a `translation` transform. It follows the OME-NGFF layout
-so that NGFF-aware tools can discover the pyramid. It is also where a
-coarser level's bin geometry is recorded: the level's attributes
-([Level groups](../layout/level_groups.md)) do not carry `bin_shape` or
-`bin_ratio`, and `read_level_metadata` takes them from this block.
+The `multiscales` block lists every level with a `scale` and a
+`translation` transform, so NGFF-aware tools can find the pyramid. It
+also records each coarser level's bin geometry, which the
+[level attributes](../layout/level_groups.md) do not carry.
 
 ---
 
@@ -29,19 +27,15 @@ coarser level's bin geometry is recorded: the level's attributes
 
 ### Example
 
-The block of a streamline store with `base_bin_shape` `[50, 50, 50]`
-and a pyramid built with `factors=[(2.0, 1.0), (2.0, 2.0)]`:
+A streamline store with `base_bin_shape` `[50, 50, 50]` and a pyramid
+built with `factors=[(2.0, 1.0), (2.0, 2.0)]`:
 
-```json
+```javascript
 "multiscales": [
   {
     "version": "0.4",
     "name": "default",
-    "axes": [
-      {"name": "x", "type": "space"},
-      {"name": "y", "type": "space"},
-      {"name": "z", "type": "space"}
-    ],
+    "axes": [{"name": "x", "type": "space"}, ...],  // y and z alike
     "datasets": [
       {
         "path": "0",
@@ -57,13 +51,7 @@ and a pyramid built with `factors=[(2.0, 1.0), (2.0, 2.0)]`:
           {"type": "translation", "translation": [50.0, 50.0, 50.0]}
         ]
       },
-      {
-        "path": "2",
-        "coordinateTransformations": [
-          {"type": "scale", "scale": [4.0, 4.0, 4.0]},
-          {"type": "translation", "translation": [100.0, 100.0, 100.0]}
-        ]
-      }
+      ...   // path "2": scale [4.0, 4.0, 4.0], translation [100.0, 100.0, 100.0]
     ],
     "metadata": {"format": "zarr_vectors"}
   }
@@ -76,45 +64,34 @@ and a pyramid built with `factors=[(2.0, 1.0), (2.0, 2.0)]`:
 |-----|-------|
 | `version` | `"0.4"` |
 | `name` | `"default"` |
-| `axes` | One entry per spatial axis, taken from the root metadata's axes: `name`, `type` (default `"space"`), and `unit` only when the axis has one (for example in a store created with `create_store(..., unit="micrometer")`) |
-| `datasets` | One entry per resolution level, in ascending level order |
+| `axes` | One per spatial axis, from the root axes: `name`, `type` (default `"space"`), and `unit` when the axis has one (for example `create_store(..., unit="micrometer")`) |
+| `datasets` | One per level, in ascending order |
 | `datasets[].path` | The level group's name (`"0"`, `"1"`, …) |
-| `datasets[].coordinateTransformations` | A `scale` transform, followed by a `translation` transform unless every offset is zero |
-| `metadata.format` | `"zarr_vectors"`, which marks the block as a Zarr Vectors pyramid. NGFF reserves `type` for the downsampling method, so the block has no `type` key |
+| `datasets[].coordinateTransformations` | `scale`, then `translation` unless every offset is zero |
+| `metadata.format` | `"zarr_vectors"`; there is no `type` key, which NGFF reserves for the downsampling method |
 
-The block has no top-level `coordinateTransformations` and no
-per-dataset `level`, `bin_ratio`, `bin_shape` or `object_sparsity` key.
+There is no top-level `coordinateTransformations` and no per-dataset
+`level`, `bin_ratio`, `bin_shape` or `object_sparsity`.
 
 ### Transform values
 
-For level 0:
+| Level | `scale` | `translation` |
+|-------|---------|---------------|
+| 0 | all `1.0` | half the root's effective bin shape (`base_bin_shape`, or `chunk_shape` if there is none) |
+| coarser | the level's `bin_ratio`; else `bin_shape / base_bin_shape`; else all `1.0` | half the level's `bin_shape`; else as level 0 |
 
-- `scale` is all `1.0`.
-- `translation` is half the root's effective bin shape
-  (`base_bin_shape`, or `chunk_shape` when the store declares no bin
-  shape).
+For a coarser level, `read_level_metadata(root, level)` sets
+`bin_ratio = scale` and `bin_shape = 2 × translation`. For level 0 it
+reports neither; level 0 uses the root's `base_bin_shape`.
 
-For a coarser level:
-
-- `scale` is the level's `bin_ratio`; when the level has no `bin_ratio`,
-  `bin_shape / base_bin_shape` per axis; when it has neither, all `1.0`.
-- `translation` is half the level's `bin_shape`, or half the root's
-  effective bin shape when the level has none.
-
-A reader recovers a coarser level's bin geometry from its transforms:
-`bin_ratio = scale` and `bin_shape = 2 × translation`.
-`read_level_metadata(root, level)` does this, and for level 0 reports
-neither (level 0 takes `base_bin_shape` from the root).
-
-Vertex positions are stored in level-0 coordinates at every level: a
-metavertex is the centroid of the positions it replaces. The transforms
-describe each level's bin grid relative to level 0; a reader of Zarr
-Vectors vertices does not apply them to positions.
+Vertex positions are in level-0 coordinates at every level (a
+metavertex is the centroid of the vertices it replaces). The transforms
+describe each level's bin grid; readers do not apply them to positions.
 
 ### Writing and reading the block
 
 The `write_*` functions and `build_pyramid` write the block. To rewrite
-it from the levels' current metadata:
+it from the current level metadata:
 
 ```python
 from zarr_vectors.core.multiscale import (
@@ -136,5 +113,4 @@ root has none.
 
 ### Validation
 
-The validators in `zarr_vectors.validate` do not read the `multiscales`
-block.
+No validator reads the `multiscales` block.

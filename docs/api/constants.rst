@@ -1,9 +1,8 @@
 Constants
 =========
 
-String constants used in store metadata, including the geometry type names.
-Importing a constant instead of typing the string lets a typo fail at import
-time.
+String constants used in store metadata. Importing them turns a typo into
+an import error.
 
 .. automodule:: zarr_vectors.constants
    :members:
