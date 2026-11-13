@@ -1231,19 +1231,45 @@ def decode_object_manifests_csr(
     )
     if n == 0:
         return empty
-    lengths = np.fromiter(
-        (0 if b is None else len(b) for b in blobs), dtype=np.int64, count=n,
-    )
+    try:
+        lengths = np.fromiter(map(len, blobs), dtype=np.int64, count=n)
+        joined = b"".join(blobs)
+    except TypeError:
+        # A ``None`` row: an object with no fragments.
+        lengths = np.fromiter(
+            (0 if b is None else len(b) for b in blobs), dtype=np.int64, count=n,
+        )
+        joined = b"".join(b for b in blobs if b)
     if np.any((lengths > 0) & (lengths < 4)):
         raise ArrayError("a manifest blob is shorter than its 4-byte header")
-    buf = np.frombuffer(b"".join(b for b in blobs if b), dtype=np.uint8)
+    buf = np.frombuffer(joined, dtype=np.uint8)
     starts = np.cumsum(lengths) - lengths
     has = lengths > 0
+    header = starts[has]
     num_blocks = np.zeros(n, dtype=np.int64)
     num_blocks[has] = (
-        buf[starts[has][:, None] + np.arange(4)].copy().view("<u4").ravel()
+        buf[header[:, None] + np.arange(4)].copy().view("<u4").ravel()
     )
     fast = (lengths == 0) | (lengths == 4 + num_blocks * width)
+
+    # Fast blocks: drop every header and every slow blob with one byte
+    # mask over the buffer, then the rest is a (blocks, width) table.
+    keep = np.ones(buf.size, dtype=bool)
+    keep[(header[:, None] + np.arange(4)).ravel()] = False
+    if fast.all():
+        # Every length fits single-fragment blocks, so the table rows are
+        # exactly the positions the mode check below would visit.
+        blocks = buf[keep].reshape(-1, width)
+        if np.all(blocks[:, sid_ndim * 8] == MANIFEST_MODE_SINGLE):
+            offsets = np.zeros(n + 1, dtype=np.int64)
+            np.cumsum(num_blocks, out=offsets[1:])
+            coords = np.ascontiguousarray(blocks[:, : sid_ndim * 8]).view("<i8")
+            idx = np.ascontiguousarray(blocks[:, sid_ndim * 8 + 1:]).view("<i8")
+            return (
+                offsets,
+                coords.reshape(-1, sid_ndim).astype(np.int64, copy=False),
+                idx.ravel().astype(np.int64, copy=False),
+            )
     cand = fast & (num_blocks > 0)
     if cand.any():
         blob_of = np.repeat(np.flatnonzero(cand), num_blocks[cand])
@@ -1254,11 +1280,6 @@ def decode_object_manifests_csr(
         if wrong.any():
             fast[np.unique(blob_of[wrong])] = False
     slow = ~fast
-
-    # Fast blocks: drop every header and every slow blob with one byte
-    # mask over the buffer, then the rest is a (blocks, width) table.
-    keep = np.ones(buf.size, dtype=bool)
-    keep[(starts[has][:, None] + np.arange(4)).ravel()] = False
     if slow.any():
         edge = np.zeros(buf.size + 1, dtype=np.int64)
         np.add.at(edge, starts[slow], 1)
