@@ -56,6 +56,19 @@ def validate_conformance(store_path: str | Path | Group) -> ValidationResult:
 
     geom_types = meta.geometry_types or []
     lc = meta.links_convention
+    # RootMetadata fills an absent links_convention with
+    # implicit_sequential.  A store created empty (create_store,
+    # api.create) declares none until its first links write stamps the
+    # geometry's own, so an absent key on a store with no links yet is
+    # "not declared", not a mismatch.
+    declared = "links_convention" in (root.attrs.to_dict().get("zarr_vectors") or {})
+    undeclared_and_unlinked = False
+    if not declared:
+        try:
+            lg0 = get_resolution_level(root, 0)
+            undeclared_and_unlinked = not lg0.array_exists(LINKS)
+        except Exception:
+            undeclared_and_unlinked = True
 
     for gt in geom_types:
         req = GEOMETRY_LINK_REQ.get(gt)
@@ -65,7 +78,12 @@ def validate_conformance(store_path: str | Path | Group) -> ValidationResult:
         if not req:
             result.add_pass(f"'{gt}': no links convention required")
             continue
-        if lc not in req:
+        if lc not in req and undeclared_and_unlinked:
+            result.add_pass(
+                f"'{gt}': no links written yet and no links_convention "
+                f"declared"
+            )
+        elif lc not in req:
             # Check if this is a composite store with a geometry index
             # (each type has its own namespaced link arrays, so the root
             # links_convention only applies to the primary geometry)
