@@ -38,7 +38,7 @@ from zarr_vectors.core.arrays import (
     write_chunk_vertices,
 )
 from zarr_vectors.core.metadata import validate_bin_shape_divides_chunk
-from zarr_vectors.core.multiscale import read_level_transform, upsert_level_transform
+from zarr_vectors.core.multiscale import upsert_level_transform
 from zarr_vectors.core.store import (
     get_resolution_level,
     list_resolution_levels,
@@ -181,41 +181,37 @@ def rebin_level(
         vertices_processed += int(positions.shape[0])
         bins_created += len(new_groups)
 
-    # The bin shape is DERIVED metadata: it lives in the NGFF transform
-    # (scale = bin / base, translation = bin / 2), never in the level's own
-    # attrs -- LevelMetadata.validate forbids a level-0 bin_shape, and
-    # read_level_metadata ignores one anyway.  This used to write
-    # bin_shape / bin_ratio into the level attrs and leave the NGFF
-    # translation at the old value.
+    # Where the bin shape lives: level 0's is the root ``base_bin_shape``,
+    # with the level-0 NGFF translation at ``bin / 2``; a coarse level keeps
+    # its own ``bin_shape`` and ``bin_ratio`` (a float, ``bin / base``) in
+    # its ``zarr_vectors_level`` block.  Every level's NGFF entry repeats
+    # level 0's transform, because coarse vertices are stored in level-0
+    # coordinates.  LevelMetadata.validate forbids a level-0 bin_shape.
     new_bin_shape = tuple(float(b) for b in target_bin_shape)
     if level == 0:
         # Through ``update_root_metadata``, which read-modify-writes the one
-        # field named; rebuilding the whole block destroyed every field the
-        # reconstruction forgot.
+        # field named.
         update_root_metadata(root, base_bin_shape=new_bin_shape)
+        translation0 = [b / 2.0 for b in new_bin_shape]
         upsert_level_transform(
-            root, 0, scale=[1.0] * ndim,
-            translation=[b / 2.0 for b in new_bin_shape],
+            root, 0, scale=[1.0] * ndim, translation=translation0,
         )
-        # Coarser levels keep their absolute bins; their scale is relative
-        # to the base, so it moves with it.
+        # Coarser levels keep their absolute bins; their ratio is relative
+        # to the base, so it moves with it, and their NGFF entry follows
+        # level 0's.
         for lv in list_resolution_levels(root):
             if lv == 0:
                 continue
-            scale, translation = read_level_transform(root, lv)
-            if translation is None:
-                continue
+            coarse_bin = read_level_metadata(root, lv).bin_shape
+            if coarse_bin is not None:
+                _set_level_bins(root, lv, coarse_bin, new_bin_shape)
             upsert_level_transform(
-                root, lv,
-                scale=[2.0 * t / b for t, b in zip(translation, new_bin_shape)],
-                translation=translation,
+                root, lv, scale=[1.0] * ndim, translation=translation0,
             )
     else:
-        base_bin = read_root_metadata(root).effective_bin_shape
-        upsert_level_transform(
-            root, level,
-            scale=[n / b for n, b in zip(new_bin_shape, base_bin)],
-            translation=[n / 2.0 for n in new_bin_shape],
+        _set_level_bins(
+            root, level, new_bin_shape,
+            read_root_metadata(root).effective_bin_shape,
         )
 
     return {
@@ -226,3 +222,16 @@ def rebin_level(
         "new_bin_shape": new_bin_shape,
         "level": level,
     }
+
+
+def _set_level_bins(root, level, bin_shape, base_bin) -> None:
+    """Write a coarse level's ``bin_shape`` and its float ``bin_ratio``
+    against ``base_bin`` into the level's ``zarr_vectors_level`` block."""
+    lg = get_resolution_level(root, level)
+    attrs = lg.attrs.to_dict()
+    block = dict(attrs.get("zarr_vectors_level", {}))
+    block["bin_shape"] = [float(b) for b in bin_shape]
+    block["bin_ratio"] = [
+        float(b) / float(bb) if bb else 1.0 for b, bb in zip(bin_shape, base_bin)
+    ]
+    lg.attrs.update({"zarr_vectors_level": block})

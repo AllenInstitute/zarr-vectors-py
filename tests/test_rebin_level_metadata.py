@@ -93,7 +93,11 @@ def test_rebinning_the_base_rescales_coarser_levels(cloud):
     lm1 = read_level_metadata(root, 1)
     assert lm1.bin_shape == (25.0,) * 3
     assert lm1.bin_ratio == (2.5,) * 3
-    assert "bin_shape" not in _level_block(path, 1)
+    # A coarse level keeps its bins in its own block; its NGFF entry
+    # repeats level 0's transform.
+    assert _level_block(path, 1)["bin_shape"] == [25.0] * 3
+    from zarr_vectors.core.multiscale import read_level_transform
+    assert read_level_transform(root, 1) == read_level_transform(root, 0)
 
 
 def test_a_store_with_manifests_is_refused(tmp_path):
