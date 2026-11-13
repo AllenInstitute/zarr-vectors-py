@@ -932,7 +932,7 @@ def _apply_out_of_bounds_policy(
     if policy == "raise":
         raise MetadataError(
             f"{n_out} of {len(positions)} points are outside store bounds "
-            f"{cur_bounds!r}; pass out_of_bounds='ignore' to drop them, "
+            f"{cur_bounds!r}; pass out_of_bounds='ignore' (on_out_of_bounds= in Dataset.add_*) to drop them, "
             f"'expand' to grow bounds, or call set_bounds() first."
         )
     if policy == "ignore":

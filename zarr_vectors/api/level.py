@@ -393,6 +393,7 @@ class Level:
         """
         if selection.objects is None and selection.groups is None:
             return
+        self._check_has_objects(selection)
         if self.kind == GEOM_MESH and selection.groups is None:
             return
         if self.kind not in (GEOM_MESH, GEOM_GRAPH, GEOM_SKELETON):
@@ -406,6 +407,172 @@ class Level:
             f"the arrays yourself, or use level.objects[...] on a geometry "
             f"that supports it (point clouds, polylines, lines, meshes)."
         )
+
+    def _touched_object_ids(self, selection: Selection) -> npt.NDArray[Any]:
+        """Distinct ids of the objects with a vertex in ``selection``.
+
+        Only the polyline reader reports ids on an ordinary read; the
+        point and mesh readers do so only on their ``object_ids=`` path,
+        and the graph and line readers never.  So :meth:`Query.object_ids`
+        answered ``[]`` for every point cloud, graph and mesh, ids or no
+        ids.  Resolved here, cheapest route first:
+
+        * the read itself carries ids (polylines, or ``objects=`` given);
+        * the level has no objects -- nothing to report;
+        * nothing narrows the selection -- every present object;
+        * points and meshes -- the same selection re-read on the
+          reader's ``object_ids=`` path, which tags each vertex;
+        * graphs, skeletons and lines -- each object's fragments, from the
+          manifests, tested against the selection's region.
+        """
+        from zarr_vectors.api.select import SelectionError
+
+        empty = np.zeros((0,), dtype=np.int64)
+        result = self._execute(selection)
+        for source in (result.part_objects, result.object_ids):
+            if source is not None and len(source):
+                return np.unique(np.asarray(source))
+        if result.vertex_count == 0:
+            return empty
+        target = (
+            self if selection.level in (None, self._index)
+            else self._dataset.level(selection.level)
+        )
+        try:
+            present = np.asarray(target.objects.ids(), dtype=np.int64)
+        except (ArrayError, StoreError, MetadataError, KeyError):
+            return empty
+        if present.size == 0:
+            return empty
+        if not _narrows(selection) and selection.limit is None:
+            return np.unique(present)
+        if selection.limit is not None:
+            raise SelectionError(
+                f"object_ids() with limit= is not supported on a "
+                f"{self.kind!r} level: its reader does not tag vertices "
+                f"with their object, so which objects the first "
+                f"{selection.limit} vertices belong to is not known. "
+                f"Drop the limit, or read with objects=."
+            )
+        if self.kind in (GEOM_POINT_CLOUD, GEOM_MESH):
+            from dataclasses import replace as _replace
+
+            tagged = self._execute(
+                _replace(selection, objects=[int(i) for i in present]),
+            )
+            ids = tagged.object_ids
+            if ids is None or not len(ids):
+                return empty
+            return np.unique(np.asarray(ids))
+        if selection.where is not None:
+            raise SelectionError(
+                f"object_ids() with where= is not supported on a "
+                f"{self.kind!r} level: its reader does not tag vertices "
+                f"with their object. Drop where=, or filter the result."
+            )
+        return self._object_ids_by_region(target, selection)
+
+    def _object_ids_by_region(
+        self, target: Level, selection: Selection,
+    ) -> npt.NDArray[Any]:
+        """Objects with a fragment vertex inside the selection's region.
+
+        For readers that never report ownership.  The region is the
+        selection's ``bbox`` / ``near`` / ``cells`` terms; each object's
+        fragments are found through the manifests and read once per chunk.
+        """
+        from zarr_vectors.core.arrays import (
+            read_chunk_vertices,
+            read_object_manifest_rows,
+        )
+
+        level_group = target.store
+        ids, manifests = read_object_manifest_rows(level_group)
+        ndim = self._dataset.ndim
+        lo = hi = None
+        if selection.bbox is not None:
+            lo = np.asarray(selection.bbox[0], dtype=np.float64)
+            hi = np.asarray(selection.bbox[1], dtype=np.float64)
+        wanted_cells = None
+        cell = None
+        if selection.cells is not None:
+            cell = np.asarray(target.grid.cell_shape, dtype=np.float64)
+            wanted_cells = {
+                tuple(int(c) for c in getattr(ref, "coords", ref))[-ndim:]
+                for ref in selection.cells
+            }
+
+        def _keep(points: npt.NDArray[Any]) -> bool:
+            if not len(points):
+                return False
+            p = np.asarray(points, dtype=np.float64).reshape(-1, ndim)
+            mask = np.ones(len(p), dtype=bool)
+            if lo is not None and hi is not None:
+                mask &= np.all((p >= lo) & (p <= hi), axis=1)
+            if selection.near is not None:
+                centre, radius = selection.near
+                off = p - np.asarray(centre, dtype=np.float64)
+                mask &= (off ** 2).sum(axis=1) <= float(radius) ** 2
+            if wanted_cells is not None and cell is not None:
+                idx = np.floor(p / cell).astype(np.int64)
+                mask &= _rows_in(idx, wanted_cells)
+            return bool(mask.any())
+
+        fragments: dict[tuple[int, ...], list[Any]] = {}
+        hit: dict[tuple[tuple[int, ...], int], bool] = {}
+        out: list[int] = []
+        for oid, manifest in zip(ids.tolist(), manifests):
+            for cc, fi in manifest:
+                key = tuple(int(c) for c in cc)
+                if key not in fragments:
+                    try:
+                        fragments[key] = read_chunk_vertices(
+                            level_group, key, ndim=ndim,
+                        )
+                    except (ArrayError, StoreError, KeyError):
+                        fragments[key] = []
+                slot = (key, int(fi))
+                if slot not in hit:
+                    frags = fragments[key]
+                    hit[slot] = int(fi) < len(frags) and _keep(frags[int(fi)])
+                if hit[slot]:
+                    out.append(int(oid))
+                    break
+        return np.unique(np.asarray(out, dtype=np.int64))
+
+    def _check_has_objects(self, selection: Selection) -> None:
+        """Refuse ``objects=`` / ``groups=`` on a level that has none.
+
+        A point cloud written without ``object_ids`` has no object index,
+        and the reader failed on it with a bare ``KeyError: 'sid_ndim'``
+        (or ``Array 'groups' not found``), which says nothing about what
+        the caller did.
+        """
+        from zarr_vectors.api.select import SelectionError
+        from zarr_vectors.constants import GROUPS
+
+        target = (
+            self if selection.level in (None, self._index)
+            else self._dataset.level(selection.level)
+        )
+        if selection.objects is not None and len(target.objects) == 0:
+            raise SelectionError(
+                f"select(objects=...) on level {target.index}: this "
+                f"{self.kind!r} level holds no object ids (it was written "
+                f"without object_ids=), so there are no objects to select."
+            )
+        if selection.groups is not None:
+            group = target.store
+            try:
+                present = group.array_exists(GROUPS) or group.standalone_array_exists(GROUPS)
+            except Exception:  # noqa: BLE001 - unknown: let the reader decide
+                present = True
+            if not present:
+                raise SelectionError(
+                    f"select(groups=...) on level {target.index}: this "
+                    f"{self.kind!r} level holds no groups (it was written "
+                    f"without groups=), so there are none to select."
+                )
 
     def _reader_kwargs(self, selection: Selection, supports: Sequence[str]) -> dict[str, Any]:
         """Selection terms this reader can express, with ``"all"`` resolved.

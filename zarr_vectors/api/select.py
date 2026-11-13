@@ -260,12 +260,12 @@ class Query:
         return self.read().vertex_count
 
     def object_ids(self) -> npt.NDArray[Any]:
-        """The distinct object ids this query touches."""
-        result = self.read()
-        for source in (result.part_objects, result.object_ids):
-            if source is not None and len(source):
-                return np.unique(np.asarray(source))
-        return np.zeros((0,), dtype=np.int64)
+        """The distinct object ids this query touches.
+
+        An object is touched when at least one of its vertices survives
+        the selection.  Empty for a level written without object ids.
+        """
+        return self._level._touched_object_ids(self._selection)
 
     # ---------------- diagnostics ----------------
 
@@ -324,40 +324,74 @@ class Query:
                 )))
             except ValueError:
                 continue
+        if not refs:
+            from zarr_vectors.api.level import _narrows
+
+            if not _narrows(self._selection):
+                # An unnarrowed plan reads the level whole and names no
+                # cells, which made this answer "none" for the query that
+                # touches every cell.  Ask the level what it holds.
+                level = self._selection.level
+                target = (
+                    self._level if level in (None, self._level.index)
+                    else self._level.dataset.level(level)
+                )
+                return target.cells()
         return CellSet(refs)
 
     def iter_cells(self) -> Any:
         """Stream the result one cell at a time.
 
-        Not available yet: streaming needs the facade to drive the read
-        itself.  Delegating to a reader that materialises everything and
-        then yielding from it would have the signature of streaming and
-        none of the benefit, which is worse than not offering it.
+        Yields ``(CellRef, ReadResult)`` pairs:
 
-        The contract it will honour, pinned here so nobody codes to a
-        guess in the meantime:
-
-        * yields ``(CellRef, ReadResult)`` pairs, one per cell that
-          :meth:`cells` names, in sorted key order;
+        * one per cell that :meth:`cells` names, in sorted key order, each
+          read on its own -- so peak memory is one cell's worth, not the
+          whole query's;
         * each :class:`~zarr_vectors.api.result.ReadResult` covers exactly
           that cell, cut into ``parts`` the way ``Selection.cells_split``
-          asks for — so the same object spanning two cells appears as one
+          asks for -- so the same object spanning two cells appears as one
           part in each, and summing part counts is not the same as
           reading the whole query;
-        * per-cell failures arrive in that result's ``errors``, not as an
-          exception, so one unreadable cell does not end the stream;
-        * ``sum(r.vertex_count for _, r in q.iter_cells()) == q.count()``.
-
-        Use :meth:`cells` today: take the cell references, and read each
-        with ``select(cells=[ref])``.
+        * a cell that fails to read arrives as an empty result whose
+          ``errors`` names it, not as an exception, so one unreadable cell
+          does not end the stream;
+        * ``sum(r.vertex_count for _, r in q.iter_cells()) == q.count()``
+          for points, meshes and graphs, and for any unnarrowed query.
+          The exception is a ``bbox``/``near`` query on lines or
+          polylines: the whole read keeps every part that reaches into
+          the region *whole*, including its vertices in cells the region
+          does not touch, while this stream covers only the region's
+          cells -- so it yields the pieces inside them and the sum can
+          be smaller;
+        * a ``limit`` is shared across the cells, and the stream stops
+          once it is used up.
         """
-        raise NotImplementedError(
-            "Query.iter_cells() arrives with the resolver phase. The legacy "
-            "readers materialise the whole result, so a generator over one "
-            "would use the same peak memory while implying it does not. "
-            "Until then: Query.cells() gives the cell references, and "
-            "select(cells=[ref]).read() reads one."
-        )
+        from zarr_vectors.api.grid import CellSet
+        from zarr_vectors.api.result import ReadError, ReadResult
+
+        sel = self._selection
+        refs = self.cells()
+        remaining = sel.limit
+        for ref in sorted(refs):
+            if remaining is not None and remaining <= 0:
+                return
+            one = replace(self._selection, cells=CellSet([ref]), limit=remaining)
+            try:
+                result = self._level._execute(one)
+            except (ZVError, KeyError, ValueError, OSError) as e:
+                ndim = int(self._level.dataset.ndim)
+                result = ReadResult(
+                    kind=self._level.kind,
+                    positions=np.zeros((0, ndim), dtype=np.float32),
+                    attributes_read=False,
+                    errors=(ReadError(
+                        cell=ref.key, array="vertices",
+                        error=f"{type(e).__name__}: {e}",
+                    ),),
+                )
+            if remaining is not None:
+                remaining -= result.vertex_count
+            yield ref, result
 
     def __repr__(self) -> str:
         return f"Query({self.explain().splitlines()[0]})"
