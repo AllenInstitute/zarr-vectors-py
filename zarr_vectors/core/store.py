@@ -1125,7 +1125,9 @@ def _create_or_open_store(
         try:
             return open_store(path, mode="r+", backend=backend, **backend_kwargs)
         except StoreError:
-            return create_store(path, backend=backend, **backend_kwargs)
+            return create_store(
+                path, backend=backend, **creator_kwargs, **backend_kwargs,
+            )
     if isinstance(path, (str, Path)):
         scheme = _detect_scheme(path)
         if scheme in {"", "file"}:
