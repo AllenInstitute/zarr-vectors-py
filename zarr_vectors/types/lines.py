@@ -261,25 +261,6 @@ def write_lines(
     )
     axes = root_meta.spatial_index_dims
 
-    arrays_present = [VERTICES, "object_index"]
-    if vertex_attr_arrays:
-        arrays_present.append(VERTEX_ATTRIBUTES)
-    level_chunk_dims: list[str] | None = None
-    if chunk_by_attribute is not None:
-        level_chunk_dims = compute_chunk_dim_names(
-            chunk_by_attribute, ndim,
-            spatial_dim_names=[a["name"] for a in axes],
-        )
-    level_meta = LevelMetadata(
-        level=0,
-        vertex_count=n_lines * 2,
-        arrays_present=arrays_present,
-        chunk_dims=level_chunk_dims,
-        chunk_attribute_name=chunk_by_attribute,
-        chunk_attribute_values=attr_bin_values,
-    )
-    level_group = create_resolution_level(root, 0, level_meta)
-
     # Vectorized chunk classification: ``floor(pos / chunk_shape)`` for
     # both endpoints in one numpy pass.  The previous list-comprehension
     # called ``bin_to_chunk(compute_chunk_coords(...))`` once per line —
@@ -348,6 +329,31 @@ def write_lines(
             cross_a_vi.append(fragment_idx_a)
             cross_b_vi.append(fragment_idx_b)
     cross_links = cross_a_vi
+
+    # Declared after the split, so ``links`` is listed exactly when a
+    # line crosses a chunk boundary (only then is a links array made).
+    arrays_present = [VERTICES, VERTEX_FRAGMENTS, "object_index"]
+    if vertex_attr_arrays:
+        arrays_present.append(VERTEX_ATTRIBUTES)
+    if object_attributes:
+        arrays_present.append("object_attributes")
+    if cross_a_vi:
+        arrays_present.append("links")
+    level_chunk_dims: list[str] | None = None
+    if chunk_by_attribute is not None:
+        level_chunk_dims = compute_chunk_dim_names(
+            chunk_by_attribute, ndim,
+            spatial_dim_names=[a["name"] for a in axes],
+        )
+    level_meta = LevelMetadata(
+        level=0,
+        vertex_count=n_lines * 2,
+        arrays_present=arrays_present,
+        chunk_dims=level_chunk_dims,
+        chunk_attribute_name=chunk_by_attribute,
+        chunk_attribute_values=attr_bin_values,
+    )
+    level_group = create_resolution_level(root, 0, level_meta)
 
     idx_ndim = ndim + 1 if line_attr_bins is not None else ndim
     # Collapse all per-array zarr.json PUTs + per-chunk byte writes into

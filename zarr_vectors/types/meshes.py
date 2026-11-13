@@ -31,6 +31,7 @@ from zarr_vectors.constants import (
     OBJECT_INDEX,
     OBJIDX_STANDARD,
     RESOLUTION_PREFIX,
+    VERTEX_ATTRIBUTES,
     VERTEX_FRAGMENTS,
     VERTICES,
 )
@@ -277,7 +278,15 @@ def write_mesh(
     level_meta = LevelMetadata(
         level=0,
         vertex_count=n_verts,
-        arrays_present=[VERTICES, "links", "object_index"],
+        # Every family this call writes.  ``links`` and its
+        # ``link_fragments`` sidecar always exist: the backstop below
+        # creates the intra-chunk array even when no face is stored.
+        arrays_present=[
+            VERTICES, VERTEX_FRAGMENTS, "links", LINK_FRAGMENTS,
+            "object_index",
+            *([VERTEX_ATTRIBUTES] if vertex_attributes else []),
+            *(["object_attributes"] if object_attributes else []),
+        ],
         chunk_dims=level_chunk_dims,
         chunk_attribute_name=chunk_by_attribute,
         chunk_attribute_values=attr_bin_values,
