@@ -481,7 +481,7 @@ class RootMetadata:
         #                 were duplicated under
         #                 ``zarr_vectors.spatial_index_dims``; per-array
         #                 ``.zattrs`` carried a redundant ``dtype`` field.
-        #   - pre-0.6.0 : ``vertex_fragments`` instead of
+        #   - pre-0.6.0 : ``vertex_group_offsets`` instead of
         #                 ``vertex_fragments``; links carried an inline
         #                 self-describing header; ``object_index`` used
         #                 the flat quad encoding.
@@ -668,7 +668,7 @@ class RootMetadata:
 
     @classmethod
     def from_dict(cls, d: dict[str, Any], *, strict: bool = True) -> RootMetadata:
-        """Deserialise from a dict (as stored in ``.zattrs``).
+        """Deserialise from a dict (as stored in the root attributes).
 
         Args:
             d: The full root-attrs dict — must contain a
@@ -1308,7 +1308,7 @@ def validate_bin_shape_divides_chunk(
 
 @dataclass
 class ArrayMetadata:
-    """Per-array metadata (stored in each array's ``.zattrs``).
+    """Per-array metadata (stored in each array's ``zarr.json`` attributes).
 
     Attributes:
         name: Array name (e.g. ``"vertices"``, ``"attributes/radius"``).

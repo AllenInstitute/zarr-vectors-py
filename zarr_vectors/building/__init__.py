@@ -14,9 +14,7 @@ get an honest promise about a smaller surface.
 
 **The distinction this makes real.**  ``zarr_vectors.core``,
 ``zarr_vectors.lazy``, ``zarr_vectors.ops``, ``zarr_vectors.encoding``
-and ``zarr_vectors.spatial`` are *internal*.  They change without notice;
-they always did, and saying so is the only honest description of a
-package whose recent history includes three breaking layout refactors.
+and ``zarr_vectors.spatial`` are *internal*: they change without notice.
 What is re-exported here does not.
 
 The contents are not a guess.  They are the symbols the two consuming
@@ -868,8 +866,8 @@ def write_object_manifests(
 
     On an index that stores its object ids (layout V2), an append extends
     the id table with ``ids``, or with the rows when the table is simply
-    the rows; otherwise it raises, where it used to add rows with no id
-    that a read by id could not find.
+    the rows; otherwise it raises rather than add rows with no id that a
+    read by id could not find.
 
     Returns:
         ``(first_row, n)``: where the written manifests start, and how many.
@@ -1102,12 +1100,9 @@ def rebuild_presence(
     one attribute shared by every cell, so stamping it races.  This
     rebuilds it once, afterwards.
 
-    Covers sharded arrays.  It did not, and defaulted to ``"skip"``,
-    while a sharded array's manifest could not be rebuilt from a per-cell
-    listing — safe then, because sharding ran after the rebuild by
-    contract, so anything sharded was already correct.  A store can now
-    be born sharded, and under that premise "skip" quietly declined to
-    repair the arrays most in need of it.
+    Covers sharded arrays by default (``on_sharded="derive"``): a store
+    can be written sharded from the start, so its sharded arrays are the
+    ones most likely to need the rebuild.
 
     The level-wide form also ends a :func:`defer_presence` declaration,
     once every manifest is written: arrays allocated afterwards get a

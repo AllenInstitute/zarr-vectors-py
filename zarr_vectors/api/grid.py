@@ -137,10 +137,9 @@ class Grid:
         The shape comes from
         :func:`~zarr_vectors.spatial.chunking.grid_layout` — the function
         the allocator itself calls — rather than from a restatement of it.
-        A restatement is what this used to be, and it was one plane short:
-        ``ceil((hi - lo) / size)`` counts cell-widths across the extent,
-        but bounds are inclusive, so a store spans
-        ``floor(hi/size) - floor(lo/size) + 1`` cells.
+        Bounds are inclusive, so a store spans
+        ``floor(hi/size) - floor(lo/size) + 1`` cells, one more than
+        ``ceil((hi - lo) / size)`` when ``hi`` sits on a cell boundary.
 
         That makes ``target_cells=n`` produce ``n + 1`` cells per axis
         when the upper bound lands exactly on a cell boundary: a vertex at
@@ -193,13 +192,11 @@ class Grid:
     def cell_of(self, point: Sequence[float]) -> CellRef:
         """Which cell a coordinate falls in.
 
-        Absolute, as stored: ``floor(point / cell_shape)``.  It used to
-        subtract :attr:`origin`, which made it bounds-relative while
-        :meth:`cells_in` — and the chunk keys on disk, and the ``chunks=``
-        term a cell selection becomes — stayed absolute.  The two agreed
-        only for a store whose bounds began at zero; anywhere else
-        ``select(cells=[cell_of(p)])`` looked in a cell that does not hold
-        ``p``, and usually does not exist.
+        Absolute, as stored: ``floor(point / cell_shape)``, with no
+        :attr:`origin` subtracted — the same frame as :meth:`cells_in`,
+        the chunk keys on disk and the ``chunks=`` term a cell selection
+        becomes, so ``select(cells=[cell_of(p)])`` reads the cell that
+        holds ``p``.
         """
         from zarr_vectors.spatial.chunking import compute_chunk_coords
 
@@ -238,9 +235,8 @@ class Grid:
         The allocation, so this is ``prod(shape)`` references however
         little of the grid holds data -- see :meth:`cells_in`.
 
-        Yields nothing for a grid with no shape; it used to yield one
-        bogus ``CellRef(())``, because ``itertools.product()`` over an
-        empty axis list produces a single empty tuple.
+        Yields nothing for a grid with no shape (``itertools.product()``
+        over an empty axis list would yield a single empty tuple).
         """
         import itertools
 

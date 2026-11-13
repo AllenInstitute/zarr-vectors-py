@@ -6,7 +6,7 @@ hashable) attributes are stored as an integer ``codes`` array plus a
 convention mirrors Apache Arrow's Dictionary type, pandas Categorical,
 and the CF ``flag_values`` / ``_FillValue`` conventions:
 
-    .zattrs:
+    zarr.json attributes:
         encoding: "dictionary"
         categories: ["soma", "axon", "dendrite", ...]
         ordered: false
@@ -72,7 +72,7 @@ def encode_categorical(
 
         - ``codes``: 1-D integer array of the same length as ``values``.
         - ``dict_metadata``: dict ready to merge into the array's
-          ``.zattrs``, containing ``encoding``, ``categories``,
+          attributes, containing ``encoding``, ``categories``,
           ``ordered``, and (when set) ``_FillValue``.
 
     Raises:

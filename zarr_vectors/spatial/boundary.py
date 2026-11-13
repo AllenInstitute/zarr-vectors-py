@@ -1134,12 +1134,13 @@ def build_vertex_chunk_mapping(
             sorted from chunk_assignments keys.
 
     Returns:
-        vertex_chunks: ``(N,)`` int64 — index into *chunk_coords_list*
-            for each vertex.
-        vertex_local_indices: ``(N,)`` int64 — local index within the
-            chunk for each vertex (i.e. position within the chunk's
-            vertex array).
-        chunk_coords_list: The chunk coordinate ordering used.
+        A tuple ``(vertex_chunks, vertex_local_indices, chunk_coords_list)``:
+
+        - ``vertex_chunks``: ``(N,)`` int64, the index into
+          ``chunk_coords_list`` for each vertex (``-1`` if unassigned).
+        - ``vertex_local_indices``: ``(N,)`` int64, each vertex's position
+          within its chunk's vertex array (``-1`` if unassigned).
+        - ``chunk_coords_list``: the chunk coordinate ordering used.
     """
     if chunk_coords_list is None:
         chunk_coords_list = sorted(chunk_assignments.keys())
@@ -1149,9 +1150,9 @@ def build_vertex_chunk_mapping(
     vertex_chunks = np.full(n_vertices, -1, dtype=np.int64)
     vertex_local_indices = np.full(n_vertices, -1, dtype=np.int64)
 
-    # Scatter per chunk rather than per vertex: the inner loop ran once
-    # for every vertex in the level, on the write path of every graph and
-    # mesh. A chunk's vertices are numbered 0..n-1 in the order they are
+    # Scatter per chunk rather than per vertex: a per-vertex loop would
+    # run once for every vertex in the level, on the write path of every
+    # graph and mesh. A chunk's vertices are numbered 0..n-1 in the order they are
     # stored, which is an arange, and their destinations are the chunk's
     # own index array -- both expressible as one scatter each.
     for coord, global_indices in chunk_assignments.items():

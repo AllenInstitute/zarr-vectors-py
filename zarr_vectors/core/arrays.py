@@ -2,8 +2,8 @@
 
 Each "array" is a subdirectory within a resolution-level group.  Chunk
 data is stored as raw binary files named by their spatial chunk
-coordinates (e.g. ``vertices/0.0.0``).  Array metadata is in
-``<array>/.zattrs``.
+coordinates (e.g. ``vertices/0.0.0``).  Array metadata is in the
+``attributes`` of ``<array>/zarr.json``.
 
 This module is the single point of contact for all array I/O — type
 modules (``types/*.py``) call these functions rather than touching
@@ -486,8 +486,8 @@ def _derive_native_config(level_group: Group) -> dict[str, Any] | None:
     root ``bounds`` and the level's effective ``chunk_shape``.
 
     Returns ``None`` when that metadata can't be read — e.g. a bare
-    ``Group`` with no root ``.zattrs``.  There is no longer a per-cell
-    group primitive to fall back to: :meth:`Group.write_bytes` requires an
+    ``Group`` with no root metadata.  There is no per-cell group
+    primitive to fall back to: :meth:`Group.write_bytes` requires an
     allocated chunk array and raises otherwise.  A ``None`` here therefore
     means a grid-shaped array cannot be allocated at all, which is
     intrinsic rather than incidental — the grid is precisely what the
@@ -894,11 +894,9 @@ def open_write_session(
             many chunks pack into one storage object.  ``None`` means
             *explicitly* unsharded, one storage object per spatial chunk.
 
-            ``None`` used to be the default, which made every second
-            write into a sharded store look like a request to unshard it
-            — and since that request was honoured by recreating the
-            array, the earlier data went with it.  The sentinel exists so
-            "I did not say" and "I said no" can be told apart.
+            The ``"inherit"`` sentinel keeps "I did not say" apart from
+            "I said no": only an explicit ``None`` asks for an unsharded
+            array.
         bounds: ``(min_corner, max_corner)`` for the level — used to
             compute the chunk grid extent and origin.
         chunk_shape: Physical chunk size per axis — paired with
@@ -1037,10 +1035,10 @@ def _is_per_chunk_array(name: str) -> bool:
 
 
 def read_zv_array_tag(meta: dict) -> str | None:
-    """Return the discriminator string from an array's ``.zattrs`` dict.
+    """Return the discriminator string from an array's attributes dict.
 
-    Looks under the new key ``zv_array`` first and falls back to the
-    legacy ``zvf_array`` key for stores written before the rename.  Use
+    Looks under ``zv_array`` first and falls back to ``zvf_array``, the
+    key older stores carry.  Use
     this helper instead of indexing the dict directly so that conformance
     / validation code keeps working against existing-on-disk stores.
     """
@@ -4443,7 +4441,7 @@ def _stamp_link_family_meta(
     num_links: int | None = None,
     num_physical_records: int | None = None,
 ) -> None:
-    """Write the ``links/<delta>/`` group's family-wide ``.zattrs``.
+    """Write the ``links/<delta>/`` group's family-wide attributes.
 
     Policy (``link_width`` / ``sid_ndim`` / ``directed`` / ``store``)
     lives here rather than on the arrays because every offsets array
@@ -4702,8 +4700,8 @@ def _parse_offsets_for_family(
     group meta didn't carry it.
 
     The source chunks in the partition have the family's true arity, so
-    they are an exact fallback for a family whose group ``.zattrs``
-    predates ``sid_ndim`` (or was written by the per-cell writers alone).
+    they are an exact fallback for a family whose group attributes lack
+    ``sid_ndim`` (or that was written by the per-cell writers alone).
     """
     if sid_ndim is None:
         for _seg, src_chunk in partition.cell_indices:
@@ -4896,7 +4894,7 @@ def link_family_policy(
     """``(link_width, sid_ndim, directed, store)`` from the family group.
 
     Returns ``None`` when the family carries no policy — an absent
-    family, or one whose group ``.zattrs`` was never stamped — which
+    family, or one whose group attributes were never stamped — which
     callers treat as "nothing to read".
     """
     family = links_group_path(delta)
@@ -7623,21 +7621,20 @@ def _require_object_index_layout(meta: dict[str, Any]) -> None:
 
 
 def _require_object_index_v1(meta: dict[str, Any]) -> None:
-    """Raise if ``object_index`` is not in the 0.8.1 vlen-manifests layout.
+    """Raise if ``object_index`` is in none of the readable layouts.
 
-    Pre-0.6 stores wrote a single-chunk ``data`` + ``offsets`` pair; the
-    reader for that layout was removed in 0.8.1 alongside the broader
-    flattening migration.  Any store reaching this point with a
-    non-V1 ``layout`` field is therefore older than what this build
-    supports and must be rewritten from source — surfacing that as a
-    clear error here beats decoding garbage out of legacy bytes.
+    The readable layouts are V1, V2 and dense (see
+    :func:`_require_object_index_layout`); any other ``layout`` value is
+    one this build cannot decode, and the store must be rewritten from
+    source rather than read as garbage.
     """
     layout = meta.get("layout")
     if layout != OBJECT_INDEX_LAYOUT_V1:
         raise ArrayError(
-            f"object_index layout {layout!r} is not the 0.8.1 vlen-manifests "
-            f"layout ({OBJECT_INDEX_LAYOUT_V1!r}); pre-0.6 ``data``+``offsets`` "
-            f"stores are not readable by this build — rewrite from source."
+            f"object_index layout {layout!r} is not readable by this build "
+            f"(readable: {OBJECT_INDEX_LAYOUT_V1!r}, "
+            f"{OBJECT_INDEX_LAYOUT_V2!r}, {_LAYOUT_DENSE!r}) — rewrite the "
+            f"store from source."
         )
 
 

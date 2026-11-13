@@ -27,9 +27,9 @@ ZARR_V3_DEFAULT_ZSTD_CODEC: dict[str, Any] = {
     "configuration": {"level": 0, "checksum": False},
 }
 
-# Spec-aspirational default ("blosc" shorthand).  Matches the Blosc(Zstd,
-# BitShuffle, l5) pipeline described in
-# ``docs/spec/foundations/codec_pipeline.md``.
+# The opt-in ``"blosc"`` shorthand (not a default): the Blosc(Zstd,
+# BitShuffle, l5) pipeline that ``docs/spec/foundations/codec_pipeline.md``
+# recommends for ``vertices/``.
 _BLOSC_BITSHUFFLE_L5_CODEC: dict[str, Any] = {
     "name": "blosc",
     "configuration": {

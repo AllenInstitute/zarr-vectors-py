@@ -1,13 +1,7 @@
 """Which modules are supported, which are internal, and which are undecided.
 
-One machine-readable answer, because there were three prose ones and they
-disagreed.  The contract test listed eight internal prefixes; the two
-surface docstrings listed five (omitting ``sharding``, ``multiresolution``
-and ``_engine`` — from which ``building`` re-exports six names, so the
-docstring reasonably read as "the rest is fair game"); and the published
-docs listed ``types``, ``lazy``, ``spatial``, ``validate``, ``constants``
-and ``typing`` while mentioning neither ``api`` nor ``building``.  A
-downstream reader met whichever of those they happened to open.
+The single machine-readable answer: the contract test, the surface
+docstrings and the published docs all defer to the tiers listed here.
 
 The three tiers:
 

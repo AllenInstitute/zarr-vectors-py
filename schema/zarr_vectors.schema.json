@@ -2,7 +2,7 @@
   "$defs": {
     "AttributeMeta": {
       "additionalProperties": false,
-      "description": "``.zattrs`` for each ``attributes/<name>/`` array.",
+      "description": "Attributes for each ``attributes/<name>/`` array.",
       "properties": {
         "channel_names": {
           "description": "For multi-channel per-vertex attributes, the channel labels.",
@@ -25,7 +25,7 @@
         "zv_array": {
           "$ref": "#/$defs/ZvArrayTag",
           "const": "attribute",
-          "description": "Discriminator slot identifying the kind of per-array ``.zattrs`` block.  Each writer in ``core/arrays.py`` stamps the corresponding token from :class:`ZvArrayTag`.\n"
+          "description": "Discriminator slot identifying the kind of per-array attributes block.  Each writer in ``core/arrays.py`` stamps the corresponding token from :class:`ZvArrayTag`.\n"
         }
       },
       "required": [
@@ -176,7 +176,7 @@
     },
     "FragmentAttributeMeta": {
       "additionalProperties": false,
-      "description": "``.zattrs`` for each ``fragment_attributes/<name>/`` array.  Stored as a dense per-chunk byte blob; each chunk holds a row per fragment, with shape ``(num_fragments_in_chunk,)`` or ``(num_fragments_in_chunk, len(channel_names))``.  Per-chunk fragment counts are derived from ``vertex_fragments/<chunk>`` at read time.  Replace-only at the chunk level.",
+      "description": "Attributes for each ``fragment_attributes/<name>/`` array.  Stored as a dense per-chunk byte blob; each chunk holds a row per fragment, with shape ``(num_fragments_in_chunk,)`` or ``(num_fragments_in_chunk, len(channel_names))``.  Per-chunk fragment counts are derived from ``vertex_fragments/<chunk>`` at read time.  Replace-only at the chunk level.",
       "properties": {
         "channel_names": {
           "description": "For multi-channel per-vertex attributes, the channel labels.",
@@ -199,7 +199,7 @@
         "zv_array": {
           "$ref": "#/$defs/ZvArrayTag",
           "const": "fragment_attribute",
-          "description": "Discriminator slot identifying the kind of per-array ``.zattrs`` block.  Each writer in ``core/arrays.py`` stamps the corresponding token from :class:`ZvArrayTag`.\n"
+          "description": "Discriminator slot identifying the kind of per-array attributes block.  Each writer in ``core/arrays.py`` stamps the corresponding token from :class:`ZvArrayTag`.\n"
         }
       },
       "required": [
@@ -226,7 +226,7 @@
     },
     "GroupingsAttributeMeta": {
       "additionalProperties": false,
-      "description": "``.zattrs`` for each ``groupings_attributes/<name>/`` array.",
+      "description": "Attributes for each ``groupings_attributes/<name>/`` array.",
       "properties": {
         "dtype": {
           "description": "Numpy dtype string of the array's value type (e.g. \"float32\").",
@@ -246,7 +246,7 @@
         "zv_array": {
           "$ref": "#/$defs/ZvArrayTag",
           "const": "groupings_attribute",
-          "description": "Discriminator slot identifying the kind of per-array ``.zattrs`` block.  Each writer in ``core/arrays.py`` stamps the corresponding token from :class:`ZvArrayTag`.\n"
+          "description": "Discriminator slot identifying the kind of per-array attributes block.  Each writer in ``core/arrays.py`` stamps the corresponding token from :class:`ZvArrayTag`.\n"
         }
       },
       "required": [
@@ -260,7 +260,7 @@
     },
     "GroupingsMeta": {
       "additionalProperties": false,
-      "description": "``.zattrs`` for ``groupings/``.",
+      "description": "Attributes for ``groupings/``.",
       "properties": {
         "num_groups": {
           "description": "Total grouping count.",
@@ -270,7 +270,7 @@
         "zv_array": {
           "$ref": "#/$defs/ZvArrayTag",
           "const": "groupings",
-          "description": "Discriminator slot identifying the kind of per-array ``.zattrs`` block.  Each writer in ``core/arrays.py`` stamps the corresponding token from :class:`ZvArrayTag`.\n"
+          "description": "Discriminator slot identifying the kind of per-array attributes block.  Each writer in ``core/arrays.py`` stamps the corresponding token from :class:`ZvArrayTag`.\n"
         }
       },
       "required": [
@@ -282,7 +282,7 @@
     },
     "LevelMetadata": {
       "additionalProperties": false,
-      "description": "Per-resolution-level ``.zattrs`` payload, persisted under the key ``zarr_vectors_level``.  Validates the runtime :class:`zarr_vectors.core.metadata.LevelMetadata` dataclass.",
+      "description": "Per-resolution-level attributes payload, persisted under the key ``zarr_vectors_level``.  Validates the runtime :class:`zarr_vectors.core.metadata.LevelMetadata` dataclass.",
       "properties": {
         "arrays_present": {
           "description": "Names of arrays present in the level group.",
@@ -411,7 +411,7 @@
           ]
         },
         "shared_fragments": {
-          "description": "True when per-chunk fragments may be referenced by multiple objects' manifests (shared metavertices in the per-object pyramid regime).  v0.6 successor to ``shared_vertex_groups``.  Readers MAY use this to short-circuit dedup work.\n",
+          "description": "True when per-chunk fragments may be referenced by multiple objects' manifests (shared metavertices in the per-object pyramid regime).  Readers MAY use this to short-circuit dedup work.\n",
           "type": [
             "boolean",
             "null"
@@ -433,10 +433,10 @@
     },
     "LinkAttributeFamilyMeta": {
       "additionalProperties": false,
-      "description": "``.zattrs`` for a ``link_attributes/<name>/<delta>/`` **group**. There is no separate cross-chunk attribute family: an intra-chunk link's attributes live under the all-zero offsets segment, exactly like the links themselves.\n``num_links`` is stamped by the whole-family writer and MUST then equal the parallel ``links/<delta>/`` family's ``num_links``.  It is absent when the family was created without data (the per-cell writers do not stamp it).",
+      "description": "Attributes for a ``link_attributes/<name>/<delta>/`` **group**. There is no separate cross-chunk attribute family: an intra-chunk link's attributes live under the all-zero offsets segment, exactly like the links themselves.\n``num_links`` is stamped by the whole-family writer and MUST then equal the parallel ``links/<delta>/`` family's ``num_links``.  It is absent when the family was created without data (the per-cell writers do not stamp it).",
       "properties": {
         "level_delta": {
-          "description": "Pyramid-level delta between the source side (the level that owns this array) and the target side of the edges.  ``0`` for intra-level arrays (the only kind written pre-0.4), ``+N`` for edges from this level to ``this_level + N`` (coarser), ``-N`` for edges to ``this_level - N`` (finer).\n",
+          "description": "Pyramid-level delta between the source side (the level that owns this array) and the target side of the edges.  ``0`` for intra-level arrays, ``+N`` for edges from this level to ``this_level + N`` (coarser), ``-N`` for edges to ``this_level - N`` (finer).\n",
           "type": "integer"
         },
         "name": {
@@ -454,7 +454,7 @@
         "zv_array": {
           "$ref": "#/$defs/ZvArrayTag",
           "const": "link_attribute_family",
-          "description": "Discriminator slot identifying the kind of per-array ``.zattrs`` block.  Each writer in ``core/arrays.py`` stamps the corresponding token from :class:`ZvArrayTag`.\n"
+          "description": "Discriminator slot identifying the kind of per-array attributes block.  Each writer in ``core/arrays.py`` stamps the corresponding token from :class:`ZvArrayTag`.\n"
         }
       },
       "required": [
@@ -467,14 +467,14 @@
     },
     "LinkAttributeMeta": {
       "additionalProperties": false,
-      "description": "``.zattrs`` for one ``link_attributes/<name>/<delta>/<offsets>/`` array.  Mirrors the ``links/<delta>/<offsets>/`` array of the same ``<delta>`` and ``<offsets>`` cell-for-cell \u2014 same cells, same per-cell row order \u2014 so attribute rows align 1:1 with link records without storing a row id.\nRows never carry the links array's ``perm_idx`` column: that column describes a record's placement, not its value, so ``has_perm`` has no analogue here and a row is exactly ``row_shape`` worth of ``dtype``.  A ``store=\"duplicate\"`` family replicates an attribute value alongside each physical copy of its record, so cells stay row-aligned with the links array they mirror.",
+      "description": "Attributes for one ``link_attributes/<name>/<delta>/<offsets>/`` array.  Mirrors the ``links/<delta>/<offsets>/`` array of the same ``<delta>`` and ``<offsets>`` cell-for-cell \u2014 same cells, same per-cell row order \u2014 so attribute rows align 1:1 with link records without storing a row id.\nRows never carry the links array's ``perm_idx`` column: that column describes a record's placement, not its value, so ``has_perm`` has no analogue here and a row is exactly ``row_shape`` worth of ``dtype``.  A ``store=\"duplicate\"`` family replicates an attribute value alongside each physical copy of its record, so cells stay row-aligned with the links array they mirror.",
       "properties": {
         "dtype": {
           "description": "Numpy dtype string of the array's value type (e.g. \"float32\").",
           "type": "string"
         },
         "level_delta": {
-          "description": "Pyramid-level delta between the source side (the level that owns this array) and the target side of the edges.  ``0`` for intra-level arrays (the only kind written pre-0.4), ``+N`` for edges from this level to ``this_level + N`` (coarser), ``-N`` for edges to ``this_level - N`` (finer).\n",
+          "description": "Pyramid-level delta between the source side (the level that owns this array) and the target side of the edges.  ``0`` for intra-level arrays, ``+N`` for edges from this level to ``this_level + N`` (coarser), ``-N`` for edges to ``this_level - N`` (finer).\n",
           "type": "integer"
         },
         "name": {
@@ -508,7 +508,7 @@
         "zv_array": {
           "$ref": "#/$defs/ZvArrayTag",
           "const": "link_attribute",
-          "description": "Discriminator slot identifying the kind of per-array ``.zattrs`` block.  Each writer in ``core/arrays.py`` stamps the corresponding token from :class:`ZvArrayTag`.\n"
+          "description": "Discriminator slot identifying the kind of per-array attributes block.  Each writer in ``core/arrays.py`` stamps the corresponding token from :class:`ZvArrayTag`.\n"
         }
       },
       "required": [
@@ -533,7 +533,7 @@
     },
     "LinksFamilyMeta": {
       "additionalProperties": false,
-      "description": "``.zattrs`` for a ``links/<delta>/`` **group** \u2014 the family-wide policy every offsets array beneath it decodes against, which is why it lives on the group rather than being repeated per array.\nSince 0.9.0 connectivity is one family: there is no separate ``cross_chunk_links/``.  An intra-chunk link is a link whose relative offsets are all zero; a cross-chunk link is one whose offsets are non-zero.\nTwo policy flags govern how a boundary-crossing record is placed: ``directed`` (endpoint order is data, so ``A\u2192B`` and ``B\u2192A`` stay distinct) and ``store`` (``canonical`` = one cell per record; ``duplicate`` = one cell per distinct incident chunk).  The source-side endpoint (input endpoint 0) lives at the level owning the array; target-side endpoints live at ``this_level + level_delta``.\n``num_links`` is the family-wide *logical* record count (one per input record) and ``num_physical_records`` the on-disk row count; both are absent until ``finalize_links`` has run, since the decentralized per-cell writers leave them for it to fill in. ``sid_ndim`` is likewise optional: a family may be stamped without it, and readers then recover offsets from each array's own ``offsets`` meta.",
+      "description": "Attributes for a ``links/<delta>/`` **group** \u2014 the family-wide policy every offsets array beneath it decodes against, which is why it lives on the group rather than being repeated per array.\nConnectivity is one family.  An intra-chunk link is a link whose relative offsets are all zero; a cross-chunk link is one whose offsets are non-zero.\nTwo policy flags govern how a boundary-crossing record is placed: ``directed`` (endpoint order is data, so ``A\u2192B`` and ``B\u2192A`` stay distinct) and ``store`` (``canonical`` = one cell per record; ``duplicate`` = one cell per distinct incident chunk).  The source-side endpoint (input endpoint 0) lives at the level owning the array; target-side endpoints live at ``this_level + level_delta``.\n``num_links`` is the family-wide *logical* record count (one per input record) and ``num_physical_records`` the on-disk row count; both are absent until ``finalize_links`` has run, since the decentralized per-cell writers leave them for it to fill in. ``sid_ndim`` is likewise optional: a family may be stamped without it, and readers then recover offsets from each array's own ``offsets`` meta.",
       "properties": {
         "directed": {
           "description": "When true, endpoint order is meaningful and preserved (no canonical sort): ``A\u2192B`` and ``B\u2192A`` occupy distinct cells and every stored ``perm_idx`` is 0.  Family-wide; defaults to false (undirected).\n",
@@ -543,7 +543,7 @@
           ]
         },
         "level_delta": {
-          "description": "Pyramid-level delta between the source side (the level that owns this array) and the target side of the edges.  ``0`` for intra-level arrays (the only kind written pre-0.4), ``+N`` for edges from this level to ``this_level + N`` (coarser), ``-N`` for edges to ``this_level - N`` (finer).\n",
+          "description": "Pyramid-level delta between the source side (the level that owns this array) and the target side of the edges.  ``0`` for intra-level arrays, ``+N`` for edges from this level to ``this_level + N`` (coarser), ``-N`` for edges to ``this_level - N`` (finer).\n",
           "type": "integer"
         },
         "link_width": {
@@ -582,7 +582,7 @@
         "zv_array": {
           "$ref": "#/$defs/ZvArrayTag",
           "const": "links_family",
-          "description": "Discriminator slot identifying the kind of per-array ``.zattrs`` block.  Each writer in ``core/arrays.py`` stamps the corresponding token from :class:`ZvArrayTag`.\n"
+          "description": "Discriminator slot identifying the kind of per-array attributes block.  Each writer in ``core/arrays.py`` stamps the corresponding token from :class:`ZvArrayTag`.\n"
         }
       },
       "required": [
@@ -595,7 +595,7 @@
     },
     "LinksMeta": {
       "additionalProperties": false,
-      "description": "``.zattrs`` for a single ``links/<delta>/<offsets>/`` array: a rank-D vlen array over the level's chunk grid, one cell per **source** chunk, holding the records whose source chunk is that cell.\nThe ``offsets`` segment names the array: ``link_width - 1`` relative offsets, each of ``sid_ndim`` signed components.  Record ``vi_k`` is local to chunk ``src + o_k``; the implicit ``o_0 = 0`` (the source itself) is never encoded.  All-zero offsets is the intra-chunk array; non-zero offsets hold records whose other endpoints sit that far away.  ``link_width == 1`` (parent\u2192child metanode refs) has no other endpoint and so carries an empty ``offsets`` list, written at the ``self`` segment.\n``has_perm`` is the record-width discriminator.  Rows are ``L`` ints normally; when ``has_perm`` is true they are ``1 + L`` (``[perm_idx, vi_0, ..., vi_{L-1}]``), where ``perm_idx`` is the Lehmer code of the canonical\u2192input-order permutation, letting readers recover the original endpoint order (mesh-face winding, directed-edge direction).  It is true exactly when a non-identity placement is possible \u2014 non-intra offsets AND ``level_delta == 0`` AND (``store=\"duplicate\"`` OR not ``directed``) \u2014 so an intra-chunk link never pays the extra 8 bytes for a value that is always 0.",
+      "description": "Attributes for a single ``links/<delta>/<offsets>/`` array: a rank-D vlen array over the level's chunk grid, one cell per **source** chunk, holding the records whose source chunk is that cell.\nThe ``offsets`` segment names the array: ``link_width - 1`` relative offsets, each of ``sid_ndim`` signed components.  Record ``vi_k`` is local to chunk ``src + o_k``; the implicit ``o_0 = 0`` (the source itself) is never encoded.  All-zero offsets is the intra-chunk array; non-zero offsets hold records whose other endpoints sit that far away.  ``link_width == 1`` (parent\u2192child metanode refs) has no other endpoint and so carries an empty ``offsets`` list, written at the ``self`` segment.\n``has_perm`` is the record-width discriminator.  Rows are ``L`` ints normally; when ``has_perm`` is true they are ``1 + L`` (``[perm_idx, vi_0, ..., vi_{L-1}]``), where ``perm_idx`` is the Lehmer code of the canonical\u2192input-order permutation, letting readers recover the original endpoint order (mesh-face winding, directed-edge direction).  It is true exactly when a non-identity placement is possible \u2014 non-intra offsets AND ``level_delta == 0`` AND (``store=\"duplicate\"`` OR not ``directed``) \u2014 so an intra-chunk link never pays the extra 8 bytes for a value that is always 0.",
       "properties": {
         "dtype": {
           "description": "Numpy dtype string of the array's value type (e.g. \"float32\").",
@@ -606,7 +606,7 @@
           "type": "boolean"
         },
         "level_delta": {
-          "description": "Pyramid-level delta between the source side (the level that owns this array) and the target side of the edges.  ``0`` for intra-level arrays (the only kind written pre-0.4), ``+N`` for edges from this level to ``this_level + N`` (coarser), ``-N`` for edges to ``this_level - N`` (finer).\n",
+          "description": "Pyramid-level delta between the source side (the level that owns this array) and the target side of the edges.  ``0`` for intra-level arrays, ``+N`` for edges from this level to ``this_level + N`` (coarser), ``-N`` for edges to ``this_level - N`` (finer).\n",
           "type": "integer"
         },
         "link_width": {
@@ -631,7 +631,7 @@
         "zv_array": {
           "$ref": "#/$defs/ZvArrayTag",
           "const": "links",
-          "description": "Discriminator slot identifying the kind of per-array ``.zattrs`` block.  Each writer in ``core/arrays.py`` stamps the corresponding token from :class:`ZvArrayTag`.\n"
+          "description": "Discriminator slot identifying the kind of per-array attributes block.  Each writer in ``core/arrays.py`` stamps the corresponding token from :class:`ZvArrayTag`.\n"
         }
       },
       "required": [
@@ -665,7 +665,7 @@
     },
     "ObjectAttributeMeta": {
       "additionalProperties": false,
-      "description": "``.zattrs`` for each ``object_attributes/<name>/`` array.",
+      "description": "Attributes for each ``object_attributes/<name>/`` array.",
       "properties": {
         "dtype": {
           "description": "Numpy dtype string of the array's value type (e.g. \"float32\").",
@@ -685,7 +685,7 @@
         "zv_array": {
           "$ref": "#/$defs/ZvArrayTag",
           "const": "object_attribute",
-          "description": "Discriminator slot identifying the kind of per-array ``.zattrs`` block.  Each writer in ``core/arrays.py`` stamps the corresponding token from :class:`ZvArrayTag`.\n"
+          "description": "Discriminator slot identifying the kind of per-array attributes block.  Each writer in ``core/arrays.py`` stamps the corresponding token from :class:`ZvArrayTag`.\n"
         }
       },
       "required": [
@@ -718,7 +718,7 @@
     },
     "ObjectIndexMeta": {
       "additionalProperties": false,
-      "description": "``.zattrs`` for ``object_index/``.",
+      "description": "Attributes for ``object_index/``.",
       "properties": {
         "layout": {
           "$ref": "#/$defs/ObjectIndexLayout",
@@ -737,7 +737,7 @@
         "zv_array": {
           "$ref": "#/$defs/ZvArrayTag",
           "const": "object_index",
-          "description": "Discriminator slot identifying the kind of per-array ``.zattrs`` block.  Each writer in ``core/arrays.py`` stamps the corresponding token from :class:`ZvArrayTag`.\n"
+          "description": "Discriminator slot identifying the kind of per-array attributes block.  Each writer in ``core/arrays.py`` stamps the corresponding token from :class:`ZvArrayTag`.\n"
         }
       },
       "required": [
@@ -750,7 +750,7 @@
     },
     "RootMetadata": {
       "additionalProperties": false,
-      "description": "Root-level ``.zattrs`` payload, persisted under the key ``zarr_vectors``.  Validates the runtime :class:`zarr_vectors.core.metadata.RootMetadata` dataclass. Note: the canonical axis list lives in ``multiscales[0].axes`` at root level (NGFF-style), NOT under ``zarr_vectors`` \u2014 see ``MultiscalesMetadata``.",
+      "description": "Root-level attributes payload, persisted under the key ``zarr_vectors``.  Validates the runtime :class:`zarr_vectors.core.metadata.RootMetadata` dataclass. Note: the canonical axis list lives in ``multiscales[0].axes`` at root level (NGFF-style), NOT under ``zarr_vectors`` \u2014 see ``MultiscalesMetadata``.",
       "properties": {
         "attribute_specs": {
           "anyOf": [
@@ -862,7 +862,7 @@
           ]
         },
         "zv_version": {
-          "description": "ZV spec version this store was written against (e.g. \"0.5.0\"). Renamed from ``format_version`` in 0.5.0 to disambiguate from Zarr v3's ``zarr_format`` field.\n",
+          "description": "ZV spec version this store was written against (e.g. \"0.9.4\"). Distinct from Zarr v3's ``zarr_format`` field.\n",
           "pattern": "^\\d+\\.\\d+(\\.\\d+)?$",
           "type": "string"
         }
@@ -878,7 +878,7 @@
     },
     "VerticesMeta": {
       "additionalProperties": false,
-      "description": "``.zattrs`` for the ``vertices/`` array.",
+      "description": "Attributes for the ``vertices/`` array.",
       "properties": {
         "dtype": {
           "description": "Numpy dtype string of the array's value type (e.g. \"float32\").",
@@ -891,7 +891,7 @@
         "zv_array": {
           "$ref": "#/$defs/ZvArrayTag",
           "const": "vertices",
-          "description": "Discriminator slot identifying the kind of per-array ``.zattrs`` block.  Each writer in ``core/arrays.py`` stamps the corresponding token from :class:`ZvArrayTag`.\n"
+          "description": "Discriminator slot identifying the kind of per-array attributes block.  Each writer in ``core/arrays.py`` stamps the corresponding token from :class:`ZvArrayTag`.\n"
         }
       },
       "required": [
@@ -902,7 +902,7 @@
       "type": "object"
     },
     "ZvArrayTag": {
-      "description": "Discriminator value for per-array ``.zattrs`` blocks (slot ``zv_array``).  Each writer in ``zarr_vectors/core/arrays.py`` stamps the corresponding tag.",
+      "description": "Discriminator value for per-array attributes blocks (slot ``zv_array``).  Each writer in ``zarr_vectors/core/arrays.py`` stamps the corresponding tag.",
       "enum": [
         "vertices",
         "vertex_fragments",
@@ -922,7 +922,7 @@
       "type": "string"
     }
   },
-  "$id": "https://w3id.org/zarr-vectors/schema/0.5",
+  "$id": "https://w3id.org/zarr-vectors/schema/0.9",
   "$schema": "https://json-schema.org/draft/2019-09/schema",
   "additionalProperties": true,
   "metamodel_version": "1.11.0",

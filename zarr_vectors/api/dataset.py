@@ -435,12 +435,11 @@ class Dataset:
         from zarr_vectors.multiresolution.coarsen import build_pyramid
 
         # The handle, not ``self.url``.  ``Group.url`` is ``repr(store)``
-        # for anything that is not a LocalStore, so re-opening it failed
-        # outright on a memory- or object-backed dataset; and even for a
-        # URL it dropped this dataset's StorageOptions, so credentials and
-        # a forced backend were silently lost.  Passing the handle also
-        # means a dataset opened ``mode="r"`` can no longer write a
-        # pyramid -- the old path re-opened as ``"r+"`` and escalated.
+        # for anything that is not a LocalStore, so it cannot be re-opened
+        # for a memory- or object-backed dataset; and a URL would drop
+        # this dataset's StorageOptions (credentials, a forced backend).
+        # Passing the handle also keeps a dataset opened ``mode="r"``
+        # read-only: re-opening as ``"r+"`` would escalate it.
         out = build_pyramid(self._group, factors=list(factors), method=method, **kw)
         self._levels.clear()
         self._meta = None
@@ -449,9 +448,9 @@ class Dataset:
     def validate(self, *, level: int = 3) -> Any:
         from zarr_vectors.validate import validate as _validate
 
-        # Likewise.  This one was broken for LOCAL stores too: ``url`` is a
-        # ``file://`` URI and level 1 did a raw ``Path()`` on it, so every
-        # validation through this method failed at level 1 and returned.
+        # Likewise: validate the handle, not ``self.url`` -- for a local
+        # store that is a ``file://`` URI, which level 1 cannot open as a
+        # path.
         return _validate(self._group, level=level)
 
     def commit(self, message: str = "zarr-vectors write") -> str | None:
@@ -650,9 +649,8 @@ _SCOPE_KWARGS: dict[str, str] = {
 def _check_declared(schema: Schema, kwargs: Mapping[str, Any]) -> None:
     """Reject data that contradicts what the store says it holds.
 
-    ``AttributeSpec.dtype`` and ``channels`` used to be inert -- a store
-    could declare ``float32`` and be handed ``float64``, and nothing
-    anywhere noticed.  A declaration that is never checked is decoration.
+    A store that declares an ``AttributeSpec.dtype`` or ``channels`` for
+    an attribute refuses data of another dtype or channel count.
 
     Only *declared* attributes are checked; passing an undeclared one is
     how a store is extended, and is fine.

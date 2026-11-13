@@ -1,12 +1,10 @@
 """Declaring what the data *is*, and — separately — how it is stored.
 
-Today a caller who wants a point cloud must also decide a chunk shape, a
-bin shape, a shard shape, a compressor and a backend, in the same call,
-with no defaults that work.  Four of those five are storage decisions
-that depend on the store's size and location, not on the data; the fifth
-is not a decision at all, since the backend is derivable from the URL.
+Chunk shape, bin shape, shard shape and compressor are storage decisions
+that depend on the store's size and location, not on the data; the
+backend is not a decision at all, since it is derivable from the URL.
 
-So they are split.  :class:`Schema` says what the data is and carries no
+So they are kept apart from the data's description.  :class:`Schema` says what the data is and carries no
 storage term.  :class:`Layout` says how to store it, every field has a
 working ``"auto"``, and it is the single place the four physical
 parameters are computed.  A caller who never touches ``Layout`` gets a
@@ -221,8 +219,7 @@ class Layout:
         ``store_kind`` and answer *unsharded* for every local store,
         including one deliberately built sharded.
     ``compression="auto"``
-        ``zstd``, or ``$ZARR_VECTORS_COMPRESSION`` when set.  It used to
-        resolve to *no* compression, which is not what the word means.
+        ``zstd``, or ``$ZARR_VECTORS_COMPRESSION`` when set.
     """
 
     cells: int | Sequence[int] | Literal["auto"] = "auto"
@@ -386,11 +383,6 @@ class Schema:
     :meth:`from_store` reads them back, so a schema round-trips and
     :func:`~zarr_vectors.api.dataset.open_or_create` can report a store
     that is missing one.
-
-    (A ``profile`` field used to sit here, standing in for the three
-    convention strings.  Nothing read it, and the type writers fill those
-    in from the geometry anyway, so it named a concept that did not
-    exist.  It was removed rather than left looking like a promise.)
     """
 
     ndim: int = 3

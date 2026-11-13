@@ -35,10 +35,9 @@ if TYPE_CHECKING:
     # :mod:`zarr_vectors.core.aio`.
     ReadSource = StoreLike | Group
 
-    # What every ``write_*`` entry point accepts.  Annotated ``str`` for
-    # a long time, which was never true: the same path through
-    # ``_create_or_open_store`` takes a Path, a pre-built Store and an
-    # already-open Group, and consumers pass all three.
+    # What every ``write_*`` entry point accepts: through
+    # ``_create_or_open_store`` that is a path string, a Path, a
+    # pre-built Store or an already-open Group.
     WriteTarget = StoreLike | Group
 
 from zarr_vectors.constants import (
@@ -1815,13 +1814,13 @@ def write_parametric_types(
     root: Group,
     types: list[ParametricTypeDef],
 ) -> None:
-    """Write parametric type registry to ``/parametric/.zattrs``."""
+    """Write parametric type registry to the ``/parametric/`` group's attributes."""
     para = get_parametric_group(root)
     para.attrs.update(serialise_parametric_types(types))
 
 
 def read_parametric_types(root: Group) -> list[ParametricTypeDef]:
-    """Read parametric type registry from ``/parametric/.zattrs``."""
+    """Read parametric type registry from the ``/parametric/`` group's attributes."""
     para = get_parametric_group(root)
     return deserialise_parametric_types(para.attrs.to_dict())
 
