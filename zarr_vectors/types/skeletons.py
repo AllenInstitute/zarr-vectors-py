@@ -4,13 +4,15 @@ The scale-out building blocks the ``write_graph`` whole-dataset path lacks,
 for skeletons (rooted trees of ``[child, parent]`` edges):
 
 - :func:`write_skeleton_chunk` — write one spatial chunk's skeleton
-  fragments (one fragment per piece) using the core per-chunk
-  primitives.  Links are stored ``[child_local, parent_local]`` in
-  **chunk-local** indices with an explicit ``[root_local, -1]`` row per
-  fragment (per the skeleton spec), so multiple skeletons coexist in one
-  chunk without their implicit-sequential parents chaining across
-  fragment boundaries.  Returns the ``(object_id, chunk, fragment_idx)``
-  records that a downstream reduce groups into a dense ``object_index``.
+  pieces, each decomposed into linear-path fragments, using the core
+  per-chunk primitives.  Within a fragment parents are implicit
+  (vertex ``i``'s parent is ``i - 1``); a fragment's first vertex has no
+  implied parent, so skeletons coexist in one chunk without chaining
+  across fragment boundaries.  The only stored link rows are branch
+  links, ``[child_local, parent_local]`` in **chunk-local** indices, one
+  group per fragment (empty for a piece's root path; no ``-1`` root row
+  is written).  Returns the ``(object_id, chunk, fragment_idx)`` records
+  that a downstream reduce groups into a dense ``object_index``.
 
 - :func:`write_skeleton_cross_chunk_links` — store ``[child, parent]``
   edges that cross a chunk boundary.  They land in the non-zero-offset
@@ -212,7 +214,7 @@ def write_skeleton_chunk(
             re-derive the manifests once afterwards from the coordinator
             (``derive_nonempty_chunks`` / ``finalize_links``).
         level_group: Target resolution-level group (arrays must already
-            be created — see :func:`init_skeleton_level`).
+            be created — see :func:`init_skeleton_store`).
         chunk_coords: Spatial chunk coordinates.
         pieces: One dict per fragment with keys ``segment_id`` (int),
             ``positions`` ``(n, D)``, ``edges`` ``(m, 2)`` ``[child,
