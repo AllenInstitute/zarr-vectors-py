@@ -297,3 +297,27 @@ def test_object_ids_for_lines(tmp_path):
     assert ds.select().object_ids().tolist() == [0, 1, 2]
     # line 1 runs (12,12,12)-(80,80,80): one endpoint in the box.
     assert ds.select(bbox=_LOW).object_ids().tolist() == [0, 1]
+
+
+# ---------------- multi-channel mesh / graph vertex attributes ----------------
+
+
+@pytest.mark.parametrize("kind", ["mesh", "graph"])
+def test_multichannel_vertex_attribute_is_read_back(tmp_path, kind):
+    V = _pts(6)
+    colour = np.arange(18, dtype="f4").reshape(6, 3)
+    tag = np.arange(6, dtype="f4")
+    ds = zv.create(
+        tmp_path / "s.zv",
+        schema=zv.Schema(bounds=BOUNDS, kind=kind, layout=zv.Layout(cells=3)),
+    )
+    attrs = {"colour": colour, "tag": tag}
+    if kind == "mesh":
+        ds.add_mesh(V, np.array([[0, 1, 2], [3, 4, 5]]), attributes=attrs)
+    else:
+        ds.add_graph(V, np.array([[0, 1]]), attributes=attrs)
+    got = ds.read()
+    assert set(got.attributes) == set(ds.level(0).attribute_names()) == {"colour", "tag"}
+    order = got.attributes["tag"].astype(int)
+    assert got.attributes["colour"].shape == (6, 3)
+    assert np.array_equal(got.attributes["colour"], colour[order])

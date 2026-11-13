@@ -362,7 +362,15 @@ def write_mesh(
 
         if vertex_attributes:
             for name, data in vertex_attributes.items():
-                create_attribute_array(level_group, name, dtype=str(data.dtype))
+                # Channel names carry the row shape: without them a (V, C)
+                # column was declared scalar and read back as V*C values.
+                create_attribute_array(
+                    level_group, name, dtype=str(data.dtype),
+                    channel_names=(
+                        [f"ch{i}" for i in range(data.shape[1])]
+                        if np.ndim(data) == 2 else None
+                    ),
+                )
         if object_attributes:
             for _name in object_attributes:
                 create_object_attributes_array(level_group, _name)
