@@ -211,3 +211,41 @@ def test_point_cloud_is_not_stamped_with_links_convention(tmp_path):
     assert "links_convention" not in root.attrs.to_dict()["zarr_vectors"]
     # Readers still see the documented default.
     assert read_root_metadata(root).links_convention == "implicit_sequential"
+
+
+# --- zv_array discriminators ---------------------------------------------
+
+def test_parametric_arrays_carry_zv_array(tmp_path):
+    from zarr_vectors.core.arrays import read_zv_array_tag
+    from zarr_vectors.core.store import get_parametric_group, open_store
+    from zarr_vectors.types.parametric import (
+        read_parametric_objects,
+        write_parametric_objects,
+    )
+
+    path = str(tmp_path / "par.zv")
+    write_parametric_objects(
+        path,
+        [{"type": "plane", "coefficients": [0, 0, 1, -5]},
+         {"type": "sphere", "coefficients": [1, 2, 3, 4]}],
+        object_attributes={"w": np.array([1.0, 2.0])},
+        groups={0: [0, 1]},
+        group_attributes={"g": np.array([7.0])},
+        create_new_store=True,
+        store_kwargs={"bounds": ([0, 0, 0], [10, 10, 10]),
+                      "chunk_shape": (5.0, 5.0, 5.0)},
+    )
+    para = get_parametric_group(open_store(path))
+    tags = {
+        name: read_zv_array_tag(para.read_array_meta(name) or {})
+        for name in ("objects", "names", "object_attributes/w", "groups",
+                     "group_attributes/g")
+    }
+    assert tags == {
+        "objects": "parametric_objects",
+        "names": "parametric_names",
+        "object_attributes/w": "object_attribute",
+        "groups": "groups",
+        "group_attributes/g": "groupings_attribute",
+    }
+    assert len(read_parametric_objects(path)) == 2
