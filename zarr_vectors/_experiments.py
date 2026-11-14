@@ -7,6 +7,10 @@ benchmark can run the same queries with and without it.
 =================  ==========================================================
 ``read_cache``     one :meth:`Group.cached_nodes` block per query: each node
                    and array spec is resolved once per read
+``batch_cells``    the optimised sharded reader parses keys, locates cells
+                   and plans its reads as arrays, and decompresses each
+                   cell straight out of its read, when a read averages 32
+                   or more cells an array; the same reads either way
 =================  ==========================================================
 """
 
