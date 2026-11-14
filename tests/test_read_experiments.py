@@ -78,7 +78,9 @@ def _answer(path, sel, remote):
 @pytest.mark.parametrize("shard", [None, 4])
 @pytest.mark.parametrize("remote", [False, True], ids=["local", "remote"])
 @pytest.mark.parametrize("reader", ["standard", "optimised"])
-def test_experiments_read_what_the_default_reads(tmp_path, monkeypatch, kind, shard, remote, reader):
+def test_experiments_read_what_the_default_reads(
+    tmp_path, monkeypatch, kind, shard, remote, reader,
+):
     path = _store(tmp_path, kind, shard)
     monkeypatch.setenv("ZARR_VECTORS_SHARD_READER", reader)
     monkeypatch.delenv("ZARR_VECTORS_EXPERIMENTS", raising=False)
