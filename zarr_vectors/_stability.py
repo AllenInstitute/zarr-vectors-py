@@ -58,6 +58,10 @@ INTERNAL: tuple[str, ...] = (
     "zarr_vectors._xp",
     "zarr_vectors._runtime",
     "zarr_vectors._gds",
+    # Opt-in read experiments (ZARR_VECTORS_EXPERIMENTS) and the per-query
+    # node set one of them keeps.
+    "zarr_vectors._experiments",
+    "zarr_vectors._query_nodes",
     "zarr_vectors.core",
     "zarr_vectors.encoding",
     "zarr_vectors.spatial",
