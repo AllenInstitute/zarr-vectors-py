@@ -11,6 +11,10 @@ benchmark can run the same queries with and without it.
                     touch in one gather (:mod:`zarr_vectors._query_nodes`)
 ``gather_indexes``  a store-backed read fetches every array's shard
                     indexes in one round, not one array after another
+``batch_cells``     the optimised sharded reader parses keys, locates cells
+                    and plans its reads as arrays, and decompresses each
+                    cell straight out of its read, when a read averages 32
+                    or more cells an array; the same reads either way
 ==================  =========================================================
 """
 
