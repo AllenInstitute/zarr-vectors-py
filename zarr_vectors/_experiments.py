@@ -4,10 +4,14 @@
 experiment changes only how a read fetches, never what it returns, so a
 benchmark can run the same queries with and without it.
 
-=================  ==========================================================
-``read_cache``     one :meth:`Group.cached_nodes` block per query: each node
-                   and array spec is resolved once per read
-=================  ==========================================================
+==================  =========================================================
+``level_handle``    a query resolves its level group once, and a level
+                    lookup is one request rather than two
+``prime_nodes``     a query resolves its level and every array it can
+                    touch in one gather (:mod:`zarr_vectors._query_nodes`)
+``gather_indexes``  a store-backed read fetches every array's shard
+                    indexes in one round, not one array after another
+==================  =========================================================
 """
 
 from __future__ import annotations

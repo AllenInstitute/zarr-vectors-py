@@ -121,7 +121,12 @@ async def _resolve_nodes(
     it answers "yes", or an ``array_exists`` probe for a legitimately
     missing array would look like a prefetch gap and loop forever.
     """
+    from zarr_vectors._query_nodes import lookup
+
     async def one(path: str) -> tuple[str, Any]:
+        primed = lookup(root.store, path)
+        if primed is not None:
+            return path, primed
         try:
             node = await root.getitem(path)
         except KeyError:
@@ -257,9 +262,17 @@ async def _fetch_arrays(
     object attributes — which readers consume end-to-end rather than a
     cell at a time.
     """
+    from zarr_vectors._query_nodes import lookup
+
     async def one(path: str) -> tuple[str, Any]:
+        primed = lookup(root.store, path)
+        if primed is _ABSENT:
+            return path, None
         try:
-            node = await root.getitem(path)
+            node = (
+                primed._async_array if isinstance(primed, zarr.Array)
+                else await root.getitem(path)
+            )
         except KeyError:
             return path, None
         if not isinstance(node, zarr.AsyncArray):

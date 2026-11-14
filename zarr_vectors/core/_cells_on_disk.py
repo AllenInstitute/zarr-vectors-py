@@ -449,11 +449,15 @@ def read_cells(
             for i, message in errors.items():
                 out[r][i] = ValueError(message)
         rows += [(local[lr], i, None, path, off, size, run) for lr, i, path, off, size, run in flat]
+    indexes = _prefetch_indexes(requests)
     for r, (src, cells) in enumerate(requests):
         if src.local_root is not None:
             continue
         cells = np.asarray(cells, dtype=np.int64).reshape(-1, len(src.shape))
-        ranges, errors = _locate(src, cells, lambda keys, src=src: dict(zip(keys, read_indexes(src, keys))))
+        if r in indexes:
+            ranges, errors = _locate(src, cells, lambda keys, got=indexes[r]: {k: got[k] for k in keys})
+        else:
+            ranges, errors = _locate(src, cells, lambda keys, src=src: dict(zip(keys, read_indexes(src, keys))))
         for i, message in errors.items():
             out[r][i] = ValueError(message)
         rows += [(r, i, src.store, rng.key, rng.offset, rng.size, rng.run) for i, rng in enumerate(ranges) if rng is not None]
@@ -490,6 +494,39 @@ def read_cells(
                 part = blob[off - lo: off - lo + size]
                 out[r][i] = part if len(part) == size else ValueError("short read")
     return out
+
+
+def _prefetch_indexes(
+    requests: list[tuple[CellSource, np.ndarray]],
+) -> dict[int, dict[str, Any]]:
+    """The shard indexes every store-backed request needs, read at once.
+
+    Experiment ``gather_indexes``.  Without it each array's indexes are
+    gathered in turn, so a read of several arrays (vertices, fragments,
+    links) spends one round trip per array before any cell is fetched.
+    Returns ``{request: {shard key: index}}``; empty when off or when at
+    most one array would read indexes.
+    """
+    from zarr_vectors._experiments import enabled
+
+    if not enabled("gather_indexes"):
+        return {}
+    wanted: list[tuple[int, CellSource, list[str]]] = []
+    for r, (src, cells) in enumerate(requests):
+        if src.local_root is not None or src.shard_shape is None:
+            continue
+        cells = np.asarray(cells, dtype=np.int64).reshape(-1, len(src.shape))
+        shards = cells // np.asarray(src.shard_shape, dtype=np.int64)
+        wanted.append((r, src, sorted({_key(src, tuple(s)) for s in shards.tolist()})))
+    if len(wanted) < 2:
+        return {}
+    from concurrent.futures import ThreadPoolExecutor
+
+    # Each read_indexes call gathers its own shards; running them side by
+    # side puts every array's indexes in the same round.
+    with ThreadPoolExecutor(len(wanted)) as pool:
+        got = list(pool.map(lambda w: dict(zip(w[2], read_indexes(w[1], w[2]))), wanted))
+    return {r: g for (r, _, _), g in zip(wanted, got)}
 
 
 # --------------------------------------------------------------------
