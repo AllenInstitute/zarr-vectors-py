@@ -331,6 +331,14 @@ class Query:
         )
         refuse_octree_read(target.store, "Query.cells()")
 
+        from zarr_vectors.api.level import _narrows
+
+        if not _narrows(self._selection):
+            # An unnarrowed plan reads the level whole and names no cells
+            # of it (at most a cell it re-checks a claim on), which made
+            # this answer "none" for the query that touches every cell.
+            # Ask the level what it holds.
+            return target.cells()
         refs = set()
         for request in self.plan().cells:
             try:
@@ -339,19 +347,6 @@ class Query:
                 )))
             except ValueError:
                 continue
-        if not refs:
-            from zarr_vectors.api.level import _narrows
-
-            if not _narrows(self._selection):
-                # An unnarrowed plan reads the level whole and names no
-                # cells, which made this answer "none" for the query that
-                # touches every cell.  Ask the level what it holds.
-                level = self._selection.level
-                target = (
-                    self._level if level in (None, self._level.index)
-                    else self._level.dataset.level(level)
-                )
-                return target.cells()
         return CellSet(refs)
 
     def iter_cells(self) -> Any:

@@ -117,3 +117,40 @@ def test_primed_nodes_end_with_the_query(tmp_path):
     zv.open(str(path)).select(bbox=([30.0] * 3, [60.0] * 3)).read()
     assert not _query_nodes._nodes and not _query_nodes._active
 
+
+class _Gets(WrapperStore):
+    """A remote-looking store that counts the cells it serves per array."""
+
+    def __init__(self, store, log):
+        super().__init__(store)
+        self.log = log
+
+    def _with_store(self, store):
+        return type(self)(store, self.log)
+
+    async def get(self, key, prototype, byte_range=None):
+        if "/c/" in key or "/c" == key[-2:]:
+            self.log.append(key.split("/c/")[0])
+        return await super().get(key, prototype, byte_range)
+
+
+@pytest.mark.parametrize("shard", [None, 4])
+def test_a_whole_tiled_point_level_reads_one_fragment_cell(tmp_path, shard):
+    """A whole-level read of a point level claiming ``fragments_tile``
+    takes the buffers as they are, re-checking the claim on one cell: one
+    ``vertex_fragments`` cell is fetched, not every one."""
+    path = _store(tmp_path, "point_cloud", shard)
+    ds = zv.open(str(path))
+    assert ds.level(0)._metadata().fragments_tile
+    log: list[str] = []
+    got = zv.open(_Gets(LocalStore(str(path), read_only=True), log)).select().read()
+    np.testing.assert_array_equal(
+        np.sort(np.asarray(got.positions), axis=0), np.sort(_data("point_cloud")[0], axis=0),
+    )
+    frag = [k for k in log if k.endswith("vertex_fragments")]
+    assert log.count("0/vertices") > 4 and len(frag) <= 2, (len(frag), log.count("0/vertices"))
+    # Narrowed or by object, the fragments are read as before.
+    for sel in ({"bbox": ([30.0] * 3, [60.0] * 3)}, {"objects": [3]}):
+        log.clear()
+        zv.open(_Gets(LocalStore(str(path), read_only=True), log)).select(**sel).read()
+        assert any(k.endswith("vertex_fragments") for k in log), sel
