@@ -41,6 +41,7 @@ from zarr_vectors.core.store import (
     read_root_metadata,
 )
 from zarr_vectors.encoding.octree_marker import OCTREE_MARKER_CODEC
+from zarr_vectors.exceptions import StoreError
 from zarr_vectors.octree_chunks import (
     OctreeError,
     converting,
@@ -291,9 +292,9 @@ def test_cell_source_sees_through_the_marker(tmp_path):
 # -- writers refuse -------------------------------------------------------------
 
 
-def _refused(path, fn, match="has octree chunks"):
+def _refused(path, fn, match="has octree chunks", exc=OctreeError):
     before = _digest(path)
-    with pytest.raises(OctreeError, match=match):
+    with pytest.raises(exc, match=match):
         fn()
     assert _digest(path) == before, "the store changed before the refusal"
 
@@ -302,34 +303,32 @@ def test_writers_refuse_an_octree_level_and_change_nothing(tmp_path):
     g, p = _graph(tmp_path / "g.zv"), _points(tmp_path / "p.zv")
     rng = np.random.default_rng(9)
     pos2 = rng.uniform(10, 390, (50, 3)).astype(np.float32)
+    # Dataset.add_* writes a store once, octree or not.
+    held = dict(match="already holds", exc=StoreError)
     _refused(g, lambda: zv.open(g, mode="r+").add_graph(
-        pos2, np.array([[0, 1]]), object_ids=np.full(50, 999)))
-    _refused(g, lambda: zv.open(g, mode="r+").add_points(pos2))
-    _refused(p, lambda: zv.open(p, mode="r+").add_points(pos2))
+        pos2, np.array([[0, 1]]), object_ids=np.full(50, 999)), **held)
+    _refused(g, lambda: zv.open(g, mode="r+").add_points(pos2), **held)
+    _refused(p, lambda: zv.open(p, mode="r+").add_points(pos2), **held)
     _refused(p, lambda: write_points(p, pos2, chunk_shape=(CELL,) * 3))
     _refused(g, lambda: write_graph(g, pos2, np.array([[0, 1]]), chunk_shape=(CELL,) * 3))
-    msg = str(pytest.raises(OctreeError, zv.open(p, mode="r+").add_points, pos2).value)
+    msg = str(pytest.raises(
+        OctreeError, write_points, p, pos2, chunk_shape=(CELL,) * 3).value)
     assert "to_uniform(store, level=0)" in msg
 
 
 def test_the_same_writes_succeed_on_a_uniform_level(tmp_path):
     g, p = _graph(tmp_path / "g.zv", octree=False), _points(tmp_path / "p.zv", octree=False)
     pos2 = np.random.default_rng(9).uniform(10, 390, (50, 3)).astype(np.float32)
-    n = read_points(p)["vertex_count"]
-    zv.open(p, mode="r+").add_points(pos2)
-    assert read_points(p)["vertex_count"] > n
-    zv.open(g, mode="r+").add_graph(pos2, np.array([[0, 1]]), object_ids=np.full(50, 999))
+    # The refusal is the octree level's: on a uniform level the writers run.
+    write_points(p, pos2, chunk_shape=(CELL,) * 3)
+    write_graph(g, pos2, np.array([[0, 1]]), chunk_shape=(CELL,) * 3)
 
 
 def test_converting_back_lets_the_write_through(tmp_path):
     p = _points(tmp_path / "p.zv")
     pos2 = np.random.default_rng(9).uniform(10, 390, (50, 3)).astype(np.float32)
-    n = read_points(p)["vertex_count"]
     to_uniform(p)
-    zv.open(p, mode="r+").add_points(pos2)
-    # Not n + 50: an append to a write_points store loses a few vertices on
-    # uniform levels too (a grid-extent mismatch outside octree chunks).
-    assert read_points(p)["vertex_count"] > n
+    write_points(p, pos2, chunk_shape=(CELL,) * 3)
 
 
 def test_edits_refuse_an_octree_level_and_change_nothing(tmp_path):
@@ -428,7 +427,7 @@ def test_a_level_mid_conversion_is_refused_with_how_to_finish(tmp_path):
     with pytest.raises(OctreeError, match="part way through to_octree"):
         refuse_octree_write(lg, "this write")
     with pytest.raises(OctreeError, match="part way through"):
-        zv.open(p, mode="r+").add_points(np.ones((3, 3), np.float32) * 50)
+        write_points(p, np.ones((3, 3), np.float32) * 50, chunk_shape=(CELL,) * 3)
 
 
 # -- pyramids and rechunking ------------------------------------------------------
