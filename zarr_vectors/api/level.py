@@ -16,7 +16,8 @@ asks for less.
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+import contextlib
+from collections.abc import Iterator, Sequence
 from typing import TYPE_CHECKING, Any
 
 import numpy as np
@@ -168,7 +169,7 @@ def _rows_in(
 class Level:
     """One resolution level of a :class:`~zarr_vectors.api.dataset.Dataset`."""
 
-    __slots__ = ("_dataset", "_index", "_meta", "_attr_names")
+    __slots__ = ("_dataset", "_index", "_meta", "_attr_names", "_held")
 
     def __init__(self, dataset: Dataset, index: int) -> None:
         self._dataset = dataset
@@ -178,6 +179,8 @@ class Level:
         # this handle exactly as ``_meta`` does: the Dataset drops its
         # Levels on every write it performs.
         self._attr_names: dict[str, tuple[str, ...]] = {}
+        # The level group while a query holds it (:meth:`_held_store`).
+        self._held: Any = None
 
     # ---------------- identity ----------------
 
@@ -347,9 +350,30 @@ class Level:
         ``building`` writer a handle it reads as a level — allocating the
         array families at the store root.
         """
+        held = self._held
+        if held is not None:
+            return held
         from zarr_vectors.core.store import get_resolution_level
 
         return get_resolution_level(self._dataset._group, self._index)
+
+    @contextlib.contextmanager
+    def _held_store(self) -> Iterator[None]:
+        """Resolve :attr:`store` once and reuse it until the block ends.
+
+        One query asks for the level group several times (attribute
+        names, metadata, known cells); each ask is a lookup of the
+        level's ``zarr.json``.  Nothing in a read creates or removes the
+        level, so the handle cannot go stale inside the block.
+        """
+        if self._held is not None:
+            yield
+            return
+        self._held = self.store
+        try:
+            yield
+        finally:
+            self._held = None
 
     def select(self, **kw: Any) -> Query:
         """Build a query against this level.  Nothing is read yet."""

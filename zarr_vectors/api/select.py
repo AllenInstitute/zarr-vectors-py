@@ -236,6 +236,11 @@ class Query:
 
     def read(self) -> ReadResult:
         """Execute and return the whole answer."""
+        from zarr_vectors._experiments import enabled
+
+        if enabled("level_handle"):
+            with self._level._held_store():
+                return self._level._execute(self._selection)
         return self._level._execute(self._selection)
 
     async def aread(self) -> ReadResult:

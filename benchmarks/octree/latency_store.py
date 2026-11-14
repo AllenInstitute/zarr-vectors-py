@@ -34,6 +34,17 @@ class LatencyStore(WrapperStore[Store]):
         self._slots = asyncio.Semaphore(max_inflight) if max_inflight else None
         self.gets = 0
         self.by_array: dict[str, int] = {}
+        self.starts: list[float] = []
+
+    @property
+    def rounds(self) -> int:
+        """Sequential request rounds: requests started together (within half
+        a latency of the previous start) count as one round."""
+        if not self.starts:
+            return 0
+        s = sorted(self.starts)
+        gap = (self.latency or 0.0) / 2
+        return 1 + sum(1 for a, b in zip(s, s[1:]) if b - a > gap)
 
     @property
     def bytes(self) -> int:
@@ -42,6 +53,7 @@ class LatencyStore(WrapperStore[Store]):
     def reset(self) -> None:
         self.gets = 0
         self.by_array.clear()
+        self.starts.clear()
 
     def _with_store(self, store: Store) -> LatencyStore:
         other = LatencyStore(store, self.latency, self.bandwidth, self.max_inflight)
@@ -56,6 +68,7 @@ class LatencyStore(WrapperStore[Store]):
     _supports_sync_io = False
 
     async def get(self, key: str, prototype: BufferPrototype, byte_range: ByteRequest | None = None) -> Buffer | None:
+        self._root().starts.append(asyncio.get_running_loop().time())
         if self._slots is None:
             buf = await self._get(key, prototype, byte_range)
         else:

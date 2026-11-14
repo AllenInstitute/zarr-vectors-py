@@ -64,7 +64,13 @@ LAYOUTS = {  # name: (codec, Layout(octree=...)); True is the codec's defaults
     "indexed": ("sharding_indexed", False),
     "octree": ("zarr_octree_sharding", True),
     "runs": ("zarr_octree_sharding", {"layout": "runs", "min_weight": 160_000, "max_weight": 640_000}),
+    # sharding_indexed, then level 0 regrouped into octree chunks (to_octree):
+    # leaves of up to OCTREE_TARGET vertices, fitted to the shards.  Point
+    # clouds and networks only; to_octree does not take meshes.
+    "octree_chunks": ("sharding_indexed", False),
 }
+OCTREE_TARGET = 2_000
+NO_OCTREE_CHUNKS = {"mesh"}
 READERS = ("zarr", "standard", "optimised")
 VERTEX_BOX = 0.5
 NO_OBJECT_READS: set[str] = set()  # every kind reads by object (graphs since read_graph(object_ids=))
@@ -90,6 +96,10 @@ def build(root: Path, kind: str, layout: str, data: dict) -> dict:
         ds.add_mesh(data["positions"], data["faces"], object_ids=data["object_ids"])
     else:
         ds.add_graph(data["positions"], data["edges"], object_ids=data["object_ids"])
+    if layout == "octree_chunks":
+        from zarr_vectors.octree_chunks import to_octree
+
+        to_octree(str(path), target=OCTREE_TARGET)
     seconds = time.perf_counter() - t0
     meta = json.loads((path / "0" / "vertices" / "zarr.json").read_text())
     assert meta["codecs"][0]["name"] == codec, meta["codecs"][0]["name"]
@@ -185,6 +195,7 @@ def run_queries(root: Path, kind: str, layout: str, reader: str, latency: float,
         rows.append({"kind": kind, "layout": layout, "reader": reader, "latency": latency, "query": qkind,
                      "label": label, "size": size, "qi": qi, "seconds": dt,
                      "requests": store.gets if store else None,
+                     "rounds": store.rounds if store else None,
                      "bytes_read": store.bytes if store else None,
                      "bytes_by_array": dict(store.by_array) if store else None, **checksum(r)})
     return rows
@@ -218,7 +229,13 @@ def main() -> None:
                          "off a store that is not local): at 4 M vertices each takes minutes")
     ap.add_argument("--max-inflight", type=int, default=128)
     ap.add_argument("--bandwidth", type=float, default=100e6)
+    ap.add_argument("--readers", nargs="+", default=list(READERS), choices=READERS)
+    ap.add_argument("--env", nargs="*", default=[], metavar="NAME=VALUE",
+                    help="environment set for every read (an experimental option); recorded in the results")
     args = ap.parse_args()
+    for kv in args.env:
+        name, _, value = kv.partition("=")
+        os.environ[name] = value
     import zarr
 
     zarr.config.set({"async.concurrency": 4096})
@@ -235,7 +252,8 @@ def main() -> None:
                          {l: LAYOUTS[l] for l in args.layouts}, "readers": READERS, "latencies": latencies,
                          "zarr": zarr.__version__, "bandwidth": args.bandwidth, "max_inflight": args.max_inflight,
                          "quick": args.quick, "no_object_reads": sorted(NO_OBJECT_READS),
-                         "skip_zarr_all": args.skip_zarr_all},
+                         "skip_zarr_all": args.skip_zarr_all, "env": args.env,
+                         "readers_run": args.readers},
                "data": {}, "build": {}, "queries": []}
     if args.out.exists():  # keep the kinds a previous run finished
         old = json.loads(args.out.read_text())
@@ -256,15 +274,16 @@ def main() -> None:
         if args.skip_build and built.exists():
             results["build"][kind] = json.loads(built.read_text())
         else:
-            results["build"][kind] = {layout: build(args.stores, kind, layout, data) for layout in args.layouts}
+            results["build"][kind] = {layout: build(args.stores, kind, layout, data) for layout in args.layouts
+                                      if not (layout == "octree_chunks" and kind in NO_OCTREE_CHUNKS)}
             built.write_text(json.dumps(results["build"][kind], indent=1))
         for layout, b in results["build"][kind].items():
             print(f"  {layout:8s} write {b['write_seconds']:6.1f} s  {b['disk_bytes'] / 1e6:8.1f} MB  {b['files']} files", flush=True)
         queries = make_queries(kind, data, args.quick, np.random.default_rng(5))
         rows = []
         for latency in latencies:
-            for layout in args.layouts:
-                for reader in READERS:
+            for layout in results["build"][kind]:
+                for reader in args.readers:
                     t0 = time.perf_counter()
                     mine = run_queries(args.stores, kind, layout, reader, latency, args.bandwidth,
                                        args.max_inflight, queries, args.skip_zarr_all)
