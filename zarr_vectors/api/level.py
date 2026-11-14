@@ -799,11 +799,19 @@ class Level:
         which case the batched attempt was at fault and no caller should
         care — or it raises the genuine error, unobscured.  The cost is
         having done the work twice on the rare read that needs it.
+
+        With the ``octree_read_once`` experiment, a level with octree
+        chunks skips the engine: the reader is called once, directly.
         """
         self._check_supported(selection)
         reader, supports, adapter = self._reader()
         kwargs = self._reader_kwargs(selection, supports)
         group = self._dataset._group
+        if self._octree_read_once(selection):
+            # The reader resolves the leaves and batches their reads
+            # itself; the engine's plan names uniform cells, so its
+            # prefetch is wasted and each replay re-reads the leaf table.
+            return self._finish(reader(group, **kwargs), adapter, selection)
         try:
             from zarr_vectors._engine.execute import execute
             from zarr_vectors._engine.fetch import GroupFetcher
@@ -833,6 +841,23 @@ class Level:
             )
             raw = reader(group, **kwargs)
         return self._finish(raw, adapter, selection)
+
+    def _octree_read_once(self, selection: Selection) -> bool:
+        """Whether ``octree_read_once`` is on and the selection's level
+        has octree chunks, from the level metadata the plan reads anyway."""
+        from zarr_vectors._experiments import enabled
+
+        if not enabled("octree_read_once"):
+            return False
+        target = (
+            self if selection.level in (None, self._index)
+            else self._dataset.level(selection.level)
+        )
+        try:
+            meta = target._metadata()
+        except (ArrayError, StoreError, MetadataError, KeyError):
+            return False
+        return getattr(meta, "octree_chunks", None) is not None
 
     async def _aexecute(self, selection: Selection) -> ReadResult:
         """The same read, with its I/O awaited.
