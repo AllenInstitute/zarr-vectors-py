@@ -581,7 +581,8 @@ def read_cell_spans(
     on_disk: list[tuple[int, tuple[str, int, int]]] = []
     in_store: dict[int, list[tuple[int, Any, str, int, int]]] = {}
     n_reads = 0
-    for src, cells in requests:
+    prefetched = _prefetch_indexes(requests)
+    for r, (src, cells) in enumerate(requests):
         cells = np.asarray(cells, dtype=np.int64).reshape(-1, len(src.shape))
         read = np.full(len(cells), -1, dtype=np.int64)
         start = np.zeros(len(cells), dtype=np.int64)
@@ -598,7 +599,10 @@ def read_cell_spans(
         inner = np.ravel_multi_index((cells % shard_shape).T, src.shard_shape)
         shard_coords = np.stack(np.unravel_index(shards, grid), axis=1)
         keys = [_key(src, tuple(s)) for s in shard_coords.tolist()]
-        indexes = read_indexes(src, keys)
+        if r in prefetched:
+            indexes = [prefetched[r][k] for k in keys]
+        else:
+            indexes = read_indexes(src, keys)
         width = 3 if src.index_format == "zarr_octree" else 2
         rows = np.full((len(cells), width), _EMPTY, dtype=np.uint64)
         bad = np.zeros(len(cells), dtype=bool)
