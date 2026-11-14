@@ -2469,7 +2469,11 @@ class Group:
             try:
                 node = self._zarr[path]
             except KeyError:
-                return None
+                node = None
+        if offline is None:
+            from zarr_vectors._query_nodes import remember
+
+            remember(self._zarr.store, self._full_path(path), _ABSENT if node is None else node)
         if node is None:
             return None
         if cache is not None and (

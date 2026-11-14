@@ -121,7 +121,7 @@ async def _resolve_nodes(
     it answers "yes", or an ``array_exists`` probe for a legitimately
     missing array would look like a prefetch gap and loop forever.
     """
-    from zarr_vectors._query_nodes import lookup
+    from zarr_vectors._query_nodes import lookup, remember
 
     async def one(path: str) -> tuple[str, Any]:
         primed = lookup(root.store, path)
@@ -130,12 +130,13 @@ async def _resolve_nodes(
         try:
             node = await root.getitem(path)
         except KeyError:
+            remember(root.store, path, _ABSENT)
             return path, _ABSENT
         # Wrap in the sync facade the readers expect.  Both wrappers are
         # plain dataclasses over the async object — no I/O here.
-        if isinstance(node, zarr.AsyncArray):
-            return path, zarr.Array(node)
-        return path, zarr.Group(node)
+        wrapped = zarr.Array(node) if isinstance(node, zarr.AsyncArray) else zarr.Group(node)
+        remember(root.store, path, wrapped)
+        return path, wrapped
 
     if not paths:
         return {}
@@ -297,7 +298,17 @@ async def _fetch_listings(
     :func:`read_async` reports which read needed listing instead of
     spinning.
     """
+    from zarr_vectors._experiments import enabled
+    from zarr_vectors._query_nodes import listing as primed_listing
+    from zarr_vectors._query_nodes import remember
+
+    once = enabled("prime_nodes")
+
     async def one(path: str) -> tuple[str, list[str]] | None:
+        if once:
+            known = primed_listing(root.store, path)
+            if known is not None:
+                return path, known
         try:
             node = await root.getitem(path) if path else root
         except KeyError:
@@ -305,8 +316,21 @@ async def _fetch_listings(
         if not isinstance(node, zarr.AsyncGroup):
             return path, []
         try:
-            names = {k async for k in node.array_keys()}
-            names |= {k async for k in node.group_keys()}
+            if once:
+                # One pass over the children, not one for arrays and one
+                # for groups: each pass loads every child's zarr.json.
+                # The children it loads are kept for the rest of the query.
+                names = set()
+                async for name, child in node.members():
+                    names.add(name)
+                    wrapped = (
+                        zarr.Array(child) if isinstance(child, zarr.AsyncArray)
+                        else zarr.Group(child)
+                    )
+                    remember(root.store, f"{path}/{name}" if path else name, wrapped)
+            else:
+                names = {k async for k in node.array_keys()}
+                names |= {k async for k in node.group_keys()}
         except Exception:
             return None
         return path, sorted(names)
