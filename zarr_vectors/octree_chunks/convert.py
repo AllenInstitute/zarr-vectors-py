@@ -540,13 +540,9 @@ def read_octree_link_cells(level_group: Any, table: LeafTable, leaves: npt.Array
     other_leaf, other_row)``; ``other_leaf`` is ``-1`` where it is not stored."""
     family = f"{LINKS}/0"
     segments = list_link_offsets(level_group, 0)
-    from zarr_vectors._experiments import enabled
-
-    if enabled("octree_read_once"):
-        # Every segment's node in one gather (inside a reader's
-        # cached_nodes block), not one round each as the listing below
-        # reaches it.
-        level_group.prime_nodes([f"{family}/{seg}" for seg in segments])
+    # Every segment's node in one gather (inside a reader's cached_nodes
+    # block), not one round each as the listing below reaches it.
+    level_group.prime_nodes([f"{family}/{seg}" for seg in segments])
     anchors = table.anchors()
     want = None if leaves is None else set(np.asarray(leaves, dtype=np.int64).tolist())
     anchor_leaf = {tuple(a): n for n, a in enumerate(anchors.tolist())}

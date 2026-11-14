@@ -1,22 +1,39 @@
-"""The read experiments return exactly what the default read returns.
+"""A read's round-trip savings change how it fetches, never what it returns.
 
-``ZARR_VECTORS_EXPERIMENTS`` switches on read-path changes that only
-alter how a read fetches (see ``zarr_vectors/_experiments.py``).  Each is
-run here against the default on point clouds, meshes and graphs, local
-and through a store wrapper (the object-store path), sharded and not.
+A query holds its level group (``Level._held_store``), resolves the level
+and its arrays in one gather (:mod:`zarr_vectors._query_nodes`) and reads
+every array's shard indexes in one round
+(``_cells_on_disk._prefetch_indexes``).  Each is patched out here, alone
+and together, and the answers compared on point clouds, meshes and
+graphs, local and through a store wrapper (the object-store path),
+sharded and not.
 """
 
 from __future__ import annotations
+
+import contextlib
 
 import numpy as np
 import pytest
 from zarr.storage import LocalStore, WrapperStore
 
 import zarr_vectors as zv
+from zarr_vectors import _query_nodes
+from zarr_vectors.api.level import Level
+from zarr_vectors.core import _cells_on_disk
 
 BOX = 100.0
-EXPERIMENTS = ["level_handle", "prime_nodes", "gather_indexes",
-               "level_handle,prime_nodes,gather_indexes"]
+SAVINGS = ["held_level", "primed_nodes", "gathered_indexes"]
+
+
+def _without(monkeypatch, names):
+    """Patch out each saving in ``names``."""
+    if "held_level" in names:
+        monkeypatch.setattr(Level, "_held_store", lambda self: contextlib.nullcontext())
+    if "primed_nodes" in names:
+        monkeypatch.setattr(_query_nodes, "primed", lambda root, level: contextlib.nullcontext())
+    if "gathered_indexes" in names:
+        monkeypatch.setattr(_cells_on_disk, "_prefetch_indexes", lambda requests: {})
 
 
 class _Remote(WrapperStore):
@@ -78,27 +95,25 @@ def _answer(path, sel, remote):
 @pytest.mark.parametrize("shard", [None, 4])
 @pytest.mark.parametrize("remote", [False, True], ids=["local", "remote"])
 @pytest.mark.parametrize("reader", ["standard", "optimised"])
-def test_experiments_read_what_the_default_reads(
+def test_savings_read_what_a_read_without_them_reads(
     tmp_path, monkeypatch, kind, shard, remote, reader,
 ):
     path = _store(tmp_path, kind, shard)
     monkeypatch.setenv("ZARR_VECTORS_SHARD_READER", reader)
-    monkeypatch.delenv("ZARR_VECTORS_EXPERIMENTS", raising=False)
     want = [_answer(path, sel, remote) for sel in QUERIES]
-    for experiments in EXPERIMENTS:
-        monkeypatch.setenv("ZARR_VECTORS_EXPERIMENTS", experiments)
-        for sel, ref in zip(QUERIES, want):
-            got = _answer(path, sel, remote)
-            assert got.keys() == ref.keys(), (experiments, sel)
-            assert np.array_equal(got["positions"], ref["positions"]), (experiments, sel)
-            for name in ("faces", "edges"):
-                assert got.get(name) == ref.get(name), (experiments, sel, name)
+    for off in [[name] for name in SAVINGS] + [SAVINGS]:
+        with monkeypatch.context() as m:
+            _without(m, off)
+            for sel, ref in zip(QUERIES, want):
+                got = _answer(path, sel, remote)
+                assert got.keys() == ref.keys(), (off, sel)
+                assert np.array_equal(got["positions"], ref["positions"]), (off, sel)
+                for name in ("faces", "edges"):
+                    assert got.get(name) == ref.get(name), (off, sel, name)
 
 
-def test_primed_nodes_end_with_the_query(tmp_path, monkeypatch):
-    from zarr_vectors import _query_nodes
-
+def test_primed_nodes_end_with_the_query(tmp_path):
     path = _store(tmp_path, "point_cloud", 4)
-    monkeypatch.setenv("ZARR_VECTORS_EXPERIMENTS", "prime_nodes")
     zv.open(str(path)).select(bbox=([30.0] * 3, [60.0] * 3)).read()
     assert not _query_nodes._nodes and not _query_nodes._active
+

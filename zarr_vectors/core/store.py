@@ -1834,17 +1834,11 @@ def get_resolution_level(root: Group, level: int) -> Group:
         StoreError: If the level does not exist.
     """
     group_name = f"{RESOLUTION_PREFIX}{level}"
-    from zarr_vectors._experiments import enabled
-
-    if enabled("level_handle"):
-        # One lookup, not a membership test and then a second lookup.
-        try:
-            return root[group_name]
-        except StoreError:
-            raise StoreError(f"Resolution level {level} not found in store") from None
-    if group_name not in root:
-        raise StoreError(f"Resolution level {level} not found in store")
-    return root[group_name]
+    # One lookup, not a membership test and then a second lookup.
+    try:
+        return root[group_name]
+    except StoreError:
+        raise StoreError(f"Resolution level {level} not found in store") from None
 
 
 def list_resolution_levels(root: Group) -> list[int]:

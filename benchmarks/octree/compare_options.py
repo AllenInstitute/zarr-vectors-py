@@ -1,16 +1,18 @@
-"""Read times with and without each opt-in read option, on the same stores.
+"""Read times under each shard reader, on the same stores.
 
     python compare_options.py STORES_DIR OUT.json [--reps-local 5] [--reps-remote 3]
 
 ``STORES_DIR`` holds ``{points,mesh,network}-{indexed,octree,octree_chunks}.zv``
-(from ``bench_kinds.build``).  Copies with presence in shard indexes
-(``*-presence.zv``) are made next to them when missing.  Every
-configuration reads the same queries per store, local (median of
-``--reps-local`` cold reads) and behind a 20 ms ``LatencyStore``
-(median of ``--reps-remote``), and must return the same answer as the
-baseline.  Whole-level reads with the default ``auto`` reader on a
-``sharding_indexed`` store are skipped: they go through zarr's sharded
-reader one cell at a time (minutes at 200k vertices).
+(from ``bench_kinds.build``).  Every configuration reads the same queries
+per store, local (median of ``--reps-local`` cold reads) and behind a
+20 ms ``LatencyStore`` (median of ``--reps-remote``), and must return the
+same answer as the first.  Whole-level reads with the ``standard`` reader
+on a ``sharding_indexed`` store are skipped: they go through zarr's
+sharded reader one cell at a time (minutes at 200k vertices).
+
+The read options this script once compared (``ZARR_VECTORS_EXPERIMENTS``)
+are now how every read works; to measure one against its absence, check
+out the commit before it became the default.
 """
 
 from __future__ import annotations
@@ -18,7 +20,6 @@ from __future__ import annotations
 import argparse
 import json
 import os
-import shutil
 import statistics
 import time
 from pathlib import Path
@@ -28,38 +29,8 @@ from zarr.storage import LocalStore
 
 from latency_store import LatencyStore
 
-ALL_READ = "level_handle,prime_nodes,gather_indexes,batch_cells,octree_read_once"
-CONFIGS = {  # name: (shard reader, experiments, store suffix)
-    "default (auto)": ("auto", "", ""),
-    "optimised reader": ("optimised", "", ""),
-    "+ fewer rounds": ("optimised", "level_handle,prime_nodes,gather_indexes", ""),
-    "+ batch_cells": ("optimised", "batch_cells", ""),
-    "+ octree_read_once": ("optimised", "octree_read_once", ""),
-    "+ presence in shards": ("optimised", "", "-presence"),
-    "all": ("optimised", ALL_READ, "-presence"),
-    "all but presence": ("optimised", ALL_READ, ""),
-}
+CONFIGS = {"default (auto)": "auto", "standard reader": "standard"}  # name: shard reader
 LATENCY = 0.02
-
-
-def presence_copy(src: Path) -> Path | None:
-    """A copy of ``src`` with presence in shard indexes, or None when the
-    conversion refuses the store."""
-    dst = src.with_name(src.name.replace(".zv", "-presence.zv"))
-    if not dst.exists():
-        import zarr_vectors as zv
-        from zarr_vectors.building import store_presence_in_shards
-
-        shutil.copytree(src, dst)
-        try:
-            ds = zv.open(str(dst), mode="r+")
-            for lv in ds.levels:
-                store_presence_in_shards(ds.level(lv).store, on=True)
-        except Exception as exc:  # noqa: BLE001 - reported, configuration skipped
-            print(f"{src.name}: no presence copy ({type(exc).__name__}: {exc})", flush=True)
-            shutil.rmtree(dst)
-            return None
-    return dst
 
 
 def queries(path: Path) -> list[tuple[str, dict]]:
@@ -122,23 +93,16 @@ def main() -> None:
             continue
         base = args.stores / f"{name}.zv"
         layout = name.split("-", 1)[1]
-        os.environ.pop("ZARR_VECTORS_EXPERIMENTS", None)
-        os.environ["ZARR_VECTORS_SHARD_READER"] = "optimised"
+        os.environ["ZARR_VECTORS_SHARD_READER"] = "auto"
         qs = queries(base)
-        pres = presence_copy(base)
         ref: dict[str, tuple] = {}
-        for cname, (reader, exps, suffix) in CONFIGS.items():
-            if args.configs and cname not in args.configs and cname != "optimised reader":
+        for cname, reader in CONFIGS.items():
+            if args.configs and cname not in args.configs:
                 continue
-            if cname == "+ octree_read_once" and layout != "octree_chunks":
-                continue
-            if suffix and pres is None:
-                continue
-            path = pres if suffix else base
+            path = base
             os.environ["ZARR_VECTORS_SHARD_READER"] = reader
-            os.environ["ZARR_VECTORS_EXPERIMENTS"] = exps
             for qname, sel in qs:
-                if reader == "auto" and qname == "whole level" and layout != "octree":
+                if reader == "standard" and qname == "whole level" and layout != "octree":
                     rows.append({"store": name, "config": cname, "query": qname, "skipped": True})
                     continue
                 local = [read_once(path, sel, 0.0) for _ in range(args.reps_local)]

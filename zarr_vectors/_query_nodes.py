@@ -1,4 +1,4 @@
-"""Nodes resolved together at the start of a query (experiment ``prime_nodes``).
+"""Nodes resolved together at the start of a query.
 
 A read resolves the level group and its arrays one at a time as it
 discovers them -- the level, its attribute names, the presence listing,

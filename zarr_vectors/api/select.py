@@ -237,15 +237,11 @@ class Query:
 
     def read(self) -> ReadResult:
         """Execute and return the whole answer."""
-        from zarr_vectors._experiments import enabled
+        from zarr_vectors import _query_nodes
 
         with contextlib.ExitStack() as stack:
-            if enabled("prime_nodes"):
-                from zarr_vectors._query_nodes import primed
-
-                stack.enter_context(primed(self._level._dataset._group, self._level.index))
-            if enabled("level_handle"):
-                stack.enter_context(self._level._held_store())
+            stack.enter_context(_query_nodes.primed(self._level._dataset._group, self._level.index))
+            stack.enter_context(self._level._held_store())
             return self._level._execute(self._selection)
 
     async def aread(self) -> ReadResult:

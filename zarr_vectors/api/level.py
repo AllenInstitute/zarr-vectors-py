@@ -800,8 +800,8 @@ class Level:
         care — or it raises the genuine error, unobscured.  The cost is
         having done the work twice on the rare read that needs it.
 
-        With the ``octree_read_once`` experiment, a level with octree
-        chunks skips the engine: the reader is called once, directly.
+        A level with octree chunks skips the engine: the reader is called
+        once, directly.
         """
         self._check_supported(selection)
         reader, supports, adapter = self._reader()
@@ -843,12 +843,9 @@ class Level:
         return self._finish(raw, adapter, selection)
 
     def _octree_read_once(self, selection: Selection) -> bool:
-        """Whether ``octree_read_once`` is on and the selection's level
-        has octree chunks, from the level metadata the plan reads anyway."""
-        from zarr_vectors._experiments import enabled
-
-        if not enabled("octree_read_once"):
-            return False
+        """Whether the selection's level has octree chunks, from the level
+        metadata the plan reads anyway: such a level is read by its reader
+        once, without the engine's prefetch of uniform cells and replays."""
         target = (
             self if selection.level in (None, self._index)
             else self._dataset.level(selection.level)

@@ -231,7 +231,7 @@ def main() -> None:
     ap.add_argument("--bandwidth", type=float, default=100e6)
     ap.add_argument("--readers", nargs="+", default=list(READERS), choices=READERS)
     ap.add_argument("--env", nargs="*", default=[], metavar="NAME=VALUE",
-                    help="environment set for every read (an experimental option); recorded in the results")
+                    help="environment set for every read (e.g. ZARR_VECTORS_SHARD_READER=standard); recorded in the results")
     args = ap.parse_args()
     for kv in args.env:
         name, _, value = kv.partition("=")
