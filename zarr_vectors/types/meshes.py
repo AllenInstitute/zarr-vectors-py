@@ -221,14 +221,25 @@ def write_mesh(
                 f"of length n_verts={n_verts}, got shape {src_values.shape}"
             )
         vertex_attr_bins, attr_bin_values = assign_attribute_bins(src_values)
-        for oid in np.unique(object_ids):
-            mask = object_ids == oid
-            unique_bins = np.unique(vertex_attr_bins[mask])
-            if len(unique_bins) > 1:
+        # One sort by object, then each object's lowest and highest bin:
+        # a mask per object was a pass over every vertex per object, 350 s
+        # of a 10^7-vertex write.
+        _bins = np.asarray(vertex_attr_bins, dtype=np.int64)
+        _order = np.argsort(object_ids, kind="stable")
+        _oids = np.asarray(object_ids)[_order]
+        _starts = np.flatnonzero(np.r_[True, _oids[1:] != _oids[:-1]]) if n_verts else _order
+        if n_verts:
+            _sb = _bins[_order]
+            _mixed = np.flatnonzero(
+                np.minimum.reduceat(_sb, _starts) != np.maximum.reduceat(_sb, _starts)
+            )
+            if _mixed.size:
+                _s = int(_starts[_mixed[0]])
+                _e = int(_starts[_mixed[0] + 1]) if _mixed[0] + 1 < _starts.size else n_verts
                 raise ArrayError(
                     f"chunk_by_attribute={chunk_by_attribute!r} requires "
-                    f"per-object uniformity for meshes; object {int(oid)} "
-                    f"has {len(unique_bins)} distinct attribute values"
+                    f"per-object uniformity for meshes; object {int(_oids[_s])} "
+                    f"has {len(np.unique(_sb[_s:_e]))} distinct attribute values"
                 )
 
     level_chunk_dims: list[str] | None = None
@@ -255,10 +266,15 @@ def write_mesh(
         prefixed: dict[ChunkCoords, npt.NDArray[np.int64]] = {}
         for spatial_cc, gi in chunk_assignments.items():
             gi = np.asarray(gi, dtype=np.int64)
-            chunk_bins = vertex_attr_bins[gi]
-            for ab in np.unique(chunk_bins):
-                mask = chunk_bins == ab
-                prefixed[(int(ab),) + spatial_cc] = gi[mask]
+            chunk_bins = np.asarray(vertex_attr_bins)[gi]
+            # Stable sort by bin, then cut: each bin's vertices in their
+            # original order, as a mask per bin gave them, in one pass.
+            order = np.argsort(chunk_bins, kind="stable")
+            sb = chunk_bins[order]
+            cuts = np.flatnonzero(sb[1:] != sb[:-1]) + 1
+            for part in np.split(order, cuts):
+                if part.size:
+                    prefixed[(int(chunk_bins[part[0]]),) + spatial_cc] = gi[part]
         chunk_assignments = prefixed
     # Group each chunk's vertices by object, so that every fragment written
     # below belongs to exactly one object and a manifest entry can name
