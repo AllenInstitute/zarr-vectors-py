@@ -1,108 +1,45 @@
-API Reference
+API reference
 =============
 
-There are two supported surfaces, split by what the caller is doing.
+Two surfaces are supported:
 
-:doc:`api` — ``zarr_vectors.api`` — is for **using** data: opening a store,
-selecting a region or a set of objects, reading it back, editing it. It is
-addressed in bounds, axes, geometry kinds and resolution levels rather than in
-chunks, bins, shards and compressors: those are defaults you can override
-(``Layout``, ``build_pyramid(chunk_scale_factors=...)``) and counts a write
-reports back, never arguments you are obliged to supply. An application belongs
-here, and its names are re-exported from the top-level package, so
-``zarr_vectors.open(...)`` and ``zarr_vectors.api.open(...)`` are the same
-function.
+- :doc:`api` (``zarr_vectors.api``) is for **using** data: opening a store,
+  selecting a region or objects, reading and editing. It works in bounds,
+  axes, geometry kinds and levels, not chunks or shards. Its names are
+  re-exported from ``zarr_vectors``.
+- :doc:`building` (``zarr_vectors.building``) is for **making** stores:
+  ingest converters, pyramid builders, exporters. It names cells, bins,
+  shards and arrays directly.
 
-:doc:`building` — ``zarr_vectors.building`` — is for **making** stores: ingest
-converters, pyramid builders, exporters. That code's job *is* the physical
-layout, so hiding the layout from it would hide the thing it works on. It gets
-the smaller, blunter surface instead, with the same promise attached.
-
-Four other modules are supported, three with pages of their own —
 ``zarr_vectors.constants`` (:doc:`constants`), ``zarr_vectors.typing``
-(:doc:`typing`) and ``zarr_vectors.headers`` (:doc:`headers`). The fourth,
-``zarr_vectors.exceptions``, has none: its classes are named in the signatures
-that raise them, which is where you meet them.
+(:doc:`typing`), ``zarr_vectors.headers`` (:doc:`headers`) and
+``zarr_vectors.exceptions`` are also supported. ``exceptions`` has no page:
+its classes are named in the signatures that raise them. Converters for
+LAS, TRK, SWC, OBJ and other formats are in the companion package
+``zarr-vectors-tools``.
 
-Which module do I use for what?
--------------------------------
+Other modules
+-------------
 
-.. list-table::
-   :header-rows: 1
-   :widths: 34 16 50
-
-   * - I want to...
-     - Tier
-     - Use
-   * - open, query, read or edit a store
-     - supported
-     - ``zarr_vectors.api`` (or ``import zarr_vectors as zv``): :doc:`api`
-   * - write a store, build a pyramid, work with chunks, fragments, shards, links
-     - supported
-     - ``zarr_vectors.building``: :doc:`building`
-   * - check the package version, API version or a module's tier
-     - supported
-     - ``zarr_vectors.stability``, ``require_api``, ``FEATURES``: :doc:`zarr_vectors`
-   * - name geometry kinds, array families or conventions without raw strings
-     - supported
-     - ``zarr_vectors.constants``: :doc:`constants`
-   * - annotate code with ``ChunkShape``, ``ObjectManifest`` and friends
-     - supported
-     - ``zarr_vectors.typing``: :doc:`typing`
-   * - keep a source format's header (``.trk``, ``.swc``, ...) in a store
-     - supported
-     - ``zarr_vectors.headers`` (``Dataset.headers``): :doc:`headers`
-   * - catch a library error
-     - supported
-     - ``zarr_vectors.exceptions`` (no page; named in signatures)
-   * - check a store against the spec
-     - undecided
-     - ``zarr_vectors.validate``: :doc:`validate`
-   * - call the per-geometry ``read_*`` functions directly
-     - undecided
-     - ``zarr_vectors.types``: :doc:`types` (the ``write_*`` functions are
-       supported via ``zarr_vectors.building``)
-   * - convert LAS, TRK, SWC, OBJ and other formats
-     - n/a
-     - the companion package ``zarr-vectors-tools``
-
-What is *not* here
-------------------
+``zarr_vectors.types`` (:doc:`types`) and ``zarr_vectors.validate``
+(:doc:`validate`) are **undecided**: treat them as internal. The
+``write_*`` functions in ``types`` are supported through
+``zarr_vectors.building``.
+``zarr_vectors.composite``, ``zarr_vectors.octree_chunks`` and
+``zarr_vectors.gpu`` are also undecided and have no page; reach the GPU
+extension through ``device=`` (see :doc:`../how_to/gpu`).
 
 ``zarr_vectors.core``, ``.encoding``, ``.spatial``, ``.lazy``, ``.ops``,
-``.sharding``, ``.multiresolution``, ``._engine``, ``._xp``, ``._runtime`` and
-``.rechunk`` are **internal**. They change without notice — they always did — so they are no
-longer advertised here. Earlier versions of this page listed ``lazy`` and
-``spatial`` as public API; that was wrong, and importing from them is what made
-previous refactors into downstream breaks. If you need a name that only exists
-in one of them, ask for it to be promoted into ``api`` or ``building`` rather
-than importing it.
-
-Two pages below document **undecided** modules — neither promised nor disowned:
-
-``zarr_vectors.types`` (:doc:`types`)
-    "The five store-creating writers are promoted into ``building`` and are
-    supported there. The readers are superseded by ``Level.read()`` /
-    ``ReadResult``, but cannot be deprecated until the api can carry per-vertex
-    attributes for every geometry — pointing callers at a lossy replacement is
-    worse than leaving them here."
-
-``zarr_vectors.validate`` (:doc:`validate`)
-    "Stable in practice and widely used, but its result objects have never been
-    given a compatibility promise."
-
-Treat both as internal until that changes. (``zarr_vectors.composite`` is
-undecided too, and undocumented: multi-geometry stores round-trip, but the
-layout they use to namespace each geometry has not been specified. So is
-``zarr_vectors.gpu``, the optional GPU extension: reach it through
-``device=`` and :func:`zarr_vectors.runtime_capabilities`, not by importing
-it -- see :doc:`../how_to/gpu`.)
+``.sharding``, ``.multiresolution``, ``.rechunk`` and the underscore
+modules are **internal** and change without notice. Import the names the
+package re-exports from them (``stability``, ``require_api``,
+``FEATURES``, ``runtime_capabilities``, ``__api_version__``,
+``__version__``) from ``zarr_vectors``.
 
 Asking at runtime
 -----------------
 
-The tiers are not prose here and prose somewhere else: they are a manifest in
-``zarr_vectors/_stability.py``, and :func:`zarr_vectors.stability` reads it::
+:func:`zarr_vectors.stability` gives a name's tier::
 
     >>> import zarr_vectors as zv
     >>> zv.stability("zarr_vectors.api")
@@ -110,9 +47,11 @@ The tiers are not prose here and prose somewhere else: they are a manifest in
     >>> zv.stability("zarr_vectors.core.arrays")
     'internal'
 
-It accepts any dotted name and answers for the module that contains it, so a
-lint rule or an import audit can check a call site without a hard-coded list.
-:func:`zarr_vectors.require_api` is the assertion form.
+It answers for the module containing a dotted name. A name on the
+top-level package, such as ``zarr_vectors.open``, is ``'supported'`` if it
+is in ``zarr_vectors.__all__`` and ``'internal'`` otherwise. A name that
+does not exist raises ``KeyError``. :func:`zarr_vectors.require_api` checks an
+API version range or feature names from :data:`zarr_vectors.FEATURES`.
 
 Pages
 -----
@@ -128,6 +67,3 @@ Pages
    headers
    types
    validate
-
-The pages themselves are generated from docstrings with
-``sphinx.ext.autodoc``, so what is rendered is what is in the source.

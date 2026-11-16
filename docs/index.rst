@@ -7,29 +7,12 @@
 
 ----
 
-**zarr-vectors** stores three-dimensional spatial geometry — point clouds,
-streamlines, graphs, skeletons, and meshes — in spatially indexed Zarr v3
-stores. Spatial queries touch only the chunks they need, whether the store
-sits on a local filesystem or a cloud object store (S3, GCS). Resolution
-pyramids are encoded natively so viewers like Neuroglancer can stream data
-progressively at any scale.
-
-The library implements `Zarr Vectors
-<https://github.com/AllenInstitute/zarr_vectors>`_, originally specified by
-Forest Collman at the Allen Institute for Brain Sciences, extended with
-separated chunk/bin sizes, per-level sparsity, and OME-Zarr-compatible
-multiscale metadata.
-
-Two module surfaces carry a compatibility promise, split by what the caller is
-doing. ``zarr_vectors.api`` is for **using** data — opening a store, selecting
-a region or a set of objects, reading it back, editing it — and is re-exported
-from the top-level package, so ``zarr_vectors.open(...)`` and
-``zarr_vectors.api.open(...)`` are the same function. ``zarr_vectors.building``
-is for **making** stores: ingest converters, pyramid builders, exporters,
-repair tools. Everything else — ``core``, ``encoding``, ``spatial``, ``lazy``,
-``ops``, ``sharding``, ``multiresolution`` and ``rechunk`` — is internal and
-changes without notice. :func:`zarr_vectors.stability` answers for any dotted
-name at runtime, so nothing here has to be taken on trust.
+**zarr-vectors** stores spatial geometry (point clouds, streamlines, graphs,
+skeletons and meshes) in chunked, multiscale Zarr v3 stores. A spatial query
+reads only the chunks it needs, on local disk or in cloud storage, and
+resolution pyramids let viewers such as Neuroglancer stream data at any scale.
+It implements `Zarr Vectors <https://github.com/AllenInstitute/zarr_vectors>`_,
+specified by Forrest Collman at the Allen Institute for Brain Science.
 
 .. figure:: _static/figures/zarr-vectors-overview.png
    :width: 100%
@@ -42,7 +25,7 @@ name at runtime, so nothing here has to be taken on trust.
    :figclass: zv-figure
 
    **Overview of Zarr Vectors.**
-   **a** — Complex and detailed derivative datasets now exceed GPU and system
+   **a** — Complex and detailed derivative datasets exceed GPU and system
    memory. **b** — Summary of the Zarr Vectors concept, showing input data
    types, construction, and uses.
 
@@ -63,47 +46,30 @@ Where to start
 .. list-table::
    :widths: 35 65
 
+   * - :doc:`getting_started/installation`
+     - Install the package and its optional extras.
    * - :doc:`getting_started/quickstart`
-     - Write and query your first vector store in a few lines of Python.
-   * - :doc:`getting_started/concepts`
-     - The mental model: chunks, supervoxel bins, fragments, the object model
-       and the resolution pyramid — and how ``Layout`` sets them.
+     - Create, write, query and validate your first store.
+   * - :doc:`explanation/concepts`
+     - The terms used throughout: chunks, bins, fragments, objects and levels.
    * - :doc:`tutorials/data_types/point_clouds`
-     - A full worked example with the simplest geometry type, once you have
-       the quickstart and the concepts.
-   * - `zarr-vectors-tools <https://github.com/AllenInstitute/zarr-vectors-tools>`_
-     - Converters for existing formats (LAS, PLY, TRX, SWC, OBJ, STL, ...,
-       and the Neuroglancer precomputed export) and the benchmarks live in this companion package, not
-       here; see the format list in :doc:`tutorials/io/ingest_formats`.
-   * - :doc:`api/api`
-     - The data surface: ``open``, ``Schema``, ``select``, ``ReadResult``,
-       resolution levels and objects.
-   * - :doc:`api/building`
-     - The builder surface, for code that writes stores rather than reads
-       them: arrays, fragments, shards and manifests.
+     - A full worked example with the simplest geometry type.
+   * - :doc:`how_to/convert_files`
+     - Converting LAS, PLY, TRX, SWC, OBJ and other formats, with the
+       companion package ``zarr-vectors-tools``.
    * - :doc:`api/index`
-     - Which modules are supported, which are internal, and how to ask at
-       runtime.
+     - The API reference, and which modules are supported.
    * - :doc:`spec/index`
-     - Full technical specification for Zarr Vectors.
+     - The full Zarr Vectors specification.
 
 
 .. toctree::
    :maxdepth: 1
-   :caption: Getting Started
+   :caption: Getting started
    :hidden:
 
    getting_started/installation
    getting_started/quickstart
-   getting_started/concepts
-   getting_started/faq
-
-.. toctree::
-   :maxdepth: 1
-   :caption: Specification
-   :hidden:
-
-   spec/index
 
 .. toctree::
    :maxdepth: 1
@@ -117,31 +83,46 @@ Where to start
    tutorials/data_types/mesh_streaming
    tutorials/multiscale/building_pyramids
    tutorials/multiscale/lazy_loading
-   tutorials/io/cloud_stores
-   tutorials/io/validation_and_repair
-   tutorials/neuroglancer/overview
-   tutorials/neuroglancer/zv_ngtools_install
-   tutorials/neuroglancer/local_viewer
-   tutorials/neuroglancer/shell_console
-   tutorials/neuroglancer/layer_api
 
 .. toctree::
    :maxdepth: 1
-   :caption: API Reference
-   :hidden:
-
-   api/index
-
-.. toctree::
-   :maxdepth: 1
-   :caption: How-To Guides
+   :caption: How-to guides
    :hidden:
 
    how_to/choose_chunk_and_bin
    how_to/memory_efficient_writes
    how_to/hpc_pipelines
+   how_to/cloud_stores
+   how_to/validate_and_repair
+   how_to/convert_files
+   how_to/view_in_neuroglancer
    how_to/gpu
    how_to/cite
+
+.. toctree::
+   :maxdepth: 1
+   :caption: Explanation
+   :hidden:
+
+   explanation/concepts
+   explanation/faq
+   explanation/comparisons/neuroglancer_precomputed
+   explanation/comparisons/ome_zarr
+   explanation/comparisons/trx_format
+
+.. toctree::
+   :maxdepth: 1
+   :caption: Specification
+   :hidden:
+
+   spec/index
+
+.. toctree::
+   :maxdepth: 1
+   :caption: API reference
+   :hidden:
+
+   api/index
 
 .. toctree::
    :maxdepth: 1

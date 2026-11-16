@@ -3,275 +3,196 @@
 ## Terms
 
 **Skeleton**
-: A tree-structured graph representing the branching morphology of a
-  biological structure — typically a neuron, blood vessel, or other
-  tubular object. Skeletons are acyclic and connected; each vertex has
-  exactly one parent except the root, which has none.
+: A rooted tree describing the branching shape of a neuron, vessel or other
+  tubular structure. Each vertex has one parent, except a root. The type
+  constant is `GEOM_SKELETON`, `"skeleton"`.
 
-**`GEOM_SKELETON`**
-: The geometry type constant `"skeleton"`, recorded as
-  `"geometry_types": ["skeleton"]` in the root `zarr_vectors` block.
+**Branch record**
+: A link record `[child, parent]` for a parent edge that the read rule
+  below does not give.
 
-**SWC convention**
-: The de facto standard file format for neuronal morphology, defined by
-  Cannon et al. (1998). An SWC file stores one vertex per row with columns:
-  `id, type, x, y, z, radius, parent_id`. Zarr Vectors does not require SWC
-  semantics: `radius` and `type` are ordinary per-vertex attributes whose
-  names and values you choose (this page uses `radius` and `swc_type`).
-
-**Vertex type**
-: An integer label from the SWC taxonomy identifying the anatomical role
-  of a vertex (table below). A producer convention only; nothing in
-  `zarr-vectors-py` reads or enforces it.
-
-**Radius**
-: The estimated radius of the tubular structure at a given vertex, as a
-  per-vertex attribute. Its unit is the unit of the store's axes
-  (`multiscales[0].axes`).
-
-**Root vertex**
-: The vertex with no parent, representing the origin of the tree (typically
-  the soma centre for a neuron). With `write_graph` the root simply has no
-  `[child, parent]` edge; the streaming writer records an explicit
-  `[root_local, -1]` row per fragment.
-
----
+**SWC**
+: The text format for neuronal morphology: `id, type, x, y, z, radius,
+  parent_id` per vertex. Radius and type are ordinary vertex attributes;
+  the format reserves no names or codes for them.
 
 ## Introduction
 
-The `skeleton` type is a specialisation of `graph` for rooted trees,
-aligned to the SWC morphology convention. It is the appropriate type for
-neuronal morphologies, vascular trees, and any other branching tree-
-structured shape that will be read by or compared to SWC-compatible tools.
+A skeleton uses `links_convention: implicit_sequential_with_branches`.
+Within a fragment, a vertex's parent is the row before it, so most parent
+edges are not stored. Each tree, or piece of one, is an object. What every
+type shares is on [Geometry types](index.md#common-to-every-type).
 
-Zarr Vectors skeletons store all the information present in an SWC file (position,
-radius, type, parent relationship) plus the spatial indexing and multi-
-resolution features of Zarr Vectors. SWC converters live in the
-companion package `zarr-vectors-tools`.
+Every reader applies this rule:
 
----
+- A vertex that opens no fragment and is the child of no record has the
+  row before it as parent. This is the only implicit edge.
+- Every record `[child, parent]` is an edge, and its child takes no
+  implicit parent.
+- A record whose parent is outside the read (another object, or outside
+  the `bbox` or `chunks` scope) gives no edge but still blocks the implicit
+  one; its child is a root of the read.
+- A vertex with several records keeps all of them.
+
+Two writers produce skeleton stores. They differ in their link family:
+
+| Writer | Family | Cross-chunk records |
+|--------|--------|---------------------|
+| `write_graph(kind="skeleton")`, whole dataset | `directed: false`, `canonical` | Sorted, with `perm_idx`; read back as `[child, parent]` |
+| Streaming (`write_skeleton_chunk`, one chunk at a time) | `directed: true`, `canonical` | `[child, parent]` in input order, no `perm_idx` |
+
+Every record, intra- or cross-chunk, reads back as `[child, parent]` from
+either writer; tools tell the two layouts apart by `directed`. See
+[Links](../object_model/links.md#endpoint-order-of-skeleton-links).
+SWC import and export are in
+[zarr-vectors-tools](https://zarr-vectors-tools.readthedocs.io/en/latest/convert/skeletons.html).
 
 ## Technical reference
 
 ### Arrays present
 
-Identical to `graph`, except that a streamed skeleton store's link
-family is written `directed=True` (see below).
+At level 0 of a store written by `write_graph(kind="skeleton")`:
 
-| Array path | Required | Description |
-|-----------|----------|-------------|
-| `vertices/` | Yes | Node positions |
-| `vertex_fragments/` | Yes | Fragment index over `vertices/` rows |
-| `links/0/<offsets>/` | Yes | The edges the reader cannot imply: branch points and fragment starts (intra-chunk, `0.0.0`), and **every** edge crossing a chunk boundary (non-zero offsets) |
-| `link_fragments/` | With `links/0/0.0.0/` | Fragment index over the intra array's rows |
-| `object_index/` | Yes | One manifest per object (`object_ids=` entry; default: the whole store is object 0) |
-| `vertex_attributes/<name>/` | No | e.g. `radius` (float32), `swc_type` (int32); names are yours to choose |
-| `object_attributes/<name>/` | No | Per-skeleton attributes |
+| Path | Present | Description |
+|------|---------|-------------|
+| `vertices/` | Always | One fragment per object per chunk, depth-first order |
+| `links/0/0.0.0/` | Always, possibly empty | Branch records within one chunk, chunk-local indices |
+| `links/0/<offsets>/` | When an edge crosses chunks | Every cross-chunk parent edge |
+| `link_fragments/` | Always | Fragment index over the intra-chunk link rows |
+| `object_index/` | Always | One manifest per object |
+| `vertex_attributes/<name>/` | With `vertex_attributes=` | For example `radius` |
+| `link_attributes/<name>/0/<offsets>/` | With `link_attributes=` | One row per stored record |
+| `object_attributes/<name>/`, `fragment_attributes/<name>/` | With the matching argument | |
 
-### Root metadata
+The streaming writer writes the same arrays, plus
+`fragment_attributes/segment_id/` (one `uint64` source ID per fragment;
+`fragment_attributes/object_id/` too when the pieces carry `object_id`)
+and, once the object index is written, `object_attributes/segment_id/`.
 
-```json
-{
-  "zarr_vectors": {
-    "geometry_types":   ["skeleton"],
-    "links_convention": "implicit_sequential_with_branches"
-  }
-}
+The root attributes (the streaming writer does not set
+`cross_chunk_strategy`):
+
+```javascript
+{"geometry_types": ["skeleton"], "links_convention": "implicit_sequential_with_branches", ...}
 ```
 
-(Alongside the usual `zarr_vectors` keys.) Skeleton-ness is carried by
-`geometry_types` and `links_convention`. L4 accepts either
-`implicit_sequential_with_branches` or `explicit` for a skeleton.
-
-> **`is_tree` and `swc_compatible` are not root metadata keys.** Neither
-> is written or read by any shipped code. `is_tree` survives only as a
-> deprecated `write_graph` argument (see [Graph](graph.md)); there is no
-> `swc_compatible` key, argument, or check anywhere. SWC round-tripping
-> is a property of which `vertex_attributes/` a store happens to carry,
-> not of a declared flag.
-
-### Implicit edges
-
-With `implicit_sequential_with_branches`, a reader infers
-`parent[i] = i - 1` over the concatenated read order (chunks in order,
-fragments within a chunk), except at the start of a fragment, which has
-no implied parent. Edges are `[child, parent]`. `write_graph(kind="skeleton")`
-reorders nodes depth-first and stores in `links/` only the edges this rule
-does not already give: branch points, fragment starts, and every edge whose
-endpoints are in different chunks. `read_graph` rebuilds the full edge list.
-
-### The link family for skeletons
-
-A skeleton store has **one** `links/0/` family, written with
-`link_width=2`. The streaming writers (`init_skeleton_store`,
-`write_skeleton_chunk`, `write_skeleton_cross_chunk_links`) declare it —
-uniquely among the core geometry types — **`directed=True`**.
-`write_graph(kind="skeleton")` keeps an undirected, canonical family whose
-`perm_idx` restores each record's `[child, parent]` input order on read;
-downstream tools tell the two skeleton layouts apart by this flag. Either
-way a reader sees `[child, parent]`.
-
-`directed=True` is family policy set at creation
-(`create_links_array(..., directed=True)`). It suppresses the canonical
-sort, which matters because child→parent order is *data*: sorting
-endpoints by `(chunk_coords, vertex_index)` would silently swap parent
-and child whenever the child's chunk sorts before the parent's.
-
-The consequence for the layout: a directed family stores `A→B` and
-`B→A` under **opposite offsets** (`0.0.+1` vs `0.0.-1`) in different
-cells, rather than deduplicating them into one lexicographically
-positive offset. Offsets in a directed family are therefore **not**
-constrained to be lex-non-negative, and [L3](../validation/l3_consistency.md)
-skips that check for them (`enforce_canonical` requires `not directed`).
-`perm_idx` is `0` throughout, since no permutation is applied.
-
-Three writers populate this family:
-
-| Writer | Lands in | Endpoint order |
-|--------|----------|----------------|
-| `write_skeleton_chunk` | all-zero offsets (`0.0.0`) | `[child_local, parent_local]` |
-| `write_skeleton_cross_chunk_links` | non-zero offsets | `[child, parent]` |
-| `write_graph(kind="skeleton")` | all offsets (undirected, `perm_idx`) | `[child, parent]` after `perm_idx` |
-
-Intra-chunk branch links are written per-cell (`write_chunk_links`),
-not through `write_links`, because they are already chunk-local and
-all-zero-offset and must stay **one group per fragment** for
-`read_chunk_link_fragment` to slice them back out — `write_links` files
-a cell's records as a single group. Intra-chunk records are stored in
-input order regardless of the `directed` policy, so branch links are
-unaffected by it.
-
-Every record in a skeleton's link family, intra- or cross-chunk, is
-`[child, parent]`: endpoint 0 is the child, endpoint 1 its parent. Readers
-(`read_graph`, `read_skeleton_by_segment_id`, the pyramid coarsener) apply
-that one rule to every array of the family.
-
-For cross-chunk records the source is the **child's** chunk, so the
-offsets name where the parent's chunk sits relative to the child's.
-
-This is a key distinction from `polyline` links, where direction encodes
-traversal order and the family is undirected. For skeletons, direction
-encodes the tree's child↔parent relationship and is preserved
-explicitly.
-
-The streaming writers (module `zarr_vectors.types.skeletons`) are for
-scale-out ingestion, where many workers each write some chunks. Their
-stores also carry a `segment_id` fragment attribute and a
-`coordinate_offset` key in the root `zarr_vectors` block (stored vertices
-are `world - coordinate_offset`). `read_skeleton_by_segment_id(path, id)`
-reads one skeleton back from such a store and returns `positions`,
-`edges` (`[child, parent]`), `attributes` and `fragment_count`, or `None`
-for an unknown id.
-
-### SWC type taxonomy
-
-| Code | Anatomical meaning |
-|------|--------------------|
-| 0 | Undefined |
-| 1 | Soma |
-| 2 | Axon |
-| 3 | Basal dendrite |
-| 4 | Apical dendrite |
-| 5+ | Custom |
-
-This is the standard SWC convention, given for producers. It is not
-stored in or enforced by the format.
-
-### Ingest and export
-
-SWC converters (single-file and directory ingest, SWC export) live in
-the companion package **`zarr-vectors-tools`**.
-
-### Write API
+### Whole-dataset writer
 
 ```python
 import numpy as np
-from zarr_vectors.types.graphs import write_graph
-
-# A 5-node tree: 0 is the root; edges are [child, parent] and the root
-# has no edge.
-node_positions = np.array(
-    [[0, 0, 0], [10, 0, 0], [20, 0, 0], [20, 10, 0], [30, 0, 0]],
-    dtype=np.float32,
-)
-parent_child_pairs = np.array(
-    [[1, 0], [2, 1], [3, 2], [4, 2]], dtype=np.int64
-)
-
-write_graph(
-    "neuron.zarrvectors",
-    positions=node_positions,
-    edges=parent_child_pairs,
-    chunk_shape=(200., 200., 200.),
-    kind="skeleton",
-    vertex_attributes={
-        "radius":   np.full(5, 1.5, dtype=np.float32),
-        "swc_type": np.full(5, 3, dtype=np.int32),
-    },
-)
-```
-
-Edge rows are `[child, parent]` vertex indices, in any row order, and
-vertices may come in any order: the writer reorders them depth-first
-from every root.  A row `[root, -1]` declares a root and is not an
-edge; any other negative index is refused.  An object may hold at most
-one root, but may hold pieces of several trees.
-
-**The read rule.**  Within a fragment, a vertex with no stored record
-has the row before it as its parent; the writer puts each fragment's
-parentless vertex first so the rule never invents an edge.  Every
-stored record is an edge, and a vertex with several (a cycle, a repeated
-edge -- not a tree, but accepted) keeps them all.  A scoped read
-(`bbox=`, `chunks=`, `object_ids=`) returns the induced subgraph: an
-edge comes back exactly when both its ends are read, so an edge between
-objects A and B needs both.  `edit_link(new_endpoints=...)` on a branch
-record re-points the child's parent: it rewrites the record in place,
-under `atomic=True` too.
-
-Through the dataset API: `ds.add_graph(positions, edges, tree=True, ...)`.
-
-### Multi-skeleton stores
-
-For many neurons in a shared coordinate space, pass `object_ids` (one entry
-per node) so each tree is its own object; `write_graph` rejects an object
-with more than one root. `read_graph(object_ids=...)` is **not
-implemented** (it raises `NotImplementedError`), so there is no
-by-object read for `write_graph` stores; read a region with `bbox=` or
-`chunks=` instead:
-
-```python
-import numpy as np
+from zarr_vectors.building import write_graph
 from zarr_vectors.types.graphs import read_graph
 
-result = read_graph(
-    "connectome.zarrvectors",
-    bbox=(np.array([1000., 2000., 500.]),
-          np.array([1200., 2200., 700.])),
+rng = np.random.default_rng(0)
+n = 200
+parent = np.array([-1] + [int(rng.integers(max(0, i - 3), i)) for i in range(1, n)])
+positions = np.zeros((n, 3))
+positions[0] = (500.0, 500.0, 500.0)
+for i in range(1, n):
+    positions[i] = positions[parent[i]] + rng.normal(0, 30, 3)
+positions = positions.astype(np.float32)
+edges = np.stack([np.arange(n), parent], axis=1)    # [child, parent]; [0, -1] marks the root
+
+summary = write_graph(
+    "neuron.zarrvectors",
+    positions,
+    edges,
+    chunk_shape=(200.0, 200.0, 200.0),
+    kind="skeleton",
+    vertex_attributes={"radius": rng.uniform(0.2, 3.0, n).astype(np.float32)},
 )
-print(result["node_count"], result["edge_count"])
+print(summary)
+# {'node_count': 200, 'edge_count': 199, 'chunk_count': 11, 'intra_edge_count': 29,
+#  'cross_edge_count': 78, 'object_count': 1, 'kind': 'skeleton'}
+
+result = read_graph("neuron.zarrvectors")
+print(result["node_count"], result["edge_count"])   # 200 199
 ```
 
-`read_graph` returns no attributes. For stores written with the streaming
-writers, `read_skeleton_by_segment_id` pulls one skeleton with its
-attributes.
+`write_graph(kind="skeleton")`:
+
+- takes `[child, parent]` edge rows and vertices in any order. A row
+  `[v, -1]` makes `v` a root and is not an edge; any other negative index
+  raises `ValueError`. An object with more than one root raises
+  `ArrayError`, but an object may hold pieces of several trees.
+- reorders vertices depth-first from each root, with each fragment's
+  parentless vertex first.
+- stores a record for every edge the read rule does not give. With
+  `link_attributes=` it stores every edge, so each edge keeps its row.
+
+`read_graph` returns `edges` as `[child, parent]` rows; see
+[Graph](graph.md#write-and-read-api).
+
+### Streaming writer
+
+`init_skeleton_store` creates the store, `write_skeleton_chunk` writes one
+chunk's pieces, `write_skeleton_cross_chunk_links` writes the edges between
+chunks, and `finalize_skeleton_store` stamps each level's `vertex_count`
+and closes the write. The caller writes the object index. It is built for
+scale-out ingestion, where each worker writes some chunks.
+
+```python
+import numpy as np
+from zarr_vectors.building import (
+    finalize_skeleton_store, init_skeleton_store, read_skeleton_by_segment_id,
+    write_object_attributes, write_object_index, write_skeleton_chunk,
+    write_skeleton_cross_chunk_links,
+)
+
+root, level0 = init_skeleton_store(
+    "stream.zarrvectors",
+    chunk_shape=(100.0, 100.0, 100.0),
+    bounds=([0.0, 0.0, 0.0], [200.0, 100.0, 100.0]),
+    ndim=3,
+    attribute_dtypes={"radius": "float32"},
+)
+# Segment 77: a branched piece in chunk (1, 0, 0), and a two-vertex piece in
+# (0, 0, 0) whose first vertex hangs off vertex 2 of the first piece.
+piece_a = {
+    "segment_id": 77,
+    "positions": np.array([[110, 10, 10], [120, 10, 10], [130, 10, 10], [120, 20, 10]], np.float32),
+    "edges": np.array([[1, 0], [2, 1], [3, 1]]),           # [child, parent], root omitted
+    "attributes": {"radius": np.ones(4, np.float32)},
+    "anchors": {"parent": 2},
+}
+piece_b = {
+    "segment_id": 77,
+    "positions": np.array([[90, 10, 10], [80, 10, 10]], np.float32),
+    "edges": np.array([[1, 0]]),
+    "attributes": {"radius": np.ones(2, np.float32)},
+    "anchors": {"child": 0},
+}
+records_a, anchors_a = write_skeleton_chunk(level0, (1, 0, 0), [piece_a])
+records_b, anchors_b = write_skeleton_chunk(level0, (0, 0, 0), [piece_b])
+write_skeleton_cross_chunk_links(
+    level0, [(anchors_b["child"], anchors_a["parent"])], ndim=3,   # (child, parent)
+)
+write_object_index(
+    level0, {0: [(cc, f) for _, cc, f in records_a + records_b]}, sid_ndim=3, total_objects=1,
+)
+write_object_attributes(level0, "segment_id", np.array([77], dtype=np.uint64))
+finalize_skeleton_store(root)
+
+skeleton = read_skeleton_by_segment_id("stream.zarrvectors", 77)
+print(skeleton["fragment_count"], skeleton["positions"].shape, skeleton["edges"].tolist())
+# 3 (6, 3) [[1, 0], [2, 1], [5, 4], [3, 1], [4, 2]]
+```
+
+| Function | Behaviour |
+|----------|-----------|
+| `write_skeleton_chunk` | Splits each piece into linear paths, one fragment each, and stores a branch record `[child_local, parent_local]` in `links/0/0.0.0/` for each path that leaves another. Returns the `(segment_id, chunk, fragment_index)` records for the object index and the chunk-local positions of the requested `anchors` |
+| `write_skeleton_cross_chunk_links` | Takes `((chunk, vertex), (chunk, vertex))` pairs, child first, and stores them in that order under the child's chunk, so the offsets name where the parent's chunk sits |
+| `read_skeleton_by_segment_id` | Resolves the ID through `object_attributes/segment_id/` and returns `positions`, `edges` (`[child, parent]`, intra- and cross-chunk), `attributes` and `fragment_count`, or `None` for an absent ID |
+
+`init_skeleton_store` also takes `shard_shape=`, `compressor=` and
+`backend=`. `coordinate_offset=` records the world position of the stored
+origin as `coordinate_offset` in the root `zarr_vectors` block (stored
+vertices are `world - coordinate_offset`) and as level 0's NGFF
+translation; `read_skeleton_by_segment_id` adds it back.
 
 ### Validation
 
-L1, L2: same as `graph`.
-
-L3: offsets segments parse; `num_physical_records` matches the rows on
-disk; every record's endpoint chunks exist at the level. For a **directed**
-(streaming-writer) family the lex-non-negative and non-decreasing offset
-checks do not apply, since `enforce_canonical` requires `not directed`; a
-`write_graph` skeleton family is undirected and canonical, so they do.
-
-L4: `links_convention` MUST be `implicit_sequential_with_branches` or
-`explicit` for `skeleton`
-([`GEOMETRY_LINK_REQ`](../../../zarr_vectors/validate/conformance.py)).
-
-`write_graph(kind="skeleton")` itself rejects an object with more than one
-root. **Not checked at any validation level:** that each skeleton is a valid
-tree (connected, acyclic, single root), that link endpoints reference valid
-vertex indices within their chunk, that `[child, parent]` direction is
-consistent with tree depth, or anything about `swc_type` / `radius` value
-ranges. See [Validation overview](../validation/overview.md).
+The [common checks](index.md#validation) apply. The lexicographic-sign and
+ordering checks apply to the `write_graph` family only, since the streaming
+family is directed. L4 also accepts `links_convention` `explicit`. No level
+checks that a skeleton is a tree, or attribute values such as radius.

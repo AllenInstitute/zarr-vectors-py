@@ -1,18 +1,12 @@
 Geometry types
 ==============
 
-Read and write functions for each Zarr Vectors geometry type. All write functions
-accept either a local path string, a ``zarr.storage.Store`` object, or
-an fsspec mapper as the first argument. All read functions return a typed
-result dictionary documented on each function's page.
+Read and write functions per geometry type. Each takes a path or URL, a
+Zarr store or an open group, and the readers return a dict.
 
-``zarr_vectors.types`` is *undecided* tier in ``zarr_vectors/_stability.py``
-— superseded by the :doc:`api` surface, but not deprecated: "The five
-store-creating writers are promoted into ``building`` and are supported
-there. The readers are superseded by ``Level.read()`` / ``ReadResult``, but
-cannot be deprecated until the api can carry per-vertex attributes for every
-geometry — pointing callers at a lossy replacement is worse than leaving
-them here."
+``zarr_vectors.types`` is *undecided*: treat it as internal. Its writers
+are supported through :doc:`building`. ``Level.read()`` in :doc:`api`
+covers its readers, except per-vertex attributes on some geometries.
 
 Point clouds
 ------------

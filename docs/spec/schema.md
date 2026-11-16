@@ -1,45 +1,23 @@
 # Machine-readable schema
 
-The narrative spec pages in `docs/spec/` describe the Zarr Vectors
-on-disk format in prose.  For a machine-readable reference — usable
-from any language with a JSON Schema validator — see the [`schema/`]
-directory in the repository root:
+The Zarr Vectors metadata is also described as a schema, so stores can
+be validated from any language with a JSON Schema validator. The files
+are in the [`schema/` directory](https://github.com/AllenInstitute/zarr-vectors-py/tree/main/schema):
 
-- [`schema/zarr_vectors.linkml.yaml`] — the canonical [LinkML] source.
-- [`schema/zarr_vectors.schema.json`] — generated JSON Schema (Draft
-  2020-12).
-- [`schema/reference.md`] — generated Markdown reference.
+| File | Content |
+|---|---|
+| `zarr_vectors.linkml.yaml` | The [LinkML](https://linkml.io/) source, edited by hand. |
+| `zarr_vectors.schema.json` | JSON Schema generated from it. |
+| `reference.md` | Markdown reference generated from it. |
+| `README.md` | Coverage, how stored attributes map onto the schema, and how to regenerate it. |
 
-The runtime Python source of truth is the dataclass tree in
-[`zarr_vectors/core/metadata.py`] (`RootMetadata`, `LevelMetadata`).  A pytest
-sanity check (`tests/test_linkml_schema.py`) prevents the LinkML schema from
-drifting from the runtime dataclasses.
+The schema models the payload of the root `zarr_vectors` attribute, of
+each level's `zarr_vectors_level` attribute and of each array's
+attributes (discriminated by `zv_array`). It has no class for the NGFF
+`multiscales` block or the `ome` node; see
+[Root metadata](layout/root_metadata.md) for those.
 
-What the schema models, and what it does not:
-
-- It describes the **payload** of the root `zarr_vectors` attribute and of each
-  level's `zarr_vectors_level` attribute, not the envelope: validate
-  `attributes["zarr_vectors"]`, not the whole attributes block. Two
-  representation differences are bridged in the test: `bounds` is a pair of
-  lists on disk but a `BoundingBox` object in the schema, and `crs` is
-  free-form.
-- It covers the per-array attribute shapes discriminated by the `zv_array`
-  attribute (`vertices`, `links`, `links_family`, `attribute`, …).
-- The root class models the `zarr_vectors` payload; the axes live in the
-  NGFF `multiscales` block and the RFC 8 `ome` node is a third root attribute —
-  see [Root metadata](layout/root_metadata.md) for all three. The schema
-  has no class for the `ome` node or for the parametric type registry.
-- The schema's `$id` carries a nominal version number that is not tied to
-  `zv_version` and is read by no code.
-
-For details on coverage, vocabulary mappings (OME-Zarr / Schema.org),
-and the build-time regeneration workflow, see
-[`schema/README.md`].
-
-[`schema/`]:                            https://github.com/AllenInstitute/zarr-vectors-py/tree/main/schema
-[`schema/zarr_vectors.linkml.yaml`]:    https://github.com/AllenInstitute/zarr-vectors-py/blob/main/schema/zarr_vectors.linkml.yaml
-[`schema/zarr_vectors.schema.json`]:    https://github.com/AllenInstitute/zarr-vectors-py/blob/main/schema/zarr_vectors.schema.json
-[`schema/reference.md`]:                https://github.com/AllenInstitute/zarr-vectors-py/blob/main/schema/reference.md
-[`schema/README.md`]:                   https://github.com/AllenInstitute/zarr-vectors-py/blob/main/schema/README.md
-[`zarr_vectors/core/metadata.py`]:      ../../zarr_vectors/core/metadata.py
-[LinkML]:                               https://linkml.io/
+The source of truth is the dataclasses in
+`zarr_vectors/core/metadata.py`. `tests/test_linkml_schema.py` checks
+that written metadata validates against the JSON Schema. The test
+workflow runs `python schema/regen.py --check` to catch a stale schema.

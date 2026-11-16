@@ -5,25 +5,16 @@ zarr\_vectors
    :no-members:
    :no-special-members:
 
-The flat top-level namespace. Importing ``zarr_vectors`` re-exports the whole
-:doc:`api` surface — ``Dataset``, ``Level``, ``Query``, ``Selection``,
-``ReadResult``, ``Schema``, ``Layout``, ``Grid``, ``ObjectCatalog``,
-``EditPlan``, and the ``open`` / ``create`` entry-points — so
-``zarr_vectors.open(...)`` and ``zarr_vectors.api.open(...)`` are the same
-object under two names.
+The top-level package re-exports the :doc:`api` surface, so
+``zarr_vectors.open`` is ``zarr_vectors.api.open``. Those names are
+documented on :doc:`api`; ``zarr_vectors.building`` on :doc:`building`.
 
-Those names are documented once, on the page that carries the reasoning for
-them: :doc:`api` for reading, querying and editing stores, and :doc:`building`
-for tools that create them. ``zarr_vectors.building`` is the same module as
-the one documented there.
-
-What is left below is the handful of names that exist only at the top level:
-they answer questions about the installed package rather than about a store.
-
-Also available at the top level: ``zarr_vectors.__version__`` (the package
-version) and ``zarr_vectors.__api_version__`` (the ``(major, minor)`` tuple of
-the supported API contract, which is what :func:`zarr_vectors.require_api`
-checks against).
+The names below exist only at the top level and describe the installed
+package. ``zarr_vectors.__version__`` is the package version and
+``zarr_vectors.__api_version__`` the ``(major, minor)`` API version that
+:func:`~zarr_vectors.require_api` compares against.
+``zarr_vectors.concurrency_contract`` is
+:func:`zarr_vectors.building.concurrency_contract`.
 
 .. autofunction:: zarr_vectors.stability
 

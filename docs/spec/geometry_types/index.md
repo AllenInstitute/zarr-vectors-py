@@ -1,22 +1,11 @@
 # Geometry types
 
-Zarr Vectors defines seven geometry types. Each type is identified by a string
-constant stored in the root `zarr_vectors` attribute block under
-`"geometry_types"` (a list, e.g. `["streamline"]`). A store normally holds one
-geometry type, and the dataset API (`zarr_vectors.open`) reads a store as the
-first type listed. A `zarr_vectors.composite` module can add further types
-to one store, but treat multi-type stores as unsupported for the common
-readers; use multiple stores.
-
-Every geometry type has a `write_*` / `read_*` pair in `zarr_vectors.types`:
-
-| Type | Writer | Reader | Dataset API |
-|------|--------|--------|-------------|
-| `point_cloud` | `write_points` | `read_points` | `ds.add_points` |
-| `line` | `write_lines` | `read_lines` | `ds.add_lines` |
-| `polyline`, `streamline` | `write_polylines(geometry_type=...)` | `read_polylines` | `ds.add_polylines(streamlines=...)` |
-| `graph`, `skeleton` | `write_graph(kind=...)` | `read_graph` | `ds.add_graph(tree=...)` |
-| `mesh` | `write_mesh` | `read_mesh` | `ds.add_mesh` |
+Zarr Vectors defines seven geometry types. A store lists its types in
+`geometry_types` in the [root attributes](../layout/root_metadata.md). Each
+writer on these pages creates a store with one geometry type, and the
+dataset API (`zarr_vectors.open`) decodes a store as the first type listed.
+`zarr_vectors.composite` can add further types to one store, but the
+readers on these pages do not support such stores; use one store per type.
 
 ## Type constants
 
@@ -32,55 +21,102 @@ from zarr_vectors.constants import (
 )
 ```
 
+## Writers and readers
+
+| Type | Writer | Reader | Dataset API |
+|------|--------|--------|-------------|
+| `point_cloud` | `write_points` | `read_points` | `ds.add_points` |
+| `line` | `write_lines` | `read_lines` | `ds.add_lines` |
+| `polyline`, `streamline` | `write_polylines(geometry_type=...)` | `read_polylines` | `ds.add_polylines(streamlines=...)` |
+| `graph`, `skeleton` | `write_graph(kind=...)` | `read_graph` | `ds.add_graph(tree=...)` |
+| `mesh` | `write_mesh` | `read_mesh` | `ds.add_mesh` |
+
+The writers are in `zarr_vectors.types.<module>` and re-exported from
+`zarr_vectors.building`; the streaming skeleton writer is on
+[Skeleton](skeleton.md#streaming-writer).
+
 ## Comparison matrix
+
+What each type's writer stores at level 0. "Optional" means the writer
+stores it when the caller passes the matching argument.
 
 | Property | `point_cloud` | `line` | `polyline` | `streamline` | `graph` | `skeleton` | `mesh` |
 |----------|:---:|:---:|:---:|:---:|:---:|:---:|:---:|
-| Discrete objects | optional† | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
-| `links/` family | — | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
-| `link_width` | — | 2 | 2 | 2 | 2 | 2 | ≥ 3 |
-| `links_convention` | — | implicit_sequential | implicit_sequential | implicit_sequential | explicit | implicit_sequential_with_branches | explicit |
-| Intra-chunk links (`0.0.0`) | — | — | — | — | ✓ | ✓‡ | ✓* |
-| Cross-chunk links (non-zero offsets) | — | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
-| Family `directed` | — | false | false | false | false | false (`write_graph`); **true** (streaming writers) | false |
-| `object_index/` | optional† | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
-| `object_attributes/` | optional† | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
-| `groups/` written by `write_*` | ✓† | — | ✓ | ✓ | — | — | — |
-| Per-vertex attributes | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
-| Multiscale pyramid (core `per_object`) | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
-| Draco compression | — | — | — | — | — | — | ✓ |
+| `links_convention` | not written | `implicit_sequential` | `implicit_sequential` | `implicit_sequential` | `explicit` | `implicit_sequential_with_branches` | `explicit` |
+| `links/0/` family | — | when a line crosses a chunk | when a polyline crosses a chunk | when a streamline crosses a chunk | ✓ | ✓ | ✓ |
+| `link_width` | — | 2 | 2 | 2 | 2 | 2 | face size, ≥ 3 |
+| Intra-chunk links (`0.0.0`) | — | — | — | — | ✓ | branch records | ✓ (raw encoding) |
+| Family `directed` | — | false | false | false | false | see [Skeleton](skeleton.md) | false |
+| `object_index/` | optional | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
+| `object_attributes/` | optional | optional | optional | optional | optional | optional | optional |
+| `groups/` | optional | — | optional | optional | — | — | — |
+| `vertex_attributes/` | optional | optional | optional | optional | optional | optional | optional |
+| `link_attributes/` | — | — | — | — | optional | optional | — |
+| Draco encoding | — | — | — | — | — | — | optional |
 
-† Only when `object_ids=` / `object_attributes=` / `groups=` is passed to
-`write_points`.
+In the `implicit_sequential` types, vertex order within a fragment gives
+the connectivity, so only links that cross a chunk boundary are stored. A
+store whose objects each sit in one chunk has no `links/` group. See
+[Links](../object_model/links.md).
 
-‡ A skeleton stores only the edges that depth-first order does not imply:
-branch points and fragment starts intra-chunk, plus every cross-chunk edge.
+## Common to every type
 
-\* Mesh intra-chunk faces move into the Draco bitstream under
-`encoding="draco"`, leaving only boundary faces in `links/`.
+The type pages state only what differs from this section.
 
-There is no `cross_chunk_links/` family: connectivity is one family,
-and an intra-chunk link is simply one whose offsets are all zero.
-`line`, `polyline`, and `streamline` use
-`links_convention: implicit_sequential` — vertex order within a
-fragment carries the topology — so they emit **only** non-zero-offset
-links, and a store whose objects never cross a chunk has no `links/`
-group at all.
+- **Arrays.** Every writer creates `vertices/` and `vertex_fragments/` at
+  level 0 (see [Chunk arrays](../layout/chunk_arrays.md)).
+  `vertex_attributes/<name>/` holds one row per vertex,
+  `object_attributes/<name>/` one row per object, and
+  `fragment_attributes/<name>/` one row per fragment.
+- **Root attributes.** No type has type-specific root keys. Besides
+  `geometry_types` and `links_convention`, the writers set
+  `object_index_convention` `"standard"` and `cross_chunk_strategy`
+  `"explicit_links"` (the streaming skeleton writer omits
+  `cross_chunk_strategy`). The other keys are on
+  [Root metadata](../layout/root_metadata.md).
+- **Links.** Every type with links, except the streaming skeleton writer,
+  writes one `links/0/` family that is undirected with
+  `store: "canonical"`: each link is stored once, under the
+  lexicographically positive offset. See [Links](../object_model/links.md).
+- **Reading.** Each reader takes `level=` and filters that combine with
+  AND. `bbox=` is a `(min_corner, max_corner)` pair of arrays.
 
-There are no `is_directed` or `is_tree` root keys; `directed` is
-per-family link policy, and tree-ness is carried by `geometry_types`
-plus `links_convention`. See [Links](../object_model/links.md).
+  | Reader | Module | Filters |
+  |--------|--------|---------|
+  | `read_points` | `zarr_vectors.types.points` | `bbox`, `object_ids`, `group_ids`, `chunks`, `attribute_filter` |
+  | `read_lines` | `zarr_vectors.types.lines` | `bbox`, `object_ids`, `attribute_filter` |
+  | `read_polylines` | `zarr_vectors.types.polylines` | `bbox`, `object_ids`, `group_ids`, `chunks`, `attribute_filter` |
+  | `read_graph` | `zarr_vectors.types.graphs` | `bbox`, `object_ids`, `chunks`, `attribute_filter` |
+  | `read_mesh` | `zarr_vectors.types.meshes` | `bbox`, `object_ids`, `chunks`, `attribute_filter` |
+
+- **Coarser levels.** See
+  [Pyramid construction](../multiscale/pyramid_construction.md).
+
+### Validation
+
+These checks apply to every type; the type pages list only their own. See
+[Validation overview](../validation/overview.md).
+
+| Level | Check |
+|-------|-------|
+| L1 | `vertices/` missing at a level is an error; `vertex_fragments/` missing is a warning. `links/` and `object_index/` are not required |
+| L3 | Each manifest entry names a chunk present at the level and a fragment below that chunk's fragment count |
+| L3 | Each `links/0/` offsets name parses under the family's `sid_ndim` and `link_width`; `num_physical_records` matches the rows on disk; each record's source chunk exists at the level, and at delta 0 every endpoint's chunk |
+| L3 | In an undirected canonical family, no offset is lexicographically negative and the offsets are non-decreasing |
+| L4 | `links_convention` is one the type allows; see [Level 4](../validation/overview.md#level-4-geometry-conventions) |
+
+No level checks that a link's vertex index exists within its chunk.
 
 ## Type selection guide
 
-| Data description | Recommended type |
-|-----------------|-----------------|
+| Data | Type |
+|------|------|
 | Lidar, synchrotron point scan, single-molecule localisation | `point_cloud` |
 | Pairs of connected points (short segments, contact sites) | `line` |
-| Ordered vertex sequences without tractography metadata | `polyline` |
-| MRI/synchrotron tractography streamlines with step size / seeding metadata | `streamline` |
-| General connectivity graph (not necessarily a tree) | `graph` |
-| Neuronal morphology, vascular tree (tree topology, SWC-compatible) | `skeleton` |
+| Ordered vertex sequences | `polyline` |
+| Tractography streamlines | `streamline` |
+| General graph, possibly with cycles | `graph` |
+| Neuronal morphology, vascular tree (SWC-compatible) | `skeleton` |
 | 3-D surface mesh (cell boundary, brain surface, organelle hull) | `mesh` |
 
 ## Per-type documentation
