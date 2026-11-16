@@ -178,6 +178,13 @@ def rechunk(
     src_root = open_store(str(store_path))
     src_meta = read_root_metadata(src_root)
     ndim = src_meta.sid_ndim
+    # Level 0's cells, manifests and links are read as uniform cells:
+    # refused on a level with octree chunks, before the output is created
+    # and before the general check, which would name its octree_chunks
+    # group as a family it cannot carry.
+    from zarr_vectors.octree_chunks.guard import refuse_octree_read
+
+    refuse_octree_read(get_resolution_level(src_root, 0), "rechunk")
     _check_carried(src_root, src_meta)
 
     if output_path.exists():
@@ -187,11 +194,6 @@ def rechunk(
 
     # Read level 0 data
     src_level = get_resolution_level(src_root, 0)
-    # Its cells, manifests and links are read as uniform cells: refused
-    # on a level with octree chunks, before the output is created.
-    from zarr_vectors.octree_chunks.guard import refuse_octree_read
-
-    refuse_octree_read(src_level, "rechunk")
 
     # Read object manifests
     try:
