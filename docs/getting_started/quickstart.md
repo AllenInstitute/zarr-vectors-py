@@ -1,61 +1,108 @@
 # Quickstart
 
-This page covers the most common operations in `zarr-vectors`: creating a
-point-cloud store, writing to it, reading it back, running a spatial
-bounding-box query, adding coarser resolution levels, and writing a set of
-streamlines with group labels. All examples use synthetic data and require
-only the base install.
+This page takes you from nothing to a stored, queried point cloud, then on to
+the other things you will want to do with a store: coarser resolution levels,
+streamlines with group labels, validation. All examples use synthetic data and
+need only the base install.
+
+**What you need:** Python 3.11 or later, and `numpy`. Nothing else.
 
 The page is one continuous session — later blocks reuse the stores that
-earlier blocks create.
+earlier blocks create. Run it from an empty scratch directory: `zv.create`
+refuses to overwrite a store that already exists, so delete the `*.zarrvectors`
+folders (or pick new names) before running a block a second time.
 
 ---
 
-## The two supported surfaces
+## Install
 
-`zarr-vectors` promises two public surfaces and reserves the right to change
-everything else. The package will tell you which is which:
+```bash
+pip install zarr-vectors
+```
+
+That brings in `zarr>=3`, `numpy` and `numcodecs`. Optional extras (cloud
+storage, Draco mesh compression) are covered in
+[Installation](installation.md); you do not need them here.
+
+## Your first store in five steps
+
+A **store** is a directory of Zarr v3 arrays. You describe what the data is
+(a `Schema`), create the store, write into it, and later open it and ask for
+only the part you want.
 
 ```python
+import numpy as np
 import zarr_vectors as zv
 
-for module in ("api", "building", "constants", "exceptions", "core", "lazy", "types"):
-    print(module, "->", zv.stability(f"zarr_vectors.{module}"))
+# 1. Describe the data: a point cloud inside a 1000 x 1000 x 1000 box, cut into
+#    about 5 cells (files) per axis.
+schema = zv.Schema(
+    bounds=((0.0, 0.0, 0.0), (1000.0, 1000.0, 1000.0)),
+    kind="point_cloud",
+    layout=zv.Layout(cells=5),
+)
+
+# 2. Create the (empty) store.
+ds = zv.create("first.zarrvectors", schema=schema)
+
+# 3. Write 100 000 random points.
+rng = np.random.default_rng(42)
+positions = rng.uniform(0, 1000, size=(100_000, 3)).astype(np.float32)
+ds.add_points(positions)
+
+# 4. Open it again, as a new session would.
+ds = zv.open("first.zarrvectors")
+print(ds)
+print(ds.level(0).vertex_count)
+
+# 5. Ask for just the points inside a 100-unit box.
+result = ds.select(bbox=((100.0, 100.0, 100.0), (200.0, 200.0, 200.0))).read()
+print(result.vertex_count, result.positions.shape)
 ```
 
 ```text
-api -> supported
-building -> supported
-constants -> supported
-exceptions -> supported
-core -> internal
-lazy -> internal
-types -> undecided
+Dataset('file:///.../first.zarrvectors', point_cloud, levels=[0])
+100000
+109 (109, 3)
 ```
 
-- **`zarr_vectors.api`** — the data-oriented surface used on this page. It is
-  re-exported from the top-level package, so `zv.create`, `zv.open`,
-  `zv.Schema` and everything else below are `api` objects.
-- **`zarr_vectors.building`** — the surface for tools that *build* stores:
-  converters, ingest pipelines, and anything that needs the writers and
-  encoders underneath `add_points`.
-- Everything reported `internal` (`core`, `lazy`, `spatial`, `encoding`, …) is
-  an implementation detail and may change without notice. `undecided` means
-  exactly that: still supported in practice, not yet promised.
+`select(...)` describes a query and reads nothing; `.read()` runs it and
+returns a `ReadResult`. Only the cells overlapping the box were opened — that
+is the point of the format. (`ds.read()` with no selection returns everything.)
 
-`import zarr_vectors as zv` is the spelling used throughout. `zv.open_dataset`
-and `zv.create_dataset` are aliases — the same function objects as `zv.open`
-and `zv.create` — for code that imports the names bare and would rather not
-shadow the builtin `open`.
+### What is on disk
 
-### The older `zarr_vectors.types` functions
+```python
+import os
 
-Earlier versions of this page used `zarr_vectors.types.write_points` /
-`read_points` and their per-geometry siblings. They still work, but they are
-superseded: they are storage-shaped rather than data-shaped — every call takes
-the chunk and bin geometry — and each geometry's reader hands back its own
-differently-shaped dict, so no two of them compose. The API below takes a
-schema once and returns one `ReadResult` for every geometry.
+print(sorted(os.listdir("first.zarrvectors")))
+print(sorted(os.listdir("first.zarrvectors/0")))
+print(sorted(os.listdir("first.zarrvectors/0/vertices/c"))[:3])
+```
+
+```text
+['0', 'zarr.json']
+['vertex_fragments', 'vertices', 'zarr.json']
+['0', '1', '2']
+```
+
+```text
+first.zarrvectors/
+├── zarr.json          store-level metadata: bounds, chunk shape, geometry kind, ...
+└── 0/                 resolution level 0 (full resolution)
+    ├── zarr.json      level metadata (vertex count, ...)
+    ├── vertices/      the points; one stored cell per occupied chunk at c/<i>/<j>/<k>
+    └── vertex_fragments/   index that lets a bounding-box read pick out one bin of a chunk
+```
+
+Everything is plain Zarr v3 — you can open it with `zarr` or browse it in a file
+manager. Arrays that hold *ragged* data (a different number of vertices in every
+chunk) store one variable-length cell per chunk rather than a padded dense
+array. Attributes, object ids, groups and coarser levels add more folders next
+to these as you write them; [Core concepts](concepts.md) draws the full tree
+and defines the terms (chunk, bin, fragment, object, level) used below.
+
+The rest of this page repeats these steps with more options. The next section builds a richer store named `scan.zarrvectors`.
 
 ---
 
@@ -96,7 +143,7 @@ print(ds.level(0).scale, ds.level(0).resolution)
 ```text
 Dataset('file:///.../scan.zarrvectors', point_cloud, levels=[0])
 (array([0., 0., 0.]), array([1000., 1000., 1000.]))
-('point_cloud',) 3 (0, 9, 1)
+('point_cloud',) 3 (0, 9, 2)
 (200.0, 200.0, 200.0) (50.0, 50.0, 50.0)
 ```
 
@@ -104,8 +151,12 @@ The store is written as a directory tree called `scan.zarrvectors/`. A
 relative path is normalised to an absolute `file://` URL, which is what the
 repr shows.
 
-`vertex_attributes` and `expected` are declarative: they document the store
-and size its arrays, but nothing enforces them at write time.
+`vertex_attributes` and `expected` are declarations, and they are checked: an
+attribute you declared as `float32` must be written as `float32` with the
+declared number of channels, or `add_points` raises `SchemaConflict` before it
+writes anything. Attributes you did not declare are still accepted (that is how
+a store is extended). `expected` is only a size hint used to choose the layout;
+a wrong hint costs speed, never correctness.
 
 ### Where `chunk_shape` and `bin_shape` went
 
@@ -694,9 +745,57 @@ point-cloud store; a freshly written point cloud has none.)
 
 `Dataset.validate(level=...)` is the same check reached from an open dataset —
 it passes its own handle, so it works on any backend. Note that
-`zarr_vectors.validate` is one of the `undecided` modules above. See
+`zarr_vectors.validate` is one of the `undecided` modules (see [The two supported surfaces](#the-two-supported-surfaces)). See
 [Validation](../tutorials/io/validation_and_repair.md) for what each level
 checks.
+
+---
+
+## The two supported surfaces
+
+`zarr-vectors` promises two public surfaces and reserves the right to change
+everything else. The package will tell you which is which:
+
+```python
+import zarr_vectors as zv
+
+for module in ("api", "building", "constants", "exceptions", "core", "lazy", "types"):
+    print(module, "->", zv.stability(f"zarr_vectors.{module}"))
+```
+
+```text
+api -> supported
+building -> supported
+constants -> supported
+exceptions -> supported
+core -> internal
+lazy -> internal
+types -> undecided
+```
+
+- **`zarr_vectors.api`** — the data-oriented surface used on this page. It is
+  re-exported from the top-level package, so `zv.create`, `zv.open`,
+  `zv.Schema` and everything else below are `api` objects.
+- **`zarr_vectors.building`** — the surface for tools that *build* stores:
+  converters, ingest pipelines, and anything that needs the writers and
+  encoders underneath `add_points`.
+- Everything reported `internal` (`core`, `lazy`, `spatial`, `encoding`, …) is
+  an implementation detail and may change without notice. `undecided` means
+  exactly that: still supported in practice, not yet promised.
+
+`import zarr_vectors as zv` is the spelling used throughout. `zv.open_dataset`
+and `zv.create_dataset` are aliases — the same function objects as `zv.open`
+and `zv.create` — for code that imports the names bare and would rather not
+shadow the builtin `open`.
+
+### The older `zarr_vectors.types` functions
+
+Earlier versions of this page used `zarr_vectors.types.write_points` /
+`read_points` and their per-geometry siblings. They still work, but they are
+superseded: they are storage-shaped rather than data-shaped — every call takes
+the chunk and bin geometry — and each geometry's reader hands back its own
+differently-shaped dict, so no two of them compose. The API on this page takes a
+schema once and returns one `ReadResult` for every geometry.
 
 ---
 
@@ -714,7 +813,7 @@ print(sorted(ds.capabilities), ds.supports("nonempty_chunks"))
 
 ```text
 (1, 0)
-(0, 9, 1)
+(0, 9, 2)
 ['multiscale_links', 'shared_fragments'] False
 ```
 
@@ -728,7 +827,7 @@ version numbers by hand:
 ```pycon
 >>> zv.require_format(ds, ">=0.9")     # returns None
 >>> zv.require_format(ds, ">=1.0")
-FormatError: file:///.../scan.zarrvectors is on-disk format 0.9.1, which does not satisfy '>=1.0'. There is no backward-compatible reader: an older store must be rewritten from source, and a newer one needs a newer zarr-vectors.
+FormatError: file:///.../scan.zarrvectors is on-disk format 0.9.2, which does not satisfy '>=1.0'. There is no backward-compatible reader: an older store must be rewritten from source, and a newer one needs a newer zarr-vectors.
 >>> zv.require_api(">=1.0", features=["surfaces", "query-cells"])   # returns None
 >>> zv.require_api(features=["streaming-reads"])
 ImportError: zarr-vectors 1.0 does not provide: streaming-reads. Known features: coarsen-strategy-options, presence-rebuild, query-cells, selection-level-optional, sharded-presence-guard, surfaces, vertex-attributes-on-read.

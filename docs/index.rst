@@ -68,6 +68,13 @@ Where to start
    * - :doc:`getting_started/concepts`
      - The mental model: chunks, supervoxel bins, fragments, the object model
        and the resolution pyramid — and how ``Layout`` sets them.
+   * - :doc:`tutorials/data_types/point_clouds`
+     - A full worked example with the simplest geometry type, once you have
+       the quickstart and the concepts.
+   * - `zarr-vectors-tools <https://github.com/AllenInstitute/zarr-vectors-tools>`_
+     - Converters for existing formats (LAS, PLY, TRX, SWC, OBJ, STL, ...,
+       and the Neuroglancer precomputed export) and the benchmarks live in this companion package, not
+       here; see the format list in :doc:`tutorials/io/ingest_formats`.
    * - :doc:`api/api`
      - The data surface: ``open``, ``Schema``, ``select``, ``ReadResult``,
        resolution levels and objects.

@@ -10,20 +10,26 @@
   `[i_d × chunk_shape[d], (i_d + 1) × chunk_shape[d])` for each axis `d`.
 
 **Chunk grid**
-: The regular partition of space induced by `chunk_shape`. The number of
-  chunks along axis `d` is `ceil(extent[d] / chunk_shape[d])`, where
-  `extent[d]` is the maximum coordinate observed across all vertices.
+: The regular partition of space induced by `chunk_shape`. The grid a level
+  allocates is anchored at `origin[d] = floor(bounds_min[d] / chunk_shape[d])`
+  and spans `floor(bounds_max[d] / chunk_shape[d]) - origin[d] + 1` cells along
+  axis `d` (the bounds are *inclusive*: a vertex exactly on `bounds_max` is
+  storable). This is what `zarr_vectors.spatial.chunking.grid_layout` computes;
+  `compute_grid_shape` (`ceil(extent / chunk_shape)`) is **not** the allocation
+  and can be one cell short.
 
 **Chunk coordinate**
-: The D-tuple of non-negative integers identifying a chunk within the
-  chunk grid. The chunk coordinate of a vertex with position `p` is
-  `floor(p[d] / chunk_shape[d])` for each axis `d`.
+: The D-tuple of integers identifying a chunk. It is **absolute** and may be
+  negative: the chunk coordinate of a vertex with position `p` is
+  `floor(p[d] / chunk_shape[d])` for each axis `d`. The chunk at coordinate `c`
+  is stored in array cell `c - origin`.
 
 **Storage key**
-: The string path at which a chunk's compressed data is stored in the
-  Zarr store. For a `vertices/` chunk at coordinate `(i, j, k)` the key
-  is `0/vertices/c/i/j/k` (with `c/` prefix per Zarr v3
-  default encoding).
+: The string path at which a chunk's data is stored in the Zarr store. For a
+  `vertices/` chunk at *cell index* `(i, j, k)` (= absolute coordinate minus
+  origin) the key is `0/vertices/c/i/j/k` (with the `c/` prefix of Zarr v3's
+  default key encoding). The dotted form `"i.j.k"` used in `nonempty_chunks`
+  and in the APIs is the **absolute** coordinate.
 
 **Boundary chunk**
 : A chunk whose spatial extent extends beyond the actual data bounding box.
@@ -53,8 +59,15 @@ storage.
 
 Unlike `bin_shape`, which controls only the spatial index granularity,
 `chunk_shape` is baked into the physical file layout and cannot be changed
-without rewriting the entire store (see [Rechunking](rechunking.md)). Set
+without rewriting the store (see [Rechunking](rechunking.md)). Set
 it deliberately before writing any data.
+
+The unit of cost is the **cell**, not the vertex: every non-empty cell of every
+array is one object in the store, and the per-cell cost of writing it is fixed.
+A `chunk_shape` that allocates more than 100 000 cells makes the writer emit a
+`RuntimeWarning` (suggesting a coarser `chunk_shape`, or `shard_store` to pack
+cells into shard objects). The automatic layout used by the high-level API
+targets a cell size rather than a cell count.
 
 ---
 
@@ -62,17 +75,21 @@ it deliberately before writing any data.
 
 ### Definition and units
 
-`chunk_shape` is declared as a D-tuple of positive floats in root `.zattrs`:
+`chunk_shape` is declared as a D-tuple of positive floats in the root
+attributes' `zarr_vectors` block:
 
 ```json
-{ "chunk_shape": [200.0, 200.0, 200.0] }
+{ "zarr_vectors": { "chunk_shape": [200.0, 200.0, 200.0], "...": "..." } }
 ```
 
-The unit is the same as the vertex coordinate unit declared in
-`"axis_units"`. If `axis_units` is `"micrometer"`, then each chunk
-covers 200 µm per axis. If coordinates are in voxel indices (integer),
-`chunk_shape` values are still floats but are typically integers or
-simple fractions.
+The unit is the same as the vertex coordinate unit declared by the axes'
+`unit` fields in `multiscales[0].axes`. If the unit is `"micrometer"`, then each
+chunk covers 200 µm per axis. If coordinates are in voxel indices,
+`chunk_shape` values are still floats but are typically integers or simple
+fractions.
+
+If `chunk_shape` is omitted at creation, `create_store` uses one chunk covering
+the bounds, and `write_points` one chunk covering the data.
 
 There is no requirement that `chunk_shape` be isotropic. For anisotropic
 data (e.g. 4 µm × 4 µm × 25 µm voxels), an anisotropic `chunk_shape`
@@ -82,19 +99,38 @@ that is roughly equal in physical extent per axis often performs better:
 { "chunk_shape": [200.0, 200.0, 175.0] }
 ```
 
+#### Per-level override
+
+`chunk_shape` in the root attributes is the **level-0 default**. A coarser
+level may carry its own `chunk_shape` in its `zarr_vectors_level` block, which
+must be a positive integer multiple of the root's along every axis (nested
+grids; `coarsen_level(..., chunk_scale_factor=2)` doubles the parent's). A
+level without the key inherits the root's. See [Level groups](../layout/level_groups.md).
+
 ### Relationship to the Zarr array shape
 
-The `vertices/` Zarr array has logical shape `(*chunk_grid_shape, N_max, D)`
-where each element of `chunk_grid_shape` is the number of chunks along
-that axis. The Zarr chunk shape (the unit of storage for the Zarr array
-itself) is `(1, 1, …, 1, N_max, D)` — one Zarr chunk per Zarr Vectors spatial
-chunk.
+Every per-spatial-chunk array (`vertices`, `vertex_fragments`, …) is a vlen-bytes
+array whose logical shape **is** the chunk grid of its level —
+`chunk_grid_shape`, e.g. `(5, 6, 4)` — and whose Zarr chunk shape is
+`(1, 1, …, 1)`: one Zarr chunk (one file, `c/i/j/k`) per spatial chunk. There is
+no `N_max` or `D` dimension; the number of vertices in a chunk is whatever the
+variable-length blob holds. See [Chunk arrays](../layout/chunk_arrays.md).
 
-The Zarr Vectors `chunk_shape` (physical units) and the Zarr chunk shape (array
-elements) are related only through the vertex density of the data. There
-is no direct mathematical mapping between them; the Zarr array's chunk
-dimensions are set by `N_max` (maximum expected vertices per Zarr Vectors chunk),
-not by `chunk_shape`.
+`chunk_shape` (physical units) therefore determines the array *shape*, and the
+vertex density of the data determines how big each cell's blob is.
+
+Worked example: `chunk_shape = (100, 100, 100)` and
+`bounds = ([-150, 0, 0], [250, 99.9, 99.9])`:
+
+```python
+import numpy as np
+from zarr_vectors.spatial.chunking import grid_layout
+
+origin, shape = grid_layout(([-150, 0, 0], [250, 99.9, 99.9]), (100, 100, 100))
+# origin == (-2, 0, 0)   shape == (5, 1, 1)
+# a vertex at x = -150 has absolute chunk coord -2 -> cell 0
+# a vertex at x =  250 has absolute chunk coord  2 -> cell 4
+```
 
 ### How chunk coordinates are computed
 
@@ -104,10 +140,10 @@ For a vertex at position `p = [p_0, p_1, p_2]` in a 3-D store:
 chunk_coord = tuple(int(math.floor(p[d] / chunk_shape[d])) for d in range(D))
 ```
 
-This is an exact integer division; floating-point coordinates very close
-to a chunk boundary (within floating-point epsilon) are assigned to the
-chunk whose lower bound is nearest. The write functions in
-`zarr-vectors-py` use `numpy.floor` for consistency.
+The write functions in `zarr-vectors-py` compute it vectorised with
+`numpy.floor(positions / chunk_shape)` in `float64`, so a coordinate that
+rounds onto a boundary in floating point lands on the upper chunk. Negative
+positions give negative chunk coordinates (handled by the grid origin).
 
 Vertices with a coordinate exactly equal to `N × chunk_shape[d]` (a chunk
 boundary) are placed in chunk `N`, not chunk `N-1`. This is the
@@ -187,19 +223,22 @@ These are starting points. Profile your actual access patterns and adjust.
 all chunk data. The chunk grid defines the physical file layout; changing
 `chunk_shape` would require moving data between files.
 
-If you need to change `chunk_shape` on an existing store, use the
-rechunking workflow described in [Rechunking](rechunking.md).
+If you need to change `chunk_shape` on an existing store, use
+`zarr_vectors.rechunk.rechunk_spatial` (links-aware, all geometry types), as
+described in [Rechunking](rechunking.md); `suggest_chunk_shape` proposes a
+shape from the busiest cell's link count.
 
 ### Validation
 
-L1: `chunk_shape` is present in root `.zattrs` and is a list of D positive
-numbers.
+L1: the root `zarr_vectors` block exists.
 
 L2:
-- `len(chunk_shape) == spatial_dims`.
+- `len(chunk_shape) == D` (the number of axes).
 - All elements are strictly positive.
-- `chunk_shape[d] % bin_shape[d] == 0` for all `d` (within floating-point
-  tolerance `1e-6 × chunk_shape[d]`). This constraint is documented in
-  detail in [Chunk vs bin](chunk_vs_bin.md).
-- The `chunk_grid` shape declared in each Zarr array's `zarr.json` is
-  consistent with the `chunk_shape` and the data bounding box.
+- If `base_bin_shape` is set, `chunk_shape[d] / base_bin_shape[d]` is an
+  integer on every axis (tolerance `1e-9` on the ratio). This constraint is
+  documented in detail in [Chunk vs bin](chunk_vs_bin.md).
+- A per-level `chunk_shape` is a positive integer multiple of the root's.
+
+The validators do not cross-check each array's declared grid shape against
+`chunk_shape` and the bounds.

@@ -13,9 +13,19 @@
   skeletons, meshes) for a coarser resolution level. Object thinning is
   independent of spatial coarsening (vertex binning).
 
+**Sparsity factor**
+: The value you pass to `build_pyramid` / `coarsen_level`: a number
+  `>= 1` meaning "keep one object in N". `sparsity_factor=4.0` keeps a
+  quarter of the objects. The stored `object_sparsity` is its reciprocal,
+  `1 / sparsity_factor`.
+
 **Sparsity strategy**
-: The algorithm used to select which objects to retain. Four strategies are
-  supported: `spatial_coverage`, `length`, `attribute`, and `random`.
+: The algorithm used to select which objects to retain. Core ships one,
+  `random`. Others (for example spatial coverage, length-ranked,
+  attribute-ranked and point-thinning) are registered by
+  `zarr-vectors-tools` and are selected by name via
+  `sparsity_strategy=`; requesting one without that package installed
+  raises an error naming it.
 
 **Balanced pyramid**
 : A multi-resolution pyramid where the data volume at each level decreases
@@ -25,7 +35,8 @@
 
 **Representative point**
 : A single spatial position used to characterise the spatial location of an
-  entire object for the `spatial_coverage` strategy. Typically the midpoint
+  entire object, as used by spatial-coverage strategies registered by
+  `zarr-vectors-tools`. Typically the midpoint
   or centroid of the object's vertex sequence.
 
 ---
@@ -45,8 +56,11 @@ still one million streamlines. For overview rendering, one million even-
 coarser streamlines may be far more than necessary.
 
 Object sparsity solves this by explicitly limiting the number of objects at
-coarser levels, using one of four selection strategies designed to preserve
-the perceptual quality of the spatial representation.
+coarser levels.
+
+Object ids are **preserved**: a dropped object keeps its id at the coarser
+level as an empty manifest slot, so ids stay stable across levels
+(format capability `preserved_object_ids`).
 
 ---
 
@@ -54,109 +68,57 @@ the perceptual quality of the spatial representation.
 
 ### Configuration
 
-Object sparsity is specified in `level_configs` during pyramid construction:
+Sparsity is the second element of each `factors` tuple passed to
+`build_pyramid` (and `sparsity_factor=` on `coarsen_level`). It is a
+*per-level ratio against the level below*, not a fraction of level 0:
 
 ```python
 from zarr_vectors.multiresolution.coarsen import build_pyramid
 
 build_pyramid(
     "tracts.zarrvectors",
-    factors=[(2.0, 1.00), (4.0, 4.00)],
+    factors=[(2.0, 1.0), (4.0, 4.0)],   # (coarsen_factor, sparsity_factor)
+    sparsity_strategy="random",         # the only core strategy
+    sparsity_seed=42,                   # reproducible selection
 )
 ```
 
-Or via `apply_sparsity` directly:
+Sparsity is only applied when `sparsity_factor > 1.0` **and** the source
+level has more than one object. A store with no `object_index` (a plain
+point cloud) is treated as a single implicit object, so sparsity has no
+effect on it.
+
+The selection step can also be called directly. Note that `apply_sparsity`
+takes the *fraction to keep* (in `(0, 1]`), not a factor:
 
 ```python
 from zarr_vectors.multiresolution.object_selection import apply_sparsity
 
-kept_ids = apply_sparsity(
-    n_objects=10000,
-    sparsity=0.5,
-    strategy="spatial_coverage",
-    representative_points=midpoints,    # shape (n_objects, D)
-    bin_shape=(100.0, 100.0, 100.0),
-)
+kept = apply_sparsity(10000, 0.5, "random", seed=42)   # sorted int64 indices
 ```
 
 ### Sparsity strategies
 
-#### `spatial_coverage`
+#### `random` (core)
 
-**Goal:** retain the objects that provide the best spatial coverage of the
-dataset, so the thinned set looks spatially similar to the full set.
+Samples `max(1, round(sparsity × n_objects))` object indices uniformly
+without replacement using `numpy.random.default_rng(seed)`, and returns
+them sorted. Reproducible for a fixed `seed`. This is the default and the
+only strategy core implements.
 
-**Algorithm:**
+#### Strategies from `zarr-vectors-tools`
 
-1. Compute a representative point for each object (default: midpoint of
-   the vertex sequence).
-2. Assign representative points to spatial bins of size `bin_shape`.
-3. For each bin, retain at most `ceil(sparsity × objects_in_bin)` objects.
-4. Within each bin, select retained objects uniformly at random.
-
-This strategy ensures that all spatial regions are represented at the
-coarser level, proportionally to their object density at the base level.
-It prevents the thinned set from clustering in dense regions while leaving
-sparse regions empty.
-
-```python
-kept_ids = apply_sparsity(
-    n_objects, sparsity=0.5, strategy="spatial_coverage",
-    representative_points=midpoints,
-    bin_shape=(100.0, 100.0, 100.0),
-)
-```
-
-#### `length`
-
-**Goal:** retain the longest objects (streamlines, skeletons). Useful when
-long objects are more anatomically significant.
-
-**Algorithm:** sort objects by total arc length (sum of inter-vertex
-distances), descending. Retain the top `ceil(sparsity × n_objects)`.
-
-```python
-kept_ids = apply_sparsity(
-    n_objects, sparsity=0.5, strategy="length",
-    lengths=streamline_lengths,   # shape (n_objects,), precomputed arc lengths
-)
-```
-
-When `lengths` is not provided, `zarr-vectors-py` computes arc lengths from
-the `vertices/` array automatically (at the cost of reading all vertex data).
-
-#### `attribute`
-
-**Goal:** retain objects with the highest (or lowest) value of a named
-per-object attribute.
-
-**Algorithm:** sort objects by `attribute_values`, descending (or ascending
-if `ascending=True`). Retain the top `ceil(sparsity × n_objects)`.
-
-```python
-kept_ids = apply_sparsity(
-    n_objects, sparsity=0.5, strategy="attribute",
-    attribute_values=fa_values,   # shape (n_objects,), e.g. mean FA
-)
-```
-
-This strategy is useful for tractography datasets where a per-streamline
-metric (mean FA, tract coherence, connectivity weight) indicates scientific
-importance.
-
-#### `random`
-
-**Goal:** reproducible random selection. Simple baseline strategy.
-
-**Algorithm:** sample `ceil(sparsity × n_objects)` object IDs uniformly
-at random without replacement, using the declared `seed` for reproducibility.
-
-```python
-kept_ids = apply_sparsity(
-    n_objects, sparsity=0.5, strategy="random",
-    seed=42,
-)
-```
+Spatial-coverage, length-ranked, attribute-ranked and point-thinning
+selection are not part of core. `apply_sparsity` accepts the optional
+context arguments they need (`lengths`, `attribute_values`,
+`attribute_mode`, `representative_points`, `bin_shape`) and forwards them
+verbatim to a registered strategy; the built-in `random` ignores them.
+A registered strategy has the signature
+`fn(n_objects, target_count, **ctx) -> sorted int64 indices` (see
+[`registry.py`](../../../zarr_vectors/multiresolution/registry.py)). Which
+names are available depends on the installed version of that package; the
+core coarsener itself passes `representative_points=None`, so a strategy
+that needs object geometry must obtain it on its own.
 
 ### Total volume reduction
 
@@ -170,7 +132,7 @@ where:
 
 ```
 vertex_reduction   = product(bin_ratio[N][d] for d in range(D))   (theoretical max)
-object_reduction   = 1.0 / object_sparsity[N]
+object_reduction   = 1.0 / object_sparsity[N]   (= sparsity_factor, compounded)
 ```
 
 For a 3-D streamline store with `bin_ratio = (4, 4, 4)` and
@@ -190,50 +152,38 @@ vertex, giving no reduction from spatial coarsening.
 ### Designing a balanced pyramid
 
 A common design goal is a balanced pyramid where each level is
-roughly `k×` smaller than the previous. For a target reduction of `8×`
-per level and `D = 3`:
+roughly `k×` smaller than the previous. Because both factors are
+per-level ratios, they compound. For a target reduction of `8×` per level
+and `D = 3`:
 
-- If spatial coarsening alone provides `8×` (`bin_ratio = (2,2,2)`),
-  set `object_sparsity = 1.0`.
-- If you want `16×` per level (aggressive thinning):
-  `bin_ratio = (2,2,2)` (8× vertex) × `object_sparsity = 0.5` (2× object)
-  = 16×.
-- If spatial density is very uneven, `spatial_coverage` strategy maintains
-  perceptual quality better than `random` for the same `object_sparsity`.
+- If spatial coarsening alone provides `8×` (`coarsen_factor=2.0` in 3-D),
+  use `sparsity_factor=1.0`.
+- For `16×` per level: `coarsen_factor=2.0` (8× vertex) with
+  `sparsity_factor=2.0` (2× object).
 
 ```python
 build_pyramid(
     "tracts.zarrvectors",
-    factors=[(2.0, 2.00), (4.0, 4.00), (8.0, 8.00)],
+    factors=[(2.0, 2.0), (2.0, 2.0), (2.0, 2.0)],   # 16x per level
 )
 ```
 
 ### Object sparsity and point clouds
 
-Object sparsity is only defined for geometry types with discrete objects.
-For point clouds (`GEOM_POINT_CLOUD`), there is no concept of a discrete
-object; every vertex is independent. The per-level `.zattrs` for a point
-cloud store always has `"object_sparsity": 1.0`, and the `sparsity_strategy`
-key is absent.
-
-Spatial thinning of point clouds is exposed via the
-[`point_thinning` strategy](../../../zarr_vectors/multiresolution/object_selection.py):
-`select_point_thinning(positions, bin_shape, seed=...)` keeps at most
-one survivor per spatial bin, yielding a uniform-density thinned
-cloud.  The same strategy is selectable through
-`apply_sparsity(..., strategy="point_thinning",
-representative_points=, bin_shape=)`.
+Object sparsity is only meaningful for geometry types with discrete objects.
+A point cloud written without `object_ids` has no `object_index`, so the
+core coarsener sees one implicit object and never thins it. Note however
+that the `object_sparsity` written to the level metadata is simply
+`1 / sparsity_factor`; the writer does not force it to `1.0` for point
+clouds, so pass `sparsity_factor=1.0` for them.
 
 ### Validation
 
-L2 checks:
-
-- `object_sparsity` is in `(0.0, 1.0]` at every level.
-- Point cloud stores have `object_sparsity == 1.0` at every level.
-
-L5 checks (pyramid consistency):
-
-- `object_count` at level `N` ≤ `object_count` at level `N-1`.
-- `object_count` at level `N` ≈ `object_count` at level 0 × `object_sparsity`
-  (within a tolerance of 1 object, due to ceiling arithmetic).
-- `vertex_count` at level `N` ≤ `vertex_count` at level `N-1`.
+L2 checks `object_sparsity` is in `(0.0, 1.0]` at every level, and L5
+repeats that check, but both read the value as a flat key on the level
+group, which current writers do not produce (they nest it under
+`zarr_vectors_level`). `LevelMetadata.validate()` enforces the same range
+when a level is created. No validator checks that point clouds have
+`object_sparsity == 1.0`, and none compares object counts across levels.
+L5 checks that `vertex_count` does not increase from level to level. See
+[Validation overview](../validation/overview.md).

@@ -16,6 +16,21 @@ from typing import Any
 
 import numpy as np
 
+# Windows has no os.pread, and os.open there defaults to text mode.
+_O_READ = os.O_RDONLY | getattr(os, "O_BINARY", 0)
+
+
+def _pread(fd: int, size: int, offset: int) -> bytes:
+    if hasattr(os, "pread"):
+        return os.pread(fd, size, offset)
+    os.lseek(fd, offset, os.SEEK_SET)
+    parts = []
+    while size > 0 and (part := os.read(fd, size)):
+        parts.append(part)
+        size -= len(part)
+    return b"".join(parts)
+
+
 _EMPTY = np.uint64(2**64 - 1)
 
 
@@ -232,7 +247,7 @@ def _read_ranges(items: list[tuple[str, int, int]]) -> list[bytes | None | Excep
         for path, offset, size in items:
             if path not in fds:
                 try:
-                    fds[path] = os.open(path, os.O_RDONLY)
+                    fds[path] = os.open(path, _O_READ)
                 except FileNotFoundError:
                     fds[path] = None
                 except Exception as exc:  # noqa: BLE001 - reported per cell
@@ -246,7 +261,7 @@ def _read_ranges(items: list[tuple[str, int, int]]) -> list[bytes | None | Excep
             try:
                 if size < 0:
                     size = os.fstat(fd).st_size
-                data = os.pread(fd, size, offset)
+                data = _pread(fd, size, offset)
             except Exception as exc:  # noqa: BLE001 - reported per cell
                 out.append(exc)
                 continue

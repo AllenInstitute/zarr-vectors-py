@@ -4,6 +4,14 @@ The `zarr-vectors` validator checks Zarr Vectors stores for conformance at five
 levels of increasing thoroughness. This tutorial covers running validation
 and interpreting results.
 
+**You will learn:** how to run the validator, what each of the five levels
+checks, how to read its messages, and which (few) problems can be repaired in
+place. **Prerequisite:** the [Quickstart](../../getting_started/quickstart.md) —
+the examples validate the `scan.zarrvectors` and `tracts.zarrvectors` stores
+built there, so run it (or the
+[point-cloud](../data_types/point_clouds.md) and
+[streamline](../data_types/polylines_streamlines.md) tutorials) first.
+
 A note on scope: **there is no general-purpose repair module.**
 `zarr-vectors` ships no function that rebuilds an object index, a fragment
 index, or a links family from damaged data. The validator tells you what is
@@ -540,5 +548,5 @@ def test_fixture_passes_l5(store_path):
     assert result.ok, result.summary()
 ```
 
-`str(store_path)` on a `Path` is the right spelling here — the validator
-wants the filesystem path, not a URL.
+`validate` accepts a `str`, a `Path`, a URL or an open handle, so the
+`str(...)` above is optional.

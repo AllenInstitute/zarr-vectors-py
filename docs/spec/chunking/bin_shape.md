@@ -11,8 +11,10 @@
 **Supervoxel bin**
 : The finest spatial subdivision in Zarr Vectors. Each bin is a rectangular region
   of physical space whose size is `bin_shape`. Bins tile the interior of
-  each chunk exactly, with no gaps or overlaps. All vertices whose position
-  falls within a bin are stored together as a fragment (fragment).
+  each chunk exactly, with no gaps or overlaps. In an undifferentiated point
+  cloud, all vertices whose position falls within a bin are stored together as
+  one fragment. (Other geometry types do not fragment by bin; see
+  [Where bins are used](#where-bins-are-used).)
 
 **Bins per chunk (`B_per_chunk`)**
 : The total number of bins within a single chunk:
@@ -26,24 +28,27 @@
   At level 0, effective bin shape equals `base_bin_shape`.
 
 **`base_bin_shape`**
-: The bin shape at the full-resolution level (level 0). Stored in root
-  `.zattrs`. Serves as the reference from which all coarser-level bin
+: The bin shape at the full-resolution level (level 0). Stored in the root
+  attributes under `zarr_vectors.base_bin_shape`; absent means "equal to
+  `chunk_shape`". Serves as the reference from which all coarser-level bin
   shapes are derived.
 
 **Divisibility constraint**
-: The requirement that `chunk_shape[d] % bin_shape[d] == 0` for all `d`.
-  Ensures bins tile chunks exactly, which is necessary for the fragment index
-  to be well-defined. Validated at write time and by the L2 validator.
+: The requirement that `chunk_shape[d] / base_bin_shape[d]` is an integer for
+  all `d`. Ensures level-0 bins tile chunks exactly, which is necessary for
+  bin ↔ fragment indexing to be well-defined. Checked by the L2 validator, by
+  `rebin_level` and by `add_resolution_level`; the point-cloud writer itself
+  rounds `chunk_shape / bin_shape` and does not check.
 
 ---
 
 ## Introduction
 
-Bins are the unit of spatial querying in Zarr Vectors. When you issue a bounding-box
-query, the query engine does not load entire chunks — it identifies which
-bins overlap the query region and reads only those bins' vertices. This
-sub-chunk spatial resolution is what makes Zarr Vectors efficient for small targeted
-queries on large datasets.
+Bins are the unit of sub-chunk spatial querying for point clouds. When you issue
+a bounding-box query against a point-cloud store with several bins per chunk,
+the reader still fetches each overlapping chunk, but it decodes only the
+fragments of the bins that overlap the query region. This sub-chunk resolution
+is what keeps small queries on large chunks cheap.
 
 `bin_shape` is the parameter that controls this query granularity. A smaller
 `bin_shape` means finer spatial queries (less read amplification for small
@@ -63,47 +68,65 @@ the fragment structure carries per-object semantics so a full
 
 ## Technical reference
 
+### Where bins are used
+
+Only **undifferentiated point clouds** (`write_points` without `object_ids`,
+`object_attributes` or `groups`) fragment by bin; there, fragment `f` of a chunk
+is the bin with row-major index `f` (see [Fragments](../object_model/fragments.md)).
+Point clouds written with objects, polylines, lines, graphs, skeletons and
+meshes accept `bin_shape` and record it as `base_bin_shape`, but their writers
+split at chunk boundaries only and emit one fragment per object per chunk. For
+those types `bin_shape` still sets the **coarsening grid** of a pyramid (bin
+centroids become metavertices) and the NGFF scale of each level. It does not
+subdivide chunks on disk, and `rebin_level` refuses them.
+
 ### Declaration and storage
 
-`base_bin_shape` is declared in root `.zattrs`:
+`base_bin_shape` is declared in the root attributes' `zarr_vectors` block:
 
 ```json
 {
-  "chunk_shape":    [200.0, 200.0, 200.0],
-  "base_bin_shape": [50.0,  50.0,  50.0]
+  "zarr_vectors": {
+    "chunk_shape":    [200.0, 200.0, 200.0],
+    "base_bin_shape": [50.0,  50.0,  50.0]
+  }
 }
 ```
 
-The effective bin shape at each resolution level is stored in the per-level
-`.zattrs` for convenience:
+The effective bin shape of each level is **not** stored in the level's own
+metadata. It is the level's NGFF transform in the root `multiscales` block:
 
 ```json
-{
-  "level":     1,
-  "bin_ratio": [2, 2, 2],
-  "bin_shape": [100.0, 100.0, 100.0]
-}
+{"path": "1", "coordinateTransformations": [
+  {"type": "scale",       "scale":       [2.0, 2.0, 2.0]},
+  {"type": "translation", "translation": [50.0, 50.0, 50.0]}
+]}
 ```
 
-Readers should compute `bin_shape` at level `N` as:
+so that `bin_ratio = scale` and `bin_shape = 2 × translation`, and by
+construction
+
 ```
 bin_shape[N][d] = base_bin_shape[d] × bin_ratio[N][d]
 ```
 
-and cross-check against the stored `bin_shape` value. A mismatch is a
-validation error (L2).
+(`read_level_metadata` returns both; level 0 reports `None` and uses
+`base_bin_shape`.) A level's scale is relative to level 0; the `coarsen_factor`
+you pass to `coarsen_level` is relative to the *parent* level and compounds.
 
 ### Divisibility constraint
 
-For bins to tile chunks exactly, `bin_shape` must divide `chunk_shape`
-evenly in every dimension:
+For level-0 bins to tile chunks exactly, `base_bin_shape` must divide
+`chunk_shape` evenly in every dimension:
 
 ```
-chunk_shape[d] / bin_shape[d]  must be a positive integer,  for all d
+chunk_shape[d] / base_bin_shape[d]  must be a positive integer,  for all d
 ```
 
-This is enforced at write time. The write functions raise `ValueError` if
-the constraint is violated.
+Tolerance is `1e-9` on the ratio. The violation is reported as a
+`MetadataError` by `validate_bin_shape_divides_chunk` (called by
+`rebin_level` and `add_resolution_level`) and as an L2 error by the validator;
+`write_points` does not itself check it, so an invalid pair surfaces later.
 
 **Example of a valid configuration:**
 
@@ -119,21 +142,11 @@ chunk_shape = (200, 200, 200)
 bin_shape   = (60, 60, 60)    → 3.333… bins per axis ✗
 ```
 
-The constraint applies at every resolution level. Because the effective
-bin shape at level `N` is `base_bin_shape × bin_ratio[N]`, and
-`base_bin_shape` already satisfies the constraint at level 0, coarser
-levels are automatically valid provided `bin_ratio` components are
-positive integers and the products `base_bin_shape[d] × bin_ratio[N][d]`
-still divide `chunk_shape[d]`.
-
-For example, with `chunk_shape = (200,)`, `base_bin_shape = (50,)`,
-and `bin_ratio = [4]` at level 2: `effective_bin_shape = 200.0`. This is
-valid (1 bin per chunk at level 2). `bin_ratio = [5]` would give
-`effective_bin_shape = 250.0 > chunk_shape[0]`, which is invalid.
-
-**Rule:** `bin_ratio[N][d]` must satisfy
-`base_bin_shape[d] × bin_ratio[N][d] ≤ chunk_shape[d]`, and the ratio
-must be a divisor.
+The constraint is **not** required of coarser levels. A coarse level's bin is
+routinely *larger* than the chunk it sits in (bin 200 in a chunk of 100: one
+bin spans two chunks), and the library's own coarsener produces such levels.
+The check is applied to a coarser level only if it overrides `chunk_shape`, and
+then only on axes where the bin is no larger than the chunk.
 
 ### Bin coordinate arithmetic
 
@@ -153,14 +166,12 @@ bin_flat   = int(np.ravel_multi_index(bin_coord, bpc_shape))
 
 ### Default behaviour when `bin_shape` is omitted
 
-If `bin_shape` is not specified at write time, it defaults to
-`chunk_shape`. This results in exactly one bin per chunk
-(`B_per_chunk = 1`), which is equivalent to a purely chunk-indexed store
-without sub-chunk spatial indexing.
-
-This default preserves backward compatibility with readers and tools that
-do not understand the bin concept. A bbox query on a one-bin-per-chunk
-store degrades gracefully to chunk-granularity queries.
+If `bin_shape` is not specified at write time, the effective bin shape is
+`chunk_shape` and **no `base_bin_shape` key is written**. This results in
+exactly one bin per chunk (`B_per_chunk = 1`), which is equivalent to a purely
+chunk-indexed store without sub-chunk spatial indexing: each chunk has a single
+fragment `(0, N)`. A bbox query on such a store degrades gracefully to
+chunk-granularity queries.
 
 ### Choosing `bin_shape`
 
@@ -185,39 +196,46 @@ larger `bin_shape` (fewer bins) reduces fragment index overhead.
 
 ### Effect on multiscale pyramids
 
-At coarser resolution levels, the effective bin shape grows proportionally
-with `bin_ratio`. This is the mechanism by which Zarr Vectors achieves spatial
-downsampling: the bin grid at level 1 is half as fine as at level 0 (for
-`bin_ratio = (2, 2, 2)`), so each bin at level 1 covers 8× the volume and
-contains up to 8× as many merged vertices.
+At coarser resolution levels, the effective bin shape grows with the level's
+`bin_ratio`. This is the mechanism by which Zarr Vectors achieves spatial
+downsampling: with `bin_ratio = (2, 2, 2)` each bin at level 1 covers 8× the
+volume, and the coarsener replaces the vertices of an object that fall in one
+bin by a single centroid (a metavertex).
 
-The `chunk_shape` never changes across levels. Only the bin grid changes.
-This means the file layout (one file per chunk) is identical at all levels;
-only the fragment index and vertex positions differ.
+The chunk grid does not have to change with the bin grid. By default every
+level inherits the root `chunk_shape`, so the file layout is identical at all
+levels and only the fragment index and vertex positions differ. A level may
+instead scale its chunks by an integer factor (`chunk_scale_factor`), keeping
+the grids nested; its bins are then measured against that larger chunk.
+
+### Re-binning
+
+`zarr_vectors.rechunk.rebin_level(store, target_bin_shape, level=0)` changes the
+bin grid of a **point-cloud** store in place without moving chunk files. See
+[Rechunking](rechunking.md#rechunking-only-bin_shape) for its side effects
+(attributes are not rewritten; fragments become occupied-bins-only).
 
 ### Validation
 
-L1: `base_bin_shape` is present in root `.zattrs` and is a list of D
-positive numbers.
+L1: the root `zarr_vectors` block exists.
 
 L2:
-- `len(base_bin_shape) == spatial_dims`.
-- All elements are strictly positive.
-- `chunk_shape[d] % base_bin_shape[d] == 0` for all `d`.
-- For each resolution level `N`: `effective_bin_shape[N][d] ≤ chunk_shape[d]`
-  and `chunk_shape[d] % effective_bin_shape[N][d] == 0` for all `d`.
-- `bin_ratio` values at every level are positive integers.
+- If `base_bin_shape` is present: length `D`, all elements strictly positive,
+  and `chunk_shape[d] / base_bin_shape[d]` an integer on every axis.
+- Per level (when the level carries `bin_shape` / `bin_ratio` in its raw
+  attributes, which current writers do not): `bin_ratio >= 1` and the bin
+  divides the effective chunk shape.
+- A level that overrides `chunk_shape` has nested chunks and, where the bin is
+  no larger than the chunk, bins that tile it.
 
-L3:
-- At level 0 with the default writer (i.e. when
-  `LevelMetadata.shared_fragments=False`), the range fragment count
-  `R` in each chunk's `vertex_fragments/<chunk_coords>` blob equals
-  that chunk's non-empty-bin count. `B_per_chunk =
-  product(chunk_shape[d] / effective_bin_shape[N][d])` remains the
-  upper bound on the total fragment count `F`.
-- For every range fragment, `start + count ≤ vertex_count_in_chunk`.
-  For every explicit fragment, all entries of the index list lie in
-  `[0, vertex_count_in_chunk)`.
-- At coarsened levels with `shared_fragments=True`, `F` is bounded
-  by the number of distinct metavertices in the chunk and has no
-  fixed relation to `B_per_chunk`.
+L3 (undifferentiated point clouds only, and only when `base_bin_shape` yields
+more than one bin per chunk):
+- a chunk has no more fragments than `B_per_chunk`;
+- for the first three chunks checked, points of fragment `f` lie inside the bin
+  `fragment_index_to_bin(f, …)` (a warning, with a `1e-4` tolerance).
+
+Writer invariants that the validator does not check individually: a range
+fragment satisfies `start + count <= rows in the chunk` and an explicit
+fragment's indices lie in `[0, rows)`. When `shared_fragments=True`, `F` is
+bounded by the number of distinct metavertices and has no fixed relation to
+`B_per_chunk`.

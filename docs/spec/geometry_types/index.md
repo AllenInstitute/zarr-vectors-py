@@ -1,9 +1,22 @@
 # Geometry types
 
 Zarr Vectors defines seven geometry types. Each type is identified by a string
-constant stored in the root `.zattrs` under `"geometry_type"`. A single
-Zarr Vectors store holds exactly one geometry type; multi-type datasets require
-multiple stores.
+constant stored in the root `zarr_vectors` attribute block under
+`"geometry_types"` (a list, e.g. `["streamline"]`). A store normally holds one
+geometry type, and the dataset API (`zarr_vectors.open`) reads a store as the
+first type listed. A `zarr_vectors.composite` module can add further types
+to one store, but treat multi-type stores as unsupported for the common
+readers; use multiple stores.
+
+Every geometry type has a `write_*` / `read_*` pair in `zarr_vectors.types`:
+
+| Type | Writer | Reader | Dataset API |
+|------|--------|--------|-------------|
+| `point_cloud` | `write_points` | `read_points` | `ds.add_points` |
+| `line` | `write_lines` | `read_lines` | `ds.add_lines` |
+| `polyline`, `streamline` | `write_polylines(geometry_type=...)` | `read_polylines` | `ds.add_polylines(streamlines=...)` |
+| `graph`, `skeleton` | `write_graph(kind=...)` | `read_graph` | `ds.add_graph(tree=...)` |
+| `mesh` | `write_mesh` | `read_mesh` | `ds.add_mesh` |
 
 ## Type constants
 
@@ -23,19 +36,25 @@ from zarr_vectors.constants import (
 
 | Property | `point_cloud` | `line` | `polyline` | `streamline` | `graph` | `skeleton` | `mesh` |
 |----------|:---:|:---:|:---:|:---:|:---:|:---:|:---:|
-| Discrete objects | — | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
+| Discrete objects | optional† | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
 | `links/` family | — | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
 | `link_width` | — | 2 | 2 | 2 | 2 | 2 | ≥ 3 |
-| Intra-chunk links (`0.0.0`) | — | — | — | — | ✓ | ✓ | ✓* |
+| `links_convention` | — | implicit_sequential | implicit_sequential | implicit_sequential | explicit | implicit_sequential_with_branches | explicit |
+| Intra-chunk links (`0.0.0`) | — | — | — | — | ✓ | ✓‡ | ✓* |
 | Cross-chunk links (non-zero offsets) | — | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
-| Family `directed` | — | false | false | false | false | **true** | false |
-| `object_index/` | — | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
-| `object_attributes/` | — | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
-| `groupings/` | — | — | ✓ | ✓ | ✓ | ✓ | ✓ |
+| Family `directed` | — | false | false | false | false | false (`write_graph`); **true** (streaming writers) | false |
+| `object_index/` | optional† | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
+| `object_attributes/` | optional† | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
+| `groups/` written by `write_*` | ✓† | — | ✓ | ✓ | — | — | — |
 | Per-vertex attributes | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
-| Object sparsity | — | — | ✓ | ✓ | ✓ | ✓ | ✓ |
-| Multiscale pyramid | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
+| Multiscale pyramid (core `per_object`) | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
 | Draco compression | — | — | — | — | — | — | ✓ |
+
+† Only when `object_ids=` / `object_attributes=` / `groups=` is passed to
+`write_points`.
+
+‡ A skeleton stores only the edges that depth-first order does not imply:
+branch points and fragment starts intra-chunk, plus every cross-chunk edge.
 
 \* Mesh intra-chunk faces move into the Draco bitstream under
 `encoding="draco"`, leaving only boundary faces in `links/`.
@@ -49,7 +68,7 @@ links, and a store whose objects never cross a chunk has no `links/`
 group at all.
 
 There are no `is_directed` or `is_tree` root keys; `directed` is
-per-family link policy, and tree-ness is carried by `geometry_type`
+per-family link policy, and tree-ness is carried by `geometry_types`
 plus `links_convention`. See [Links](../object_model/links.md).
 
 ## Type selection guide
