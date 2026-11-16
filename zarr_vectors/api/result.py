@@ -515,12 +515,15 @@ class ReadResult:
 
     @classmethod
     def from_graph(cls, raw: Mapping[str, Any], *, kind: str) -> ReadResult:
-        """``{positions, edges, node_count, edge_count}``."""
+        """``{positions, edges, node_count, edge_count}``, plus a
+        per-node ``object_ids`` on the ``object_ids=`` path."""
         positions = np.asarray(raw["positions"])
+        object_ids = raw.get("object_ids")
         return cls(
             kind=kind,
             positions=positions,
             parts=(slice(0, len(positions)),) if len(positions) else (),
+            object_ids=None if object_ids is None else np.asarray(object_ids),
             edges=np.asarray(raw["edges"]),
             attributes_read=False,
         )

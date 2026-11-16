@@ -347,6 +347,13 @@ def requires_object_index(convention: str, num_chunks: int) -> bool:
 # RootMetadata
 # ===================================================================
 
+def _capability_list(value: Any) -> list[str]:
+    """The string entries of a list value; ``[]`` for anything else."""
+    if not isinstance(value, (list, tuple)):
+        return []
+    return [c for c in value if isinstance(c, str)]
+
+
 @dataclass
 class RootMetadata:
     """Root-level metadata for a ZV store.
@@ -393,6 +400,15 @@ class RootMetadata:
     """Optional capability tokens this store uses.  See
     :mod:`zarr_vectors.constants` for the canonical token names
     (``CAP_*``).  Empty list by default."""
+    required_capabilities: list[str] = field(default_factory=list)
+    """Capabilities a reader must implement to read this store correctly;
+    a reader that checks the list refuses a store naming one it does not
+    implement.  A store with an octree-chunked level lists
+    :data:`~zarr_vectors.constants.CAP_OCTREE_CHUNKS` (kept by the
+    conversions in :mod:`zarr_vectors.octree_chunks`); one with additive
+    levels, ``"additive_levels"``.  This package does not refuse on it
+    yet.  Optional and empty by default -- written only when non-empty --
+    and round-tripped here so a rewrite of the root keeps it."""
     attribute_specs: dict[str, dict[str, Any]] | None = None
     """What the store declares its attributes to be, by scope.
 
@@ -423,6 +439,14 @@ class RootMetadata:
     store written before it. It is a writer default, not a claim about
     what is on disk; an array's own ``zarr.json`` remains the truth about
     that array, and ``sharding.get_shard_info`` reports it."""
+    octree_sharding: dict[str, Any] | None = None
+    """The store's octree marker: the ``zarr_octree_sharding`` codec's
+    configuration (``{}`` for its defaults), or ``None`` for
+    ``sharding_indexed``.  Like ``shard_shape``, a writer default read by
+    every path that allocates a sharded per-chunk array; each array's own
+    ``zarr.json`` remains the truth about that array.  Needs
+    ``shard_shape``.  Optional and additive: absent in every other store
+    (see :data:`zarr_vectors.constants.CAP_OCTREE_SHARDING`)."""
     manifest_layout: str | None = None
     """``"dense"`` when object indexes are created in the dense layout
     (``manifest_spans`` + ``manifest_blocks``), else ``None`` for the vlen
@@ -581,6 +605,11 @@ class RootMetadata:
                 normalise_shard_shape(self.shard_shape, sid_ndim)
             except ValueError as exc:
                 raise MetadataError(f"Invalid shard_shape: {exc}") from exc
+        if self.octree_sharding is not None and self.shard_shape is None:
+            raise MetadataError(
+                "octree_sharding is set but shard_shape is not: the octree "
+                "groups the cells of a shard, so the store must be sharded"
+            )
 
     @property
     def effective_bin_shape(self) -> tuple[float, ...]:
@@ -627,12 +656,16 @@ class RootMetadata:
                 if isinstance(self.shard_shape, int)
                 else [int(x) for x in self.shard_shape]
             )
+        if self.octree_sharding is not None:
+            d["zarr_vectors"]["octree_sharding"] = dict(self.octree_sharding)
         if self.manifest_layout == "dense":
             d["zarr_vectors"]["manifest_layout"] = "dense"
         if self.manifest_block_dtype == "int32":
             d["zarr_vectors"]["manifest_block_dtype"] = "int32"
         if self.format_capabilities:
             d["zarr_vectors"]["format_capabilities"] = list(self.format_capabilities)
+        if self.required_capabilities:
+            d["zarr_vectors"]["required_capabilities"] = list(self.required_capabilities)
         if self.attribute_specs:
             d["zarr_vectors"]["attribute_specs"] = {
                 scope: {n: dict(spec) for n, spec in named.items()}
@@ -710,6 +743,7 @@ class RootMetadata:
             reduction_factor=zv.get("reduction_factor", DEFAULT_REDUCTION_FACTOR),
             base_bin_shape=tuple(bbs) if bbs else None,
             format_capabilities=list(caps),
+            required_capabilities=_capability_list(zv.get("required_capabilities")),
             attribute_specs=(
                 {
                     scope: {n: dict(spec) for n, spec in named.items()}
@@ -718,6 +752,9 @@ class RootMetadata:
                 if (specs := zv.get("attribute_specs")) else None
             ),
             shard_shape=_read_shard_shape(zv.get("shard_shape")),
+            octree_sharding=(
+                dict(zv["octree_sharding"]) if zv.get("octree_sharding") is not None else None
+            ),
             manifest_layout=zv.get("manifest_layout"),
             manifest_block_dtype=zv.get("manifest_block_dtype"),
         )
@@ -884,6 +921,9 @@ class LevelMetadata:
     records silently, so absent (the default, and what every earlier
     store says) means "unknown" and readers fall back to filtering the
     whole cell."""
+    octree_chunks: dict[str, Any] | None = None
+    """The octree plan (``max_depth``, ``origin_cell``, ``target``, ``balanced``),
+    or ``None`` for a uniform level; see :doc:`/spec/chunking/octree_chunks`."""
 
     def to_dict(self) -> dict[str, Any]:
         """Serialise to a JSON-compatible dict."""
@@ -920,6 +960,8 @@ class LevelMetadata:
             d["fragments_tile"] = True
         if self.link_fragments_aligned:
             d["link_fragments_aligned"] = True
+        if self.octree_chunks is not None:
+            d["octree_chunks"] = dict(self.octree_chunks)
         return {"zarr_vectors_level": d}
 
     @classmethod
@@ -969,6 +1011,7 @@ class LevelMetadata:
             shared_fragments=bool(lv.get("shared_fragments", False)),
             fragments_tile=bool(lv.get("fragments_tile", False)),
             link_fragments_aligned=bool(lv.get("link_fragments_aligned", False)),
+            octree_chunks=dict(lv["octree_chunks"]) if isinstance(lv.get("octree_chunks"), dict) else None,
         )
 
     def validate(self) -> None:

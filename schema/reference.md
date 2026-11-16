@@ -82,6 +82,7 @@ Name: zarr_vectors
 | [parent_level](parent_level.md) | Source level index (None for level 0) |
 | [preserves_object_ids](preserves_object_ids.md) | True for levels written by the per-object pyramid regime |
 | [reduction_factor](reduction_factor.md) | Multi-resolution coarsening factor (≥ 2) |
+| [required_capabilities](required_capabilities.md) | Capabilities a reader must implement to read this store correctly; a reader t... |
 | [row_shape](row_shape.md) | Tail dimensions of one attribute row (``[]`` for a 1-D per-link attribute), l... |
 | [shape](shape.md) | Shape of a dense per-object/per-group array |
 | [shard_shape](shard_shape.md) | Cells per shard per axis, or absent for one storage object per cell |
@@ -2023,6 +2024,7 @@ URI: [zv:FormatCapability](https://w3id.org/zarr-vectors/schema/0.5/FormatCapabi
 | shared_fragments | None | At least one level stores per-chunk fragments that may be referenced by multi... |
 | fragment_index | None | The store uses the v0 |
 | multiscale_links | None | Store uses the multiscale links layout (``links/<delta>/<offsets>/`` and ``li... |
+| octree_chunks | None | At least one level has octree chunks: its chunks are octree leaves of several... |
 
 
 
@@ -2032,6 +2034,7 @@ URI: [zv:FormatCapability](https://w3id.org/zarr-vectors/schema/0.5/FormatCapabi
 | Name | Description |
 | ---  | --- |
 | [format_capabilities](format_capabilities.md) | Optional 0 |
+| [required_capabilities](required_capabilities.md) | Capabilities a reader must implement to read this store correctly; a reader t... |
 
 
 
@@ -2100,6 +2103,14 @@ permissible_values:
       edges (``delta != 0``).  Since 0.9.0 there is no separate cross-chunk family
       — a cross-chunk link is a link with a non-zero offsets segment — so this token
       now marks only the presence of ``delta != 0`` arrays.
+
+      '
+  octree_chunks:
+    text: octree_chunks
+    description: 'At least one level has octree chunks: its chunks are octree leaves
+      of several grid cells each, stored at each leaf''s anchor cell, and links between
+      leaves are named ``offset^depth-change``. A reader without it would take each
+      leaf for one grid cell, so a store using it also lists it in ``required_capabilities``.
 
       '
 
@@ -5862,6 +5873,17 @@ URI: [zv:RootMetadata](https://w3id.org/zarr-vectors/schema/0.5/RootMetadata)
         
       RootMetadata : reduction_factor
         
+      RootMetadata : required_capabilities
+        
+          
+    
+        
+        
+        RootMetadata --> "*" FormatCapability : required_capabilities
+        click FormatCapability href "../FormatCapability/"
+    
+
+        
       RootMetadata : shard_shape
         
       RootMetadata : zv_version
@@ -5891,6 +5913,7 @@ URI: [zv:RootMetadata](https://w3id.org/zarr-vectors/schema/0.5/RootMetadata)
 | [reduction_factor](reduction_factor.md) | 0..1 <br/> [Integer](Integer.md) | Multi-resolution coarsening factor (≥ 2) | direct |
 | [base_bin_shape](base_bin_shape.md) | * <br/> [Float](Float.md) | Supervoxel bin edge lengths at level 0 | direct |
 | [format_capabilities](format_capabilities.md) | * <br/> [FormatCapability](FormatCapability.md) | Optional 0 | direct |
+| [required_capabilities](required_capabilities.md) | * <br/> [FormatCapability](FormatCapability.md) | Capabilities a reader must implement to read this store correctly; a reader t... | direct |
 | [attribute_specs](attribute_specs.md) | 0..1 <br/> [AttributeSpecs](AttributeSpecs.md) | What the store declares its attributes to be, keyed by scope (``vertex`` / ``... | direct |
 | [shard_shape](shard_shape.md) | * <br/> [Integer](Integer.md) | Cells per shard per axis, or absent for one storage object per cell | direct |
 | [manifest_layout](manifest_layout.md) | 0..1 <br/> [ManifestLayout](ManifestLayout.md) | ``dense`` when object indexes are created in the dense layout (``manifest_spa... | direct |
@@ -5965,6 +5988,7 @@ slots:
 - reduction_factor
 - base_bin_shape
 - format_capabilities
+- required_capabilities
 - attribute_specs
 - shard_shape
 - manifest_layout
@@ -6131,6 +6155,20 @@ attributes:
   format_capabilities:
     name: format_capabilities
     description: Optional 0.3+ feature tokens advertised by this store.
+    from_schema: https://w3id.org/zarr-vectors/schema/0.5
+    rank: 1000
+    owner: RootMetadata
+    domain_of:
+    - RootMetadata
+    range: FormatCapability
+    multivalued: true
+  required_capabilities:
+    name: required_capabilities
+    description: 'Capabilities a reader must implement to read this store correctly;
+      a reader that checks the list refuses a store naming one it does not implement.  Optional,
+      default empty.  A store with an octree-chunked level lists ``octree_chunks``.
+
+      '
     from_schema: https://w3id.org/zarr-vectors/schema/0.5
     rank: 1000
     owner: RootMetadata
@@ -11479,6 +11517,114 @@ rank: 1000
 domain_of:
 - LevelMetadata
 range: boolean
+
+```
+</details></div>
+
+
+---
+
+---
+search:
+  boost: 5.0
+---
+
+# Slot: required_capabilities 
+
+
+_Capabilities a reader must implement to read this store correctly; a reader that checks the list refuses a store naming one it does not implement.  Optional, default empty.  A store with an octree-chunked level lists ``octree_chunks``._
+
+__
+
+
+
+<div data-search-exclude markdown="1">
+
+
+
+URI: [zv:required_capabilities](https://w3id.org/zarr-vectors/schema/0.5/required_capabilities)
+<!-- no inheritance hierarchy -->
+
+
+
+
+
+## Applicable Classes
+
+| Name | Description | Modifies Slot |
+| --- | --- | --- |
+| [RootMetadata](RootMetadata.md) | Root-level `` |  no  |
+
+
+
+
+
+
+## Properties
+
+### Type and Range
+
+| Property | Value |
+| --- | --- |
+| Range | [FormatCapability](FormatCapability.md) |
+| Domain Of | [RootMetadata](RootMetadata.md) |
+### Cardinality and Requirements
+
+| Property | Value |
+| --- | --- |
+| Multivalued | Yes |
+
+
+
+
+
+
+
+
+
+
+
+
+## Identifier and Mapping Information
+
+
+
+
+
+### Schema Source
+
+
+* from schema: https://w3id.org/zarr-vectors/schema/0.5
+
+
+
+
+## Mappings
+
+| Mapping Type | Mapped Value |
+| ---  | ---  |
+| self | zv:required_capabilities |
+| native | zv:required_capabilities |
+
+
+
+
+## LinkML Source
+
+<details>
+```yaml
+name: required_capabilities
+description: 'Capabilities a reader must implement to read this store correctly; a
+  reader that checks the list refuses a store naming one it does not implement.  Optional,
+  default empty.  A store with an octree-chunked level lists ``octree_chunks``.
+
+  '
+from_schema: https://w3id.org/zarr-vectors/schema/0.5
+rank: 1000
+domain_of:
+- RootMetadata
+range: FormatCapability
+multivalued: true
 
 ```
 </details></div>

@@ -251,6 +251,30 @@ separate cross-chunk family — a cross-chunk link is a link with a
 non-zero offsets segment — so this token now marks only the presence of
 ``delta != 0`` arrays."""
 
+CAP_OCTREE_SHARDING: str = "octree_sharding"
+"""The store is marked octree: its sharded per-chunk arrays are written with
+zarr-octree's ``zarr_octree_sharding`` codec (cells grouped into the leaves of
+an octree aimed at a target size, and a sparse shard index) instead of
+``sharding_indexed``.  Stamped with the root's ``octree_sharding`` block (the
+codec's configuration); set at construction (``Layout(octree=...)``) or by
+:func:`zarr_vectors.sharding.set_octree`, which converts either way.  Reading
+or writing such an array needs the zarr-octree package.  Optional and
+additive: absent means ``sharding_indexed``, as every other store."""
+
+CAP_OCTREE_CHUNKS: str = "octree_chunks"
+"""A level of the store has octree chunks: its per-chunk arrays hold one cell
+per octree leaf (an aligned cube of the uniform grid's cells, sized by its
+vertex count), at the leaf's minimum-corner cell, with cross-leaf links named
+by ``(offset, depth change)``.  A reader without it must not read such a
+level: it would take each leaf for one uniform cell.  Readers that do not
+check capabilities are stopped by zarr itself: the level's per-chunk arrays
+carry the ``zarr_vectors_octree_chunks`` codec
+(:mod:`zarr_vectors.encoding.octree_marker`), which a zarr reader must know
+to open them.  Listed in the root's ``required_capabilities`` as well as
+``format_capabilities``, for the same span, so a viewer that checks the
+first can refuse the store with a clear message.  Optional, and converted
+to and from uniform chunks by ``zarr_vectors.octree_chunks``."""
+
 DEFAULT_AXES_NAMES: tuple[str, ...] = ("x", "y", "z", "w")
 """Default axis names used when ``create_store`` is called without an
 explicit ``axes`` kwarg.  Indexed by ``sid_ndim`` (1 → ``("x",)``, 2 →

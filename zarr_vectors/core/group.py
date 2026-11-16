@@ -84,6 +84,76 @@ _MISS_CELL = "cell"
 _MISS_ROW = "row"
 
 
+def _shard_codec(ndim: int, compressors: list[Any], octree: dict[str, Any] | None) -> Any:
+    """zarr-octree's ``zarr_octree_sharding`` codec configured by the store's
+    ``octree`` marker (:data:`zarr_vectors.constants.CAP_OCTREE_SHARDING`), or
+    None for ``sharding_indexed`` (zarr-octree is then never imported)."""
+    if octree is None:
+        return None
+    from zarr.codecs import VLenBytesCodec
+
+    return _octree_codec_class()(
+        chunk_shape=(1,) * ndim, codecs=[VLenBytesCodec(), *compressors], **dict(octree),
+    )
+
+
+def _shard(kwargs: dict[str, Any], ndim: int, shard_shape: Sequence[int], octree: Any) -> None:
+    """Shard ``create_array`` ``kwargs``: ``shards=``, or :func:`_shard_codec`'s codec."""
+    shard_codec = _shard_codec(ndim, kwargs["compressors"], octree)
+    if shard_codec is None:
+        kwargs["shards"] = tuple(shard_shape)
+    else:  # same array, same inner cells and keys; another sharding codec
+        kwargs.update(chunks=tuple(shard_shape), serializer=shard_codec, compressors=None)
+
+
+def _octree_codec_class() -> Any:
+    """zarr-octree's codec class; ValueError naming where to get it if it is missing."""
+    from zarr.registry import get_codec_class
+
+    try:
+        return get_codec_class("zarr_octree_sharding")
+    except (KeyError, ImportError) as exc:  # not registered, or its package is gone
+        raise ValueError(
+            "this store is marked octree (zarr_octree_sharding): pip install "
+            "git+https://github.com/Andrew-Keenlyside/zarr-octree"
+        ) from exc
+
+
+def check_octree_sharding(octree: Any, ndim: int) -> dict[str, Any]:
+    """An octree marker (the ``zarr_octree_sharding`` configuration, ``{}`` for its
+    defaults), checked by building the codec once before anything is written.
+
+    Raises:
+        ValueError: zarr-octree is not installed (the message says where
+            to get it).
+        MetadataError: ``octree`` is not a mapping, not JSON, or a
+            configuration the codec refuses.
+    """
+    import json
+    from collections.abc import Mapping
+
+    from zarr_vectors.exceptions import MetadataError
+
+    if not isinstance(octree, Mapping):
+        raise MetadataError(
+            f"octree_sharding must be the zarr_octree_sharding codec's configuration "
+            f"(a mapping, {{}} for its defaults), got {octree!r}"
+        )
+    config = dict(octree)
+    try:
+        json.dumps(config)
+    except (TypeError, ValueError) as exc:
+        raise MetadataError(f"octree_sharding {config!r} is not JSON: {exc}") from exc
+    codec_class = _octree_codec_class()
+    try:
+        codec_class(chunk_shape=(1,) * ndim, **config)
+    except (TypeError, ValueError) as exc:
+        raise MetadataError(
+            f"invalid octree_sharding {config!r} for zarr_octree_sharding: {exc}"
+        ) from exc
+    return config
+
+
 class _OfflineSession:
     """The snapshot an offline read is served from, shared by a Group and
     every Group derived from it.
@@ -459,6 +529,7 @@ class Group:
                 finish.  Cell payloads themselves are independent objects
                 and never race.
         """
+        self._refuse_octree_write("writing", array_name)
         if self._source_cell(chunk_key) is not None:
             raise ArrayError(
                 f"{array_name}/{chunk_key}: a composite level writes only its own "
@@ -522,6 +593,7 @@ class Group:
         the per-call overhead of the singular form was most of that
         write.  Returns how many cells were written.
         """
+        self._refuse_octree_write("writing", array_name)
         if array_name in (_VERTICES_ARRAY, _VERTEX_FRAGMENTS_ARRAY):
             self._clear_fragments_tile()
         if _breaks_link_alignment(array_name):
@@ -1568,6 +1640,7 @@ class Group:
     # ---------------- array metadata ----------------
 
     def write_array_meta(self, array_name: str, meta: dict[str, Any]) -> None:
+        self._refuse_octree_write("writing the metadata of", array_name)
         # An existing chunk array takes its metadata directly on its own
         # ``attrs`` (the Zarr-spec location for per-array user metadata).
         # Checked BEFORE the batched queue, so a chunk array never routes
@@ -1647,6 +1720,7 @@ class Group:
                 ``None`` for one object per chunk.  Zarr's own
                 ``sharding_indexed``, so any Zarr v3 reader reads it.
         """
+        self._refuse_octree_write("writing", path)
         arr_data = np.asarray(data)
         if chunks is None:
             chunks = arr_data.shape if arr_data.shape else (1,)
@@ -1718,6 +1792,7 @@ class Group:
             StoreError: If ``path`` does not exist or is not an array.
             ValueError: If the tail dimensions do not match.
         """
+        self._refuse_octree_write("appending to", path)
         # ``_node``: a caller that has just resolved the array hands it over
         # rather than paying a second lookup for it.
         arr = _node if _node is not None else self._require_array_node(path)
@@ -1803,6 +1878,7 @@ class Group:
                 (single chunk).
             attributes: Dict applied to the array's ``attributes`` block.
         """
+        self._refuse_octree_write("writing", path)
         blob_list = list(blobs)
         n = len(blob_list)
         if n == 0:
@@ -1945,6 +2021,7 @@ class Group:
         origin: tuple[int, ...] | None = None,
         compressors: list[dict[str, Any]] | None = None,
         attributes: dict[str, Any] | None = None,
+        octree: Any = _ABSENT,
     ) -> None:
         """Allocate a vlen-bytes Zarr array for per-chunk blobs.
 
@@ -1979,6 +2056,9 @@ class Group:
             attributes: Per-array metadata merged into the array's
                 ``zarr.json`` ``attributes`` block (the standard Zarr
                 v3 location for user metadata).
+            octree: The ``zarr_octree_sharding`` configuration, or ``None`` for
+                ``sharding_indexed`` (for :func:`zarr_vectors.sharding.set_octree`);
+                omitted, the store's marker decides (:meth:`_store_octree`).
         """
         ndim = len(grid_shape)
         if shard_shape is not None and len(shard_shape) != ndim:
@@ -2011,7 +2091,8 @@ class Group:
         if shard_shape is not None:
             # Zarr 3.2 high-level ``shards=`` kwarg: wraps the inner
             # ``chunks=`` codec in ``sharding_indexed`` automatically.
-            create_kwargs["shards"] = tuple(shard_shape)
+            octree = self._store_octree() if octree is _ABSENT else octree
+            _shard(create_kwargs, ndim, shard_shape, octree)
 
         # Every attribute is passed to ``create_array`` rather than
         # assigned afterwards: each ``arr.attrs[...] = ...`` rewrites the
@@ -2038,6 +2119,25 @@ class Group:
         # the ``zarr.json`` we have in hand.
         if self._node_cache is not None:
             self._node_cache[self._full_path(array_name)] = arr
+
+    def _store_octree(self) -> dict[str, Any] | None:
+        """The store's octree marker (root ``zarr_vectors.octree_sharding``) or None
+        (bare group, or no key), cached per group.  Other read failures raise
+        uncached, so a failed request never allocates ``sharding_indexed`` arrays."""
+        from zarr.errors import GroupNotFoundError
+
+        if "_octree_sharding" in self.__dict__:
+            return self.__dict__["_octree_sharding"]
+        try:
+            root = zarr.open_group(self._zarr.store, path="/", mode="r", zarr_format=3)
+        except GroupNotFoundError:  # a bare group: no store root to ask, so unmarked
+            block = {}
+        else:
+            block = root.attrs.get("zarr_vectors") or {}
+        octree = block.get("octree_sharding")
+        octree = dict(octree) if octree is not None else None
+        self.__dict__["_octree_sharding"] = octree
+        return octree
 
     def create_sharded_chunk_arrays(
         self,
@@ -2093,7 +2193,7 @@ class Group:
             "compressors": list(compressors) if compressors else [],
         }
         if shard_shape is not None:
-            base_kwargs["shards"] = tuple(shard_shape)
+            _shard(base_kwargs, ndim, shard_shape, self._store_octree())
         base_attrs: dict[str, Any] = self._initial_presence_attrs()
         if origin is not None and any(int(o) != 0 for o in origin):
             base_attrs[_CHUNK_GRID_ORIGIN_ATTR] = [int(o) for o in origin]
@@ -2255,6 +2355,13 @@ class Group:
             return
         self._alignment_claim_settled = True
         self._drop_level_claim("link_fragments_aligned")
+
+    def _refuse_octree_write(self, verb: str, name: str) -> None:
+        """Refuse a write to an octree level (:mod:`zarr_vectors.octree_chunks.guard`)."""
+        from zarr_vectors.octree_chunks.guard import is_octree_level, refuse_octree_write
+
+        if is_octree_level(self):
+            refuse_octree_write(self, f"{verb} {name}")
 
     def _drop_level_claim(self, key: str) -> None:
         """Remove ``key`` from this level's metadata when it is set."""
@@ -2541,6 +2648,7 @@ class Group:
     # ---------------- delete ----------------
 
     def delete_subtree(self, name: str) -> None:
+        self._refuse_octree_write("deleting", name)
         self._invalidate_node(name)
         if name in self._zarr:
             del self._zarr[name]

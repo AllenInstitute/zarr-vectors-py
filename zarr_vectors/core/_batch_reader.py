@@ -592,6 +592,53 @@ def flush_prefetch(
     return cache
 
 
+SHARD_READERS = ("auto", "standard", "optimised", "zarr")
+
+
+def shard_reader() -> str:
+    """How sharded arrays are read: ``ZARR_VECTORS_SHARD_READER``.
+
+    ``auto`` (the default): per array, by its sharding codec -- an array
+    written with zarr-octree's ``zarr_octree_sharding`` is read as
+    ``optimised``, every other array exactly as ``standard`` (see
+    :func:`shard_reader_for`).  ``standard``: as zarr-vectors always has
+    -- a local store's shards read off the filesystem, each shard's index
+    once for a batch and one range per wanted cell; any other store
+    through zarr's array API.  ``optimised``: through
+    :func:`_sharded_read_plan` from local files and any store alike, each
+    shard's index read once for a whole batch and the wanted cells' byte
+    ranges coalesced (see ``_cells_on_disk._coalescing``).  ``zarr``:
+    through zarr's array API only -- the array's sharding codec reads
+    every cell, and shard presence is read from the cells themselves.
+    Each works with any sharding codec; none needs zarr-octree unless an
+    array was written with its codec.
+    """
+    mode = os.environ.get("ZARR_VECTORS_SHARD_READER", "auto").lower()
+    if mode == "optimized":
+        mode = "optimised"
+    if mode not in SHARD_READERS:
+        raise ValueError(f"ZARR_VECTORS_SHARD_READER={mode!r}: expected one of {SHARD_READERS}")
+    return mode
+
+
+def shard_reader_for(src: Any, mode: str | None = None) -> str:
+    """The reader one array gets: ``standard``, ``optimised`` or ``zarr``.
+
+    ``mode`` (default :func:`shard_reader`) as it stands, but for ``auto``,
+    which is decided by the array -- ``src``, its
+    :class:`~zarr_vectors.core._cells_on_disk.CellSource`: ``optimised``
+    for a zarr-octree shard index, which only that reader reads by run;
+    ``standard`` for anything else (``sharding_indexed``, unsharded, or
+    ``None``: no layout recognised), so a store without zarr-octree reads
+    as it always has.  Decided once per array, never per cell.
+    """
+    if mode is None:
+        mode = shard_reader()
+    if mode != "auto":
+        return mode
+    return "optimised" if getattr(src, "index_format", None) == "zarr_octree" else "standard"
+
+
 class _ShardedSpec(NamedTuple):
     """Everything needed to read one sharded array's cells off the filesystem."""
 
@@ -601,7 +648,10 @@ class _ShardedSpec(NamedTuple):
 
 
 def _sharded_spec(node: Any) -> _ShardedSpec | None:
-    """A :class:`_ShardedSpec` for a sharded local vlen array, else None.
+    """A :class:`_ShardedSpec` for a sharded vlen array, else None: always
+    under :func:`shard_reader` ``zarr``, and for a store that is not local
+    when the array is read ``standard`` (see :func:`shard_reader_for`:
+    under the default ``auto``, every array but a zarr-octree one).
 
     zarr reads a sharded cell through the sharding codec one cell at a
     time -- the shard's index, then the cell's range, each a round trip
@@ -613,10 +663,13 @@ def _sharded_spec(node: Any) -> _ShardedSpec | None:
     """
     from zarr_vectors.core._cells_on_disk import cell_source
 
-    if not isinstance(node, zarr.Array):
+    mode = shard_reader()
+    if not isinstance(node, zarr.Array) or mode == "zarr":
         return None
     src = cell_source("", node, any_codecs=True)
-    if src is None or src.shard_shape is None or src.local_root is None:
+    if src is None or src.shard_shape is None:
+        return None
+    if shard_reader_for(src, mode) == "standard" and src.local_root is None:  # other stores: through zarr, as always
         return None
     meta = node.metadata
     inner = tuple(meta.codecs[0].codecs[1:])
@@ -644,7 +697,7 @@ def _sharded_read_plan(
     hold are omitted, a cell with nothing stored reads as ``b""``, and a
     cell that cannot be read is omitted (``tolerant``) or raises.
     """
-    from zarr_vectors.core._cells_on_disk import read_local
+    from zarr_vectors.core._cells_on_disk import read_cells
 
     requests, wanted = [], []
     for array_name, spec, chunk_keys in entries:
@@ -666,7 +719,7 @@ def _sharded_read_plan(
     if not requests:
         return {}
     out: dict[tuple[str, str], bytes] = {}
-    for (array_name, spec, keys), raws in zip(wanted, read_local(requests)):
+    for (array_name, spec, keys), raws in zip(wanted, read_cells(requests)):
         for chunk_key, raw in zip(keys, raws):
             try:
                 if isinstance(raw, Exception):

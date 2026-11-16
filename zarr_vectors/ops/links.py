@@ -319,7 +319,13 @@ def edit_link_in_session(
     if new_endpoints is not None:
         src, dst = int(new_endpoints[0]), int(new_endpoints[1])
         new_row = np.asarray([src, dst], dtype=group.dtype)
-        if atomic:
+        # A skeleton reader takes every record as an edge, so appending
+        # would keep the old parent too: rewrite in place.
+        from zarr_vectors.core.metadata import RootMetadata
+        conv = RootMetadata.from_dict(
+            session.root.attrs.to_dict(),
+        ).links_convention
+        if atomic and conv != LINKS_IMPLICIT_BRANCHES:
             new_idx = builder.append_link_row(cell, ref.fragment, new_row)
             target_row = new_idx
         else:
@@ -562,6 +568,9 @@ def materialise_object_links_explicit(
         return 0  # already explicit; nothing to materialise
 
     level_group = get_resolution_level(root, level)
+    from zarr_vectors.octree_chunks.guard import refuse_octree_write
+
+    refuse_octree_write(level_group, "materialising links")
     manifest = read_object_manifest(level_group, object_id)
     if not manifest:
         return 0
@@ -755,6 +764,9 @@ def reorder_vertices_implicit(
         )
 
     level_group = get_resolution_level(root, level)
+    from zarr_vectors.octree_chunks.guard import refuse_octree_write
+
+    refuse_octree_write(level_group, "reordering vertices")
     # The slot count is stamped on the index; reading every manifest to
     # take its length decoded the whole level to learn a number already
     # written down. Only the targeted objects' manifests are then read.

@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from zarr_vectors.constants import (
     CROSS_CHUNK_BOTH,
@@ -220,4 +220,35 @@ def validate_metadata(store_path: str | Path | Group) -> ValidationResult:
         except Exception as e:
             result.add_error(f"resolution_{li}: cannot read metadata: {e}")
 
+    _check_octree_capabilities(root, meta, levels, result)
     return result
+
+
+def _check_octree_capabilities(root: Group, meta: Any, levels: list[int],
+                               result: ValidationResult) -> None:
+    """Warn unless both root capability lists hold ``octree_chunks`` exactly while
+    a level has an octree block (see ``docs/spec/chunking/octree_chunks.md``)."""
+    from zarr_vectors.constants import CAP_OCTREE_CHUNKS
+    from zarr_vectors.octree_chunks.guard import is_octree_level
+
+    octree = []
+    for li in levels:
+        try:
+            if is_octree_level(get_resolution_level(root, li)):
+                octree.append(li)
+        except Exception:  # noqa: BLE001 - an unreadable level is reported above
+            continue
+    fix = "run zarr_vectors.octree_chunks.refresh_capabilities(store) to fix"
+    for name, listed in (("format_capabilities", meta.format_capabilities),
+                         ("required_capabilities", meta.required_capabilities)):
+        has = CAP_OCTREE_CHUNKS in (listed or [])
+        if octree and not has:
+            result.add_warning(
+                f"level(s) {octree} have octree chunks but the root's {name} lacks "
+                f"{CAP_OCTREE_CHUNKS!r} (converted before it was written?); {fix}"
+            )
+        elif has and not octree:
+            result.add_warning(
+                f"the root's {name} lists {CAP_OCTREE_CHUNKS!r} but no level has octree "
+                f"chunks; {fix}"
+            )

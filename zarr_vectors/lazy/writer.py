@@ -137,6 +137,10 @@ class ZVWriter:
         )
         self._level = level
         self._group = level._group
+        # Every mutation below addresses uniform cells, which an octree level lacks.
+        from zarr_vectors.octree_chunks.guard import refuse_octree_write
+
+        refuse_octree_write(self._group, "ZVWriter")
         self._committed = False
         # Manifests staged by ``append_vertices`` and flushed by
         # ``commit`` as a pending sidecar batch.

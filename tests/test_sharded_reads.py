@@ -21,6 +21,13 @@ from zarr_vectors.core.cells import read_cells
 from zarr_vectors.core.store import get_resolution_level, open_store
 from zarr_vectors.types.points import write_points
 
+
+@pytest.fixture(autouse=True)
+def _optimised_reader(monkeypatch):
+    """These tests are about zarr-vectors' own sharded reader, so they pin it
+    whatever ``ZARR_VECTORS_SHARD_READER`` the run was given."""
+    monkeypatch.setenv("ZARR_VECTORS_SHARD_READER", "optimised")
+
 _CHUNK = (25.0, 25.0, 25.0)
 
 

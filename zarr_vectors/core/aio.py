@@ -165,6 +165,10 @@ async def _fetch_chunks(
         _direct_read_plan,
         _direct_spec,
         _gather_plan,
+        _sharded_read_plan,
+        _sharded_spec,
+        shard_reader,
+        shard_reader_for,
     )
 
     if not keys:
@@ -175,12 +179,20 @@ async def _fetch_chunks(
         by_array.setdefault(array_path, []).append(chunk_key)
 
     direct: list[tuple[str, Any, list[str]]] = []
+    sharded: list[tuple[str, Any, list[str]]] = []
     gathered: list[tuple[str, list[str]]] = []
     for array_path, chunk_keys in by_array.items():
         spec = None
         node = nodes.get(array_path)
         if sync_root is not None and isinstance(node, zarr.Array):
             spec = _direct_spec(sync_root, array_path, node)
+            # The optimised reader's arrays (see shard_reader_for: under
+            # the default, zarr-octree ones); the rest gather, as always.
+            if spec is None and shard_reader() != "standard":
+                shard_spec = _sharded_spec(node)
+                if shard_spec is not None and shard_reader_for(shard_spec.source) == "optimised":
+                    sharded.append((array_path, shard_spec, chunk_keys))
+                    continue
         if spec is None:
             gathered.append((array_path, chunk_keys))
         else:
@@ -196,6 +208,8 @@ async def _fetch_chunks(
         # One job for every direct array together, so the files pool
         # across arrays rather than per array.
         tasks.append(asyncio.to_thread(_direct_read_plan, direct))
+    if sharded:
+        tasks.append(asyncio.to_thread(_sharded_read_plan, sharded))
     results = await asyncio.gather(*tasks)
 
     out: dict[tuple[str, str], bytes] = {}

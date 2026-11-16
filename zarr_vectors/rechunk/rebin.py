@@ -99,6 +99,9 @@ def rebin_level(
     validate_bin_shape_divides_chunk(chunk_shape, target_bin_shape)
 
     level_group = get_resolution_level(root, level)
+    from zarr_vectors.octree_chunks.guard import refuse_octree_write
+
+    refuse_octree_write(level_group, "rebin_level")
     level_meta = read_level_metadata(root, level)
     old_bin_shape = (
         level_meta.bin_shape

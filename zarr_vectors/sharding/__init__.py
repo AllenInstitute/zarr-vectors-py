@@ -12,6 +12,7 @@ Public API:
     shard_store("scan.zv", shard_shape=8)        # 8x8x8 = 512 chunks/shard
     info = get_shard_info("scan.zv")
     unshard_store("scan.zv")                     # back to flat
+    set_octree("scan.zv")                        # zarr-octree's codec; False undoes
 
 See :doc:`/spec/chunking/sharding` for the full design rationale.
 """
@@ -20,6 +21,7 @@ from zarr_vectors.sharding.io import (
     get_shard_info,
     is_sharded,
     reshard,
+    set_octree,
     shard_store,
     unshard_store,
 )
@@ -30,6 +32,7 @@ __all__ = [
     "get_shard_info",
     "is_sharded",
     "reshard",
+    "set_octree",
     "shard_store",
     "unshard_store",
 ]

@@ -32,6 +32,7 @@ from zarr_vectors.core._cells_on_disk import (  # noqa: F401  (re-exported)
     _read_ranges,
     cell_source,
     locate_local,
+    read_indexes,
 )
 
 
@@ -53,6 +54,14 @@ class RawCells:
 
 # --------------------------------------------------------------------
 # Locating cells
+
+
+def locate_store(src: CellSource, cells: np.ndarray) -> tuple[list[_Range | None], dict[int, str]]:
+    """The byte range holding each of ``cells`` in a non-local store, via
+    :func:`read_indexes` (dense or zarr-octree); an unreadable index is an
+    error for each of its shard's cells."""
+    cells = np.asarray(cells, dtype=np.int64).reshape(-1, len(src.shape))
+    return _locate(src, cells, lambda keys: dict(zip(keys, read_indexes(src, keys))))
 
 
 # --------------------------------------------------------------------
@@ -184,33 +193,17 @@ def _fetch_store(src: CellSource, cells: np.ndarray) -> RawCells:
     """Any zarr store: async byte-range gets, one upload."""
     import asyncio
 
-    from zarr.abc.store import RangeByteRequest, SuffixByteRequest
+    from zarr.abc.store import RangeByteRequest
     from zarr.core.buffer import default_buffer_prototype
     from zarr.core.sync import sync
 
-    cells = np.asarray(cells, dtype=np.int64).reshape(-1, len(src.shape))
     proto = default_buffer_prototype()
 
     async def get(key: str, byte_range: Any = None) -> bytes | None:
         buf = await src.store.get(key, prototype=proto, byte_range=byte_range)
         return None if buf is None else buf.to_bytes()
 
-    def read_indexes(keys: list[str]) -> dict[str, Any]:
-        n = _index_nbytes(src)
-        rng = SuffixByteRequest(n) if src.index_at_end else RangeByteRequest(0, n)
-
-        async def one(key: str) -> Any:
-            try:
-                return _parse_index(src, await get(key, rng))
-            except Exception as exc:  # noqa: BLE001 - reported per cell
-                return exc
-
-        async def run() -> list[Any]:
-            return await asyncio.gather(*(one(k) for k in keys))
-
-        return dict(zip(keys, sync(run())))
-
-    ranges, errors = _locate(src, cells, read_indexes)
+    ranges, errors = locate_store(src, cells)
 
     async def one_cell(r: _Range | None) -> Any:
         if r is None:
@@ -228,9 +221,12 @@ def _fetch_store(src: CellSource, cells: np.ndarray) -> RawCells:
     blobs = sync(run_cells())
     parts: list[bytes] = []
     sizes = np.zeros(len(ranges), dtype=np.int64)
-    for i, blob in enumerate(blobs):
+    for i, (r, blob) in enumerate(zip(ranges, blobs)):
         if isinstance(blob, Exception):
             errors[i] = f"{type(blob).__name__}: {blob}"
+        elif r is not None and r.size >= 0 and len(blob or b"") != r.size:
+            # A range past the object's end reads short, with no error from the store.
+            errors[i] = f"short read: {len(blob or b'')} of {r.size} bytes"
         elif blob:
             parts.append(blob)
             sizes[i] = len(blob)

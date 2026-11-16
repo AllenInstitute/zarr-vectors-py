@@ -82,14 +82,11 @@ _READERS: dict[str, tuple[str, str, tuple[str, ...], str]] = {
         ("bbox", "object_ids", "group_ids", "chunks", "attribute_filter"),
         "from_polylines",
     ),
-    # ``object_ids`` stays listed for graph/skeleton even though
-    # ``read_graph`` cannot scope by object.  Dropping it does NOT help:
+    # Meshes, graphs and skeletons take no ``group_ids``, and
     # ``to_reader_kwargs`` silently discards a term the reader cannot
-    # express, and ``_post_filter`` has nothing to filter on (the reader
-    # returns no per-vertex object ids), so the read would come back as
-    # the whole level with the caller believing they had scoped it.
-    # Raising is the right answer; ``_check_supported`` below raises it
-    # with a message about what the CALLER typed.
+    # express, so the read would come back unscoped with the caller
+    # believing they had scoped it.  ``_check_supported`` below refuses
+    # it with a message about what the CALLER typed.
     GEOM_MESH: (
         "zarr_vectors.types.meshes", "read_mesh",
         ("bbox", "object_ids", "chunks", "attribute_filter"),
@@ -385,26 +382,20 @@ class Level:
     def _check_supported(self, selection: Selection) -> None:
         """Refuse a selection term this geometry's reader cannot honour.
 
-        ``read_graph`` cannot scope by object, and ``read_mesh`` has no
-        ``group_ids=``; refusing is right -- silently handing back the
-        whole level is the worst outcome -- and is said here in the
-        caller's own terms rather than as a reader parameter they never
-        passed.
+        ``read_mesh`` and ``read_graph`` have no ``group_ids=``; refusing
+        is right -- silently handing back the whole level is the worst
+        outcome -- and is said here in the caller's own terms rather
+        than as a reader parameter they never passed.
         """
-        if selection.objects is None and selection.groups is None:
-            return
-        if self.kind == GEOM_MESH and selection.groups is None:
+        if selection.groups is None:
             return
         if self.kind not in (GEOM_MESH, GEOM_GRAPH, GEOM_SKELETON):
             return
-        term = "objects=" if selection.objects is not None else "groups="
         raise ZVError(
-            f"select({term}...) is not supported for {self.kind!r}: the "
-            f"reader behind it cannot scope a read by object, and applying "
-            f"the filter afterwards is impossible because the result "
-            f"carries no per-vertex object ids. Read the level and filter "
-            f"the arrays yourself, or use level.objects[...] on a geometry "
-            f"that supports it (point clouds, polylines, lines, meshes)."
+            f"select(groups=...) is not supported for {self.kind!r}: the "
+            f"reader behind it cannot scope a read by group. Select the "
+            f"group's objects with objects=, or use a geometry that "
+            f"supports groups (point clouds, polylines)."
         )
 
     def _reader_kwargs(self, selection: Selection, supports: Sequence[str]) -> dict[str, Any]:
@@ -480,6 +471,11 @@ class Level:
             else self._dataset.level(selection.level)
         )
         level_group = target.store
+        from zarr_vectors.octree_chunks.guard import is_octree_level
+
+        if is_octree_level(level_group):
+            # chunks= cannot name leaves: read the level, keep the first ``limit``.
+            return None
         try:
             keys = list_chunk_keys(level_group)
         except (ArrayError, StoreError, KeyError):
@@ -518,13 +514,18 @@ class Level:
         data. It is the better argument to ``select(cells=...)`` whenever
         the caller wants "what is here", and ``Grid.cells_in`` remains
         the right one for "what could be here".
+
+        Refused on a level with octree chunks, whose chunks are leaves
+        (see :mod:`zarr_vectors.octree_chunks`).
         """
         import numpy as _np
 
         from zarr_vectors.api.grid import CellRef, CellSet
         from zarr_vectors.core.arrays import list_chunk_keys, resolve_chunk_keys
+        from zarr_vectors.octree_chunks.guard import refuse_octree_read
 
         level_group = self.store
+        refuse_octree_read(level_group, "Level.cells()")
         if bbox is None:
             coords = list_chunk_keys(level_group)
         else:

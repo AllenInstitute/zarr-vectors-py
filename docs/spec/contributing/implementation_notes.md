@@ -110,3 +110,43 @@ are needed: the consistency check compares fragment columns with `sid_ndim`,
 which says nothing about cell addressing, and `derive_nonempty_chunks` rebuilds
 presence at the array's own rank, so a mis-ranked array agrees with itself and
 only the comparison with `vertices` catches it.
+
+## Octree sharding and octree chunks
+
+**Octree sharding codec** (`core.group._shard_codec`, `check_octree_sharding`).
+`zarr_octree_sharding` (from the zarr-octree package, needed to write and to
+read) has a sparse shard index and groups cells into the leaves of an octree
+aimed at a target size (100,000 by default). The marker's configuration is
+checked by building the codec once, at `create_store` / `set_octree`, so a bad
+key or a missing package fails at the call that asked for it rather than in
+whichever writer first allocates a sharded array. `Group._store_octree` caches
+`None` only for a genuinely absent marker; any other read failure raises
+uncached, since caching `None` would allocate `sharding_indexed` arrays in a
+store marked octree for the rest of the handle's life.
+
+**`set_octree` crash safety** (`sharding.io`). Only shard bytes change: cells,
+keys, grid, inner codecs and attributes are kept. Each array is converted into
+`<level>/__set_octree/<array>`; the scratch group's `set_octree` attribute
+(`array`, `complete`, `swapped`) records progress, and its existence means a
+conversion began. The source is untouched until `complete` is stamped. A re-run
+swaps in a complete copy (whatever state the swap reached), drops an incomplete
+one, then skips arrays already in the wanted codec. On a local store the source
+is renamed aside into `__set_octree/__replaced/` and the copy renamed into
+place, so the array is missing only between two renames. On other stores the
+copy's objects are written over the source with `zarr.json` last (a reader
+finds no array rather than part of one), `swapped` is stamped, and the copy
+deleted; a kill mid-copy leaves that array missing until a re-run. If both the
+array and its complete copy are gone, it raises (restore from backup). The
+marker is written first when marking and removed last when unmarking; with
+`arrays=` it changes only once every sharded array is in the wanted codec. It is
+a coordinator operation: no concurrent writers, no overlapping runs.
+
+**Skeleton edges** (`types.graphs`). The reader gives the implicit `i - 1`
+parent only to a vertex with no stored record that does not open a fragment,
+so the writer opens each fragment with its parentless vertex (if any) and
+stores every parent edge of a vertex that has several. `_reorder_tree` walks
+depth-first from every root in index order, then from unreached vertices
+(cycles); input already depth-first is unchanged. `read_graph(object_ids=)`
+returns the induced subgraph, and a skeleton reads the link cells *touching*
+the objects' chunks, so a record whose parent was not read makes its child a
+root instead of inheriting the previous row.

@@ -67,6 +67,14 @@ def validate_consistency(store_path: str | Path | Group) -> ValidationResult:
             result.add_error(f"{prefix}: cannot open: {e}")
             continue
 
+        from zarr_vectors.octree_chunks.guard import is_octree_level
+
+        if is_octree_level(lg):
+            # Its chunks are leaves, not uniform cells: every check below
+            # would misread them.  It has checks of its own.
+            _validate_octree_level(lg, ndim, prefix, result)
+            continue
+
         chunk_keys = list_chunk_keys(lg)
         if not chunk_keys:
             result.add_warning(f"{prefix}: no chunk data")
@@ -361,6 +369,172 @@ def validate_consistency(store_path: str | Path | Group) -> ValidationResult:
             )
 
     return result
+
+
+def _validate_octree_level(lg: Any, ndim: int, prefix: str, result: ValidationResult) -> None:
+    """Level 3 checks for a level with octree chunks, in place of the uniform ones
+    (see ``docs/spec/chunking/octree_chunks.md``, Compatibility)."""
+    from zarr_vectors.constants import VERTEX_FRAGMENTS, VERTICES
+    from zarr_vectors.core.arrays import list_link_deltas
+    from zarr_vectors.encoding.octree_marker import OCTREE_MARKER_CODEC, has_marker
+    from zarr_vectors.octree_chunks.convert import cell_table, leaf_table, read_octree_link_cells
+    from zarr_vectors.octree_chunks.guard import octree_meta, unfinished
+
+    block = octree_meta(lg) or {}
+    if "converting" in block:
+        result.add_error(f"{prefix}: {unfinished(block)}")
+        return
+    try:
+        table = leaf_table(lg)
+        cells = cell_table(lg)
+    except Exception as e:
+        result.add_error(f"{prefix}: octree chunks: cannot read the leaf and cell tables: {e}")
+        return
+    _check_octree_shards(lg, table, prefix, result)
+    n_leaves = len(table)
+    anchors = [tuple(a) for a in table.anchors().tolist()]
+    leaf_at = {a: n for n, a in enumerate(anchors)}
+    stored = {tuple(int(c) for c in ck) for ck in list_chunk_keys(lg)}
+    for what, bad in (("leaf anchors with no vertex chunk", [a for a in anchors if a not in stored]),
+                      ("vertex chunks at no leaf's anchor", sorted(stored - set(anchors)))):
+        if bad:
+            result.add_error(f"{prefix}: octree chunks: {len(bad)} {what}, e.g. {bad[0]}")
+
+    leaf_col = cells[:, 3] if len(cells) else np.zeros(0, np.int64)
+    if len(cells) and ((leaf_col < 0) | (leaf_col >= n_leaves)).any():
+        result.add_error(f"{prefix}: octree chunks: the cell table names leaves that do not exist")
+        return
+    cell_rows = np.bincount(leaf_col, weights=cells[:, 4], minlength=n_leaves).astype(np.int64)
+    cell_frags = np.bincount(leaf_col, weights=cells[:, 5], minlength=n_leaves).astype(np.int64)
+    rows = np.zeros(n_leaves, dtype=np.int64)
+    frags = np.zeros(n_leaves, dtype=np.int64)
+    keys = [".".join(str(c) for c in a) for a in anchors if a in stored]
+    with lg.batched_reads([(VERTICES, keys), (VERTEX_FRAGMENTS, keys)]):
+        for n, a in enumerate(anchors):
+            if a not in stored:
+                continue
+            try:
+                groups = read_chunk_vertices(lg, a, ndim=ndim, _leaf=True)
+            except Exception as e:
+                result.add_error(f"{prefix}: leaf {n} (chunk {a}) decode failed: {e}")
+                continue
+            rows[n] = sum(len(g) for g in groups)
+            frags[n] = len(groups)
+    weight = np.asarray(table.weight, dtype=np.int64)
+    for what, other in (("leaf table weight", weight), ("cell table vertices", cell_rows)):
+        bad = np.flatnonzero(rows != other)
+        if len(bad):
+            n = int(bad[0])
+            result.add_error(
+                f"{prefix}: octree chunks: {len(bad)} leaves hold a different vertex count "
+                f"than the {what}, e.g. leaf {n}: {int(rows[n])} vs {int(other[n])}"
+            )
+    bad = np.flatnonzero(frags != cell_frags)
+    if len(bad):
+        n = int(bad[0])
+        result.add_error(
+            f"{prefix}: octree chunks: {len(bad)} leaves hold a different fragment count "
+            f"than the cell table, e.g. leaf {n}: {int(frags[n])} vs {int(cell_frags[n])}"
+        )
+    total = int(rows.sum())
+    evc = (lg.attrs.get("zarr_vectors_level") or {}).get("vertex_count")
+    if evc is not None and int(evc) != total:
+        result.add_error(f"{prefix}: metadata vertex_count={evc}, actual={total}")
+
+    try:
+        ids, manifests = read_object_manifest_rows(lg)
+    except Exception:
+        ids, manifests = np.zeros(0, np.int64), []
+    for oid, mf in zip(ids.tolist(), manifests):
+        for cc, f in mf:
+            n = leaf_at.get(tuple(int(c) for c in cc))
+            if n is None:
+                result.add_error(f"{prefix}: obj {oid} refs {cc}, which is no leaf's anchor")
+            elif not 0 <= int(f) < frags[n]:
+                result.add_error(f"{prefix}: obj {oid} refs fragment_idx={f} of leaf {n}, "
+                                 f"which has {int(frags[n])}")
+
+    n_links = 0
+    for d in list_link_deltas(lg):
+        if d != 0:
+            result.add_error(f"{prefix}: links[delta={d}] on a level with octree chunks "
+                             f"(links between levels are not supported with them)")
+    try:
+        src, r_src, oth, r_oth = read_octree_link_cells(lg, table)
+    except Exception as e:
+        result.add_error(f"{prefix}: octree links unreadable: {e}")
+    else:
+        n_links = len(src)
+        if (oth < 0).any():
+            result.add_error(f"{prefix}: octree links: {int((oth < 0).sum())} name a leaf "
+                             f"that is not stored")
+        ok = oth >= 0
+        for end, (leaf, row) in enumerate(((src, r_src), (oth, r_oth))):
+            bad = ok & ((row < 0) | (row >= rows[np.where(ok, leaf, 0)]))
+            if bad.any():
+                result.add_error(f"{prefix}: octree links: {int(bad.sum())} name a row "
+                                 f"past the end of their leaf (endpoint {end})")
+        family = (lg.read_array_meta("links/0") or {}) if lg.array_exists("links/0") else {}
+        if "num_physical_records" in family and int(family["num_physical_records"]) != n_links:
+            result.add_error(f"{prefix}: octree links: num_physical_records="
+                             f"{family['num_physical_records']} != {n_links} stored")
+
+    try:
+        if stored and not has_marker(lg.zarr_group[VERTICES]):
+            result.add_warning(
+                f"{prefix}: octree chunks, but vertices lacks the {OCTREE_MARKER_CODEC} "
+                f"codec: a reader without octree chunks would read its leaves as cells"
+            )
+    except Exception:
+        pass
+    result.add_pass(
+        f"{prefix}: octree chunks: {n_leaves} leaves, {total} vertices, {n_links} links validated"
+    )
+
+
+def _check_octree_shards(lg: Any, table: Any, prefix: str, result: ValidationResult) -> None:
+    """No leaf wider than the level's ``max_leaf_cells``, nor outside one shard of
+    its arrays' current shard grid (a resharding may split leaves): an error
+    with a recorded cap, a warning without, unreported with ``fit_shards=False``."""
+    from zarr_vectors.octree_chunks.convert import array_shard_grid
+
+    if not len(table):
+        return
+    cap = table.max_leaf_cells
+    sides = table.sides()
+    if cap is not None and int(sides.max()) > int(cap):
+        n = int(np.argmax(sides))
+        result.add_error(
+            f"{prefix}: octree chunks: {int((sides > cap).sum())} leaves are wider than the "
+            f"level's max_leaf_cells={cap}, e.g. leaf {table.key(n)} ({int(sides[n])} cells per side)"
+        )
+    if not table.fit_shards:
+        return
+    try:
+        grid = array_shard_grid(lg)
+    except Exception:
+        grid = None
+    if grid is None or grid[0] is None or len(grid[0]) != 3:
+        return
+    shard, origin = grid
+    bad = table.straddling(shard, origin)
+    if not len(bad):
+        return
+    n = int(bad[0])
+    msg = (
+        f"{prefix}: octree chunks: {len(bad)} leaves are not inside one shard of "
+        f"{list(shard)} cells, e.g. leaf {table.key(n)} ({int(sides[n])} cells per side "
+        f"at cell {tuple(table.anchors()[n].tolist())}), so its data sits in its anchor's "
+        f"shard and per-shard writes and reads miss it; run zarr_vectors.octree_chunks."
+        f"to_uniform, then to_octree, to fit the leaves to these shards"
+    )
+    if cap is not None:
+        fitted = (f"shards of {list(table.shard_shape)} cells" if table.shard_shape is not None
+                  else "no shards")
+        result.add_error(f"{msg} (it was converted with leaves capped at {cap} cells for "
+                         f"{fitted} and has been resharded since)")
+    else:
+        result.add_warning(f"{msg} (it was converted without a leaf cap)")
 
 
 def _dense_index_problems(lg: Any) -> list[str]:

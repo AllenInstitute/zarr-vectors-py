@@ -43,6 +43,7 @@ if TYPE_CHECKING:
 
 from zarr_vectors.constants import (
     CAP_DENSE_MANIFESTS,
+    CAP_OCTREE_SHARDING,
     DEFAULT_AXES_NAMES,
     DEFAULT_BOUNDS_SIDE,
     FORMAT_VERSION,  # noqa: F401  (re-exported for callers)
@@ -51,7 +52,7 @@ from zarr_vectors.constants import (
     VALID_OOB_POLICIES,
     VERTICES,
 )
-from zarr_vectors.core.group import Group
+from zarr_vectors.core.group import Group, check_octree_sharding
 from zarr_vectors.core.metadata import (
     LevelMetadata,
     NgffAxis,
@@ -362,6 +363,7 @@ def create_store(
     format_capabilities: list[str] | None = None,
     attribute_specs: dict[str, dict[str, Any]] | None = None,
     shard_shape: int | Sequence[int] | None = None,
+    octree_sharding: dict[str, Any] | None = None,
     manifest_layout: str | None = None,
     manifest_block_dtype: str | None = None,
     name: str | None = None,
@@ -458,6 +460,13 @@ def create_store(
             their grids differ.  It is a writer default rather than a
             claim about what is on disk: each array's own ``zarr.json``
             remains the truth about that array.
+        octree_sharding: Mark the store octree: its sharded per-chunk
+            arrays use zarr-octree's ``zarr_octree_sharding`` codec with
+            this configuration (``{}`` for its defaults) instead of
+            ``sharding_indexed``.  Needs ``shard_shape`` and the
+            zarr-octree package, both checked here, before the store
+            exists.  ``None`` (the default) writes nothing.  See
+            :func:`zarr_vectors.sharding.set_octree` to convert.
         manifest_layout: ``"dense"`` to write object indexes as
             fixed-width integer arrays (``manifest_spans`` +
             ``manifest_blocks``) rather than one vlen blob per object;
@@ -517,6 +526,17 @@ def create_store(
         normalise_shard_shape(shard_shape, resolved_ndim)
     except ValueError as exc:
         raise MetadataError(f"Invalid shard_shape: {exc}") from exc
+    if octree_sharding is not None:
+        # Likewise the octree marker, and before the store exists: checked
+        # only where an array is allocated, a typo or a node without
+        # zarr-octree left a marked, empty store behind for every later
+        # attempt to trip over.
+        if shard_shape is None:
+            raise MetadataError(
+                "octree_sharding needs shard_shape: the octree groups the "
+                "cells of a shard, so the store must be sharded"
+            )
+        octree_sharding = check_octree_sharding(octree_sharding, resolved_ndim)
     if axes is None:
         if resolved_ndim > len(DEFAULT_AXES_NAMES):
             raise MetadataError(
@@ -582,6 +602,7 @@ def create_store(
         format_capabilities=format_capabilities,
         attribute_specs=attribute_specs,
         shard_shape=shard_shape,
+        octree_sharding=octree_sharding,
         manifest_layout=manifest_layout,
         manifest_block_dtype=manifest_block_dtype,
         name=name,
@@ -666,6 +687,7 @@ def _write_root_attrs(
     format_capabilities: list[str] | None = None,
     attribute_specs: dict[str, dict[str, Any]] | None = None,
     shard_shape: int | Sequence[int] | None = None,
+    octree_sharding: dict[str, Any] | None = None,
     manifest_layout: str | None = None,
     manifest_block_dtype: str | None = None,
     name: str | None = None,
@@ -718,6 +740,11 @@ def _write_root_attrs(
             int(shard_shape) if isinstance(shard_shape, int)
             else [int(x) for x in shard_shape]
         )
+    if octree_sharding is not None:  # create_store has checked shard_shape
+        zv["octree_sharding"] = dict(octree_sharding)
+        caps = list(zv.get("format_capabilities") or [])
+        if CAP_OCTREE_SHARDING not in caps:
+            zv["format_capabilities"] = [*caps, CAP_OCTREE_SHARDING]
     if manifest_layout not in (None, "vlen", "dense"):
         raise MetadataError(
             f"manifest_layout={manifest_layout!r}; expected 'vlen' or 'dense'"
@@ -1041,12 +1068,44 @@ def _create_or_open_store(
     geometry_types: list[str] | None = None,
     ndim: int | None = None,
     shard_shape: int | Sequence[int] | None = None,
+    level: int = 0,
     **backend_kwargs: Any,
 ) -> Group:
     """Warm the store with :func:`create_store` if no store exists at
     ``path``, else open it read-write.  Writers route through this so
     callers can either ``create_store(path)`` first and then write, or
     write directly against a fresh path.
+
+    ``level`` is the level the caller is about to write (every type
+    writer writes level 0).  When it has octree chunks
+    (:mod:`zarr_vectors.octree_chunks`) the store is refused here, before
+    the writer stamps anything on the root or the level.  See
+    :func:`_create_or_open` for the rest.
+    """
+    root = _create_or_open(
+        path, backend=backend, bounds=bounds, chunk_shape=chunk_shape, axes=axes,
+        geometry_types=geometry_types, ndim=ndim, shard_shape=shard_shape,
+        **backend_kwargs,
+    )
+    from zarr_vectors.octree_chunks.guard import refuse_octree_levels
+
+    refuse_octree_levels(root, [level], f"writing level {level}")
+    return root
+
+
+def _create_or_open(
+    path: StoreLike | Group,
+    *,
+    backend: str | None = None,
+    bounds: tuple[list[float], list[float]] | None = None,
+    chunk_shape: tuple[float, ...] | None = None,
+    axes: list[dict[str, str]] | None = None,
+    geometry_types: list[str] | None = None,
+    ndim: int | None = None,
+    shard_shape: int | Sequence[int] | None = None,
+    **backend_kwargs: Any,
+) -> Group:
+    """Body of :func:`_create_or_open_store`, without the level check.
 
     Accepts an already-opened :class:`Group` (e.g. the return value of
     :func:`create_store` / :func:`open_store`) and returns it unchanged
@@ -1484,6 +1543,12 @@ def create_resolution_level(
             read_root_metadata(root), level_metadata,
         )
     group_name = f"{RESOLUTION_PREFIX}{level}"
+    if group_name in root:
+        # Rewriting an octree level's metadata drops its octree block
+        # and leaves its leaves to be read as uniform cells.
+        from zarr_vectors.octree_chunks.guard import refuse_octree_write
+
+        refuse_octree_write(root[group_name], f"writing level {level}")
     level_group = root.require_group(group_name)
     payload = level_metadata.to_dict()
     payload["zarr_vectors_level"].pop("bin_shape", None)
@@ -1617,6 +1682,15 @@ def update_level_metadata(
     """
     import dataclasses
 
+    if "octree_chunks" in fields:
+        # Only the conversions may change it, together with the arrays.
+        from zarr_vectors.octree_chunks.guard import is_converting
+
+        if not is_converting(level_group):
+            raise MetadataError(
+                "update_level_metadata() cannot set octree_chunks: use "
+                "zarr_vectors.octree_chunks.to_octree / to_uniform"
+            )
     bad = sorted(set(fields) & set(_DERIVED_LEVEL_FIELDS))
     if bad:
         why = "; ".join(f"{k} is owned by {_DERIVED_LEVEL_FIELDS[k]}" for k in bad)
