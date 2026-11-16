@@ -1,15 +1,10 @@
-"""Back-compat surface for the legacy ``ShardLayout`` / ``ShardCodec`` API.
+"""``ShardLayout``: a sharded / unsharded selector.
 
-Older versions exposed an enum of shard layouts (FLAT, OCTREE, SNAKE,
-INDEX_TABLE) plus a ``ShardCodec`` that mapped chunk coordinates to
-shard ids via Morton / Hilbert space-filling curves.  Sharding now
-goes through Zarr v3's built-in ``sharding_indexed`` codec, which
-clusters spatially-adjacent inner chunks into the same outer chunk
-automatically via the C-order outer grid — no custom curve needed.
-
-This module remains only to keep the import line in older callers
-working.  Treat ``OCTREE`` / ``SNAKE`` / ``INDEX_TABLE`` as aliases
-for the single native-sharded mode; ``FLAT`` is the unsharded layout.
+Sharding goes through Zarr v3's built-in ``sharding_indexed`` codec,
+which clusters spatially-adjacent inner chunks into the same outer chunk
+via the C-order outer grid, so there is a single sharded mode.
+``OCTREE`` / ``SNAKE`` / ``INDEX_TABLE`` all name it; ``FLAT`` is the
+unsharded layout.
 """
 
 from __future__ import annotations
@@ -18,11 +13,11 @@ from enum import StrEnum
 
 
 class ShardLayout(StrEnum):
-    """Layout selector for back-compat with older shard APIs.
+    """Shard layout selector.
 
     ``FLAT`` keeps one storage object per Zarr Vectors chunk (no sharding).
-    All other values request native ``sharding_indexed`` sharding;
-    the curve distinction is no longer load-bearing.
+    All other values request native ``sharding_indexed`` sharding, and
+    are equivalent to one another.
     """
 
     FLAT = "flat"

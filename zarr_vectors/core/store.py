@@ -35,10 +35,9 @@ if TYPE_CHECKING:
     # :mod:`zarr_vectors.core.aio`.
     ReadSource = StoreLike | Group
 
-    # What every ``write_*`` entry point accepts.  Annotated ``str`` for
-    # a long time, which was never true: the same path through
-    # ``_create_or_open_store`` takes a Path, a pre-built Store and an
-    # already-open Group, and consumers pass all three.
+    # What every ``write_*`` entry point accepts: through
+    # ``_create_or_open_store`` that is a path string, a Path, a
+    # pre-built Store or an already-open Group.
     WriteTarget = StoreLike | Group
 
 from zarr_vectors.constants import (
@@ -560,6 +559,13 @@ def create_store(
         )
     if geometry_types is None:
         geometry_types = []
+    if base_bin_shape is not None:
+        # Before anything touches disk: a bin that does not tile the chunk
+        # otherwise makes a store that fails validation.
+        from zarr_vectors.core.metadata import check_bin_shape_tiles_chunk
+        check_bin_shape_tiles_chunk(
+            chunk_shape, base_bin_shape, name="base_bin_shape",
+        )
 
     from zarr.abc.store import Store as _ZStore
     local_root: Path | None = None
@@ -870,6 +876,10 @@ def _ensure_root_metadata_for_write(
         zv["geometry_types"] = gts
 
     if base_bin_shape is not None:
+        # Every type writer stamps its bin_shape here; refuse one that
+        # does not tile the store's chunks before it reaches the store.
+        from zarr_vectors.core.metadata import check_bin_shape_tiles_chunk
+        check_bin_shape_tiles_chunk(zv["chunk_shape"], base_bin_shape)
         zv["base_bin_shape"] = list(base_bin_shape)
 
     if links_convention is not None:
@@ -947,7 +957,7 @@ def _apply_out_of_bounds_policy(
     if policy == "raise":
         raise MetadataError(
             f"{n_out} of {len(positions)} points are outside store bounds "
-            f"{cur_bounds!r}; pass out_of_bounds='ignore' to drop them, "
+            f"{cur_bounds!r}; pass out_of_bounds='ignore' (on_out_of_bounds= in Dataset.add_*) to drop them, "
             f"'expand' to grow bounds, or call set_bounds() first."
         )
     if policy == "ignore":
@@ -1172,7 +1182,9 @@ def _create_or_open(
         try:
             return open_store(path, mode="r+", backend=backend, **backend_kwargs)
         except StoreError:
-            return create_store(path, backend=backend, **backend_kwargs)
+            return create_store(
+                path, backend=backend, **creator_kwargs, **backend_kwargs,
+            )
     if isinstance(path, (str, Path)):
         scheme = _detect_scheme(path)
         if scheme in {"", "file"}:
@@ -1533,14 +1545,13 @@ def create_resolution_level(
 ) -> Group:
     """Create a new resolution level group within the store.
 
-    The level's spatial transform (``bin_ratio`` → NGFF ``scale``,
-    ``bin_shape`` → NGFF ``translation = bin_shape / 2``) is written to
-    the NGFF ``multiscales[0].datasets`` block via
-    :func:`zarr_vectors.core.multiscale.upsert_level_transform` so the
-    NGFF block stays the **single source of truth** for spatial
-    geometry.  ``bin_shape`` and ``bin_ratio`` are intentionally
-    omitted from the level's own ``zarr_vectors_level`` attrs; readers
-    derive them from the NGFF block (see :func:`read_level_metadata`).
+    The level's NGFF ``multiscales[0].datasets`` entry is written via
+    :func:`zarr_vectors.core.multiscale.upsert_level_transform`.  Every
+    level stores its vertices in level-0 coordinates, so a coarse level's
+    entry repeats level 0's transform; a coarse level's ``bin_shape`` and
+    ``bin_ratio`` go in its own ``zarr_vectors_level`` attrs, where
+    :func:`read_level_metadata` reads them (falling back to the NGFF
+    block for stores that encoded them there).
     """
     level_metadata.validate()
     if strict:
@@ -1568,11 +1579,13 @@ def create_resolution_level(
     payload = level_metadata.to_dict()
     payload["zarr_vectors_level"].pop("bin_shape", None)
     payload["zarr_vectors_level"].pop("bin_ratio", None)
-    level_group.attrs.update(payload)
 
-    # Mirror the spatial transform into the NGFF block.
-    from zarr_vectors.core.multiscale import upsert_level_transform
+    from zarr_vectors.core.multiscale import (
+        read_level_transform,
+        upsert_level_transform,
+    )
     if level == 0:
+        level_group.attrs.update(payload)
         # Level 0: scale = 1.0 per-axis; translation seeded by base_bin/2 if known.
         try:
             root_meta = read_root_metadata(root)
@@ -1586,51 +1599,48 @@ def create_resolution_level(
         upsert_level_transform(
             root, level, scale=scale, translation=translation,
         )
-    elif level_metadata.bin_ratio is not None or level_metadata.bin_shape is not None:
-        base_bin: tuple[float, ...] | None = None
-        try:
-            root_meta = read_root_metadata(root)
-            ndim = root_meta.sid_ndim
-            base_bin = root_meta.effective_bin_shape
-        except Exception:
-            ndim = (
-                len(level_metadata.bin_ratio) if level_metadata.bin_ratio
-                else (len(level_metadata.bin_shape) if level_metadata.bin_shape else 1)
-            )
-        if level_metadata.bin_shape is not None and base_bin is not None:
-            # Derive the NGFF scale from bin_shape (this level's ÷ the
-            # root's).  ``bin_shape`` is preferred over ``bin_ratio``
-            # because the OTHER half of this same transform — the
-            # translation below — is bin_shape/2, so sourcing the two
-            # halves from different fields lets one transform contradict
-            # itself.  It did: a coarsen_factor of 1.5 on a root bin of 8
-            # gave bin_shape 12, translation 6.0 (right) and, via a
-            # bin_ratio rounded to 2, scale 2.0 (33% wrong) — invisible
-            # through the ZV API and visible in any NGFF viewer.
-            #
-            # It also covers the case a caller sets only bin_shape,
-            # letting the ratio be implied so cumulative-across-levels
-            # bin_shape math is the single source of truth; that used to
-            # fall through to a non-cumulative scale of 1.0.
-            #
-            # Plain float division, not compute_bin_ratio: the NGFF scale
-            # is a float multiplier with no integer requirement, so a
-            # fractional coarsen factor must not raise.
-            scale = [
-                (float(bs) / float(bb)) if bb else 1.0
-                for bb, bs in zip(base_bin, level_metadata.bin_shape)
-            ]
-        elif level_metadata.bin_ratio is not None:
-            # No bin_shape to derive from — the ratio is all there is.
-            scale = [float(r) for r in level_metadata.bin_ratio]
-        else:
-            scale = [1.0] * ndim
-        translation = (
-            [bs / 2.0 for bs in level_metadata.bin_shape]
-            if level_metadata.bin_shape is not None
-            else None
+    else:
+        # A coarse level's vertices are stored in level-0 coordinates
+        # (metavertices are centroids of level-0 positions), so the NGFF
+        # transform that places them is level 0's own.  This block used to
+        # stamp ``scale = bin_ratio`` and ``translation = bin_shape / 2``,
+        # which an NGFF viewer applies to the stored positions: level 1
+        # drawn at twice its size and shifted by a bin, level 2 at four
+        # times.  The bin geometry is ZV's own business and is kept in the
+        # level's ``zarr_vectors_level`` block, where
+        # :func:`read_level_metadata` reads it first.
+        if level_metadata.bin_ratio is not None or level_metadata.bin_shape is not None:
+            base_bin: tuple[float, ...] | None = None
+            try:
+                base_bin = read_root_metadata(root).effective_bin_shape
+            except Exception:
+                pass
+            if level_metadata.bin_shape is not None and base_bin is not None:
+                # The ratio as a float off bin_shape, not a rounded
+                # bin_ratio: a coarsen factor of 1.5 must read back as 1.5.
+                ratio = [
+                    (float(bs) / float(bb)) if bb else 1.0
+                    for bb, bs in zip(base_bin, level_metadata.bin_shape)
+                ]
+            elif level_metadata.bin_ratio is not None:
+                ratio = [float(r) for r in level_metadata.bin_ratio]
+            else:
+                ratio = None
+            zvl = payload["zarr_vectors_level"]
+            if ratio is not None:
+                zvl["bin_ratio"] = ratio
+            if level_metadata.bin_shape is not None:
+                zvl["bin_shape"] = [float(b) for b in level_metadata.bin_shape]
+        level_group.attrs.update(payload)
+        scale0, translation0 = read_level_transform(root, 0)
+        if scale0 is None:
+            try:
+                scale0 = [1.0] * read_root_metadata(root).sid_ndim
+            except Exception:
+                scale0 = [1.0]
+        upsert_level_transform(
+            root, level, scale=scale0, translation=translation0,
         )
-        upsert_level_transform(root, level, scale=scale, translation=translation)
 
     # Keep the RFC 8 node's level list in step with the level groups.
     # Derived from disk rather than appended to, so it cannot drift.
@@ -1642,17 +1652,17 @@ def create_resolution_level(
 #: Level-metadata fields that are DERIVED, and therefore refused by
 #: :func:`update_level_metadata`.
 #:
-#: ``bin_shape`` / ``bin_ratio`` live in the NGFF ``multiscales`` block:
-#: :func:`create_resolution_level` pops them from the level payload and
-#: :func:`read_level_metadata` rebuilds them from the transform, so writing
-#: them here produces keys no reader consults.  ``chunk_shape`` and
+#: ``bin_shape`` / ``bin_ratio`` are fixed when the level is written:
+#: :func:`create_resolution_level` derives them (into the level block for a
+#: coarse level, into the NGFF block for level 0), and the level's
+#: vertices were binned against them.  ``chunk_shape`` and
 #: ``bounds`` are worse than dead -- they feed ``level_grid_layout``, so
 #: changing one after arrays exist would size the NEXT allocated array to a
 #: different grid than the arrays already on disk, which is a layout change
 #: reached through a metadata-only call.
 _DERIVED_LEVEL_FIELDS: dict[str, str] = {
-    "bin_shape": "the NGFF multiscales block; use upsert_level_transform",
-    "bin_ratio": "the NGFF multiscales block; use upsert_level_transform",
+    "bin_shape": "the binning the level was written with; rewrite the level",
+    "bin_ratio": "the binning the level was written with; rewrite the level",
     "chunk_shape": (
         "the level's array grids; changing it after allocation would "
         "mis-size every later array. Rewrite the level instead"
@@ -1854,7 +1864,13 @@ def read_level_metadata(root: Group, level: int) -> LevelMetadata:
     level_group = get_resolution_level(root, level)
     lm = LevelMetadata.from_dict(level_group.attrs.to_dict())
 
-    # NGFF takes precedence over the legacy fields when present.
+    # A coarse level written since the NGFF transform became level 0's
+    # carries its bin geometry in its own block, and that is the answer.
+    # Otherwise the NGFF block holds it: stores written before then
+    # encoded ``bin_ratio`` as the scale and ``bin_shape / 2`` as the
+    # translation.
+    if level != 0 and (lm.bin_shape is not None or lm.bin_ratio is not None):
+        return lm
     from zarr_vectors.core.multiscale import read_level_transform
     scale, translation = read_level_transform(root, level)
     if scale is not None:
@@ -1877,13 +1893,13 @@ def write_parametric_types(
     root: Group,
     types: list[ParametricTypeDef],
 ) -> None:
-    """Write parametric type registry to ``/parametric/.zattrs``."""
+    """Write parametric type registry to the ``/parametric/`` group's attributes."""
     para = get_parametric_group(root)
     para.attrs.update(serialise_parametric_types(types))
 
 
 def read_parametric_types(root: Group) -> list[ParametricTypeDef]:
-    """Read parametric type registry from ``/parametric/.zattrs``."""
+    """Read parametric type registry from the ``/parametric/`` group's attributes."""
     para = get_parametric_group(root)
     return deserialise_parametric_types(para.attrs.to_dict())
 
@@ -1980,13 +1996,26 @@ def add_resolution_level(
 
 
 def remove_resolution_level(root: Group, level_index: int) -> None:
-    """Remove a resolution level from the store.
+    """Remove the coarsest resolution level from the store.
 
-    Level 0 cannot be removed.
+    Level 0 cannot be removed, and neither can a level that has a
+    coarser level above it: levels must stay contiguous (validation
+    level 5), and renumbering the levels above would also mean
+    rewriting every cross-level link that names them.  To drop a
+    middle level, remove the levels above it first (coarsest first).
+
+    Everything that refers to the removed level goes with it: its
+    entry in the NGFF ``multiscales`` datasets, and every
+    ``links/+k`` / ``link_attributes/<name>/+k`` family on a finer
+    level that points at it.
 
     Raises:
-        StoreError: If the level does not exist or is level 0.
+        StoreError: If the level does not exist, is level 0, or is not
+            the coarsest level.
     """
+    from zarr_vectors.constants import LINK_ATTRIBUTES, LINKS
+    from zarr_vectors.core.paths import format_delta
+
     if level_index == 0:
         raise StoreError("Cannot remove level 0 (full resolution)")
 
@@ -1994,7 +2023,64 @@ def remove_resolution_level(root: Group, level_index: int) -> None:
     if group_name not in root:
         raise StoreError(f"Resolution level {level_index} not found")
 
+    levels = list_resolution_levels(root)
+    above = [lv for lv in levels if lv > level_index]
+    if above:
+        raise StoreError(
+            f"Cannot remove resolution level {level_index}: levels "
+            f"{above} sit above it and levels must stay contiguous. "
+            f"Remove the coarser levels first (from {max(above)} down)."
+        )
+
+    # Cross-level families on finer levels that point at this level.
+    for lower in levels:
+        if lower >= level_index:
+            continue
+        lg = get_resolution_level(root, lower)
+        families = [LINKS]
+        if lg.array_exists(LINK_ATTRIBUTES):
+            families += [
+                f"{LINK_ATTRIBUTES}/{name}" for name in lg[LINK_ATTRIBUTES]
+            ]
+        emptied: list[str] = []
+        for fam in families:
+            if not lg.array_exists(fam):
+                continue
+            for name in list(lg[fam]):
+                if not name.startswith("+"):
+                    continue
+                try:
+                    delta = int(name)
+                except ValueError:
+                    continue
+                if lower + delta >= level_index:
+                    lg.delete_subtree(f"{fam}/{format_delta(delta)}")
+            if not list(lg[fam]):
+                lg.delete_subtree(fam)
+                emptied.append(fam)
+        if lg.array_exists(LINK_ATTRIBUTES) and not list(lg[LINK_ATTRIBUTES]):
+            lg.delete_subtree(LINK_ATTRIBUTES)
+            emptied.append(LINK_ATTRIBUTES)
+        if emptied:
+            block = dict(lg.attrs.to_dict().get("zarr_vectors_level", {}))
+            present = block.get("arrays_present")
+            if present is not None:
+                kept = [a for a in present if a not in emptied]
+                if kept != list(present):
+                    update_level_metadata(lg, arrays_present=kept)
+
     root.delete_subtree(group_name)
+
+    # Drop the level's NGFF dataset entry.
+    attrs = root.attrs.to_dict()
+    ms = attrs.get("multiscales")
+    if isinstance(ms, list) and ms:
+        entry = dict(ms[0])
+        datasets = list(entry.get("datasets") or [])
+        kept_ds = [d for d in datasets if d.get("path") != group_name]
+        if len(kept_ds) != len(datasets):
+            entry["datasets"] = kept_ds
+            root.attrs.update({"multiscales": [entry] + list(ms[1:])})
 
     from zarr_vectors.core.ome import refresh_root_node
     refresh_root_node(root)

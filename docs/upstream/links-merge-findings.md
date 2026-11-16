@@ -283,7 +283,15 @@ the whole point, so parent→child survives a canonical sort. The consequence
 is that **a reader cannot tell which convention a given record used**: both
 orders are legal, stored identically, and indistinguishable.
 
-Left unfixed deliberately. `write_skeleton_cross_chunk_links` has no
+**Resolved (2026-11-13): `[child, parent]` throughout.** Every other
+writer and reader already used child-first -- `write_skeleton_chunk`,
+`write_graph(kind="skeleton")` (via `perm_idx`), `read_graph`, and the
+zarr-vectors-tools ingesters (which pass `(child gid, parent gid)`) and
+coarsener (`parent[endpoint0] = endpoint1`). Only this docstring said
+otherwise, so it was the docstring that changed; no stored bytes did.
+`read_skeleton_by_segment_id` now also follows the cross-chunk records.
+
+Originally left unfixed deliberately. `write_skeleton_cross_chunk_links` has no
 in-package caller, so it is public API whose docstring *is* the contract;
 flipping either side would silently invert an external caller's parent/child
 relationships with no error. Which one is authoritative is a question for

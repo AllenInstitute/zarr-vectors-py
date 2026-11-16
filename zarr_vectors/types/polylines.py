@@ -377,25 +377,6 @@ def write_polylines(
             k: v for k, v in vertex_attributes.items() if k != chunk_by_attribute
         }
 
-    arrays_present = [VERTICES, "object_index"]
-    if fragment_attributes:
-        arrays_present.append(FRAGMENT_ATTRIBUTES)
-    level_chunk_dims: list[str] | None = None
-    if chunk_by_attribute is not None:
-        level_chunk_dims = compute_chunk_dim_names(
-            chunk_by_attribute, ndim,
-            spatial_dim_names=[a["name"] for a in axes],
-        )
-    level_meta = LevelMetadata(
-        level=0,
-        vertex_count=total_vertices,
-        arrays_present=arrays_present,
-        chunk_dims=level_chunk_dims,
-        chunk_attribute_name=chunk_by_attribute,
-        chunk_attribute_values=attr_bin_values,
-    )
-    level_group = create_resolution_level(root, 0, level_meta)
-
     # Every polyline split into per-chunk fragments at once: each (object,
     # chunk key) run is ONE fragment with implicit_sequential edges, and
     # each step from one fragment to the next becomes a cross-chunk link
@@ -423,6 +404,38 @@ def write_polylines(
         [plan.first[bridge] + plan.seg_len[bridge] - 1, plan.first[bridge + 1]],
         axis=1,
     )
+
+    # Declared after the fragment plan, so ``links`` is listed exactly
+    # when a polyline crosses a chunk boundary (only the bridges make a
+    # links array).
+    arrays_present = [VERTICES, VERTEX_FRAGMENTS, "object_index"]
+    if vertex_attributes:
+        arrays_present.append(VERTEX_ATTRIBUTES)
+    if fragment_attributes:
+        arrays_present.append(FRAGMENT_ATTRIBUTES)
+    if object_attributes:
+        arrays_present.append("object_attributes")
+    if groups:
+        arrays_present.append("groups")
+    if group_attributes:
+        arrays_present.append("group_attributes")
+    if len(bridge):
+        arrays_present.append("links")
+    level_chunk_dims: list[str] | None = None
+    if chunk_by_attribute is not None:
+        level_chunk_dims = compute_chunk_dim_names(
+            chunk_by_attribute, ndim,
+            spatial_dim_names=[a["name"] for a in axes],
+        )
+    level_meta = LevelMetadata(
+        level=0,
+        vertex_count=total_vertices,
+        arrays_present=arrays_present,
+        chunk_dims=level_chunk_dims,
+        chunk_attribute_name=chunk_by_attribute,
+        chunk_attribute_values=attr_bin_values,
+    )
+    level_group = create_resolution_level(root, 0, level_meta)
 
     idx_ndim = ndim + 1 if attr_bins is not None else ndim
     # Collapse all per-array zarr.json + per-chunk byte writes into one

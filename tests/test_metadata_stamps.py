@@ -168,7 +168,7 @@ class TestObjectPresenceIsRecorded:
 
 
 class TestTheTransformAgreesWithItself:
-    """A7 — the NGFF scale is derived from the same field as the translation."""
+    """A7 — bin_ratio is derived from the same field as bin_shape."""
 
     def _pyramid(self, factor: float):
         path = os.path.join(tempfile.mkdtemp(), "ngff.zv")
@@ -194,13 +194,13 @@ class TestTheTransformAgreesWithItself:
     @pytest.mark.parametrize("factor", [1.5, 2.0, 3.0])
     def test_scale_equals_bin_shape_over_root_bin(self, factor):
         path = self._pyramid(factor)
-        tf = self._transform(path)
         lm = read_level_metadata(open_store(path, mode="r"), 1)
-        # translation is bin_shape / 2 by construction, so this is the
-        # self-consistency check the fractional case used to fail.
-        assert tf["translation"] == pytest.approx([b / 2.0 for b in lm.bin_shape])
-        assert tf["scale"] == pytest.approx([b / 8.0 for b in lm.bin_shape])
-        assert tf["scale"] == pytest.approx([factor] * 3)
+        # The ratio comes off bin_shape, as a float, so the two agree.
+        assert lm.bin_ratio == pytest.approx([b / 8.0 for b in lm.bin_shape])
+        assert lm.bin_ratio == pytest.approx([factor] * 3)
+        # Coarse vertices are stored in level-0 coordinates, so the NGFF
+        # transform that places them is level 0's (scale 1), not the ratio.
+        assert self._transform(path)["scale"] == pytest.approx([1.0] * 3)
 
     def test_a_fractional_ratio_round_trips(self):
         lm = read_level_metadata(open_store(self._pyramid(1.5), mode="r"), 1)

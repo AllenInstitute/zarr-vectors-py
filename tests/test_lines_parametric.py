@@ -94,6 +94,42 @@ class TestLinesCrossChunk:
         assert result["line_count"] == 3
 
 
+    def test_cross_link_points_at_the_split_endpoints(
+        self, tmp_path: Path,
+    ) -> None:
+        # Whole lines are two-vertex fragments, so a split endpoint's
+        # chunk-local index is NOT its fragment index once a whole line
+        # precedes it in the same chunk.
+        from zarr_vectors.core.arrays import read_chunk_vertices, read_links
+        from zarr_vectors.core.store import get_resolution_level, open_store
+
+        endpoints = np.array([
+            [[10, 50, 50], [20, 50, 50]],      # whole, chunk 0
+            [[30, 50, 50], [130, 50, 50]],     # split 0 -> 1
+            [[140, 50, 50], [150, 50, 50]],    # whole, chunk 1
+            [[40, 50, 50], [160, 50, 50]],     # split 0 -> 1
+        ], dtype=np.float32)
+        store = str(tmp_path / "split.zarrvectors")
+        write_lines(store, endpoints, chunk_shape=(100.0, 100.0, 100.0))
+        lg = get_resolution_level(open_store(store), 0)
+        verts = {}
+        got = set()
+        for rec in read_links(lg):
+            pts = []
+            for cc, vi in rec:
+                if cc not in verts:
+                    verts[cc] = np.concatenate(
+                        read_chunk_vertices(lg, cc, ndim=3),
+                    )
+                pts.append(tuple(verts[cc][vi].tolist()))
+            got.add(tuple(sorted(pts)))
+        want = {
+            tuple(sorted(tuple(map(float, p)) for p in endpoints[i]))
+            for i in (1, 3)
+        }
+        assert got == want
+
+
 class TestLinesBbox:
 
     def test_bbox_filter(self, tmp_path: Path) -> None:

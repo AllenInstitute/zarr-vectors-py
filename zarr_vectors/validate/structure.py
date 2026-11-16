@@ -6,6 +6,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+import zarr
+
 from zarr_vectors.constants import (
     FRAGMENT_ATTRIBUTES,
     GROUPS,
@@ -79,7 +81,6 @@ def validate_structure(store_path: str | Path | Group) -> ValidationResult:
     """
     result = ValidationResult(level=1)
 
-    from zarr_vectors.core.arrays import list_link_deltas
     from zarr_vectors.core.store import (
         list_resolution_levels,
         open_store,
@@ -136,42 +137,106 @@ def validate_structure(store_path: str | Path | Group) -> ValidationResult:
             result.add_error(f"{ln}/ cannot be opened: {e}")
             continue
 
-        if level.array_exists(VERTICES):
-            result.add_pass(f"{ln}/vertices/ exists")
-        else:
-            result.add_error(f"{ln}/vertices/ missing")
-
-        if level.array_exists(VERTEX_FRAGMENTS):
-            result.add_pass(f"{ln}/vertex_fragments/ exists")
-        else:
-            result.add_warning(f"{ln}/vertex_fragments/ missing")
-
-        if level.attrs.to_dict():
-            result.add_pass(f"{ln}/ has metadata")
-        else:
-            result.add_warning(f"{ln}/ has no metadata file")
-
-        for opt in [VERTEX_ATTRIBUTES, FRAGMENT_ATTRIBUTES,
-                    OBJECT_INDEX, OBJECT_ATTRIBUTES, GROUPS]:
-            if level.array_exists(opt):
-                result.add_pass(f"{ln}/{opt}/ exists")
-
-        # Multiscale link layout (0.4+): list every <delta> segment.  All
-        # connectivity lives under the single ``links/`` family since 0.9.0.
-        if level.array_exists(LINKS):
-            deltas = list_link_deltas(level)
-            if deltas:
-                names = ",".join(format_delta(d) for d in deltas)
-                result.add_pass(f"{ln}/links/ exists (deltas: {names})")
-            else:
-                result.add_warning(f"{ln}/links/ exists but has no <delta> subdirs")
-
-        _check_chunk_ranks(root, lv, level, result)
+        # A node whose zarr.json does not parse (e.g. a shape whose rank
+        # disagrees with its chunk grid) raises a raw zarr ValueError from
+        # whichever check touches it first; name each one instead.
+        broken = _unreadable_nodes(level)
+        for path, err in broken:
+            result.add_error(f"{ln}/{path} metadata cannot be read: {err}")
+        if broken:
+            continue
+        try:
+            _check_level(root, lv, level, result)
+        except Exception as e:
+            result.add_error(f"{ln}/ cannot be checked: {type(e).__name__}: {e}")
 
     if root.array_exists(PARAMETRIC_GROUP):
         result.add_pass("parametric/ group exists")
 
     return result
+
+
+def _check_level(
+    root: Group, lv: int, level: Group, result: ValidationResult,
+) -> None:
+    """The per-level structural checks of :func:`validate_structure`."""
+    from zarr_vectors.core.arrays import list_link_deltas
+
+    ln = str(lv)
+    if level.array_exists(VERTICES):
+        result.add_pass(f"{ln}/vertices/ exists")
+    else:
+        result.add_error(f"{ln}/vertices/ missing")
+
+    if level.array_exists(VERTEX_FRAGMENTS):
+        result.add_pass(f"{ln}/vertex_fragments/ exists")
+    else:
+        result.add_warning(f"{ln}/vertex_fragments/ missing")
+
+    if level.attrs.to_dict():
+        result.add_pass(f"{ln}/ has metadata")
+    else:
+        result.add_warning(f"{ln}/ has no metadata file")
+
+    for opt in [VERTEX_ATTRIBUTES, FRAGMENT_ATTRIBUTES,
+                OBJECT_INDEX, OBJECT_ATTRIBUTES, GROUPS]:
+        if level.array_exists(opt):
+            result.add_pass(f"{ln}/{opt}/ exists")
+
+    # Multiscale link layout (0.4+): list every <delta> segment.  All
+    # connectivity lives under the single ``links/`` family since 0.9.0.
+    if level.array_exists(LINKS):
+        deltas = list_link_deltas(level)
+        if deltas:
+            names = ",".join(format_delta(d) for d in deltas)
+            result.add_pass(f"{ln}/links/ exists (deltas: {names})")
+        else:
+            result.add_warning(f"{ln}/links/ exists but has no <delta> subdirs")
+
+    _check_chunk_ranks(root, lv, level, result)
+
+
+def _unreadable_nodes(level: Group) -> list[tuple[str, str]]:
+    """``(path, error)`` for every node under ``level`` that fails to open.
+
+    Walks the store listing (one listing per group, no chunk keys: arrays
+    are not descended into) and opens each node, so its ``zarr.json`` is
+    parsed exactly as a reader would.  A directory that is no node at all
+    (``KeyError``) is not reported; level 1 judges the layout elsewhere.
+    """
+    from zarr.core.sync import sync
+
+    zg = level.zarr_group
+    store_path = zg.store_path
+    store = store_path.store
+    base = store_path.path.strip("/")
+    out: list[tuple[str, str]] = []
+
+    async def _names(prefix: str) -> list[str]:
+        return [n async for n in store.list_dir(prefix)]
+
+    def _walk(rel: str) -> None:
+        prefix = "/".join(p for p in (base, rel) if p)
+        try:
+            names = sync(_names(f"{prefix}/" if prefix else ""))
+        except Exception:
+            return
+        for raw in sorted({n.rstrip("/") for n in names}):
+            if not raw or raw == "zarr.json":
+                continue
+            child = f"{rel}/{raw}" if rel else raw
+            try:
+                node = zg[child]
+            except KeyError:
+                continue
+            except Exception as e:
+                out.append((child, f"{type(e).__name__}: {e}"))
+                continue
+            if isinstance(node, zarr.Group):
+                _walk(child)
+
+    _walk("")
+    return out
 
 
 def _check_chunk_ranks(

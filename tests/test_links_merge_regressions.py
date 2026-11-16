@@ -366,8 +366,10 @@ class TestLinesCrossChunkEndpointIndices:
 
     Link endpoints are chunk-local vertex indices.  ``write_lines`` appends
     each cross-chunk endpoint as its own single-vertex fragment, and a
-    chunk's vertices are its fragments concatenated in order — so the k-th
-    line's endpoint sits at chunk-local index k.  Hardcoding 0 made every
+    chunk's vertices are its fragments concatenated in order — so a split
+    endpoint sits at the chunk's running vertex count (its fragment index
+    only when no whole, two-vertex line precedes it; see
+    ``test_lines_parametric``).  Hardcoding 0 made every
     line in a chunk link to that chunk's *first* vertex: three distinct
     lines all decoded to the identical record.
 

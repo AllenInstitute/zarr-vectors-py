@@ -29,6 +29,18 @@ def _check_dracopy() -> bool:
     return _HAS_DRACOPY
 
 
+def draco_backend_available() -> bool:
+    """True when DracoPy imports or a ``draco_encoder`` CLI is on PATH.
+
+    Lets a writer refuse a Draco write before it creates anything,
+    rather than fail on the first chunk with a half-written store.
+    """
+    if _check_dracopy():
+        return True
+    import shutil
+    return shutil.which("draco_encoder") is not None
+
+
 def draco_encode_mesh(
     positions: npt.NDArray[np.floating],
     faces: npt.NDArray[np.integer],

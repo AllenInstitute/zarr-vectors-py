@@ -14,7 +14,11 @@ import zarr
 
 from zarr_vectors.core.metadata import LevelMetadata
 from zarr_vectors.core.multiscale import read_multiscale_metadata
-from zarr_vectors.core.store import create_resolution_level, open_store
+from zarr_vectors.core.store import (
+    create_resolution_level,
+    open_store,
+    read_level_metadata,
+)
 from zarr_vectors.sharding.io import _is_native_sharded
 from zarr_vectors.types.points import write_points
 from zarr_vectors.types.skeletons import (
@@ -116,15 +120,20 @@ class TestNGFFScaleFromBinShape:
                         return t["scale"]
         raise AssertionError(f"no scale for level {level}")
 
+    def _ratio_for(self, path: str, level: int) -> tuple[float, ...]:
+        return read_level_metadata(open_store(path), level).bin_ratio
+
     def test_integer_ratio_from_bin_shape(self) -> None:
         path = self._store_with_level1((100.0, 100.0, 100.0))  # 2x
-        np.testing.assert_allclose(self._scale_for(path, "1"), [2.0, 2.0, 2.0])
+        np.testing.assert_allclose(self._ratio_for(path, 1), [2.0, 2.0, 2.0])
+        # Vertices stay in level-0 coordinates: the NGFF scale is level 0's.
+        np.testing.assert_allclose(self._scale_for(path, "1"), [1.0, 1.0, 1.0])
 
     def test_fractional_ratio_from_bin_shape(self) -> None:
         # 75/50 = 1.5 — an integer-only ratio helper cannot express this,
         # and the old code silently produced 1.0.
         path = self._store_with_level1((75.0, 75.0, 75.0))
-        np.testing.assert_allclose(self._scale_for(path, "1"), [1.5, 1.5, 1.5])
+        np.testing.assert_allclose(self._ratio_for(path, 1), [1.5, 1.5, 1.5])
 
     def test_level_zero_is_identity(self) -> None:
         path = self._store_with_level1((75.0, 75.0, 75.0))

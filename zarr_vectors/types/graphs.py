@@ -37,6 +37,7 @@ from zarr_vectors.constants import (
     OBJECT_INDEX,
     OBJIDX_STANDARD,
     RESOLUTION_PREFIX,
+    VERTEX_ATTRIBUTES,
     VERTEX_FRAGMENTS,
     VERTICES,
 )
@@ -146,7 +147,9 @@ def write_graph(
         vertex_attributes: Per-node attributes ``{name: (N,) or (N,C)}``.
             (Spec name; replaces ``node_attributes``.)
         link_attributes: Per-edge attributes ``{name: (M,) or (M,C)}``.
-            (Spec name; replaces ``edge_attributes``.)
+            (Spec name; replaces ``edge_attributes``.)  With
+            ``kind="skeleton"`` they make every edge an explicit record
+            (implied ones included), so each edge keeps its value.
         fragment_attributes: Per-fragment attributes, keyed per chunk:
             ``{name: {chunk_coords: ndarray}}``.  Each per-chunk ndarray
             has shape ``(num_fragments_in_chunk,)`` or
@@ -332,18 +335,6 @@ def write_graph(
             spatial_dim_names=[a["name"] for a in axes],
         )
 
-    arrays_present_list = [VERTICES, "links", "object_index"]
-    if fragment_attributes:
-        arrays_present_list.append(FRAGMENT_ATTRIBUTES)
-    level_meta = LevelMetadata(
-        level=0,
-        vertex_count=n_nodes,
-        arrays_present=arrays_present_list,
-        chunk_dims=level_chunk_dims,
-        chunk_attribute_name=chunk_by_attribute,
-        chunk_attribute_values=attr_bin_values,
-    )
-    level_group = create_resolution_level(root, 0, level_meta)
     link_width = 2
 
     # Assign nodes to chunks.  When attribute-chunked, prefix each
@@ -455,9 +446,44 @@ def write_graph(
         )
         store_mask = ~implied
         _check_one_root_per_object(edges, object_ids, n_nodes)
+        if edge_attributes:
+            # ``link_attributes/`` mirrors the stored records row for row,
+            # so an implied edge has nowhere to keep its values -- skipping
+            # them silently dropped every attribute row but the branch and
+            # cross-chunk ones.  Store every edge explicitly instead: a
+            # record restating the implied parent is legal under
+            # ``implicit_sequential_with_branches`` (readers apply it as an
+            # override that changes nothing).  Stores written without edge
+            # attributes are unaffected.
+            store_mask = np.ones(n_edges, dtype=bool)
     else:
         store_mask = np.ones(n_edges, dtype=bool)
     store_rows = np.flatnonzero(store_mask)
+
+    # Declared once the stored edges are known: ``link_attributes`` is
+    # only written when some edge is stored rather than implied.  The
+    # links family and its ``link_fragments`` sidecar always exist (the
+    # backstop below creates the intra-chunk array).
+    arrays_present_list = [
+        VERTICES, VERTEX_FRAGMENTS, "links", LINK_FRAGMENTS, "object_index",
+    ]
+    if node_attributes:
+        arrays_present_list.append(VERTEX_ATTRIBUTES)
+    if fragment_attributes:
+        arrays_present_list.append(FRAGMENT_ATTRIBUTES)
+    if edge_attributes and len(store_rows) > 0:
+        arrays_present_list.append("link_attributes")
+    if object_attributes:
+        arrays_present_list.append("object_attributes")
+    level_meta = LevelMetadata(
+        level=0,
+        vertex_count=n_nodes,
+        arrays_present=arrays_present_list,
+        chunk_dims=level_chunk_dims,
+        chunk_attribute_name=chunk_by_attribute,
+        chunk_attribute_values=attr_bin_values,
+    )
+    level_group = create_resolution_level(root, 0, level_meta)
 
     # Records stay in edge order, which the partitioner preserves within
     # each cell — that is what lets the per-edge attribute rows below be
@@ -491,7 +517,15 @@ def write_graph(
         # below, which know the offsets arrays each record lands in.
         if node_attributes:
             for name, data in node_attributes.items():
-                create_attribute_array(level_group, name, dtype=str(data.dtype))
+                # Channel names carry the row shape: without them a (V, C)
+                # column was declared scalar and read back as V*C values.
+                create_attribute_array(
+                    level_group, name, dtype=str(data.dtype),
+                    channel_names=(
+                        [f"ch{i}" for i in range(data.shape[1])]
+                        if np.ndim(data) == 2 else None
+                    ),
+                )
         if object_attributes:
             for _name in object_attributes:
                 create_object_attributes_array(level_group, _name)
