@@ -1,0 +1,22 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="720" height="290" viewBox="0 0 720 290" role="img" aria-labelledby="title desc">
+  <title id="title">Complete boundary triangle from one selected owner</title>
+  <desc id="desc">The triangle belongs to cell 0,0,0 and uses vertices from the neighboring cells 1,0,0 and 0,1,0. Distant geometry is not read.</desc>
+  <rect width="720" height="290" fill="#ffffff"/>
+  <g stroke="#64748b" stroke-width="1.5">
+    <rect x="55" y="140" width="110" height="110" fill="#dbeafe"/>
+    <rect x="165" y="140" width="110" height="110" fill="#dcfce7"/>
+    <rect x="55" y="30" width="110" height="110" fill="#dcfce7"/>
+    <rect x="535" y="140" width="110" height="110" fill="#f1f5f9"/>
+    <path d="M66 239 L66 129 L176 239 Z" fill="#2563eb" fill-opacity="0.2" stroke="#2563eb" stroke-width="3"/>
+    <path d="M554 230 L580 180 L611 230 Z" fill="#cbd5e1" stroke="#94a3b8"/>
+  </g>
+  <g fill="#166534"><circle cx="66" cy="239" r="5"/><circle cx="66" cy="129" r="5"/><circle cx="176" cy="239" r="5"/></g>
+  <g font-family="sans-serif" font-size="16" fill="#0f172a">
+    <text x="80" y="170">Selected</text><text x="80" y="192">owner</text>
+    <text x="175" y="165">Vertex</text><text x="175" y="187">chunk</text>
+    <text x="70" y="58">Vertex</text><text x="70" y="80">chunk</text>
+    <text x="70" y="277">Complete triangle; original winding</text>
+    <text x="480" y="111">Distant geometry</text><text x="520" y="133">not read</text>
+    <text x="350" y="201" fill="#64748b">…</text>
+  </g>
+</svg>

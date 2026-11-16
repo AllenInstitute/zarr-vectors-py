@@ -6256,7 +6256,12 @@ def read_link_arrays(
     sid_ndim = int(fam_meta["sid_ndim"])
     directed = bool(fam_meta.get("directed", False))
     store = str(fam_meta.get("store", "canonical"))
-    scale_src, scale_trg = _link_scales(level_group, delta, sid_ndim)
+    # Same-level anchoring is identity at any chunk scale. Reading the root
+    # again to derive two equal scales adds metadata I/O but no information.
+    if delta == 0:
+        scale_src = scale_trg = (1,) * sid_ndim
+    else:
+        scale_src, scale_trg = _link_scales(level_group, delta, sid_ndim)
 
     # inverse[p] gathers a placed row back into input order: the
     # ``out[sigma[i]] = placed[i]`` of apply_perm_inverse, as one index.
