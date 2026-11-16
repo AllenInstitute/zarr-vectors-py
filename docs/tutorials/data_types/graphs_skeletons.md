@@ -12,6 +12,14 @@ depth-first and declares the store's geometry type as `skeleton`. The
 SWC-compatible per-vertex attributes (`radius`, `swc_type`) are ones you
 write yourself — a skeleton store written without them has none.
 
+**You will learn:** how to write a skeleton or a general graph, read it back by
+region, and build a pyramid for it. **Prerequisite:** the
+[Quickstart](../../getting_started/quickstart.md) for the vocabulary (store,
+chunk, level). The examples are self-contained and use synthetic nodes and
+edges; the one exception is the "Multi-skeleton stores" section, which
+refers to a `connectome.zarrvectors` you would have built yourself (for
+example by SWC ingest) and is illustrative only.
+
 All examples on this page use only the core `zarr-vectors` package.
 SWC/GraphML converters live in the companion package
 **`zarr-vectors-tools`**.
@@ -26,6 +34,11 @@ surfaces: `zarr_vectors` itself for reading data, and
 `zv.stability("zarr_vectors.types")`.
 
 ---
+
+The data API can also write graphs: `Dataset.add_graph(positions, edges,
+tree=True)` writes a skeleton, in the same style as `add_points` in the
+[point-cloud tutorial](point_clouds.md). This page uses the building-surface
+`write_graph`, which takes the physical `chunk_shape` directly.
 
 ## Skeletons (SWC-aligned)
 

@@ -3,22 +3,23 @@
 ## Terms
 
 **Rechunking**
-: The process of rewriting an existing Zarr Vectors store with a different
-  `chunk_shape` (and optionally a different `bin_shape`). Rechunking
-  produces a new store; the original is not modified in-place unless
-  explicitly requested.
+: Rewriting an existing Zarr Vectors store so that its chunk layout differs
+  from the source's. Zarr Vectors has three distinct operations that change a
+  layout, because "layout" means three different things:
+
+  | Operation | Changes | In place? | Function |
+  |-----------|---------|-----------|----------|
+  | **Spatial rechunk** | the spatial `chunk_shape` | no — writes `output` | `rechunk_spatial` |
+  | **Dimension rechunk** | prefixes every chunk key with a bin of a non-spatial dimension (group / object id / attribute value) | yes by default, or to `output` | `rechunk`, `rechunk_by_attribute` |
+  | **Re-bin** | the bin grid inside each chunk (point clouds only) | yes | `rebin_level` |
 
 **In-place rechunking**
-: Rechunking that overwrites the source store.  Supported by
-  `zarr_vectors.rechunk.rechunk(path, spec)` when ``output`` is left
-  as ``None``: the engine writes to a sibling ``<name>.rechunked``
-  directory, renames the source to ``<name>.backup``, moves the new
-  store into place, and deletes the backup.  The source path
-  identifier is preserved across the swap.
-
-**Out-of-place rechunking**
-: Rechunking that writes to a new destination path. The original store
-  is preserved. This is the default behaviour.
+: `zarr_vectors.rechunk.rechunk(path, spec)` with `output=None`: the engine
+  writes a sibling `<name>.rechunked` directory, renames the source to
+  `<name>.backup`, moves the new store into place, and deletes the backup. The
+  source path is preserved across the swap, but **the original data is gone
+  afterwards**. Pass `output=` to keep it. (`rechunk_spatial` has no in-place
+  mode.)
 
 **Chunk boundary crossing**
 : When rechunking from a fine `chunk_shape` to a coarser one, vertices
@@ -28,153 +29,152 @@
   destination chunks.
 
 **Link invalidation**
-: When rechunking, every link must be recomputed, because the chunk
-  boundaries change. A record's `<offsets>` array is determined by the
-  gap between its endpoints' chunks, so both the offsets naming its
-  array and the chunk-local `vi_k` within it change.
+: When the spatial chunk grid changes, every link must be recomputed. A
+  record's `<offsets>` array is determined by the gap between its endpoints'
+  chunks, so both the offsets naming its array and the chunk-local `vi_k` within
+  it change.
+
+**Prefix dimension**
+: The extra leading chunk-key axis a dimension rechunk adds, so that all objects
+  in one group / attribute value are contiguous on disk
+  (`(prefix_bin, x, y, z)`). Recorded in the level's `chunk_dims`; see
+  [Attribute-based chunking](attribute_chunking.md).
 
 ---
 
 ## Introduction
 
-Because `chunk_shape` controls the physical file layout, it cannot be
-modified without rewriting the underlying data. Rechunking is the operation
-that achieves this. It reads all vertices from the source store (chunk by
-chunk), re-assigns each vertex to its chunk in the destination layout, and
-writes the result.
+Because `chunk_shape` controls the physical file layout, it cannot be modified
+without rewriting the underlying data. `rechunk_spatial` is the operation that
+does so, for every geometry kind and every resolution level. It exists because
+chunk size is chosen at ingest, but the right size depends on the *density* of
+what was ingested: the same grid that suits a coarse level can leave a fine
+level with chunks holding tens of millions of links.
 
 Rechunking is relatively rare in practice: most users choose `chunk_shape`
-once before writing and do not change it. The most common scenario is
-discovering, after writing a large dataset, that the chosen `chunk_shape`
-is poorly matched to the actual query access pattern.
-
-Rechunking is also necessary when importing data from a different format
-(e.g. TRK or LAS) that has its own chunking scheme, and when building a
-Zarr Vectors store that will be served from cloud storage where chunk size
-requirements differ from those for local access.
+once before writing. The common scenarios are discovering after a large write
+that the chunk size is poorly matched to the access pattern, or needing
+physically contiguous groups for fast categorical reads (the dimension
+rechunk).
 
 ---
 
 ## Technical reference
 
-### Rechunking API
+### Spatial rechunk: `rechunk_spatial`
 
 ```python
-from zarr_vectors.core.rechunk import rechunk_store
+from zarr_vectors.rechunk import rechunk_spatial, suggest_chunk_shape
 
-rechunk_store(
-    source="scan.zarrvectors",
-    dest="scan_rechunked.zarrvectors",
-    chunk_shape=(500.0, 500.0, 500.0),   # new chunk shape
-    bin_shape=(100.0, 100.0, 100.0),     # new bin shape (optional)
+rechunk_spatial(
+    "scan.zarrvectors",
+    "scan_rechunked.zarrvectors",          # output: must not exist (or pass force=True)
+    chunk_shape=(500.0, 500.0, 500.0),     # new root chunk shape; None = suggest_chunk_shape()
 )
 ```
 
-If `bin_shape` is omitted, the new bin shape defaults to `chunk_shape / 4`
-per axis (isotropic), or the closest valid divisor.
+Full signature: `rechunk_spatial(store_path, output, chunk_shape=None, *,
+level_chunk_shapes=None, target_links_per_chunk=8_000_000, levels=None,
+force=False)`.
 
-### What rechunking does
+- `chunk_shape` — the new root chunk shape. If `None`, one is chosen by
+  `suggest_chunk_shape`, which halves the chunk per axis until the busiest
+  cell's projected link count is under `target_links_per_chunk` (default 8M,
+  well under the `2**32`-byte cell ceiling at which the vlen-bytes codec would
+  silently truncate).
+- `level_chunk_shapes={level: shape}` — give coarse levels their own, coarser
+  grid; each shape must be an integer multiple of the root's. Without it the
+  whole pyramid is written on one grid.
+- `levels` — the levels to carry across (default all).
 
-Rechunking proceeds in three phases:
+Bin shape: the output keeps the source's `base_bin_shape`, or `chunk_shape / 4`
+per axis if the source had none.
 
-**Phase 1 — Vertex repartitioning.** For each vertex in the source store,
-compute its destination chunk coordinate in the new chunk grid:
+#### What it does
+
+1. **Vertices** of each object are re-assigned to chunks by
+   `floor(position / chunk_shape)` and written one fragment per object per chunk.
+2. **Links** of any `link_width` are re-split onto the new grid: the intra-chunk
+   majority is written directly, the cross-chunk remainder through `write_links`,
+   so endpoint canonicalisation and the `perm_idx` that restores winding are
+   handled by the library. Records move between offsets arrays of the same
+   family.
+3. **Object index** is rebuilt, with **object ids preserved exactly**.
+4. **Object attributes**, **groups** and **group attributes** are carried across
+   per level.
+5. Every level is rechunked, not just level 0.
+
+#### What is preserved vs recomputed
+
+| Array | After `rechunk_spatial` | Notes |
+|-------|-------------------------|-------|
+| `vertices/` values | Preserved | Same positions, different chunk assignment |
+| `vertex_fragments/` | Recomputed | One fragment per object per chunk (no bin fragments) |
+| `links/<delta>/<offsets>/`, `link_fragments/` | Recomputed | Offsets and chunk-local vertex indices change |
+| `object_index/` | Recomputed | Chunk coordinates and fragment indices change; ids preserved |
+| `object_attributes/` | Preserved | Per-object, not per-chunk |
+| `groups`, `group_attributes/` | Preserved | Per-group |
+| `vertex_attributes/` | **Not carried** | Not read or written by this function |
+| `fragment_attributes/` | **Not carried** | Derived data; regenerate (`write_fragment_owner_column`) |
+| `link_attributes/` | **Not carried** | |
+| Root `zarr_vectors` block | New | `chunk_shape` updated; `bounds`, `geometry_types` and conventions copied |
+| Per-level metadata | Rebuilt | `parent_level`, `coarsening_method`, a per-level `chunk_shape` override; levels `> 0` are stamped `preserves_object_ids` |
+
+If you need per-vertex or per-link attributes on the output, write them again
+afterwards (see [Attributes](../object_model/object_attributes.md#adding-attributes-to-an-existing-store)).
+
+### Dimension rechunk: `rechunk` and `rechunk_by_attribute`
 
 ```python
-new_chunk_coord = tuple(
-    int(math.floor(p[d] / new_chunk_shape[d])) for d in range(D)
-)
+from zarr_vectors.rechunk import RechunkSpec, rechunk, rechunk_by_attribute
+
+rechunk("tracts.zarrvectors", RechunkSpec(by="group"), output="tracts_by_group.zarrvectors")
+rechunk_by_attribute("cells.zarrvectors", "gene")           # in place; one chunk-key prefix per value
 ```
 
-Vertices are buffered per destination chunk. Once all vertices for a
-destination chunk have been collected, the chunk is sorted into fragment order
-(by new bin coordinate) and written.
+`RechunkSpec.by` is `"group"`, `"object_id"`, `"attribute:<name>"` (a
+**per-object** attribute) or `"spatial"`; `bins`, `categorical`,
+`spatial_chunk_shape` and `prefix_dim_name` refine the mapping. With
+`output=None` the call is in place (see the Terms).
 
-**Phase 2 — Attribute and link re-assignment.** Per-vertex attributes are
-re-ordered to match the new vertex ordering. For polyline and streamline
-stores, the `links/<delta>/` family is also recomputed: each record is
-re-partitioned against the new chunk grid and re-filed under the offsets
-naming the new gap between its endpoints. Records that were intra-chunk
-may become cross-chunk and vice versa — they simply move between offsets
-arrays within the same family.
-
-**Phase 3 — Object index rebuild.** For stores with an `object_index`, the
-index is rebuilt from scratch against the new chunk layout.
+This engine is deliberately narrow, and its docstring in
+`zarr_vectors.rechunk.spatial` says why a separate spatial rechunk exists. It
+rewrites **level 0 only**, copies only `vertices`, `object_index` and (for
+`by="group"`) the group memberships, never reads or writes the `links` family,
+and **renumbers objects** with a running counter — so ids no longer join back to
+the source and no mapping is stored. For a point cloud with no links that is
+lossless; for any type whose topology lives in links, use it only on stores you
+can afford to lose links from. Each destination chunk holds one fragment per
+object piece.
 
 ### Rechunking and resolution levels
 
-Rechunking operates on a single resolution level. To rechunk a multi-
-resolution store, rechunk each level separately:
+`rechunk_spatial` rechunks all levels in one call (or those in `levels=`), so
+there is no per-level loop to write. To rechunk only the base level and rebuild
+coarser levels, pass `levels=[0]` and build a pyramid on the output:
 
 ```python
-from zarr_vectors.core.rechunk import rechunk_store
-
-for level in [0, 1, 2]:
-    rechunk_store(
-        source=f"scan.zarrvectors/resolution_{level}",
-        dest=f"scan_rechunked.zarrvectors/resolution_{level}",
-        chunk_shape=(500.0, 500.0, 500.0),
-        bin_shape=(100.0, 100.0, 100.0),
-        level=level,
-        source_root="scan.zarrvectors",       # for metadata
-        dest_root="scan_rechunked.zarrvectors",
-    )
-```
-
-Alternatively, rechunk only the base level and rebuild coarser levels:
-
-```python
-from zarr_vectors.core.rechunk import rechunk_store
+from zarr_vectors.rechunk import rechunk_spatial
 from zarr_vectors.multiresolution.coarsen import build_pyramid
 
-rechunk_store("scan.zarrvectors", "scan_rechunked.zarrvectors",
-              chunk_shape=(500.0, 500.0, 500.0), levels=[0])
-
-build_pyramid("scan_rechunked.zarrvectors", factors=[(2.0, 1.00), (4.0, 2.00)])
+rechunk_spatial("scan.zarrvectors", "scan_rechunked.zarrvectors",
+                chunk_shape=(500.0, 500.0, 500.0), levels=[0])
+build_pyramid("scan_rechunked.zarrvectors", factors=[(2.0, 1.0), (2.0, 2.0)])
 ```
 
 ### Memory usage
 
-Rechunking requires buffering all vertices that will land in a single
-destination chunk. For a store with uniform vertex density and isotropic
-rechunking from `chunk_shape=(200,…)` to `chunk_shape=(500,…)`, each
-destination chunk receives approximately `(500/200)³ ≈ 15.6×` as many
-vertices as the average source chunk. Peak memory usage scales with
-`new_chunk_volume / old_chunk_volume × avg_vertices_per_source_chunk`.
-
-For very large rechunking ratios (e.g. 10× per axis), use the streaming
-rechunker which writes destination chunks as they fill rather than
-buffering all source data:
-
-```python
-rechunk_store(
-    source="scan.zarrvectors",
-    dest="scan_rechunked.zarrvectors",
-    chunk_shape=(2000.0, 2000.0, 2000.0),
-    streaming=True,          # lower memory; slower due to multiple source passes
-)
-```
+Both engines hold a whole level's per-object geometry in memory while they
+re-bucket it: `rechunk_spatial` reads each level into `{object_id:
+(vertices, links)}` before writing. Peak memory scales with the size of a
+level, not with the ratio of old to new chunk volume, and there is no
+streaming option. For very large stores, rechunk level by level
+(`levels=[n]`, one output store per call) or re-ingest from source.
 
 ### CLI usage
 
-The `zarr-vectors rechunk` CLI subcommand lives in the companion package
-**`zarr-vectors-tools`**.
-
-### What is preserved vs recomputed
-
-| Array | Preserved? | Notes |
-|-------|-----------|-------|
-| `vertices/` values | Yes | Same positions, different chunk assignment |
-| `vertex_fragments/` | Recomputed | Fragment partition changes with new bin grid |
-| `link_fragments/` | Recomputed | Parallel to `vertex_fragments/` for `links/0/` |
-| `links/<delta>/<offsets>/` | Recomputed | Both the offsets naming each record's array and its chunk-local vertex indices change |
-| `link_attributes/<name>/<delta>/<offsets>/` | Recomputed | Mirrors the offsets arrays cell-for-cell |
-| `attributes/` values | Yes | Reordered to match new vertex ordering |
-| `object_index/` | Recomputed | Chunk coordinates *and* fragment indices change |
-| `object_attributes/` | Preserved | Per-object, not per-chunk |
-| `groupings/` | Preserved | Per-group, not per-chunk |
-| Root `.zattrs` | Updated | `chunk_shape` and `base_bin_shape` updated |
-| Per-level `.zattrs` | Updated | `bin_shape` updated; `bin_ratio` unchanged |
+A `zarr-vectors rechunk` CLI subcommand, if present, lives in a companion
+package and is not part of this repository.
 
 ### Rechunking only `bin_shape`
 
@@ -184,51 +184,59 @@ only the fragment partition within each chunk does. `rebin_level`
 handles this case:
 
 ```python
-from zarr_vectors.rechunk.rebin import rebin_level
+from zarr_vectors.rechunk import rebin_level
 
 rebin_level(
     "scan.zarrvectors",
     target_bin_shape=(25.0, 25.0, 25.0),   # finer bins within the same chunks
     level=0,
 )
+# -> {"chunks_processed", "vertices_processed", "bins_created",
+#     "old_bin_shape", "new_bin_shape", "level"}
 ```
 
 **`rebin_level` is point-cloud-only.** It raises `StoreError` unless
 `geometry_types == ["point_cloud"]` exactly. Re-binning re-sorts
 vertices *within* a chunk, which is safe only when the fragment layout
 is derivable from positions alone; every other type carries per-object
-or per-bundle fragment semantics that the re-sort would flatten
-irreversibly. For those, use `zarr_vectors.rechunk.rechunk()`, which
-rebuilds the object manifests too.
+fragment semantics that the re-sort would flatten irreversibly. For those,
+use `rechunk_spatial`, which rebuilds the object manifests too.
 
 The links question therefore does not arise: a store `rebin_level`
-accepts has no links, no `object_index/`, and no manifests to rewrite.
+accepts has no links to rewrite.
 
-`rebin_level` is in-place: it rewrites `vertex_fragments/` and re-sorts
-vertices within each chunk, and updates root `base_bin_shape` (when
-`level == 0`) plus the level's `bin_shape` / `bin_ratio`. Chunk file
-paths are unaffected.
+`rebin_level` is in-place. It re-sorts the vertices of each chunk into the
+new bins and rewrites `vertex_fragments/` with **one fragment per *occupied*
+bin**, sorted by bin coordinate — unlike `write_points`, which emits a
+fragment for every bin. After a rebin, fragment `f` is therefore *not* the bin
+with row-major index `f`. It updates the root `base_bin_shape` (when
+`level == 0`) and rewrites the level's metadata block. Chunk file paths are
+unaffected.
 
 > **Per-vertex attribute arrays are NOT rewritten.** `rebin_level`
-> leaves `attributes/` untouched while shuffling vertex order within
-> each chunk, so any post-write per-vertex attribute array is left
-> **misaligned** with its vertices and must be regenerated by the
-> caller. This is a documented property of the function, not a bug —
-> but it means `rebin_level` is unsafe to run on a store with
-> per-vertex attributes unless you regenerate them afterwards.
+> leaves `vertex_attributes/` untouched while shuffling vertex order within
+> each chunk, so any per-vertex attribute array is left **misaligned** with its
+> vertices and must be regenerated by the caller. This is a documented property
+> of the function, not a bug — but it means `rebin_level` is unsafe to run on a
+> store with per-vertex attributes unless you regenerate them afterwards. It
+> also re-encodes vertices as `float32`.
 
-`target_bin_shape` must evenly divide `chunk_shape` or the call raises.
+`target_bin_shape` must evenly divide `chunk_shape` or the call raises
+`MetadataError`.
 
 ### Validation after rechunking
 
-Run the full L5 validator after rechunking to confirm the new store is
-consistent:
+Run the validator after rechunking to confirm the new store is consistent:
 
 ```python
 from zarr_vectors.validate import validate
-result = validate("scan_rechunked.zarrvectors", level=5)
+
+result = validate("scan_rechunked.zarrvectors", level=3)
+print(result)
 ```
 
-Pay particular attention to L3 checks (fragment offset consistency) and L4 checks
-(cross-chunk link validity), as these are most likely to expose bugs in
-the rechunking implementation.
+`validate(path, level=N)` accepts levels 1–5; the shipped checks are
+described in [Validation](../validation/overview.md). Pay particular attention
+to the L3 manifest and link checks (every object's blocks name an existing chunk
+and fragment, and every link's endpoint chunks exist), as these are the most
+likely to expose a rechunking bug.

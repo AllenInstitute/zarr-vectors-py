@@ -6,6 +6,13 @@ imaging, and synchrotron science. It natively understands several data
 formats (OME-Zarr image volumes, Neuroglancer precomputed, N5), but does
 not have native support for the Zarr Vectors.
 
+**You will learn:** the two ways to look at a store in Neuroglancer and what
+each needs. **Prerequisite:** a store to look at — the
+[Quickstart](../../getting_started/quickstart.md) builds `scan.zarrvectors` and
+`tracts.zarrvectors`. The viewer itself is a separate package
+(`zv-ngtools`, below); its commands are documented here but live in that
+package's repository, not in `zarr-vectors-py`.
+
 [`zv-ngtools`](https://github.com/AllenInstitute/zv-ngtools) bridges
 this gap. It is a fork of
 [`ngtools`](https://github.com/neuroscales/ngtools) — a collection of
@@ -73,8 +80,9 @@ This path is best for sharing published datasets with collaborators who
 will not install `zv-ngtools`, or for embedding Neuroglancer links in
 publications and websites.
 
-See [Precomputed export](precomputed_export.md) for the conversion
-workflow.
+The converter is not part of this package: it lives in the companion package
+**`zarr-vectors-tools`**. See [Precomputed export](precomputed_export.md) for
+the pointer.
 
 ---
 

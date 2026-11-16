@@ -3,6 +3,7 @@ Headers
 
 .. automodule:: zarr_vectors.headers
    :no-members:
+   :no-special-members:
 
 A store often comes from somewhere — a ``.trk`` file, an ``.swc``, a
 Neuroglancer precomputed volume — and that source format has a header the

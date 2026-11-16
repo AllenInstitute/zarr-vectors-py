@@ -4,8 +4,8 @@
 
 **Structural check**
 : A validation check that examines the store's node layout: which nodes
-  exist, and the shape of the per-chunk arrays' cell grids. It reads no
-  cell data.
+  exist, the root attribute blocks, and the shape of the per-chunk arrays'
+  cell grids. It reads no cell data.
 
 **Required path**
 : A store path that must exist for a valid Zarr Vectors store. Missing required
@@ -13,7 +13,7 @@
   independent** — see *Scope* below.
 
 **Level directory**
-: A directory under the store root whose name parses as an integer
+: A group under the store root whose name parses as an integer
   (`0/`, `1/`, …). Directories whose names do not parse as integers
   (e.g. `parametric/`) are not level directories and are skipped by the
   level walk.
@@ -23,10 +23,11 @@
 ## Introduction
 
 L1 validation answers the question: "does this store have the right shape?"
-It checks that the store root, its metadata, and each resolution
-level's required nodes are present, and that each level's per-chunk
-arrays agree on the rank of the chunk grid they share. It reads no cell
-data, and it interprets metadata only as far as the rank check needs.
+It checks that the store opens, the root carries a `zarr_vectors`
+metadata block, each resolution level's required nodes are present, and
+each level's per-chunk arrays agree on the rank of the chunk grid they
+share. It reads no cell data, and it interprets metadata only as far as
+the rank check needs.
 
 L1 is the fastest validation level and is appropriate as a first triage
 step when opening an unfamiliar store. An L1 failure means the store is
@@ -36,8 +37,8 @@ structurally incomplete and cannot be read by any Zarr Vectors reader.
 
 L1 is deliberately **narrow**, and narrower than a reader's needs:
 
-- It asks the store, not a filesystem, so it works on any backend a
-  reader can open. It resolves nodes through the same lookup readers
+- It asks the store, not a filesystem, so it works on local paths, URLs,
+  open `Group` handles and any backend a reader can open. It resolves nodes through the same lookup readers
   use.
 - It opens each per-chunk array's `zarr.json` for one purpose: its
   **rank**, and the arity of the keys in its `nonempty_chunks`
@@ -50,10 +51,6 @@ L1 is deliberately **narrow**, and narrower than a reader's needs:
   by [`validate_conformance`](../../../zarr_vectors/validate/conformance.py),
   which is the level that reads `geometry_types` and
   `links_convention`.
-
-Anything stated as a per-type requirement in this page's history was
-never enforced at L1; it has been removed rather than left as an
-aspiration.
 
 ---
 
@@ -76,19 +73,26 @@ do not carry stable machine-readable check IDs (see
 | The root attributes carry an RFC 8 `ome` node | Warning |
 | At least one resolution level exists | Error (returns immediately) |
 
-The two immediate returns are **fatal to the walk**: no per-level
-results follow them.
+The `ome` node is optional (format 0.9.2): a store without one is valid
+and fully readable, but cannot be resolved as a member of an OME
+collection. The warning's remedy is
+`zarr_vectors.building.stamp_ome_node(store)`, which adds the node
+without rewriting data.
 
-#### Per level directory
+The two immediate returns are **fatal to the walk**: no per-level
+results follow them. A missing
+`zarr_vectors` block is recorded and the walk continues.
+
+##### Per level directory
 
 Repeated for every integer-named directory under the root, in ascending
 numeric order:
 
 | Rule | Failure type |
 |------|--------------|
-| `N/vertices/` exists and is a directory | **Error** |
-| `N/vertex_fragments/` exists and is a directory | Warning |
-| `N/.zattrs` or `N/zarr.json` exists | Warning |
+| `N/vertices/` exists | **Error** |
+| `N/vertex_fragments/` exists | Warning |
+| The level group has non-empty attributes | Warning |
 
 `vertices/` is the **only** per-level path whose absence is an L1 error.
 
@@ -157,15 +161,17 @@ does not parse is reported at L2, and this rule is skipped for it.
 
 ```
 Level 1 validation: FAIL
-  6 passed, 2 warnings, 1 errors
+  6 passed, 3 warnings, 1 errors
   ERROR: 1/vertices/ missing
+  WARN:  No RFC 8 'ome' node in the root attributes; ...
   WARN:  1/vertex_fragments/ missing
   WARN:  0/links/ exists but has no <delta> subdirs
 ```
 
 Passing messages take the form `Store root opened`,
-`Root metadata file found`, `Found 2 resolution level(s)`,
-`0/vertices/ exists`, `0/links/ exists (deltas: 0,+1)`, and
+`Root metadata file found`, `RFC 8 'ome' node found`,
+`Found 2 resolution level(s)`, `0/vertices/ exists`,
+`0/links/ exists (deltas: 0,+1)`, and
 `0/ per-chunk arrays share rank 4 (3 arrays)`.
 
 ### Implementation notes for contributors

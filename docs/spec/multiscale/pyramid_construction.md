@@ -106,6 +106,17 @@ on import; `build_pyramid` / `coarsen_level` then dispatch to them by
 `zarr-vectors-tools` installed raises a clear error naming the package to
 install. Core takes no dependency on it.
 
+### What the core coarsener writes
+
+For each coarser level the core `per_object` method writes: `vertices`
+(one metavertex per occupied bin; centroid positions, `float32`),
+`object_index` (when the source has one; ids preserved, dropped objects
+empty), copies of the per-object `object_attributes`, and, when
+`cross_level_storage` is not `"none"`, the cross-level `links/<±delta>/`
+arrays. It does **not** write per-vertex attributes, `groups`, or a
+recomputed intra-level `links/0/` family for the coarse level. A store
+with no `object_index` is treated as one implicit object.
+
 ### Coarsening by geometry type
 
 > These geometry-type-specific coarseners are provided by
@@ -206,7 +217,7 @@ to a `zarr-vectors-tools`-registered implementation.
 
 ```python
 def build_pyramid(
-    store_path: str | Path,
+    store_path: str | Path | Group,
     *,
     factors: list[tuple[float, float]],
     chunk_scale_factors: list[int | tuple[int, ...]] | None = None,
@@ -215,8 +226,20 @@ def build_pyramid(
     cross_level_depth: int = 1,
     cross_level_storage: str = "explicit",
     method: str = "per_object",            # core built-in; else via tools
+    options: dict[str, Any] | None = None, # keywords forwarded to a registered method
 ) -> dict[str, Any]
 ```
+
+The same pyramid can be built from an open dataset with
+`Dataset.build_pyramid(factors=[...], method="per_object", **kw)`;
+`zarr_vectors.coarsen_methods()` lists every `method=` the current
+environment accepts (`("per_object",)` unless `zarr-vectors-tools` is
+installed). `options=` is for a registered method's own keywords and
+raises `CoarseningError` when combined with `per_object`.
+
+The return value is a dict with `levels_created`, `level_specs` (one
+summary per level), `method`, `cross_level_depth` and
+`cross_level_storage`.
 
 ### `coarsen_level` API
 
@@ -282,8 +305,8 @@ Zarr Vectors defines a canonical vocabulary of aggregation tokens
 > `build_pyramid` nor `coarsen_level` takes an `agg_mode=` argument.
 > The core `per_object` coarsener aggregates **positions only**, always
 > as the bin centroid (arithmetic mean), and carries **per-object**
-> attributes across unchanged for each surviving OID (with a
-> `present_mask` for dropped objects). It does not coarsen per-vertex
+> attributes across for each surviving OID (rows of dropped objects
+> carry the array's `fill_value`; there is no separate presence mask). It does not coarsen per-vertex
 > attributes at all.
 >
 > The vocabulary above exists so that coarsening methods registered by

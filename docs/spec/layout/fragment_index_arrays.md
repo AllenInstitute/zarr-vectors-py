@@ -17,13 +17,21 @@ coarsened pyramid levels.
 
 ## Terms
 
+**Cell notation**
+: Throughout this page `<array>/<i.j.k>` means *the cell at chunk-grid
+  coordinate `(i, j, k)` of the single vlen-bytes array `<array>`* — stored as
+  the file `<array>/c/i/j/k` (shifted by the array's `chunk_grid_origin`, see
+  [Chunk arrays](chunk_arrays.md)). It is not a sub-array.
+
 **Fragment**
 : A logical grouping of rows inside one chunk's `vertices/<i.j.k>`
-  (or `links/0/<all-zero offsets>/<i.j.k>`) array. A fragment is either a contiguous
-  range of rows or an explicit list of row indices. At level 0 with
-  the default writer, each non-empty bin emits exactly one fragment;
-  at coarsened pyramid levels a fragment may represent a metavertex
-  shared between several objects' manifests.
+  (or `links/0/<all-zero offsets>/<i.j.k>`) cell. A fragment is either a
+  contiguous range of rows or an explicit list of row indices. What a fragment
+  *represents* depends on the writer: for an undifferentiated point cloud it is
+  one bin (every bin of the chunk, including empty ones); for polylines,
+  meshes, graphs and point clouds with objects it is one object's piece of the
+  chunk; at coarsened pyramid levels it may be a metavertex shared between
+  several objects' manifests. See [Fragments](../object_model/fragments.md).
 
 **Range fragment**
 : A fragment that owns a contiguous run `[start, start + count)` of
@@ -76,10 +84,12 @@ coarsened pyramid levels.
 | `count == 0` (empty bin) | No fragment is emitted for that bin |
 | `count == -1` (fill, never written) | No fragment is emitted for that bin |
 
-In the new format, empty bins do not occupy a slot; the fixed
-`B_per_chunk × 16-byte` overhead of the pre-0.6 layout is gone.
-Variable-width fragments and arbitrary index lists become possible
-because the index no longer relies on a fixed-shape int64 table.
+The fragment *count* is now the writer's choice rather than a fixed
+`B_per_chunk`: object-based writers emit one fragment per object per chunk and
+no empty ones. (The point-cloud bin writer still emits one fragment per bin,
+empty or not, so its index remains `B_per_chunk × 16` bytes plus header.)
+Variable-width fragments and arbitrary index lists become possible because the
+index no longer relies on a fixed-shape int64 table.
 
 ---
 
@@ -135,14 +145,14 @@ in a pyramid. The answer depends on the level and on the writer:
 
 | Scenario | Sharing needed? | Why |
 |----------|----------------|-----|
-| Level 0, default writer | No | Each vertex belongs to exactly one bin; manifests refer to disjoint row ranges. A contiguous `(start, count)` per non-empty bin is sufficient. |
+| Level 0, default writers | No | Each vertex belongs to exactly one bin or object piece; manifests refer to disjoint row ranges. A contiguous `(start, count)` per fragment is sufficient. |
 | Level 0, custom writer that splits one bin across two manifests (e.g. a polyline with both endpoints in the same bin claimed by separate objects) | Yes, but rare | Almost always cheaper to duplicate the few rows than pay the explicit-fragment overhead. |
 | Coarsened pyramid level, no merging (`shared_fragments=False`) | No | Coarsening preserves disjoint manifests; only the spatial granularity changes. |
 | Coarsened pyramid level, metanode-style merging (`shared_fragments=True`) | **Yes — the dominant case the format exists for** | A coarsened metavertex commonly belongs to *N* parent objects' paths. Duplicating its vertex row *N* times costs N× storage for the row plus N× the bytes through the network on any bbox read that touches that chunk. |
 
 The metanode case drives the whole design. At level 0 the format
-collapses to "one range fragment per non-empty bin" — structurally
-identical to the pre-0.6 `(offset, count)` table for non-empty rows.
+collapses to "one range fragment per bin / per object piece" — structurally
+identical to the pre-0.6 `(offset, count)` table.
 At coarsened levels the same byte layout absorbs sharing without
 duplicating rows. The single format covers both cases without a
 mode switch at the level or chunk level — only at the per-fragment
@@ -386,8 +396,8 @@ def indices(f):                          # any fragment f → row indices
 
 To read all vertices belonging to one object:
 
-1. Decode the object's **manifest** from `object_index/data` — a
-   sequence of per-chunk blocks, each naming `(chunk_coords,
+1. Decode the object's **manifest** from its row of
+   `object_index/manifests` — a sequence of per-chunk blocks, each naming `(chunk_coords,
    fragment_ref)` where `fragment_ref` is one of the three manifest
    block modes (single / range / explicit). See
    [Object manifest](../object_model/object_manifest.md) for the
@@ -410,20 +420,26 @@ To read all vertices belonging to one object:
 
 For spatial (bbox) queries rather than per-object reads:
 
-**Level 0, default writer.** Each non-empty bin has emitted exactly
-one range fragment. The bbox query is:
+**Undifferentiated point cloud.** Each bin has emitted exactly one range
+fragment, and fragment `f` is the bin with row-major index `f` within the chunk
+(unless `rebin_level` has since run). The bbox query is:
 
 ```python
 for chunk_coord in overlapping_chunks(bbox):
     fidx = read_fragment_index(VERTEX_FRAGMENTS, chunk_coord)
     for f in range(fidx.num_fragments):
         start, count = fidx.range(f)
-        # Optional bin-bbox prefilter: the writer's fragment-order
-        # invariant lets readers map f → bin and skip bin bboxes
-        # outside the query without reading vertex rows.
+        if count == 0:
+            continue                      # empty bin
+        # Optional bin-bbox prefilter: map f -> bin coordinates
+        # (spatial.chunking.fragment_index_to_bin) and skip bins outside
+        # the query without reading their rows.
         verts = vertices[chunk_coord][start : start + count]
         yield verts  # final point-in-bbox filter applied client-side
 ```
+
+Stores of other geometry types carry no bin ↔ fragment relationship; their
+bbox queries work at chunk granularity.
 
 **Coarsened levels with `shared_fragments=True`.** The query walks
 every fragment in overlapping chunks; sharing is invisible to the
@@ -434,18 +450,25 @@ slice. An explicit fragment's row list materialises via
 
 ### `vertex_fragments/` array schema
 
+A chunk array like `vertices/` (see [Chunk arrays](chunk_arrays.md)):
+
 | Property | Value |
 |----------|-------|
-| zarr `node_type` | `array` |
-| dtype | `uint8` |
-| logical shape | one variable-length blob per chunk, addressed by chunk coordinate |
-| codec pipeline | none — chunks are written as opaque bytes via the FsGroup `write_bytes` path |
-| group metadata | `{"zv_array": "vertex_fragments", "encoding": "fragment_index_v1"}` |
+| Zarr `data_type` | `variable_length_bytes` |
+| Shape | `chunk_grid_shape` — one cell per spatial chunk |
+| Zarr chunk shape | `(1, …, 1)` |
+| Fill value | `b""` (an unwritten cell reads as empty, which is *not* a valid blob — see below) |
+| Codec pipeline | `vlen-bytes` only; no compressor by default (a write session may add one, and `create_store(compressor=…)` fixes it for the warm-created array) |
+| Array attributes | `zv_array="vertex_fragments"`, `encoding="fragment_index_v1"`, `chunk_grid_origin`, `nonempty_chunks` |
 
-Each chunk holds one fragment-index blob in the v1 byte layout
-described above. The metadata `encoding: "fragment_index_v1"` tag
-identifies the format and is the discriminator that future versions
-of Zarr Vectors will rev when the binary layout changes.
+Each written cell holds one fragment-index blob in the v1 byte layout described
+above. The `encoding: "fragment_index_v1"` attribute identifies the format and
+is the discriminator that future versions will rev when the binary layout
+changes. A chunk that was written with no fragments holds the 16-byte
+header-only blob; a cell that was never written reads back as `b""`, which
+`decode_fragments` rejects as too short. `read_vertex_fragment_index` does not
+guard against this, so enumerate chunks from `nonempty_chunks`
+(`list_chunk_keys`) rather than probing the grid.
 
 The blob is intentionally not compressed by default. It is already
 binary-packed (header + bitmap + dense int64 range table + uint32/int64
@@ -456,21 +479,20 @@ fragment-index format is independent of any outer compression.
 
 ### `link_fragments/` array schema
 
-Identical structure, parallel role for exactly one link array: the
+Identical structure and codec, parallel role for exactly one link array: the
 **intra-chunk array at delta 0**, `links/0/<all-zero offsets>/`.
 
 | Property | Value |
 |----------|-------|
-| zarr `node_type` | `array` |
-| dtype | `uint8` |
-| logical shape | one blob per chunk |
-| codec pipeline | none |
-| group metadata | `{"zv_array": "link_fragments", "encoding": "fragment_index_v1"}` |
+| Zarr `data_type` | `variable_length_bytes` |
+| Shape | `chunk_grid_shape` |
+| Array attributes | `zv_array="link_fragments"`, `encoding="fragment_index_v1"`, `chunk_grid_origin`, `nonempty_chunks` |
 
-`link_fragments/<chunk_coords>` describes the fragment partition of
-`links/0/<all-zero offsets>/<chunk_coords>` rows. Present iff the geometry
-type has connectivity (polyline / streamline / graph / skeleton / mesh) and
-at least one chunk has been written.
+`link_fragments/<chunk_coords>` describes the fragment partition of the rows of
+`links/0/<all-zero offsets>/<chunk_coords>`. It is allocated alongside that
+intra array (`create_links_array`), and present iff the geometry type has
+connectivity (polyline / streamline / graph / skeleton / mesh) and the intra
+array was created.
 
 Every other link array — any non-zero offsets segment, and every
 `delta != 0` — uses an inline self-describing ragged blob and has **no**
@@ -525,23 +547,23 @@ A writer SHALL maintain:
 7. **Non-negative explicit indices.** Every entry of
    `explicit_indices` is `>= 0`.
 
-At level 0, the default writer additionally emits one range fragment
-per non-empty bin in ascending bin-flat-index order, preserving the
-pre-0.6 fragment order convention. At coarsened levels, fragment order
-follows the metavertex emission order chosen by the coarsening
-pipeline.
+The undifferentiated point-cloud writer additionally emits one range fragment
+per bin (empty bins as `(start, 0)`) in ascending bin-flat-index order. Object
+writers emit one fragment per object in the order the object's vertices were
+written. At coarsened levels, fragment order follows the metavertex emission
+order chosen by the coarsening pipeline.
 
 ### Worked example
 
 A chunk holds three fragments:
 
-- **Fragment 0** is a range starting at row 0, count 4 — the
-  vertices of one non-empty bin at level 0.
+- **Fragment 0** is a range starting at row 0, count 4 — for instance
+  the vertices of one bin of a point cloud.
 - **Fragment 1** is explicit, with rows `[12, 7, 19]` — a shared
   metavertex emitted by the coarsening pipeline that references
   rows of `vertices/<chunk>` not contiguous in bin order.
 - **Fragment 2** is a range starting at row 20, count 8 — another
-  non-empty bin at level 0.
+  bin.
 
 So `F = 3`, `R = 2`, `E = 1`, `T = 3`. Annotated hex dump:
 

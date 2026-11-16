@@ -3,8 +3,8 @@
 ## Terms
 
 **Geometry type constant**
-: The string value stored in `"geometry_type"` in root `.zattrs` that
-  uniquely identifies the type. Must be a lowercase alphanumeric string
+: The string value stored in the `geometry_types` list of the root
+  `zarr_vectors` attribute block that identifies the type. Must be a lowercase alphanumeric string
   with underscores (e.g. `"point_cloud"`, `"streamline"`).
 
 **Type-specific arrays**
@@ -24,11 +24,13 @@
 
 ## Introduction
 
-Adding a new geometry type to Zarr Vectors requires changes at every layer of the
-stack: a new type constant, type-specific arrays, a writer, a reader, a
-validator, a lazy loader, and documentation. This page provides a step-by-
-step checklist for contributors adding a new type, using the existing types
-as reference implementations.
+Adding a new geometry type to Zarr Vectors touches several layers: a new
+type constant, a writer, a reader, the dataset-API reader table, the
+geometry conformance table, the LinkML schema, tests, and documentation.
+This page is a checklist for contributors, using the existing types as
+reference implementations. It names real extension points in the code;
+there is no plug-in registry for geometry types, so each step is an edit
+to the library itself.
 
 Before beginning implementation, ensure the new type has been ratified via
 the RFC process (see [Spec change process](spec_change_process.md)).
@@ -41,267 +43,171 @@ the RFC process (see [Spec change process](spec_change_process.md)).
 
 Decide:
 1. The type constant string (e.g. `"voxel_cloud"` for a new type).
-2. Which existing arrays it requires (all types need `vertices/` and
-   `vertex_fragments/`; types with intra-chunk connectivity also need
-   `link_fragments/`).
-3. What new arrays, if any, it introduces.
+2. Which existing arrays it requires (every type writes `vertices/`; the
+   writers also produce `vertex_fragments/`).
+3. What new arrays, if any, it introduces. Prefer reusing the existing
+   families (`vertex_attributes/`, `object_attributes/`, `links/`) over new
+   arrays.
 4. Whether it has discrete objects (requires `object_index/`).
 5. Its link-family policy: `link_width`, and whether the family is
    `directed` (endpoint order is data) or undirected (canonical-sorted
-   and deduplicated, with `perm_idx` recovering input order).
+   and deduplicated, with `perm_idx` recovering input order). The policy is
+   set by `write_links(directed=..., store=...)` /
+   `create_links_array(...)`.
 6. Whether its connectivity is explicit or implicit — an
    `implicit_sequential` type emits no intra-chunk links at all, since
-   vertex order within a fragment carries the topology.
-7. What type-specific metadata keys it adds to root `.zattrs`.
+   vertex order within a fragment carries the topology. The value goes in
+   `links_convention` (one of `explicit`, `implicit_sequential`,
+   `implicit_sequential_with_branches`).
+7. Whether it needs any root-metadata keys. Prefer none: existing types
+   declare none beyond `geometry_types` and the three convention fields.
 
 ### Step 1 — Add the type constant
 
 ```python
 # zarr_vectors/constants.py
-GEOM_VOXEL_CLOUD = "voxel_cloud"    # ← new constant
+GEOM_VOXEL_CLOUD: str = "voxel_cloud"    # ← new constant
 
-GEOMETRY_TYPES = {
+VALID_GEOMETRY_TYPES: frozenset[str] = frozenset({
     GEOM_POINT_CLOUD, GEOM_LINE, GEOM_POLYLINE, GEOM_STREAMLINE,
-    GEOM_GRAPH, GEOM_SKELETON, GEOM_MESH,
+    GEOM_SKELETON, GEOM_GRAPH, GEOM_MESH,
     GEOM_VOXEL_CLOUD,    # ← register new constant
-}
+})
 ```
 
-### Step 2 — Define required and optional arrays
+`RootMetadata.validate()` rejects any `geometry_types` entry not in
+`VALID_GEOMETRY_TYPES`. Also add the token to the `GeometryType` enum in
+`schema/zarr_vectors.linkml.yaml` and regenerate the artefacts with
+`python schema/regen.py` (`--check` verifies they are current).
 
-```python
-# zarr_vectors/validate/structure.py
-REQUIRED_ARRAYS = {
-    ...
-    "voxel_cloud": [
-        "vertices/",
-        "vertex_fragments/",
-        "links/voxel_ids/",      # new type-specific array
-    ],
-}
+### Step 2 — Write the write function
 
-OPTIONAL_ARRAYS = {
-    ...
-    "voxel_cloud": [
-        "attributes/",
-        "object_index/",
-    ],
-}
-```
+Create `zarr_vectors/types/voxel_clouds.py`. The existing writers
+(`write_points` is the simplest reference) share one skeleton, built from
+these real helpers:
 
-### Step 3 — Write the write function
+1. Validate arguments; reject unsupported `out_of_bounds` policies
+   *before* creating anything.
+2. `_create_or_open_store(store_path, backend=..., bounds=..., chunk_shape=..., ndim=...)`
+   from `zarr_vectors.core.store`.
+3. `_apply_out_of_bounds_policy(root, positions, policy=out_of_bounds)`.
+4. `_ensure_root_metadata_for_write(root, inferred_ndim=ndim, geometry_type=GEOM_VOXEL_CLOUD, base_bin_shape=bin_shape, links_convention=..., object_index_convention=..., cross_chunk_strategy=...)`.
+5. `create_resolution_level(root, 0, LevelMetadata(level=0, vertex_count=..., arrays_present=[...]))`.
+6. Inside `open_write_session(level_group, compressor=..., shard_shape=..., bounds=..., chunk_shape=...)`
+   (from `zarr_vectors.core.arrays`): `create_vertices_array`, then
+   per chunk `write_chunk_vertices(level_group, chunk_coords, fragments, dtype=...)`,
+   `create_attribute_array` / `write_chunk_attributes` for vertex attributes,
+   `write_links` for any connectivity, and
+   `write_object_index(level_group, manifests, sid_ndim=...)` for objects.
+7. `stamp_fragments_tile(level_group, ndim)` (only when each chunk's
+   fragments tile its buffer) and `_finalize_write(root, "write_voxel_cloud")`.
+8. Return a summary dict (`vertex_count`, `chunk_count`, ...).
 
-Create `zarr_vectors/types/voxel_cloud.py`:
-
-```python
-def write_voxel_cloud(
-    store_path: str,
-    positions: npt.NDArray[np.floating],
-    voxel_ids: npt.NDArray[np.integer],
-    *,
-    chunk_shape: ChunkShape,
-    bin_shape: BinShape | None = None,
-    attributes: dict[str, npt.NDArray] | None = None,
-    **kwargs,
-) -> None:
-    """Write a voxel cloud store.
-
-    Parameters
-    ----------
-    store_path:
-        Path to the output .zarrvectors directory.
-    positions:
-        Vertex positions, shape (N, D).
-    voxel_ids:
-        Integer voxel ID for each vertex, shape (N,).
-    chunk_shape:
-        Spatial extent of each chunk in coordinate units.
-    bin_shape:
-        Supervoxel bin shape. Defaults to chunk_shape.
-    attributes:
-        Optional per-vertex attribute arrays.
-    """
-    # Validate inputs
-    _validate_write_args(positions, chunk_shape, bin_shape)
-
-    # Open or create the store
-    root = _open_or_create_store(store_path, geometry_type=GEOM_VOXEL_CLOUD,
-                                 chunk_shape=chunk_shape, bin_shape=bin_shape)
-
-    # Partition vertices into chunks
-    chunk_map = _partition_into_chunks(positions, chunk_shape)
-
-    for chunk_coord, (chunk_verts, chunk_indices) in chunk_map.items():
-        # Sort into fragment order and emit one range fragment per non-empty bin
-        sorted_verts, order, fragments = build_level0_fragments(
-            chunk_verts, chunk_coord, chunk_shape, bin_shape
-        )
-        # Write vertices
-        _write_chunk_array(root, "0/vertices", chunk_coord,
-                           sorted_verts)
-        # Write fragment index (binary blob, one per chunk)
-        _write_chunk_bytes(root, "0/vertex_fragments",
-                           chunk_coord, encode_fragments(fragments))
-        # Write type-specific array
-        sorted_voxel_ids = voxel_ids[chunk_indices][order]
-        _write_chunk_array(root, "0/links/voxel_ids",
-                           chunk_coord, sorted_voxel_ids)
-        # Write attributes
-        if attributes:
-            for name, values in attributes.items():
-                _write_chunk_array(root, f"0/attributes/{name}",
-                                   chunk_coord, values[chunk_indices][order])
-
-    # Write multiscale metadata
-    write_multiscale_metadata(root)
-    write_metadata_json(root)
-```
+Signature conventions (keyword-only after the data arguments):
+`chunk_shape`, `bin_shape=None`, `bounds=None`, `vertex_attributes=None`,
+`object_attributes=None`, `dtype="float32"`, `backend=None`,
+`chunk_by_attribute=None`, `out_of_bounds=DEFAULT_OOB_POLICY`,
+`compressor=None`, `shard_shape=None`. Name per-vertex attributes
+`vertex_attributes` to match the on-disk directory (the older
+`attributes=` spelling is deprecated everywhere).
 
 Key invariants to maintain in the writer:
-- Vertices must be in fragment order (bin-sorted) within each chunk.
-- The fragment list passed to `encode_fragments` must reference the
-  sorted vertex rows; emit one `(start, count)` range per non-empty bin.
-- All attribute arrays must be reordered with the same `order` permutation.
+- Fragment indices recorded in manifests must match the fragment order
+  actually written for each chunk.
+- All per-vertex attribute arrays must be split with the same fragment
+  boundaries and row order as `vertices`.
+- Links are given to `write_links` in global `(chunk_coords, vertex_index)`
+  form; it routes each record to its `<offsets>` array.
 
-See [`zarr_vectors.encoding.fragments`](../../api/index.rst) for
-`encode_fragments` and the canonical `build_level0_fragments` helper.
+### Step 3 — Write the read function
 
-### Step 4 — Write the read function
+`read_voxel_clouds(store_path, *, level=0, bbox=None, object_ids=None, chunks=None, attribute_filter=None, backend=None)`
+returns a dict. Follow the existing readers:
 
-```python
-def read_voxel_cloud(
-    store_path: str,
-    *,
-    bbox: BoundingBox | None = None,
-    level: int = 0,
-    attributes: list[str] | None = None,
-) -> dict[str, Any]:
-    """Read a voxel cloud store."""
-    root = open_store(store_path, mode="r")
-    _assert_geometry_type(root, GEOM_VOXEL_CLOUD)
+- `open_store(store_path, backend=backend)` accepts a path, URL, `Store` or
+  `Group`; wrap the body in `root.cached_nodes()`.
+- Resolve the chunks to read with `resolve_chunk_keys(level_group, level_chunk_shape, bbox=..., chunks=...)` (from `zarr_vectors.core.arrays`), using
+  `get_level_chunk_shape(root_meta, level_meta)` for the level's effective chunk shape.
+- If a filter is not implemented, **raise** (`NotImplementedError`) rather than
+  ignoring it: `read_mesh` and `read_graph` do this for `object_ids=`.
+- Return the shared keys where they apply (`positions` or `vertices`,
+  `vertex_attributes`, `vertex_count`, ...). There is no uniform return
+  schema across types; the dataset API adapts each (next step).
 
-    verts, fragments = _read_bbox_fragments(root, level, bbox)
-    voxel_ids = _read_bbox_array(root, level, "links/voxel_ids", bbox,
-                                 fragments)
-    attrs = _read_attributes(root, level, attributes, fragments)
+### Step 4 — Plug into the dataset API
 
-    return {
-        "vertex_count": len(verts),
-        "positions":    verts,
-        "voxel_ids":    voxel_ids,
-        "attributes":   attrs,
-        "level":        level,
-        "bbox_used":    bbox,
-    }
-```
+`zarr_vectors/api/level.py` holds `_READERS`: for each geometry constant,
+the reader's module and function, the keyword arguments it supports, and
+the name of a `ReadResult.from_<type>` classmethod in
+`zarr_vectors/api/result.py` that maps its dict into the uniform
+`ReadResult`. Add an entry and an adapter, and an `add_<type>` method on
+`Dataset` (`zarr_vectors/api/dataset.py`) if the type should be writable
+from `Schema(kind=...)`.
 
-### Step 5 — Add L1 structural checks
+### Step 5 — Add geometry conformance checks
+
+Validation levels L1–L3 are geometry-independent. Type-specific rules live
+at L4 in `zarr_vectors/validate/conformance.py`:
 
 ```python
-# zarr_vectors/validate/structure.py
-def check_type_specific_l1(root, geometry_type, result):
+GEOMETRY_LINK_REQ: dict[str, set[str]] = {
     ...
-    if geometry_type == GEOM_VOXEL_CLOUD:
-        _assert_array_exists(root, "0/links/voxel_ids/", result)
-```
-
-### Step 6 — Add L2 metadata checks
-
-```python
-# zarr_vectors/validate/metadata.py
-def check_type_specific_l2(root, geometry_type, result):
-    ...
-    if geometry_type == GEOM_VOXEL_CLOUD:
-        voxel_ids_array = root["0"]["links"]["voxel_ids"]
-        _check_dtype(voxel_ids_array, expected="int64", result=result,
-                     check_name="voxel_ids_dtype")
-        _check_last_dim(voxel_ids_array, expected=None,  # scalar per vertex
-                        result=result, check_name="voxel_ids_shape")
-```
-
-### Step 7 — Add L3 consistency checks
-
-```python
-# zarr_vectors/validate/consistency.py
-def check_type_specific_l3(root, geometry_type, chunk_coord, result):
-    ...
-    if geometry_type == GEOM_VOXEL_CLOUD:
-        voxel_ids = _read_chunk(root, "links/voxel_ids", chunk_coord)
-        vertex_count = _read_vertex_count(root, chunk_coord)
-        _check_equal(len(voxel_ids), vertex_count,
-                     "voxel_ids_length_matches", result)
-```
-
-### Step 8 — Add lazy loader support
-
-```python
-# zarr_vectors/lazy.py  (or lazy/voxel_cloud.py)
-class LazyVoxelCloud(LazyStore):
-    @property
-    def voxel_ids(self) -> LazyArray:
-        return LazyArray(self._root, "links/voxel_ids", self._level)
-```
-
-### Step 9 — Add coarsening support
-
-If the type supports multi-resolution pyramids (it should), add a
-coarsening function:
-
-```python
-# zarr_vectors/multiresolution/voxel_cloud.py
-def coarsen_voxel_cloud_level(root, source_level, target_level, bin_ratio):
-    """Coarsen a voxel cloud level. Voxel IDs are aggregated by majority vote."""
-    ...
-```
-
-And register it in `zarr_vectors/multiresolution/coarsen.py`:
-
-```python
-COARSEN_FUNCTIONS = {
-    GEOM_POINT_CLOUD:  coarsen_point_cloud_level,
-    ...
-    GEOM_VOXEL_CLOUD:  coarsen_voxel_cloud_level,
+    GEOM_VOXEL_CLOUD: {LINKS_EXPLICIT},   # allowed links_convention values
 }
 ```
 
-### Step 10 — Write tests
+Add any further per-type check inside `validate_conformance` (it receives
+the root metadata and level 0). Messages are free text appended to the
+`ValidationResult` (`add_pass` / `add_warning` / `add_error`); there are no
+stable check IDs, and no `REQUIRED_ARRAYS` table to extend. L1 is
+`validate_structure` and requires only `vertices/` for every type.
 
-Add a test module `tests/test_voxel_cloud.py` covering:
+### Step 6 — Multiresolution
+
+Core's `per_object` coarsener is geometry-agnostic: it rebuilds `vertices`,
+`object_index` and per-object attributes. Geometry-specific coarsening
+(connectivity rewrite, attribute aggregation) is added by registering a
+coarsen method through `zarr_vectors.multiresolution.registry`
+(`register_coarsen_strategy(name, fn)`), selected by `method=name`;
+registered names must not shadow the built-in `per_object`. See
+[Pyramid construction](../multiscale/pyramid_construction.md).
+
+### Step 7 — Write tests
+
+Tests live flat in `tests/` (`tests/test_<area>.py`, e.g.
+`tests/test_meshes.py`, `tests/test_graphs.py`) with integration tests
+under `tests/integration/`. Add `tests/test_voxel_clouds.py` covering:
 
 - [ ] Round-trip write → read produces identical data.
 - [ ] Bbox query returns correct vertices.
-- [ ] Multi-resolution pyramid is correctly constructed.
-- [ ] L1–L3 validation passes on a freshly written store.
-- [ ] L3 validation catches intentionally corrupted `voxel_ids` alignment.
-- [ ] Ingest/export round-trip (if applicable).
+- [ ] A pyramid can be built and read at level 1.
+- [ ] `validate(path, level=5)` passes on a freshly written store.
+- [ ] A deliberately corrupted store is rejected at the level that should
+      catch it.
+- [ ] The dataset-API path (`Dataset.add_*`, `Level.read`) works.
 
-Add a reference fixture store (see [Compliance testing](test_compliance.md)).
+See [Compliance testing](test_compliance.md).
 
-### Step 11 — Write documentation
+### Step 8 — Write documentation
 
 Add these pages (following the spec page template):
 
 - `docs/spec/geometry_types/voxel_cloud.md` — type spec page.
-- `docs/tutorials/data_types/voxel_cloud.md` — tutorial.
+- A section in `docs/tutorials/data_types/` — tutorial.
 
-Update `docs/spec/geometry_types/index.md` to include the new type in the
-comparison matrix and type selection guide.
+Update `docs/spec/geometry_types/index.md` (constants, comparison matrix,
+writer/reader table, selection guide) and its toctree.
 
 ### Checklist summary
 
-- [ ] Type constant in `constants.py`
-- [ ] Registered in `GEOMETRY_TYPES` set
-- [ ] Required/optional arrays in `validate/structure.py`
+- [ ] Type constant in `constants.py` and `VALID_GEOMETRY_TYPES`
+- [ ] LinkML `GeometryType` enum updated and `schema/regen.py` re-run
 - [ ] Write function in `types/<type>.py`
 - [ ] Read function in `types/<type>.py`
-- [ ] L1 structural checks
-- [ ] L2 metadata checks
-- [ ] L3 consistency checks
-- [ ] Lazy loader support
-- [ ] Coarsening support
+- [ ] Entry in `api/level.py` `_READERS` plus a `ReadResult.from_<type>` adapter
+- [ ] `GEOMETRY_LINK_REQ` entry (and any extra L4 checks) in `validate/conformance.py`
+- [ ] Coarsening strategy registered (if `per_object` is not enough)
 - [ ] Test module with round-trip, bbox, pyramid, and validation tests
-- [ ] Reference fixture store
 - [ ] Spec page in `docs/spec/geometry_types/`
 - [ ] Tutorial in `docs/tutorials/data_types/`
 - [ ] Comparison matrix updated
-- [ ] Changelog entry

@@ -3,11 +3,14 @@ Data API
 
 .. automodule:: zarr_vectors.api
    :no-members:
+   :no-special-members:
 
 The sections below follow the order you meet them in: open a dataset, say what
 you want stored or what you want back, read it, then work with the objects,
-the grid, and edits. Every name here is also importable from ``zarr_vectors``
-itself.
+the grid, and edits. Every name in ``zarr_vectors.api.__all__`` is also
+importable from ``zarr_vectors`` itself. A few helper classes documented below
+(``ResolvedLayout``, ``GroupCatalog``, ``ObjectGroup``) are reached through the
+objects that return them and are importable only from their own submodule.
 
 Datasets
 --------

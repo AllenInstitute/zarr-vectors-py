@@ -59,7 +59,7 @@ please also cite:
 | Zarr v3 storage | [Zarr development team](https://zenodo.org/record/3773454) |
 | OME-Zarr multiscale metadata | [Moore et al., 2021](https://doi.org/10.1007/s00418-021-02029-x) |
 | Draco mesh compression | [Google Draco](https://github.com/google/draco) |
-| TRX format ingest | [TRX format](https://tractography-file-format.github.io/) |
+| TRX format ingest | [TRX format](https://tee-ar-ex.github.io/) |
 | Neuroglancer viewer | [Google Neuroglancer](https://github.com/google/neuroglancer) |
 
 ## Acknowledgement text

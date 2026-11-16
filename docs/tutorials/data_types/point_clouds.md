@@ -14,6 +14,10 @@ deliberately reach into `zarr_vectors.building`, the other supported surface,
 for physical detail the api does not carry. Format converters for
 LAS/PLY/CSV/XYZ live in the companion package **`zarr-vectors-tools`**.
 
+**You will learn:** the full set of point-cloud write, read, query and pyramid
+options. **Prerequisite:** the [Quickstart](../../getting_started/quickstart.md)
+(the first-store walkthrough is enough).
+
 The page is one continuous session — later blocks reuse the stores earlier
 blocks create.
 
@@ -54,7 +58,7 @@ print(ds.level(0).vertex_count)
 
 ```text
 {'vertex_count': 100000, 'chunk_count': 125, 'object_count': 0, 'group_count': 0, 'bins_per_chunk': (4, 4, 4)}
-('point_cloud',) 3 (0, 9, 1)
+('point_cloud',) 3 (0, 9, 2)
 (200.0, 200.0, 200.0) (50.0, 50.0, 50.0)
 Grid(6x6x6 cells of (200.0, 200.0, 200.0)) (6, 6, 6)
 100000
@@ -131,8 +135,9 @@ print(sorted(os.listdir("scan.zarrvectors/0/vertex_attributes")))
 The `Schema` *declares* the attributes — dtype, channel width, whether a label
 is categorical, what a value is measured in — and sizes their arrays; the values
 themselves are always passed to the write call, as `attributes=`. Declarations
-are documentation and layout input, not validation: nothing checks a written
-array against its spec.
+are checked: an attribute whose array has a different dtype or channel width than
+its `AttributeSpec` makes `add_points` raise `SchemaConflict` before writing
+anything. An attribute you did not declare is accepted as-is.
 
 Each name becomes one child array under `vertex_attributes/`, on the same chunk
 grid as `vertices/`, with rows aligned 1:1 with it.
@@ -519,7 +524,7 @@ writes float32 today, so coordinates that need sub-nanometre precision at
 kilometre scale come back rounded. Until the api carries the declaration
 through, `building.write_points(..., dtype="float64")` is the way to actually
 store float64 — verify with `ds.read().positions.dtype` rather than assuming.
-Be aware that float64 doubles storage size and reduces Blosc compression ratio.
+Be aware that float64 doubles storage size and reduces the compression ratio.
 
 **Attribute array of the wrong length.**
 An attribute array shorter than `positions` fails during binning, with an index

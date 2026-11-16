@@ -24,9 +24,8 @@
   whatever winding the producer used survives a round-trip.
 
 **Draco compression**
-: An optional codec applied to mesh geometry (`vertices/` and `links/<delta>/`)
-  that can achieve 6–15× compression over uncompressed float32 data.
-  Requires `zarr-vectors[draco]`.
+: An optional lossy encoding of each chunk's vertices and intra-chunk faces
+  (`encoding="draco"`). Requires `zarr-vectors[draco]`.
 
 **Boundary face**
 : A face whose vertices do not all lie in one chunk. There is no special
@@ -60,14 +59,15 @@ local to its own chunk. The `object_index/` maps each mesh object
 
 | Array path | Required | Description |
 |-----------|----------|-------------|
-| `vertices/` | Yes | Vertex positions, shape `(N, D)` float32 per chunk |
+| `vertices/` | Yes | Vertex positions, shape `(N, D)` per chunk (`float32` by default). Under Draco, a Draco bitstream per chunk |
 | `vertex_fragments/` | Yes | Fragment index over `vertices/` rows |
 | `links/0/0.0.0/` | Raw: yes | Faces whose vertices share a chunk. **Draco: absent** — see below |
 | `links/0/<offsets>/` | When a face straddles chunks | Boundary faces; offsets name the other vertices' chunks |
 | `link_fragments/` | Yes (with `links/0/0.0.0/`) | Fragment index over the intra array's rows |
 | `object_index/` | Yes | Per-object manifest blobs naming fragments |
-| `attributes/<name>/` | No | Per-vertex attributes (normals, UVs, colours) |
+| `vertex_attributes/<name>/` | No | Per-vertex attributes (normals, UVs, colours) |
 | `object_attributes/<name>/` | No | Per-mesh attributes (volume, surface area) |
+| `link_attributes/<name>/0/<offsets>/` | No | Per-face attributes — not accepted by `write_mesh` (see Write API) |
 
 There is no `cross_chunk_links/` array and no global-vertex-ID
 mechanism: boundary faces are records with non-zero offsets in the same
@@ -83,11 +83,13 @@ Which faces reach the link family depends on `encoding`:
 | `"draco"` (3-D only) | Embedded in the chunk's Draco bitstream, in chunk-local indices | `links/0/<offsets>/` |
 
 Draco mode applies only when `encoding == "draco"` **and** `sid_ndim ==
-3`; otherwise the raw path is used. Draco removes only the *intra-chunk*
+3`; otherwise the raw path is used (silently — no error for a
+non-3-D store). In Draco mode each chunk is a single fragment, so every
+object present in that chunk names fragment 0. Draco removes only the *intra-chunk*
 faces from the family — boundary faces have no chunk whose bitstream
 could hold them, so they stay in `links/`. A Draco mesh with no
 boundary-crossing face therefore has an **empty** link family;
-`write_meshes` still calls `create_links_array` afterwards so the family
+`write_mesh` still calls `create_links_array` afterwards so the family
 is advertised in `arrays_present` for the per-cell editors in `ops/`.
 
 ### Face policy and winding
@@ -102,16 +104,20 @@ undirected despite winding being significant.
 Records stay in input face order within each cell, so a parallel
 `link_attributes/<name>/0/<offsets>/` array stays row-aligned.
 
-### Root `.zattrs` type-specific keys
+### Root metadata
 
 ```json
 {
-  "geometry_type":    "mesh",
-  "links_convention": "explicit"
+  "zarr_vectors": {
+    "geometry_types":   ["mesh"],
+    "links_convention": "explicit"
+  }
 }
 ```
 
-`mesh` declares no type-specific root keys of its own.
+(Alongside the usual `zarr_vectors` keys; see
+[Root metadata](../layout/root_metadata.md).) `mesh` declares no
+type-specific keys of its own.
 
 > **`winding_order` and `closed_surface` are not root metadata keys.**
 > Neither is written, read, or validated by any shipped code, and
@@ -123,60 +129,34 @@ Records stay in input face order within each cell, so a parallel
 
 ### Face encoding and boundary faces
 
-**Intra-chunk faces:** All three vertices are in the same chunk. Vertex
-indices are local to the chunk (0-indexed within the chunk's vertex slice).
+Every face is a record of `L` endpoints `(chunk_coords, local_vertex_index)`.
+Each vertex lives in the chunk its own position falls in, and its
+index is local to that chunk's vertex buffer.
 
-**Boundary faces:** One or more vertices are in a different chunk. For
-boundary faces, vertex indices that refer to other chunks use a *negative
-sentinel* encoding:
+**Intra-chunk faces:** all `L` vertices share a chunk. The record lands
+in the all-zero-offsets array `links/0/0.0.0/` (raw encoding).
 
-- Vertices in the current chunk: positive local index `[0, N_chunk)`.
-- Vertices in other chunks: stored as a negative value `-(global_vertex_id + 1)`,
-  where `global_vertex_id` is the vertex's position in the global vertex
-  ID space.
+**Boundary faces:** the vertices span chunks. The record is canonical-sorted
+by `(chunk_coords, vertex_index)`, filed under the chunk of its
+lexicographically smallest endpoint (the *source*), in the offsets array
+naming where the other endpoints' chunks sit relative to it. There are no
+negative sentinel indices and no global vertex IDs.
 
-At read time, the reader resolves negative indices by looking up the
-corresponding global vertex IDs and fetching those vertices from their
-respective chunks.
-
-**Global vertex ID** for a vertex at local index `k` in chunk `(cx, cy, cz)`:
-
-```
-global_id = chunk_flat_index * N_max + k
-```
-
-where `chunk_flat_index = ravel_multi_index((cx, cy, cz), chunk_grid_shape)`
-and `N_max` is the maximum vertices per chunk declared in the Zarr array shape.
-
-### Face assignment to chunks
-
-Each triangular face is assigned to the chunk containing its centroid:
-
-```python
-centroid = (vertices[i] + vertices[j] + vertices[k]) / 3
-face_chunk = floor(centroid / chunk_shape).astype(int)
-```
-
-This ensures each face is stored exactly once. All three vertices of a face
-are guaranteed to be within at most one chunk-width of the face's chunk (faces
-cannot span more than two chunks in any dimension if all vertices are within
-the face's chunk neighbourhood).
+`faces` passed to `write_mesh` use **global** vertex indices into the
+`vertices` array you supply; `read_mesh` returns faces remapped to the
+output vertex order.
 
 ### Draco compression
 
-Pass `use_draco=True` and a `draco_quantization` value when writing a
-mesh (via `write_mesh()` or the format converters in
-`zarr-vectors-tools`). The `vertices/` and `links/<delta>/` arrays then
-use the `draco` codec.
+Pass `encoding="draco"` (and optionally `draco_quantization_bits=`,
+default `11`) to `write_mesh`. The vertices and intra-chunk faces of each
+chunk are then encoded jointly as one Draco bitstream. Draco applies only
+when the store is 3-D, and requires the optional dependency
+`zarr-vectors[draco]` (DracoPy). There is no `use_draco=` or
+`draco_quantization=` keyword.
 
-Reading requires `zarr-vectors[draco]`. See
-[Codec pipeline](../foundations/codec_pipeline.md) for quantisation
-precision details.
-
-Draco compression is applied per-chunk. The Draco codec receives the
-combined (vertices, faces) data for one chunk and compresses them jointly,
-exploiting vertex-face correlations for additional compression beyond what
-independent array compression achieves.
+Draco compression is lossy (quantised). See
+[Codec pipeline](../foundations/codec_pipeline.md).
 
 ### Write API
 
@@ -184,14 +164,35 @@ independent array compression achieves.
 import numpy as np
 from zarr_vectors.types.meshes import write_mesh
 
-write_mesh(
+# A small unit tetrahedron scaled to 100 units
+vertices = 100.0 * np.array(
+    [[0, 0, 0], [1, 0, 0], [0, 1, 0], [0, 0, 1]], dtype=np.float32
+)
+faces = np.array(
+    [[0, 1, 2], [0, 1, 3], [0, 2, 3], [1, 2, 3]], dtype=np.int64
+)  # (F, 3) global vertex indices
+
+summary = write_mesh(
     "brain.zarrvectors",
-    vertices=vertices,   # (N, 3) float32
-    faces=faces,         # (F, 3) int32 — global vertex indices
-    chunk_shape=(100.0, 100.0, 100.0),
+    vertices,
+    faces,
+    chunk_shape=(50.0, 50.0, 50.0),
     bin_shape=(25.0, 25.0, 25.0),
 )
+# summary: {"vertex_count", "face_count", "chunk_count",
+#           "intra_face_count", "cross_face_count", "encoding"}
 ```
+
+`chunk_shape` is required. `faces` is `(F, L)` with `L >= 3`; quads (`L=4`)
+are accepted and set `link_width`. Other keywords: `bounds`, `encoding`
+(`"raw"` default, or `"draco"`), `vertex_attributes`
+(`{name: (V,)}` or `(V, C)`), `object_attributes`, `object_ids`
+(`(V,)` **per vertex**, assigning vertices to mesh objects; default all 0),
+`dtype`, `draco_quantization_bits`, `backend`, `chunk_by_attribute`,
+`out_of_bounds` (`"ignore"` is rejected), `compressor`, `shard_shape`.
+There is no per-face (link) attribute argument.
+
+Through the dataset API: `ds.add_mesh(vertices, faces, ...)`.
 
 ### Ingest and export
 
@@ -201,29 +202,36 @@ OBJ, STL, and PLY converters live in the companion package
 ### Read API
 
 ```python
+import numpy as np
 from zarr_vectors.types.meshes import read_mesh
 
 result = read_mesh("brain.zarrvectors")
 print(result["vertex_count"])    # int
 print(result["face_count"])      # int
-print(result["vertices"].shape)  # (N, 3)
-print(result["faces"].shape)     # (F, 3) global vertex indices
+print(result["vertices"].shape)  # (V, D)
+print(result["faces"].shape)     # (F, L) indices into result["vertices"]
 
-# Spatial query — returns faces whose centroid is in bbox
+# Spatial query: bbox is applied to vertices; faces with a dropped
+# vertex are dropped
 result = read_mesh(
     "brain.zarrvectors",
     bbox=(np.array([0., 0., 0.]), np.array([500., 500., 500.])),
 )
 ```
 
+Other keywords: `level`, `chunks`, `attribute_filter`, `backend`.
+**`read_mesh(object_ids=...)` raises `NotImplementedError`**: the filter is
+not implemented, and rather than silently returning the whole level the
+reader refuses. The dataset API likewise refuses `select(objects=...)`
+for meshes.
+
 ### Multi-mesh stores
 
 A single `mesh` store may contain many distinct mesh objects (e.g. one per
-cell or organelle). Each object is one connected surface:
-
-```python
-result = read_mesh("cells.zarrvectors", object_ids=[42, 107])
-```
+cell or organelle): pass `object_ids` (one entry per vertex) to
+`write_mesh`. Objects are recorded in `object_index/`, but there is
+currently no object-scoped mesh read; read the level and filter the
+arrays.
 
 ### Validation
 
