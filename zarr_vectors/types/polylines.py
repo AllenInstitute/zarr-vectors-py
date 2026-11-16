@@ -34,6 +34,7 @@ from zarr_vectors.constants import (
 )
 from zarr_vectors.core.arrays import (
     _read_chunk_fragments,
+    _reshape_vertex_buffer,
     attribute_layout,
     create_attribute_array,
     create_fragment_attribute_array,
@@ -42,11 +43,13 @@ from zarr_vectors.core.arrays import (
     create_object_attributes_array,
     create_object_index_array,
     create_vertices_array,
+    read_all_object_manifests_csr,
     read_chunk_attributes,
     read_fragment,
     read_group_object_ids,
     read_object_manifest_rows,
     read_object_manifests,
+    read_vertex_fragment_index,
     resolve_chunk_keys,
     stamp_fragments_tile,
     write_chunk_attributes,
@@ -798,6 +801,20 @@ def _read_polylines(
         except Exception:
             continue
 
+    # The whole level, unfiltered: assembled from the manifests as flat
+    # arrays rather than object by object.  Anything that route does not
+    # cover sends it back here, to the per-object loop below.
+    if (
+        not explicit_subset
+        and target_chunks is None
+        and chunk_whitelist is None
+        and filter_bin is None
+        and not attr_layouts
+    ):
+        whole = _read_whole_level(level_group, len(object_ids), dtype, ndim)
+        if whole is not None:
+            return whole
+
     # Choose between a selective read (an explicit object/group subset —
     # read only those objects' manifests and the chunks they reference,
     # O(subset)) and a full read (decode every manifest + vertex chunk
@@ -1138,6 +1155,151 @@ def _objects_touching(
     manifests = manifests_from_csr(bounds, coords[sel], frags[sel])
     by_id = dict(zip(oids.tolist(), manifests))
     return np.sort(oids).tolist(), by_id
+
+
+def _packable(span: npt.NDArray[np.int64]) -> bool:
+    """Whether coordinates over ``span`` pack into one int64 each."""
+    total = 1
+    for v in span.tolist():
+        total *= int(v)
+    return total < (1 << 62)
+
+
+def _pack_coords(
+    coords: npt.NDArray[np.int64],
+    lo: npt.NDArray[np.int64],
+    span: npt.NDArray[np.int64],
+) -> npt.NDArray[np.int64]:
+    """Each ``(D,)`` row of ``coords`` as one integer, row-major over ``span``."""
+    out = np.zeros(coords.shape[0], dtype=np.int64)
+    for d in range(coords.shape[1]):
+        out *= int(span[d])
+        out += coords[:, d] - lo[d]
+    return out
+
+
+def _read_whole_level(
+    level_group: Any,
+    num_objects: int,
+    dtype: np.dtype,
+    ndim: int,
+) -> dict[str, Any] | None:
+    """Every polyline of a level with no per-vertex attributes.
+
+    The result of the per-object full read in :func:`_read_polylines`,
+    built from the manifests as CSR arrays: one slice of the chunks'
+    vertices per fragment, with no per-object manifest decode or lookup.
+
+    None for anything that loop handles specially -- unreadable
+    manifests or chunks, explicit (non-range) fragments, a fragment
+    the chunk does not hold, ids named twice -- and the caller takes
+    that loop, which stays the definition.
+    """
+    try:
+        csr = read_all_object_manifests_csr(level_group)
+    except Exception:
+        return None
+    offsets = np.asarray(csr.offsets, dtype=np.int64)
+    coords = np.asarray(csr.chunk_coords, dtype=np.int64)
+    fragment_idx = np.asarray(csr.fragment_idx, dtype=np.int64)
+    n_rows = int(offsets.shape[0]) - 1
+    per_row = np.diff(offsets)
+    if csr.object_ids is None:
+        ids = np.arange(n_rows, dtype=np.int64)
+        listed = ids < num_objects
+    else:
+        ids = np.asarray(csr.object_ids, dtype=np.int64)
+        if ids.shape[0] != n_rows:
+            return None
+        listed = (ids >= 0) & (ids < num_objects)
+        named = np.sort(ids[listed])
+        if named.size > 1 and bool((named[1:] == named[:-1]).any()):
+            return None
+    # Rows of the objects returned, ascending by id, which is the order
+    # the per-object loop emits them in.
+    rows = np.flatnonzero(listed & (per_row > 0))
+    rows = rows[np.argsort(ids[rows], kind="stable")]
+    if rows.size == 0:
+        return _empty_polyline_result(ndim)
+
+    # Manifest entries in output order, and the chunks they name.
+    per = per_row[rows]
+    ends = np.cumsum(per)
+    entries = np.repeat(offsets[rows] - (ends - per), per) + np.arange(
+        int(ends[-1]), dtype=np.int64,
+    )
+    entry_coords = coords[entries]
+    lo = entry_coords.min(axis=0)
+    span = entry_coords.max(axis=0) - lo + 1
+    if not _packable(span):
+        return None
+    packed, entry_chunk = np.unique(
+        _pack_coords(entry_coords, lo, span), return_inverse=True,
+    )
+    chunk_coords = np.empty((packed.shape[0], coords.shape[1]), dtype=np.int64)
+    rest = packed
+    for d in range(coords.shape[1] - 1, -1, -1):
+        chunk_coords[:, d] = rest % span[d] + lo[d]
+        rest = rest // span[d]
+    chunk_list = [tuple(cc) for cc in chunk_coords.tolist()]
+    keys = [".".join(str(c) for c in cc) for cc in chunk_list]
+
+    # Every chunk's vertices end to end, with each fragment's rows as a
+    # (start, count) into that one buffer.
+    buffers: list[npt.NDArray] = []
+    tables: list[npt.NDArray[np.int64]] = []
+    base = 0
+    with level_group.batched_reads([(VERTICES, keys), (VERTEX_FRAGMENTS, keys)]):
+        for cc, key in zip(chunk_list, keys):
+            try:
+                raw = level_group.read_bytes(VERTICES, key)
+                fi = read_vertex_fragment_index(level_group, cc)
+            except Exception:
+                return None
+            table = fi.ranges()
+            if table is None:
+                return None
+            full = _reshape_vertex_buffer(raw, dtype, ndim)
+            table = np.asarray(table, dtype=np.int64).reshape(-1, 2)
+            if table.shape[0] and (
+                int(table[:, 0].min()) < 0
+                or int(table[:, 1].min()) < 0
+                or int((table[:, 0] + table[:, 1]).max()) > full.shape[0]
+            ):
+                return None
+            buffers.append(full)
+            tables.append(table + np.array([base, 0], dtype=np.int64))
+            base += full.shape[0]
+    n_fragments = np.array([t.shape[0] for t in tables], dtype=np.int64)
+    entry_fragment = fragment_idx[entries]
+    if bool(
+        ((entry_fragment < 0) | (entry_fragment >= n_fragments[entry_chunk])).any()
+    ):
+        return None
+    first = np.concatenate(([0], np.cumsum(n_fragments)[:-1]))
+    spans = np.concatenate(tables)[first[entry_chunk] + entry_fragment]
+    vertices = np.concatenate(buffers) if len(buffers) > 1 else buffers[0]
+    # Read-only like the per-chunk buffers it joins, so a caller writing
+    # into a returned polyline fails here as it does on the other paths.
+    vertices.flags.writeable = False
+
+    starts = spans[:, 0]
+    stops = starts + spans[:, 1]
+    fragments = [
+        vertices[a:b] for a, b in zip(starts.tolist(), stops.tolist())
+    ]
+    bounds = [0, *ends.tolist()]
+    polylines = [
+        fragments[a:b] for a, b in zip(bounds[:-1], bounds[1:])
+    ]
+    return {
+        "polylines": polylines,
+        "object_ids": ids[rows].tolist(),
+        "vertex_attributes": {},
+        "ndim": ndim,
+        "polyline_count": len(polylines),
+        "vertex_count": int(spans[:, 1].sum()),
+    }
 
 
 def _read_manifest_run(

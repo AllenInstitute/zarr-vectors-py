@@ -66,6 +66,7 @@ from zarr_vectors.encoding.fragments import (
     decode_object_manifests_many,
     encode_fragments,
     encode_object_manifest_blocks,
+    encode_object_manifests_csr,
     encode_object_manifests_many,
     fragment_sections_from_index,
     pack_fragment_sections,
@@ -2351,19 +2352,10 @@ def write_object_index(
         from zarr_vectors.core import dense_manifests as dense
 
         offsets, coords, frags = dense.csr_from_manifests(manifest_list, sid_ndim)
-        _write_dense_index(
-            level_group, offsets, coords, frags,
-            mode="replace", at=None, ids=None, sid_ndim=sid_ndim, block_dtype=block_dtype,
+        write_object_index_csr(
+            level_group, row_ids, offsets, coords, frags, sid_ndim,
+            layout="dense", block_dtype=block_dtype,
         )
-        _write_object_id_table(level_group, row_ids)
-        level_group.write_array_meta(OBJECT_INDEX, {
-            "zv_array": "object_index",
-            "num_objects": len(row_ids),
-            "num_present": int(np.count_nonzero(np.diff(offsets))),
-            "sid_ndim": sid_ndim,
-            "layout": dense.OBJECT_INDEX_LAYOUT_DENSE,
-            OBJECT_IDS_SORTED_ATTR: True,
-        })
         return
 
     # v0.6 manifest-block encoding.  Each old (chunk, fragment_index) tuple
@@ -2405,43 +2397,60 @@ def write_object_index_arrays(
     frags: npt.NDArray[np.integer],
     sid_ndim: int,
 ) -> None:
-    """:func:`write_object_index` for objects ``0..len(offsets)-2`` whose
-    manifests are held as CSR arrays.
-
-    Object ``o`` owns rows ``offsets[o]:offsets[o+1]`` of ``coords``
-    (``(B, sid_ndim)``) and ``frags`` (``(B,)``), each one
-    ``(chunk_coords, fragment_index)`` pair.  The index written is the
-    one ``write_object_index`` writes for the same manifests, in the
-    layout it would choose, without a Python tuple per pair.
-    """
-    from zarr_vectors.encoding.fragments import encode_object_manifests_csr
-
+    """:func:`write_object_index_csr` for objects ``0..len(offsets)-2``,
+    each row its own id."""
     offsets = np.asarray(offsets, dtype=np.int64)
-    coords = np.asarray(coords, dtype=np.int64).reshape(-1, sid_ndim)
-    frags = np.asarray(frags, dtype=np.int64)
-    n = len(offsets) - 1
-    if _index_layout_for_write(level_group, None) == "dense":
-        from zarr_vectors.core import dense_manifests as dense
+    write_object_index_csr(
+        level_group, np.arange(len(offsets) - 1, dtype=np.int64), offsets,
+        np.asarray(coords, dtype=np.int64).reshape(-1, sid_ndim),
+        np.asarray(frags, dtype=np.int64), sid_ndim,
+    )
 
+
+def write_object_index_csr(
+    level_group: Group,
+    row_ids: Any,
+    offsets: npt.NDArray[np.int64],
+    coords: npt.NDArray[np.int64],
+    frags: npt.NDArray[np.int64],
+    sid_ndim: int,
+    *,
+    layout: str | None = None,
+    block_dtype: Any = None,
+) -> None:
+    """:func:`write_object_index` for manifests already held as CSR arrays.
+
+    Row ``r`` is object ``row_ids[r]`` (sorted ascending) and owns the
+    single-fragment blocks ``offsets[r]:offsets[r+1]`` of ``coords``
+    (``(B, sid_ndim)``) and ``frags`` (``(B,)``).  Writes what
+    :func:`write_object_index` writes for the matching manifest dict,
+    without a Python step per object.
+    """
+    from zarr_vectors.core import dense_manifests as dense
+    from zarr_vectors.core.dense_manifests import check_block_dtype
+
+    check_block_dtype(block_dtype)
+    num_present = int(np.count_nonzero(np.diff(offsets)))
+    if _index_layout_for_write(level_group, layout) == "dense":
         _write_dense_index(
             level_group, offsets, coords, frags,
-            mode="replace", at=None, ids=None, sid_ndim=sid_ndim, block_dtype=None,
+            mode="replace", at=None, ids=None, sid_ndim=sid_ndim, block_dtype=block_dtype,
         )
-        layout = dense.OBJECT_INDEX_LAYOUT_DENSE
+        layout_stamp = dense.OBJECT_INDEX_LAYOUT_DENSE
     else:
         _write_object_index_manifests(
             level_group,
             encode_object_manifests_csr(coords, frags, offsets, sid_ndim=sid_ndim),
             layout="vlen",
         )
-        layout = OBJECT_INDEX_LAYOUT_V2
-    _write_object_id_table(level_group, range(n))
+        layout_stamp = OBJECT_INDEX_LAYOUT_V2
+    _write_object_id_table(level_group, row_ids)
     level_group.write_array_meta(OBJECT_INDEX, {
         "zv_array": "object_index",
-        "num_objects": n,
-        "num_present": int(np.count_nonzero(np.diff(offsets))),
+        "num_objects": len(row_ids),
+        "num_present": num_present,
         "sid_ndim": sid_ndim,
-        "layout": layout,
+        "layout": layout_stamp,
         OBJECT_IDS_SORTED_ATTR: True,
     })
 
@@ -2592,6 +2601,7 @@ def _write_object_id_table(
     ids = (
         np.arange(row_ids.start, row_ids.stop, row_ids.step, dtype=np.int64)
         if isinstance(row_ids, range)
+        else np.asarray(row_ids, dtype=np.int64) if isinstance(row_ids, np.ndarray)
         else np.fromiter(row_ids, dtype=np.int64)
     )
     level_group.write_array(
@@ -7214,8 +7224,14 @@ def _id_table_is_identity(level_group: Group, meta: dict[str, Any], node: Any) -
     if meta.get(OBJECT_IDS_SORTED_ATTR):
         committed = meta.get("num_objects")
         m = n if committed is None else max(0, min(int(committed), n))
-        if m and (int(node[0]) != 0 or int(node[m - 1]) != m - 1):
-            return False
+        if m:
+            from zarr_vectors.core._batch_reader import direct_elements
+
+            ends = direct_elements(node, [0, m - 1])
+            if ends is None:
+                ends = (node[0], node[m - 1])
+            if int(ends[0]) != 0 or int(ends[1]) != m - 1:
+                return False
         lo = m
     else:
         lo = 0
@@ -7924,6 +7940,12 @@ def link_cells_within(
     lo = src.min(axis=0)
     ext = src.max(axis=0) - lo + 1
     src_keys = np.ravel_multi_index((src - lo).T, ext)
+    # A handful of chunks -- one object's -- is tested as tuples against
+    # a set: the array form below costs ~60 us of numpy calls per
+    # segment whatever the size, ~2 ms over a mesh's 33 segments.
+    few = src.shape[0] <= _LINK_CELLS_SET_MAX
+    src_rows = [tuple(c) for c in src.tolist()] if few else []
+    src_set = set(src_rows)
 
     out: dict[str, list[str]] = {}
     for seg in list_link_offsets(level_group, delta):
@@ -7953,16 +7975,29 @@ def link_cells_within(
             if keys:
                 out[seg] = keys
             continue
-        ok = np.ones(src.shape[0], dtype=bool)
-        for off in offsets:
-            if not any(off):
-                continue
-            rel = src + np.asarray(off, dtype=np.int64) - lo
-            inside = np.all((rel >= 0) & (rel < ext), axis=1)
-            keys = np.ravel_multi_index(np.where(inside[:, None], rel, 0).T, ext)
-            ok &= inside & np.isin(keys, src_keys)
-            if not ok.any():
-                break
+        shifts = [off for off in offsets if any(off)]
+        if few:
+            ok = np.fromiter(
+                (
+                    all(
+                        tuple(a + b for a, b in zip(c, off)) in src_set
+                        for off in shifts
+                    )
+                    for c in src_rows
+                ),
+                dtype=bool, count=len(src_rows),
+            )
+        else:
+            ok = np.ones(src.shape[0], dtype=bool)
+            for off in shifts:
+                rel = src + np.asarray(off, dtype=np.int64) - lo
+                inside = np.all((rel >= 0) & (rel < ext), axis=1)
+                keys = np.ravel_multi_index(
+                    np.where(inside[:, None], rel, 0).T, ext,
+                )
+                ok &= inside & np.isin(keys, src_keys)
+                if not ok.any():
+                    break
         if not ok.any():
             continue
         seg_path = f"{family}/{seg}"
@@ -7976,55 +8011,51 @@ def link_cells_within(
     return out
 
 
-@_device_result
-def read_link_arrays(
-    level_group: Group,
-    *,
-    delta: int = 0,
-    include_intra: bool = True,
-    cells: Mapping[str, Sequence[str]] | None = None,
-    link_fragments: Mapping[str, Sequence[int]] | None = None,
-) -> tuple[npt.NDArray[np.int64], npt.NDArray[np.int64]]:
-    """Every link record under ``links/<delta>/`` as two arrays.
+#: Most chunks :func:`link_cells_within` tests as Python tuples rather
+#: than arrays.
+_LINK_CELLS_SET_MAX = 256
 
-    :func:`read_links` in array form: ``(chunks, vi)`` of shapes
-    ``(M, L, sid_ndim)`` and ``(M, L)``, one row per record in exactly
-    the order :func:`read_links` returns them -- offsets segments
-    sorted, cells sorted within each, rows in write order -- and with
-    the input endpoint order restored from ``perm_idx``.  So
-    ``read_links(...)[i]`` is ``tuple(zip(map(tuple, chunks[i]), vi[i]))``.
 
-    Offered because the per-record tuples are the cost of a large
-    family: half a million faces took 8 s to build as tuples and a
-    further 2 s to take apart again, for arithmetic -- a chunk offset
-    plus a local index -- that is one gather over these arrays.  A
-    ``store="duplicate"`` family returns each record once per copy,
-    like :func:`read_links`.
+def _perm_inverse_table(link_width: int) -> npt.NDArray[np.int64]:
+    """``inverse[p]`` gathers a row placed under ``perm_idx`` ``p`` back
+    into input order: the ``out[sigma[i]] = placed[i]`` of
+    apply_perm_inverse, as one index per permutation."""
+    import math
 
-    ``cells`` restricts the read to ``{offsets_segment: [cell_key,
-    ...]}`` -- typically :func:`link_cells_within` -- and is what lets a
-    scoped reader touch only the cells its chunks can reach.  ``None``
-    (the default) reads every cell of every segment.
-
-    ``link_fragments`` narrows the intra-chunk cell at delta 0 further:
-    ``{cell_key: [fragment, ...]}`` keeps only those link fragments of
-    that cell, in the order given; cells it does not name are read whole.
-    Only meaningful where the fragments partition the cell usefully --
-    one per vertex fragment, on a level claiming
-    ``link_fragments_aligned`` -- which is the caller's to check.
-
-    Returns empty ``(0, 0, 0)`` / ``(0, 0)`` arrays when the family is
-    absent or holds no rows.
-    """
     from zarr_vectors.spatial.boundary import _lehmer_decode
 
-    empty = (np.empty((0, 0, 0), dtype=np.int64), np.empty((0, 0), dtype=np.int64))
+    return np.stack([
+        np.argsort(_lehmer_decode(p, link_width))
+        for p in range(math.factorial(link_width))
+    ]).astype(np.int64)
+
+
+def _link_segment_blobs(
+    level_group: Group,
+    delta: int,
+    *,
+    include_intra: bool,
+    cells: Mapping[str, Sequence[str]] | None,
+    link_fragments: Mapping[str, Sequence[int]] | None,
+) -> tuple[
+    int, int, tuple[int, ...], tuple[int, ...],
+    list[tuple[tuple[Any, ...], list[tuple[str, bytes | None]]]],
+] | None:
+    """Layout and raw cell bytes of every segment a link read touches.
+
+    The first half of :func:`read_link_arrays` and :func:`read_link_rows`:
+    ``(link_width, sid_ndim, scale_src, scale_trg, segment_rows)``, each
+    ``segment_rows`` entry being ``(arr_name, offsets, has_perm, ncols,
+    flat, cell_dtype, cell_keys, ranged)`` and its ``[(cell_key, blob)]``
+    in sorted key order, ``blob`` ``None`` for a ``ranged`` cell.
+    ``None`` when the family is absent or carries no layout.
+    """
     family = links_group_path(delta)
     if not level_group.array_exists(family):
-        return empty
+        return None
     fam_meta = level_group.read_array_meta(family) or {}
     if "link_width" not in fam_meta or "sid_ndim" not in fam_meta:
-        return empty
+        return None
     link_width = int(fam_meta["link_width"])
     sid_ndim = int(fam_meta["sid_ndim"])
     directed = bool(fam_meta.get("directed", False))
@@ -8035,10 +8066,6 @@ def read_link_arrays(
         scale_src = scale_trg = (1,) * sid_ndim
     else:
         scale_src, scale_trg = _link_scales(level_group, delta, sid_ndim)
-
-    # inverse[p] gathers a placed row back into input order: the
-    # ``out[sigma[i]] = placed[i]`` of apply_perm_inverse, as one index.
-    inverse: npt.NDArray[np.int64] | None = None
 
     # Two passes: work out every segment's layout and cells first, so all
     # of them are fetched in one batched prefetch rather than one read
@@ -8085,8 +8112,6 @@ def read_link_arrays(
             cell_keys, ranged,
         ))
 
-    chunk_parts: list[npt.NDArray[np.int64]] = []
-    vi_parts: list[npt.NDArray[np.int64]] = []
     with _maybe_batched_reads(level_group, [
         (seg_info[0], [k for k in seg_info[6] if k not in seg_info[7]])
         for seg_info in segments
@@ -8100,6 +8125,62 @@ def read_link_arrays(
             ])
             for seg_info in segments
         ]
+    return link_width, sid_ndim, scale_src, scale_trg, segment_rows
+
+
+@_device_result
+def read_link_arrays(
+    level_group: Group,
+    *,
+    delta: int = 0,
+    include_intra: bool = True,
+    cells: Mapping[str, Sequence[str]] | None = None,
+    link_fragments: Mapping[str, Sequence[int]] | None = None,
+) -> tuple[npt.NDArray[np.int64], npt.NDArray[np.int64]]:
+    """Every link record under ``links/<delta>/`` as two arrays.
+
+    :func:`read_links` in array form: ``(chunks, vi)`` of shapes
+    ``(M, L, sid_ndim)`` and ``(M, L)``, one row per record in exactly
+    the order :func:`read_links` returns them -- offsets segments
+    sorted, cells sorted within each, rows in write order -- and with
+    the input endpoint order restored from ``perm_idx``.  So
+    ``read_links(...)[i]`` is ``tuple(zip(map(tuple, chunks[i]), vi[i]))``.
+
+    Offered because the per-record tuples are the cost of a large
+    family: half a million faces took 8 s to build as tuples and a
+    further 2 s to take apart again, for arithmetic -- a chunk offset
+    plus a local index -- that is one gather over these arrays.  A
+    ``store="duplicate"`` family returns each record once per copy,
+    like :func:`read_links`.
+
+    ``cells`` restricts the read to ``{offsets_segment: [cell_key,
+    ...]}`` -- typically :func:`link_cells_within` -- and is what lets a
+    scoped reader touch only the cells its chunks can reach.  ``None``
+    (the default) reads every cell of every segment.
+
+    ``link_fragments`` narrows the intra-chunk cell at delta 0 further:
+    ``{cell_key: [fragment, ...]}`` keeps only those link fragments of
+    that cell, in the order given; cells it does not name are read whole.
+    Only meaningful where the fragments partition the cell usefully --
+    one per vertex fragment, on a level claiming
+    ``link_fragments_aligned`` -- which is the caller's to check.
+
+    Returns empty ``(0, 0, 0)`` / ``(0, 0)`` arrays when the family is
+    absent or holds no rows.
+    """
+    empty = (np.empty((0, 0, 0), dtype=np.int64), np.empty((0, 0), dtype=np.int64))
+    layout = _link_segment_blobs(
+        level_group, delta, include_intra=include_intra, cells=cells,
+        link_fragments=link_fragments,
+    )
+    if layout is None:
+        return empty
+    link_width, sid_ndim, scale_src, scale_trg, segment_rows = layout
+    # inverse[p] gathers a placed row back into input order: the
+    # ``out[sigma[i]] = placed[i]`` of apply_perm_inverse, as one index.
+    inverse: npt.NDArray[np.int64] | None = None
+    chunk_parts: list[npt.NDArray[np.int64]] = []
+    vi_parts: list[npt.NDArray[np.int64]] = []
     for (arr_name, offsets, has_perm, ncols, flat, cell_dtype, _keys, ranged), blobs in segment_rows:
         cell_rows: list[npt.NDArray[np.int64]] = []
         cell_chunks: list[tuple[ChunkCoords, ...]] = []
@@ -8131,12 +8212,7 @@ def read_link_arrays(
         )
         if has_perm:
             if inverse is None:
-                import math
-
-                inverse = np.stack([
-                    np.argsort(_lehmer_decode(p, link_width))
-                    for p in range(math.factorial(link_width))
-                ]).astype(np.int64)
+                inverse = _perm_inverse_table(link_width)
             perm = rows[:, 0]
             if perm.size and (int(perm.min()) < 0 or int(perm.max()) >= inverse.shape[0]):
                 raise ArrayError(
@@ -8155,6 +8231,89 @@ def read_link_arrays(
         np.concatenate(chunk_parts, axis=0),
         np.concatenate(vi_parts, axis=0),
     )
+
+
+def read_link_rows(
+    level_group: Group,
+    row_maps: Mapping[ChunkCoords, npt.NDArray[np.int64]],
+    *,
+    delta: int = 0,
+    cells: Mapping[str, Sequence[str]] | None = None,
+    touching: bool = False,
+) -> npt.NDArray[np.int64]:
+    """Link records under ``links/<delta>/`` as output rows, ``(M, L)``.
+
+    :func:`read_link_arrays` followed by a remap, fused: endpoint ``(c,
+    vi)`` becomes ``row_maps[c][vi]``, and a record is kept only when
+    every endpoint maps to a row ``>= 0`` -- its chunk is in
+    ``row_maps``, ``vi`` is inside that chunk's map and the map does not
+    say ``-1``.  Records come back in :func:`read_link_arrays` order with
+    the input endpoint order restored from ``perm_idx``.
+
+    A cell's endpoint chunks are the same for all of its rows
+    (:func:`cell_endpoint_chunks`), so each slot is one gather through
+    one chunk's map; no per-endpoint chunk array is built, which on a
+    bbox read was most of the face work.  ``row_maps`` is typically a
+    reader's per-chunk slice of one ``cumsum(mask) - 1`` table, or of
+    ``arange`` when every row is taken.
+
+    ``cells`` scopes the read as in :func:`read_link_arrays`.  With
+    ``touching``, a record is kept when its first endpoint maps to a row,
+    and an endpoint that does not map comes back as ``-1``: a skeleton
+    reader needs a read child's record even when its parent was not read
+    (see :func:`link_cells_within`).  Returns an empty ``(0, L)`` array
+    when no record survives, ``(0, 0)`` when the family is absent.
+    """
+    layout = _link_segment_blobs(
+        level_group, delta, include_intra=True, cells=cells,
+        link_fragments=None,
+    )
+    if layout is None:
+        return np.empty((0, 0), dtype=np.int64)
+    link_width, _sid_ndim, scale_src, scale_trg, segment_rows = layout
+    inverse: npt.NDArray[np.int64] | None = None
+    parts: list[npt.NDArray[np.int64]] = []
+    for (arr_name, offsets, has_perm, ncols, flat, cell_dtype, _keys, _ranged), blobs in segment_rows:
+        for cell_key, blob in blobs:
+            if not blob:
+                continue
+            rows = _link_cell_rows(blob, ncols=ncols, flat=flat, dtype=cell_dtype)
+            if rows.size == 0:
+                continue
+            if has_perm:
+                if inverse is None:
+                    inverse = _perm_inverse_table(link_width)
+                perm = rows[:, 0]
+                if int(perm.min()) < 0 or int(perm.max()) >= inverse.shape[0]:
+                    raise ArrayError(
+                        f"{arr_name}: perm_idx out of range [0, {inverse.shape[0]})"
+                    )
+            maps = [row_maps.get(c) for c in cell_endpoint_chunks(
+                _parse_chunk_key(cell_key), offsets, scale_src, scale_trg,
+            )]
+            if not touching and any(m is None for m in maps):
+                continue
+            vi = rows[:, 1:] if has_perm else rows
+            placed = np.empty((rows.shape[0], link_width), dtype=np.int64)
+            for k, table in enumerate(maps):
+                if table is None or not len(table):
+                    placed[:, k] = -1
+                    continue
+                v = vi[:, k]
+                inside = (v >= 0) & (v < len(table))
+                if inside.all():
+                    placed[:, k] = table[v]
+                else:
+                    placed[:, k] = np.where(inside, table[np.where(inside, v, 0)], -1)
+            if has_perm and placed.shape[0]:
+                placed = np.take_along_axis(placed, inverse[rows[:, 0]], axis=1)
+            ok = placed[:, 0] >= 0 if touching else (placed >= 0).all(axis=1)
+            if not ok.all():
+                placed = placed[ok]
+            parts.append(placed)
+    if not parts:
+        return np.empty((0, link_width), dtype=np.int64)
+    return np.concatenate(parts, axis=0)
 
 
 def _link_fragment_rows(

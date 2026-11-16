@@ -30,12 +30,15 @@ from __future__ import annotations
 
 import asyncio
 import os
+import struct
 import threading
+import time
 from typing import Any, NamedTuple
 
 import numpy as np
 import zarr
 from numcodecs.vlen import VLenBytes
+from zarr.abc.codec import BytesBytesCodec
 from zarr.core.array_spec import ArraySpec
 from zarr.core.buffer import default_buffer_prototype
 from zarr.core.sync import sync
@@ -60,6 +63,9 @@ _VLEN_BYTES = VLenBytes()
 # process that reconfigures zarr's buffer prototype mid-run would need a
 # restart, which nothing in ZV does.
 _BUFFER_PROTOTYPE = default_buffer_prototype()
+
+# numcodecs' VLenBytes header: item count, then the first item's length.
+_VLEN_COUNT_LENGTH = struct.Struct("<II")
 
 
 def _is_icechunk_store(store: Any) -> bool:
@@ -347,10 +353,28 @@ def _decode_direct(spec: _DirectSpec, raw: bytes | None) -> bytes | None:
     """
     if raw is None:
         return b""
-    buffer = spec.spec.prototype.buffer.from_bytes(raw)
-    for codec in reversed(spec.codecs):
-        buffer = codec._decode_sync(buffer, spec.spec)
-    decoded = _VLEN_BYTES.decode(buffer.as_numpy_array())
+    codecs = spec.codecs
+    if all(type(codec).__name__ == "ZstdCodec" for codec in codecs):
+        # The mirror of the writer's ``_encode_direct``: the numcodecs
+        # Zstd instance the zarr codec delegates to, minus the Buffer
+        # wrapping around every call.
+        frame: Any = raw
+        for codec in reversed(codecs):
+            frame = codec._zstd_codec.decode(frame)
+    else:
+        buffer = spec.spec.prototype.buffer.from_bytes(raw)
+        for codec in reversed(codecs):
+            buffer = codec._decode_sync(buffer, spec.spec)
+        frame = buffer.as_numpy_array()
+    # A cell holds one vlen item, so its payload is the frame past the
+    # header; VLenBytes would build an object array to say the same.
+    # Any other frame takes VLenBytes, which judges it exactly as before.
+    view = memoryview(frame)
+    if view.nbytes >= _VLEN_COUNT_LENGTH.size:
+        count, length = _VLEN_COUNT_LENGTH.unpack_from(view)
+        if count == 1 and length == view.nbytes - _VLEN_COUNT_LENGTH.size:
+            return bytes(view[_VLEN_COUNT_LENGTH.size:])
+    decoded = _VLEN_BYTES.decode(frame)
     if decoded.size != 1:
         return None
     value = decoded.flat[0]
@@ -373,6 +397,83 @@ def _direct_read(spec: _DirectSpec, chunk_key: str) -> bytes | None:
     return _decode_direct(spec, _read_file(path))
 
 
+def direct_elements(node: Any, indices: Any) -> np.ndarray | None:
+    """Elements ``indices`` of a 1-D local array, read off the filesystem.
+
+    The row form of the direct path above, for the object index: a by-id
+    read wants one manifest row and the two end rows of the id table,
+    and each went through a zarr selection -- indexers, a sync hop onto
+    the event loop and back, a codec pipeline pass -- that cost 1-5 ms
+    around a decode of well under one. Here each chunk file the rows
+    fall in is opened and decoded through the array's own codecs, so the
+    values are the ones the selection returns.
+
+    Returns the elements in the order asked, or None for anything not
+    recognised (not a local unsharded v3 array, a codec other than one
+    array-to-bytes serializer plus bytes-to-bytes codecs, an index off
+    the array, a chunk with no stored object), which the caller reads
+    through zarr instead.
+    """
+    store = node.store_path.store
+    if type(store).__name__ != "LocalStore":
+        return None
+    meta = node.metadata
+    if getattr(meta, "zarr_format", None) != 3 or len(meta.shape) != 1:
+        return None
+    if getattr(meta, "storage_transformers", ()):
+        return None
+    chunk_shape = getattr(getattr(meta, "chunk_grid", None), "chunk_shape", None)
+    if chunk_shape is None or len(chunk_shape) != 1:
+        return None
+    serializer, *bytes_codecs = meta.codecs
+    if type(serializer).__name__ not in ("VLenBytesCodec", "BytesCodec"):
+        return None
+    if not all(
+        isinstance(c, BytesBytesCodec) and hasattr(c, "_decode_sync")
+        for c in bytes_codecs
+    ):
+        return None
+    cke = meta.chunk_key_encoding.to_dict()
+    if cke.get("name") != "default":
+        return None
+    separator = (cke.get("configuration") or {}).get("separator", "/")
+
+    idx = np.asarray(indices, dtype=np.int64).ravel()
+    n = int(meta.shape[0])
+    if idx.size == 0 or int(idx.min()) < 0 or int(idx.max()) >= n:
+        return None
+    rows = int(chunk_shape[0])
+    try:
+        spec = ArraySpec(
+            shape=(rows,),
+            dtype=meta.data_type,
+            fill_value=meta.fill_value,
+            config=node._async_array.config,
+            prototype=_BUFFER_PROTOTYPE,
+        )
+    except Exception:
+        return None
+
+    root = os.path.join(str(store.root), node.store_path.path, "c")
+    chunk_of = idx // rows
+    out: np.ndarray | None = None
+    for c in np.unique(chunk_of).tolist():
+        raw = _read_file(f"{root}{separator}{c}")
+        if raw is None:
+            return None
+        buffer = _BUFFER_PROTOTYPE.buffer.from_bytes(raw)
+        for codec in reversed(bytes_codecs):
+            buffer = codec._decode_sync(buffer, spec)
+        values = serializer._decode_sync(buffer, spec).as_numpy_array()
+        if values.shape != (rows,):
+            return None
+        at = chunk_of == c
+        if out is None:
+            out = np.empty(idx.size, dtype=values.dtype)
+        out[at] = values[idx[at] - c * rows]
+    return out
+
+
 #: Cells above which the direct path reads in parallel.
 #:
 #: The direct reader exists to skip zarr's async machinery per chunk,
@@ -391,8 +492,32 @@ def _direct_read(spec: _DirectSpec, chunk_key: str) -> bytes | None:
 #: than where parallelism first helps: below it nothing changes, above
 #: it a slow store stops being read one file at a time. ``open`` and
 #: ``read`` release the GIL, so the threads genuinely overlap; decoding
-#: stays on the calling thread.
+#: has its own threshold, :data:`_PARALLEL_DECODE_MIN_BYTES`.
+#:
+#: Above the threshold the files are still read one after another while
+#: the store proves warm, because there the pool is not merely overhead
+#: but a loss: a future per file costs more than reading the file, and
+#: 2,852 warm files took 330 ms through the pool against 173 ms serially.
+#: Each run of :data:`_READ_PROBE` files is timed, and the first run
+#: averaging over :data:`_SLOW_READ_S` a file hands everything left to
+#: the pool -- so a cold store pays for at most one slow run serially,
+#: wherever in the plan it turns cold.
 _PARALLEL_READ_MIN = 256
+_READ_PROBE = 32
+_SLOW_READ_S = 200e-6
+
+#: Compressed bytes above which a plan's cells are decoded on the reader
+#: pool.
+#:
+#: Decoding is the other half of a large read, and it scales with bytes,
+#: not cells: a 10^7-point cloud is 126 cells of ~0.8 MB, below the read
+#: threshold, and their serial zstd decode was most of ``read_points``.
+#: zstd releases the GIL, so the pool overlaps the decompression.  Only
+#: compressed cells count: an uncompressed cell's decode is the payload
+#: copy, which holds the GIL, and pooling 114 MB of them made the copy
+#: half again slower.  Below this a plan decodes serially, as before --
+#: a 10^6-point read (~10 MB) gained nothing from the pool.
+_PARALLEL_DECODE_MIN_BYTES = 32 << 20
 _PARALLEL_READ_WORKERS = min(16, (os.cpu_count() or 4) * 2)
 
 _READ_POOL: Any = None
@@ -429,6 +554,27 @@ def _reset_read_pool_after_fork() -> None:
 
 if hasattr(os, "register_at_fork"):
     os.register_at_fork(after_in_child=_reset_read_pool_after_fork)
+
+
+def _read_files(paths: list[str]) -> list[bytes | None]:
+    """:func:`_read_file` for each of ``paths``, in order.
+
+    Serial while the store answers quickly, pooled from the first run of
+    files that does not; see :data:`_PARALLEL_READ_MIN`.
+    """
+    if len(paths) < _PARALLEL_READ_MIN:
+        return [_read_file(p) for p in paths]
+    raws: list[bytes | None] = []
+    for start in range(0, len(paths), _READ_PROBE):
+        run = paths[start:start + _READ_PROBE]
+        t0 = time.perf_counter()
+        raws.extend(_read_file(p) for p in run)
+        if time.perf_counter() - t0 > _SLOW_READ_S * len(run):
+            raws.extend(
+                _read_pool().map(_read_file, paths[start + len(run):])
+            )
+            break
+    return raws
 
 
 def _direct_read_many(
@@ -470,23 +616,50 @@ def _direct_read_plan(
                 wanted.append((array_name, spec, chunk_key, path))
     if not wanted:
         return {}
-    if len(wanted) >= _PARALLEL_READ_MIN:
-        raws = list(
-            _read_pool().map(_read_file, [w[3] for w in wanted])
-        )
+    raws = _read_files([w[3] for w in wanted])
+    specs = [w[1] for w in wanted]
+    compressed = sum(
+        len(raw) for spec, raw in zip(specs, raws)
+        if raw is not None and spec.codecs
+    )
+    if len(wanted) > 1 and compressed >= _PARALLEL_DECODE_MIN_BYTES:
+        # A few slices per worker rather than a future per cell, so a
+        # plan of many small cells does not pay a hand-off for each.
+        step = -(-len(wanted) // (4 * _PARALLEL_READ_WORKERS))
+        starts = range(0, len(wanted), step)
+        decoded = [
+            data
+            for part in _read_pool().map(
+                _decode_all,
+                [specs[i:i + step] for i in starts],
+                [raws[i:i + step] for i in starts],
+            )
+            for data in part
+        ]
     else:
-        raws = [_read_file(w[3]) for w in wanted]
+        decoded = _decode_all(specs, raws)
     out: dict[tuple[str, str], bytes] = {}
-    for (array_name, spec, chunk_key, _path), raw in zip(wanted, raws):
-        try:
-            data = _decode_direct(spec, raw)
-        except Exception:
+    for (array_name, _spec, chunk_key, _path), data in zip(wanted, decoded):
+        if isinstance(data, Exception):
             # Tolerant: the cell is left out, and its sync read raises.
             if not tolerant:
-                raise
+                raise data
             continue
         if data is not None:
             out[(array_name, chunk_key)] = data
+    return out
+
+
+def _decode_all(specs: list[_DirectSpec], raws: list[bytes | None]) -> list[Any]:
+    """:func:`_decode_direct` over paired cells, returning rather than
+    raising each cell's error, so a pooled decode reports the first
+    failing cell in plan order and a tolerant one skips just that cell."""
+    out: list[Any] = []
+    for spec, raw in zip(specs, raws):
+        try:
+            out.append(_decode_direct(spec, raw))
+        except Exception as exc:
+            out.append(exc)
     return out
 
 

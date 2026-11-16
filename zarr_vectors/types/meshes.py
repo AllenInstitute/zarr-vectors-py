@@ -42,12 +42,12 @@ from zarr_vectors.core.arrays import (
     create_object_index_array,
     create_vertices_array,
     link_cells_within,
-    link_endpoints_to_rows,
     link_range_requests,
     list_link_offsets,
     read_chunk_vertices,
     read_fragment,
     read_link_arrays,
+    read_link_rows,
     read_object_manifests,
     read_vertex_fragment_index,
     resolve_chunk_keys,
@@ -85,6 +85,7 @@ from zarr_vectors.exceptions import ArrayError
 from zarr_vectors.spatial.boundary import (
     build_vertex_chunk_mapping,
     partition_faces,
+    partition_link_indices,
 )
 from zarr_vectors.spatial.chunking import (
     assign_chunks,
@@ -319,24 +320,31 @@ def write_mesh(
             faces, vertex_chunks, vertex_local, chunk_list
         )
         store_rows = np.flatnonzero(~is_intra_face)
-        f_chunk = f_chunk[store_rows]
-        f_local = f_local[store_rows]
+        link_cidx = f_chunk[store_rows]
+        link_vi = f_local[store_rows]
+        link_intra = is_intra_face[store_rows]
+    else:
+        link_cidx, link_vi, link_intra = f_chunk, f_local, is_intra_face
 
     # Records stay in face order, which the partitioner preserves within
-    # each cell.  Held as arrays -- ``(F, L, D)`` endpoint chunks and
-    # ``(F, L)`` local indices -- rather than one list of tuples per
-    # face: building those and taking them apart again was 3 s of a
-    # half-million-face write before anything was partitioned.  Raw
-    # stores every face, so it takes the gathered arrays as they are.
-    link_chunks = np.asarray(chunk_list, dtype=np.int64)[f_chunk]
-    link_vi = f_local
+    # each cell.  Held as arrays -- ``(F, L)`` endpoint chunk indices and
+    # local indices -- rather than one list of tuples per face: building
+    # those and taking them apart again was 3 s of a half-million-face
+    # write before anything was partitioned.  Chunk indices rather than
+    # coords, so the intra-chunk faces group by one small-integer sort.
+    idx_ndim = ndim + 1 if vertex_attr_bins is not None else ndim
+    link_buckets: dict[tuple[str, ChunkCoords], Any] = {}
+    if len(link_vi):
+        link_buckets = partition_link_indices(
+            np.asarray(chunk_list, dtype=np.int64), link_cidx, link_vi,
+            sid_ndim=idx_ndim, intra=link_intra,
+        )
 
     # Write vertices per chunk, one fragment per object in the chunk.
     object_manifests: dict[int, ObjectManifest] = {}
     # First row of each chunk's vertex fragments, so write_links can file
     # each chunk's intra-chunk faces one link fragment per vertex fragment.
     fragment_starts: dict[ChunkCoords, npt.NDArray[np.int64]] = {}
-    idx_ndim = ndim + 1 if vertex_attr_bins is not None else ndim
 
     # Collapse all per-array zarr.json + per-chunk byte writes into one
     # asyncio.gather (mirrors points.py:300).  ``shard_shape`` also
@@ -421,10 +429,11 @@ def write_mesh(
         # Intra-chunk faces are filed one link fragment per vertex
         # fragment -- i.e. per object -- so an object read can take its
         # own faces without decoding its neighbours'.
-        if len(link_vi):
+        if link_buckets:
             write_links(
                 level_group, [], idx_ndim, delta=0,
-                link_width=link_width, _arrays=(link_chunks, link_vi),
+                link_width=link_width, _prepartitioned=link_buckets,
+                _num_records=len(link_vi),
                 fragment_starts=fragment_starts or None,
             )
         # Backstop: `arrays_present` advertises the family, and the
@@ -680,30 +689,33 @@ def _read_mesh(
         positions_out = np.concatenate(all_positions, axis=0)
 
         # Faces: one family, so intra and cross records come back from one
-        # call already in global ``(chunk, local_idx)`` form — a single
-        # remap covers both, with winding restored from ``perm_idx``.  A
-        # face touching a chunk outside ``chunk_keys`` has no offset and is
-        # dropped, which is what applies the bbox/chunks filter to faces.
-        all_faces: list[npt.NDArray] = []
-        # As arrays, not one tuple per face: the remap is a gather.
-        face_chunks, face_vi = read_link_arrays(
-            level_group, delta=0, cells=link_cells,
-        )
-        if face_vi.shape[0] and face_vi.shape[1] == link_width:
-            rows = link_endpoints_to_rows(face_chunks, face_vi, chunk_offsets)
-            keep = (rows >= 0).all(axis=1)
-            if keep.any():
-                all_faces.append(rows[keep])
-
-        if all_faces:
-            faces_out = np.concatenate(all_faces, axis=0)
-        else:
-            faces_out = np.zeros((0, link_width), dtype=np.int64)
-
+        # call, with winding restored from ``perm_idx``.  A face touching a
+        # chunk outside ``chunk_keys`` has no rows and is dropped, which is
+        # what applies the bbox/chunks filter to faces.
+        # The bbox mask is known before any face is read, so each chunk's
+        # rows map straight to output rows (``-1`` where dropped) and faces
+        # go through that map once, per cell.  A whole-level read maps
+        # every row to its chunk offset plus itself.
         if bbox is not None:
-            positions_out, faces_out, _ = _bbox_filter(
-                positions_out, faces_out, bbox, link_width,
+            bbox_min, bbox_max = np.asarray(bbox[0]), np.asarray(bbox[1])
+            node_mask = np.all(
+                (positions_out >= bbox_min) & (positions_out <= bbox_max),
+                axis=1,
             )
+            row_of = np.cumsum(node_mask, dtype=np.int64) - 1
+            row_of[~node_mask] = -1
+            if not node_mask.all():
+                positions_out = positions_out[node_mask]
+        else:
+            row_of = np.arange(running, dtype=np.int64)
+        starts = list(chunk_offsets.items())
+        ends = [start for _, start in starts[1:]] + [running]
+        row_maps = {
+            cc: row_of[start:end] for (cc, start), end in zip(starts, ends)
+        }
+        faces_out = read_link_rows(level_group, row_maps, cells=link_cells)
+        if faces_out.shape[1] != link_width:
+            faces_out = np.zeros((0, link_width), dtype=np.int64)
 
         return {
             "vertices": positions_out,
