@@ -289,9 +289,7 @@ class Dataset:
     ) -> dict[str, Any]:
         """Write polylines, or streamlines when ``streamlines=True``.
 
-        ``attributes`` takes one array per polyline for each name -- a
-        list as long as ``polylines``, each with one row per vertex --
-        and ``object_attributes`` one row per polyline.
+        Each ``attributes`` value is a list of one array per polyline.
         """
         from zarr_vectors.constants import GEOM_STREAMLINE
         from zarr_vectors.types.polylines import write_polylines
@@ -440,10 +438,7 @@ class Dataset:
         if layout is not None:
             _check_layout_matches_store(self.url, schema, resolved)
         kwargs = {k: v for k, v in kwargs.items() if v is not None}
-        # The position dtype the store was created with.  ``create``
-        # stamps Schema.position_dtype on level 0's vertices array, but
-        # every writer defaults ``dtype="float32"``, so without this a
-        # float64 schema silently stored float32 positions.
+        # The schema's position dtype; the writers default to float32.
         kwargs.setdefault("dtype", self._position_dtype())
         # Checked BEFORE the write: a declaration the data contradicts is
         # worth catching while the store is still as it was.
@@ -462,17 +457,7 @@ class Dataset:
         return report
 
     def _refuse_overwrite(self) -> None:
-        """Raise if level 0 already holds geometry.
-
-        The writers behind ``add_*`` create a store's level 0; they do not
-        append to one.  Called a second time they rewrote the cells the
-        new batch touched, left the rest of the first batch in place and
-        stamped the level's vertex count with the new batch alone -- 1,000
-        points then 500 read back as some mix of the two -- and a batch
-        reaching cells the first never allocated failed with a bare
-        StoreError.  Refusing is the only honest answer until a real
-        append path exists.
-        """
+        """Raise if level 0 already holds geometry: ``add_*`` cannot append."""
         if 0 not in self.levels:
             return
         try:
@@ -541,11 +526,12 @@ class Dataset:
         from zarr_vectors.multiresolution.coarsen import build_pyramid
 
         # The handle, not ``self.url``.  ``Group.url`` is ``repr(store)``
-        # for anything that is not a LocalStore, so it cannot be re-opened
-        # for a memory- or object-backed dataset; and a URL would drop
-        # this dataset's StorageOptions (credentials, a forced backend).
-        # Passing the handle also keeps a dataset opened ``mode="r"``
-        # read-only: re-opening as ``"r+"`` would escalate it.
+        # for anything that is not a LocalStore, so re-opening it failed
+        # outright on a memory- or object-backed dataset; and even for a
+        # URL it dropped this dataset's StorageOptions, so credentials and
+        # a forced backend were silently lost.  Passing the handle also
+        # means a dataset opened ``mode="r"`` can no longer write a
+        # pyramid -- the old path re-opened as ``"r+"`` and escalated.
         out = build_pyramid(self._group, factors=list(factors), method=method, **kw)
         self._levels.clear()
         self._meta = None
@@ -554,9 +540,9 @@ class Dataset:
     def validate(self, *, level: int = 3) -> Any:
         from zarr_vectors.validate import validate as _validate
 
-        # Likewise: validate the handle, not ``self.url`` -- for a local
-        # store that is a ``file://`` URI, which level 1 cannot open as a
-        # path.
+        # Likewise.  This one was broken for LOCAL stores too: ``url`` is a
+        # ``file://`` URI and level 1 did a raw ``Path()`` on it, so every
+        # validation through this method failed at level 1 and returned.
         return _validate(self._group, level=level)
 
     def commit(self, message: str = "zarr-vectors write") -> str | None:
@@ -756,8 +742,9 @@ _SCOPE_KWARGS: dict[str, str] = {
 def _check_declared(schema: Schema, kwargs: Mapping[str, Any]) -> None:
     """Reject data that contradicts what the store says it holds.
 
-    A store that declares an ``AttributeSpec.dtype`` or ``channels`` for
-    an attribute refuses data of another dtype or channel count.
+    ``AttributeSpec.dtype`` and ``channels`` used to be inert -- a store
+    could declare ``float32`` and be handed ``float64``, and nothing
+    anywhere noticed.  A declaration that is never checked is decoration.
 
     Only *declared* attributes are checked; passing an undeclared one is
     how a store is extended, and is fine.
@@ -830,12 +817,7 @@ def _n_rows(value: Any, what: str) -> int:
 
 
 def _check_rows(what: str, value: Any, expected: int, of: str) -> None:
-    """Raise unless ``value`` has exactly ``expected`` rows.
-
-    Checked here, before the write: a short array otherwise surfaced from
-    deep in a writer as ``IndexError: index 259 is out of bounds``, and a
-    long one was silently truncated.
-    """
+    """Raise unless ``value`` has exactly ``expected`` rows."""
     if value is None:
         return
     got = _n_rows(value, what)
@@ -854,8 +836,7 @@ def _check_columns(
 
 
 def _check_groups(groups: Mapping[Any, Any] | None) -> None:
-    """Group ids are integers; the writer failed on a string with an
-    unrelated ``TypeError`` about string concatenation."""
+    """Raise unless every group id is an integer."""
     import numbers
 
     for key in (groups or {}):
@@ -886,14 +867,8 @@ def _inherit_grid(layout: Layout, stored: Layout) -> Layout:
 def _check_layout_matches_store(
     url: str, schema: Schema, resolved: Any,
 ) -> None:
-    """Refuse a ``layout=`` whose grid differs from the store's.
-
-    A store has one grid, recorded on its root when it is created; the
-    writers place vertices on the grid they are handed but leave the
-    root's declaration alone.  Writing on a different grid produced chunk
-    keys the store's own metadata contradicts, and a bbox read then looked
-    in the wrong cells and returned almost nothing, with no error.
-    """
+    """Refuse a ``layout=`` whose grid differs from the store's: the root
+    declares one grid, and chunk keys on another are unreadable."""
     stored = schema.layout.resolve(schema)
     problems = []
     for name, mine, theirs in (

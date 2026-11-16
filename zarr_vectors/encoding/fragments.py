@@ -1248,8 +1248,6 @@ def decode_object_manifests_csr(
     keep = np.ones(buf.size, dtype=bool)
     keep[(header[:, None] + np.arange(4)).ravel()] = False
     if fast.all():
-        # Every length fits single-fragment blocks, so the table rows are
-        # exactly the positions the mode check below would visit.
         blocks = buf[keep].reshape(-1, width)
         if np.all(blocks[:, sid_ndim * 8] == MANIFEST_MODE_SINGLE):
             offsets = np.zeros(n + 1, dtype=np.int64)

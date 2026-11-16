@@ -312,9 +312,7 @@ async def _fetch_listings(
         if not isinstance(node, zarr.AsyncGroup):
             return path, []
         try:
-            # One pass over the children, not one for arrays and one for
-            # groups: each pass loads every child's zarr.json.  The
-            # children it loads are kept for the rest of the query.
+            # One pass (each loads every child's zarr.json); children kept.
             names = set()
             async for name, child in node.members():
                 names.add(name)

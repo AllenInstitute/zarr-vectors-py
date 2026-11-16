@@ -355,8 +355,7 @@ def _decode_direct(spec: _DirectSpec, raw: bytes | None) -> bytes | None:
         return b""
     codecs = spec.codecs
     if all(type(codec).__name__ == "ZstdCodec" for codec in codecs):
-        # The mirror of the writer's ``_encode_direct``: the numcodecs
-        # Zstd instance the zarr codec delegates to, minus the Buffer
+        # The mirror of the writer's ``_encode_direct``, minus the Buffer
         # wrapping around every call.
         frame: Any = raw
         for codec in reversed(codecs):
@@ -367,8 +366,7 @@ def _decode_direct(spec: _DirectSpec, raw: bytes | None) -> bytes | None:
             buffer = codec._decode_sync(buffer, spec.spec)
         frame = buffer.as_numpy_array()
     # A cell holds one vlen item, so its payload is the frame past the
-    # header; VLenBytes would build an object array to say the same.
-    # Any other frame takes VLenBytes, which judges it exactly as before.
+    # header; any other frame takes VLenBytes.
     view = memoryview(frame)
     if view.nbytes >= _VLEN_COUNT_LENGTH.size:
         count, length = _VLEN_COUNT_LENGTH.unpack_from(view)
@@ -400,19 +398,11 @@ def _direct_read(spec: _DirectSpec, chunk_key: str) -> bytes | None:
 def direct_elements(node: Any, indices: Any) -> np.ndarray | None:
     """Elements ``indices`` of a 1-D local array, read off the filesystem.
 
-    The row form of the direct path above, for the object index: a by-id
-    read wants one manifest row and the two end rows of the id table,
-    and each went through a zarr selection -- indexers, a sync hop onto
-    the event loop and back, a codec pipeline pass -- that cost 1-5 ms
-    around a decode of well under one. Here each chunk file the rows
-    fall in is opened and decoded through the array's own codecs, so the
-    values are the ones the selection returns.
-
-    Returns the elements in the order asked, or None for anything not
-    recognised (not a local unsharded v3 array, a codec other than one
-    array-to-bytes serializer plus bytes-to-bytes codecs, an index off
-    the array, a chunk with no stored object), which the caller reads
-    through zarr instead.
+    Each chunk file is decoded through the array's own codecs, so the
+    values are the ones a zarr selection returns.  Returns them in the
+    order asked, or None for anything not recognised (not a local
+    unsharded v3 array, other codecs, an index off the array, a missing
+    chunk), which the caller reads through zarr instead.
     """
     store = node.store_path.store
     if type(store).__name__ != "LocalStore":
@@ -492,31 +482,15 @@ def direct_elements(node: Any, indices: Any) -> np.ndarray | None:
 #: than where parallelism first helps: below it nothing changes, above
 #: it a slow store stops being read one file at a time. ``open`` and
 #: ``read`` release the GIL, so the threads genuinely overlap; decoding
-#: has its own threshold, :data:`_PARALLEL_DECODE_MIN_BYTES`.
-#:
-#: Above the threshold the files are still read one after another while
-#: the store proves warm, because there the pool is not merely overhead
-#: but a loss: a future per file costs more than reading the file, and
-#: 2,852 warm files took 330 ms through the pool against 173 ms serially.
-#: Each run of :data:`_READ_PROBE` files is timed, and the first run
-#: averaging over :data:`_SLOW_READ_S` a file hands everything left to
-#: the pool -- so a cold store pays for at most one slow run serially,
-#: wherever in the plan it turns cold.
+#: has its own threshold, :data:`_PARALLEL_DECODE_MIN_BYTES`.  Above it,
+#: files are still read serially (on a warm store the pool is a loss) until
+#: a run of :data:`_READ_PROBE` averages over :data:`_SLOW_READ_S` a file.
 _PARALLEL_READ_MIN = 256
 _READ_PROBE = 32
 _SLOW_READ_S = 200e-6
 
 #: Compressed bytes above which a plan's cells are decoded on the reader
-#: pool.
-#:
-#: Decoding is the other half of a large read, and it scales with bytes,
-#: not cells: a 10^7-point cloud is 126 cells of ~0.8 MB, below the read
-#: threshold, and their serial zstd decode was most of ``read_points``.
-#: zstd releases the GIL, so the pool overlaps the decompression.  Only
-#: compressed cells count: an uncompressed cell's decode is the payload
-#: copy, which holds the GIL, and pooling 114 MB of them made the copy
-#: half again slower.  Below this a plan decodes serially, as before --
-#: a 10^6-point read (~10 MB) gained nothing from the pool.
+#: pool: zstd releases the GIL; an uncompressed cell's copy does not.
 _PARALLEL_DECODE_MIN_BYTES = 32 << 20
 _PARALLEL_READ_WORKERS = min(16, (os.cpu_count() or 4) * 2)
 
@@ -557,11 +531,8 @@ if hasattr(os, "register_at_fork"):
 
 
 def _read_files(paths: list[str]) -> list[bytes | None]:
-    """:func:`_read_file` for each of ``paths``, in order.
-
-    Serial while the store answers quickly, pooled from the first run of
-    files that does not; see :data:`_PARALLEL_READ_MIN`.
-    """
+    """:func:`_read_file` for each of ``paths``, in order; serial while the
+    store answers quickly (see :data:`_PARALLEL_READ_MIN`)."""
     if len(paths) < _PARALLEL_READ_MIN:
         return [_read_file(p) for p in paths]
     raws: list[bytes | None] = []
@@ -772,7 +743,7 @@ def shard_reader() -> str:
     """How sharded arrays are read: ``ZARR_VECTORS_SHARD_READER``.
 
     ``auto`` (the default): ``optimised``, for every sharding codec (see
-    :func:`shard_reader_for`).  ``standard``: as zarr-vectors always had
+    :func:`shard_reader_for`).  ``standard``: as zarr-vectors always has
     -- a local store's shards read off the filesystem, each shard's index
     once for a batch and one range per wanted cell; any other store
     through zarr's array API.  ``optimised``: through
@@ -798,11 +769,7 @@ def shard_reader_for(src: Any, mode: str | None = None) -> str:
     ``mode`` (default :func:`shard_reader`) as it stands, but ``auto`` is
     ``optimised`` for every array ``src`` (its
     :class:`~zarr_vectors.core._cells_on_disk.CellSource`), whatever its
-    shard index.  ``auto`` once read a ``sharding_indexed`` array
-    ``standard``, which behind an object store goes through zarr's
-    sharded reader one cell at a time: ten point objects of a 200k-vertex
-    store took 11 s at 20 ms a request, against 0.9 s optimised.
-    Decided once per array, never per cell.
+    shard index.  Decided once per array, never per cell.
     """
     if mode is None:
         mode = shard_reader()
@@ -907,8 +874,7 @@ def _sharded_read_plan(
 
 
 #: Cells per array, on average, from which :func:`_sharded_read_batched`
-#: takes a read: it costs ~0.15 ms an array however few cells it holds,
-#: the per-cell path ~15 us a cell (local, warm cache).
+#: takes a read (it has a fixed cost per array).
 _BATCH_CELLS = 32
 
 
@@ -938,8 +904,7 @@ def _cells_of(src: Any, chunk_keys: list[str]) -> tuple[np.ndarray, list[str]]:
 def _zstd_steps(codecs: tuple[Any, ...]) -> list[Any] | None:
     """The decompressions a cell's stored bytes go through, last codec
     first, when every codec is zstd (or the octree marker, the identity
-    on bytes); else None. ``numcodecs.zstd.decompress`` is what the
-    codec's own decode calls, minus its checks of the argument."""
+    on bytes); else None."""
     from numcodecs import zstd
 
     steps = []
@@ -975,9 +940,7 @@ def _sharded_read_batched(
         return {}
     located, reads = read_cell_spans(requests)
     views = [memoryview(r) if isinstance(r, bytes) else r for r in reads]
-    # A read's length, -1 for one that is not bytes and for no read at
-    # all (the last): a cell is served straight from its read when that
-    # read holds all of it.
+    # A read's length; -1 for a non-bytes read and for no read (the last).
     lengths = np.asarray(
         [len(v) if isinstance(v, memoryview) else -1 for v in views] + [-1], dtype=np.int64,
     )

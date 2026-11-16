@@ -145,10 +145,8 @@ def coarsen_level(
         sparsity_strategy: Object selection strategy — ``"random"`` (core)
             or a name registered by ``zarr-vectors-tools``.
         sparsity_seed: Random seed.
-        sparsity_attribute: Name of a per-object attribute on the source
-            level whose values are handed to the selection strategy as
-            ``attribute_values`` (the ``"attribute"`` strategy ranks by
-            it).  ``None`` passes none.
+        sparsity_attribute: Per-object attribute handed to the selection
+            strategy as ``attribute_values``.
         sparsity_attribute_mode: ``"max"`` or ``"min"``, forwarded as
             ``attribute_mode``.
         cross_level_storage: When called via ``build_pyramid`` this is
@@ -228,14 +226,7 @@ def _refuse_octree_levels(store_path: Any, levels: list[int] | None, what: str) 
 def _refresh_arrays_present(
     store_path: str | Path | Group, levels,
 ) -> None:
-    """Re-derive ``arrays_present`` on ``levels`` from what is on disk.
-
-    A coarsen step writes more than the level it creates declares: the
-    coarse level's ``vertex_fragments``, ``object_attributes`` and link
-    families, and a ``links/+1`` family on the source level.  The list was
-    hand-written as ``[vertices, object_index]`` and never revisited, so a
-    reader gating on it could not see arrays that exist.
-    """
+    """Re-derive ``arrays_present`` on ``levels`` from what is on disk."""
     from zarr_vectors.building import refresh_arrays_present
 
     root = open_store(store_path, mode="r+")
@@ -410,27 +401,14 @@ def _per_object_coarsen(
         }
 
     # --- Step 1: drop a fraction of source objects ----------------------
-    # Selection is nested: it draws from the objects the source level
-    # still holds, not from every id it inherited.  A dropped object stays
-    # addressable at every coarser level as an empty manifest, and drawing
-    # from all rows again redrew dropped ones -- with a fixed seed the
-    # same half every level, so nothing further was dropped; without one,
-    # a level's draw mostly landed on objects already gone.
+    # Nested: draw only from objects the source level still holds.
     keep_oids: list[int]
     candidates = [row for row, m in enumerate(src_manifests) if m]
-    # The fraction this step kept, as the level records it: 1.0 unless a
-    # selection actually ran.  A point cloud without objects is one
-    # implicit object and is never thinned, yet was stamped
-    # ``1 / sparsity_factor`` as though it had been.
+    # 1.0 unless a selection actually ran (a lone implicit object never is).
     sparsity_applied = sparsity_factor > 1.0 and len(candidates) > 1
     step_sparsity = (1.0 / sparsity_factor) if sparsity_applied else 1.0
     if sparsity_applied:
         keep_frac = 1.0 / sparsity_factor
-        # The per-object context the strategy interface defines, aligned
-        # with ``candidates``.  It was never built: every registered
-        # strategy got ``representative_points=None`` and no lengths or
-        # values, so spatial-coverage, length and attribute selection could
-        # not run through this entry point.  ``random`` uses none of it.
         ctx: dict[str, Any] = {}
         if sparsity_strategy != "random":
             ctx = _selection_context(
@@ -770,19 +748,9 @@ def _selection_context(
     geometry_types: list[str],
     attribute: str | None,
 ) -> dict[str, Any]:
-    """Per-object context for a registered selection strategy.
-
-    Each array is aligned with ``candidates`` (source manifest rows):
-
-    * ``representative_points`` -- each object's middle vertex in manifest
-      order, the convention ``zarr-vectors-tools`` uses for a polyline's
-      representative point;
-    * ``lengths`` -- path length through the object's vertices for line
-      geometries (lines, polylines, streamlines, skeletons), otherwise its
-      vertex count as a size measure;
-    * ``attribute_values`` -- the named per-object attribute's rows, when
-      one is named.
-    """
+    """``representative_points`` (middle vertex), ``lengths`` (path length,
+    or vertex count for non-path geometry) and ``attribute_values`` for a
+    selection strategy, aligned with ``candidates``."""
     n = len(candidates)
     rep = np.zeros((n, ndim), dtype=np.float64)
     lengths = np.zeros(n, dtype=np.float64)
@@ -1512,8 +1480,7 @@ def build_pyramid(
         cross_level_depth=cross_level_depth,
         cross_level_storage=cross_level_storage,
     )
-    # The finalize pass adds the deeper ``+N`` / ``-N`` link families to
-    # levels the per-step refresh has already seen.
+    # The finalize pass adds deeper link families after the per-step refresh.
     if cross_level_depth not in (0, 1) and cross_level_storage != XLEVEL_NONE:
         _refresh_arrays_present(store_path, range(len(factors) + 1))
 

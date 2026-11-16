@@ -65,12 +65,9 @@ def rebin_level(
     bin.  Per-vertex attribute arrays are re-sorted with their vertices,
     and vertices keep the store's dtype.
 
-    The bin shape lives in the NGFF ``multiscales`` block, not in the
-    level's own attrs.  Re-binning level 0 sets the root
-    ``base_bin_shape`` and the level-0 translation (``bin / 2``), and
-    re-derives every coarser level's scale against the new base (their
-    absolute bins are unchanged).  Re-binning a coarser level sets that
-    level's scale (``bin / base``) and translation.
+    Level 0 updates the root ``base_bin_shape``, the NGFF translation
+    and every coarser level's ``bin_ratio``; a coarser level updates its
+    own ``bin_shape`` / ``bin_ratio``.
 
     Args:
         store_path: Path or URL to a writable ZV store.
@@ -126,9 +123,7 @@ def rebin_level(
     bins_created = 0
     bs = np.asarray(target_bin_shape, dtype=np.float64)
 
-    # Fragments are rebuilt from positions, so anything that names a
-    # fragment -- an object manifest, a per-fragment attribute -- would be
-    # left pointing at the wrong vertices.
+    # Fragments are rebuilt, so anything naming one would go stale.
     named = [f for f in (OBJECT_INDEX, FRAGMENT_ATTRIBUTES)
              if f in level_group.children()]
     if named:
@@ -158,7 +153,6 @@ def rebin_level(
         positions = np.concatenate(groups, axis=0)
         if positions.shape[0] == 0:
             continue
-        # Per-vertex attributes in the same (fragment) order as positions.
         attrs: dict[str, npt.NDArray] = {}
         for name, meta in attr_meta.items():
             adt = np.dtype(meta.get("dtype", "float32"))
@@ -184,12 +178,9 @@ def rebin_level(
         vertices_processed += int(positions.shape[0])
         bins_created += len(new_groups)
 
-    # Where the bin shape lives: level 0's is the root ``base_bin_shape``,
-    # with the level-0 NGFF translation at ``bin / 2``; a coarse level keeps
-    # its own ``bin_shape`` and ``bin_ratio`` (a float, ``bin / base``) in
-    # its ``zarr_vectors_level`` block.  Every level's NGFF entry repeats
-    # level 0's transform, because coarse vertices are stored in level-0
-    # coordinates.  LevelMetadata.validate forbids a level-0 bin_shape.
+    # Level 0's bin is the root base_bin_shape (a level-0 bin_shape is
+    # invalid); coarse vertices are in level-0 coordinates, so every
+    # level's NGFF entry repeats level 0's transform.
     new_bin_shape = tuple(float(b) for b in target_bin_shape)
     if level == 0:
         # Through ``update_root_metadata``, which read-modify-writes the one
@@ -199,9 +190,7 @@ def rebin_level(
         upsert_level_transform(
             root, 0, scale=[1.0] * ndim, translation=translation0,
         )
-        # Coarser levels keep their absolute bins; their ratio is relative
-        # to the base, so it moves with it, and their NGFF entry follows
-        # level 0's.
+        # Coarser levels keep their absolute bins; their ratio moves.
         for lv in list_resolution_levels(root):
             if lv == 0:
                 continue
@@ -228,8 +217,7 @@ def rebin_level(
 
 
 def _set_level_bins(root, level, bin_shape, base_bin) -> None:
-    """Write a coarse level's ``bin_shape`` and its float ``bin_ratio``
-    against ``base_bin`` into the level's ``zarr_vectors_level`` block."""
+    """Set a coarse level's ``bin_shape`` and float ``bin_ratio``."""
     lg = get_resolution_level(root, level)
     attrs = lg.attrs.to_dict()
     block = dict(attrs.get("zarr_vectors_level", {}))

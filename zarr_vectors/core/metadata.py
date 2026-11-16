@@ -633,14 +633,8 @@ class RootMetadata:
         :func:`zarr_vectors.core.multiscale.write_multiscale_metadata`.
         Combine the two when writing root attrs.
 
-        Key presence follows :func:`zarr_vectors.core.store._write_root_attrs`:
-        ``zv_version``, ``format_capabilities`` (possibly empty),
-        ``chunk_shape``, ``bounds`` and ``geometry_types`` are always
-        written; ``crs`` and the other optional keys only when they carry
-        a value.  The policy fields (``links_convention`` ...
-        ``reduction_factor``) always have one here, so they are always
-        emitted, whereas a store records them only once a writer stamps
-        them -- :meth:`from_dict` reads an absent one as its default.
+        ``format_capabilities`` (possibly empty) is always written; ``crs``
+        and the other optional keys only when they carry a value.
         """
         d = {
             "zarr_vectors": {
@@ -1680,13 +1674,8 @@ def check_bin_shape_tiles_chunk(
     *,
     name: str = "bin_shape",
 ) -> None:
-    """Raise unless ``bin_shape`` tiles ``chunk_shape`` on every axis.
-
-    The level-0 bin grid must nest inside the chunk grid: each chunk is
-    split into a whole number of bins.  Writers call this up front, so a
-    bin that does not divide the chunk is rejected at the call that
-    declared it rather than producing a store that fails validation (or
-    an unrelated error from deep inside the chunk writer).
+    """Raise unless ``bin_shape`` tiles ``chunk_shape`` on every axis
+    (each chunk holds a whole number of level-0 bins).
 
     Raises:
         MetadataError: On a rank mismatch, a non-positive bin, or a bin

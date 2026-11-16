@@ -89,10 +89,8 @@ class LevelContext:
     kind: str | None = None
     """The level's geometry kind, when known."""
     fragments_tile: bool = False
-    """The level claims each cell's fragments tile its buffer in order
-    (``LevelMetadata.fragments_tile``), so a whole-level point read takes
-    the buffers as they are and reads ``vertex_fragments`` for one cell,
-    to re-check the claim."""
+    """``LevelMetadata.fragments_tile``: a whole-level point read then needs
+    ``vertex_fragments`` for one cell only, to re-check the claim."""
 
     @property
     def prefix(self) -> str:
@@ -130,11 +128,8 @@ def _arrays_for(
     id table, which maps those ids to rows and is one integer per
     object.
 
-    ``vertex_fragments`` is left out of a ``bulk`` read (nothing narrows
-    it) of a point level that claims ``fragments_tile`` and has no
-    attribute to read: ``read_points`` then skips the fragment index, so
-    fetching it fetched one cell per cell of the level for nothing.
-    :func:`resolve` plans the one cell the reader does read.
+    ``vertex_fragments`` is left out of a ``bulk`` (unnarrowed) read of a
+    ``fragments_tile`` point level with no attribute to read.
     """
     arrays = list(_CORE_ARRAYS)
     if attributes == "all":
@@ -280,8 +275,7 @@ def resolve(selection: Any, ctx: LevelContext) -> ReadPlan:
     bbox = getattr(selection, "bbox", None)
     near = getattr(selection, "near", None)
     explicit = getattr(selection, "cells", None)
-    # The read_points terms that make a read "bulk" there: nothing narrows
-    # it (a limit reads a prefix of cells chosen by their fragments).
+    # Bulk: nothing narrows the read (a limit does: it picks cells).
     bulk = not by_object and all(
         getattr(selection, term, None) is None
         for term in ("bbox", "near", "cells", "where", "limit")
@@ -293,10 +287,7 @@ def resolve(selection: Any, ctx: LevelContext) -> ReadPlan:
     )
     plan = ReadPlan.of(nodes=[ctx.prefix], arrays=wanted.whole_arrays)
     if VERTEX_FRAGMENTS not in wanted.arrays:
-        # Left out of a bulk read, the fragment index is still wanted for
-        # one cell: the reader re-checks the tiling claim on its first
-        # chunk, the first of the listing ``known_cells`` is.  Named here,
-        # it comes in the first round, not two rounds after.
+        # The reader still re-checks the tiling claim on its first cell.
         frag = ctx.path(VERTEX_FRAGMENTS)
         plan = plan.merge(ReadPlan.of(
             nodes=[frag],
@@ -396,24 +387,17 @@ def context_from_level(level: Any) -> LevelContext:
             "dense" if getattr(root, "manifest_layout", None) == "dense" else "vlen"
         ),
         known_cells=_known_cells(level),
-        kind=_kind(level),
-        fragments_tile=_fragments_tile(level),
+        kind=_or(lambda: level.kind, None),
+        fragments_tile=_or(lambda: bool(getattr(level._metadata(), "fragments_tile", False))),
     )
 
 
-def _kind(level: Any) -> str | None:
+def _or(get: Any, default: Any = False) -> Any:
+    """``get()``, or ``default`` when the level cannot answer."""
     try:
-        return level.kind
-    except Exception:  # noqa: BLE001 - unknown kind: plan as before
-        return None
-
-
-def _fragments_tile(level: Any) -> bool:
-    """The level's ``fragments_tile`` claim; ``False`` when unreadable."""
-    try:
-        return bool(getattr(level._metadata(), "fragments_tile", False))
-    except Exception:  # noqa: BLE001 - unreadable: plan as before
-        return False
+        return get()
+    except Exception:  # noqa: BLE001
+        return default
 
 
 def _known_cells(level: Any) -> tuple[str, ...]:

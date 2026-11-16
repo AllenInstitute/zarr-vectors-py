@@ -439,14 +439,9 @@ def read_cells(
         if src.local_root is not None:
             continue
         cells = np.asarray(cells, dtype=np.int64).reshape(-1, len(src.shape))
-        if r in indexes:
-            ranges, errors = _locate(
-                src, cells, lambda keys, got=indexes[r]: {k: got[k] for k in keys},
-            )
-        else:
-            ranges, errors = _locate(
-                src, cells, lambda keys, src=src: dict(zip(keys, read_indexes(src, keys))),
-            )
+        ranges, errors = _locate(src, cells, lambda keys, src=src, got=indexes.get(r): (
+            dict(zip(keys, read_indexes(src, keys))) if got is None else {k: got[k] for k in keys}
+        ))
         for i, message in errors.items():
             out[r][i] = ValueError(message)
         rows += [(r, i, src.store, rng.key, rng.offset, rng.size, rng.run) for i, rng in enumerate(ranges) if rng is not None]
@@ -488,13 +483,8 @@ def read_cells(
 def _prefetch_indexes(
     requests: list[tuple[CellSource, np.ndarray]],
 ) -> dict[int, dict[str, Any]]:
-    """The shard indexes every store-backed request needs, read at once.
-
-    Gathered array by array, a read of several arrays (vertices,
-    fragments, links) would spend one round trip per array before any
-    cell is fetched.  Returns ``{request: {shard key: index}}``; empty
-    when at most one array would read indexes.
-    """
+    """The shard indexes every store-backed request needs, read in one round:
+    ``{request: {shard key: index}}``, empty when at most one array reads any."""
     wanted: list[tuple[int, CellSource, list[str]]] = []
     for r, (src, cells) in enumerate(requests):
         if src.local_root is not None or src.shard_shape is None:
@@ -506,22 +496,15 @@ def _prefetch_indexes(
         return {}
     from concurrent.futures import ThreadPoolExecutor
 
-    # Each read_indexes call gathers its own shards; running them side by
-    # side puts every array's indexes in the same round.
     with ThreadPoolExecutor(len(wanted)) as pool:
         got = list(pool.map(lambda w: dict(zip(w[2], read_indexes(w[1], w[2]))), wanted))
     return {r: g for (r, _, _), g in zip(wanted, got)}
 def _span_starts(
     src: CellSource, shard: np.ndarray, off: np.ndarray, end: np.ndarray, run: np.ndarray | None,
 ) -> np.ndarray:
-    """Which stored cells -- sorted by shard then offset -- start a read,
-    grouped as :func:`_spans` groups them under :func:`_coalescing` of
-    ``src``, but as arrays: a loop runs per read, never per cell.
-
-    A cell joins the read before it by gap when it starts within ``gap``
-    bytes of the previous cells' furthest end, which is that read's end
-    for cells that do not overlap -- the cells of any shard zarr writes.
-    """
+    """Which stored cells (sorted by shard, then offset) start a read, as
+    :func:`_spans` groups them under :func:`_coalescing` of ``src``, but
+    vectorised; a gap is measured from the previous cells' furthest end."""
     mode, gap, span = _coalescing(src)
     new = np.ones(len(off), dtype=bool)
     same = shard[1:] == shard[:-1]
@@ -552,10 +535,8 @@ def read_cell_spans(
 ) -> tuple[list[tuple[np.ndarray, np.ndarray, np.ndarray, dict[int, Exception]]], list[Any]]:
     """:func:`read_cells` for sharded arrays, with cells located as arrays.
 
-    The same index reads and the same coalesced ranges as
-    :func:`read_cells`, but each shard's index is looked up for all its
-    cells at once and no cell's bytes are cut out of their read. Returns,
-    per request, ``(read, start, stop, errors)`` -- cell ``i``'s stored
+    Same reads and coalesced ranges, but no cell's bytes are cut out of
+    their read.  Returns, per request, ``(read, start, stop, errors)`` -- cell ``i``'s stored
     bytes are ``reads[read[i]][start[i]:stop[i]]``; ``read[i]`` -1 is a
     cell with nothing stored, -2 one whose shard index could not be read,
     its error in ``errors[i]`` -- and the ``reads``: bytes, None for an

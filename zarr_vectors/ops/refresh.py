@@ -114,10 +114,8 @@ def rebuild_pyramid_from_level(
     # destructive level removal.  No-op on non-transactional backends.
     if session_for(root) is not None:
         commit(root, "pre-refresh commit")
-    # Drop every level above the source first, coarsest first: levels
-    # must stay contiguous, so only the top level can be removed, and
-    # dropping them all up front also clears the cross-level links that
-    # point at them before anything is rebuilt.
+    # Drop levels coarsest first (only the top one can go), clearing
+    # their cross-level links before anything is rebuilt.
     for entry in reversed(plan):
         lv = entry["level"]
         remove_resolution_level(root, lv)

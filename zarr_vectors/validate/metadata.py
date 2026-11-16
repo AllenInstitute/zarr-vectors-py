@@ -31,25 +31,18 @@ VALID_OBJIDX = {OBJIDX_STANDARD, OBJIDX_IDENTITY}
 VALID_CROSS = {CROSS_CHUNK_EXPLICIT, CROSS_CHUNK_DEDUP, CROSS_CHUNK_BOTH}
 
 
-#: Level fields the validators check, and the legacy top-level spellings
-#: some old stores used before they moved under ``zarr_vectors_level``.
+#: Level fields the validators check (``bin_size`` is a legacy spelling).
 _LEVEL_FIELDS = (
     "vertex_count", "bin_shape", "bin_size", "bin_ratio", "object_sparsity",
 )
 
 
 def level_fields(root: Group, li: int, lg: Group) -> dict:
-    """The level's metadata fields as stored, for checking.
+    """The level's metadata fields as stored, uncoerced, so a malformed
+    value reaches the check that reports it.
 
-    The writer keeps per-level fields under the ``zarr_vectors_level``
-    block, and ``bin_shape`` / ``bin_ratio`` only in the NGFF
-    ``multiscales`` block (see :func:`read_level_metadata`).  Reading
-    them off the level's top-level attributes -- as the validators once
-    did -- found nothing, so every per-level check silently passed.
-
-    Values are returned raw (not coerced through :class:`LevelMetadata`)
-    so a malformed value reaches the check that reports it.  Precedence:
-    NGFF transform > ``zarr_vectors_level`` > legacy top-level keys.
+    Precedence: NGFF transform > ``zarr_vectors_level`` > legacy
+    top-level keys (see :func:`read_level_metadata`).
     """
     attrs = lg.attrs.to_dict()
     out = {k: attrs[k] for k in _LEVEL_FIELDS if k in attrs}
@@ -65,8 +58,7 @@ def level_fields(root: Group, li: int, lg: Group) -> dict:
     except Exception:
         scale, translation = None, None
     if scale is not None:
-        # Mirrors read_level_metadata: level 0 is the identity by
-        # convention and inherits the root's base_bin_shape.
+        # Level 0 inherits the root's base_bin_shape.
         if li == 0:
             out.pop("bin_shape", None)
             out.pop("bin_ratio", None)
@@ -94,10 +86,7 @@ def validate_metadata(store_path: str | Path | Group) -> ValidationResult:
         return result
     result.add_pass("Root metadata parsed")
 
-    # Parsing checks only that the keys are there; RootMetadata.validate
-    # holds the rules about their values (format version, conventions,
-    # cross-level settings, manifest layout, ...).  Readers do not run it,
-    # so this is where a store that breaks them is reported.
+    # Parsing checks keys only; readers never run RootMetadata.validate.
     from zarr_vectors.exceptions import ConventionError, MetadataError
     try:
         meta.validate()
@@ -238,12 +227,8 @@ def validate_metadata(store_path: str | Path | Group) -> ValidationResult:
                 if level_meta is not None else meta.chunk_shape
             )
             bin_shape = la.get("bin_shape")
-            # A coarse level that inherits the root grid takes its bin
-            # from the coarsen factor and is not required to tile the
-            # chunk (bin 20 in a chunk of 50 is what the coarsener writes);
-            # see validate_level_chunk_shape_against_root, the writer's
-            # rule.  Divisibility is checked where the level declares its
-            # own chunk_shape, or on a legacy level we could not parse.
+            # A coarse level on the root grid need not tile the chunk
+            # (see validate_level_chunk_shape_against_root).
             inherits_grid = (
                 li > 0 and level_meta is not None
                 and level_meta.chunk_shape is None
@@ -260,10 +245,7 @@ def validate_metadata(store_path: str | Path | Group) -> ValidationResult:
                                 f"resolution_{li}: bin_shape[{i}]={bs} not > 0"
                             )
                         elif inherits_grid or bs > cs:
-                            # A coarse level's bin may span several chunks
-                            # (bin 200 in a chunk of 100); tiling is only
-                            # required while bins are the finer of the two,
-                            # as validate_level_chunk_shape_against_root says.
+                            # Tiling is only required of bins finer than chunks.
                             continue
                         else:
                             ratio = cs / bs

@@ -1822,13 +1822,9 @@ def write_chunk_vertex_runs(
     *,
     record_presence: bool = True,
 ) -> None:
-    """:func:`write_chunk_vertices` for fragments already laid end to end.
-
-    ``vertices`` is the chunk's ``(N, D)`` rows and ``counts`` the row
-    count of each fragment in order, so the cell is written from one
-    buffer without splitting it into a list of groups first.  The bytes
-    are the same as for ``write_chunk_vertices`` with those groups.
-    """
+    """:func:`write_chunk_vertices` for fragments already laid end to end:
+    ``vertices`` is ``(N, D)``, ``counts`` each fragment's row count, in
+    order.  Writes the same bytes."""
     _write_vertex_cell(
         level_group, _chunk_key(chunk_coords),
         np.ascontiguousarray(vertices, dtype=np.dtype(dtype)).tobytes(),
@@ -4740,9 +4736,8 @@ def iter_link_cells(
 
     Offsets come from each array's own ``offsets`` meta when present,
     falling back to parsing the path segment; the two agree, but the
-    meta needs no ``sid_ndim`` to decode.  The row width likewise comes
-    from the array's ``has_perm`` stamp, as :func:`read_links` reads it,
-    with :func:`links_has_perm` only as the fallback for unstamped arrays.
+    meta needs no ``sid_ndim`` to decode.  ``has_perm`` likewise comes
+    from the array's stamp, with :func:`links_has_perm` as the fallback.
     """
     policy = link_family_policy(level_group, delta)
     if policy is None:
@@ -4762,8 +4757,6 @@ def iter_link_cells(
         else:
             continue
         dtype = np.dtype(meta.get("dtype", "int64"))
-        # The array's own stamp wins, as in read_links; the policy is
-        # only the fallback for an array written before it was stamped.
         has_perm = bool(meta.get(
             "has_perm",
             links_has_perm(
@@ -5536,13 +5529,8 @@ def _read_chunk_fragments(
     dtype: np.dtype | str | None = None,
     ndim: int = 3,
 ) -> Sequence[npt.NDArray[np.floating]]:
-    """:func:`read_chunk_vertices`, cutting range fragments on access.
-
-    A reader that needs a few fragments of a chunk -- a box query reads
-    the neighbour chunks its objects reach into for a handful of their
-    thousands of fragments -- otherwise builds a view per fragment it
-    never looks at.  The same arrays, indexed the same way.
-    """
+    """:func:`read_chunk_vertices`, cutting range fragments only when
+    accessed (a box query wants a few of a neighbour chunk's fragments)."""
     full, fi = _read_chunk_buffer(level_group, chunk_coords, dtype, ndim)
     if full is None:
         return []
@@ -7351,8 +7339,8 @@ def object_ids_for_rows(
     return table if rows is None else table[np.asarray(list(rows), dtype=np.int64)]
 
 
-def object_count(level_group: Group) -> int:
-    """How many objects this level declares, without decoding any of them."""
+def object_row_count(level_group: Group) -> int:
+    """How many manifest rows this level holds."""
     try:
         meta = level_group.read_array_meta(OBJECT_INDEX)
     except Exception:
@@ -7360,15 +7348,13 @@ def object_count(level_group: Group) -> int:
     return int(meta.get("num_objects", 0) or 0)
 
 
-def object_row_count(level_group: Group) -> int:
-    """How many manifest rows this level holds.
-
-    The same number as :func:`object_count` -- one manifest row per
-    declared object, both read from ``object_index``'s ``num_objects``
-    stamp -- and kept as an alias that delegates to it.  An id lookup's
-    row count is not this; callers read that from the lookup itself.
-    """
-    return object_count(level_group)
+def object_count(level_group: Group) -> int:
+    """How many objects this level declares, without decoding any of them."""
+    try:
+        meta = level_group.read_array_meta(OBJECT_INDEX)
+    except Exception:
+        return 0
+    return int(meta.get("num_objects", 0) or 0)
 
 
 def object_present_mask(level_group: Group) -> npt.NDArray[np.bool_]:
@@ -7432,13 +7418,8 @@ def _require_object_index_layout(meta: dict[str, Any]) -> None:
 
 
 def _require_object_index_v1(meta: dict[str, Any]) -> None:
-    """Raise if ``object_index`` is in none of the readable layouts.
-
-    The readable layouts are V1, V2 and dense (see
-    :func:`_require_object_index_layout`); any other ``layout`` value is
-    one this build cannot decode, and the store must be rewritten from
-    source rather than read as garbage.
-    """
+    """Raise if ``object_index`` is in none of the readable layouts (V1, V2,
+    dense; see :func:`_require_object_index_layout`)."""
     layout = meta.get("layout")
     if layout != OBJECT_INDEX_LAYOUT_V1:
         raise ArrayError(
@@ -7946,9 +7927,8 @@ def link_cells_within(
     lo = src.min(axis=0)
     ext = src.max(axis=0) - lo + 1
     src_keys = np.ravel_multi_index((src - lo).T, ext)
-    # A handful of chunks -- one object's -- is tested as tuples against
-    # a set: the array form below costs ~60 us of numpy calls per
-    # segment whatever the size, ~2 ms over a mesh's 33 segments.
+    # A handful of chunks is tested as tuples against a set: the array
+    # form below has a fixed numpy cost per segment.
     few = src.shape[0] <= _LINK_CELLS_SET_MAX
     src_rows = [tuple(c) for c in src.tolist()] if few else []
     src_set = set(src_rows)
@@ -8047,15 +8027,9 @@ def _link_segment_blobs(
     int, int, tuple[int, ...], tuple[int, ...],
     list[tuple[tuple[Any, ...], list[tuple[str, bytes | None]]]],
 ] | None:
-    """Layout and raw cell bytes of every segment a link read touches.
-
-    The first half of :func:`read_link_arrays` and :func:`read_link_rows`:
-    ``(link_width, sid_ndim, scale_src, scale_trg, segment_rows)``, each
-    ``segment_rows`` entry being ``(arr_name, offsets, has_perm, ncols,
-    flat, cell_dtype, cell_keys, ranged)`` and its ``[(cell_key, blob)]``
-    in sorted key order, ``blob`` ``None`` for a ``ranged`` cell.
-    ``None`` when the family is absent or carries no layout.
-    """
+    """``(link_width, sid_ndim, scale_src, scale_trg, segment_rows)`` for a
+    link read (each row ``(seg_info, [(cell_key, blob)])``, ``blob`` None
+    for a ranged cell), or ``None`` when the family has no layout."""
     family = links_group_path(delta)
     if not level_group.array_exists(family):
         return None
@@ -8249,26 +8223,15 @@ def read_link_rows(
 ) -> npt.NDArray[np.int64]:
     """Link records under ``links/<delta>/`` as output rows, ``(M, L)``.
 
-    :func:`read_link_arrays` followed by a remap, fused: endpoint ``(c,
-    vi)`` becomes ``row_maps[c][vi]``, and a record is kept only when
-    every endpoint maps to a row ``>= 0`` -- its chunk is in
-    ``row_maps``, ``vi`` is inside that chunk's map and the map does not
-    say ``-1``.  Records come back in :func:`read_link_arrays` order with
-    the input endpoint order restored from ``perm_idx``.
-
-    A cell's endpoint chunks are the same for all of its rows
-    (:func:`cell_endpoint_chunks`), so each slot is one gather through
-    one chunk's map; no per-endpoint chunk array is built, which on a
-    bbox read was most of the face work.  ``row_maps`` is typically a
-    reader's per-chunk slice of one ``cumsum(mask) - 1`` table, or of
-    ``arange`` when every row is taken.
+    :func:`read_link_arrays` fused with a remap: endpoint ``(c, vi)``
+    becomes ``row_maps[c][vi]``, and a record is kept only when every
+    endpoint maps to a row ``>= 0`` (chunk in ``row_maps``, ``vi`` inside
+    its map, not ``-1``).  Same order as :func:`read_link_arrays`.
 
     ``cells`` scopes the read as in :func:`read_link_arrays`.  With
-    ``touching``, a record is kept when its first endpoint maps to a row,
-    and an endpoint that does not map comes back as ``-1``: a skeleton
-    reader needs a read child's record even when its parent was not read
-    (see :func:`link_cells_within`).  Returns an empty ``(0, L)`` array
-    when no record survives, ``(0, 0)`` when the family is absent.
+    ``touching``, a record is kept when its first endpoint maps, and an
+    unmapped endpoint comes back as ``-1``.  Returns ``(0, L)`` when no
+    record survives, ``(0, 0)`` when the family is absent.
     """
     layout = _link_segment_blobs(
         level_group, delta, include_intra=True, cells=cells,
@@ -8461,10 +8424,8 @@ def link_endpoints_to_rows(
     if m == 0:
         return np.empty((0, link_width), dtype=np.int64)
     flat = chunks.reshape(-1, sid_ndim)
-    # Each endpoint's chunk as one integer, by mixed radix over the
-    # coordinates' range.  ``np.unique(axis=0)`` sorts the rows as a
-    # structured dtype, which on a mesh's five million endpoints was
-    # 5 s of a 6 s whole-level read; a table gather is linear.
+    # Each endpoint's chunk as one integer (mixed radix over the range),
+    # a linear table gather instead of ``np.unique(axis=0)``'s sort.
     lo = flat.min(axis=0)
     span = flat.max(axis=0) - lo + 1
     cells = int(np.prod(span.astype(object)))

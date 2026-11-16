@@ -56,11 +56,8 @@ def validate_conformance(store_path: str | Path | Group) -> ValidationResult:
 
     geom_types = meta.geometry_types or []
     lc = meta.links_convention
-    # RootMetadata fills an absent links_convention with
-    # implicit_sequential.  A store created empty (create_store,
-    # api.create) declares none until its first links write stamps the
-    # geometry's own, so an absent key on a store with no links yet is
-    # "not declared", not a mismatch.
+    # An empty store declares no links_convention until its first links
+    # write; absent with no links is "not declared", not a mismatch.
     declared = "links_convention" in (root.attrs.to_dict().get("zarr_vectors") or {})
     undeclared_and_unlinked = False
     if not declared:
@@ -114,8 +111,7 @@ def validate_conformance(store_path: str | Path | Group) -> ValidationResult:
 
     if GEOM_MESH in geom_types:
         # Check mesh link_width — in composite stores, look at links_mesh/
-        # ``read_array_meta`` answers {} for a missing path rather than
-        # raising, so existence is asked explicitly.
+        # ``read_array_meta`` answers {} for a missing path.
         found_mesh_links = False
         try:
             if not lg.array_exists(links_group_path(0)):
@@ -147,8 +143,6 @@ def validate_conformance(store_path: str | Path | Group) -> ValidationResult:
     if GEOM_POINT_CLOUD in geom_types and not any(
         gt in geom_types for gt in [GEOM_GRAPH, GEOM_SKELETON, GEOM_MESH]
     ):
-        # Not read_array_meta: it returns {} for a missing path instead
-        # of raising, so this warned on every point cloud.
         if lg.array_exists(LINKS):
             result.add_warning("Point cloud but links array exists")
         else:

@@ -459,11 +459,6 @@ class Group:
         read.  Every directory under a node is a node in Zarr v3, so the
         listing is the answer.
 
-        A local directory is listed with ``os.listdir``: the store's
-        ``list_dir`` does the same walk behind a sync hop and a
-        ``pathlib`` call per entry, 1.4-2.6 ms for the 33 offsets arrays
-        of a mesh against tens of microseconds.
-
         Falls back to :meth:`children` offline (the snapshot carries the
         listing, not the store) and on any store that cannot list.
         """

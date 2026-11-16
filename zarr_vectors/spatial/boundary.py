@@ -811,8 +811,7 @@ def _pack_rows(rows: npt.NDArray[np.int64]) -> npt.NDArray[np.int64] | None:
     when the columns' ranges do not fit in 63 bits."""
     if rows.shape[0] == 0:
         return None
-    # Column by column: an axis-0 reduction over a tall, narrow array is
-    # several times slower than one pass per contiguous-stride column.
+    # Per column: faster than an axis-0 reduction on a narrow array.
     lo = np.array([rows[:, c].min() for c in range(rows.shape[1])], dtype=rows.dtype)
     span = np.array([rows[:, c].max() for c in range(rows.shape[1])], dtype=rows.dtype) - lo + 1
     total = 1
@@ -914,8 +913,6 @@ def partition_link_arrays(
         return {}
 
     # --- placement: which input endpoint leads, and in what order -----
-    # One 1-D compare per (endpoint, axis) rather than an (n, L, D) mask
-    # reduced over its two short trailing axes.
     intra = xp.ones(n, dtype=bool)
     for j in range(1, L):
         for d in range(sid_ndim):
@@ -933,8 +930,6 @@ def partition_link_arrays(
             np.concatenate([chunks, vi[:, :, None]], axis=2).reshape(-1, sid_ndim + 1)
         )
         if packed is not None:
-            # (chunk_coords, vi) as one integer per endpoint, so the
-            # within-record order is a stable argsort along each row.
             sigma = np.argsort(packed.reshape(n, L), axis=1, kind="stable")
         else:
             rec = xp.repeat(xp.arange(n, dtype=xp.int64), L)
@@ -966,8 +961,7 @@ def partition_link_arrays(
     key = xp.concatenate([src, offsets.reshape(n, -1)], axis=1)
     packed = None if on_device else _pack_rows(key)
     if packed is not None:
-        # One stable argsort of one integer per record, in place of a
-        # lexsort over every column: same order, a fraction of the time.
+        # Same order as the lexsort below.
         order = np.argsort(packed, kind="stable")
         ps = packed[order]
         key_sorted = key[order]
@@ -1029,26 +1023,15 @@ def partition_link_indices(
     sid_ndim: int,
     intra: npt.NDArray[np.bool_] | None = None,
 ) -> dict[tuple[str, ChunkCoords], tuple[npt.NDArray[np.int64], npt.NDArray[np.int64]]]:
-    """:func:`partition_link_arrays` for same-level, undirected records
-    whose endpoint chunks are given as indices into a sorted table.
-
-    Returns exactly what ``partition_link_arrays(chunk_table[cidx], vi,
-    ...)`` returns with ``delta=0`` scales, without building the
-    ``(M, L, sid_ndim)`` coordinate array.  A mesh has nearly all its
-    faces inside one chunk, and for those the general placement is the
-    identity, the offsets are zero and the bucket is the source chunk,
-    so they are grouped by a stable sort of their chunk index alone.
-    Only the records that cross a chunk boundary go through
-    :func:`partition_link_arrays`.
+    """``partition_link_arrays(chunk_table[cidx], vi, ...)`` for same-level
+    undirected records, with intra-chunk records grouped by a sort alone.
 
     Args:
-        chunk_table: ``(C, sid_ndim)`` chunk coords, lexicographically
-            sorted and distinct, so index order is coordinate order.
+        chunk_table: ``(C, sid_ndim)`` distinct chunk coords, sorted.
         cidx: ``(M, L)`` index into ``chunk_table`` of every endpoint.
         vi: ``(M, L)`` chunk-local vertex index of every endpoint.
         sid_ndim: Spatial index dimensionality.
-        intra: ``(M,)`` whether all of a record's endpoints share a
-            chunk, when the caller has it already.
+        intra: ``(M,)`` whether a record lies in one chunk, if known.
 
     Returns:
         As :func:`partition_link_arrays`.
@@ -1094,9 +1077,8 @@ def partition_link_indices(
             chunk_table[cidx[cross_idx]], vi[cross_idx],
             link_width=L, sid_ndim=sid_ndim, scale_src=unit, scale_trg=unit,
         )
-    # Buckets in the order partition_link_arrays gives them: by source
-    # chunk, then offsets.  A crossing record's offsets are
-    # lexicographically positive, so a chunk's intra bucket leads its own.
+    # Merge in partition_link_arrays order; a chunk's intra bucket (zero
+    # offsets) leads its crossing ones.
     out: dict[
         tuple[str, ChunkCoords], tuple[npt.NDArray[np.int64], npt.NDArray[np.int64]]
     ] = {}
@@ -1150,9 +1132,9 @@ def build_vertex_chunk_mapping(
     vertex_chunks = np.full(n_vertices, -1, dtype=np.int64)
     vertex_local_indices = np.full(n_vertices, -1, dtype=np.int64)
 
-    # Scatter per chunk rather than per vertex: a per-vertex loop would
-    # run once for every vertex in the level, on the write path of every
-    # graph and mesh. A chunk's vertices are numbered 0..n-1 in the order they are
+    # Scatter per chunk rather than per vertex: the inner loop ran once
+    # for every vertex in the level, on the write path of every graph and
+    # mesh. A chunk's vertices are numbered 0..n-1 in the order they are
     # stored, which is an arange, and their destinations are the chunk's
     # own index array -- both expressible as one scatter each.
     for coord, global_indices in chunk_assignments.items():

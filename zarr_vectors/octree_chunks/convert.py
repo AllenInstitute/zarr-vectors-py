@@ -489,8 +489,7 @@ def read_octree_link_cells(level_group: Any, table: LeafTable, leaves: npt.Array
     other_leaf, other_row)``; ``other_leaf`` is ``-1`` where it is not stored."""
     family = f"{LINKS}/0"
     segments = list_link_offsets(level_group, 0)
-    # Every segment's node in one gather (inside a reader's cached_nodes
-    # block), not one round each as the listing below reaches it.
+    # Every segment's node in one gather.
     level_group.prime_nodes([f"{family}/{seg}" for seg in segments])
     anchors = table.anchors()
     want = None if leaves is None else set(np.asarray(leaves, dtype=np.int64).tolist())

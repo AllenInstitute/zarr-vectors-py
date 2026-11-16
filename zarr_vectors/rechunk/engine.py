@@ -74,14 +74,7 @@ _CARRIED = {
 
 
 def _check_carried(src_root: FsGroup, src_meta: Any) -> None:
-    """Refuse a source holding data :func:`rechunk` would not write out.
-
-    ``rechunk`` regroups objects under a bin prefix.  It writes vertices,
-    manifests, vertex / object / group attributes, groupings, and -- for
-    an ``implicit_sequential`` store -- the bridge links between an
-    object's consecutive fragments, which follow from the manifests.
-    Anything else would be silently left behind, so it is refused.
-    """
+    """Refuse a source holding data :func:`rechunk` would not write out."""
     levels = list_resolution_levels(src_root)
     problems: list[str] = []
     if [lv for lv in levels if lv != 0]:
@@ -126,25 +119,19 @@ def rechunk(
     an output store where chunk keys have a prefix dimension
     ``(bin, z, y, x)``.
 
-    Carried: vertices, manifests (objects that have vertices are
-    renumbered densely in bin order), vertex attributes, object
-    attributes (remapped to the new ids), groupings and group attributes,
-    and the bridge links of an ``implicit_sequential`` store.  A source
-    holding anything else -- levels above 0, explicit links, fragment or
-    link attributes -- is refused with ``NotImplementedError`` before
-    anything is written.
-
-    ``RechunkSpec(by="spatial")`` has no bins to prefix, so it is handed
-    to :func:`~zarr_vectors.rechunk.spatial.rechunk_spatial`, which
-    changes the chunk grid and carries links and every level.
+    Objects are renumbered densely in bin order; attributes, groupings
+    and ``implicit_sequential`` bridge links are carried.  Levels above
+    0, explicit links and fragment/link attributes raise
+    ``NotImplementedError`` before anything is written.
+    ``by="spatial"`` is handed to
+    :func:`~zarr_vectors.rechunk.spatial.rechunk_spatial`.
 
     Args:
         store_path: Source store path.
         spec: Rechunk specification.
         output: Output store path. If None, rechunks in-place by
             writing to a temporary store then replacing the source.
-        overwrite: Replace an existing ``output``.  Without it an
-            existing output is refused rather than deleted.
+        overwrite: Replace an existing ``output`` instead of raising.
 
     Returns:
         Summary dict with ``objects_rechunked``, ``bins_created``,
@@ -178,10 +165,7 @@ def rechunk(
     src_root = open_store(str(store_path))
     src_meta = read_root_metadata(src_root)
     ndim = src_meta.sid_ndim
-    # Level 0's cells, manifests and links are read as uniform cells:
-    # refused on a level with octree chunks, before the output is created
-    # and before the general check, which would name its octree_chunks
-    # group as a family it cannot carry.
+    # Before _check_carried, which would report octree_chunks as a family.
     from zarr_vectors.octree_chunks.guard import refuse_octree_read
 
     refuse_octree_read(get_resolution_level(src_root, 0), "rechunk")
@@ -339,9 +323,7 @@ def rechunk(
         name: dict(src_level.read_array_meta(f"{VERTEX_ATTRIBUTES}/{name}") or {})
         for name in _names(src_level, VERTEX_ATTRIBUTES)
     }
-    # Bridges are what connect a path across its fragments, so a path store
-    # gets them whether or not the source happened to need any: a smaller
-    # spatial_chunk_shape can split a path that used to sit in one chunk.
+    # A path store always gets bridges: a smaller grid can split a path.
     write_bridges = bool(list_link_deltas(src_level)) or (
         src_meta.links_convention == LINKS_IMPLICIT_SEQUENTIAL
         and bool(set(src_meta.geometry_types)
@@ -430,10 +412,7 @@ def rechunk(
                 starts[key] = np.concatenate([[0], np.cumsum(lens)]).tolist()
                 total_vertices += sum(lens)
 
-            # implicit_sequential: a fragment's vertices are connected in
-            # order, and each step from one fragment of an object to the
-            # next is a bridge link -- last vertex of one, first of the
-            # next -- exactly as write_polylines / write_lines lay them out.
+            # Bridge: last vertex of a fragment -> first of the next.
             if write_bridges:
                 for oid in by_bin[bin_idx]:
                     man = object_manifests_out.get(old_to_new.get(oid, -1), [])
@@ -479,8 +458,7 @@ def rechunk(
         create_groupings_attributes_array(out_level, name, dtype=str(data.dtype))
         write_groupings_attributes(out_level, name, data)
 
-    # Groupings ride along whatever the rechunk was by, remapped to the
-    # new ids (they used to be written for by="group" only).
+    # Groupings, remapped to the new ids.
     if groupings:
         from zarr_vectors.core.arrays import (
             create_groupings_array,

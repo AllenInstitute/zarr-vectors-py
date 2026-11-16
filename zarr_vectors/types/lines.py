@@ -295,8 +295,7 @@ def write_lines(
     cross_b_chunk: list[ChunkCoords] = []
     cross_a_vi: list[int] = []
     cross_b_vi: list[int] = []
-    # Vertices appended to each chunk so far: a split endpoint's
-    # chunk-local index is this count when its fragment is appended.
+    # Vertices appended to each chunk so far.
     chunk_nverts: dict[ChunkCoords, int] = {}
 
     # One Python pass over lines is unavoidable to preserve line-id-
@@ -326,18 +325,14 @@ def write_lines(
 
             object_manifests[i] = [(ca, fragment_idx_a), (cb, fragment_idx_b)]
             # Link endpoints are chunk-local vertex indices, not
-            # fragment-local ones, and not fragment indices either: a
-            # chunk's vertices are the concatenation of its fragments,
-            # and a whole line in the same chunk is a TWO-vertex fragment
-            # ahead of this one, so the fragment index undercounts.
+            # fragment-local ones, nor fragment indices (a whole line is
+            # a two-vertex fragment).
             cross_a_chunk.append(ca)
             cross_b_chunk.append(cb)
             cross_a_vi.append(vi_a)
             cross_b_vi.append(vi_b)
     cross_links = cross_a_vi
 
-    # Declared after the split, so ``links`` is listed exactly when a
-    # line crosses a chunk boundary (only then is a links array made).
     arrays_present = [VERTICES, VERTEX_FRAGMENTS, "object_index"]
     if vertex_attr_arrays:
         arrays_present.append(VERTEX_ATTRIBUTES)

@@ -21,7 +21,6 @@ would be a behaviour change and every caller would have to be revisited.
 
 from __future__ import annotations
 
-import contextlib
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, Any
@@ -239,9 +238,8 @@ class Query:
         """Execute and return the whole answer."""
         from zarr_vectors import _query_nodes
 
-        with contextlib.ExitStack() as stack:
-            stack.enter_context(_query_nodes.primed(self._level._dataset._group, self._level.index))
-            stack.enter_context(self._level._held_store())
+        level = self._level
+        with _query_nodes.primed(level._dataset._group, level.index), level._held_store():
             return self._level._execute(self._selection)
 
     async def aread(self) -> ReadResult:
@@ -266,11 +264,7 @@ class Query:
         return self.read().vertex_count
 
     def object_ids(self) -> npt.NDArray[Any]:
-        """The distinct object ids this query touches.
-
-        An object is touched when at least one of its vertices survives
-        the selection.  Empty for a level written without object ids.
-        """
+        """The distinct object ids this query touches."""
         return self._level._touched_object_ids(self._selection)
 
     # ---------------- diagnostics ----------------
@@ -334,10 +328,7 @@ class Query:
         from zarr_vectors.api.level import _narrows
 
         if not _narrows(self._selection):
-            # An unnarrowed plan reads the level whole and names no cells
-            # of it (at most a cell it re-checks a claim on), which made
-            # this answer "none" for the query that touches every cell.
-            # Ask the level what it holds.
+            # An unnarrowed plan names no cells: ask the level what it holds.
             return target.cells()
         refs = set()
         for request in self.plan().cells:
@@ -350,31 +341,21 @@ class Query:
         return CellSet(refs)
 
     def iter_cells(self) -> Any:
-        """Stream the result one cell at a time.
+        """Stream the result one cell at a time, each cell read on its own.
 
-        Yields ``(CellRef, ReadResult)`` pairs:
-
-        * one per cell that :meth:`cells` names, in sorted key order, each
-          read on its own -- so peak memory is one cell's worth, not the
-          whole query's;
+        * yields ``(CellRef, ReadResult)`` pairs, one per cell that
+          :meth:`cells` names, in sorted key order;
         * each :class:`~zarr_vectors.api.result.ReadResult` covers exactly
           that cell, cut into ``parts`` the way ``Selection.cells_split``
-          asks for -- so the same object spanning two cells appears as one
+          asks for — so the same object spanning two cells appears as one
           part in each, and summing part counts is not the same as
           reading the whole query;
-        * a cell that fails to read arrives as an empty result whose
-          ``errors`` names it, not as an exception, so one unreadable cell
-          does not end the stream;
-        * ``sum(r.vertex_count for _, r in q.iter_cells()) == q.count()``
-          for points, meshes and graphs, and for any unnarrowed query.
-          The exception is a ``bbox``/``near`` query on lines or
-          polylines: the whole read keeps every part that reaches into
-          the region *whole*, including its vertices in cells the region
-          does not touch, while this stream covers only the region's
-          cells -- so it yields the pieces inside them and the sum can
-          be smaller;
-        * a ``limit`` is shared across the cells, and the stream stops
-          once it is used up.
+        * per-cell failures arrive in that result's ``errors``, not as an
+          exception, so one unreadable cell does not end the stream;
+        * ``sum(r.vertex_count for _, r in q.iter_cells()) == q.count()``,
+          except for a ``bbox``/``near`` query on lines or polylines (the
+          whole read keeps parts reaching outside the region's cells);
+        * a ``limit`` is shared across the cells.
         """
         from zarr_vectors.api.grid import CellSet
         from zarr_vectors.api.result import ReadError, ReadResult

@@ -131,9 +131,8 @@ def write_mesh(
         vertices: ``(V, D)`` vertex positions.
         faces: ``(F, L)`` face index array (L=3 triangles, L=4 quads).
         chunk_shape: Spatial chunk size per dimension.
-        encoding: ``"raw"`` or ``"draco"``.  Draco applies to 3-D
-            triangle meshes only; on vertices that are not 3-D the mesh
-            is written (and stamped) raw.
+        encoding: ``"raw"`` or ``"draco"`` (3-D triangles only; other
+            vertices are written raw).
         vertex_attributes: Per-vertex attributes ``{name: (V,) or (V,C)}``.
         object_ids: ``(V,)`` array assigning vertices to mesh objects.
             If None, all vertices belong to object 0.
@@ -180,16 +179,12 @@ def write_mesh(
             "Use 'raise' (default) or 'expand', or pre-filter vertices "
             "and remap faces upstream."
         )
-    # Draco is only applied to 3-D vertices; anything else is written
-    # raw, and the vertices array must say so -- it used to be stamped
-    # with the requested encoding regardless.
     is_draco = encoding == ENCODING_DRACO and ndim == 3
     stored_encoding = ENCODING_DRACO if is_draco else (
         ENCODING_RAW if encoding == ENCODING_DRACO else encoding
     )
     if is_draco:
-        # Fail before anything is created: a Draco failure inside the
-        # chunk loop left the root, level and empty arrays on disk.
+        # Fail before anything is created.
         from zarr_vectors.encoding.draco import draco_backend_available
         from zarr_vectors.exceptions import DracoError
         if link_width != 3:
@@ -247,9 +242,7 @@ def write_mesh(
                 f"of length n_verts={n_verts}, got shape {src_values.shape}"
             )
         vertex_attr_bins, attr_bin_values = assign_attribute_bins(src_values)
-        # One sort by object, then each object's lowest and highest bin:
-        # a mask per object was a pass over every vertex per object, 350 s
-        # of a 10^7-vertex write.
+        # One sort by object, then each object's lowest and highest bin.
         _bins = np.asarray(vertex_attr_bins, dtype=np.int64)
         _order = np.argsort(object_ids, kind="stable")
         _oids = np.asarray(object_ids)[_order]
@@ -278,9 +271,7 @@ def write_mesh(
     level_meta = LevelMetadata(
         level=0,
         vertex_count=n_verts,
-        # Every family this call writes.  ``links`` and its
-        # ``link_fragments`` sidecar always exist: the backstop below
-        # creates the intra-chunk array even when no face is stored.
+        # ``links`` always exists: the backstop below creates it.
         arrays_present=[
             VERTICES, VERTEX_FRAGMENTS, "links", LINK_FRAGMENTS,
             "object_index",
@@ -301,8 +292,7 @@ def write_mesh(
         for spatial_cc, gi in chunk_assignments.items():
             gi = np.asarray(gi, dtype=np.int64)
             chunk_bins = np.asarray(vertex_attr_bins)[gi]
-            # Stable sort by bin, then cut: each bin's vertices in their
-            # original order, as a mask per bin gave them, in one pass.
+            # Stable sort by bin keeps each bin's vertices in order.
             order = np.argsort(chunk_bins, kind="stable")
             sb = chunk_bins[order]
             cuts = np.flatnonzero(sb[1:] != sb[:-1]) + 1
@@ -337,8 +327,6 @@ def write_mesh(
     # record reaches ``write_links``.
     f_chunk = vertex_chunks[faces]                      # (F, L)
     f_local = vertex_local[faces]                       # (F, L)
-    # Column against column: ``np.all(..., axis=1)`` over the short
-    # trailing axis was several times slower than L - 1 1-D compares.
     is_intra_face = np.ones(len(f_chunk), dtype=bool)
     for col in range(1, f_chunk.shape[1]):
         is_intra_face &= f_chunk[:, col] == f_chunk[:, 0]
@@ -359,11 +347,8 @@ def write_mesh(
         link_cidx, link_vi, link_intra = f_chunk, f_local, is_intra_face
 
     # Records stay in face order, which the partitioner preserves within
-    # each cell.  Held as arrays -- ``(F, L)`` endpoint chunk indices and
-    # local indices -- rather than one list of tuples per face: building
-    # those and taking them apart again was 3 s of a half-million-face
-    # write before anything was partitioned.  Chunk indices rather than
-    # coords, so the intra-chunk faces group by one small-integer sort.
+    # each cell.  Chunk indices rather than coords, so the intra-chunk
+    # faces group by one small-integer sort.
     idx_ndim = ndim + 1 if vertex_attr_bins is not None else ndim
     link_buckets: dict[tuple[str, ChunkCoords], Any] = {}
     if len(link_vi):
@@ -403,8 +388,7 @@ def write_mesh(
 
         if vertex_attributes:
             for name, data in vertex_attributes.items():
-                # Channel names carry the row shape: without them a (V, C)
-                # column was declared scalar and read back as V*C values.
+                # Channel names carry the row shape of a (V, C) column.
                 create_attribute_array(
                     level_group, name, dtype=str(data.dtype),
                     channel_names=(
@@ -731,13 +715,8 @@ def _read_mesh(
         positions_out = np.concatenate(all_positions, axis=0)
 
         # Faces: one family, so intra and cross records come back from one
-        # call, with winding restored from ``perm_idx``.  A face touching a
-        # chunk outside ``chunk_keys`` has no rows and is dropped, which is
-        # what applies the bbox/chunks filter to faces.
-        # The bbox mask is known before any face is read, so each chunk's
-        # rows map straight to output rows (``-1`` where dropped) and faces
-        # go through that map once, per cell.  A whole-level read maps
-        # every row to its chunk offset plus itself.
+        # call, with winding restored from ``perm_idx``.  Each chunk's rows
+        # map to output rows, ``-1`` where the bbox/chunks filter drops them.
         if bbox is not None:
             bbox_min, bbox_max = np.asarray(bbox[0]), np.asarray(bbox[1])
             node_mask = np.all(

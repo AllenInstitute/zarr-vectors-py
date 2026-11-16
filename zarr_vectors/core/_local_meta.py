@@ -1,28 +1,11 @@
 """Synchronous ``zarr.json`` resolution for nodes on a local filesystem.
 
-Every node lookup through zarr's sync facade is an event-loop hop, a
-``to_thread`` file read, a JSON parse and a metadata ``from_dict``:
-0.3-0.5 ms a node.  A small read resolves three or four nodes before
-any data moves, so on a local store that was most of a single-chunk
-query.  :func:`resolve_local_node` does the same work with a plain
-``open()`` on the calling thread, and skips the parse altogether when
-the document is unchanged since it was last parsed.
-
-The parsed-metadata cache is process-wide and validated on every hit
-with one ``os.stat``: an entry is served only while the file's inode,
-size, mtime and ctime all match what was read.  zarr's ``LocalStore``
-and the zarr-vectors direct writers replace ``zarr.json`` by
-tmp-and-rename, so a rewrite always changes the inode, and an in-place
-rewrite changes mtime and ctime.  The one blind spot -- two rewrites of
-the same size inside one filesystem timestamp tick, on a recycled
-inode -- is closed with git's racy-clean rule: a document modified less
-than :data:`_RACY_NS` before it was read is never cached, so any later
-rewrite of a cached document necessarily carries a newer timestamp.
-
-Only metadata is cached, never nodes: each hit builds a fresh
-``AsyncArray`` / ``AsyncGroup``, and its ``attributes`` dict is a fresh
-copy, because both zarr (``AsyncGroup.update_attributes``) and the
-writers here update ``metadata.attributes`` in place.
+:func:`resolve_local_node` reads a node's ``zarr.json`` with a plain
+``open()`` on the calling thread instead of zarr's event-loop round trip,
+and caches the parsed metadata process-wide.  A cache hit is validated
+with one ``os.stat`` (inode, size, mtime, ctime); a document modified
+within :data:`_RACY_NS` of being read is never cached (git's racy-clean
+rule).  Each hit returns a fresh node with its own ``attributes`` copy.
 """
 
 from __future__ import annotations
@@ -43,8 +26,7 @@ from zarr.storage import LocalStore
 # well above the filesystem timestamp granularity (a jiffy on Linux).
 _RACY_NS = 50_000_000
 
-# Entries kept before the oldest is evicted.  A store has a few dozen
-# nodes per level; this covers many open stores at a few kB per entry.
+# Entries kept before the oldest is evicted.
 _MAX_ENTRIES = 4096
 
 # ``zarr.json`` path -> (stat signature, metadata, attributes as JSON).
@@ -58,12 +40,8 @@ def _signature(st: os.stat_result) -> tuple[int, int, int, int]:
 
 
 def _with_fresh_attributes(metadata: Any, attributes_json: str) -> Any:
-    """``metadata`` with its own copy of ``attributes``.
-
-    ``dataclasses.replace`` would re-run the validating ``__init__``,
-    which is the cost being avoided; the metadata classes are frozen
-    dataclasses whose other fields are immutable in practice.
-    """
+    """``metadata`` with its own copy of ``attributes``, without re-running
+    the validating ``__init__`` that ``dataclasses.replace`` would."""
     fresh = copy.copy(metadata)
     object.__setattr__(fresh, "attributes", json.loads(attributes_json))
     return fresh
@@ -89,8 +67,6 @@ def _read_metadata(fn: str) -> Any:
         _CACHE[fn] = (
             _signature(st), metadata, json.dumps(metadata.attributes),
         )
-        # The caller owns ``metadata``; the cache must not share its
-        # attributes dict.
         metadata = _with_fresh_attributes(metadata, _CACHE[fn][2])
     return metadata
 

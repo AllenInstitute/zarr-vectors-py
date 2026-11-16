@@ -46,8 +46,8 @@ Public API
     Status queries — checks whether any array in the store uses the
     ``sharding_indexed`` codec.
 
-There is no Morton / Hilbert curve indirection: the native sharding
-codec already clusters spatially-adjacent inner chunks
+The Morton / Hilbert curve indirection of older versions is gone; the
+native sharding codec already clusters spatially-adjacent inner chunks
 into the same shard via its C-order outer grid, giving the same
 read-locality benefit without a custom mapping.
 
@@ -60,10 +60,13 @@ every array allocated afterwards honours it, including the ones created
 lazily in workers.  That is cheaper than writing flat and repacking, and
 it is what a pipeline that knows its own object budget should do.
 
-Sharding need not be the last coordinator pass:
-:meth:`~zarr_vectors.core.group.Group.derive_nonempty_chunks` reads a
-sharded array's cells out of its shard objects.  One ordering does
-hold: ``shard_store`` selects cells through the presence manifest, so a store whose workers
+This module used to document the opposite as a contract: sharding had to
+be the LAST coordinator pass, because ``nonempty_chunks`` could only be
+rebuilt from a per-cell store listing and a sharded array does not have
+one.  :meth:`~zarr_vectors.core.group.Group.derive_nonempty_chunks` now
+reads a sharded array's cells out of its shard objects, so that ordering
+is no longer forced.  What remains true is narrower: ``shard_store``
+selects cells through the presence manifest, so a store whose workers
 wrote with ``record_presence=False`` still needs its rebuild before it
 is repacked -- otherwise there is nothing to migrate and the pass
 silently does nothing.
@@ -183,9 +186,7 @@ def _list_array_names(level_group, requested: list[str] | None) -> list[str]:
             _walk(f"{prefix}{name}/", group[name])
 
     _walk("", level_group.zarr_group)
-    # The store lists keys in whatever order it likes (directory order on
-    # a local store), so sort: get_shard_info reports, and the migrations
-    # process, the arrays in one stable order.
+    # Stores list keys in any order; callers want a stable one.
     return sorted(names)
 
 
@@ -231,7 +232,7 @@ def shard_store(
     """Repack every per-chunk array in the store with the
     ``sharding_indexed`` codec.
 
-    The sharded layout uses Zarr v3's built-in ``sharding_indexed`` codec
+    The new layout uses Zarr v3's built-in ``sharding_indexed`` codec
     — readable by any standards-compliant Zarr v3 implementation
     (zarrs, tensorstore, neuroglancer-precomputed/zarr3, ...).  No
     ZV-specific metadata is needed; the sharding configuration lives
@@ -386,9 +387,8 @@ def unshard_store(
     storage object per spatial chunk (``<array>/c/i/j/k``).
 
     The logical single-array layout is unchanged; only the Zarr v3
-    ``sharding_indexed`` packing is removed.  Unsharding the whole store
-    (``arrays=None``) also clears the root ``shard_shape``, so arrays
-    created afterwards are unsharded too.  Useful for write-heavy
+    ``sharding_indexed`` packing is removed; with ``arrays=None`` the
+    root ``shard_shape`` is cleared too.  Useful for write-heavy
     workflows where shard read-modify-write contention hurts throughput,
     or when a reader prefers one file per chunk.  On a store marked octree
     (:func:`set_octree`) the marker and its capability are removed once no
@@ -451,12 +451,7 @@ def unshard_store(
             arrays_unsharded += 1
             chunks_extracted += len(chunk_payloads)
 
-    # The root's shard_shape is what every array allocated LATER honours
-    # (create_store(shard_shape=) records it for exactly that), so leaving
-    # it behind made the next write -- a pyramid level, a new attribute --
-    # come out sharded again in a store just unsharded.  Only a whole-store
-    # unshard clears it: one limited to some arrays leaves the rest, and
-    # the store's default, as they were.
+    # Arrays allocated later honour the root shard_shape.
     if arrays is None:
         attrs = root.attrs.to_dict()
         block = dict(attrs.get("zarr_vectors", {}))
@@ -962,10 +957,7 @@ def get_shard_info(store_path: str | Path | Group) -> dict[str, Any]:
 
     * ``sharded`` — bool, mirrors :func:`is_sharded`.
     * ``arrays`` — list of ``{name, shard_shape, grid_shape}`` dicts,
-      one per native-sharded array, ordered by level and then by array
-      path.  Every per-chunk array of a level -- ``links/<delta>/<offsets>``
-      included -- is indexed by the level's own chunk grid (a link record
-      sits in its source chunk's cell), so they share ``grid_shape``.
+      one per native-sharded array, ordered by level then array path.
     * ``shard_count`` — total shard files across all arrays.
     """
     import zarr
@@ -1006,6 +998,16 @@ def get_shard_info(store_path: str | Path | Group) -> dict[str, Any]:
     }
 
 
+# ===================================================================
+# Back-compat shims (deprecation path for old positional API)
+# ===================================================================
+
+
+# Older versions accepted ``ShardLayout`` + ``shard_size`` positional
+# args; these alias to the new ``shard_shape``-driven API.  The
+# layout-curve (Morton / Hilbert) distinction has been removed because
+# Zarr's native ``sharding_indexed`` codec clusters spatially-adjacent
+# inner chunks into the same shard automatically.
 __all__ = [
     "shard_store",
     "unshard_store",

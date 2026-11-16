@@ -1,10 +1,12 @@
 """Declaring what the data *is*, and — separately — how it is stored.
 
-Chunk shape, bin shape, shard shape and compressor are storage decisions
-that depend on the store's size and location, not on the data; the
-backend is not a decision at all, since it is derivable from the URL.
+Today a caller who wants a point cloud must also decide a chunk shape, a
+bin shape, a shard shape, a compressor and a backend, in the same call,
+with no defaults that work.  Four of those five are storage decisions
+that depend on the store's size and location, not on the data; the fifth
+is not a decision at all, since the backend is derivable from the URL.
 
-So they are kept apart from the data's description.  :class:`Schema` says what the data is and carries no
+So they are split.  :class:`Schema` says what the data is and carries no
 storage term.  :class:`Layout` says how to store it, every field has a
 working ``"auto"``, and it is the single place the four physical
 parameters are computed.  A caller who never touches ``Layout`` gets a
@@ -220,7 +222,8 @@ class Layout:
         ``store_kind`` and answer *unsharded* for every local store,
         including one deliberately built sharded.
     ``compression="auto"``
-        ``zstd``, or ``$ZARR_VECTORS_COMPRESSION`` when set.
+        ``zstd``, or ``$ZARR_VECTORS_COMPRESSION`` when set.  It used to
+        resolve to *no* compression, which is not what the word means.
     ``octree=False``
         ``True`` (or the codec's configuration, e.g. ``{"target":
         100_000}``) marks the store octree: its shards are written with
@@ -383,13 +386,8 @@ class StorageOptions:
     backend: str | None = None
     options: Mapping[str, Any] = field(default_factory=dict)
     branch: str | None = None
-    """The icechunk branch to open a session on (icechunk's own default,
-    ``"main"``, when unset).
-
-    Only icechunk has branches, so setting this with any other backend
-    raises rather than being ignored -- it used to be ignored everywhere,
-    which opened ``main`` while the caller believed they were on their
-    branch."""
+    """The icechunk branch to open (default ``"main"``); any other backend
+    raises."""
 
     def resolve_backend(self, url: str) -> str | None:
         """Explicit, then ``$ZARR_VECTORS_BACKEND``, then scheme detection.
@@ -402,11 +400,7 @@ class StorageOptions:
         return os.environ.get("ZARR_VECTORS_BACKEND") or None
 
     def resolve_options(self, url: str) -> dict[str, Any] | None:
-        """The ``storage_options`` to open ``url`` with.
-
-        :attr:`options`, plus :attr:`branch` for an icechunk store, whose
-        session factory takes it.  ``None`` when there is nothing to pass.
-        """
+        """:attr:`options` plus :attr:`branch` for opening ``url``, or None."""
         opts = dict(self.options)
         if self.branch is not None:
             backend = self.resolve_backend(url)
@@ -435,6 +429,11 @@ class Schema:
     :meth:`from_store` reads them back, so a schema round-trips and
     :func:`~zarr_vectors.api.dataset.open_or_create` can report a store
     that is missing one.
+
+    (A ``profile`` field used to sit here, standing in for the three
+    convention strings.  Nothing read it, and the type writers fill those
+    in from the geometry anyway, so it named a concept that did not
+    exist.  It was removed rather than left looking like a promise.)
     """
 
     ndim: int = 3
@@ -449,8 +448,6 @@ class Schema:
     layout: Layout = field(default_factory=Layout)
 
     def __post_init__(self) -> None:
-        # A misspelt kind used to be accepted and recorded as the store's
-        # geometry type, after which no reader could decode the store.
         if self.kind and self.kind not in VALID_GEOMETRY_TYPES:
             raise MetadataError(
                 f"Schema.kind={self.kind!r} is not a geometry type; expected "

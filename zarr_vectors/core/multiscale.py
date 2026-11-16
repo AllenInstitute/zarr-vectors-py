@@ -151,9 +151,7 @@ def write_multiscale_metadata(root: FsGroup) -> list[dict[str, Any]]:
         axes.append(out)
 
     # Build datasets array (one per level).  Every level's vertices are
-    # in level-0 coordinates, so every level gets level 0's transform:
-    # scale 1 (a coarse level is not on a coarser index grid; its
-    # metavertices are centroids of level-0 positions).
+    # in level-0 coordinates, so every level gets level 0's transform.
     scale0 = [1.0] * ndim
     translation0 = [bs / 2.0 for bs in base_bin]
     transforms0: list[dict[str, Any]] = [{"type": "scale", "scale": scale0}]
@@ -163,9 +161,7 @@ def write_multiscale_metadata(root: FsGroup) -> list[dict[str, Any]]:
     datasets: list[dict[str, Any]] = []
     for lvl in levels:
         if lvl != 0:
-            # A store written before coarse levels carried their bin
-            # geometry in their own block kept it only in this NGFF entry,
-            # which is about to be rewritten -- move it across first.
+            # Older stores kept a coarse level's bins only in this entry.
             _migrate_level_bins(root, lvl)
         datasets.append({
             "path": f"{RESOLUTION_PREFIX}{lvl}",

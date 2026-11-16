@@ -1,7 +1,13 @@
 """Which modules are supported, which are internal, and which are undecided.
 
-The single machine-readable answer: the contract test, the surface
-docstrings and the published docs all defer to the tiers listed here.
+One machine-readable answer, because there were three prose ones and they
+disagreed.  The contract test listed eight internal prefixes; the two
+surface docstrings listed five (omitting ``sharding``, ``multiresolution``
+and ``_engine`` — from which ``building`` re-exports six names, so the
+docstring reasonably read as "the rest is fair game"); and the published
+docs listed ``types``, ``lazy``, ``spatial``, ``validate``, ``constants``
+and ``typing`` while mentioning neither ``api`` nor ``building``.  A
+downstream reader met whichever of those they happened to open.
 
 The three tiers:
 
@@ -58,7 +64,6 @@ INTERNAL: tuple[str, ...] = (
     "zarr_vectors._xp",
     "zarr_vectors._runtime",
     "zarr_vectors._gds",
-    # The per-query node set a read resolves in one gather.
     "zarr_vectors._query_nodes",
     "zarr_vectors.core",
     "zarr_vectors.encoding",
@@ -150,22 +155,13 @@ def stability(module: str) -> Tier:
             or a dotted name exported from one, e.g.
             ``"zarr_vectors.api.Dataset"``.
 
-    The package itself and the names it exports are answered too:
-    ``"zarr_vectors"`` is supported, a name listed in
-    ``zarr_vectors.__all__`` (``zarr_vectors.open``,
-    ``zarr_vectors.stability``, ...) is supported, and any other
-    top-level name -- the storage-layer re-exports retired from
-    ``__all__``, such as ``zarr_vectors.FsGroup`` or
-    ``zarr_vectors.rechunk_by_attribute`` -- is internal: importable for
-    now, promised by nobody.  Where one of those has a supported
-    spelling it is in :mod:`zarr_vectors.building`.
+    A top-level name is supported if listed in ``zarr_vectors.__all__``,
+    otherwise internal.
 
     Raises:
         KeyError: If nothing in the manifest covers it — which means a
             module was added without being classified — or if no such
-            module or exported name exists.  A name that does not exist
-            is not "supported" just because it sits under a supported
-            prefix.
+            module or exported name exists.
     """
     if module == "zarr_vectors":
         return "supported"

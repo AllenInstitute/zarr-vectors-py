@@ -15,17 +15,13 @@ source.
 This function does the other job -- change the SPATIAL chunk grid, keep
 everything else -- for any geometry kind:
 
-* links of any ``link_width`` are re-split onto the new grid, with the
-  records written through ``write_links`` so endpoint canonicalisation and
-  the ``perm_idx`` that restores winding are handled by the library.
-* every resolution level is rechunked, not just level 0, with its own
-  ``bin_shape`` and its cross-level ``links/<+-k>`` families.
-* fragments shared between objects (coarse-level metavertices) stay shared,
-  and each object's manifest keeps its order.
+* links of any ``link_width`` are re-split onto the new grid via
+  ``write_links``.
+* every resolution level is rechunked, with its cross-level links.
+* shared fragments stay shared; manifests keep their order.
 * object ids are preserved exactly, so ``segment_id`` and any other attribute
   still addresses the same object.
-* vertex attributes, object attributes and groupings are carried across per
-  level; a level with fragment or link attributes is refused.
+* vertex/object attributes and groupings are carried across.
 
 WHY A STORE NEEDS THIS
 ----------------------
@@ -48,10 +44,7 @@ import numpy.typing as npt
 
 __all__ = ["rechunk_spatial", "suggest_chunk_shape"]
 
-#: Vertex-attribute array keys the writer owns: the core fields
-#: create_attribute_array sets, and the presence bookkeeping that names
-#: the SOURCE grid's chunks.  Everything else (dictionary encoding,
-#: user extensions) is copied to the output array.
+#: Vertex-attribute meta keys the writer sets itself; the rest is copied.
 _ATTR_META_OWNED = frozenset({
     "zv_array", "name", "dtype", "channel_names", "row_shape",
     "nonempty_chunks", "zarr_vectors_presence",
@@ -114,27 +107,13 @@ def _max_links_per_chunk(root, level: int) -> float:
 # ===================================================================
 # reading a level as a vertex table plus its fragments
 # ===================================================================
-#
-# A level is read as ONE table of vertices plus the fragments that slice
-# it, not as per-object geometry.  Coarse pyramid levels share fragments
-# between objects -- a metavertex sits in the manifest of every object it
-# aggregates -- and an object's manifest is an ORDERED walk that may visit
-# the same fragment more than once.  A per-object read either has to pick
-# one owner per fragment (and every other object loses that geometry) or
-# copy the vertex once per owner (and the level grows).  Keeping fragments
-# as the unit keeps each vertex once and every manifest's order intact.
+# Fragments, not objects, are the unit: coarse levels share fragments
+# between objects, and a manifest is an ordered walk that may revisit one.
 
 class _Level:
-    """One level read off disk.
-
-    ``pos``: ``(N, ndim)`` vertex positions, source chunks back to back.
-    ``frags``: per source fragment, its table rows in fragment order.
-    ``manifests``: per object row, the ordered list of fragment numbers.
-    ``chunk_base`` / ``chunk_size``: where each source chunk's buffer
-    starts in the table, for turning a stored ``(chunk, local index)``
-    link endpoint into a table row.
-    ``vattrs``: ``{name: (N, ...) array}`` per-vertex attributes.
-    """
+    """One level as a vertex table ``pos``; ``frags`` are row arrays,
+    ``manifests`` fragment-number walks, ``chunk_base``/``chunk_size``
+    map a source ``(chunk, local index)`` to a row."""
 
     def __init__(self):
         self.pos = None
@@ -240,9 +219,7 @@ def _read_level(src_group, ndim: int) -> _Level:
     lv.vattrs = {n: np.concatenate(p) for n, p in attr_parts.items() if p}
     lv.dtype = np.dtype(dtype) if dtype is not None else np.dtype(np.float32)
 
-    # A store may legitimately carry no object index -- write_points does not
-    # write one -- in which case every fragment belongs to one implicit
-    # object 0.
+    # No object index (write_points): every fragment is implicit object 0.
     try:
         ids, manifests = read_object_manifest_rows(src_group)
     except Exception:  # noqa: BLE001
@@ -284,21 +261,10 @@ def _endpoint_rows(lv: _Level, chunks, vi) -> npt.NDArray[np.int64]:
 
 def _write_level(level_group, lv: _Level, chunk_shape, ndim: int,
                  total_objects: int):
-    """Write vertices, fragments, manifests and vertex attributes.
-
-    Every source fragment is cut into runs of consecutive rows that fall
-    in one new chunk; each run becomes a new fragment, so a manifest that
-    walked fragments ``A, B`` now walks ``A's runs, B's runs`` and the
-    vertex order of every object is unchanged.  A fragment several objects
-    share (or one object visits twice) is written once and referenced from
-    each visit.  A fragment referenced exactly once is private to that
-    visit, so its runs are merged with the neighbouring private runs of the
-    same walk that land in the same chunk -- otherwise level 0, where every
-    fragment is private, would keep one fragment per OLD chunk crossing.
-
-    Returns ``(new_chunk, new_local)`` per table row, for re-addressing
-    links, and the vertex count.
-    """
+    """Cut each fragment into per-new-chunk runs and write them; shared
+    fragments are written once, private runs merge with same-chunk
+    neighbours.  Returns ``(new_chunk, new_local)`` per row and the
+    vertex count."""
     from zarr_vectors.core.arrays import (
         create_attribute_array,
         write_chunk_attributes,
@@ -322,12 +288,10 @@ def _write_level(level_group, lv: _Level, chunk_shape, ndim: int,
         if rows.size == 0:
             return []
         c = new_cc[rows]
-        # A row may only join the run before it if it lands in the same chunk.
         cut = np.flatnonzero(np.any(c[1:] != c[:-1], axis=1)) + 1
         return [(tuple(int(x) for x in new_cc[r[0]]), r)
                 for r in np.split(rows, cut)]
 
-    # chunk -> list of row arrays (one per new fragment), in creation order
     chunk_frags: dict[tuple, list] = {}
 
     def new_frag(cc: tuple, rows) -> tuple:
@@ -394,12 +358,8 @@ def _write_level(level_group, lv: _Level, chunk_shape, ndim: int,
 
 def _carry_links(out_group, src_group, delta: int, src_lv: _Level,
                  dst_lv: _Level, src_map, dst_map, ndim: int) -> tuple[int, int]:
-    """Re-address one ``links/<delta>`` family onto the new grids.
-
-    Endpoint 0 lives at the owning level, endpoints k > 0 at
-    ``level + delta``.  Returns ``(written, dropped)``; a record is dropped
-    only when an endpoint did not resolve to a vertex in the SOURCE store.
-    """
+    """Re-address one ``links/<delta>`` family; returns ``(written,
+    dropped)``, dropping records with an unresolvable source endpoint."""
     from zarr_vectors.core.arrays import (
         create_links_family,
         link_family_policy,
@@ -443,8 +403,7 @@ def _carry_links(out_group, src_group, delta: int, src_lv: _Level,
 # the public entry point
 # ===================================================================
 
-#: Level families this function carries.  Anything else present with
-#: content makes it refuse rather than write a store that silently lacks it.
+#: Level families carried; any other makes rechunk_spatial refuse.
 _CARRIED = {"vertices", "vertex_fragments", "object_index", "links",
             "link_fragments", "vertex_attributes", "object_attributes",
             "groups", "group_attributes"}
@@ -476,20 +435,8 @@ def rechunk_spatial(
 ) -> dict[str, Any]:
     """Rewrite a store on a different spatial chunk grid, losslessly.
 
-    Works for every geometry kind: every ``links/<delta>`` family -- the
-    intra-level one and the cross-level ``±k`` ones of a pyramid -- is
-    carried across at its own ``link_width`` (3 for triangle meshes, 2 for
-    skeletons, graphs and polylines), and a store with no links at all (a
-    point cloud) simply has none to carry.
-
-    Each vertex is written once.  A fragment shared between objects (the
-    metavertices of a coarse pyramid level) stays shared: vertices are
-    grouped on the new grid by the set of objects that own them, and each
-    group is listed in every owner's manifest.  Object ids, per-vertex,
-    per-object and per-group attributes, groupings, each level's
-    ``bin_shape`` / ``bin_ratio`` and the root's base bin are carried
-    unchanged.  Fragment and link attributes are not: they are tied to the
-    source's fragments and link cells, so a level carrying them is refused.
+    Every links family and attribute is carried, except fragment and link
+    attributes: a level with those is refused.
 
     Args:
         store_path: source store.
@@ -505,8 +452,7 @@ def rechunk_spatial(
             and offers one level. Each shape must be an integer multiple of the
             root chunk shape.
         target_links_per_chunk: used only when ``chunk_shape`` is None.
-        levels: levels to carry across; default all of them.  Cross-level
-            links whose other end is a level left out are not carried.
+        levels: levels to carry (default all); links to others are dropped.
         force: overwrite ``output`` if it exists.
 
     Returns:
@@ -559,10 +505,7 @@ def rechunk_spatial(
     all_levels = sorted(list_resolution_levels(root))
     todo = all_levels if levels is None else [lo for lo in all_levels if lo in levels]
 
-    # Read and check everything BEFORE touching the output, so a refusal
-    # never costs the caller an existing directory.  Each level is read as
-    # uniform cells, which a level with octree chunks does not have (its
-    # links are filed by leaf).
+    # Check everything before touching the output.
     from zarr_vectors.octree_chunks.guard import refuse_octree_levels
 
     refuse_octree_levels(root, todo, "rechunk_spatial", read=True)
@@ -582,8 +525,7 @@ def rechunk_spatial(
     # and a reader with no links_convention cannot resolve the intra-chunk
     # links at all -- only the cross-chunk ones survive, which renders as
     # geometry along chunk boundaries and nothing else.
-    # The base bin is the SOURCE's effective one: it is the level-0
-    # resolution, and every coarse level's bin_ratio is relative to it.
+    # Coarse levels' bin_ratio is relative to the source's base bin.
     base_bin = tuple(float(b) for b in meta.effective_bin_shape)
     caps = [c for c in (meta.format_capabilities or [])
             if c in (CAP_PRESERVED_OBJECT_IDS, CAP_SHARED_FRAGMENTS,
@@ -631,8 +573,7 @@ def rechunk_spatial(
         if lvl > 0:
             kw["parent_level"] = (src_lm.parent_level
                                   if src_lm.parent_level is not None else lvl - 1)
-            # The source level's own bin, not one re-derived from the level
-            # index: a pyramid need not coarsen by 2 per level.
+            # Not re-derived: a pyramid need not coarsen by 2 per level.
             kw["bin_shape"] = (tuple(src_lm.bin_shape) if src_lm.bin_shape
                                else tuple(b * (2 ** lvl) for b in base_bin))
             if src_lm.bin_ratio is not None:
@@ -674,8 +615,7 @@ def rechunk_spatial(
                        "dropped_links": 0, "vertex_attributes": len(lv.vattrs),
                        "attributes": n_attr, "chunk_shape": lvl_shape})
 
-    # Links last: a cross-level family needs both levels' metadata (their
-    # chunk grids anchor its offsets) and both levels' new addresses.
+    # Links last: a cross-level family needs both levels' new addresses.
     by_level = {r["level"]: r for r in report}
     for lvl in todo:
         src_g = get_resolution_level(root, lvl)

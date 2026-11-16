@@ -109,9 +109,7 @@ def validate_consistency(store_path: str | Path | Group) -> ValidationResult:
             bs <= 0 or abs(cs / bs - round(cs / bs)) > 1e-9
             for cs, bs in zip(level_chunk_shape, level_bin_shape)
         ):
-            # Bins that do not tile the chunk (a coarse level's bin may
-            # exceed or straddle it) carry no per-bin fragment layout to
-            # check; level 2 judges whether that is legal.
+            # Non-tiling bins have no per-bin layout; level 2 judges them.
             level_bin_shape = level_chunk_shape
 
         # Compute bins_per_chunk for this level
@@ -239,19 +237,14 @@ def validate_consistency(store_path: str | Path | Group) -> ValidationResult:
         try:
             evc = level_fields(root, li, lg).get("vertex_count")
             if evc is not None:
-                # vertex_count counts stored vertex rows.  Fragments may
-                # reference the same rows more than once (a graph built on
-                # a polyline store's vertices, shared metavertices), so
-                # their summed lengths are not the row count; the
-                # fragment index's row extent is, and costs no decode.
+                # Stored rows, not summed fragment lengths: fragments may
+                # share rows.
                 from zarr_vectors.core.arrays import chunk_vertex_count
                 n_rows = sum(
                     chunk_vertex_count(lg, ck) for ck in chunk_fragment_counts
                 )
                 if evc == 0 and n_rows:
-                    # 0 is the placeholder several build paths stamp and
-                    # never refresh (create_store, attribute/group
-                    # rechunk); stale, but not a claim to reject on.
+                    # 0 is a placeholder some build paths never refresh.
                     result.add_warning(
                         f"{prefix}: metadata vertex_count=0 (not recorded), "
                         f"actual={n_rows} stored vertex rows"

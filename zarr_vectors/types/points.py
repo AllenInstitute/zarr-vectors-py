@@ -196,9 +196,7 @@ def write_points(
         chunk_shape = tuple(side for _ in range(ndim))
 
     if bin_shape is not None:
-        # Up front: a bin that does not tile the chunk used to write a
-        # store that fails validation, or fail later with an unrelated
-        # out-of-grid StoreError.
+        # Checked before anything is written.
         from zarr_vectors.core.metadata import check_bin_shape_tiles_chunk
         check_bin_shape_tiles_chunk(chunk_shape, bin_shape)
     effective_bin = bin_shape if bin_shape is not None else chunk_shape
@@ -283,17 +281,13 @@ def write_points(
         inferred_ndim=ndim,
         geometry_type=GEOM_POINT_CLOUD,
         base_bin_shape=bin_shape,
-        # A point cloud has no links, and the spec says it carries no
-        # links_convention; stamping one here also pinned it (first
-        # writer wins) for any linked geometry added to the store later.
+        # Points have no links; a convention would pin it for later writers.
         links_convention=None,
         object_index_convention=OBJIDX_STANDARD,
         cross_chunk_strategy=CROSS_CHUNK_EXPLICIT,
     )
     axes = root_meta.spatial_index_dims
 
-    # Every family this call writes, so the level declares what is on
-    # disk (vertex_fragments is always written next to vertices).
     arrays_present = [VERTICES, VERTEX_FRAGMENTS]
     if attributes:
         arrays_present.append(VERTEX_ATTRIBUTES)
@@ -415,15 +409,10 @@ def write_points(
         if needs_objects:
             create_object_index_array(level_group)
 
-        # The chunk count reported is the number of chunks the bin grid
-        # groups the vertices into, on either layout.
         n_chunks = 0
         n_objects = 0
         if n_vertices and object_ids is not None:
-            # With objects: one fragment per object per chunk (not per
-            # bin), so the object index can name each object's pieces.
-            # With ``attr_bins`` the chunk key gains a leading attr-bin
-            # dim and an object's vertices may land in several keys.
+            # One fragment per object per chunk, so the index can name it.
             row_ids, offsets, coords, frags = _write_object_point_chunks(
                 level_group, positions, attributes, object_ids, chunk_shape,
                 np_dtype, attr_bins, fragment_attributes, fragment_attr_dtypes,
@@ -436,7 +425,6 @@ def write_points(
             bin_chunks, _ = _bin_cells(positions, effective_bin, bins_per_chunk)
             n_chunks = len(_rank_cells(bin_chunks)[1])
         elif n_vertices:
-            # Undifferentiated: one fragment per bin, empty bins included.
             n_chunks = _write_binned_point_chunks(
                 level_group, positions, attributes, effective_bin,
                 bins_per_chunk, np_dtype, fragment_attributes, fragment_attr_dtypes,
@@ -527,9 +515,7 @@ def read_points(
             prefix,
             f"{prefix}/{VERTICES}",
             f"{prefix}/{VERTEX_FRAGMENTS}",
-            # A box query asks whether the level has an object index (its
-            # fragments are then per object, not per bin); in the same
-            # gather, so the answer costs no extra round-trip.
+            # A box query needs to know whether fragments are per object.
             *((f"{prefix}/{OBJECT_INDEX}",) if bbox is not None else ()),
             *(f"{prefix}/{VERTEX_ATTRIBUTES}/{name}"
               for name in (attribute_names or ())),
@@ -855,23 +841,10 @@ def _read_points(
     for _bpc in bins_per_chunk:
         total_bins_per_chunk *= int(_bpc)
     if has_bins and bbox is not None:
-        # Bin-level targeting reads fragment ``k`` of a cell as bin ``k``.
-        # That holds only where the level was written one fragment per
-        # root bin, on the root's chunk grid.  Elsewhere the fragment it
-        # names holds other points (or none), and the box silently loses
-        # rows, so those levels take chunk-level targeting -- which is
-        # exact, because the box mask below runs on every row:
-        #
-        # * a coarsened level (``shared_fragments``): one fragment per
-        #   metavertex;
-        # * a level on its own chunk grid (``chunk_scale_factors``) or
-        #   with its own bin: the root's ``bins_per_chunk`` is not this
-        #   level's;
-        # * a level with an object index: points written with object ids
-        #   are one fragment per object per cell.
-        #
-        # A cell written as a single fragment (``building.assign_chunks``)
-        # on an otherwise per-bin level is caught per cell below.
+        # Bin targeting reads fragment k as bin k, which holds only for a
+        # level written one fragment per root bin on the root grid; other
+        # levels (shared fragments, own grid or bin, object index) take
+        # chunk targeting, which the box mask below keeps exact.
         _lvl_bin = getattr(level_meta, "bin_shape", None)
         if (
             getattr(level_meta, "shared_fragments", False)
@@ -924,10 +897,7 @@ def _read_points(
     if not skip_fragments or attribute_names:
         prefetch_plan.append((VERTEX_FRAGMENTS, chunk_key_strs))
     elif chunk_key_strs:
-        # The first chunk's index alone, which re-checks the tiling claim
-        # (below).  Planned, so a query replaying this reader fetches that
-        # one cell; read unplanned, it fanned out to every cell of
-        # ``vertex_fragments``.
+        # The first chunk's index alone, which re-checks the tiling claim.
         prefetch_plan.append((VERTEX_FRAGMENTS, chunk_key_strs[:1]))
     if attribute_names:
         for attr_name in attribute_names:
@@ -996,9 +966,7 @@ def _read_points(
 
             chunk_keys_set = set(chunk_keys)
             all_positions = []
-            # Uncompressed arrays on a byte-range store read just a bin's
-            # bytes through ``read_fragment``; elsewhere the whole cell is
-            # read anyway, so it is sliced once below.
+            # Only a byte-range store reads a bin's bytes alone.
             ranged = level_group.range_readable(VERTICES)
             for cc, fragment_indices in chunk_fragment_targets.items():
                 if fragment_indices is None:
@@ -1014,13 +982,8 @@ def _read_points(
                     if len(rows) > 0:
                         all_positions.append(rows)
                     continue
-                # A cell whose fragments are not one per bin -- a single
-                # fragment from ``building.assign_chunks``, say -- cannot
-                # be addressed by bin; read it whole and let the mask
-                # below cut it.  The fragment index is prefetched and is
-                # decoded once here: off a byte-range store the wanted
-                # bins are sliced from it directly, rather than through
-                # ``read_fragment``, which decoded it again for every bin.
+                # A cell not one fragment per bin is read whole; the mask
+                # below cuts it.
                 try:
                     fi = read_vertex_fragment_index(level_group, cc)
                 except (ArrayError, StoreError):
@@ -1272,11 +1235,8 @@ def _write_fragment_attrs_for_chunk(
 def _floor_cells(
     positions: npt.NDArray[np.floating], cell: tuple[float, ...],
 ) -> list[npt.NDArray[np.int64]]:
-    """``floor(positions / cell)`` as one int64 column per axis.
-
-    The arithmetic of :func:`~zarr_vectors.spatial.chunking.assign_chunks`, a column at a time, so a
-    vertex lands in the same cell either way.
-    """
+    """``floor(positions / cell)`` per axis, as
+    :func:`~zarr_vectors.spatial.chunking.assign_chunks` computes it."""
     cs = np.asarray(cell, dtype=np.float64)
     out = []
     for d in range(positions.shape[1]):
@@ -1292,9 +1252,7 @@ def _bin_cells(
     bins_per_chunk: tuple[int, ...],
 ) -> tuple[list[npt.NDArray[np.int64]], npt.NDArray[np.int64]]:
     """Each vertex's chunk (one column per axis) and the row-major index
-    of its bin inside that chunk: what
-    :func:`~zarr_vectors.spatial.chunking.group_bins_by_chunk` derives from
-    :func:`~zarr_vectors.spatial.chunking.assign_bins`, without grouping."""
+    of its bin inside that chunk."""
     bins = _floor_cells(positions, bin_shape)
     chunk_cols = []
     local = np.zeros(len(positions), dtype=np.int64)
@@ -1326,7 +1284,6 @@ def _rank_cells(
         key -= low
     size = int(np.prod(span))
     if size <= 2 * n + 65536:
-        # A grid this small is ranked through a lookup table, not a sort.
         present = np.zeros(size, dtype=bool)
         present[key] = True
         linear = np.flatnonzero(present)
@@ -1341,11 +1298,8 @@ def _rank_cells(
 
 
 def _stable_order(key: npt.NDArray[np.int64], n_keys: int) -> npt.NDArray[np.intp]:
-    """``np.argsort(key, kind="stable")`` for keys in ``[0, n_keys)``.
-
-    Narrowed to 8 or 16 bits when they fit, where numpy radix-sorts:
-    at 10^7 keys that is a quarter of the int64 sort's time.
-    """
+    """``np.argsort(key, kind="stable")`` for keys in ``[0, n_keys)``,
+    narrowed to 8/16 bits where numpy radix-sorts."""
     if n_keys <= 1 << 8:
         key = key.astype(np.uint8)
     elif n_keys <= 1 << 16:
@@ -1364,12 +1318,8 @@ def _write_point_chunks(
     fragment_attributes: dict[str, dict[ChunkCoords, npt.NDArray]] | None,
     fragment_attr_dtypes: dict[str, np.dtype],
 ) -> None:
-    """Write vertices already sorted by chunk, then by fragment.
-
-    Chunk ``cells[i]`` holds rows ``row_ends[i-1]:row_ends[i]`` of
-    ``positions`` (and of each attribute), as fragments of
-    ``frag_counts[i]`` rows each.
-    """
+    """Write chunk ``cells[i]`` as rows ``row_ends[i-1]:row_ends[i]``,
+    in fragments of ``frag_counts[i]`` rows each."""
     start = 0
     for cc, end, counts in zip(map(tuple, cells.tolist()), row_ends.tolist(), frag_counts):
         write_chunk_vertex_runs(
@@ -1398,13 +1348,8 @@ def _write_binned_point_chunks(
     fragment_attributes: dict[str, dict[ChunkCoords, npt.NDArray]] | None,
     fragment_attr_dtypes: dict[str, np.dtype],
 ) -> int:
-    """Write every chunk as one fragment per bin, empty bins included.
-
-    One stable sort by (chunk, bin) orders the vertices; each chunk is
-    then a contiguous run of them, and each bin a run inside it, so
-    vertices keep their input order within a bin.  Returns the number
-    of chunks written.
-    """
+    """Write every chunk as one fragment per bin (empty bins included),
+    keeping input order within a bin; returns the chunk count."""
     chunk_cols, local = _bin_cells(positions, bin_shape, bins_per_chunk)
     ranks, cells = _rank_cells(chunk_cols)
     per_chunk = int(np.prod(bins_per_chunk))
@@ -1438,11 +1383,7 @@ def _write_object_point_chunks(
 ]:
     """Write every chunk as one fragment per object, ordered by id.
 
-    One stable sort by (chunk, object id) orders the vertices, so each
-    fragment is a contiguous run that keeps its vertices' input order;
-    chunk keys lead with the attr bin when ``attr_bins`` is given.
-    Returns the object index as CSR arrays ``(row_ids, offsets, coords,
-    frags)``: each object's fragments in chunk order, objects by id.
+    Returns the object index as CSR ``(row_ids, offsets, coords, frags)``.
     """
     cols = _floor_cells(positions, chunk_shape)
     if attr_bins is not None:
@@ -1482,8 +1423,7 @@ def _write_object_point_chunks(
         np_dtype, fragment_attributes, fragment_attr_dtypes,
     )
 
-    # Manifests: an object's fragments in chunk order, objects by id.  The
-    # index is keyed by integer id, as ``int(obj_id)`` keyed it.
+    # Manifests: an object's fragments in chunk order, objects by id.
     frag_obj = sorted_ids[frag_start]
     if not integer:
         frag_obj = frag_obj.astype(np.int64)

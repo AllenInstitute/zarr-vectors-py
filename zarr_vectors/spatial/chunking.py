@@ -92,11 +92,8 @@ def assign_chunks(
     if n == 0:
         return {}
 
-    # Vectorised chunk coordinate computation, one column at a time into
-    # a column-major array: numpy's reductions and arithmetic over a tall
-    # (N, D) array along axis 0 are several times slower than D passes
-    # over contiguous columns.  Each column is divided in the same dtype
-    # as ``positions / chunk_shape`` would be, so the floors are the same.
+    # Vectorised chunk coordinate computation, a column at a time, in the
+    # dtype ``positions / chunk_shape`` would use so the floors agree.
     cs = np.array(chunk_shape, dtype=np.float64)
     div_dtype = np.result_type(positions.dtype, cs.dtype)
     chunk_ints = np.empty((n, ndim), dtype=np.int64, order="F")  # (N, D)
@@ -117,10 +114,8 @@ def assign_chunks(
     # object path; the packed form sorts one column and finds the group
     # boundaries with one diff.  Packing is exact whenever the coord
     # ranges multiply to under 2**63, which is any grid a store can
-    # allocate; anything wider takes the lexsort path.  A grid of at
-    # most 65536 cells packs into uint16, whose stable argsort is numpy's
-    # radix sort rather than a timsort: the same order, several times
-    # faster.
+    # allocate; anything wider takes the lexsort path.  uint16 keys
+    # radix-sort.
     packed = _pack_coords(chunk_ints)
     if packed is not None:
         sort_idx = np.argsort(packed, kind="stable")

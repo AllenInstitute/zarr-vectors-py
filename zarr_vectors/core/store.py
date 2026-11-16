@@ -560,8 +560,7 @@ def create_store(
     if geometry_types is None:
         geometry_types = []
     if base_bin_shape is not None:
-        # Before anything touches disk: a bin that does not tile the chunk
-        # otherwise makes a store that fails validation.
+        # Before anything touches disk.
         from zarr_vectors.core.metadata import check_bin_shape_tiles_chunk
         check_bin_shape_tiles_chunk(
             chunk_shape, base_bin_shape, name="base_bin_shape",
@@ -876,8 +875,6 @@ def _ensure_root_metadata_for_write(
         zv["geometry_types"] = gts
 
     if base_bin_shape is not None:
-        # Every type writer stamps its bin_shape here; refuse one that
-        # does not tile the store's chunks before it reaches the store.
         from zarr_vectors.core.metadata import check_bin_shape_tiles_chunk
         check_bin_shape_tiles_chunk(zv["chunk_shape"], base_bin_shape)
         zv["base_bin_shape"] = list(base_bin_shape)
@@ -937,10 +934,8 @@ def _apply_out_of_bounds_policy(
         )
     bmin = np.asarray(cur_bounds[0], dtype=positions.dtype)
     bmax = np.asarray(cur_bounds[1], dtype=positions.dtype)
-    # Per-column extremes first: when they sit inside the bounds every
-    # point does, and 2*D column reductions cost a fraction of the
-    # (N, D) masks below.  A NaN makes its column's min and max NaN,
-    # which fails this test and takes the exact path.
+    # Fast path: per-column extremes inside the bounds (a NaN fails this
+    # test and takes the exact path below).
     ndim = positions.shape[1]
     if bmin.shape == bmax.shape == (ndim,) and all(
         positions[:, k].min() >= bmin[k] and positions[:, k].max() <= bmax[k]
@@ -1600,15 +1595,8 @@ def create_resolution_level(
             root, level, scale=scale, translation=translation,
         )
     else:
-        # A coarse level's vertices are stored in level-0 coordinates
-        # (metavertices are centroids of level-0 positions), so the NGFF
-        # transform that places them is level 0's own.  This block used to
-        # stamp ``scale = bin_ratio`` and ``translation = bin_shape / 2``,
-        # which an NGFF viewer applies to the stored positions: level 1
-        # drawn at twice its size and shifted by a bin, level 2 at four
-        # times.  The bin geometry is ZV's own business and is kept in the
-        # level's ``zarr_vectors_level`` block, where
-        # :func:`read_level_metadata` reads it first.
+        # Vertices are in level-0 coordinates, so the NGFF transform is
+        # level 0's; the bin geometry goes in the level's own block.
         if level_metadata.bin_ratio is not None or level_metadata.bin_shape is not None:
             base_bin: tuple[float, ...] | None = None
             try:
@@ -1812,7 +1800,6 @@ def get_resolution_level(root: Group, level: int) -> Group:
         StoreError: If the level does not exist.
     """
     group_name = f"{RESOLUTION_PREFIX}{level}"
-    # One lookup, not a membership test and then a second lookup.
     try:
         return root[group_name]
     except StoreError:
@@ -1866,11 +1853,8 @@ def read_level_metadata(root: Group, level: int) -> LevelMetadata:
     level_group = get_resolution_level(root, level)
     lm = LevelMetadata.from_dict(level_group.attrs.to_dict())
 
-    # A coarse level written since the NGFF transform became level 0's
-    # carries its bin geometry in its own block, and that is the answer.
-    # Otherwise the NGFF block holds it: stores written before then
-    # encoded ``bin_ratio`` as the scale and ``bin_shape / 2`` as the
-    # translation.
+    # A coarse level's own block wins; older stores encoded the bins in
+    # the NGFF transform (scale = bin_ratio, translation = bin_shape / 2).
     if level != 0 and (lm.bin_shape is not None or lm.bin_ratio is not None):
         return lm
     from zarr_vectors.core.multiscale import read_level_transform
@@ -2000,16 +1984,10 @@ def add_resolution_level(
 def remove_resolution_level(root: Group, level_index: int) -> None:
     """Remove the coarsest resolution level from the store.
 
-    Level 0 cannot be removed, and neither can a level that has a
-    coarser level above it: levels must stay contiguous (validation
-    level 5), and renumbering the levels above would also mean
-    rewriting every cross-level link that names them.  To drop a
-    middle level, remove the levels above it first (coarsest first).
-
-    Everything that refers to the removed level goes with it: its
-    entry in the NGFF ``multiscales`` datasets, and every
-    ``links/+k`` / ``link_attributes/<name>/+k`` family on a finer
-    level that points at it.
+    Level 0 cannot be removed.
+    Nor can a level with a coarser one above it (levels must stay
+    contiguous).  Its NGFF ``multiscales`` entry and every ``links/+k`` /
+    ``link_attributes/<name>/+k`` family pointing at it go with it.
 
     Raises:
         StoreError: If the level does not exist, is level 0, or is not

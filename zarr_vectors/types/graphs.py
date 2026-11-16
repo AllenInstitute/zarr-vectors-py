@@ -148,8 +148,7 @@ def write_graph(
             (Spec name; replaces ``node_attributes``.)
         link_attributes: Per-edge attributes ``{name: (M,) or (M,C)}``.
             (Spec name; replaces ``edge_attributes``.)  With
-            ``kind="skeleton"`` they make every edge an explicit record
-            (implied ones included), so each edge keeps its value.
+            ``kind="skeleton"`` every edge is then stored explicitly.
         fragment_attributes: Per-fragment attributes, keyed per chunk:
             ``{name: {chunk_coords: ndarray}}``.  Each per-chunk ndarray
             has shape ``(num_fragments_in_chunk,)`` or
@@ -447,23 +446,14 @@ def write_graph(
         store_mask = ~implied
         _check_one_root_per_object(edges, object_ids, n_nodes)
         if edge_attributes:
-            # ``link_attributes/`` mirrors the stored records row for row,
-            # so an implied edge has nowhere to keep its values -- skipping
-            # them silently dropped every attribute row but the branch and
-            # cross-chunk ones.  Store every edge explicitly instead: a
-            # record restating the implied parent is legal under
-            # ``implicit_sequential_with_branches`` (readers apply it as an
-            # override that changes nothing).  Stores written without edge
-            # attributes are unaffected.
+            # ``link_attributes/`` mirrors stored records, so store every
+            # edge; restating an implied parent is a no-op override.
             store_mask = np.ones(n_edges, dtype=bool)
     else:
         store_mask = np.ones(n_edges, dtype=bool)
     store_rows = np.flatnonzero(store_mask)
 
-    # Declared once the stored edges are known: ``link_attributes`` is
-    # only written when some edge is stored rather than implied.  The
-    # links family and its ``link_fragments`` sidecar always exist (the
-    # backstop below creates the intra-chunk array).
+    # ``links`` always exists: the backstop below creates it.
     arrays_present_list = [
         VERTICES, VERTEX_FRAGMENTS, "links", LINK_FRAGMENTS, "object_index",
     ]
@@ -517,8 +507,7 @@ def write_graph(
         # below, which know the offsets arrays each record lands in.
         if node_attributes:
             for name, data in node_attributes.items():
-                # Channel names carry the row shape: without them a (V, C)
-                # column was declared scalar and read back as V*C values.
+                # Channel names carry the row shape of a (V, C) column.
                 create_attribute_array(
                     level_group, name, dtype=str(data.dtype),
                     channel_names=(
@@ -897,8 +886,6 @@ def _read_graph(
         # touching a chunk outside ``chunk_keys`` has no offset and is
         # dropped, which is what applies the bbox/chunks filter to edges.
         all_edges: list[npt.NDArray] = []
-        # Each chunk's local rows map to output rows through its offset,
-        # resolved once per link cell rather than per endpoint.
         row_of = np.arange(running, dtype=np.int64)
         starts = list(chunk_offsets.items())
         ends = [start for _, start in starts[1:]] + [running]
@@ -907,8 +894,7 @@ def _read_graph(
             {cc: row_of[start:end] for (cc, start), end in zip(starts, ends)},
             delta=0, cells=link_cells, touching=is_tree,
         )
-        # A skeleton keeps every record whose child was read; a parent of
-        # -1 (not read) makes that child a root below.
+        # A parent of -1 (not read) makes that child a root below.
         if rows.shape[0] and rows.shape[1] == 2:
             all_edges.append(np.ascontiguousarray(rows))
 

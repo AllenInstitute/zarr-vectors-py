@@ -359,13 +359,8 @@ class Level:
 
     @contextlib.contextmanager
     def _held_store(self) -> Iterator[None]:
-        """Resolve :attr:`store` once and reuse it until the block ends.
-
-        One query asks for the level group several times (attribute
-        names, metadata, known cells); each ask is a lookup of the
-        level's ``zarr.json``.  Nothing in a read creates or removes the
-        level, so the handle cannot go stale inside the block.
-        """
+        """Resolve :attr:`store` once and reuse it until the block ends;
+        a read never creates or removes the level, so it cannot go stale."""
         if self._held is not None:
             yield
             return
@@ -428,19 +423,9 @@ class Level:
     def _touched_object_ids(self, selection: Selection) -> npt.NDArray[Any]:
         """Distinct ids of the objects with a vertex in ``selection``.
 
-        Only the polyline reader reports ids on an ordinary read; the
-        point and mesh readers do so only on their ``object_ids=`` path,
-        and the graph and line readers never.  So :meth:`Query.object_ids`
-        answered ``[]`` for every point cloud, graph and mesh, ids or no
-        ids.  Resolved here, cheapest route first:
-
-        * the read itself carries ids (polylines, or ``objects=`` given);
-        * the level has no objects -- nothing to report;
-        * nothing narrows the selection -- every present object;
-        * points and meshes -- the same selection re-read on the
-          reader's ``object_ids=`` path, which tags each vertex;
-        * graphs, skeletons and lines -- each object's fragments, from the
-          manifests, tested against the selection's region.
+        Cheapest route first: ids the read carries; all present objects
+        if nothing narrows; a re-read with ``objects=`` for points and
+        meshes; otherwise the manifests tested against the region.
         """
         from zarr_vectors.api.select import SelectionError
 
@@ -451,10 +436,7 @@ class Level:
                 return np.unique(np.asarray(source))
         if result.vertex_count == 0:
             return empty
-        target = (
-            self if selection.level in (None, self._index)
-            else self._dataset.level(selection.level)
-        )
+        target = self._target(selection)
         try:
             present = np.asarray(target.objects.ids(), dtype=np.int64)
         except (ArrayError, StoreError, MetadataError, KeyError):
@@ -492,12 +474,8 @@ class Level:
     def _object_ids_by_region(
         self, target: Level, selection: Selection,
     ) -> npt.NDArray[Any]:
-        """Objects with a fragment vertex inside the selection's region.
-
-        For readers that never report ownership.  The region is the
-        selection's ``bbox`` / ``near`` / ``cells`` terms; each object's
-        fragments are found through the manifests and read once per chunk.
-        """
+        """Objects with a fragment vertex inside the selection's ``bbox`` /
+        ``near`` / ``cells`` region, found through the manifests."""
         from zarr_vectors.core.arrays import (
             read_chunk_vertices,
             read_object_manifest_rows,
@@ -558,20 +536,11 @@ class Level:
         return np.unique(np.asarray(out, dtype=np.int64))
 
     def _check_has_objects(self, selection: Selection) -> None:
-        """Refuse ``objects=`` / ``groups=`` on a level that has none.
-
-        A point cloud written without ``object_ids`` has no object index,
-        and the reader failed on it with a bare ``KeyError: 'sid_ndim'``
-        (or ``Array 'groups' not found``), which says nothing about what
-        the caller did.
-        """
+        """Refuse ``objects=`` / ``groups=`` on a level that has none."""
         from zarr_vectors.api.select import SelectionError
         from zarr_vectors.constants import GROUPS
 
-        target = (
-            self if selection.level in (None, self._index)
-            else self._dataset.level(selection.level)
-        )
+        target = self._target(selection)
         if selection.objects is not None and len(target.objects) == 0:
             raise SelectionError(
                 f"select(objects=...) on level {target.index}: this "
@@ -797,13 +766,10 @@ class Level:
         care — or it raises the genuine error, unobscured.  The cost is
         having done the work twice on the rare read that needs it.
 
-        Two kinds of level skip the engine, the reader called once,
-        directly: one with octree chunks (the engine's plan names uniform
-        cells, so its prefetch is wasted and each replay re-reads the leaf
-        table), and one whose presence is deferred (see
-        :func:`zarr_vectors.building.defer_presence`), whose arrays carry
-        no ``nonempty_chunks``: an offline replay cannot ask the store
-        which cells are there, and so read none.
+        Levels with octree chunks or deferred presence (see
+        :func:`zarr_vectors.building.defer_presence`) skip the engine and
+        call the reader once: its plan and offline replay assume uniform,
+        listed cells.
         """
         self._check_supported(selection)
         reader, supports, adapter = self._reader()
@@ -855,9 +821,7 @@ class Level:
             return False
 
     def _octree_read_once(self, selection: Selection) -> bool:
-        """Whether the selection's level has octree chunks, from the level
-        metadata the plan reads anyway: such a level is read by its reader
-        once, without the engine's prefetch of uniform cells and replays."""
+        """Whether the selection's level has octree chunks."""
         target = self._target(selection)
         try:
             meta = target._metadata()
@@ -871,8 +835,7 @@ class Level:
         Reuses :func:`zarr_vectors.core.aio.read_async`, which supplies
         any reader's I/O up front and replays it offline — so the async
         path is the sync reader, not a second implementation of it.  A
-        level whose presence is deferred cannot be replayed offline (see
-        :meth:`_execute`), so its reader runs directly in a worker thread.
+        deferred-presence level runs its reader in a worker thread.
         """
         from zarr_vectors.core.aio import read_async
 

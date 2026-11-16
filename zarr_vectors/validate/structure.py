@@ -137,9 +137,7 @@ def validate_structure(store_path: str | Path | Group) -> ValidationResult:
             result.add_error(f"{ln}/ cannot be opened: {e}")
             continue
 
-        # A node whose zarr.json does not parse (e.g. a shape whose rank
-        # disagrees with its chunk grid) raises a raw zarr ValueError from
-        # whichever check touches it first; name each one instead.
+        # Report unparseable zarr.json nodes by name, not as a raw error.
         broken = _unreadable_nodes(level)
         for path, err in broken:
             result.add_error(f"{ln}/{path} metadata cannot be read: {err}")
@@ -197,13 +195,8 @@ def _check_level(
 
 
 def _unreadable_nodes(level: Group) -> list[tuple[str, str]]:
-    """``(path, error)`` for every node under ``level`` that fails to open.
-
-    Walks the store listing (one listing per group, no chunk keys: arrays
-    are not descended into) and opens each node, so its ``zarr.json`` is
-    parsed exactly as a reader would.  A directory that is no node at all
-    (``KeyError``) is not reported; level 1 judges the layout elsewhere.
-    """
+    """``(path, error)`` for every node under ``level`` that fails to open
+    (directories that are no node at all are skipped)."""
     from zarr.core.sync import sync
 
     zg = level.zarr_group

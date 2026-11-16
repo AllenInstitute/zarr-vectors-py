@@ -4,21 +4,14 @@ The scale-out building blocks the ``write_graph`` whole-dataset path lacks,
 for skeletons (rooted trees of ``[child, parent]`` edges):
 
 - :func:`write_skeleton_chunk` — write one spatial chunk's skeleton
-  pieces, each decomposed into linear-path fragments, using the core
-  per-chunk primitives.  Within a fragment parents are implicit
-  (vertex ``i``'s parent is ``i - 1``); a fragment's first vertex has no
-  implied parent, so skeletons coexist in one chunk without chaining
-  across fragment boundaries.  The only stored link rows are branch
-  links, ``[child_local, parent_local]`` in **chunk-local** indices, one
-  group per fragment (empty for a piece's root path; no ``-1`` root row
-  is written).  Returns the ``(object_id, chunk, fragment_idx)`` records
-  that a downstream reduce groups into a dense ``object_index``.
+  pieces as linear-path fragments (parent of vertex ``i`` is ``i - 1``;
+  a fragment's first vertex has none).  Only branch links are stored,
+  ``[child_local, parent_local]`` in **chunk-local** indices.  Returns the
+  ``(object_id, chunk, fragment_idx)`` records for the ``object_index``.
 
 - :func:`write_skeleton_cross_chunk_links` — store ``[child, parent]``
-  edges that cross a chunk boundary.  They land in the non-zero-offset
-  arrays of the same ``links/0/`` family the branch links above use, which
-  is declared ``directed=True`` because child→parent order is data.  Every
-  record in the family, intra- or cross-chunk, leads with the child.
+  edges that cross a chunk boundary, in the same ``directed=True``
+  ``links/0/`` family.
 
 - :func:`read_skeleton_by_segment_id` — resolve a segment ID to its
   object, follow the manifest, and reconstruct the skeleton (positions +
@@ -411,10 +404,8 @@ def init_skeleton_store(
     ):
         create_vertices_array(level_group, dtype="float32")
         # One links family holds both the intra-chunk branch links and the
-        # boundary-crossing edges, all ``[child, parent]``.  ``directed=True``
-        # is family policy: it stops the cross-chunk arrays canonical-sorting
-        # endpoints (which would swap child and parent).  Intra-chunk records
-        # are stored in input order regardless, so branch links are unaffected.
+        # boundary-crossing edges, all ``[child, parent]``; ``directed=True``
+        # stops a canonical sort swapping them.
         create_links_array(
             level_group, link_width=2, delta=0, sid_ndim=ndim, directed=True,
         )
@@ -441,20 +432,8 @@ def write_skeleton_cross_chunk_links(
 
     Each link is ``((chunkA, viA), (chunkB, viB))`` with chunk-local
     vertex indices, endpoint 0 the **child** and endpoint 1 its
-    **parent** -- the same order as the intra-chunk branch links
-    :func:`write_skeleton_chunk` writes, the ``write_graph(kind=
-    "skeleton")`` records, and what :func:`read_skeleton_by_segment_id`
-    and ``read_graph`` decode.  These are the connections the coarsener
-    uses to merge an object's fragments once both endpoints fall in the
-    same (coarser) chunk.
-
-    Stored ``directed=True`` so the child→parent order survives -- a
-    canonical sort by chunk coord would otherwise silently swap
-    endpoints whenever the parent chunk sorts before the child chunk.
-    Each link lands in the cell of the child's chunk, in the offsets
-    array naming where the parent's chunk sits relative to it, within
-    the same ``links/0/`` family :func:`write_skeleton_chunk` writes
-    branch links into.
+    **parent**, as in :func:`write_skeleton_chunk`.  Stored
+    ``directed=True`` so a canonical sort cannot swap them.
     """
     if not links:
         return
@@ -464,16 +443,8 @@ def write_skeleton_cross_chunk_links(
 
 
 def finalize_skeleton_store(root) -> None:
-    """Finish a streamed skeleton store: stamp counts, then commit.
-
-    ``init_skeleton_store`` creates level 0 before any vertex exists, so
-    it records ``vertex_count: 0`` and only the families it can foresee in
-    ``arrays_present``; the per-chunk writers never touch the shared
-    level metadata (concurrent workers would race on it).  Here, on the
-    coordinator, every level's ``vertex_count`` is set from its chunks'
-    fragment indices -- kilobytes per chunk, no vertex decoding -- and its
-    ``arrays_present`` from the families on disk.
-    """
+    """Finish a streamed skeleton store: stamp each level's
+    ``vertex_count`` and ``arrays_present`` from disk, then commit."""
     from zarr_vectors.building import refresh_arrays_present
 
     for level in list_resolution_levels(root):
@@ -586,9 +557,8 @@ def read_skeleton_by_segment_id(
             if a is not None and b is not None:
                 all_edges.append(np.array([[a, b]], dtype=np.int64))
 
-    # Cross-chunk records ([child, parent], non-zero offsets) join this
-    # object's fragments across chunk boundaries.  Only cells whose every
-    # endpoint chunk is one the manifest names can hold such a record.
+    # Cross-chunk records join this object's fragments; only cells within
+    # the manifest's chunks can hold one.
     cells = link_cells_within(level_group, list(cc_frags))
     cells = {seg: keys for seg, keys in cells.items() if keys}
     if cells:

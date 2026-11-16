@@ -1,17 +1,10 @@
 """Nodes resolved together at the start of a query.
 
-A read resolves the level group and its arrays one at a time as it
-discovers them -- the level, its attribute names, the presence listing,
-then the engine's own resolution of the same arrays -- and behind an
-object store each is a sequential round trip.  :func:`primed` resolves
-the level and every array a read of it can touch in one gather, and for
-the rest of the query :meth:`Group._lookup_node` and the engine's
-:func:`~zarr_vectors.core.aio._resolve_nodes` answer from that set.  A
-node either of them resolves later in the query (a link family's offset
-arrays, found by listing) joins the set, so it too is fetched once.
-
-Read-only: nothing inside the block may create or remove a node.  The set
-is keyed by store, so a query on one store never sees another's nodes.
+:func:`primed` resolves a level group and every array a read of it can
+touch in one gather; for the rest of the block
+:meth:`Group._lookup_node` and :func:`~zarr_vectors.core.aio._resolve_nodes`
+answer from that set, and nodes resolved later join it.  Read-only: nothing
+inside the block may create or remove a node.  Keyed by store.
 """
 
 from __future__ import annotations

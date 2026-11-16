@@ -60,11 +60,10 @@ Two shapes are written:
     ``name`` stays because it is the RFC 5 spelling of the identifier,
     and a reader written against that draft looks for it.
 
-Nothing here reads the bare-root ``multiscales`` block.  Its entries
-repeat level 0's transform at every level (vertices are level-0
-coordinates throughout), but stores written earlier carry a bin ratio as
-a coarse level's ``scale``, so ``world`` is declared afresh rather than
-derived from a transform.
+Nothing here reads the bare-root ``multiscales`` block, whose ``scale`` is
+a bin ratio in older stores (newer ones repeat level 0's transform).
+That block is why ``world`` is declared afresh
+rather than derived from a transform.
 """
 
 from __future__ import annotations
