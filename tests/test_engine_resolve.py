@@ -265,7 +265,9 @@ GOLDEN = [
     ("eight cells", {"bbox": ([0.0, 0.0, 0.0], [100.0, 100.0, 100.0])}, 4, 24, 1, 0),
     ("sphere", {"near": ([400.0, 400.0, 400.0], 50.0)}, 4, 24, 1, 0),
     ("one attribute", {"attributes": ["a"]}, 1, 0, 1, 3),
-    ("no attributes", {"attributes": []}, 1, 0, 1, 2),
+    # A tiled point level: vertices whole, and the one fragment cell the
+    # reader re-checks the tiling claim on.
+    ("no attributes", {"attributes": []}, 2, 1, 1, 1),
 ]
 
 

@@ -1,10 +1,11 @@
-"""Experiment ``batch_cells``: the sharded reader's per-cell work done as arrays.
+"""The sharded reader's per-cell work done as arrays.
 
-With ``ZARR_VECTORS_EXPERIMENTS=batch_cells`` the optimised sharded reader
-parses keys, locates cells in their shards' indexes and plans its reads
-for all cells at once, and decompresses each cell straight out of its
-read. It must return the same cells and make the same reads -- the same
-ranges of the same files, the same store requests -- as without it.
+When a read averages ``_BATCH_CELLS`` or more cells an array, the
+optimised sharded reader parses keys, locates cells in their shards'
+indexes and plans its reads for all cells at once, and decompresses each
+cell straight out of its read. It must return the same cells and make the
+same reads -- the same ranges of the same files, the same store requests
+-- as the per-cell reader.
 """
 
 from __future__ import annotations
@@ -30,18 +31,20 @@ except ImportError:
     HAVE_OCTREE = False
 
 
+_THRESHOLD: dict[str, int] = {}
+
+
 @pytest.fixture(autouse=True)
 def _optimised_reader(monkeypatch):
-    """The experiment is in the optimised reader, so pin it."""
+    """Batching is in the optimised reader, so pin it."""
     monkeypatch.setenv("ZARR_VECTORS_SHARD_READER", "optimised")
-    monkeypatch.delenv("ZARR_VECTORS_EXPERIMENTS", raising=False)
+    _THRESHOLD.clear()
 
 
 def _on(monkeypatch, on):
-    if on:
-        monkeypatch.setenv("ZARR_VECTORS_EXPERIMENTS", "batch_cells")
-    else:
-        monkeypatch.delenv("ZARR_VECTORS_EXPERIMENTS", raising=False)
+    """Batch at the threshold the test runs with (``on``), or never."""
+    at = _THRESHOLD.setdefault("on", _batch_reader._BATCH_CELLS)
+    monkeypatch.setattr(_batch_reader, "_BATCH_CELLS", at if on else 10**12)
 
 
 @pytest.fixture
@@ -95,19 +98,9 @@ def test_prefetch_is_the_same_cells_and_the_same_reads(tmp_path, monkeypatch, ra
     (off, off_reads), (on, on_reads) = _both(
         monkeypatch, ranges, lambda: _batch_reader.flush_prefetch(lg.zarr_group, plan),
     )
-    assert batched  # the experiment ran ...
+    assert batched  # the batched reader ran ...
     assert on == off and any(on.values())  # ... and read the same cells
     assert on_reads == off_reads and on_reads
-
-
-def test_off_is_the_per_cell_reader(tmp_path, monkeypatch):
-    lg = _level(tmp_path / "s.zv")
-
-    def _no(*a, **k):
-        raise AssertionError("batch_cells ran with the experiment off")
-
-    monkeypatch.setattr(_batch_reader, "_sharded_read_batched", _no)
-    assert _batch_reader.flush_prefetch(lg.zarr_group, _plan(lg))
 
 
 def test_few_cells_an_array_take_the_per_cell_reader(tmp_path, monkeypatch):

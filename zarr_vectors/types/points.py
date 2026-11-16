@@ -923,6 +923,12 @@ def _read_points(
     # tiling claim lets the positions skip it.
     if not skip_fragments or attribute_names:
         prefetch_plan.append((VERTEX_FRAGMENTS, chunk_key_strs))
+    elif chunk_key_strs:
+        # The first chunk's index alone, which re-checks the tiling claim
+        # (below).  Planned, so a query replaying this reader fetches that
+        # one cell; read unplanned, it fanned out to every cell of
+        # ``vertex_fragments``.
+        prefetch_plan.append((VERTEX_FRAGMENTS, chunk_key_strs[:1]))
     if attribute_names:
         for attr_name in attribute_names:
             prefetch_plan.append((f"{VERTEX_ATTRIBUTES}/{attr_name}", chunk_key_strs))

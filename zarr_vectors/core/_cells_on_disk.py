@@ -363,9 +363,8 @@ def read_local(
 def _coalescing(src: CellSource | None = None) -> tuple[str, int, int]:
     """``ZARR_VECTORS_COALESCE``: how neighbouring cells of a shard of ``src``
     share a read when that array is read by the optimised reader (see
-    ``_batch_reader.shard_reader_for``: under the default ``auto``, a
-    zarr-octree array); an array read by the standard reader -- and, under
-    ``auto``, ``src`` None -- reads one range per cell.
+    ``_batch_reader.shard_reader_for``: under the default ``auto``, every
+    array); an array read by the standard reader reads one range per cell.
 
     ``auto`` (the default): a zarr-octree shard's wanted cells are read one
     range per run -- first to last wanted cell -- and any other shard's as
@@ -441,9 +440,13 @@ def read_cells(
             continue
         cells = np.asarray(cells, dtype=np.int64).reshape(-1, len(src.shape))
         if r in indexes:
-            ranges, errors = _locate(src, cells, lambda keys, got=indexes[r]: {k: got[k] for k in keys})
+            ranges, errors = _locate(
+                src, cells, lambda keys, got=indexes[r]: {k: got[k] for k in keys},
+            )
         else:
-            ranges, errors = _locate(src, cells, lambda keys, src=src: dict(zip(keys, read_indexes(src, keys))))
+            ranges, errors = _locate(
+                src, cells, lambda keys, src=src: dict(zip(keys, read_indexes(src, keys))),
+            )
         for i, message in errors.items():
             out[r][i] = ValueError(message)
         rows += [(r, i, src.store, rng.key, rng.offset, rng.size, rng.run) for i, rng in enumerate(ranges) if rng is not None]
@@ -487,16 +490,11 @@ def _prefetch_indexes(
 ) -> dict[int, dict[str, Any]]:
     """The shard indexes every store-backed request needs, read at once.
 
-    Experiment ``gather_indexes``.  Without it each array's indexes are
-    gathered in turn, so a read of several arrays (vertices, fragments,
-    links) spends one round trip per array before any cell is fetched.
-    Returns ``{request: {shard key: index}}``; empty when off or when at
-    most one array would read indexes.
+    Gathered array by array, a read of several arrays (vertices,
+    fragments, links) would spend one round trip per array before any
+    cell is fetched.  Returns ``{request: {shard key: index}}``; empty
+    when at most one array would read indexes.
     """
-    from zarr_vectors._experiments import enabled
-
-    if not enabled("gather_indexes"):
-        return {}
     wanted: list[tuple[int, CellSource, list[str]]] = []
     for r, (src, cells) in enumerate(requests):
         if src.local_root is not None or src.shard_shape is None:
@@ -567,7 +565,8 @@ def read_cell_spans(
     on_disk: list[tuple[int, tuple[str, int, int]]] = []
     in_store: dict[int, list[tuple[int, Any, str, int, int]]] = {}
     n_reads = 0
-    for src, cells in requests:
+    prefetched = _prefetch_indexes(requests)
+    for r, (src, cells) in enumerate(requests):
         cells = np.asarray(cells, dtype=np.int64).reshape(-1, len(src.shape))
         read = np.full(len(cells), -1, dtype=np.int64)
         start = np.zeros(len(cells), dtype=np.int64)
@@ -584,7 +583,10 @@ def read_cell_spans(
         inner = np.ravel_multi_index((cells % shard_shape).T, src.shard_shape)
         shard_coords = np.stack(np.unravel_index(shards, grid), axis=1)
         keys = [_key(src, tuple(s)) for s in shard_coords.tolist()]
-        indexes = read_indexes(src, keys)
+        if r in prefetched:
+            indexes = [prefetched[r][k] for k in keys]
+        else:
+            indexes = read_indexes(src, keys)
         width = 3 if src.index_format == "zarr_octree" else 2
         rows = np.full((len(cells), width), _EMPTY, dtype=np.uint64)
         bad = np.zeros(len(cells), dtype=bool)

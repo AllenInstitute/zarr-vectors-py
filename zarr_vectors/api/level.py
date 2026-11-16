@@ -797,17 +797,19 @@ class Level:
         care — or it raises the genuine error, unobscured.  The cost is
         having done the work twice on the rare read that needs it.
 
-        With the ``octree_read_once`` experiment, a level with octree
-        chunks skips the engine: the reader is called once, directly.
+        Two kinds of level skip the engine, the reader called once,
+        directly: one with octree chunks (the engine's plan names uniform
+        cells, so its prefetch is wasted and each replay re-reads the leaf
+        table), and one whose presence is deferred (see
+        :func:`zarr_vectors.building.defer_presence`), whose arrays carry
+        no ``nonempty_chunks``: an offline replay cannot ask the store
+        which cells are there, and so read none.
         """
         self._check_supported(selection)
         reader, supports, adapter = self._reader()
         kwargs = self._reader_kwargs(selection, supports)
         group = self._dataset._group
-        if self._octree_read_once(selection):
-            # The reader resolves the leaves and batches their reads
-            # itself; the engine's plan names uniform cells, so its
-            # prefetch is wasted and each replay re-reads the leaf table.
+        if self._octree_read_once(selection) or self._presence_deferred(selection):
             return self._finish(reader(group, **kwargs), adapter, selection)
         try:
             from zarr_vectors._engine.execute import execute
@@ -839,17 +841,24 @@ class Level:
             raw = reader(group, **kwargs)
         return self._finish(raw, adapter, selection)
 
-    def _octree_read_once(self, selection: Selection) -> bool:
-        """Whether ``octree_read_once`` is on and the selection's level
-        has octree chunks, from the level metadata the plan reads anyway."""
-        from zarr_vectors._experiments import enabled
-
-        if not enabled("octree_read_once"):
-            return False
-        target = (
+    def _target(self, selection: Selection) -> Level:
+        return (
             self if selection.level in (None, self._index)
             else self._dataset.level(selection.level)
         )
+
+    def _presence_deferred(self, selection: Selection) -> bool:
+        """Whether the selection's level declares its presence deferred."""
+        try:
+            return self._target(selection).store.presence_deferred()
+        except (ArrayError, StoreError, KeyError):
+            return False
+
+    def _octree_read_once(self, selection: Selection) -> bool:
+        """Whether the selection's level has octree chunks, from the level
+        metadata the plan reads anyway: such a level is read by its reader
+        once, without the engine's prefetch of uniform cells and replays."""
+        target = self._target(selection)
         try:
             meta = target._metadata()
         except (ArrayError, StoreError, MetadataError, KeyError):
@@ -861,13 +870,20 @@ class Level:
 
         Reuses :func:`zarr_vectors.core.aio.read_async`, which supplies
         any reader's I/O up front and replays it offline — so the async
-        path is the sync reader, not a second implementation of it.
+        path is the sync reader, not a second implementation of it.  A
+        level whose presence is deferred cannot be replayed offline (see
+        :meth:`_execute`), so its reader runs directly in a worker thread.
         """
         from zarr_vectors.core.aio import read_async
 
         self._check_supported(selection)
         reader, supports, adapter = self._reader()
         kwargs = self._reader_kwargs(selection, supports)
+        if self._presence_deferred(selection):
+            import asyncio
+
+            raw = await asyncio.to_thread(reader, self._dataset._group, **kwargs)
+            return self._finish(raw, adapter, selection)
         raw = await read_async(reader, self._dataset._group, **kwargs)
         return self._finish(raw, adapter, selection)
 

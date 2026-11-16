@@ -771,10 +771,8 @@ SHARD_READERS = ("auto", "standard", "optimised", "zarr")
 def shard_reader() -> str:
     """How sharded arrays are read: ``ZARR_VECTORS_SHARD_READER``.
 
-    ``auto`` (the default): per array, by its sharding codec -- an array
-    written with zarr-octree's ``zarr_octree_sharding`` is read as
-    ``optimised``, every other array exactly as ``standard`` (see
-    :func:`shard_reader_for`).  ``standard``: as zarr-vectors always has
+    ``auto`` (the default): ``optimised``, for every sharding codec (see
+    :func:`shard_reader_for`).  ``standard``: as zarr-vectors always had
     -- a local store's shards read off the filesystem, each shard's index
     once for a batch and one range per wanted cell; any other store
     through zarr's array API.  ``optimised``: through
@@ -797,19 +795,18 @@ def shard_reader() -> str:
 def shard_reader_for(src: Any, mode: str | None = None) -> str:
     """The reader one array gets: ``standard``, ``optimised`` or ``zarr``.
 
-    ``mode`` (default :func:`shard_reader`) as it stands, but for ``auto``,
-    which is decided by the array -- ``src``, its
-    :class:`~zarr_vectors.core._cells_on_disk.CellSource`: ``optimised``
-    for a zarr-octree shard index, which only that reader reads by run;
-    ``standard`` for anything else (``sharding_indexed``, unsharded, or
-    ``None``: no layout recognised), so a store without zarr-octree reads
-    as it always has.  Decided once per array, never per cell.
+    ``mode`` (default :func:`shard_reader`) as it stands, but ``auto`` is
+    ``optimised`` for every array ``src`` (its
+    :class:`~zarr_vectors.core._cells_on_disk.CellSource`), whatever its
+    shard index.  ``auto`` once read a ``sharding_indexed`` array
+    ``standard``, which behind an object store goes through zarr's
+    sharded reader one cell at a time: ten point objects of a 200k-vertex
+    store took 11 s at 20 ms a request, against 0.9 s optimised.
+    Decided once per array, never per cell.
     """
     if mode is None:
         mode = shard_reader()
-    if mode != "auto":
-        return mode
-    return "optimised" if getattr(src, "index_format", None) == "zarr_octree" else "standard"
+    return "optimised" if mode == "auto" else mode
 
 
 class _ShardedSpec(NamedTuple):
@@ -823,8 +820,8 @@ class _ShardedSpec(NamedTuple):
 def _sharded_spec(node: Any) -> _ShardedSpec | None:
     """A :class:`_ShardedSpec` for a sharded vlen array, else None: always
     under :func:`shard_reader` ``zarr``, and for a store that is not local
-    when the array is read ``standard`` (see :func:`shard_reader_for`:
-    under the default ``auto``, every array but a zarr-octree one).
+    when the array is read ``standard`` (see :func:`shard_reader_for`;
+    never under the default ``auto``).
 
     zarr reads a sharded cell through the sharding codec one cell at a
     time -- the shard's index, then the cell's range, each a round trip
@@ -870,10 +867,9 @@ def _sharded_read_plan(
     hold are omitted, a cell with nothing stored reads as ``b""``, and a
     cell that cannot be read is omitted (``tolerant``) or raises.
     """
-    from zarr_vectors._experiments import enabled
     from zarr_vectors.core._cells_on_disk import read_cells
 
-    if enabled("batch_cells") and sum(len(k) for *_, k in entries) >= _BATCH_CELLS * len(entries):
+    if sum(len(k) for *_, k in entries) >= _BATCH_CELLS * len(entries):
         return _sharded_read_batched(entries, tolerant=tolerant)
     requests, wanted = [], []
     for array_name, spec, chunk_keys in entries:
@@ -961,9 +957,9 @@ def _sharded_read_batched(
     *,
     tolerant: bool = False,
 ) -> dict[tuple[str, str], bytes]:
-    """:func:`_sharded_read_plan` with the per-cell work done as arrays
-    (experiment ``batch_cells``): keys parsed, cells located and their
-    reads planned for all cells at once (see
+    """:func:`_sharded_read_plan` with the per-cell work done as arrays,
+    when a read averages ``_BATCH_CELLS`` or more cells an array: keys
+    parsed, cells located and their reads planned for all cells at once (see
     :func:`~zarr_vectors.core._cells_on_disk.read_cell_spans`), and each
     cell decompressed straight out of its read. Same reads, same results.
     """

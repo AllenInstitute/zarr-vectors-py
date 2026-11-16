@@ -193,7 +193,7 @@ async def _fetch_chunks(
         if sync_root is not None and isinstance(node, zarr.Array):
             spec = _direct_spec(sync_root, array_path, node)
             # The optimised reader's arrays (see shard_reader_for: under
-            # the default, zarr-octree ones); the rest gather, as always.
+            # the default, every sharded one); the rest gather, as always.
             if spec is None and shard_reader() != "standard":
                 shard_spec = _sharded_spec(node)
                 if shard_spec is not None and shard_reader_for(shard_spec.source) == "optimised":
@@ -298,17 +298,13 @@ async def _fetch_listings(
     :func:`read_async` reports which read needed listing instead of
     spinning.
     """
-    from zarr_vectors._experiments import enabled
     from zarr_vectors._query_nodes import listing as primed_listing
     from zarr_vectors._query_nodes import remember
 
-    once = enabled("prime_nodes")
-
     async def one(path: str) -> tuple[str, list[str]] | None:
-        if once:
-            known = primed_listing(root.store, path)
-            if known is not None:
-                return path, known
+        known = primed_listing(root.store, path)
+        if known is not None:
+            return path, known
         try:
             node = await root.getitem(path) if path else root
         except KeyError:
@@ -316,21 +312,17 @@ async def _fetch_listings(
         if not isinstance(node, zarr.AsyncGroup):
             return path, []
         try:
-            if once:
-                # One pass over the children, not one for arrays and one
-                # for groups: each pass loads every child's zarr.json.
-                # The children it loads are kept for the rest of the query.
-                names = set()
-                async for name, child in node.members():
-                    names.add(name)
-                    wrapped = (
-                        zarr.Array(child) if isinstance(child, zarr.AsyncArray)
-                        else zarr.Group(child)
-                    )
-                    remember(root.store, f"{path}/{name}" if path else name, wrapped)
-            else:
-                names = {k async for k in node.array_keys()}
-                names |= {k async for k in node.group_keys()}
+            # One pass over the children, not one for arrays and one for
+            # groups: each pass loads every child's zarr.json.  The
+            # children it loads are kept for the rest of the query.
+            names = set()
+            async for name, child in node.members():
+                names.add(name)
+                wrapped = (
+                    zarr.Array(child) if isinstance(child, zarr.AsyncArray)
+                    else zarr.Group(child)
+                )
+                remember(root.store, f"{path}/{name}" if path else name, wrapped)
         except Exception:
             return None
         return path, sorted(names)

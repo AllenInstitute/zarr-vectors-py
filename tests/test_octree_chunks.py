@@ -37,6 +37,7 @@ import numpy as np
 import pytest
 
 import zarr_vectors as zv
+from zarr_vectors.api.level import Level
 from zarr_vectors.constants import CAP_OCTREE_CHUNKS
 from zarr_vectors.core.arrays import (
     _parse_chunk_key,
@@ -278,12 +279,15 @@ def test_select_on_an_octree_level(graph_store, tmp_path):
     assert len(a.edges) == len(b.edges)
 
 
+_READ_ONCE = Level._octree_read_once
 _SELECTIONS = [{}, {"bbox": ([40, 40, 40], [160, 160, 160])}, {"bbox": ([0, 0, 0], [30, 30, 30])},
                {"objects": [3]}, {"objects": [0, 17, 150, 199]}]
 
 
-def _reads(path, monkeypatch, experiments):
-    monkeypatch.setenv("ZARR_VECTORS_EXPERIMENTS", experiments)
+def _reads(path, monkeypatch, once):
+    """Each selection's answer, the level read once (``once``) or through
+    the engine's plan and replays, as a uniform level is."""
+    monkeypatch.setattr(Level, "_octree_read_once", _READ_ONCE if once else lambda self, sel: False)
     out = []
     for sel in _SELECTIONS:
         q = zv.open(path).level(0).select(**sel)
@@ -301,8 +305,8 @@ def test_octree_read_once_answers_as_before(graph_store, tmp_path, monkeypatch, 
         write_points(octr, pos, chunk_shape=(CELL,) * 3, bounds=([0] * 3, [BOX] * 3),
                      object_ids=(np.arange(len(pos)) // 40).astype(np.int64))
         to_octree(octr, target=250)
-    off = _reads(octr, monkeypatch, "")
-    on = _reads(octr, monkeypatch, "octree_read_once")
+    off = _reads(octr, monkeypatch, False)
+    on = _reads(octr, monkeypatch, True)
     for a, b in zip(off, on):
         for x, y in zip(a, b):
             if x is None or y is None:
@@ -327,12 +331,11 @@ def test_octree_read_once_reads_once(graph_store, tmp_path, monkeypatch):
     monkeypatch.setattr(LeafTable, "from_rows",
                         classmethod(lambda cls, *a, **k: tables.append(1) or from_rows(cls, *a, **k)))
     monkeypatch.setattr(engine, "execute", lambda *a, **k: runs.append(1) or execute(*a, **k))
-    monkeypatch.setenv("ZARR_VECTORS_EXPERIMENTS", "octree_read_once")
     zv.open(octr).level(0).select(bbox=box).read()
     assert (len(tables), len(runs)) == (1, 0)
     zv.open(uni).level(0).select(bbox=box).read()
     assert len(runs) == 1
-    monkeypatch.setenv("ZARR_VECTORS_EXPERIMENTS", "")
+    monkeypatch.setattr(Level, "_octree_read_once", lambda self, sel: False)
     tables.clear()
     zv.open(octr).level(0).select(bbox=box).read()
     assert len(tables) > 1 and len(runs) == 2
