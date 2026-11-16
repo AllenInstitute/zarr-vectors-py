@@ -246,47 +246,20 @@ def refresh_root_node(
     name: str | None = None,
     axes: list[dict[str, str]] | None = None,
 ) -> dict[str, Any]:
-    """Rebuild the root ``ome`` block from what is on disk, and write it.
+    """Rebuild the root ``ome`` block from the level groups on disk, and write it.
 
-    The level list is derived from the store's level groups rather than
-    maintained alongside them, so it cannot drift: every path that adds or
-    removes a level calls this and the answer comes from the same place a
-    reader would look.  (The same reasoning as
-    :func:`zarr_vectors.building.refresh_arrays_present`.)
-
-    **What is rebuilt and what is kept.**  This function owns the node's
-    ``version``, ``type``, ``name``, ``attributes.scene``, and the
-    *level entries* of ``nodes``.  Everything else is kept as found:
-
-    * any other key of ``attributes`` (a ``zv:companionImage``, say);
-    * any other top-level key of the node;
-    * every **foreign** child in ``nodes`` — one for which
-      :func:`is_owned_node` is false — verbatim and in its original
-      relative order, after the level entries.
-
-    So a tool that files its own node here (a back-reference from the
-    store to the collection that contains it is the motivating case)
-    keeps it across ``build_pyramid``, ``remove_resolution_level`` and
-    :func:`zarr_vectors.building.stamp_ome_node`, all of which call this.
-
-    Two things are *not* kept, both with a :class:`UserWarning` naming
-    them, because keeping them would make the written node illegal:
-
-    * a foreign child that is not a JSON object (it is not a node);
-    * a foreign child whose ``name`` equals a level's name.  RFC 8
-      requires child names to be unique within a collection, and the
-      level list is the side derived from disk, so it wins.  Level names
-      are the decimal level indices, so a foreign node never collides
-      with one unless it is named like a level.
+    Rebuilds ``version``, ``type``, ``name``, ``attributes.scene`` and the
+    level entries of ``nodes``; every other key, and every foreign child
+    (see :func:`is_owned_node`) in its original order after the levels, is
+    kept.  A foreign child that is not a JSON object, or that is named
+    like a level, is dropped with a :class:`UserWarning`.
 
     Args:
         root: Store root group.
-        name: Store name.  ``None`` keeps the name already recorded, and
-            derives one from the store URL when there is none — so a name
-            set once is not overwritten by a later level being added.
-        axes: NGFF axis descriptors.  ``None`` reads them from the
-            existing ``world`` declaration, falling back to
-            ``multiscales[0].axes``.
+        name: Store name.  ``None`` keeps the recorded name, else derives
+            one from the store URL.
+        axes: NGFF axis descriptors.  ``None`` reads the existing
+            ``world`` declaration, falling back to ``multiscales[0].axes``.
 
     Returns:
         The block as written.
@@ -310,10 +283,6 @@ def refresh_root_node(
         name=name, axes=axes, levels=list_resolution_levels(root),
     )
 
-    # Preserve anything a caller put on the node that this function does
-    # not own -- a ``zv:companionImage`` reference, say.  Only the keys
-    # built above are authoritative, and of ``nodes`` only the level
-    # entries.
     merged_attributes = dict(existing.get("attributes") or {})
     merged_attributes.update(node["attributes"])
     merged_nodes = node["nodes"] + _foreign_nodes(
@@ -332,24 +301,9 @@ def refresh_root_node(
 def is_owned_node(child: Any) -> bool:
     """Whether a child of the root's ``nodes`` list is one this package writes.
 
-    **The rule:** a child is owned iff it is a JSON object whose ``type``
-    is exactly :data:`NODE_TYPE_LEVEL` (``"zv:level"``).  Owned children
-    are regenerated from the level groups on disk by every refresh, so a
-    stale one disappears and anything a caller added *to* one is lost.
-    Every other child is foreign and is carried through unchanged — a
-    core ``collection`` or ``multiscale``, another tool's prefixed type,
-    or a ``zv:``-prefixed type other than ``zv:level``.
-
-    Keyed on the type rather than on the ``zv:`` prefix as a whole for
-    the same reason the attributes merge is keyed on ``scene`` rather
-    than on every ``zv:`` key: the refresh owns what it builds and
-    nothing more, so a ``zv:`` identifier some other part of this
-    package (or a caller) files here is not silently discarded.
-
-    When the level entries become ``collection`` nodes carrying a
-    ``path`` (the 0.10.0 re-seating described above), a core type can no
-    longer say "this is a level", and this predicate must grow a marker
-    those entries carry.  That is why the rule lives in one function.
+    True iff it is a JSON object whose ``type`` is exactly
+    :data:`NODE_TYPE_LEVEL` (not any ``zv:`` type).  Owned children are
+    regenerated by every refresh; all others are carried through unchanged.
     """
     return isinstance(child, dict) and child.get("type") == NODE_TYPE_LEVEL
 
@@ -357,11 +311,8 @@ def is_owned_node(child: Any) -> bool:
 def _foreign_nodes(
     existing: Any, *, level_names: set[str],
 ) -> list[dict[str, Any]]:
-    """The children of an existing ``nodes`` list that a refresh keeps.
-
-    See :func:`refresh_root_node` for why the two dropped cases are
-    dropped rather than kept.
-    """
+    """The children of an existing ``nodes`` list that a refresh keeps
+    (see :func:`refresh_root_node`)."""
     import warnings
 
     kept: list[dict[str, Any]] = []
@@ -389,11 +340,8 @@ def _foreign_nodes(
 
 
 def _axes_from_node(node: dict[str, Any]) -> list[dict[str, str]] | None:
-    """The ``world`` axes already declared on a node, if any.
-
-    Matched by ``id`` or by ``name``: a store stamped before the ``id``
-    was added declares the system by ``name`` alone.
-    """
+    """The ``world`` axes already declared on a node, matched by ``id`` or
+    (older stores) ``name``."""
     scene = (node.get("attributes") or {}).get("scene") or {}
     for system in scene.get("coordinateSystems") or []:
         if WORLD in (system.get("id"), system.get("name")):

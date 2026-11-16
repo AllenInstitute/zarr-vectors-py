@@ -1,33 +1,13 @@
 """Optional GPU extension: device arrays for zarr-vectors reads and writes.
 
-Installed with ``pip install "zarr-vectors[gpu]"``, or in a conda
-environment by installing cupy from conda-forge (the extra would add a
-second, pip-built cupy). Nothing in the core imports this module at import
-time; it is loaded the first time a device array is involved, through
-``device="cuda"`` on a reader or a device array passed to a writer.
-
-What it does:
-
-- reads (:func:`zarr_vectors.core.cells.read_cells` with
-  ``device="cuda"``) fetch cells' stored bytes into device memory and
-  decode them there (:mod:`._read`, :mod:`._fetch`, :mod:`._kernels`),
-  with zstd through nvCOMP when asked (:mod:`._codecs`);
-- writers handed device arrays run the fragment, manifest and link
-  partition encoders on the device and download the encoded form
-  (:mod:`._encode`);
-- everything else moves arrays between host and device once per array.
-
-Compression and the write itself stay on the host, so the bytes on disk
-are the same whether the arrays came from numpy or from the device.
-:func:`zarr_vectors.runtime_capabilities` reports what this install can
-do (``device_decode``, ``gpu_encode``, ``gpu_codecs``, ``gpu_io``).
-
-Callers should reach this through ``device=`` and ``runtime_capabilities``
-rather than import it: its own surface is not yet promised. The one
-function meant to be imported is :func:`decode_zstd`, for callers that
-fetch zstd-compressed bytes into device memory themselves (a dense image
-reader, say) and want them checked before nvCOMP sees them; its presence
-is advertised in ``zarr_vectors.FEATURES`` as ``"decode-zstd"``.
+Install with ``pip install "zarr-vectors[gpu]"`` (or cupy from conda-forge).
+Loaded lazily, through ``device="cuda"`` or a device array passed to a writer:
+device reads (:mod:`._read`, :mod:`._fetch`, :mod:`._kernels`, :mod:`._codecs`)
+and device encoders (:mod:`._encode`). Compression and writes stay on the
+host, so stored bytes do not depend on where arrays came from. Reach it
+through ``device=`` and :func:`zarr_vectors.runtime_capabilities`; the one
+public import is :func:`decode_zstd` (``FEATURES`` entry ``"decode-zstd"``).
+See ``docs/how_to/gpu.md``.
 """
 
 from __future__ import annotations
@@ -69,36 +49,20 @@ def decode_zstd(
 ) -> tuple[list[Any], dict[int, str]]:
     """Decompress zstd frames in device memory, checking each one first.
 
-    nvCOMP does not validate its input: a truncated frame can hang its
-    kernel, and a damaged one can hit an illegal memory access, which
-    kills the process's CUDA context. So each frame's structure (header,
-    every block header, the exact end) is walked on the device before
-    nvCOMP sees it, and an output is kept only when its length is the
-    content size the frame declares. That catches truncation and broken
-    structure. It cannot catch damage inside a compressed block, which
-    only a content checksum would; decode only data you trust.
+    Catches truncation and broken frame structure, not damage inside a
+    block; decode only trusted data (see ``docs/how_to/gpu.md``).
 
     Args:
-        frames: One zstd frame per entry: C-contiguous device arrays (or
-            anything exposing ``__cuda_array_interface__``), read as bytes.
-            Frames must declare their content size, as zarr's and
-            numcodecs' zstd do.
-        expected_nbytes: The size every frame (an int) or each frame (a
-            sequence) must decode to; a frame declaring anything else is
-            reported, not decoded. ``None`` accepts what frames declare.
-        out: Optional device arrays to decode into, one per frame, each
-            exactly the size its frame declares.
-        stream: A cupy stream to run on; the current stream by default.
-            It is synchronised before returning. The frames must be ready
-            on it: work that produced them on another stream (a copy to
-            the device on the default stream, say) has to be ordered
-            before the call, as for any CUDA stream.
+        frames: C-contiguous device byte buffers, one zstd frame each, each
+            declaring its content size.
+        expected_nbytes: Required decoded size, for all frames or per frame.
+        out: Optional device arrays to decode into, sized as declared.
+        stream: cupy stream (default: current) on which the frames are
+            ready; synchronised on return.
 
     Returns:
-        ``(outputs, errors)``: ``outputs[i]`` is frame ``i`` decoded, as a
-        cupy ``uint8`` array (a view of ``out[i]`` when ``out`` is given),
-        or None, with the reason in ``errors[i]``. Errors are reported,
-        never raised.
+        ``(outputs, errors)``: decoded ``uint8`` arrays or None, with each
+        None's reason in ``errors``. Errors are reported, never raised.
     """
     from zarr_vectors.gpu import _codecs
 

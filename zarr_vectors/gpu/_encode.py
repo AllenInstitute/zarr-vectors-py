@@ -1,18 +1,10 @@
 """The whole-array encoders, run on the device.
 
-A writer handed device arrays used to copy each one to the host and
-encode there. These are the same encoders run where the arrays already
-are, so that what crosses to the host is the *encoded* form, which is
-often much smaller: a fragment that is a run of consecutive vertex
-indices becomes 16 bytes of range table however long it is.
-
-Each function here mirrors its numpy original in
-:mod:`zarr_vectors.encoding.fragments` step for step, raises the same
-errors with the same messages, and returns the same host values; the
-tests compare the bytes. Only the arithmetic moves: every byte is still
-framed, compressed (by libzstd) and written on the host, which is what
-keeps a store written from device arrays identical to one written from
-numpy.
+Each function mirrors its numpy original in
+:mod:`zarr_vectors.encoding.fragments` step for step: same errors and
+messages, same host return values. Only the arithmetic moves; framing,
+compression and writing stay on the host, so stores written from device
+arrays are byte-identical to ones written from numpy.
 """
 
 from __future__ import annotations
@@ -50,8 +42,7 @@ def _scalars(*values: Any) -> list[int]:
 def classify_fragments_csr(indices: Any, offsets: Any, *, force_explicit: bool) -> Any:
     """:func:`~zarr_vectors.encoding.fragments.classify_fragments_csr` on the device.
 
-    Returns host :class:`FragmentSections`: four downloads, of the
-    sections rather than of the indices.
+    Returns host :class:`FragmentSections`.
     """
     from zarr_vectors.encoding.fragments import FragmentSections
 

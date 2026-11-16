@@ -94,4 +94,5 @@ comparisons/ome_zarr
 contributing/spec_change_process
 contributing/adding_geometry_types
 contributing/test_compliance
+contributing/implementation_notes
 ```

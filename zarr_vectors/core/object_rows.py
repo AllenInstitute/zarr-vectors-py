@@ -1,34 +1,12 @@
 """Reserving the object layer's rows, and writing ranges of them in place.
 
-The object layer's ``at=`` writes are a resume cursor: a write below the
-current length truncates everything after it (a torn flush's residue),
-one above it pads the gap, and every call resizes the arrays and rewrites
-their shape metadata. That is right for one writer resuming after a crash
-and wrong for several writers filling disjoint row ranges at once: the
-second writer's pad or truncation lands in the first writer's rows, and
-the shape metadata is read-modify-written by all of them.
-
-So a parallel writer works in two steps:
-
-1. The coordinator calls :func:`reserve_object_rows` once: every
-   object-layer array it names is created or grown to the final row count
-   (and, for a dense index, the final block count), so nothing is resized
-   later.
-2. Each worker writes its rows with ``mode="place"``
-   (:func:`place_manifests`, :func:`place_attribute_columns`): the rows
-   ``[at, at + n)`` only -- no resize, no padding, no metadata. Ranges of
-   different workers must not share a storage object:
-   :func:`concurrency_contract` gives the alignment.
-
-Then :func:`~zarr_vectors.core.arrays.commit_object_index` commits the
-count, once. Every reserved row below it must have been written -- an
-object with no fragments is written as an empty manifest -- and the
-commit refuses rows nobody wrote where it can see them: a stored id table
-fills with ``-1``, and a vlen row of a bucket that was partly written
-reads ``b""`` (zarr fills the other rows of a chunk it creates with the
-type's default, not the array's fill value). Rows of a bucket nobody wrote
-read as empty objects either way: a vlen index is created with the empty
-manifest as its fill, a dense one's spans with ``(0, 0)``.
+For several processes filling disjoint row ranges at once, which the ``at=``
+resume cursor (it resizes, pads and truncates) cannot serve: the coordinator
+calls :func:`reserve_object_rows` once, each worker writes an aligned range
+with ``mode="place"`` (:func:`place_manifests`, :func:`place_attribute_columns`;
+alignment from :func:`concurrency_contract`), then
+:func:`~zarr_vectors.core.arrays.commit_object_index` commits the count once,
+refusing reserved rows nobody wrote where it can tell.
 """
 
 from __future__ import annotations
@@ -57,12 +35,10 @@ UNWRITTEN_ID = -1
 def row_alignment(level_group: Group | None = None) -> tuple[int, int]:
     """``(rows, blocks)``: the alignment disjoint writers' ranges need.
 
-    A range must start at a multiple and end at one (or at the reserved
-    end), so no two writers touch one storage object: the object layer's
-    shard when it is sharded, else the largest row bucket -- 65,536
-    attribute rows, and a dense index's blocks as their array is chunked
-    (65,536 rows when created now, 16,384 in an index created before; a
-    new index's without ``level_group``).
+    Ranges start and end at multiples (or the reserved end) so no two writers
+    share a storage object: the object layer's shard when sharded, else the
+    row bucket (65,536 attribute rows; dense blocks as their array is chunked,
+    16,384 in older indexes, a new index's without ``level_group``).
     """
     import zarr
 
@@ -83,22 +59,17 @@ def row_alignment(level_group: Group | None = None) -> tuple[int, int]:
 def concurrency_contract(level_group: Group | None = None) -> dict[str, Any]:
     """What several processes may write into one store at once.
 
-    - ``shard_is_unit``: per-chunk arrays (vertices, fragments, links and
-      their attributes) may be written by many processes if each storage
-      object -- a cell, or the shard holding it -- is written by one
-      process at a time. Presence stamps are shared state: defer them
-      (``defer_presence``) and record them once afterwards.
-    - ``concurrent_at_ranges``: the object layer may be filled by many
-      processes after one :func:`reserve_object_rows`, each writing its
-      own ``[at, at + n)`` with ``mode="place"``, when ``at`` and
-      ``at + n`` are multiples of ``at_alignment`` (the last range may end
-      at the reserved end). Then one ``commit_object_index``.
-    - ``at_alignment`` / ``block_alignment``: those multiples, for rows
-      and (dense index) for ``block_at``; for ``level_group`` if given,
-      else for a new, unsharded object layer (65,536 both).
+    - ``shard_is_unit``: per-chunk arrays may be written concurrently if each
+      storage object (cell or shard) has one writer at a time; presence must
+      be deferred (``defer_presence``) and recorded once afterwards.
+    - ``concurrent_at_ranges``: after one :func:`reserve_object_rows`, the
+      object layer may be filled by ``mode="place"`` ranges ``[at, at + n)``
+      at multiples of ``at_alignment`` (the last may end at the reserved
+      end); then one ``commit_object_index``.
+    - ``at_alignment`` / ``block_alignment``: those multiples, for rows and
+      dense ``block_at`` (a new unsharded layer's without ``level_group``).
 
-    Not covered: the ``at=`` append mode (a resume cursor, one writer at
-    a time), metadata writes (one coordinator), and two processes writing
+    Not covered: ``at=`` appends, metadata writes, and two processes writing
     one link cell.
     """
     rows, blocks = row_alignment(level_group)
@@ -128,12 +99,8 @@ def _create_empty(
     serializer: Any = None,
     compressors: list[dict[str, Any]] | None = None,
 ) -> None:
-    """Create an array of ``shape`` without writing a byte of it.
-
-    Every row reads as ``fill_value`` until written, which is what makes
-    reserving a billion rows cost one ``zarr.json``. ``compressors``: a
-    codecs list for this array, else the write session's.
-    """
+    """Create an array of ``shape`` without writing data (rows read as
+    ``fill_value``); ``compressors`` defaults to the write session's."""
     from zarr.errors import UnstableSpecificationWarning
 
     parent_path, _, leaf = path.rpartition("/")
@@ -189,40 +156,13 @@ def reserve_object_rows(
 ) -> dict[str, Any]:
     """Size the object layer for ``n_objects`` rows, once, before workers write.
 
-    Creates, or grows (never shrinks), every array a parallel fill will
-    write, so that no worker resizes anything:
-
-    - the object index, in its existing layout or, new, in ``layout``
-      (default: the store's ``manifest_layout``): a vlen index's
-      ``manifests``, or a dense one's ``manifest_spans`` and -- when
-      ``n_blocks`` is given -- ``manifest_blocks``; plus the id table,
-      where the layout stores one;
-    - each of ``columns``, ``{name: dtype}``, ``{name: (dtype,
-      row_shape)}`` or ``{name: (dtype, row_shape, fill_value)}``, as
-      :func:`~zarr_vectors.core.arrays.write_object_attributes` would
-      create it.
-
-    New arrays are created empty: nothing is written until a worker
-    writes its rows. ``num_objects`` is not touched:
-    :func:`~zarr_vectors.core.arrays.commit_object_index` commits it, and
-    refuses reserved rows nobody wrote where it can tell (see the module
-    docstring).
-
-    Args:
-        n_objects: Rows the layer will hold.
-        sid_ndim: Spatial-index rank, for a new index (default: the level's).
-        layout: ``"vlen"`` or ``"dense"``, for a new index.
-        n_blocks: Dense only: rows of ``manifest_blocks`` to reserve --
-            at least the fragments every worker will write, each worker's
-            region aligned (see :func:`concurrency_contract`).
-        columns: Object attribute columns to reserve.
-        shard_rows: Create new arrays sharded at this many rows (a
-            multiple of 65,536). ``None`` follows the layer's existing
-            layout. Refused if the layer already has another.
-        block_dtype: Dense only: ``"int64"`` or ``"int32"`` for a new
-            ``manifest_blocks`` (default: the store's
-            ``manifest_block_dtype``). Blocks that exist keep theirs, and
-            another value is refused. Ignored for a vlen index.
+    Creates empty, or grows (never shrinks), the object index in its layout
+    (new: ``layout``, default the store's), its id table, dense
+    ``manifest_blocks`` to ``n_blocks`` rows (every worker's aligned region),
+    and each of ``columns`` (``{name: dtype | (dtype, row_shape[, fill])}``).
+    ``shard_rows`` (a multiple of 65,536) shards new arrays, refused if the
+    layer has another; dense ``block_dtype`` must match existing blocks.
+    Leaves ``num_objects`` to :func:`~zarr_vectors.core.arrays.commit_object_index`.
 
     Returns:
         ``{"rows", "layout", "arrays", "at_alignment", "block_alignment"}``.
@@ -323,9 +263,8 @@ def reserve_object_rows(
             if _grow(level_group, path, n):
                 touched.append(path)
                 if bytes(node.fill_value or b"") != _EMPTY_MANIFEST_BLOB:
-                    # An index created before reservation filled with b"",
-                    # which not every manifest reader accepts: give the new
-                    # rows the empty manifest now, bucket by bucket.
+                    # An older index fills with b"", which not every manifest
+                    # reader accepts: write the empty manifest into new rows.
                     node = level_group.zarr_group[path]
                     for lo in range(n0, n, OBJECT_INDEX_MANIFEST_BUCKET):
                         hi = min(lo + OBJECT_INDEX_MANIFEST_BUCKET, n)
@@ -428,16 +367,12 @@ def place_manifests(
 ) -> tuple[int, int]:
     """Write manifests into reserved rows ``[at, at + n)``, and nothing else.
 
-    No resize, no padding, no metadata write -- so disjoint, aligned
-    ranges may be written by several processes at once. Give encoded
-    ``manifest_blobs`` (vlen) or CSR ``offsets`` / ``coords`` / ``frags``
-    (either layout). A dense index also needs ``block_at``: the first row
-    of ``manifest_blocks`` this call's fragments occupy, inside the
-    reservation and aligned like ``at``. Where the layout stores ids,
-    ``ids`` names the rows' objects (default: the rows themselves). The
-    blocks are checked against the reserved array's dtype (an ``int32``
-    index refuses a value that does not fit), and ``block_dtype``, if
-    given, must be that dtype.
+    No resize, padding or metadata, so disjoint aligned ranges may be written
+    concurrently. Give ``manifest_blobs`` (vlen) or CSR ``offsets`` /
+    ``coords`` / ``frags`` (either layout). Dense also needs ``block_at``, the
+    first ``manifest_blocks`` row, aligned like ``at``; blocks must fit the
+    reserved dtype, which ``block_dtype`` must equal if given. ``ids`` names
+    the rows' objects where the layout stores ids (default: the rows).
 
     Returns:
         ``(at, n)``.
@@ -512,8 +447,7 @@ def place_attribute_columns(
 ) -> None:
     """Write attribute rows into reserved rows ``[at, at + n)``, and nothing else.
 
-    The in-place twin of the append mode: no resize, no gap fill, no
-    metadata. Every column must have been reserved
+    No resize, gap fill or metadata; every column must be reserved
     (:func:`reserve_object_rows`) to at least ``at + n`` rows.
     """
     from zarr_vectors import _xp

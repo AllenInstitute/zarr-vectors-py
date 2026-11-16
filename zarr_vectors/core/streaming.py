@@ -100,8 +100,6 @@ class ObjectIndexAppender:
         from zarr_vectors.core import dense_manifests as dense
         from zarr_vectors.core.arrays import _index_layout_for_write
 
-        # A dense index (see zarr_vectors.core.dense_manifests) is appended
-        # to as arrays; otherwise the vlen path below.
         self._dense = _index_layout_for_write(level_group) == "dense"
         if self._dense:
             empty = np.zeros(1, dtype=np.int64)
@@ -279,8 +277,7 @@ class ObjectIndexAppender:
                 OBJECT_IDS_SORTED_ATTR: True,
             })
         else:
-            # Counted as appended, plus whatever rows [0, base_oid) held:
-            # without it, the first patch took every slot for present.
+            # Present rows below base_oid count too.
             self._level_group.write_array_meta(OBJECT_INDEX, {
                 "zv_array": "object_index",
                 "num_objects": total,

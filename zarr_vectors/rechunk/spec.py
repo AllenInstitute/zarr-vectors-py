@@ -68,11 +68,8 @@ class DimensionMapper:
 
     Attributes:
         labels: Set by :meth:`map_objects`: ``{bin_index: label}``, the
-            value a reader passes to select that bin.  A categorical bin
-            is labelled by its value, a bin cut by edges by its lower
-            edge, and a group bin by its group index (``-1`` for the
-            ungrouped).  Empty for ``by="spatial"``, which has no bins
-            to select between.
+            value a reader passes to select that bin (see
+            :class:`RechunkSpec`).  Empty for ``by="spatial"``.
     """
 
     def __init__(self, spec: RechunkSpec) -> None:

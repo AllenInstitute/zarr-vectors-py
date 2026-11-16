@@ -1,23 +1,11 @@
 """Whether reads can use GPUDirect Storage, and which way a device read goes.
 
-A device read of local files goes one of two ways (see
-:mod:`zarr_vectors.gpu._fetch`): ``kvikio``, straight into device memory,
-or ``host``, plain reads into pinned host memory and one copy up. kvikio
-is only worth it with GPUDirect Storage (GDS); without it cuFile reads
-through a bounce buffer, one copy per cell, which the host path does in
-one copy for all of them.
-
-"With GDS" is cuFile's own verdict, ``is_gds_available``: it needs the
-nvidia-fs driver and a supported filesystem. kvikio's compat-mode
-setting cannot tell: its default, ``AUTO``, is the same whether or not
-GDS works, and ``is_compat_mode_preferred()`` is False whenever libcufile
-loads, even when cuFile then falls back to POSIX reads.
-
-kvikio moved its settings between releases (``defaults.compat_mode()``
-in 25.x, ``defaults.get("compat_mode")`` in 26.x; cuFile's properties
-likewise), so everything here asks both ways and answers ``host`` rather
-than raise. This module does not import cupy, so
-:func:`zarr_vectors.runtime_capabilities` and the CPU tests can use it.
+Local device reads go through ``kvikio`` (straight to device memory) or
+``host`` (pinned host reads, one copy up); kvikio is only worth it with GDS.
+"With GDS" is cuFile's ``is_gds_available`` verdict: kvikio's compat-mode
+setting cannot tell. Settings are read both the kvikio 25.x and 26.x way,
+answering ``host`` rather than raising. No cupy import, so
+:func:`zarr_vectors.runtime_capabilities` and CPU tests can use it.
 """
 
 from __future__ import annotations
@@ -119,11 +107,9 @@ def check_io(io: str) -> None:
 def choose_io(io: str = "auto") -> Literal["kvikio", "host"]:
     """The read path for local files: ``"kvikio"`` or ``"host"``.
 
-    An explicit ``io`` wins; ``"auto"`` defers to ``$ZARR_VECTORS_GPU_IO``
-    (``kvikio`` or ``host``; anything else is ``auto``), and ``auto``
-    itself is ``kvikio`` only when :func:`gds_status` says GDS is
-    available. Asking for ``kvikio`` without GDS still works: kvikio then
-    reads in compatibility mode.
+    ``"auto"`` defers to ``$ZARR_VECTORS_GPU_IO`` (``kvikio`` or ``host``),
+    else is ``kvikio`` only when :func:`gds_status` reports GDS available.
+    Explicit ``kvikio`` without GDS runs in compatibility mode.
     """
     check_io(io)
     if io == "auto":
@@ -146,9 +132,8 @@ def choose_io(io: str = "auto") -> Literal["kvikio", "host"]:
 def kvikio_threads() -> Iterator[None]:
     """Run kvikio's reads on several threads, for the duration.
 
-    Only when nobody has chosen a count: ``$KVIKIO_NTHREADS`` unset and
-    the setting still at kvikio's default of 1. The setting is restored
-    afterwards, so a process that sets its own count keeps it.
+    Only when ``$KVIKIO_NTHREADS`` is unset and the setting is still at
+    kvikio's default of 1; restored afterwards.
     """
     kv = _kvikio()
     if kv is None:

@@ -79,15 +79,8 @@ def _is_icechunk_store(store: Any) -> bool:
 
 
 def _array_on(arr: zarr.Array, store: Any) -> zarr.Array:
-    """``arr`` read and written through ``store``, from the metadata it holds.
-
-    ``zarr.open_array(store=..., path=...)`` re-reads the metadata the
-    handle already carries, and without ``zarr_format`` it asks for
-    ``zarr.json``, ``.zarray`` and ``.zattrs`` at once: three round trips
-    on a network filesystem, two of them failing, per array per flush. A
-    wrapper store over the same keys sees the same document, so build the
-    handle from the one in hand.
-    """
+    """``arr`` read and written through ``store``, built from the metadata it
+    holds: ``zarr.open_array`` would re-read it, up to three round trips."""
     from zarr.core.array import AsyncArray
     from zarr.storage import StorePath
 
@@ -167,14 +160,8 @@ def _presence_after(
 def _emit_batch_presence(
     array_name: str, cells: dict[str, tuple[bytes, bool]],
 ) -> None:
-    """Report this array's landed stamps to ``observe_presence_writes``.
-
-    Only the cells that asked to be recorded, matching what
-    ``_presence_after`` folded into the manifest.  The batch paths write
-    the whole list at once rather than through
-    ``_record_nonempty_chunk``, so without this the instrument would be
-    silent on exactly the writes that bypass it.
-    """
+    """Report the recorded cells' stamps to ``observe_presence_writes``: the
+    batch paths bypass ``_record_nonempty_chunk``, which reports the rest."""
     from zarr_vectors.core.group import _emit_presence, _presence_observers
 
     if not _presence_observers:
@@ -430,13 +417,8 @@ def _write_pool() -> Any:
 
 
 def _reset_write_pool_after_fork() -> None:
-    """A forked child inherits the pool object but none of its threads.
-
-    Its first pooled write would queue work no thread takes, and wait for
-    it forever. The child builds a fresh pool on first use instead, as a
-    new process would. The lock is replaced too: a parent thread may have
-    held it at the fork.
-    """
+    """In a forked child, drop the inherited pool (it has no threads, so work
+    would wait forever) and the lock a parent thread may have held."""
     global _WRITE_POOL, _WRITE_POOL_LOCK
     _WRITE_POOL = None
     _WRITE_POOL_LOCK = threading.Lock()

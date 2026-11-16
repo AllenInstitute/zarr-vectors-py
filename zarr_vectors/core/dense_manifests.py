@@ -1,33 +1,12 @@
 """The dense object-index layout: manifests as fixed-width integer arrays.
 
-The vlen layout stores one ``bytes`` blob per object, so a million
-objects is a million Python objects to write and a million to decode, on
-the host, whatever the caller held them as. The dense layout stores the
-same manifests as two numeric arrays::
-
-    object_index/manifest_spans    int64 (n_objects, 2)   start, count
-    object_index/manifest_blocks   int64 (n_blocks, sid_ndim + 1)
-                                          chunk coords..., fragment index
-    object_index/object_ids        int64 (n_objects,)     as in V2
-
-``manifest_blocks`` may instead be ``int32``, chosen when the index is
-created (see :func:`resolve_block_dtype`); every reader widens it to ``int64``.
-
-Object row ``o`` owns blocks ``start .. start + count``, one row per
-fragment it references, in manifest order. An object with no fragments
-has ``count == 0``. Range and explicit-list blocks of the vlen encoding
-are expanded to one row per fragment, so every block is fixed width and
-a whole-index read is a gather, never a decode.
-
-Spans rather than offsets, so that writes stay proportional to what they
-change: an append adds span rows and block rows; a patch appends the
-replacement blocks and rewrites only the patched objects' span rows,
-leaving the blocks they used to own unreferenced until the next full
-rewrite (``vacuum``, or any ``write_object_index``) compacts them.
-
-Selected per store by the root's ``manifest_layout`` (``"dense"``), or
-per index by the first write that creates it. An index keeps its layout:
-appends and patches never convert one layout into the other.
+``manifest_spans`` (int64 ``(n_objects, 2)``: start, count) points each object
+row at its rows of ``manifest_blocks`` (``(n_blocks, sid_ndim + 1)``: chunk
+coords, then fragment index; int64, or int32 chosen at creation), one row per
+fragment, so a whole-index read is a gather, never a decode. An append adds
+rows to both; a patch appends blocks and rewrites only its span rows. Chosen
+by the root's ``manifest_layout`` or the first write; an index keeps its
+layout. See ``docs/spec/object_model/object_manifest.md``.
 """
 
 from __future__ import annotations
@@ -80,21 +59,11 @@ MANIFEST_ZSTD_LEVEL = 9
 def manifest_codecs(level_group: Group) -> list[dict[str, Any]]:
     """The codec pipeline a new object-index integer array is created with.
 
-    The write session's codec (``batched_writes`` / ``chunk_array_codecs``
-    / ``open_write_session``) is chosen for the chunk arrays it writes,
-    cells written in a hot loop, so it decides the codec here but not
-    always the level:
-
-    - a session compressing with zstd: its pipeline, at level
-      :data:`MANIFEST_ZSTD_LEVEL` when it asks for less;
-    - a session compressing with anything else (blosc, ...): its
-      pipeline as it is;
-    - no session, or one that does not compress (what ``compressor=None``
-      resolves to): ``bytes`` + zstd at :data:`MANIFEST_ZSTD_LEVEL`.
-
-    Only creation reads it: an array that exists keeps its codecs. A
-    caller that wants another pipeline creates the array itself
-    (``Group.write_array(compressors=)``), and the writers append to it.
+    A write session compressing with zstd gives its pipeline, at no less than
+    :data:`MANIFEST_ZSTD_LEVEL`; one compressing with anything else gives its
+    pipeline as is; none, or one that does not compress, gives ``bytes`` +
+    zstd at :data:`MANIFEST_ZSTD_LEVEL`. Only creation reads it: an array
+    that exists keeps its codecs.
     """
     session = list(level_group._active_codecs or ())
     if not any(c.get("name") != "bytes" for c in session):
@@ -123,10 +92,8 @@ def existing_codecs(node: Any) -> list[dict[str, Any]]:
 def is_dense(level_group: Group, meta: dict[str, Any] | None = None) -> bool:
     """Whether ``level_group``'s object index uses this layout.
 
-    The ``layout`` field decides; failing that, the arrays do -- a caller
-    that stamps its own ``object_index`` metadata after an append may
-    carry a vlen ``layout`` over from habit, and the arrays on disk are
-    the truth about what was written.
+    The ``layout`` field decides, else the arrays on disk (a caller's own
+    metadata stamp may carry a stale vlen ``layout``).
     """
     if meta is None:
         try:
@@ -207,11 +174,9 @@ def resolve_block_dtype(
 ) -> np.dtype:
     """The dtype the blocks a write makes are stored as.
 
-    An index keeps the dtype it was created with: ``requested`` must
-    agree with blocks that exist (:class:`ArrayError` otherwise), unless
-    the write recreates them (``recreate``) -- a full rewrite, which takes
-    ``requested`` when given and the existing dtype when not. New blocks
-    take ``requested``, else the store's ``manifest_block_dtype``.
+    Existing blocks keep theirs: ``requested`` must agree (:class:`ArrayError`
+    otherwise) unless ``recreate`` (a full rewrite). New blocks take
+    ``requested``, else the store's ``manifest_block_dtype``.
     """
     import zarr
 
@@ -234,9 +199,8 @@ def resolve_block_dtype(
 def fit_blocks(blocks: npt.NDArray[np.int64], dtype: Any, what: str) -> np.ndarray:
     """``blocks`` as ``dtype``, or :class:`ArrayError` naming a value that does not fit.
 
-    zarr casts a write into an array of a narrower dtype without a check,
-    wrapping what does not fit (2**40 + 5 is stored as 5): every write of
-    blocks into an index goes through this first.
+    zarr casts into a narrower dtype unchecked, wrapping (2**40 + 5 is stored
+    as 5), so every write of blocks goes through this first.
     """
     dtype = np.dtype(dtype)
     blocks = np.asarray(blocks)
@@ -386,10 +350,8 @@ def read_csr(
 ) -> tuple[npt.NDArray[np.int64], npt.NDArray[np.int64], npt.NDArray[np.int64]]:
     """``(offsets, coords, frags)`` for ``rows`` (all rows ``[0, stop)`` when None).
 
-    Ascending object rows written in order -- what ascending ids give --
-    own ascending block rows, so those are read as they are: no
-    ``unique``, no ``searchsorted``, and a run of them as a slice. Rows
-    in any other order cost one ``unique``.
+    Ascending rows written in order own ascending blocks, read as they are (a
+    contiguous run as one slice); rows in any other order cost one ``unique``.
     """
     sel: Any = slice(0, stop) if rows is None else np.asarray(rows, dtype=np.int64)
     spans = _rows(level_group, SPANS_PATH, sel).astype(np.int64, copy=False).reshape(-1, 2)
@@ -456,14 +418,8 @@ def _create(level_group: Group, path: str, data: npt.NDArray[np.int64]) -> None:
 
 
 def _truncate(level_group: Group, path: str, n: int) -> None:
-    """Shrink ``path`` to its first ``n`` rows, storing what writing only them would.
-
-    ``resize`` drops the storage objects wholly past the new end, but the
-    object holding row ``n`` keeps the old rows after it. They are cleared
-    to the fill value first -- up to the end of that object (the shard when
-    sharded) -- so its bytes are a fresh write's, and inner chunks left
-    holding only fill are not stored.
-    """
+    """Shrink ``path`` to its first ``n`` rows, storing what writing only them
+    would: the rest of the object holding row ``n`` is cleared before ``resize``."""
     node = _node(level_group, path)
     n0 = int(node.shape[0])
     if n >= n0:
@@ -493,13 +449,10 @@ def write(
 
     ``replace`` rewrites spans and blocks. ``append`` adds rows at ``at``
     (default: the end), padding a gap with empty objects; an ``at`` before
-    the end (a torn flush's residue) truncates the spans there first. The
-    object id table and the index metadata are the caller's, as they are
-    for the vlen writer -- apart from the ``block_dtype`` stamp of an index
-    this call creates narrow.
-
-    ``block_dtype``: see :func:`resolve_block_dtype`; the blocks written are
-    checked against the dtype they are stored as (:func:`fit_blocks`).
+    the end truncates the residue first. The id table and index metadata
+    are the caller's, apart from the ``block_dtype`` stamp of an index this
+    creates narrow. ``block_dtype``: see :func:`resolve_block_dtype`; blocks
+    are checked with :func:`fit_blocks`.
     """
     offsets = np.asarray(offsets, dtype=np.int64)
     coords = np.asarray(coords, dtype=np.int64).reshape(-1, sid_ndim)
@@ -539,21 +492,13 @@ def write(
     if start < 0:
         raise ArrayError(f"Append index {at} is negative")
     if start < n0:
-        # Residue past the commit point: keep the rows before ``start`` and
-        # the blocks they use, and drop the rest of both -- the blocks too,
-        # or every rewrite from ``start`` leaves the old rows' blocks behind,
-        # unreferenced, and appends after them. Rows' blocks are laid out in
-        # the order written, so the kept rows use blocks below the highest
-        # end any of them names (a patch that moved a row's blocks past
-        # residue keeps that residue too: never less than is referenced).
+        # Drop the residue's blocks too, or every rewrite from ``start``
+        # leaves the old rows' blocks behind, unreferenced.
         keep = _kept_block_end(level_group, start, n0, b0)
         if keep < b0:
             _truncate(level_group, BLOCKS_PATH, keep)
             b0 = keep
-        # The kept rows stay where they are: cut the spans at ``start`` --
-        # clearing the rest of the object holding the new last row, as a
-        # fresh write stores it -- and append, never read them back to
-        # rewrite them.
+        # Cut the spans at ``start`` and append; kept rows are never rewritten.
         _truncate(level_group, SPANS_PATH, start)
     tail = np.empty((max(start - n0, 0) + n, 2), dtype=np.int64)
     pad = max(start - n0, 0)
@@ -581,28 +526,9 @@ def _span_pieces(level_group: Group, lo: int, hi: int) -> Any:
 
 
 def _kept_block_end(level_group: Group, start: int, n0: int, b0: int) -> int:
-    """The highest block end any of rows ``[0, start)`` names (0 for none).
-
-    What an append at ``start < n0`` truncates ``manifest_blocks`` to.
-    Usually proved from the residue alone, without reading the rows
-    kept: when every row from ``start - 1`` on begins where the row
-    before it ended and the last ends at the block count -- the layout
-    appends leave -- the residue's blocks are exactly ``[E, b0)``, with
-    ``E`` the end of row ``start - 1``, and no kept row's blocks can lie
-    in them (no two rows share blocks; every writer gives each row its
-    own), so the answer is ``E``. That reads ``n0 - start + 1`` rows, the
-    ones being replaced.
-
-    Otherwise -- a patch or a placed range moved blocks out of row order,
-    or reserved blocks sit past the last row -- the kept rows are scanned,
-    in pieces of :data:`_SCAN_ROWS`, so memory stays bounded.
-
-    The proof does not see a kept row a patch emptied after the residue
-    was written: such a row's (empty) span starts at the block count of
-    that time, which the scan counts, keeping the residue's blocks
-    unreferenced behind it; the proof drops them. Every row reads the
-    same either way.
-    """
+    """The highest block end any of rows ``[0, start)`` names (0 for none). Proved
+    from the residue's spans when they are consecutive and end at ``b0``, else
+    by scanning the kept rows in :data:`_SCAN_ROWS` pieces."""
     if start <= 0:
         return 0
     consecutive = True
@@ -628,14 +554,8 @@ def _kept_block_end(level_group: Group, start: int, n0: int, b0: int) -> int:
 
 
 def _declare_capability(level_group: Group) -> None:
-    """Add ``dense_manifests`` to the root's ``format_capabilities``.
-
-    ``create_store(manifest_layout="dense")`` stamps it, but an index can
-    also become dense later -- ``write_object_manifests(layout="dense")``
-    on a store created without the choice -- and the store should say so
-    either way. A root without a zarr-vectors block (a bare group in a
-    test) is left alone.
-    """
+    """Add ``dense_manifests`` to the root's ``format_capabilities``, also for an
+    index made dense after creation; a root with no zarr-vectors block is left alone."""
     import zarr
 
     from zarr_vectors.constants import CAP_DENSE_MANIFESTS

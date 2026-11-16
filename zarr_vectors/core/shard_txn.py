@@ -1,43 +1,12 @@
-"""Write one shard of every per-chunk array, then publish it all at once.
+"""Shard transactions: stage one shard's cell writes, publish them on exit.
 
-A task that owns a shard of a sharded store writes its cells straight
-into the live store: each write is a read-modify-write of the shard
-object, published as it happens. A retried task therefore starts from its
-failed attempt's half-written shards -- and a link cell appends a row
-group per call, so a retry doubles its records unless the task first
-resets every cell it owns. A straggling first attempt and its retry can
-both write. The caller has had to build resets, quarantines, per-shard
-locks and its own fsync around every task.
-
-A shard transaction replaces all of that with staging:
-
-- inside the block, every cell written to this level -- through
-  :meth:`Group.write_bytes` / :meth:`Group.write_cells`, so through every
-  zarr-vectors writer -- is held in memory, and must lie in the owned
-  shard (:class:`~zarr_vectors.exceptions.ShardOwnershipError`
-  otherwise);
-- reads of owned cells see the transaction: a cell written reads back
-  its new bytes and, under ``mode="replace"``, a cell not yet written
-  reads empty -- so an append starts from nothing, not from a failed
-  attempt's rows;
-- on exit each touched shard object is encoded by zarr's own sharding
-  codec against a staging store, written beside its target as
-  ``<object>.<token>.partial`` (fsynced when ``durable``), then renamed
-  into place, and the directories fsynced. An exception before that
-  publishes nothing. With ``io_threads`` the encode, write and fsync of
-  each object run on a pool, and only the renames wait for all of them:
-  the same bytes, each object still durable before its rename.
-
-Atomic per object, not per set: a crash while renaming leaves some
-arrays' shards new and others old. Re-running the task converges: under
-``replace`` its shards are rebuilt from its cells alone, and zarr encodes a
-shard from its cells in a fixed order, so the same cells give the same
-bytes.
-
-The transaction writes no metadata. It requires the level's presence to
-be deferred (``nonempty_chunks`` is shared by every cell) and every array
-to be allocated beforehand: an array created by several tasks at once is
-a race this cannot fix.
+Inside the block every cell written to the level, by any writer, is held in
+memory and must lie in the owned shard; reads of owned cells see the staging.
+On exit each touched shard is encoded by zarr's sharding codec, written as
+``<object>.<token>.partial``, fsynced and renamed into place. Atomic per
+object, not per set: after a crash mid-publish a re-run converges (same cells,
+same bytes). Writes no metadata; needs presence deferred and arrays allocated
+beforehand. See :func:`zarr_vectors.building.shard_transaction`.
 """
 
 from __future__ import annotations
@@ -271,13 +240,9 @@ class ShardTransaction:
     # On exit
 
     def _encode_one(self, name: str) -> tuple[str, Any, list[str] | None]:
-        """One owned shard object: ``(key, value, written)``.
-
-        ``value`` is the object's new bytes, ``None`` to remove it, or
-        :data:`_UNCHANGED`; ``written`` is the array's non-empty cells, or
-        None when the transaction gave it none. Touches no shared state,
-        so arrays encode concurrently.
-        """
+        """``(key, value, written)`` for one owned shard: new bytes, ``None`` to
+        remove, or :data:`_UNCHANGED`; ``written`` is ``None`` if no cells were
+        staged. Touches no shared state, so arrays encode concurrently."""
         import warnings
 
         from zarr.errors import UnstableSpecificationWarning
@@ -292,8 +257,7 @@ class ShardTransaction:
         staging = _StagingStore(store, [owned.key] if self.mode == "replace" else [])
         with warnings.catch_warnings():
             warnings.simplefilter("ignore", UnstableSpecificationWarning)
-            # From the metadata the handle holds: opening by path re-reads
-            # zarr.json, and probes .zarray and .zattrs besides.
+            # From the handle's metadata: opening by path re-reads zarr.json.
             arr = _array_on(owned.arr, staging)
             selection = tuple(
                 np.asarray(axis, dtype=np.intp)
@@ -429,15 +393,9 @@ _POOL_PREFIX = "zv-write"
 
 
 def _map_lanes(fn: Callable[[_T], _R], items: list[_T], lanes: int) -> list[_R]:
-    """``[fn(x) for x in items]``, on up to ``lanes`` threads of the shared
-    writer pool (:func:`~zarr_vectors.core._batch_writer._write_pool`).
-
-    Item ``i`` runs on lane ``i % lanes``, each lane in order. Every lane
-    is waited for before this returns or raises, so nothing it started is
-    still running when a caller cleans up after it; after a failure each
-    lane stops before its next item, and the failing item that comes
-    first is the one raised.
-    """
+    """``[fn(x) for x in items]`` on up to ``lanes`` shared-pool threads. Every
+    lane finishes before this returns or raises; after a failure lanes stop,
+    and the earliest failing item's exception is raised."""
     lanes = min(int(lanes), len(items))
     if lanes <= 1:
         return [fn(x) for x in items]
@@ -476,10 +434,8 @@ def _map_lanes(fn: Callable[[_T], _R], items: list[_T], lanes: int) -> list[_R]:
 def _write_partial(
     path: str, value: bytes, *, durable: bool, touched: Any, partials: list[str],
 ) -> str:
-    """Write ``value`` beside ``path`` as ``<path>.<token>.partial``,
-    fsynced when ``durable``, and return its path. It is recorded in
-    ``partials`` before it is opened, so a caller can remove it whatever
-    happens, and a write that fails removes it itself."""
+    """Write ``value`` to ``<path>.<token>.partial`` (fsynced if ``durable``) and
+    return its path; recorded in ``partials`` before opening, removed on failure."""
     touched.makedirs(os.path.dirname(path))
     tmp = f"{path}.{uuid.uuid4().hex}.partial"
     partials.append(tmp)
@@ -511,14 +467,9 @@ def _publish_renames(
     *,
     durable: bool,
 ) -> None:
-    """The publish: rename each ``(partial, target)`` into place, remove
-    the objects mapped to None, then fsync each touched directory once.
-
-    Renames and removals only, each atomic on its own, made one after
-    another. A failure part-way leaves some objects new and some old (a
-    re-run converges); the partials not yet renamed go with it, and a
-    crash that leaves them is swept by the next attempt.
-    """
+    """Rename each ``(partial, target)`` into place, remove objects mapped to
+    None, then fsync touched directories. A failure part-way leaves some objects
+    new (a re-run converges) and removes the partials not yet renamed."""
     for i, (tmp, path) in enumerate(renames):
         try:
             os.replace(tmp, path)

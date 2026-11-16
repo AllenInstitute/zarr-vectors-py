@@ -73,10 +73,8 @@ _LOOP_LOCK = threading.Lock()
 def _writer_loop() -> asyncio.AbstractEventLoop:
     """The event loop the ``*_sync`` mirrors run on, started on first use.
 
-    Deliberately not zarr's (see the module docstring): the mirrors'
-    ``to_thread`` fan-out must draw on a different thread pool from the
-    one zarr's own ``sync()`` calls need, or it can take every thread
-    those calls are waiting for.
+    Not zarr's: ``to_thread`` fan-out on zarr's loop can take every thread
+    its nested ``sync()`` storage calls wait for, and hang.
     """
     global _LOOP
     if _LOOP is None:

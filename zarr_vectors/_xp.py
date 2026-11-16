@@ -1,24 +1,11 @@
 """Which device an array lives on, and moving arrays between host and device.
 
-The core works in numpy and never imports cupy. A caller may still hand
-it device arrays (cupy, or anything exposing ``__cuda_array_interface__``)
-and ask for device arrays back; this module is the one place that knows
-how. Everything device-specific is behind :func:`_gpu`, which imports the
-optional :mod:`zarr_vectors.gpu` extension only when a device is actually
-involved.
-
-The contract every array-form entry point keeps:
-
-- a writer copies each device argument to the host **once**, at entry
-  (:func:`to_host`), and encodes there, so the bytes it writes are the
-  ones a numpy caller would get;
-- a reader decodes on the host and copies each array it returns to the
-  device **once**, at exit (:func:`to_device`);
-- ``device="cuda"`` without the extension is an error, never a host
-  array returned in its place.
-
-Device arrays are recognised by ``__cuda_array_interface__`` rather than
-the array-API ``__array_namespace__``, which cupy 13 does not define.
+The core never imports cupy; :func:`_gpu` imports :mod:`zarr_vectors.gpu`
+only when a device array is involved. Contract: a writer copies each device
+argument to the host once (:func:`to_host`); a reader copies each returned
+array to the device once (:func:`to_device`); ``device="cuda"`` without the
+extension is an error. Device arrays are recognised by
+``__cuda_array_interface__`` (cupy 13 lacks ``__array_namespace__``).
 """
 
 from __future__ import annotations
@@ -43,20 +30,14 @@ _INSTALL_HINT = (
 
 
 def is_device_array(a: Any) -> bool:
-    """Whether ``a`` lives in device memory.
-
-    Checked on the type, so a property that would itself touch the device
-    is never evaluated.
-    """
+    """Whether ``a`` lives in device memory (checked on the type, not touching the device)."""
     return hasattr(type(a), "__cuda_array_interface__")
 
 
 def resolve_device(device: str | None, *like: Any) -> Device:
     """The device a result should land on.
 
-    ``None`` means "where the inputs are": ``"cuda"`` if any of ``like``
-    is a device array, else ``"cpu"``. A reader with no array input
-    therefore returns host arrays unless asked otherwise.
+    ``None`` means ``"cuda"`` if any of ``like`` is a device array, else ``"cpu"``.
     """
     if device is None:
         return "cuda" if any(is_device_array(a) for a in like) else "cpu"
@@ -145,12 +126,9 @@ def namespace(*arrays: Any) -> Any:
 def encode_on_device(*arrays: Any) -> bool:
     """Whether an encoder handed ``arrays`` should run on the device.
 
-    True when any of them is a device array that cupy can take as it is
-    (a cupy array, or one exporting DLPack, such as a torch tensor) and
-    the GPU extension imports, unless ``ZARR_VECTORS_GPU_ENCODE=0`` asks
-    for the host encoders -- a way to rule the device encoders out when
-    chasing a difference; the bytes are the same either way. Any other
-    device array is copied to the host once and encoded there.
+    True when any is a device array and all of them are cupy or DLPack
+    arrays, the GPU extension imports, and ``ZARR_VECTORS_GPU_ENCODE`` is not
+    ``"0"``. The bytes written are the same either way.
     """
     import os
 

@@ -40,6 +40,12 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+import numpy as np
+import zarr
+from zarr.core.sync import sync
+
+from zarr_vectors._api_version import parse_version
+
 # --- array names and layout sentinels --------------------------------
 from zarr_vectors.constants import (
     CAP_FRAGMENT_INDEX,
@@ -158,7 +164,23 @@ from zarr_vectors.core.cells import (
     read_cells,
     read_neighbourhood,
 )
-from zarr_vectors.core.group import Group, observe_presence_writes
+from zarr_vectors.core import dense_manifests as dense
+from zarr_vectors.core._batch_writer import _stamp_presence
+from zarr_vectors.core.arrays import _is_per_chunk_array
+from zarr_vectors.core.group import (
+    _NONEMPTY_CHUNKS_ATTR,
+    _PRESENCE_DECL_ATTR,
+    _PRESENCE_DEFERRED,
+    Group,
+    _coord_to_index,
+    _coords_in_bounds,
+    _format_chunk_key,
+    _grid_origin,
+    _list_store_prefix,
+    _parse_chunk_coords,
+    observe_presence_writes,
+)
+from zarr_vectors.core.user_metadata import Metadata
 from zarr_vectors.core.sources import (
     SOURCE_AXIS,
     chunk_sources,
@@ -220,6 +242,7 @@ from zarr_vectors.core.store import (
 from zarr_vectors.core.manifest_writer import ObjectManifestWriter, object_manifest_writer
 from zarr_vectors.core.streaming import ObjectIndexAppender
 from zarr_vectors.encoding.fragments import (
+    decode_fragments,
     decode_object_manifest_blocks,
     decode_object_manifests_csr,
     encode_object_manifest_blocks,
@@ -445,40 +468,28 @@ def array_is_sharded(level_group: Group, array_name: str) -> bool:
 def decode_fragment_index(blob: bytes) -> Any:
     """Decode a ``vertex_fragments`` / ``link_fragments`` cell's bytes.
 
-    :func:`read_vertex_fragment_index` reads a cell and decodes it; this
-    is the decode alone, for bytes the caller already holds -- from a
-    prefetch, say, or a batched read. Returns the same
-    ``ChunkFragmentIndex``: ``len``, ``range(f)``, ``indices(f)`` and, for
-    every fragment at once, ``flat()``.
+    The decode half of :func:`read_vertex_fragment_index`, for bytes already
+    held; returns the same ``ChunkFragmentIndex``.
     """
-    from zarr_vectors.encoding.fragments import decode_fragments
-
     return decode_fragments(blob)
 
 
 def user_metadata(group: Group) -> Any:
     """The user-metadata namespaces on ``group``.
 
-    The object :attr:`zarr_vectors.api.Dataset.metadata` and
-    ``Level.metadata`` return, for a :class:`Group` a builder already
-    holds. ``user_metadata(g)["bridge"]`` (or ``.namespace("bridge")``)
-    is one application's keys, a ``MutableMapping`` kept apart from the
-    format's own attributes; ``names()`` lists the namespaces.
+    The object :attr:`zarr_vectors.api.Dataset.metadata` returns:
+    ``user_metadata(g)["ns"]`` is one application's ``MutableMapping``, kept
+    apart from the format's own attributes; ``names()`` lists them.
     """
-    from zarr_vectors.core.user_metadata import Metadata
-
     return Metadata(group)
 
 
 def is_dense_index(level_group: Group) -> bool:
     """Whether the level's object index uses the dense layout.
 
-    The ``layout`` stamp decides, and failing that the arrays on disk do:
-    the same test every reader of the index applies. A level with no
-    object index is not dense.
+    Decided by the ``layout`` stamp, else the arrays on disk; ``False`` when
+    the level has no object index.
     """
-    from zarr_vectors.core import dense_manifests as dense
-
     if not level_group.array_exists(OBJECT_INDEX):
         return False
     return dense.is_dense(level_group)
@@ -489,13 +500,8 @@ def cell_objects(
 ) -> list[str]:
     """The store key of the object holding each of these cells.
 
-    One key per cell, in order: the cell's own object for an unsharded
-    array, the shard holding it for a sharded one (so cells of one shard
-    share a key). Keys are relative to the store root; on a local store
-    the file is ``Path(store_root) / key``. For a caller that has to act
-    on the objects themselves -- fsync them, copy them, check they exist
-    -- without re-deriving zarr's addressing: the array's own grid origin
-    and shard shape, and its chunk-key encoding.
+    One key per cell, in order: the cell's own object when unsharded, the
+    shard holding it when sharded. Keys are relative to the store root.
 
     Args:
         chunk_coords: Absolute chunk coordinates, as tuples or rows of a
@@ -505,8 +511,6 @@ def cell_objects(
         StoreError: ``array_name`` is not a per-chunk array here.
         ArrayError: A cell lies outside the array's grid.
     """
-    from zarr_vectors.core.group import _coord_to_index, _coords_in_bounds, _grid_origin
-
     arr = level_group._sharded_chunk_array(array_name)
     if arr is None:
         raise StoreError(
@@ -544,29 +548,18 @@ _FIRST_READER: dict[str, str] = {
 
 @dataclass(frozen=True)
 class StoreLayout:
-    """How a store's bytes are laid out, resolved from what it holds.
-
-    Every field is read from the store, not assumed from the build that
-    reads it. ``created_by`` is the ``zv_version`` stamped when the store
-    was created -- never updated after, so it is not the layout. The
-    layout is the rest; ``min_reader`` sums it up as the oldest
-    zarr-vectors that can read all of it.
+    """How a store's bytes are laid out, as read from the store.
 
     Attributes:
-        created_by: Format version of the build that created the store.
+        created_by: ``zv_version`` stamped at creation (never updated).
         format_capabilities: Capability tokens the store declares.
-        shard_shape: The store's declared cells per shard (the default
-            for new arrays); ``None`` for one object per cell.
-        object_index: The level's object-index layout
-            (``vlen_manifests_v1``, ``vlen_manifests_v2``,
-            ``dense_manifests_v1``), or ``None`` when it has none.
+        shard_shape: Declared cells per shard; ``None`` for one object per cell.
+        object_index: The level's object-index layout, or ``None``.
         link_policy: ``{delta: (directed, store)}`` for each link family.
         presence_deferred: The level is under :func:`defer_presence`.
         min_reader: Oldest zarr-vectors format that reads this layout.
-        object_shard_rows: Rows per shard of the level's object layer, as
-            its arrays hold it (:func:`shard_object_layer`); ``None`` for
-            one object per row bucket. Zarr's own sharding, so it does
-            not move ``min_reader``.
+        object_shard_rows: Rows per shard of the object layer
+            (:func:`shard_object_layer`); ``None`` if unsharded.
     """
 
     created_by: str | None
@@ -583,17 +576,9 @@ def store_layout(root_or_level: Group, *, level: int = 0) -> StoreLayout:
     """The layout of a store, and of one of its levels, as one object.
 
     Given a level group, describes that level; given the root, level
-    ``level`` (0 by default). Answers what ``FORMAT_VERSION`` and
-    ``zv_version`` cannot: a store's layout is recorded structure by
-    structure (the object index's ``layout`` stamp, each link family's
-    policy, the presence declaration, the shard declaration), some of it
-    added after the store was created, and not every layout change moved
-    the format version.
+    ``level``. Read structure by structure, since not every layout change
+    moved ``FORMAT_VERSION``.
     """
-    import zarr
-
-    from zarr_vectors._api_version import parse_version
-
     group = root_or_level
     if "zarr_vectors" in (group.attrs.to_dict() or {}):
         root = group
@@ -653,63 +638,21 @@ def shard_transaction(
     io_threads: int | None = None,
     sweep: bool = True,
 ) -> Any:
-    """Write one shard of a level privately, and publish it at the end.
+    """Stage one shard's cell writes privately, and publish them on exit.
 
-    A context manager. Inside it every cell written to ``level_group`` --
-    by any zarr-vectors writer, or by ``tx.write_cells(array, [(key,
-    payload), ...])`` -- is staged in memory, and must lie in shard
-    ``shard_coords`` of one of ``arrays`` (default: every per-chunk array
-    of the level), else :class:`~zarr_vectors.exceptions.
-    ShardOwnershipError`. Reads of owned cells see the staged view; under
-    ``mode="replace"`` an owned cell not yet written reads empty, so a
-    retried task starts from nothing, not from a failed attempt's rows.
-
-    On a normal exit each changed shard object is encoded by zarr's own
-    sharding codec, written beside its target as
-    ``<object>.<token>.partial`` (fsynced when ``durable``), then renamed
-    into place, and the directories fsynced. Under ``replace`` an owned
-    shard is rebuilt from the transaction's cells alone, and an array in
-    scope that got none loses its shard. Under ``merge`` the cells are
-    merged into what the store holds. An exception inside the block
-    publishes nothing.
-
-    With ``io_threads`` the objects are encoded, written and fsynced from
-    that many threads at once, and renamed only once all of them are
-    written: the same bytes and the same ``published``, each object
-    durable before its rename. On a network filesystem, where every
-    create, fsync and rename is a round trip to the server, that is most
-    of a transaction's commit. A failure on any thread publishes nothing
-    and leaves no ``.partial`` behind.
-
-    Guarantees and limits:
-
-    - atomic per object: a crash while renaming leaves some shards new and
-      some old, and re-running the task converges, since zarr encodes a
-      shard from its cells in a fixed order (same cells, same bytes, for
-      the same codecs and library versions);
-    - requires the level's presence deferred (:func:`defer_presence`) and
-      every array allocated and sharded beforehand;
-    - writes no metadata; ``tx.written`` (the non-empty cells per array,
-      after exit) feeds :func:`set_presence`;
-    - local stores publish by rename; any other store by one ``set`` per
-      object, each atomic on its own (issued together under
-      ``io_threads``; one at a time on icechunk, whatever is asked).
-
-    Args:
-        shard_coords: The shard's index in the arrays' shard grid (see
-            :func:`shard_of`), one entry per array axis, a bin axis
-            included on a level chunked by an attribute.
-        arrays: Per-chunk arrays the transaction covers.
-        mode: ``"replace"`` or ``"merge"``.
-        durable: Fsync before and after publishing (local stores).
-        io_threads: Threads to publish from (``None`` or 1: one at a
-            time). Drawn from zarr-vectors' shared writer pool, which
-            caps how many run at once (16 at most).
-        sweep: Remove the ``.partial`` files a failed attempt left beside
-            the owned shards, on entry (local stores). Each is a listing
-            of a shard directory; a caller that knows the shard's last
-            transaction completed may pass False. A partial left in place
-            is never read, only taking up space until a later sweep.
+    A context manager. Every cell written inside it must lie in shard
+    ``shard_coords`` (:func:`shard_of`) of ``arrays`` (default: every per-chunk
+    array), else :class:`~zarr_vectors.exceptions.ShardOwnershipError`.
+    ``mode="replace"`` rebuilds each owned shard from the staged cells alone
+    (unwritten owned cells read empty); ``"merge"`` merges into what is stored.
+    On exit each changed shard is written as a ``.partial`` (fsynced if
+    ``durable``, from ``io_threads`` threads) and renamed into place once all
+    are written; an exception publishes nothing. Atomic per object: after a
+    crash, re-running the task converges. Needs presence deferred
+    (:func:`defer_presence`) and every array allocated and sharded first;
+    writes no metadata (``tx.written`` feeds :func:`set_presence`). ``sweep``
+    removes a failed attempt's ``.partial`` files on entry. See
+    :mod:`zarr_vectors.core.shard_txn`.
     """
     return level_group.shard_transaction(
         tuple(shard_coords), arrays=arrays, mode=mode, durable=durable,
@@ -722,13 +665,9 @@ def shard_of(
 ) -> tuple[int, ...]:
     """The index of the shard holding cell ``chunk_coords`` of ``array_name``.
 
-    What :func:`shard_transaction` takes: the cell's index in the array
-    (its coordinates less the grid origin) divided by the shard shape.
-    Every array of a level normally shares both, so one answer serves them
-    all.
+    What :func:`shard_transaction` takes. A level's arrays normally share
+    grid origin and shard shape, so one answer serves them all.
     """
-    from zarr_vectors.core.group import _coord_to_index, _grid_origin
-
     arr = level_group._sharded_chunk_array(array_name)
     if arr is None or arr.shards is None:
         raise ArrayError(f"shard_of: {array_name!r} is not a sharded per-chunk array")
@@ -1030,53 +969,19 @@ def build_fragment_owner_index(store_path, *, level: int | None = None) -> int:
 def defer_presence(level_group: Group) -> list[str]:
     """Declare this level's presence deferred to one coordinator rebuild.
 
-    The build mode for many workers writing one level.  ``nonempty_chunks``
-    is ONE attribute per array, shared by every cell, so each stamp is a
-    read-modify-write of the whole list: two workers writing disjoint
-    cells still race, and every stamp costs the full list again, which
-    makes a build of N cells O(N²) in metadata bytes.  Declaring the
-    level deferred removes both at the source:
-
-    * every per-chunk array in the level drops its manifest, and arrays
-      allocated afterwards -- a links segment a worker creates on first
-      write -- are born without one;
-    * a write into an array with no manifest stamps nothing, whatever
-      ``record_presence`` says, so a worker needs no flag threaded
-      through every call, including the writers that do not expose one;
-    * readers ask the store instead: :meth:`Group.chunk_exists` reads the
-      cell, :meth:`Group.list_chunks` lists the array.  A cell is visible
-      the moment its payload lands, not only after the rebuild.
-
-    Then one :func:`rebuild_presence` over the level, after the workers
-    finish, writes every manifest once and clears the declaration.  The
-    finished store records the same presence an undeferred build does.
-
-    Call it from the coordinator BEFORE the workers open the level: the
-    declaration is read from the level handle a worker holds, so a handle
-    opened earlier still allocates arrays with a manifest.  Those stay
-    correct -- the rebuild rewrites them too -- but their stamps are back
-    to racing.
-
-    While deferred, readers pay for asking the store: a listing per
-    array per :meth:`Group.list_chunks` (cached inside
-    :meth:`Group.cached_nodes`), a request per :meth:`Group.chunk_exists`,
-    and a sharded array is read shard by shard.  Three kinds of reader
-    see nothing until the rebuild: an offline-read session, which must
-    not touch the store; one on a store that cannot list; and a
-    zarr-vectors older than 0.9.3, which reads a missing manifest as an
-    empty array.  A reader of the manifest itself may do better:
-    neuroglancer's datasource probes every cell when there is none,
-    which finds them all, slowly.
+    For many workers writing one level: ``nonempty_chunks`` is one attribute
+    per array, so concurrent stamps race. Every per-chunk array drops its
+    manifest, arrays allocated later are born without one, and writes into
+    them stamp nothing, whatever ``record_presence`` says. Readers ask the
+    store instead, except offline-read sessions, stores that cannot list and
+    zarr-vectors older than 0.9.3, which see nothing until
+    :func:`rebuild_presence` (or :func:`set_presence`) writes the manifests
+    and clears the declaration. Call it before workers open the level: a
+    handle opened earlier still allocates arrays with a manifest.
 
     Returns:
         Every per-chunk array path in the level.
     """
-    from zarr_vectors.core.group import (
-        _NONEMPTY_CHUNKS_ATTR,
-        _PRESENCE_DECL_ATTR,
-        _PRESENCE_DEFERRED,
-    )
-
     # Declared first, so an array allocated while the manifests are
     # being dropped is born without one rather than slipping between.
     level_group.attrs.update({_PRESENCE_DECL_ATTR: _PRESENCE_DEFERRED})
@@ -1152,24 +1057,14 @@ def rebuild_presence(
 
 def _clear_deferral(level_group: Group) -> None:
     """Remove the level's deferral declaration; the one place that does."""
-    from zarr_vectors.core.group import _PRESENCE_DECL_ATTR
-
     if level_group.presence_deferred():
         del level_group.zarr_group.attrs[_PRESENCE_DECL_ATTR]
 
 
 def _array_objects(level_group: Group, arr: Any) -> dict[tuple[int, ...], str]:
-    """``{grid index: store key}`` of every object ``arr`` stores.
-
-    The grid is zarr's: cells for an unsharded array, shards for a
-    sharded one. One prefix listing; keys that are not chunk keys of the
-    array (its ``zarr.json``, a ``.partial`` a shard transaction left) are
-    not objects of it.
-    """
-    from zarr.core.sync import sync
-
-    from zarr_vectors.core.group import _list_store_prefix
-
+    """``{grid index: store key}`` of every object ``arr`` stores (cells, or
+    shards when sharded), from one prefix listing; non-chunk keys such as
+    ``zarr.json`` or a ``.partial`` are skipped."""
     store = level_group.zarr_group.store
     base = arr.path
     head = f"{base}/" if base else ""
@@ -1205,19 +1100,13 @@ def _array_objects(level_group: Group, arr: Any) -> dict[tuple[int, ...], str]:
 def stored_objects(level_group: Group, array_name: str) -> list[str]:
     """The store keys of the objects a per-chunk array holds, sorted.
 
-    One per stored cell, or per shard when the array is sharded: what the
-    store itself lists, through zarr's prefix listing, so it works on any
-    store that lists (a local directory, memory, an object store) and
-    reads no object. The keys are relative to the store root and are the
-    keys :func:`cell_objects` names, so a caller can compare the two
-    directly -- which cells' objects are missing, which objects nobody
-    claimed.
+    One per stored cell, or per shard when sharded, from a prefix listing on
+    any store that lists; no object is read. The keys are those
+    :func:`cell_objects` names, so the two compare directly.
 
     Raises:
         StoreError: ``array_name`` is not a per-chunk array here.
     """
-    from zarr_vectors.core.arrays import _is_per_chunk_array
-
     arr = level_group._sharded_chunk_array(array_name)
     if arr is None or not _is_per_chunk_array(array_name):
         raise StoreError(
@@ -1232,15 +1121,6 @@ def _presence_mismatch(
 ) -> dict[str, list[str]] | None:
     """What the store holds against the claimed ``keys``, or ``None`` if
     they agree under ``mode`` (see :func:`set_presence`)."""
-    import numpy as np
-
-    from zarr_vectors.core.group import (
-        _coord_to_index,
-        _format_chunk_key,
-        _grid_origin,
-        _parse_chunk_coords,
-    )
-
     origin = _grid_origin(arr)
     shape = tuple(int(n) for n in arr.shape)
     outer = tuple(int(n) for n in arr.metadata.chunk_grid.chunk_shape)
@@ -1292,71 +1172,23 @@ def set_presence(
 ) -> list[str]:
     """Record each named array's presence as exactly the cells given.
 
-    For a coordinator that already knows which cells its workers filled
-    -- they reported them -- and so need not read the store back to find
-    out, which is what :func:`rebuild_presence` does: a listing and a read
-    of every shard object of every array. Each named array's
-    ``nonempty_chunks`` becomes exactly ``cells[name]``, in canonical
-    ``"i.j.k"`` form; arrays not named are left alone. All the manifests
-    are written in one gather.
+    For a coordinator that knows which cells its workers filled, instead of
+    :func:`rebuild_presence` reading the store back. ``cells`` maps array
+    name to ``"i.j.k"`` keys or tuples, in absolute chunk coordinates; it
+    must be the union over all workers, name every array they wrote and be
+    passed once they finish. Unnamed arrays are left alone. Every key is
+    validated before anything is written: ``StoreError`` for an array that
+    is not per-chunk here, ``ArrayError`` for a key outside its grid.
 
-    Keys may be ``"i.j.k"`` strings or coordinate tuples, in absolute
-    chunk coordinates (the array's grid origin is applied here). Every key
-    of every array is checked -- it must parse, and fall inside the
-    array's grid -- before anything is written, so a bad key writes
-    nothing.
-
-    "Exactly" means exactly: a cell written by more than one worker (a
-    canonical link cell, say) must appear in the union the caller passes,
-    and every array the workers wrote must be named, ``vertex_fragments``,
-    ``link_fragments`` and ``link_attributes/*`` included. Calling it
-    while workers are still writing brings back the races deferral
-    exists to avoid.
-
-    ``verify`` checks the claims against the store first, for a caller
-    whose record of what its workers wrote may be incomplete (a lost
-    report, a retried task), on any store that lists:
-
-    - ``"objects"``: one listing per array (:func:`stored_objects`).
-      Every claimed cell's object -- the cell, or the shard holding it --
-      must be stored, and every stored object must hold a claimed cell.
-      A shard only partly claimed has its index read (one ranged read of
-      its last bytes), and none of its unclaimed cells may hold a payload.
-    - ``"index"``: as ``"objects"``, and the index of every claimed shard
-      is read, so each claimed cell must itself hold a payload. For an
-      unsharded array the two are the same: the object is the cell.
-
-    Args:
-        cells: ``{array_name: keys}``.
-        end_deferral: Then end the level's :func:`defer_presence`
-            declaration, as :func:`end_presence_deferral` does.
-        verify: ``None`` (trust the claims), ``"objects"`` or ``"index"``.
-        on_mismatch: When a claim fails ``verify``: ``"raise"``
-            :class:`~zarr_vectors.exceptions.PresenceMismatchError`, naming
-            every failing array and what was found, before anything is
-            written; or ``"derive"`` each failing array's presence from
-            the store instead (as :func:`rebuild_presence` would) and write
-            the rest as claimed.
-
-    Returns:
-        The array names written, sorted.
-
-    Raises:
-        StoreError: A name is not a per-chunk array of this level.
-        ArrayError: A key does not parse or lies outside its array's grid.
-        PresenceMismatchError: ``verify`` found a claim the store does not
-            bear out, under ``on_mismatch="raise"``.
+    ``verify="objects"`` first checks one listing per array: claimed objects
+    are stored, every stored object holds a claimed cell, and a partly
+    claimed shard's other cells are empty. ``"index"`` also requires each
+    claimed cell of a shard to hold a payload. On a mismatch,
+    ``on_mismatch="raise"`` raises :class:`~zarr_vectors.exceptions.PresenceMismatchError`
+    before writing; ``"derive"`` takes the failing arrays from the store.
+    ``end_deferral`` then calls :func:`end_presence_deferral`. Returns the
+    array names written, sorted.
     """
-    from zarr_vectors.core._batch_writer import _stamp_presence
-    from zarr_vectors.core.arrays import _is_per_chunk_array
-    from zarr_vectors.core.group import (
-        _coord_to_index,
-        _coords_in_bounds,
-        _format_chunk_key,
-        _grid_origin,
-        _parse_chunk_coords,
-    )
-
     if verify not in (None, "objects", "index"):
         raise ArrayError(f"verify={verify!r}; expected None, 'objects' or 'index'")
     if on_mismatch not in ("raise", "derive"):
@@ -1385,8 +1217,6 @@ def set_presence(
             keys.add(_format_chunk_key(coords))
         stamps.append((name, arr, sorted(keys), {}))
     if verify is not None:
-        from zarr_vectors.exceptions import PresenceMismatchError
-
         mismatches = {}
         for name, arr, keys, _extra in stamps:
             found = _presence_mismatch(level_group, arr, keys, verify)
@@ -1413,26 +1243,18 @@ def end_presence_deferral(
 ) -> list[str]:
     """End the level's :func:`defer_presence` declaration.
 
-    What :func:`rebuild_presence` does last, on its own: for a coordinator
-    that recorded presence itself, with :func:`set_presence`, or rebuilt
-    it array by array across processes. Arrays allocated afterwards get a
-    manifest again, and stamps resume.
-
-    An array still without a manifest when the declaration goes would stay
-    store-derived for good -- its writes never stamp -- and would read as
-    empty to a zarr-vectors older than 0.9.3. So by default that refuses.
+    For a coordinator that recorded presence itself (:func:`set_presence`, or
+    a rebuild split across processes); :func:`rebuild_presence` ends it on
+    its own. Arrays allocated afterwards get a manifest, and stamps resume.
 
     Args:
-        missing: What to do about per-chunk arrays with no manifest:
-            ``"raise"`` (the default) names them and changes nothing;
-            ``"derive"`` rebuilds each from the store first, as
-            :func:`rebuild_presence` would.
+        missing: For per-chunk arrays still without a manifest, which would
+            otherwise stay store-derived for good: ``"raise"`` (default)
+            names them and changes nothing; ``"derive"`` rebuilds each first.
 
     Returns:
         The arrays derived under ``missing="derive"`` (empty otherwise).
     """
-    from zarr_vectors.core.group import _NONEMPTY_CHUNKS_ATTR
-
     if missing not in ("raise", "derive"):
         raise ArrayError(f"missing={missing!r}; expected 'raise' or 'derive'")
     lacking = []

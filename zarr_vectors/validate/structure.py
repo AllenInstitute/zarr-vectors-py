@@ -179,18 +179,10 @@ def _check_chunk_ranks(
 ) -> None:
     """Every per-chunk array in a level shares one rank, and so do its keys.
 
-    A level's per-chunk arrays are cells of one chunk grid, so they have
-    one rank: the spatial rank, plus one when the level is chunked by an
-    attribute. An array allocated a rank short aliases cells (the bug
-    fixed in ``cf4c2f1``), and no other validator notices: the
-    consistency check compares a fragment's column count with
-    ``sid_ndim``, which says nothing about how its cell was addressed.
-
-    Both halves are needed. A presence key whose arity differs from its
-    array's rank names a cell the array cannot hold. But
-    ``derive_nonempty_chunks`` rebuilds the manifest at the array's own
-    rank, so after a rebuild a mis-ranked array agrees with itself. Only
-    comparing it with ``vertices`` then catches it.
+    The rank is the spatial rank, plus one on an attribute-chunked level;
+    a rank-short array aliases cells. Presence-key arity is checked against
+    the array's rank, and each array's rank against ``vertices`` (a rebuilt
+    manifest agrees with a mis-ranked array).
     """
     from zarr_vectors.building import per_chunk_array_paths
 

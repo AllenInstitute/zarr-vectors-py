@@ -1,35 +1,11 @@
 """Chunk sources: a *composite* level whose objects reference fragments of other stores.
 
-A level may declare a leading ``"source"`` chunk axis, exactly as an
-attribute-chunked level declares its bin axis (``chunk_dims`` names it first;
-cell keys become ``s.z.y.x``; object manifests carry one more coordinate).
-:attr:`~zarr_vectors.core.metadata.LevelMetadata.chunk_sources` says what each
-value of that axis is:
-
-* ``chunk_sources[0] == {"self": true}`` -- this store's own cells, written
-  and read as any level's;
-* ``chunk_sources[s]`` for ``s >= 1`` -- another store::
-
-      {"ref": {"path": "../member.zarrvectors", "id": "world"},
-       "level": 0,
-       "transform": [[...], ...],        # (D+1) x (D+1): source -> this store
-       "fingerprint": {"object_count": 1234, ...}}
-
-  ``ref`` is an OME-Zarr RFC-8 ``Reference``: ``path`` relative to this
-  store's root (or absolute), ``id`` the coordinate system it binds to (a
-  zarr-vectors store's ``world``). A cell ``(s, *spatial)`` is that source
-  level's cell ``spatial``; its ``vertices`` come back through ``transform``
-  (in this store's frame), and every other per-chunk array -- fragment
-  indexes, vertex attributes, links -- comes back as stored, because their row
-  numbers refer to the source's own vertex buffer, which is what is read.
-
-So no manifest block changes: an object's fragment ``(s, z, y, x, f)`` is
-fragment ``f`` of the source's cell ``(z, y, x)``, resolved where every read
-already passes (:meth:`zarr_vectors.core.group.Group.read_bytes`). A source is
-never written through a composite, and a source whose recorded fingerprint no
-longer matches (it was rebuilt) is an error on first use, not a silent misread.
-Spatial box queries over a composite level are refused (a source's cells are
-in the source's grid); objects are read through their manifests.
+A composite level has a leading ``"source"`` chunk axis (cell keys
+``s.z.y.x``); ``chunk_sources[0]`` is this store and ``chunk_sources[s]``
+names another store's level, whose cells are read through
+:meth:`zarr_vectors.core.group.Group.read_bytes` with ``vertices``
+transformed into this store's frame. A source whose fingerprint no longer
+matches is an error on first use. See ``docs/spec/chunking/chunk_sources.md``.
 """
 from __future__ import annotations
 
@@ -100,13 +76,11 @@ def is_composite(level_group) -> bool:
 def verify_chunk_sources(level_group) -> "list[dict] | None":
     """Open every source of a composite level now, raising if one cannot be read as recorded.
 
-    The check a read makes on first use of each source, made for all of them
-    at once: a reader that tolerates unreadable cells (and so would see a
-    rebuilt source's cells as missing) calls this first. Raises
-    :class:`~zarr_vectors.exceptions.StoreError` for a source that cannot be
-    opened and :class:`~zarr_vectors.exceptions.ArrayError` for one whose
-    fingerprint no longer matches. Returns the table (``None`` for an
-    ordinary level, which has nothing to check).
+    For readers that tolerate unreadable cells and so would not notice a
+    rebuilt source. Raises :class:`~zarr_vectors.exceptions.StoreError` for a
+    source that cannot be opened and :class:`~zarr_vectors.exceptions.ArrayError`
+    for a fingerprint mismatch. Returns the table, or ``None`` for an
+    ordinary level.
     """
     res = resolver_for(level_group)
     if res is None:
@@ -126,12 +100,10 @@ def source_fingerprint(level_group) -> dict:
 def set_chunk_sources(level_group, sources: list, *, fingerprint: bool = True) -> list:
     """Make *level_group* a composite level of *sources*; returns the stored table.
 
-    Call before the level's arrays are allocated, and allocate them with the
-    leading axis (``open_write_session(..., bin_count=len(sources))``). Each
-    source ``ref.path`` is resolved against this store's root; with
-    *fingerprint* (default) every source is opened once now and its
-    :func:`source_fingerprint` merged into the entry (keys the caller gave
-    win), so a later read can tell when it was rebuilt.
+    Call before the level's arrays are allocated, then allocate them with
+    ``open_write_session(..., bin_count=len(sources))``. ``ref.path`` resolves
+    against this store's root. With *fingerprint*, each source's
+    :func:`source_fingerprint` is merged into its entry (caller's keys win).
     """
     from zarr_vectors.core.metadata import LevelMetadata
 

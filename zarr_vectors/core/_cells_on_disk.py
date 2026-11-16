@@ -1,21 +1,11 @@
 """Where a per-chunk array's cells are stored, and reading them raw.
 
-A per-chunk array is a zarr v3 vlen-bytes array with one cell per zarr
-chunk, optionally sharded. zarr reads a sharded cell through its
-sharding codec one cell at a time -- the shard index, then the cell's
-range, per cell -- which on a local store is almost all overhead. This
-module works out where each cell's *stored* bytes are (a file, or a
-byte range of a shard given by that shard's index, read once) and reads
-many of them in one pooled pass, opening each file once.
-
-Both readers use it: the host prefetch (:mod:`zarr_vectors.core._batch_reader`),
-which decodes the bytes with the array's own codecs, and the device
-reader (:mod:`zarr_vectors.gpu._fetch`), which decodes them on the GPU.
-
-:func:`cell_source` returns None for a layout it does not positively
-recognise, and the caller then reads that array through zarr. It never
-guesses: an unknown codec, chunk shape, key encoding or shard index
-codec all mean "not here".
+Locates each cell's *stored* bytes (a file, or a byte range of a shard given
+by that shard's index, read once) and reads many in one pooled pass, opening
+each file once. Used by the host prefetch (:mod:`zarr_vectors.core._batch_reader`)
+and the device reader (:mod:`zarr_vectors.gpu._fetch`). :func:`cell_source`
+returns None for any layout it does not positively recognise (codec, chunk
+shape, key encoding, shard index codec); the caller then reads through zarr.
 """
 
 from __future__ import annotations

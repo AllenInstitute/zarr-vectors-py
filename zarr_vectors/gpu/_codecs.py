@@ -1,34 +1,12 @@
-"""Decompressing cells on the device.
+"""zstd decompression of cells on the device, through nvCOMP's batched decoder.
 
-zstd is the one byte codec decoded here, because it is the only one a
-zarr-vectors store writes besides none: the store default is
-``vlen-bytes`` alone, and ``compressor="zstd"`` (BRIDGE's default, level
-5) adds a single zstd frame per cell. Decompression goes through nvCOMP's
-batched zstd decoder, one call for every cell of a read.
-
-nvCOMP does not validate what it is given: a buffer that is not zstd at
-all decodes, without an error, to bytes of some length, and a truncated
-frame can hang its kernel. So a frame is only handed to it after
-:func:`~zarr_vectors.gpu._kernels.zstd_walk` has checked its structure
-(header, every block header, exact end), and its output is only kept when
-its length is the content size the header declares. A frame that fails
-either check is reported per cell, the way a host decode error is.
-
-What the walk cannot check is the entropy-coded inside of a block, and
-there nvCOMP is not safe. Measured on 40 frames each corrupted by one
-byte inside a block (structure intact, so the walk passes them): libzstd
-raised for 32 and returned wrong bytes for 8; nvCOMP returned wrong
-bytes for 9, hung its kernel for 10, and hit an illegal memory access --
-which poisons the process's CUDA context -- for 21. Neither decoder
-catches every corruption without a content checksum; only nvCOMP turns
-one into a hang or a dead process. That is why :func:`~zarr_vectors.core.cells.read_cells`
-decodes zstd arrays on the device only when asked to outright
-(``decode="device"``), and on the host under ``decode="auto"``: a store
-whose bytes may be damaged should not be read through here.
-
-Compression never happens here. A store written from device arrays is
-compressed on the host by libzstd, which is what keeps it byte-identical
-to one written from numpy.
+nvCOMP does not validate its input, so a frame reaches it only after
+:func:`~zarr_vectors.gpu._kernels.zstd_walk` has checked its structure, and
+an output is kept only when its length is the declared content size;
+failures are reported per cell. Damage inside a block can still hang nvCOMP
+or kill the CUDA context, which is why ``read_cells`` decodes on the device
+only under ``decode="device"`` (see ``docs/how_to/gpu.md``). Compression is
+never done here: device-written stores are compressed on the host.
 """
 
 from __future__ import annotations
@@ -54,10 +32,8 @@ def zstd_decode(
 ) -> list[Any]:
     """Decompress device byte arrays, one zstd frame each, in one batch.
 
-    Returns device arrays in the same order (``out`` itself when given);
-    the caller checks their lengths against the declared content sizes.
-    Runs on ``stream`` (default: the current stream) and synchronises it
-    before returning, since the caller reads the outputs by pointer.
+    Returns device arrays in order (views of ``out`` when given), unchecked
+    against declared sizes. Synchronises ``stream`` (default: current).
     """
     mod = nvcomp()
     if mod is None:  # pragma: no cover - callers check first
@@ -94,9 +70,8 @@ def zstd_decode(
 
 
 def _codec(mod: Any, stream_ptr: int = 0) -> Any:
-    # A codec is bound to its stream, so only the default stream's is
-    # kept: one kept for a caller's stream would outlive it, and its
-    # teardown at exit fails once the CUDA context is gone.
+    # Only the default stream's codec is cached: one bound to a caller's
+    # stream would outlive it and fail teardown at exit.
     if not stream_ptr:
         return _default_codec(mod)
     return mod.Codec(
@@ -131,13 +106,9 @@ def decode_frames(
 ) -> tuple[list[Any], dict[int, str]]:
     """Check, then decompress, zstd frames at device addresses.
 
-    Frame ``j`` is ``sizes[j]`` bytes at ``ptrs[j]``. Its structure is
-    walked on the device first (:func:`~zarr_vectors.gpu._kernels.zstd_walk`);
-    it must declare ``expected[j]`` bytes when ``expected`` is given, and
-    fit ``out[j]`` exactly when ``out`` is. Only frames that pass go to
-    nvCOMP, in one batch, and an output is kept only when its length is
-    what the frame declares. Returns one device array or None per frame,
-    and the reason for each None.
+    Frame ``j`` is ``sizes[j]`` bytes at ``ptrs[j]`` and must declare
+    ``expected[j]`` bytes and fit ``out[j]`` exactly, when given. Returns
+    one device array or None per frame, and the reason for each None.
     """
     import cupy as cp
 

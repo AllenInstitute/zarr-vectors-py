@@ -1,22 +1,11 @@
 """Writes that are on disk when the block returns (``durable=True``).
 
-A local write lands the way zarr lands it: a temporary file, renamed over
-the object. That is atomic -- a reader never sees half a cell -- but not
-durable: neither the file nor its directory is fsynced, so after a power
-loss or a node crash a cell whose write "returned" can be missing, or
-empty. A caller that records "done" in a journal it does fsync needs the
-cells to be at least as durable as the journal line.
-
-So a durable write fsyncs each file before its rename (a rename can reach
-the disk before the data it points at, which fsyncing afterwards does not
-prevent), and then each directory it created an entry in, once, before
-the block returns. Two paths write cells: zarr-vectors' own direct writer
-(a local, unsharded array) and zarr's store (everything else, sharded
-objects included); :class:`DurableLocalStore` is the second one's hook.
-
-Only local filesystems are covered. On an object store a PUT that has
-returned is the durability point, and there is nothing to add; on
-icechunk it is the session's commit.
+zarr's temp-file-and-rename is atomic but not durable. A durable write
+fsyncs each file *before* its rename (a rename can reach disk before its
+data), then each directory it added an entry to, once, before the block
+returns. zarr-vectors' direct writer uses :func:`write_file`; zarr's store
+path is hooked through :class:`DurableLocalStore`. Local filesystems only:
+on an object store a returned PUT is already durable, on icechunk the commit.
 """
 
 from __future__ import annotations
@@ -44,11 +33,7 @@ class Touched:
             self._dirs.add(directory)
 
     def makedirs(self, directory: str) -> None:
-        """``os.makedirs``, recording each directory it had to create.
-
-        A new directory is an entry in its parent, so the parent (the
-        deepest one that already existed) is recorded too.
-        """
+        """``os.makedirs``, recording each directory it created and the deepest existing parent."""
         missing = []
         d = directory
         while d and not os.path.isdir(d):
@@ -72,11 +57,7 @@ class Touched:
 
 
 def fsync_dirs(dirs: Iterable[str]) -> None:
-    """Fsync directories, so the entries in them survive a crash.
-
-    Skipped on Windows, which cannot open a directory for fsync (its
-    renames are journalled by NTFS instead).
-    """
+    """Fsync directories, so the entries in them survive a crash (no-op on Windows)."""
     if os.name == "nt":
         return
     for d in dirs:
@@ -106,8 +87,7 @@ def fsync_files(paths: Iterable[str]) -> None:
 def write_file(path: str, data: bytes, touched: Touched, *, exclusive: bool = False) -> None:
     """Write ``data`` to ``path`` durably: temporary, fsync, rename.
 
-    The directory entry the rename makes is recorded in ``touched``, to be
-    fsynced once for the whole block.
+    The directory is recorded in ``touched``, to be fsynced once per block.
     """
     directory = os.path.dirname(path)
     touched.makedirs(directory)
@@ -134,8 +114,7 @@ def write_file(path: str, data: bytes, touched: Touched, *, exclusive: bool = Fa
 class DurableLocalStore(WrapperStore[LocalStore]):
     """A :class:`LocalStore` whose writes are fsynced before their rename.
 
-    Reads, listings and everything else pass through to the wrapped
-    store. Opened only for the duration of one durable flush.
+    Everything else passes through. Opened for one durable flush.
     """
 
     def __init__(self, store: LocalStore, touched: Touched) -> None:

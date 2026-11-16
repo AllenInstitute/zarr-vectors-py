@@ -413,26 +413,17 @@ def unshard_store(
 def shard_object_layer(level_group: Group, shard_rows: int | None) -> dict[str, Any]:
     """Repack a level's object layer into shards of ``shard_rows`` rows.
 
-    The object layer -- ``object_index``'s arrays and every
-    ``object_attributes/<name>`` column -- is 1-D along objects, chunked
-    in fixed row buckets (16,384 index rows, 65,536 attribute rows), one
-    storage object per bucket: about 70,000 objects per column at 10^9
-    objects. Sharding packs ``shard_rows // bucket`` buckets into one
-    object. ``shard_rows`` must be a multiple of 65,536, so both buckets
-    tile it; ``None`` unshards.
+    The object layer (``object_index``'s arrays and every
+    ``object_attributes/<name>`` column) is chunked in fixed row buckets
+    (16,384 index rows, 65,536 attribute rows); sharding packs
+    ``shard_rows // bucket`` buckets per storage object. ``shard_rows`` must
+    be a multiple of 65,536; ``None`` unshards. Sharding is zarr's own
+    ``sharding_indexed`` codec, and later columns follow the existing layout
+    (:func:`zarr_vectors.core.arrays.object_shard_rows`).
 
-    Nothing here is a zarr-vectors format key: sharding lives in each
-    array's own ``zarr.json`` as zarr's ``sharding_indexed`` codec, which
-    any Zarr v3 reader reads. Writers keep a level's object layer in the
-    layout its arrays already have (see
-    :func:`zarr_vectors.core.arrays.object_shard_rows`), so a column
-    created after this call is sharded too.
-
-    Each array is streamed, never held whole: copied block by block
-    (blocks aligned to both layouts) into a sibling array, which then
-    replaces it -- by a directory rename on a local store, by copying its
-    objects elsewhere. A coordinator operation: nothing else may write the
-    object layer meanwhile.
+    Each array is streamed block by block into a sibling that then replaces
+    it. A coordinator operation: nothing else may write the object layer
+    meanwhile.
 
     Returns:
         ``{"arrays_repacked": [...], "shard_rows": shard_rows}``.

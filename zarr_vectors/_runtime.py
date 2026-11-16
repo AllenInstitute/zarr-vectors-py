@@ -1,12 +1,8 @@
 """What this installation can do, for a caller that branches on it.
 
-:func:`runtime_capabilities` answers for the *install*: which array-form
-entry points this build has, and whether device arrays are usable here.
-It is not :attr:`~zarr_vectors.api.Dataset.capabilities`, which reports
-what a *store* declares on disk, and it is not ``FEATURES``, which names
-API features fixed at build time. A caller probes it instead of parsing a
-version string, because a shared checkout can change branch under a
-running process.
+:func:`runtime_capabilities` answers for the *install*, unlike
+:attr:`~zarr_vectors.api.Dataset.capabilities` (what a store declares) and
+``FEATURES`` (API features fixed at build time).
 """
 
 from __future__ import annotations
@@ -63,9 +59,7 @@ def _gpu_extension() -> bool:
     """Whether the optional GPU extension imports (does not touch CUDA)."""
     try:
         import zarr_vectors.gpu  # noqa: F401
-    except Exception:
-        # A probe must answer, not raise: a cupy that imports but cannot
-        # find its CUDA libraries is as unusable as a missing one.
+    except Exception:  # a cupy without its CUDA libraries is as unusable as none
         return False
     return True
 
@@ -97,28 +91,13 @@ def _gds_available() -> bool:
 def runtime_capabilities(*, probe_device: bool = False) -> dict[str, bool]:
     """What this installation of zarr-vectors can do.
 
-    Every value is a bool, True only when usable in this process:
-
-    - ``device_arrays``: the optional GPU extension imports (and, with
-      ``probe_device=True``, a CUDA device is visible), so readers take
-      ``device="cuda"`` and writers take device arrays;
-    - ``device_decode``: ``read_cells`` can decode uncompressed cells on
-      the device rather than on the host (same condition);
-    - ``gpu_encode``: writers handed device arrays encode fragments,
-      manifests and link partitions on the device, and download the
-      encoded form (same condition; the bytes written are unchanged);
-    - ``gpu_codecs``: nvCOMP is installed too, so ``read_cells(...,
-      decode="device")`` can decompress zstd cells on the device;
-    - ``gpu_io``: kvikio is installed too, so local files can be read
-      straight into device memory (GPUDirect Storage where the system
-      has it; see ``docs/how_to/gpu.md``);
-    - ``gds``: with ``probe_device=True`` only, cuFile reports GPUDirect
-      Storage available, so ``read_cells(device="cuda")`` on local files
-      reads them straight into device memory under ``io="auto"``. Without
-      the probe it is False: asking opens the cuFile driver.
-
-    Probing a device initialises the CUDA driver, so a process that will
-    fork should probe in its children, not before forking.
+    Every value is a bool, True only when usable in this process; the keys
+    are listed in ``docs/how_to/gpu.md``. The device keys (``device_arrays``,
+    ``device_decode``, ``gpu_encode``) need the GPU extension to import and,
+    with ``probe_device=True``, a visible CUDA device; ``gpu_codecs`` and
+    ``gpu_io`` also need nvCOMP and kvikio. ``gds`` is only probed with
+    ``probe_device=True`` (it opens the cuFile driver). Probing initialises
+    CUDA, so a process that will fork should probe in its children.
 
     Returns:
         A new dict each call; the key set only grows between releases.

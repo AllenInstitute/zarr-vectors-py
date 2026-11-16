@@ -165,21 +165,8 @@ def _make_fsspec_zarr_store(
 def _reject_unused_backend_kwargs(
     kwargs: dict[str, Any], *, backend: str,
 ) -> None:
-    """Raise ``TypeError`` for loose kwargs this backend cannot use.
-
-    Only for the branches that discard them ENTIRELY -- a local store, or
-    one the caller built themselves.  The remote backends genuinely take
-    open-ended options (obstore's ``from_url`` and fsspec's per-filesystem
-    ``storage_options`` are both ``**kwargs``), so there is nothing
-    honest to validate them against and they stay permissive.
-
-    Explicit ``storage_options=`` is never rejected, here or anywhere: a
-    caller passing one options dict across several backends means it, and
-    a key that is meaningless for the local one is not a typo.  The loose
-    ``**backend_kwargs`` channel is the one where a misspelling lands,
-    which is how ``create_store(path, shard_shape=8)`` came to be accepted
-    and silently dropped for the whole life of the feature.
-    """
+    """Raise ``TypeError`` for loose kwargs a backend that takes no options
+    would silently drop.  Explicit ``storage_options=`` is never rejected."""
     if not kwargs:
         return
     names = ", ".join(repr(k) for k in sorted(kwargs))

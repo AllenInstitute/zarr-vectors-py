@@ -151,12 +151,9 @@ def _match_known(
 ) -> tuple[str, ...]:
     """The cells in ``known`` that the keys in ``named`` select, sorted.
 
-    A key of the level's own rank selects itself.  A spatial key -- what
-    ``Grid`` hands out, and what a box expands to -- selects every known
-    cell with that spatial tail: on a level chunked by an attribute, one
-    per bin, compared on the trailing components as :func:`_key_in_box`
-    is.  On a spatial level the tail is the whole key, so this is an
-    exact match there.
+    A key of the level's own rank selects itself; a spatial key selects
+    every known cell with that spatial tail (one per bin on an
+    attribute-chunked level), as :func:`_key_in_box` compares.
     """
     known_set = set(known)
     by_tail: dict[str, list[str]] | None = None

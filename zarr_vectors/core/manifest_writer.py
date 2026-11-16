@@ -1,28 +1,12 @@
 """Write object manifests as a stream: :func:`object_manifest_writer`.
 
-:func:`~zarr_vectors.building.write_object_manifests` is one call per
-block of objects, and every call starts from nothing: it resolves the
-index's layout and spatial rank from its metadata, checks the id table,
-resizes every array it touches and rewrites the index's metadata. A
-writer committing a large layer in bounded blocks -- ~11,600 calls for
-1.9e8 objects -- pays that every time, and on a sharded object layer
-each call that ends inside a shard makes the next one read the shard
-back and write it again.
-
-:class:`ObjectManifestWriter` makes the same writes as those calls, in
-order, and stores the same bytes; but after its first write it resolves
-nothing again. Rows are held until they fill whole storage objects (the
-layer's shards when it is sharded, else its row chunks) and written
-then, so a shard is written once, not once per call that reaches it.
-
-The first write is exactly one ``write_object_manifests(mode="append",
-at=at)`` call -- the one that creates the index, pads to ``at`` or
-truncates the residue past it -- and the writer then holds the index's
-state itself: the row and block counts, the id table's ends and its
-sorted stamp. Anything it cannot hold that way (an id table chunked
-otherwise than the writers chunk it, an offline or batched-write
-session) sends every later write through the per-call path too, so the
-result never depends on which path ran.
+:class:`ObjectManifestWriter` makes the same writes, storing the same bytes, as
+a sequence of ``write_object_manifests(mode="append")`` calls, but resolves
+the index's layout, rank and id-table state once (its first write is exactly
+one such call) and holds rows until they fill whole storage objects, so a
+shard is written once. Where it cannot hold that state (an id table chunked
+otherwise, an offline or batched-write session) every write takes the
+per-call path, so the result never depends on which path ran.
 """
 
 from __future__ import annotations
@@ -128,15 +112,10 @@ class ObjectManifestWriter:
             for block in blocks:
                 w.write(chunk_coords=..., fragment_idx=..., manifest_offsets=...)
 
-    :meth:`write` takes what ``write_object_manifests`` takes -- encoded
-    ``manifest_blobs``, or ``chunk_coords`` / ``fragment_idx`` /
-    ``manifest_offsets``, and ``ids`` -- and writes the objects after the
-    previous write's, starting at ``at``. Leaving the block writes what
-    is held and, with ``commit=True``, commits the index's count (see
-    :func:`~zarr_vectors.core.arrays.commit_object_index`); leaving it by
-    an exception writes nothing more, so the rows already written stay
-    past the committed count as a torn flush's do, for the next append
-    at that count to replace.
+    Leaving the block writes what is held and, with ``commit=True``, commits
+    the count; leaving it by an exception writes nothing more, so rows
+    already written stay past the committed count, as a torn flush's do, for
+    the next append at that count to replace.
     """
 
     def __init__(
@@ -537,31 +516,15 @@ def object_manifest_writer(
 ) -> ObjectManifestWriter:
     """A context that writes object manifests as a stream.
 
-    The streamed form of ``write_object_manifests(mode="append")``: the
-    writes made through it store exactly the bytes the same sequence of
-    calls would (each at the row the previous one ended at), but the
-    index's layout, spatial rank and id-table state are resolved once,
-    and rows are written in whole storage objects -- the object layer's
-    shards when it is sharded, so no shard is rewritten per call.
-
     Args:
-        level_group: The resolution level.
-        at: The row the first write starts at, with ``at=``'s meaning
-            for an append: a short index is padded to it, residue past it
-            is truncated (by the first write -- an empty one included).
+        at: The first write's row, with ``at=``'s append meaning (pads a short
+            index, truncates residue past it, even on an empty first write);
             ``None`` appends at the current end.
-        layout: ``"vlen"`` or ``"dense"``, for an index the first write
-            creates.
-        commit: On a clean exit, commit the index's count (``num_objects``
-            becomes the end of the last write) with
-            :func:`~zarr_vectors.core.arrays.commit_object_index`,
-            counting ``num_present`` from what was written when the index
-            was committed at ``at`` before.
-        block_dtype: ``"int64"`` or ``"int32"``, as
-            ``write_object_manifests`` takes it: for a dense index the
-            first write creates, and refused against one that exists in
-            another. Every write's blocks are checked against the index's
-            dtype as the write is taken.
+        layout: ``"vlen"`` or ``"dense"``, for an index the first write creates.
+        commit: On a clean exit, commit ``num_objects`` as the last write's end
+            (:func:`~zarr_vectors.core.arrays.commit_object_index`).
+        block_dtype: ``"int64"`` or ``"int32"``, as ``write_object_manifests``
+            takes it; every write's blocks are checked against the index's dtype.
 
     Returns:
         An :class:`ObjectManifestWriter`; its ``write`` takes what

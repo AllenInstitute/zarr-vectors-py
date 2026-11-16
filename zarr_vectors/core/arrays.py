@@ -203,13 +203,9 @@ def check_object_shard_rows(rows: Any) -> int:
 def object_shard_rows(level_group: Group) -> int | None:
     """Rows per shard of the level's object layer, or ``None`` if unsharded.
 
-    Read from the arrays themselves -- sharding lives in each array's own
-    ``zarr.json`` (zarr's ``sharding_indexed``, which any Zarr v3 reader
-    reads), so there is no zarr-vectors key for it and nothing for an
-    older reader to misread. Every writer that creates or rewrites an
-    object-layer array asks this first, so an array created later (a new
-    attribute column, an index rewritten in full) follows the layout the
-    level already has.
+    Read from the arrays' own ``zarr.json`` (``sharding_indexed``). Writers
+    ask this first so a newly created object-layer array follows the
+    level's existing layout.
     """
     import zarr
 
@@ -232,9 +228,7 @@ def object_shard_rows(level_group: Group) -> int | None:
 
 
 def object_layer_arrays(level_group: Group) -> list[str]:
-    """Every object-layer array the level holds: the object index's
-    arrays and each object attribute column (not the single-chunk
-    groupings)."""
+    """Paths of the level's object index arrays and object attribute columns."""
     import zarr
 
     paths = [
@@ -278,13 +272,9 @@ def _parse_chunk_key(key: str) -> ChunkCoords:
 
 
 def _device_result(fn):
-    """Give a flat-array reader a keyword-only ``device=`` argument.
+    """Add a keyword-only ``device=`` to a reader; moves numpy results there.
 
-    The reader decodes on the host as always; ``device="cuda"`` then moves
-    each array it returns to the device in one copy (see
-    :mod:`zarr_vectors._xp`). ``None`` and ``"cpu"`` return host arrays.
-    Only numpy results move: a ``default`` the caller supplied comes back
-    untouched, and a tuple of arrays moves element by element.
+    See :mod:`zarr_vectors._xp`. Non-array results pass through untouched.
     """
     import functools
     import inspect
@@ -433,36 +423,10 @@ _UNSET = object()
 def _leading_grid_axes(
     level_group: Group, level_meta: Any, spatial_rank: int,
 ) -> tuple[int, ...]:
-    """Extents of the level's non-spatial LEADING grid axes, if any.
+    """Extents of the level's non-spatial leading grid axes (``()`` if none).
 
-    A level chunked by an attribute puts the attribute bin first in every
-    chunk key -- ``gene.z.y.x`` -- and its per-chunk arrays are allocated
-    one axis wider to match, extent ``K`` bins.  ``()`` for an ordinary
-    spatial level.
-
-    Two sources, because neither covers everything:
-
-    1. **An existing sibling.**  ``vertices`` is allocated before anything
-       else in the level, by a writer that knew the bin count, so its
-       shape IS the level's grid.  This is the same ground truth readers
-       already use -- :func:`_chunks_in_box` takes ``len(shape) - ndim``
-       off the allocated array rather than off metadata.
-    2. **``LevelMetadata.chunk_attribute_values``**, whose length is the
-       bin count.  It is what ``bin_count`` already is at every
-       :func:`open_write_session` call site, and the spec names it the
-       authoritative bin-to-value map.
-
-    Source 2 alone is not enough: ``rechunk`` sets ``chunk_dims``
-    unconditionally but ``chunk_attribute_*`` only for ``attribute:``
-    specs, so a group- or object-id rechunk yields a wider grid with no
-    bin values recorded at all.  Source 1 is what covers those.
-
-    ``chunk_dims`` is deliberately NOT consulted.  It carries axis
-    *names*, nothing validates it against the spatial rank or against the
-    other two fields, and no other code reads its length.
-
-    The mirror-image repair on the scale side is :func:`_pad_scale`,
-    which front-pads chunk-scale factors for the same skew.
+    Taken from the allocated ``vertices`` array's extra axes, else from
+    ``len(chunk_attribute_values)``; ``chunk_dims`` is not consulted.
     """
     arr = level_group._sharded_chunk_array(VERTICES)
     if arr is not None and arr.ndim > spatial_rank:
@@ -764,47 +728,23 @@ def _ensure_chunk_arrays(
 def _array_matches_layout(
     level_group: Group, array_name: str, cfg: dict[str, Any],
 ) -> bool:
-    """Whether an existing single vlen array can be reused as-is under an
-    explicit session, rather than recreated to match ``cfg``.
+    """Whether an existing vlen array is reused rather than recreated to match ``cfg``.
 
-    An **empty** array is never a match: it is recreated so it picks up
-    the session's full config — grid shape, sharding, *and* codec
-    pipeline.  This is what lets a store whose ``vertices`` was
-    warm-created (unsharded, uncompressed) by :func:`create_store` be
-    rewritten with ``shard_shape=`` or ``compressor=``.
-
-    An array that HOLDS DATA is always reused, even when the session asks
-    for a different layout, because recreating it means
-    :meth:`Group.create_sharded_chunk_array` deleting the node first.
-    The mismatch is real and worth saying out loud, but re-laying-out a
-    populated array is :func:`zarr_vectors.sharding.reshard`'s job and it
-    does it without losing the bytes.
-
-    Emptiness is asked of the STORE, not only of ``nonempty_chunks``.
-    The manifest is empty in exactly the cases where it must not be
-    believed: a decentralised writer passing ``record_presence=False``
-    leaves it so while the payloads are on disk, and a manifest that lost
-    an update under-reports.  Trusting it deleted populated arrays —
-    a second ``write_points`` into a store built with ``shard_shape=``
-    takes the default ``shard_shape=None``, which read as a layout
-    mismatch, and the first write was silently destroyed.
+    Empty arrays (checked in the store, not just ``nonempty_chunks``) are
+    recreated; arrays holding data are always reused, with a warning on mismatch.
     """
     existing = level_group._sharded_chunk_array(array_name)
     if existing is None:
         return False
 
-    # Does it hold anything?  The manifest answers cheaply when it says
-    # yes; only when it says no is the store asked, because that is the
-    # answer that cannot be trusted.
+    # A "no" from the manifest can't be trusted (record_presence=False,
+    # lost updates), so only that answer is checked against the store.
     if existing.attrs.get("nonempty_chunks"):
         has_data = True
     else:
         has_data = level_group._array_has_stored_data(array_name)
 
-    # Nothing to lose: recreate unconditionally, even if the grid and
-    # sharding already agree.  The session's CODECS are not part of that
-    # comparison, and applying them to the warm-created array is the
-    # whole reason this branch exists.
+    # Recreate even if grid and sharding agree, to apply the session's codecs.
     if not has_data:
         return False
 
@@ -1718,12 +1658,9 @@ def create_link_attributes_array(
 
 
 def _neighbour_offsets(sid_ndim: int, *, positive_only: bool) -> list[ChunkCoords]:
-    """The chunk offsets a delta-0 record between neighbours can take.
+    """Non-zero chunk offsets of a delta-0 neighbour record.
 
-    All ``3**sid_ndim - 1`` non-zero offsets, or with ``positive_only``
-    the lexicographically positive half, which is where canonical
-    placement files an undirected record (see
-    :func:`zarr_vectors.spatial.boundary.partition_records_by_offset`).
+    With ``positive_only``, the lexicographically positive half (canonical placement).
     """
     return [
         tuple(d) for d in itertools.product((-1, 0, 1), repeat=int(sid_ndim))
@@ -1745,25 +1682,13 @@ def create_link_segments(
 ) -> list[str]:
     """Allocate every segment a delta-0, two-endpoint link family writes.
 
-    For a coordinator to run before workers start, so that no worker
-    creates an array: creating one from several workers races on its
-    ``zarr.json``. What it allocates, all idempotent:
-
-    - the family, with its ``directed`` / ``store`` policy;
-    - one ``links/0/<offsets>`` array per neighbour offset -- the 13
-      lexicographically positive ones for an undirected canonical family
-      (``3**sid_ndim // 2`` in general), all 26 for a directed or
-      duplicate one -- at ``dtype``;
-    - with ``include_intra``, the intra-chunk segment at ``intra_dtype``
-      (default ``dtype``), and the fragment sidecar next to it;
-    - for each of ``attributes`` (``{name: dtype}`` or ``{name: (dtype,
-      row_shape)}``), the parallel ``link_attributes/<name>/0/<offsets>``
-      array of every cross-chunk segment, stamped as
-      :func:`create_link_attributes_array` stamps it, and likewise
-      ``intra_attributes`` for the intra segment.
-
-    New arrays are created in one gather per kind rather than one call
-    each; the store left is the one the per-segment calls leave.
+    Run by a coordinator before workers start, since concurrent array creation
+    races on ``zarr.json``. Idempotently creates the family policy, one
+    ``links/0/<offsets>`` array per neighbour offset (positive half for an
+    undirected canonical family), the intra segment and its fragment sidecar
+    with ``include_intra``, and the parallel ``link_attributes`` arrays for
+    ``attributes`` / ``intra_attributes`` (``{name: dtype}`` or
+    ``{name: (dtype, row_shape)}``).
 
     Returns:
         Every array path ensured: links first, then attributes.
@@ -1822,20 +1747,9 @@ def create_link_segments(
 def _write_array_meta_if_changed(
     level_group: Group, array_name: str, meta: dict[str, Any],
 ) -> bool:
-    """:meth:`Group.write_array_meta`, skipped when nothing would change.
+    """:meth:`Group.write_array_meta`, skipped when no key in ``meta`` would change.
 
-    For stamps that repeat on every call but whose values settle once:
-    the link-attribute writers restamp ``dtype`` / ``row_shape`` per
-    segment per batch, and a family group is restamped for every segment
-    allocated under it.  Each stamp is a rewrite of the whole
-    ``zarr.json`` -- a metadata operation that, on a shared filesystem,
-    is the expensive part of a small write -- and on a chunk array it is
-    also a read-modify-write of the same document ``nonempty_chunks``
-    lives in.
-
-    Compared key by key against what the node already holds, so a key
-    the stamp does not mention is never a reason to write.  Returns
-    whether it wrote.
+    Returns whether it wrote.
     """
     current = level_group.read_array_meta(array_name)
     if all(current.get(k) == v for k, v in meta.items()):
@@ -2059,56 +1973,21 @@ def write_chunk_fragments(
     force_explicit: bool = False,
     record_presence: bool = True,
 ) -> list[int] | tuple[int, int]:
-    """Write fragment-index entries to a chunk's vertex_fragments/<chunk>
-    or link_fragments/<chunk> blob.
+    """Write fragment-index entries to ``vertex_fragments/`` or ``link_fragments/``.
 
-    Give the new fragments one of two ways:
-
-    - ``new_fragments``: a list mixing ``(start, count)`` range tuples and
-      1-D integer index arrays, one Python object per fragment;
-    - ``csr=(indices, offsets)``: fragment ``f`` is
-      ``indices[offsets[f]:offsets[f + 1]]``. No Python object per
-      fragment; device arrays are copied to the host once.
-
-    Both write the bytes :func:`encode_fragments` would: a fragment that
-    is a non-empty run of consecutive indices from >= 0 is stored as a
-    range, anything else as an explicit list, unless ``force_explicit``.
-
-    Args:
-        level_group: Resolution level group.
-        chunk_coords: Spatial chunk coordinates.
-        new_fragments: The list form. Order is preserved.
-        csr: The array form, ``(indices, offsets)``.
-        target: ``"vertex"`` writes to ``vertex_fragments/<chunk>``;
-            ``"link"`` writes to ``link_fragments/<chunk>``.
-        mode: ``"replace"`` writes the new fragments as the whole blob.
-            ``"append"`` adds them after the existing ones. The existing
-            fragments are kept exactly as stored -- their sections are
-            concatenated, never decoded to a list and re-classified -- so
-            appending costs the cell's bytes, not a Python object per
-            fragment already there. Without an existing blob it behaves
-            like ``"replace"``.
-        force_explicit: Store every new fragment as an explicit list.
-        record_presence: ``False`` skips stamping the presence manifest,
-            for writers that rebuild it once afterwards.
+    Fragments come as ``new_fragments`` (``(start, count)`` tuples and 1-D index
+    arrays) or ``csr=(indices, offsets)``; bytes match :func:`encode_fragments`.
+    ``mode="append"`` concatenates after the stored fragments without
+    re-encoding them (``"replace"`` if none exist). Read-modify-write, last
+    writer wins: serialise appends per chunk, and not inside ``batched_reads``.
 
     Returns:
-        The list form returns the new entries' fragment indices,
-        ``list(range(n_existing, n_existing + n_new))`` (``[]`` for an
-        empty append, which does not touch the blob). The ``csr`` form
-        returns ``(n_existing, n_new)``.
+        List form: the new fragment indices (``[]`` for an empty append, which
+        leaves the blob alone). ``csr`` form: ``(n_existing, n_new)``.
 
     Raises:
-        ArrayError: If ``target`` or ``mode`` is invalid, neither or both
-            fragment forms are given, or the fragments are malformed.
-
-    Concurrency:
-        Read-modify-write. ``write_bytes`` is delete-then-create — last
-        writer wins. This is NOT cross-writer-safe; callers must
-        serialise concurrent appends to the same chunk's fragment-index
-        (per-chunk sharding satisfies this). An append reads the cell
-        through :meth:`Group.read_bytes`, so it must not run inside an
-        enclosing ``batched_reads`` block, whose cache would be stale.
+        ArrayError: Invalid ``target``/``mode``, not exactly one fragment form,
+            or malformed fragments.
     """
 
     if target == "vertex":
@@ -2322,18 +2201,8 @@ def write_chunk_link_attributes(
 
 
 def _check_object_index_size(size: int, n_present: int) -> None:
-    """Refuse an id space declared far past the objects written into it.
-
-    ``size`` is the rows an index will hold and ``n_present`` the rows a
-    caller named an object for; the difference is rows a declared id
-    space (``write_object_index(total_objects=)``) adds with nothing in
-    them. Only that padding is bounded, by
-    :data:`OBJECT_INDEX_MAX_ROWS`: rows that hold objects are dense
-    and cost what the objects do, however many there are.
-
-    Raises:
-        ArrayError: When the padding would exceed
-            :data:`OBJECT_INDEX_MAX_ROWS` rows.
+    """Raise :class:`ArrayError` if empty id-space padding (``size - n_present``)
+    exceeds :data:`OBJECT_INDEX_MAX_ROWS`; warn when the index is mostly padding.
     """
     padding = size - n_present
     if padding > OBJECT_INDEX_MAX_ROWS:
@@ -2486,25 +2355,15 @@ def commit_object_index(
 ) -> dict[str, Any]:
     """Commit the object index's metadata after manifest writes.
 
-    :func:`write_object_manifests` (and the ``at=`` protocol built on it)
-    writes rows and leaves the commit to the caller, who knows when the
-    last row is in. This is that commit, the one every caller would
-    otherwise write by hand: it merges into the index's metadata, never
-    replacing it.
+    Merges into the existing metadata (see :func:`write_object_manifests`):
 
-    - ``num_objects`` becomes ``num_objects``: the committed prefix.
-      Rows past it are uncommitted residue, which a later append at
-      ``at=num_objects`` replaces. It may not exceed the rows written.
-    - ``layout`` is kept: dense stays dense, a stamped vlen layout stays,
-      and an unstamped vlen index -- what the array-form writer creates --
-      is stamped V1, without which no reader accepts it.
+    - ``num_objects``: the committed prefix (rows past it are residue a later
+      ``at=num_objects`` append replaces); may not exceed the rows written.
+    - ``layout``: kept; an unstamped vlen index is stamped V1.
     - ``sid_ndim``: the argument, else the stamp, else the level's.
-    - ``num_present`` is counted over the committed rows (a dense index
-      reads only its spans; a vlen one reads every blob, which a caller
-      that already knows the count can skip by passing it). So a
-      tombstone followed by an append no longer leaves it stale.
-    - ``object_ids_sorted`` is stamped on any index that stores ids (V2
-      or dense) from the committed ids, unless given.
+    - ``num_present``: counted over committed rows unless given.
+    - ``object_ids_sorted``: computed from the committed ids for an index
+      that stores ids (V2 or dense), unless given.
 
     Returns:
         The metadata keys written.
@@ -2567,17 +2426,14 @@ def commit_object_index(
         "layout": layout,
     }
     if is_dense and level_group.array_exists(dense.BLOCKS_PATH):
-        # Restated from the array, which is the truth about it: a commit
-        # inside a batched session replaces the document with what it
-        # queued, and a narrow index should keep saying so.
+        # Restated from the array: a batched commit replaces the document.
         dt = np.dtype(level_group._require_array_node(dense.BLOCKS_PATH).dtype)
         if dt != np.int64 or dense.BLOCK_DTYPE_ATTR in meta:
             out[dense.BLOCK_DTYPE_ATTR] = dt.name
     table_path = f"{OBJECT_INDEX}/{OBJECT_IDS_ARRAY}"
     if layout in (OBJECT_INDEX_LAYOUT_V2, _LAYOUT_DENSE) and level_group.array_exists(table_path):
         if object_ids_sorted is None:
-            # In pieces: the committed ids are 8 bytes a row, 12 GB at
-            # 1.5e9 objects, and only a count and an order are wanted.
+            # Read in pieces: only a count and an order are needed.
             node = level_group.zarr_group[table_path]
             held = min(int(node.shape[0]), n)
             if held < n:
@@ -2817,10 +2673,8 @@ def _patch_dense_manifests(
 
 
 def _object_array(blobs: Any) -> npt.NDArray[np.object_]:
-    """``blobs`` as a 1-D object array of ``bytes``, without a Python loop.
-
-    Never through a fixed-width byte string: that strips trailing NULs,
-    and every manifest ends in them (an empty one is four zero bytes).
+    """``blobs`` as a 1-D object array of ``bytes``, never via fixed-width bytes
+    (which would strip the trailing NULs every manifest ends in).
     """
     if isinstance(blobs, np.ndarray) and blobs.dtype == object:
         return blobs.reshape(-1)
@@ -2829,12 +2683,8 @@ def _object_array(blobs: Any) -> npt.NDArray[np.object_]:
 
 
 def _empty_manifests(n: int) -> npt.NDArray[np.object_]:
-    """``n`` empty-manifest blobs as an object array.
-
-    Not ``np.full(n, blob, dtype=object)``: that converts the fill value
-    through a fixed-width byte string, which strips the trailing NULs --
-    and an empty manifest is nothing but four NULs, so it became ``b""``,
-    which no reader accepts.
+    """``n`` empty-manifest blobs as an object array (not ``np.full``, which strips
+    the blob's NULs to ``b""``).
     """
     out = np.empty(max(int(n), 0), dtype=object)
     out.fill(_EMPTY_MANIFEST_BLOB)
@@ -2844,12 +2694,9 @@ def _empty_manifests(n: int) -> npt.NDArray[np.object_]:
 def _extend_object_id_table(
     level_group: Group, keep: int, new_ids: npt.NDArray[np.int64],
 ) -> None:
-    """Keep the first ``keep`` rows of ``object_index/object_ids``, add ``new_ids``.
+    """Keep the first ``keep`` rows of ``object_index/object_ids`` and add ``new_ids``.
 
-    Appends in place once the table is chunked at the manifest bucket,
-    as every table written since is; a table written as one chunk (an
-    older store) and a truncation are rewritten with that chunking, so
-    later appends touch only the rows they add.
+    Appends in place when bucket-chunked; otherwise rewrites with that chunking.
     """
     path = f"{OBJECT_INDEX}/{OBJECT_IDS_ARRAY}"
     node = level_group.zarr_group[path]
@@ -2886,10 +2733,8 @@ def _ids_for_append(
 ) -> npt.NDArray[np.int64] | None:
     """The ids appended rows get, or ``None`` when rows are the ids (V1).
 
-    Appending by row to an index whose ids are *stored* (V2) used to add
-    rows with no id, so they could not be found by id and a read by id
-    dropped them. Now the ids are given (``ids=``) or, when the stored
-    table is the identity, extended as the identity; anything else raises.
+    On an index that stores ids: ``ids=`` if given, the identity if the table
+    is the identity, else :class:`ArrayError`.
     """
     meta = level_group.read_array_meta(OBJECT_INDEX) if OBJECT_INDEX in level_group else {}
     table_path = f"{OBJECT_INDEX}/{OBJECT_IDS_ARRAY}"
@@ -2938,10 +2783,8 @@ def _ids_for_append(
 
 
 def _index_layout_for_write(level_group: Group, requested: str | None = None) -> str:
-    """``"dense"`` or ``"vlen"``: the layout a write to this index uses.
-
-    An explicit request wins; an index that exists keeps its layout; a
-    new one takes the store's ``manifest_layout``.
+    """``"dense"`` or ``"vlen"``: explicit request, else the existing index's
+    layout, else the store's ``manifest_layout``.
     """
     from zarr_vectors.core import dense_manifests as dense
 
@@ -2985,14 +2828,12 @@ def _write_dense_index(
     sid_ndim: int,
     block_dtype: Any = None,
 ) -> int:
-    """Write manifests as CSR arrays to a dense index (see
-    :mod:`zarr_vectors.core.dense_manifests`), keeping its id table and
-    ``layout`` stamp in step. Returns the first row written."""
+    """Write CSR manifests to a dense index (:mod:`zarr_vectors.core.dense_manifests`),
+    keeping its id table and ``layout`` stamp in step. Returns the first row written.
+    """
     from zarr_vectors.core import dense_manifests as dense
 
-    # The block dtype first, so a refused one (or a block that does not
-    # fit it) fails before anything changes -- the vlen arrays below
-    # included, which a rewrite as dense would otherwise have dropped.
+    # Resolve the block dtype first, so a refusal fails before anything changes.
     recreate = mode == "replace" or not level_group.array_exists(dense.BLOCKS_PATH)
     dtype = dense.resolve_block_dtype(level_group, block_dtype, recreate=recreate)
     if mode == "replace" and level_group.array_exists(f"{OBJECT_INDEX}/manifests"):
@@ -3419,25 +3260,18 @@ def write_object_attribute_columns(
 ) -> None:
     """Write several object attribute columns in one call.
 
-    The store ends up exactly as one :func:`write_object_attributes` call
-    per column would leave it, for the same arguments. What changes is
-    the cost of the common case, a column that grows in place: one node
-    lookup per column instead of three, one resize covering any gap and
-    the new rows instead of two, and the columns grown concurrently.
-    A column that is new, reaches back past its end (a torn flush) or has
-    metadata too thin to grow from goes through the single-column writer.
+    Leaves the store as one :func:`write_object_attributes` call per column
+    would, but columns that grow in place are extended concurrently.
 
     Args:
-        level_group: Resolution level group.
-        columns: ``{name: rows}``; device arrays are copied off once each.
-        mode: ``"append"`` (the default), ``"replace"``, or ``"place"``:
-            rows ``[at, at + n)`` of columns sized by
-            :func:`~zarr_vectors.core.object_rows.reserve_object_rows`,
-            and nothing else, for several processes writing disjoint,
-            aligned ranges at once.
+        columns: ``{name: rows}``; device arrays are copied to the host once.
+        mode: ``"append"`` (default), ``"replace"``, or ``"place"`` (rows
+            ``[at, at + n)`` of columns sized by
+            :func:`~zarr_vectors.core.object_rows.reserve_object_rows`, for
+            processes writing disjoint ranges at once).
         at: Row the new rows start at, as for :func:`write_object_attributes`.
-        fill_values: The absent-row sentinel: one value for every column,
-            or a mapping by name (missing names use the dtype default).
+        fill_values: Absent-row sentinel: one value, or a mapping by name
+            (missing names use the dtype default).
     """
     from concurrent.futures import ThreadPoolExecutor
 
@@ -4576,25 +4410,6 @@ def _read_attr_cell(
     )
 
 
-def _append_attr_rows(
-    level_group: Group, full_name: str, key: str, new_rows: npt.NDArray,
-) -> npt.NDArray:
-    """``new_rows`` after whatever the attribute cell already holds.
-
-    Reads the cell rather than asking the presence manifest whether it is
-    there: the manifest lags the cells whenever stamps are collected or
-    deferred, and an append told "absent" overwrites the rows it should
-    have kept.  The array's metadata is read only when the cell turns out
-    to hold something, so a first write to a cell costs no more than it
-    did.
-    """
-    blob = level_group.read_bytes(full_name, key)
-    if not blob:
-        return new_rows
-    existing = _read_attr_cell(level_group, full_name, key, new_rows, blob=blob)
-    return np.concatenate([existing, new_rows], axis=0)
-
-
 def _parse_offsets_for_family(
     seg: str,
     *,
@@ -4661,12 +4476,8 @@ def list_link_attribute_offsets(
 
 
 def _cast_checked(values: npt.NDArray, dtype: Any, what: str) -> npt.NDArray:
-    """``values`` as ``dtype``, raising rather than changing a value.
-
-    Integer targets must hold every value exactly; float targets must not
-    turn a finite value infinite. A store's stamped element type wins over
-    the caller's, so a cast is how new rows join old ones -- and a silent
-    wrap there is the corruption this guards against.
+    """``values`` as ``dtype``, raising :class:`ArrayError` if an integer value would
+    change or a finite float become infinite.
     """
     dtype = np.dtype(dtype)
     if values.dtype == dtype:
@@ -4690,12 +4501,8 @@ def _stamped_link_dtype(level_group: Group, name: str, fallback: Any) -> np.dtyp
 
 
 def _stamp_is(stamped: Any, dtype: Any) -> bool:
-    """Whether a segment's stamped dtype is ``dtype`` already.
-
-    Then "does the segment hold data?" cannot change the answer, and the
-    listing that asks it -- in a deferred level, a read of every shard --
-    is skipped. Both sides go through ``np.dtype`` (``np.dtype('f8') ==
-    None`` is True), and a stamp that does not parse is not a match.
+    """Whether a stamped dtype equals ``dtype`` (an unparseable stamp is not a
+    match; both go through ``np.dtype`` since ``np.dtype('f8') == None``).
     """
     try:
         return np.dtype(stamped) == np.dtype(dtype)
@@ -4706,15 +4513,10 @@ def _stamp_is(stamped: Any, dtype: Any) -> bool:
 def _link_attr_target_dtype(
     level_group: Group, full_name: str, keys: Sequence[str], new_dtype: Any,
 ) -> tuple[np.dtype, dict[str, bytes]]:
-    """The dtype an attribute segment's cells are written in, and their bytes.
+    """The dtype an attribute segment's cells are written in, and their current bytes.
 
-    The stamped dtype wins once the segment holds data, so rows appended
-    later join the old ones instead of re-typing the segment under them
-    (every cell written before would then decode at the wrong width). A
-    segment with no data yet -- pre-created with a placeholder dtype --
-    takes the data's. "Holds data" is asked of the cells being written as
-    well as of the presence manifest, which lags whenever stamps are
-    deferred.
+    The stamped dtype wins once the segment holds data (asked of the cells as
+    well as the lagging presence manifest); an empty segment takes ``new_dtype``.
     """
     meta = level_group.read_array_meta(full_name) or {}
     blobs = {k: level_group.read_bytes(full_name, k) for k in keys}
@@ -5108,8 +4910,6 @@ def _write_link_cells_arrays(
         partition_link_arrays,
     )
 
-    # Device records stay on the device through the partition, which
-    # returns them grouped; anything else is copied off once here.
     if _xp.encode_on_device(chunks, vids):
         cc, vi = chunks, vids
     else:
@@ -5139,8 +4939,6 @@ def _write_link_cells_arrays(
             directed=directed, store=store, action="append to",
         )
 
-    # Placement: the array partitioner where it applies (pinned to the
-    # record one by test), the record one otherwise.
     buckets: dict[tuple[str, ChunkCoords], tuple[npt.NDArray, npt.NDArray]]
     if store == "canonical" and link_width <= _MAX_ARRAY_LINK_WIDTH:
         scale_src, scale_trg = _link_scales(level_group, delta, sid_ndim)
@@ -5173,7 +4971,6 @@ def _write_link_cells_arrays(
     for (seg, src), (rows, idx) in sorted(buckets.items()):
         by_seg.setdefault(seg, []).append((src, rows, idx))
 
-    # Allocate, and learn each segment's stored element types.
     seg_info: dict[str, tuple[Any, np.dtype, bool]] = {}
     for seg in by_seg:
         offsets = parse_offsets(seg, sid_ndim=sid_ndim, link_width=link_width)
@@ -5222,10 +5019,7 @@ def _write_link_cells_arrays(
     if intra_keys:
         plan.append((LINK_FRAGMENTS, sorted(set(intra_keys))))
     cache = flush_prefetch(level_group._zarr, plan)
-    # The prefetch reads the store. Inside a shard transaction a cell the
-    # transaction holds -- written, or under "replace" not yet written --
-    # must come from it, as Group.read_bytes serves it: otherwise an append
-    # after a cleared cell keeps the store's old rows.
+    # Cells staged in a shard transaction win over the store prefetch.
     txn = level_group._shard_txn
 
     def raw(name: str, key: str) -> bytes:
@@ -5307,13 +5101,8 @@ def _write_link_cells_arrays(
 def _append_flat_link_cell(
     raw: bytes, raw_sidecar: bytes, rows: npt.NDArray, dtype: np.dtype,
 ) -> tuple[bytes, bytes]:
-    """An intra cell and its fragment sidecar with ``rows`` added as a group.
-
-    What decoding the cell into its groups, appending ``rows`` and
-    writing it back through :func:`write_chunk_links` produces. When the
-    sidecar tiles the cell -- every bulk writer's layout -- that is the
-    old bytes with the new rows after them, and one more range; otherwise
-    the groups are materialised and laid out afresh, as that path does.
+    """An intra cell and its fragment sidecar with ``rows`` added as a group, as
+    :func:`write_chunk_links` would write them (fast path when the sidecar tiles the cell).
     """
     width = rows.shape[1]
     new_bytes = np.ascontiguousarray(rows, dtype=dtype).tobytes()
@@ -7180,14 +6969,10 @@ def read_object_manifests(
 def read_object_manifests_csr(
     level_group: Group, ids: Sequence[int],
 ) -> ManifestCSR:
-    """The manifests of the objects ``ids``, as CSR arrays.
+    """The manifests of the objects ``ids``, as a :class:`ManifestCSR`.
 
-    :func:`read_object_manifests` for a named subset, in the shape
-    :func:`read_all_object_manifests_csr` returns: no Python object per
-    object or per fragment. Row ``o`` of the result is the ``o``-th id
-    found, in the order asked; ``object_ids`` names them. Ids the level
-    does not hold are left out, as :func:`read_object_manifests` leaves
-    them out, so a caller may pass a superset.
+    Row ``o`` is the ``o``-th id found, in the order asked; unknown ids are
+    left out, as in :func:`read_object_manifests`.
     """
     meta = level_group.read_array_meta(OBJECT_INDEX)
     _require_object_index_layout(meta)
@@ -7277,17 +7062,8 @@ def _id_table_is_identity(level_group: Group, meta: dict[str, Any], node: Any) -
 
 
 def _object_id_lookup(level_group: Group) -> tuple[Any, ...] | None:
-    """How ids resolve to rows on this level, or ``None`` for V1 identity.
-
-    One of:
-
-    - ``("identity", n)``: the stored table is ``0 .. n - 1``, so an id
-      is its row. Proved without holding the table (see
-      :func:`_id_table_is_identity`): at 1.5e9 objects the table alone is
-      12 GB, and sorting it as many again.
-    - ``("sorted", table)``: ascending ids; an id's row is its position.
-      The writer's stamp says so (bulk writers emit ids in order).
-    - ``("permuted", sorted_ids, rows)``: anything else, sorted once.
+    """How ids resolve to rows: ``None`` (V1 identity), ``("identity", n)`` (proved
+    without loading the table), ``("sorted", table)`` or ``("permuted", sorted_ids, rows)``.
     """
     cache = level_group._object_id_lookup_cache
     key = level_group._full_path(OBJECT_INDEX)

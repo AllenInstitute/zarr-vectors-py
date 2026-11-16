@@ -850,12 +850,8 @@ def _split_by_bin(
     assignments: dict[ChunkCoords, npt.NDArray],
     mv_bin: npt.NDArray[np.int64],
 ) -> dict[ChunkCoords, npt.NDArray]:
-    """Prefix each spatial chunk's metavertices with their attribute bin.
-
-    ``{(z, y, x): idx}`` becomes ``{(bin, z, y, x): idx[mv_bin[idx] == bin]}``,
-    the on-disk keys of a level chunked by an attribute.  Order within a
-    chunk is kept, which is what fixes each metavertex's fragment index.
-    """
+    """``{(z, y, x): idx}`` -> ``{(bin, z, y, x): idx[mv_bin[idx] == bin]}``,
+    keeping order within a chunk (it fixes each fragment index)."""
     out: dict[ChunkCoords, npt.NDArray] = {}
     for scc, idx in assignments.items():
         idx = np.asarray(idx)
@@ -869,16 +865,9 @@ def _coarse_grid(
     level_group, root_meta: Any, chunk_shape: tuple[float, ...],
     leading: tuple[int, ...],
 ):
-    """The allocation context for a coarse level's per-chunk arrays.
-
-    A spatial level needs none: arrays allocated without a session derive
-    their grid from the store.  A level with a leading bin axis is given
-    its grid outright.  The derivation would find the bin count in
-    ``chunk_attribute_values``, but a rechunk made before bin labels were
-    recorded has the axis with no values, and there it would allocate one
-    rank short.  Once ``vertices`` exists at the full rank, every later
-    allocation in the level derives the axis from it.
-    """
+    """The allocation context for a coarse level's per-chunk arrays: none for
+    a spatial level; an explicit grid when there is a leading bin axis
+    (its values may be unrecorded, so derivation could be a rank short)."""
     if not leading:
         return nullcontext()
     from zarr_vectors.core.arrays import level_grid_layout
@@ -894,15 +883,9 @@ def _coarse_grid(
 
 @contextmanager
 def _rollback_level_on_failure(root, source_level: int, target_level: int):
-    """Undo one coarsen step's writes if it raises.
-
-    The step writes the target level, stamps the root (the NGFF
-    ``multiscales`` entry, capability tokens, the ``ome`` node) and may
-    add a ``links/+1`` family to the source level.  All of it is new,
-    because the caller refuses a target that already exists, so undoing
-    it is deleting it and restoring the attributes it changed.  A cleanup
-    failure is attached to the original error rather than replacing it.
-    """
+    """Undo one coarsen step if it raises: drop the target level and any new
+    ``links/+1`` family, restore root/source attrs.  A cleanup failure is
+    added as a note on the original error."""
     src = get_resolution_level(root, source_level)
     root_before = root.attrs.to_dict()
     src_before = src.attrs.to_dict()

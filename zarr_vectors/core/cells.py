@@ -1,16 +1,11 @@
 """Many cells of many arrays in one read, returned as flat arrays.
 
-The per-cell readers answer "this chunk's vertices"; a pipeline that works
-on a chunk and its neighbours asks that 27 times per array, one round trip
-each. :func:`read_cells` reads any set of cells of any set of per-chunk
-arrays with one batched prefetch, and returns each array as one flat
-``data`` array plus CSR ``offsets`` over the requested cells -- the shape
-an array program wants, and the one that crosses to a device in a single
-copy (``device="cuda"``).
-
-The rows are each cell's *stored* rows, as :func:`read_chunk_vertex_buffer`
-returns them: not filtered by fragment, so per-vertex attribute rows line
-up 1:1 with vertex rows.
+:func:`read_cells` reads any set of cells of any set of per-chunk arrays with
+one batched prefetch, and returns each array as one flat ``data`` array plus
+CSR ``offsets`` over the requested cells, which crosses to a device in one
+copy. The rows are each cell's *stored* rows, as
+:func:`read_chunk_vertex_buffer` returns them: not filtered by fragment, so
+per-vertex attribute rows line up 1:1 with vertex rows.
 """
 
 from __future__ import annotations
@@ -54,19 +49,12 @@ class CellReadError:
 class ArrayRead:
     """How one array's cells reached a :class:`CellBatch`.
 
-    ``path`` is one of:
-
-    - ``gds``: stored bytes read with kvikio, GPUDirect Storage on;
-    - ``kvikio-compat``: read with kvikio through cuFile's bounce buffer;
-    - ``pinned-host``: plain reads into pinned host memory, one copy up;
-    - ``store``: byte-range gets from a store that is not a local
-      directory, one copy up;
-    - ``host``: read and decoded on the host (a host read, or an array
-      a device read left to the host).
-
-    The first four decode on the device. ``stored_bytes`` is what they
-    read from storage, before decompression; ``None`` for ``host``, where
-    zarr does not say.
+    ``path`` is ``gds`` (kvikio, GPUDirect Storage on), ``kvikio-compat``
+    (kvikio through cuFile's bounce buffer), ``pinned-host`` (pinned host
+    reads, one copy up) or ``store`` (byte-range gets from a non-local store,
+    one copy up), all decoded on the device; or ``host`` (read and decoded on
+    the host). ``stored_bytes`` is what was read from storage, before
+    decompression; ``None`` for ``host``.
     """
 
     array: str
@@ -108,19 +96,12 @@ class CellColumn:
 class FragmentColumn:
     """The vertex fragments of every requested cell, as flat arrays.
 
-    Cell ``i``'s fragments are ``cell_offsets[i]:cell_offsets[i + 1]``,
-    in the order its fragment index lists them. Fragment ``f`` holds
-    ``counts[f]`` of the cell's vertex rows, numbered from the cell's
-    first row in the ``vertices`` column: rows ``starts[f]`` to
-    ``starts[f] + counts[f]`` when it is a range, and otherwise
-    (``starts[f] == -1``) rows ``indices[index_offsets[f]:index_offsets[f + 1]]``.
-    Range fragments have no entries in ``indices``. All on the batch's
-    device.
-
-    A store written bin by bin (a point cloud, say) holds fragments that
-    tile each cell's rows in bin order, empty bins included, so cell
-    ``i``'s bin boundaries are ``0`` followed by the running sum of
-    ``counts[a:b]``, with ``a, b = cell_offsets[i], cell_offsets[i + 1]``.
+    Cell ``i``'s fragments are ``cell_offsets[i]:cell_offsets[i + 1]``, in
+    fragment-index order. Fragment ``f`` holds ``counts[f]`` of the cell's
+    vertex rows, numbered from its first row: ``starts[f]`` onward for a
+    range, else (``starts[f] == -1``) ``indices[index_offsets[f]:index_offsets[f + 1]]``.
+    All on the batch's device. A store written bin by bin has fragments
+    tiling each cell's rows in bin order, empty bins included.
     """
 
     cell_offsets: Any
@@ -140,19 +121,13 @@ class FragmentColumn:
 class CellBatch(Mapping[str, CellColumn]):
     """The result of :func:`read_cells`: one :class:`CellColumn` per array.
 
-    ``chunk_coords`` is the requested cells in request order, always on
-    the host; the columns are on ``device``.
-
-    ``fragments`` is the vertices' fragment index when it was asked for
-    (``read_cells(..., fragments=True)``), else None.
-
-    ``io`` says how each array read was served (:class:`ArrayRead`), one
-    entry per array actually read, which can be more than were asked for:
-    ``vertices``, when it was read only to size an attribute whose width
-    is not stamped, and ``vertex_fragments`` last, with ``fragments=True``.
-    ``io_seconds`` says where the time went: ``fetch`` and ``decode`` for
-    the arrays decoded on the device, ``host`` for the rest (reading and
-    decoding together). Neither takes part in equality.
+    ``chunk_coords`` is the requested cells in request order, on the host;
+    the columns are on ``device``. ``fragments`` is the vertices' fragment
+    index with ``fragments=True``, else None. ``io`` says how each array read
+    was served (:class:`ArrayRead`), including ``vertices`` read only to size
+    an unstamped attribute and ``vertex_fragments`` last. ``io_seconds`` holds
+    ``fetch`` and ``decode`` (device) and ``host`` times. Neither takes part
+    in equality.
     """
 
     chunk_coords: npt.NDArray[np.int64]
@@ -323,48 +298,27 @@ def read_cells(
     """Read the cells ``chunk_coords`` of every array in ``arrays`` at once.
 
     Args:
-        level_group: Resolution level group.
-        chunk_coords: ``(C, K)`` integer chunk coordinates (a list of
-            tuples is fine; a device array is copied off once). The
-            result keeps this order, duplicates included.
-        arrays: Per-chunk arrays to read: ``vertices``,
-            ``vertex_attributes/<name>``, ``fragment_attributes/<name>``,
-            ``links/<delta>/<offsets>`` (physical rows, perm column
-            included) or ``link_attributes/<name>/<delta>/<offsets>``.
+        chunk_coords: ``(C, K)`` chunk coordinates; the result keeps this
+            order, duplicates included.
+        arrays: ``vertices``, ``vertex_attributes/<name>``,
+            ``fragment_attributes/<name>``, ``links/<delta>/<offsets>`` (physical
+            rows, perm column included) or ``link_attributes/<name>/<delta>/<offsets>``.
         ndim: Vertex coordinate width; ``None`` reads it from the store.
-        missing_arrays: ``"skip"`` leaves an array that does not exist
-            out of the result instead of raising.
-        on_error: ``"record"`` puts a cell that cannot be read in
-            ``errors`` and gives it no rows; ``"raise"`` re-raises.
-        device: ``"cpu"``, ``"cuda"`` or ``None`` (where ``chunk_coords``
-            lives). Each returned array crosses to the device once.
-        decode: Where a ``device="cuda"`` read decodes its cells; the
-            result is the same either way. ``"auto"`` decodes on the
-            device every uncompressed array (vlen-bytes cells, sharded or
-            not) and the rest on the host. ``"device"`` also decodes zstd
-            arrays there, through nvCOMP, and raises for an array it
-            cannot decode instead of falling back. nvCOMP trusts its
-            input: a zstd cell corrupted inside a block can return wrong
-            bytes, hang, or crash the CUDA context where the host decoder
-            raises, so use it only on stores you trust. ``"host"``
-            decodes everything on the host and uploads the result.
-            Ignored for a host read.
-        io: How a device decode reads a local store's files:
-            ``"kvikio"`` straight into device memory, ``"host"`` into
-            pinned host memory and one copy up. ``"auto"`` takes
-            ``$ZARR_VECTORS_GPU_IO`` if set, else ``kvikio`` only where
-            cuFile reports GPUDirect Storage available
-            (:func:`zarr_vectors._gds.choose_io`). The result is the same
-            either way. Ignored for a host read and for other stores.
-        fragments: Also return the vertices' fragment index, as
-            ``batch.fragments`` (:class:`FragmentColumn`): how each cell's
-            vertex rows split into fragments -- a point cloud's bins, for
-            instance, without working them out again from coordinates.
-            Read in the same prefetch and decoded on the host (a range
-            fragment is 16 bytes), then moved to ``device``.
+        missing_arrays: ``"skip"`` omits arrays that do not exist.
+        on_error: ``"record"`` puts unreadable cells in ``errors``, with no
+            rows; ``"raise"`` re-raises.
+        device: ``"cpu"``, ``"cuda"`` or ``None`` (where ``chunk_coords`` lives).
+        decode: Where a cuda read decodes (same result): ``"auto"``
+            uncompressed arrays on the device; ``"device"`` zstd too, via
+            nvCOMP, raising if it cannot (nvCOMP trusts its input: corrupt
+            cells can crash the CUDA context, so trusted stores only); ``"host"``.
+        io: How a device read reads local files: ``"kvikio"``, ``"host"``
+            (pinned), or ``"auto"`` (``$ZARR_VECTORS_GPU_IO``, else
+            :func:`zarr_vectors._gds.choose_io`).
+        fragments: Also return ``batch.fragments`` (:class:`FragmentColumn`).
 
     Returns:
-        A :class:`CellBatch`. A cell nobody wrote, or outside an array's
+        A :class:`CellBatch`; a cell nobody wrote, or outside an array's
         grid, has no rows.
     """
     from zarr_vectors._gds import check_io
@@ -548,11 +502,8 @@ def _device_payloads(
     io: str = "auto",
     seconds: dict[str, float] | None = None,
 ) -> dict[str, Any]:
-    """Fetch and unframe on the device every array it can decode.
-
-    Returns ``{array: Payloads}`` for the arrays read there; the others
-    are left to the host path. Empty for a host read.
-    """
+    """``{array: Payloads}`` fetched and unframed on the device, for every
+    array it can decode; the rest are left to the host path."""
     if decode == "host":
         return {}
     if decode not in ("auto", "device"):

@@ -420,10 +420,8 @@ def _read_pool() -> Any:
 
 
 def _reset_read_pool_after_fork() -> None:
-    """A forked child inherits the pool object but none of its threads.
-
-    See :func:`zarr_vectors.core._batch_writer._reset_write_pool_after_fork`.
-    """
+    """Drop a forked child's inherited pool and lock; see
+    :func:`zarr_vectors.core._batch_writer._reset_write_pool_after_fork`."""
     global _READ_POOL, _READ_POOL_LOCK
     _READ_POOL = None
     _READ_POOL_LOCK = threading.Lock()

@@ -300,12 +300,7 @@ def classify_fragments_csr(
     range exactly when :func:`encode_fragments` would make it one: it is
     non-empty, starts at an index >= 0, and steps by one throughout. An
     empty fragment stays explicit. A negative index anywhere raises, as it
-    does there: it can never sit in a range, so the explicit path would
-    reject it.
-
-    Vectorised: a fragment is a run of +1 steps exactly when the running
-    count of steps that are not +1 is the same at its first and last
-    index.
+    does there.
     """
     from zarr_vectors import _xp
 
@@ -334,6 +329,7 @@ def classify_fragments_csr(
         breaks = np.concatenate(([0], np.cumsum(np.diff(idx) != 1)))
         nonempty = counts > 0
         is_range = np.zeros(num, dtype=bool)
+        # A run of +1 steps: the count of non-+1 steps is equal at both ends.
         is_range[nonempty] = (
             breaks[off[1:][nonempty] - 1] == breaks[starts[nonempty]]
         )
@@ -580,10 +576,7 @@ class ChunkFragmentIndex:
         ``rows`` is ``np.concatenate([self.indices(f) for f in frags])``
         and ``lengths[i]`` is ``len(self.indices(frags[i]))``, so fragment
         ``frags[i]``'s rows are ``rows[o[i]:o[i + 1]]`` with ``o`` the
-        cumulative sum of ``lengths`` from 0. Built with one repeat and one
-        cumulative sum over the request, never a call per fragment: a
-        range fragment is ``start + (0 .. count)``, an explicit one the
-        same over the CSR slice it owns, then looked up in its indices.
+        cumulative sum of ``lengths`` from 0.
 
         Raises:
             IndexError: A fragment outside ``[0, len(self))``, as
@@ -1170,10 +1163,8 @@ def encode_object_manifests_csr(
     )
 
     out = np.empty(counts.size, dtype=object)
-    # One pass per distinct block count, never per object. Each blob is a
-    # fixed-width row there, and a void view of the rows turns into full
-    # ``bytes`` in C -- a fixed-width byte string would strip the trailing
-    # NULs every manifest ends with.
+    # One pass per distinct block count. A void view keeps trailing NULs,
+    # which a fixed-width byte string would strip.
     for k in np.unique(counts).tolist():
         rows = np.flatnonzero(counts == k)
         blob_width = 4 + k * width

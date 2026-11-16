@@ -1026,52 +1026,20 @@ class Group:
     @contextmanager
     def collect_presence(self) -> Iterator[list[tuple[str, str, bool]]]:
         """Defer the ``nonempty_chunks`` stamps inside the block, so the
-        caller decides when — and under what lock — they are applied.
+        caller decides when, and under what lock, to apply them.
 
-        The third presence mode, for a writer that can serialise a short
-        section but not the whole flush.  The other two each give up one
-        of the properties such a writer needs:
-
-        * ``record_presence=True`` (the default) stamps inline.  Correct
-          serially, but the manifest is ONE attribute shared by every
-          cell, so it is a read-modify-write of state outside the cell
-          being written: two workers writing DISJOINT cells still race,
-          and the loser's key vanishes while its payload sits on disk.
-        * ``record_presence=False`` plus a coordinator's
-          :func:`zarr_vectors.building.rebuild_presence` has no race, but
-          the cell is invisible to :meth:`list_chunks` until the rebuild
-          runs — and consumers legitimately run before it.
-
-        Inside the block, any write that would stamp instead records
-        ``(array_name, chunk_key, present)`` into the yielded list.  The
-        PAYLOADS ARE NOT DEFERRED: they go out inline, exactly as they
-        would otherwise, which is the essential difference from
-        :meth:`batched_writes`.  So the bulk of the I/O proceeds
-        unlocked and only :meth:`apply_presence` needs serialising::
+        Writes that would stamp instead append ``(array_name, chunk_key,
+        present)`` to the yielded list; payloads still go out inline.
+        Leaving the block does not apply them, even on error; pass the
+        list to :meth:`apply_presence`.  ``record_presence=False`` is still
+        honoured.  The list and this Group belong to one thread.  Nesting
+        or use inside :meth:`batched_writes` raises :class:`StoreError`.
+        See ``docs/how_to/hpc_pipelines.md``::
 
             with level_group.collect_presence() as pending:
                 flush(level_group)          # payloads, no lock held
-            with store_write_lock(path):    # short, lock held
+            with store_write_lock(path):
                 level_group.apply_presence(pending)
-
-        Leaving the block restores normal stamping but DOES NOT apply —
-        the caller choosing the moment is the entire point.  ``pending``
-        is the list itself, so if the body raises it is still fully
-        populated and still applicable; the payloads that did land are
-        recorded, and applying is how they become visible.
-
-        ``record_presence=False`` is still honoured inside the block: an
-        opt-out is a decision not to stamp at all, not a request to stamp
-        later.
-
-        ``pending`` belongs to one thread.  This Group must not be shared
-        across workers while collecting, and the token must not be handed
-        to another thread to apply.
-
-        Nesting is not supported and raises :class:`StoreError`, as is
-        collecting inside :meth:`batched_writes` — that block defers the
-        payloads too and stamps its own manifest at flush time, so the
-        two cannot both own the stamp.
         """
         if self._pending_presence is not None:
             raise StoreError("collect_presence() does not support nesting")
@@ -1093,28 +1061,13 @@ class Group:
     def apply_presence(self, pending: list[tuple[str, str, bool]]) -> int:
         """Apply stamps collected by :meth:`collect_presence`.
 
-        Coalesced to ONE read-modify-write of ``nonempty_chunks`` per
-        array, not one per cell.  That is what makes the call short
-        enough to hold a lock across, and it is fewer attribute writes
-        than stamping each in turn would have been.
-
-        Entries are folded in order, so the last write to a chunk key
-        wins: present-then-absent within a block leaves the key absent,
-        matching the ``present=bool(data)`` semantics of an inline stamp.
-
-        Each array is re-resolved BY NAME here rather than through a
-        handle held from collection time — a sharded array resolves via
-        ``_sharded_chunk_array``, and the level may have been re-opened
-        in between.
-
-        Applying an empty ``pending`` is a no-op, not an error, so a
-        caller need not test before calling.
+        One read-modify-write of ``nonempty_chunks`` per array; entries
+        fold in order, so the last stamp for a chunk key wins.  Arrays are
+        re-resolved by name.  An empty ``pending`` is a no-op.
 
         Returns:
-            How many arrays were stamped.  An array with no manifest --
-            one in a deferred level -- is left alone and not counted:
-            its presence is derived from the store, and folding these
-            keys into a new list would hide every other cell.
+            How many arrays were stamped.  An array with no manifest (a
+            deferred level) is skipped and not counted.
 
         Raises:
             StoreError: If an array named in ``pending`` is gone.
@@ -1122,8 +1075,7 @@ class Group:
         if not pending:
             return 0
 
-        # dict preserves insertion order and last-write-wins, which IS
-        # the ordering rule -- no explicit sort or dedupe needed.
+        # dict assignment gives last-write-wins.
         by_array: dict[str, dict[str, bool]] = {}
         for array_name, chunk_key, present in pending:
             by_array.setdefault(array_name, {})[chunk_key] = present
@@ -1141,9 +1093,8 @@ class Group:
                 )
             current = arr.attrs.get(_NONEMPTY_CHUNKS_ATTR)
             if current is None:
-                # No manifest to fold into: presence here is derived from
-                # the store (a deferred level), and a list of just these
-                # keys would claim the array holds nothing else.
+                # Deferred level: a list of just these keys would hide
+                # every other cell.
                 skipped += 1
                 continue
             keys = set(current)
@@ -1152,17 +1103,8 @@ class Group:
                     keys.add(chunk_key)
                 else:
                     keys.discard(chunk_key)
-            # Same mechanism as ``_record_nonempty_chunk``, so the handle
-            # we just resolved keeps serving the value we just wrote.
             arr.attrs[_NONEMPTY_CHUNKS_ATTR] = sorted(keys)
-            # ``_chunk_listing`` memoizes the manifest and has no refresh
-            # path, so a warm entry would keep answering with the
-            # pre-stamp list and defeat the visibility this call exists
-            # to provide.  Targeted rather than ``_invalidate_node``,
-            # which would also drop the node handle and the unrelated
-            # object-id lookup.  Belt-and-braces: ``cached_nodes`` is
-            # documented read-only, so a caller mixing the two is
-            # already outside the contract.
+            # ``_chunk_listing`` memoizes the manifest; drop the stale entry.
             if self._listing_cache:
                 self._listing_cache.pop(self._full_path(array_name), None)
             for chunk_key, present in stamps.items():
@@ -1452,17 +1394,9 @@ class Group:
         return _vlen_get_cell(sharded_arr, index) != b""
 
     def _derived_listing(self, array_name: str, arr: zarr.Array) -> list[str]:
-        """Presence for an array that records none, asked of the store.
-
-        An array carries no ``nonempty_chunks`` while its level's presence
-        is deferred (see :func:`zarr_vectors.building.defer_presence`), and
-        answering "no cells" for it -- what this used to do -- hid every
-        cell a worker had written until the coordinator's rebuild.
-
-        Two cases still answer empty, as before, because neither can ask:
-        an offline-read session, which must not touch the store, and a
-        store that cannot list.
-        """
+        """Presence for an array without ``nonempty_chunks`` (deferred
+        level), derived from the store.  Empty when offline or when the
+        store cannot list."""
         if self._offline is not None:
             return []
         if not getattr(self._zarr.store, "supports_listing", True):
@@ -1472,28 +1406,10 @@ class Group:
     def _presence_contains(
         self, array_name: str, present: list[str], chunk_key: str,
     ) -> bool:
-        """``chunk_key in present``, without rescanning an unchanged list.
-
-        Inside a :meth:`batched_writes` or :meth:`cached_nodes` block the
-        node handle is cached, so every call sees the same manifest list,
-        and a caller asking per cell -- the per-tuple link readers,
-        :func:`~zarr_vectors.core.arrays.read_chunk_fragment_attributes`
-        -- scanned it once per cell.  The second sighting of a list builds
-        a set and later ones reuse it.  The first is still a plain scan:
-        outside a block every call re-reads ``zarr.json`` and parses a
-        fresh list, and building a set from it would only add to a lookup
-        that is never repeated.
-
-        Not a binary search, even though every writer here stores the
-        list sorted: only the sharding spec says it must be, and a list
-        from any other writer out of order would make a bisection answer
-        "absent" for a cell that is there.
-
-        Keyed to the list OBJECT, not its contents.  Every stamp assigns
-        a new list rather than mutating the old one, so identity is an
-        exact staleness test; holding the list in the entry keeps its id
-        from being reused while the entry lives.
-        """
+        """``chunk_key in present``; builds a set on the second sighting of
+        the same list object (stamps always assign a new list, so identity
+        is an exact staleness test).  Not bisected: foreign writers may
+        not sort."""
         cache = self._presence_sets
         if cache is None:
             cache = self._presence_sets = {}
@@ -1928,11 +1844,9 @@ class Group:
         return [bytes(b) for b in node[:]]
 
     def read_vlen_array_raw(self, path: str, stop: int | None = None) -> Any:
-        """Rows ``[0, stop)`` of a vlen-bytes array as zarr returns them.
-
-        An object array of ``bytes``, without the Python ``bytes()`` per
-        row :meth:`read_vlen_array` makes -- for a reader that hands the
-        rows to an array decoder, which is all of them it touches.
+        """Rows ``[0, stop)`` of a vlen-bytes array as zarr returns them:
+        an object array, without :meth:`read_vlen_array`'s per-row
+        ``bytes()`` conversion.
         """
         cached = self._offline_array(path)
         if cached is not None:
@@ -2377,10 +2291,8 @@ class Group:
         """Whether this level declares its presence deferred.
 
         See :func:`zarr_vectors.building.defer_presence`.  Read from the
-        handle's own metadata, so it costs nothing -- and it is only as
-        fresh as the handle: a worker must open the level after the
-        coordinator declares, which is the order a coordinator runs in
-        anyway.
+        handle's metadata, so only as fresh as the handle: open the level
+        after the coordinator declares.
         """
         try:
             return self._zarr.attrs.get(_PRESENCE_DECL_ATTR) == _PRESENCE_DEFERRED
@@ -2388,14 +2300,8 @@ class Group:
             return False
 
     def _initial_presence_attrs(self) -> dict[str, Any]:
-        """The presence attribute a new chunk array is born with.
-
-        An empty manifest normally, which is a claim -- "no cell holds
-        data" -- that each stamp then keeps true.  In a deferred level
-        there is no manifest at all, because every stamp would be a
-        write of state shared between cells, and absence is what tells a
-        reader to ask the store instead.
-        """
+        """A new chunk array's presence attrs: an empty manifest, or none in
+        a deferred level (absence tells readers to ask the store)."""
         return {} if self.presence_deferred() else {_NONEMPTY_CHUNKS_ATTR: []}
 
     def _sharded_chunk_array(self, array_name: str) -> zarr.Array | None:
@@ -2416,57 +2322,21 @@ class Group:
     ) -> list[str]:
         """Rebuild ``array_name``'s ``nonempty_chunks`` from what is on disk.
 
-        The coordinator half of ``write_bytes(..., record_presence=False)``:
-        workers write cell payloads without touching the shared manifest
-        attribute, then one caller runs this once to restore it.  The
-        listing bounds *which* cells to consider; the cells themselves
-        still have to be read, because a cell written with an empty
-        payload is an object on disk that must not be recorded as
-        present.  Those reads go out as one :func:`asyncio.gather` — the
-        same prefetch :meth:`batched_reads` uses — so the cost is one
-        listing plus one round-trip per array rather than a GET per cell.
-
-        Works on a **sharded** array too, by a different route.  There the
-        listing enumerates shard objects rather than cells — zarr builds a
-        sharded array's chunk grid from the SHARD shape, so a key under
-        ``<array>/c/`` is a shard index — so each listed key is expanded
-        to the cell region it covers (``index * shards`` up to
-        ``+shards``, clipped to the array) and that region is read in one
-        slice.  One read per shard that exists, which is strictly fewer
-        than the unsharded branch pays, and only shards that were written
-        are visited.  Returns the sorted keys now recorded.
-
-        This is why sharding no longer has to be the last coordinator
-        pass.  It used to: presence could only be rebuilt from a per-cell
-        listing, so an array had to stay flat until every worker had
-        finished.  A store may now be born sharded.
-
-        Not reported to :func:`observe_presence_writes`.  That instrument
-        watches the INCREMENTAL stamps, where a read-modify-write of
-        shared state can lose a key; this rebuild derives the whole
-        manifest from what is on disk, so it is idempotent, has no
-        per-cell semantics, and there is nothing for an observer to
-        police.
+        The coordinator half of ``write_bytes(..., record_presence=False)``.
+        Candidate cells come from one store listing and are read in one
+        batch, so cells holding an empty payload are not recorded.  For a
+        sharded array each listed shard is answered from its index (see
+        ``docs/spec/chunking/sharding.md``).  Not reported to
+        :func:`observe_presence_writes`.
 
         Args:
-            on_sharded: What to do when ``array_name`` *is* natively
-                sharded.  ``"derive"`` (the default) rebuilds it, as
-                above; the name is a little odd, since deriving is also
-                what happens when the array is flat, but it is kept
-                because the parameter is on a supported surface.
-                ``"skip"`` returns the manifest already recorded without
-                rewriting it, for a caller that wants the cheap answer.
+            on_sharded: For a natively sharded array: ``"derive"`` rebuilds
+                it, ``"skip"`` returns the recorded manifest unchanged,
                 ``"raise"`` raises
-                :class:`~zarr_vectors.exceptions.ShardedPresenceError`,
-                for a caller asserting an array is not sharded.
+                :class:`~zarr_vectors.exceptions.ShardedPresenceError`.
 
-        ``"raise"`` was the default while the sharded case could not be
-        derived at all, and it guarded a real failure: rebuilding from a
-        listing that resolves nothing took a store with 1605 recorded
-        cells down to 2, with no exception and no warning, and the rest
-        became unreachable through ``list_chunks``.  The guard is kept as
-        an assertion rather than removed, but it is no longer what a
-        caller wants by default.
+        Returns the sorted keys now recorded; raises :class:`StoreError`
+        if ``array_name`` is not a chunk array.
         """
         arr = self._sharded_chunk_array(array_name)
         if arr is None:
@@ -2494,21 +2364,13 @@ class Group:
         return keys
 
     def _stored_cell_keys(self, array_name: str, arr: zarr.Array) -> list[str]:
-        """The chunk keys of the cell objects an unsharded array has.
-
-        One listing, no cell reads.  Under zarr's default
-        ``write_empty_chunks=False`` a cell written empty leaves no
-        object, so for an unsharded array this is its presence exactly;
-        :meth:`derive_nonempty_chunks` still reads every candidate,
-        because a store configured otherwise keeps empty cells as
-        objects and the recorded manifest must not list them.
-        """
+        """Chunk keys of the cell objects an unsharded array has: one listing,
+        no cell reads (so a cell stored empty is still listed)."""
         base = self._zarr.path.strip("/")
         prefix = f"{base}/{array_name}/c/" if base else f"{array_name}/c/"
         origin = _grid_origin(arr)
         candidates: list[str] = []
         for stored in _list_store_prefix(self._zarr.store, prefix):
-            # ``c/i/j/k`` → cell index (i, j, k) → absolute coord.
             parts = stored[len(prefix):].split("/")
             if len(parts) != arr.ndim:
                 continue
@@ -2526,16 +2388,9 @@ class Group:
     def _presence_from_store(
         self, array_name: str, arr: zarr.Array, *, verify: bool,
     ) -> list[str]:
-        """``array_name``'s populated cells, asked of the store.  Sorted.
-
-        ``verify=True`` is the rebuild's standard: every candidate is
-        read and an empty one dropped.  ``verify=False`` is a reader's:
-        an unsharded array is answered from the listing alone (see
-        :meth:`_stored_cell_keys`), because a reader asking what an array
-        holds should not have to download it to find out.  A sharded
-        array is always read shard by shard -- one listed object covers
-        many cells, so a listing alone cannot say which.
-        """
+        """``array_name``'s populated cells from the store, sorted.
+        ``verify=True`` reads each unsharded candidate and drops empty ones;
+        ``verify=False`` trusts the listing.  Sharded arrays are always read."""
         shards = getattr(arr, "shards", None)
         if shards is not None:
             return sorted(
@@ -2546,30 +2401,16 @@ class Group:
             return sorted(candidates)
         from zarr_vectors.core._batch_reader import flush_prefetch
 
-        # flush_prefetch applies the grid origin itself and omits any
-        # cell that reads back empty or missing, so a key surviving in
-        # the cache is exactly the ``if _vlen_get_cell(...)`` this
-        # replaced.  It also carries the icechunk serial fallback.
+        # flush_prefetch omits cells that read back empty or missing.
         cells = flush_prefetch(self._zarr, [(array_name, candidates)])
         return sorted(
             chunk_key for (_name, chunk_key), data in cells.items() if data
         )
 
     def _array_has_stored_data(self, array_name: str) -> bool:
-        """Whether ``array_name`` has any chunk object on disk.
-
-        The question ``nonempty_chunks`` is *supposed* to answer, asked of
-        the store instead — because the cases where it matters are exactly
-        the cases where the manifest is not to be trusted.  A decentralised
-        writer passing ``record_presence=False`` leaves it empty while the
-        payloads are on disk, and an array whose manifest lost an update
-        under-reports.  Believing it there is how a populated array gets
-        deleted as "empty".
-
-        Short-circuits on the first key, so it costs one listing request
-        rather than a full enumeration, and it is only asked when the
-        cheap signal already said "empty".
-        """
+        """Whether ``array_name`` has any chunk object on disk, asked of the
+        store because ``nonempty_chunks`` may under-report.  Stops at the
+        first key."""
         from zarr.core.sync import sync
 
         base = self._zarr.path.strip("/")
@@ -2579,27 +2420,9 @@ class Group:
     def _derive_presence_sharded(
         self, arr: zarr.Array, array_name: str, shards: tuple[int, ...],
     ) -> set[str]:
-        """The sharded half of :meth:`derive_nonempty_chunks`.
-
-        Zarr builds a sharded array's chunk grid from the SHARD shape
-        (``chunks_out = shard_shape`` when ``shards=`` is given), so a
-        stored key ``c/i/j/k`` names a shard, not a cell.
-
-        Each listed shard is answered from its INDEX alone -- one ranged
-        read of its last ``16 * cells + 4`` bytes, which say which inner
-        cells are stored and how large -- rather than by reading and
-        decoding every cell it holds: a finalize deriving the presence of
-        the level-0 vertices otherwise re-reads all of them. A stored cell
-        small enough to be an empty payload is read and decoded, so the
-        answer is the one the cells give (see
-        :func:`~zarr_vectors.core._cells_on_disk.shard_cells`).
-
-        A shard whose index cannot be read, and every shard of an array
-        whose layout the index reader does not recognise (or an icechunk
-        store), is expanded to the cell region it covers and read whole:
-        unwritten cells come back as ``b""``, the emptiness test the
-        unsharded branch applies to its per-cell reads.
-        """
+        """The sharded half of :meth:`derive_nonempty_chunks`: stored keys
+        name shards; each is answered from its index, or by reading its
+        cell region whole (see :meth:`_shard_presence`)."""
         base = self._zarr.path.strip("/")
         prefix = f"{base}/{array_name}/c/" if base else f"{array_name}/c/"
         origin = _grid_origin(arr)
@@ -2628,12 +2451,9 @@ class Group:
     def _shard_presence(
         self, arr: zarr.Array, shards: tuple[int, ...], shard_indices: list[tuple[int, ...]],
     ) -> dict[tuple[int, ...], list[tuple[int, ...]]]:
-        """The cells (array indices) each shard holds with a payload.
-
-        From the shard's index where it can be read
-        (:func:`~zarr_vectors.core._cells_on_disk.shard_cells`), else by
-        reading the shard's cell region whole.
-        """
+        """The cells (array indices) each shard holds with a payload, from
+        :func:`~zarr_vectors.core._cells_on_disk.shard_cells` where the
+        index is readable, else by reading the shard's region whole."""
         from zarr_vectors.core._cells_on_disk import shard_cells
 
         shape = arr.shape
@@ -2644,9 +2464,8 @@ class Group:
             if cells is not None:
                 out[shard_index] = [tuple(c) for c in cells.tolist()]
                 continue
-            # The cell region this shard covers, clipped to the array: a
-            # shard at the edge of the grid is only partly in bounds, and
-            # a shard may legitimately be larger than the whole array.
+            # Clip to the array: edge shards (or ones larger than the
+            # array) are only partly in bounds.
             starts = tuple(i * s for i, s in zip(shard_index, shards))
             stops = tuple(
                 min(start + s, dim)
@@ -2664,7 +2483,6 @@ class Group:
             for offset in np.ndindex(block.shape):
                 if block[offset]:
                     found.append(tuple(a + o for a, o in zip(starts, offset)))
-            # Dropped before the next shard: only truthiness was wanted.
             del block
         return out
 
@@ -2882,11 +2700,9 @@ _PRESENCE_DEFERRED = "deferred"
 
 
 class PresenceEvent(NamedTuple):
-    """One stamp applied to an array's ``nonempty_chunks`` manifest.
-
-    Delivered to whatever :func:`observe_presence_writes` has installed.
-    ``present`` mirrors ``_record_nonempty_chunk``'s own argument: True
-    added the key, False discarded it.
+    """One stamp applied to an array's ``nonempty_chunks`` manifest, as
+    delivered by :func:`observe_presence_writes`.  ``present`` is True when
+    the key was added, False when discarded.
     """
 
     array_name: str
@@ -2907,26 +2723,13 @@ def observe_presence_writes(
 ) -> Iterator[None]:
     """Call ``callback`` for every incremental ``nonempty_chunks`` stamp.
 
-    An INSTRUMENT, not a data API: it exists so a test can assert *where*
-    a stamp happened — inside a lock, on which thread — which nothing
-    observable from the store can answer after the fact.  Reach for
-    :meth:`Group.list_chunks` to ask what the manifest says.
-
-    ``callback`` runs SYNCHRONOUSLY, on the thread performing the write,
-    at the moment the stamp lands.  That is the whole point: a caller
-    checking its own lock depth can only do so while the write is
-    happening, so an async or batched-at-exit notification would answer a
-    different question.  Keep the callback cheap and non-raising — it
-    runs in the ``write_bytes`` hot path, and an exception propagates
-    into the writer.
-
-    Covers the INCREMENTAL stamp sites: :meth:`Group.write_bytes`,
+    A test instrument for asserting where a stamp happened (inside a lock,
+    on which thread).  ``callback`` runs synchronously on the writing
+    thread as the stamp lands; keep it cheap, since an exception
+    propagates into the writer.  Covers :meth:`Group.write_bytes`,
     :meth:`Group.write_cells`, :meth:`Group.apply_presence` and the
-    :meth:`Group.batched_writes` flush.  NOT
-    :meth:`Group.derive_nonempty_chunks`, which rebuilds the whole
-    manifest from the store listing: it is idempotent and has no
-    per-cell semantics, so it cannot lose a key the way a
-    read-modify-write can, and there is nothing there to police.
+    :meth:`Group.batched_writes` flush, not
+    :meth:`Group.derive_nonempty_chunks`.  Blocks nest.
 
     Example::
 
@@ -2943,12 +2746,7 @@ def observe_presence_writes(
 
 
 def _emit_presence(array_name: str, chunk_key: str, present: bool) -> None:
-    """Notify observers that ``chunk_key``'s stamp just landed.
-
-    The empty-list check is why this is cheap enough to sit in the write
-    path: with nothing installed it costs one truth test and no
-    allocation.
-    """
+    """Notify observers that ``chunk_key``'s stamp just landed."""
     if not _presence_observers:
         return
     event = PresenceEvent(array_name, chunk_key, present)
@@ -2972,16 +2770,8 @@ def _grid_origin(arr: zarr.Array) -> tuple[int, ...] | None:
 
 
 def _listable_prefix(cells_prefix: str) -> str:
-    """The array node a ``<array>/c/`` prefix lives under.
-
-    Listing is asked of the ARRAY'S prefix and filtered to its cells,
-    never of ``c/`` directly: icechunk accepts only a prefix that names a
-    group or an array, and ``c/`` is neither, so asking for it raised on
-    every icechunk store -- which took ``write_points`` down with it once
-    the layout check started asking the store whether an array is empty.
-    The cost is the array's own ``zarr.json`` in the listing, dropped by
-    the filter.
-    """
+    """The array node a ``<array>/c/`` prefix lives under.  Listings start
+    here and filter to cells because icechunk rejects a ``c/`` prefix."""
     if not cells_prefix.endswith("c/"):
         raise ValueError(f"not a cell prefix: {cells_prefix!r}")
     return cells_prefix[: -len("c/")]
@@ -2995,11 +2785,7 @@ async def _collect_store_prefix(store: Any, prefix: str) -> list[str]:
 
 
 def _list_store_prefix(store: Any, prefix: str) -> list[str]:
-    """List every stored key under the cell prefix ``<array>/c/``.
-
-    A zarr Store is async-only, hence the ``sync``.  See
-    :func:`_listable_prefix` for why the listing starts one level up.
-    """
+    """List every stored key under the cell prefix ``<array>/c/``."""
     from zarr.core.sync import sync
 
     return sync(_collect_store_prefix(store, prefix))
@@ -3015,20 +2801,9 @@ async def _any_key_under(store: Any, prefix: str) -> bool:
 def _coord_to_index(
     coords: tuple[int, ...], origin: tuple[int, ...] | None,
 ) -> tuple[int, ...]:
-    """Translate an absolute chunk coord to a 0-based array index.
-
-    A coord whose rank does not match the origin's is returned UNCHANGED
-    rather than zipped.  ``zip`` truncates to the shorter sequence, which
-    turned a rank disagreement into a silently wrong cell: a rank-4 key
-    against a rank-3 origin produced a rank-3 index that dropped the last
-    spatial axis and offset the leading one by the wrong origin
-    component, then passed the length check in
-    :func:`_coords_in_bounds` and aliased every key differing only in the
-    dropped axis onto one cell.  Returning the coords lets that same
-    length check reject them, which is what every caller here already
-    handles -- :meth:`Group.read_bytes` treats it as absent,
-    :meth:`Group.write_bytes` raises.
-    """
+    """Translate an absolute chunk coord to a 0-based array index.  A rank
+    mismatch with the origin returns ``coords`` unchanged (not zipped), so
+    the caller's bounds check rejects it instead of aliasing cells."""
     if origin is None or len(coords) != len(origin):
         return coords
     return tuple(c - o for c, o in zip(coords, origin))
@@ -3122,11 +2897,6 @@ def _check_coords_in_bounds(
     coords: tuple[int, ...], shape: tuple[int, ...], array_name: str,
 ) -> None:
     if len(coords) != len(shape):
-        # Named separately from an out-of-range coord because the cause
-        # is different and the fix is elsewhere: the array was allocated
-        # at the wrong rank, not addressed at the wrong place.  The usual
-        # reason is a level chunked by an attribute -- its keys carry a
-        # leading bin axis -- whose array was allocated spatial-only.
         raise StoreError(
             f"Chunk coords {coords} have rank {len(coords)} but array "
             f"{array_name!r} has grid {shape}, rank {len(shape)}. The "
@@ -3219,16 +2989,8 @@ def _json_safe(d: dict[str, Any]) -> dict[str, Any]:
 
 
 def _merge_attributes(node: zarr.Array | zarr.Group, attrs: dict[str, Any]) -> None:
-    """Merge ``attrs`` into ``node``'s attributes in ONE ``zarr.json`` write.
-
-    ``node.attrs.update(d)`` is :meth:`MutableMapping.update`: it calls
-    ``__setitem__`` once per key, and in zarr 3 every ``__setitem__``
-    rewrites the whole document.  So a six-key stamp was six writes of the
-    same object -- and on a chunk array, six read-modify-writes of the
-    document ``nonempty_chunks`` lives in.  ``update_attributes`` merges
-    with exactly the same semantics and writes once; it updates the
-    handle's metadata in place, so ``node`` stays current.
-    """
+    """Merge ``attrs`` into ``node``'s attributes in ONE ``zarr.json`` write
+    (``attrs.update`` writes once per key); ``node`` stays current."""
     if attrs:
         node.update_attributes(attrs)
 

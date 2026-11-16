@@ -1,22 +1,13 @@
-"""The CUDA kernels behind device-side cell decode.
+"""The CUDA kernels behind device-side cell decode, compiled on first use.
 
-Three small kernels, compiled on first use through cupy's NVRTC path:
+- :func:`zstd_walk` checks each zstd frame's structure before nvCOMP sees it;
+- :func:`unframe` parses each cell's vlen-bytes frame (and a ragged link
+  cell's group header), reporting payload address, length and status;
+- :func:`gather` copies many byte ranges into one contiguous buffer.
 
-- :func:`zstd_walk` checks every zstd frame's structure -- header, each
-  block header, the end -- before nvCOMP is allowed to see it (nvCOMP
-  does not validate its input, and a truncated frame can hang its
-  kernel);
-- :func:`unframe` reads each cell's vlen-bytes frame (item count, byte
-  length) and, for a ragged link cell, its group header, and reports
-  where the payload starts, how long it is, and whether the frame was
-  well formed;
-- :func:`gather` copies many byte ranges, each at its own address, into
-  one contiguous buffer at given offsets.
-
-Segments are addressed by raw device pointers rather than offsets into a
-single buffer, because decompressed cells arrive as one allocation each.
-Every multi-byte field is read byte by byte: cell payloads carry no
-alignment guarantee.
+Segments are addressed by raw device pointers (decompressed cells are one
+allocation each), and multi-byte fields are read byte by byte (payloads
+carry no alignment guarantee).
 """
 
 from __future__ import annotations

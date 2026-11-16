@@ -163,15 +163,9 @@ def axes_with_unit(
 ) -> list[dict[str, str]]:
     """``axes`` with ``unit`` declared on every space axis.
 
-    The one-word way to say what the store's vertex coordinates are
-    measured in, for a caller that knows the unit but has no reason to
-    spell out the axes.  It lands in ``multiscales[0].axes`` -- the
-    canonical axis store -- and from there in the ``world`` coordinate
-    system of the RFC 8 ``scene`` (:mod:`zarr_vectors.core.ome`), which
-    is where a collection placing this store beside an image reads it.
-
-    Only ``space`` axes (or axes with no ``type``, which the scene reads
-    as space) get it: a time or channel axis is not measured in metres.
+    Only ``space`` axes (or axes with no ``type``) get it.  The result
+    belongs in ``multiscales[0].axes``, from which the RFC 8 ``scene``
+    (:mod:`zarr_vectors.core.ome`) reads it.
 
     Args:
         axes: NGFF axis descriptors.  Not modified.
@@ -182,9 +176,7 @@ def axes_with_unit(
 
     Raises:
         MetadataError: If ``unit`` is not an NGFF space unit, or a space
-            axis already declares a *different* one -- two answers to one
-            question, and silently picking one would mislabel every
-            coordinate in the store by a power of ten.
+            axis already declares a different one.
     """
     if unit not in NGFF_SPACE_UNITS:
         raise MetadataError(
@@ -278,14 +270,8 @@ def validate_conventions(
 
 
 def _read_shard_shape(raw: Any) -> int | list[int] | None:
-    """A stored ``shard_shape`` back as an int or a list of ints.
-
-    Tolerant on read, like the rest of ``from_dict``: a store written by
-    something else may hold a tuple, a float that is really an int, or a
-    value that means nothing here. Anything unusable reads as ``None`` --
-    unsharded, the conservative answer, and the one every store written
-    before this field gives.
-    """
+    """A stored ``shard_shape`` back as an int or a list of ints; anything
+    unusable reads as ``None`` (unsharded)."""
     if raw is None or isinstance(raw, bool):
         return None
     if isinstance(raw, int):
@@ -305,26 +291,15 @@ def normalise_shard_shape(
     *,
     bin_axis: bool = False,
 ) -> tuple[int, ...] | None:
-    """A shard declaration as a per-axis tuple for a grid of rank ``ndim``.
-
-    The value is *cells per shard per axis*, which says nothing about how
-    big the grid is — the same declaration is meaningful at every level of
-    a pyramid, whose grids differ. So it is stored verbatim and normalised
-    here, against whichever grid is being allocated. A shard larger than
-    the array is legal and is left alone; clipping it would make a coarse
-    level's arrays disagree with the shape the store declared.
+    """A shard declaration (cells per shard per axis) as a per-axis tuple
+    for a grid of rank ``ndim``.  Not clipped to the grid.
 
     Args:
-        ndim: Rank of the TARGET grid, including the bin axis if there is
-            one.
-        bin_axis: True when the target grid carries a leading
-            attribute-bin axis that the declaration does not describe
-            (``chunk_by_attribute``, and the rechunk engine's output).
-            A scalar still broadcasts across it — that is what a scalar
-            means. An explicit per-axis list gets ``1`` prepended instead,
-            so a shard never straddles bins, which are queried
-            independently and would otherwise be dragged into each
-            other's reads.
+        ndim: Rank of the target grid, including any bin axis.
+        bin_axis: True when the grid has a leading attribute-bin axis the
+            declaration does not describe.  A scalar broadcasts across
+            it; a per-axis list gets ``1`` prepended so shards never
+            straddle bins.
 
     Returns:
         ``None`` when ``shard_shape`` is ``None`` (explicitly unsharded).

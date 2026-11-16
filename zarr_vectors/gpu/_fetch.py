@@ -1,28 +1,11 @@
-"""Fetching cells' stored bytes into device memory, undecoded.
+"""Fetching cells' stored (undecoded) bytes into device memory.
 
-A per-chunk array is a zarr v3 vlen-bytes array with one cell per zarr
-chunk, optionally sharded. The host reader asks zarr for each cell and
-gets it decoded; the device reader needs the *stored* bytes instead, so
-it can decompress and unframe them on the GPU. This module works out
-where each cell's bytes live -- a file, or a byte range of a shard given
-by the shard's index -- and reads them all into one device buffer.
-
-Three ways to read, chosen per call:
-
-- ``kvikio``: straight into device memory with kvikio, which uses
-  GPUDirect Storage when the system has it. Local files only.
-- ``host``: into pinned host memory with plain reads on a thread pool,
-  then one host-to-device copy. Local files only; what ``auto`` picks
-  unless cuFile reports GPUDirect Storage available, because without it
-  kvikio does the same thing in smaller pieces (:mod:`zarr_vectors._gds`).
-- any other zarr store (fsspec, obstore, icechunk, memory) is read
-  through the store's own async ``get`` with byte ranges, then copied up
-  once.
-
-:func:`cell_source` returns None for a layout it does not positively
-recognise, and the caller then reads that array on the host. It never
-guesses: an unknown codec, chunk shape, key encoding or shard index
-codec all mean "not here".
+Cell locations come from :mod:`zarr_vectors.core._cells_on_disk`. Local
+arrays are read with kvikio (``io="kvikio"``) or into pinned host memory and
+copied up once (``io="host"``; see :mod:`zarr_vectors._gds` for ``auto``);
+any other zarr store through its async ``get`` with byte ranges. A layout
+:func:`cell_source` does not positively recognise returns None and is read
+on the host.
 """
 
 from __future__ import annotations
@@ -56,11 +39,9 @@ from zarr_vectors.core._cells_on_disk import (  # noqa: F401  (re-exported)
 class RawCells:
     """Stored bytes of many cells in one device buffer.
 
-    Cell ``i`` is ``data[starts[i]:starts[i] + sizes[i]]``; a size of 0
-    means nothing is stored there, which reads as an empty cell. ``path``
-    is how the bytes were read: ``gds`` (kvikio with GPUDirect Storage),
-    ``kvikio-compat`` (kvikio through cuFile's bounce buffer),
-    ``pinned-host`` or ``store``.
+    Cell ``i`` is ``data[starts[i]:starts[i] + sizes[i]]``; size 0 reads as
+    an empty cell. ``path`` is how the bytes were read: ``gds``,
+    ``kvikio-compat``, ``pinned-host`` or ``store``.
     """
 
     data: Any
@@ -84,10 +65,8 @@ def fetch_many(
     """Read the stored bytes of many arrays' cells as one job.
 
     ``requests`` pairs each array with ``(C, K)`` cell indices into it.
-    Local arrays are read together -- one pooled pass over every file,
-    one host-to-device copy (or kvikio reads) -- and so are the others,
-    through their stores. The result is one :class:`RawCells` per request,
-    in order; they may share a device buffer.
+    Returns one :class:`RawCells` per request, in order; they may share a
+    device buffer.
     """
     how = _gds.choose_io(io)
     out: list[RawCells | None] = [None] * len(requests)

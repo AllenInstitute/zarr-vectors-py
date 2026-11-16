@@ -1,23 +1,11 @@
 """Device-side decode for :func:`zarr_vectors.core.cells.read_cells`.
 
-For every array :func:`~zarr_vectors.gpu._fetch.cell_source` recognises,
-a device read of ``C`` cells is:
-
-1. one fetch of the cells' stored bytes into device memory
-   (:mod:`~zarr_vectors.gpu._fetch`);
-2. for a zstd array, one kernel walking every frame's structure (nvCOMP
-   trusts its input, and a truncated frame can hang it), then one batched
-   nvCOMP decode (:mod:`~zarr_vectors.gpu._codecs`);
-3. one kernel reading every vlen frame (and a ragged link cell's group
-   header), and one download of the payload lengths;
-4. one kernel copying every payload into the output buffer, which is then
-   viewed as the array's dtype -- no per-row work anywhere, and no host
-   copy of the data.
-
-The result is the same :class:`~zarr_vectors.core.cells.CellColumn` the
-host path builds, element for element; the host path stays the reference
-and the tests compare the two. A cell that fails any check is reported
-the way the host path reports it, and reads as empty.
+A device read fetches the cells' stored bytes (:mod:`~zarr_vectors.gpu._fetch`),
+checks and decompresses zstd frames in one batch (:mod:`~zarr_vectors.gpu._codecs`),
+unframes every vlen frame in one kernel and gathers the payloads into the
+output buffer, with no host copy of the data. The result equals the host
+path's :class:`~zarr_vectors.core.cells.CellColumn` element for element, and
+a cell that fails a check is reported as the host path would and reads empty.
 """
 
 from __future__ import annotations
@@ -58,10 +46,8 @@ def supports(
 ) -> _fetch.CellSource | None:
     """The array's cell source, if its cells can be decoded on the device.
 
-    ``zstd`` admits zstd-compressed arrays, which go through nvCOMP. It
-    is off unless the caller asked for device decode outright: nvCOMP
-    does not survive corrupt input the way libzstd does (see
-    :mod:`zarr_vectors.gpu._codecs`).
+    ``zstd`` admits zstd-compressed arrays (nvCOMP); callers set it only
+    for ``decode="device"`` (see :mod:`zarr_vectors.gpu._codecs`).
     """
     if lay is not None and not lay.dtype.isnative:
         return None
@@ -81,11 +67,8 @@ def fetch_payloads(
     """Fetch, decompress and unframe many arrays' cells as one job.
 
     ``items`` is ``[(source, chunk_keys, chunk_coords, ragged), ...]``;
-    ``ragged`` marks a ragged links array. Every array's files are read
-    in one pooled pass, every zstd frame is checked in one kernel and
-    decoded in one nvCOMP batch, and every frame is unframed in one
-    kernel, however many arrays there are. ``seconds``, if given, gains
-    the time spent fetching (``fetch``) and decoding (``decode``).
+    ``ragged`` marks a ragged links array. ``seconds``, if given, gains the
+    time spent fetching (``fetch``) and decoding (``decode``).
     """
     t0 = time.perf_counter()
     requests = []
