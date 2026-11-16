@@ -117,6 +117,37 @@ def test_chunk_by_attribute_adds_leading_grid_axis() -> None:
     assert out.shape[0] == 300
 
 
+def test_an_array_added_without_a_session_gets_the_leading_axis_too() -> None:
+    """The derived counterpart of the test above.
+
+    ``write_points`` opens a write session and passes it ``bin_count``,
+    so the rank above was never in doubt. An array allocated later -- by
+    a worker, an edit, the lazy writer -- has no session and derives its
+    grid from metadata instead; that derivation ignored the bin axis and
+    allocated one rank short.
+    """
+    from zarr_vectors.building import (
+        create_attribute_array,
+        get_resolution_level,
+        open_store,
+    )
+
+    store = _store("attr_derived")
+    rs = np.random.RandomState(4)
+    write_points(
+        store, rs.rand(300, 3).astype("float32") * 200.0,
+        vertex_attributes={"lab": rs.randint(0, 3, size=300)},
+        chunk_by_attribute="lab", chunk_shape=(100.0, 100.0, 100.0),
+    )
+
+    level = get_resolution_level(open_store(store, mode="r+"), 0)
+    create_attribute_array(level, "added_later", dtype="float32")
+
+    assert level._sharded_chunk_array(
+        "vertex_attributes/added_later"
+    ).shape == level._sharded_chunk_array("vertices").shape
+
+
 def test_list_chunk_keys_numeric_order_stable() -> None:
     """Enumeration order is numeric (``2 < 10``), not lexicographic, so
     downstream flat-index reconstruction stays stable."""

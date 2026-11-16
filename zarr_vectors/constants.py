@@ -9,8 +9,52 @@ everywhere in the package.
 # Format version
 # ---------------------------------------------------------------------------
 
-FORMAT_VERSION: str = "0.9.2"
+FORMAT_VERSION: str = "0.9.4"
 """Current ZV specification version.
+
+0.9.4: an optional dense object-index layout, ``"dense_manifests_v1"``:
+``object_index/manifest_spans`` (``int64 (n_objects, 2)``, start and
+count) indexing ``object_index/manifest_blocks`` (``int64 (n_blocks,
+sid_ndim + 1)``, chunk coordinates then fragment index, one row per
+fragment an object references), with ``object_index/object_ids`` as in
+the V2 vlen layout. Chosen per store by the root's
+``manifest_layout: "dense"`` (absent means vlen, so every 0.9.3 store
+reads unchanged), and declared by the ``dense_manifests`` capability.
+A store that uses it is not readable by a 0.9.3 build, whose object
+index reader rejects the unknown ``layout`` with an error rather than
+misreading it.
+
+0.9.3: optional, backward-compatible ``shard_shape`` on the root (absent
+⇒ unsharded, so 0.9.0-0.9.2 stores read unchanged).  Cells per shard per
+axis -- an ``int`` when every axis agrees, a list when they do not.
+
+The store's declared PACKING, which had nowhere to live before.  Sharding
+was per-array and per-call: a writer passed ``shard_shape=`` and the
+arrays that call created were sharded, while every array allocated later
+-- an attribute array or links segment made on first write, in a worker
+that never saw the argument -- came out flat.  Recording it on the root
+is what lets those paths find it.  ``create_store(shard_shape=)``
+previously had no parameter at all, so the value was absorbed by
+``**backend_kwargs`` and dropped without a word.
+
+Additive: no reader needs it.  Sharding is transparent to any conformant
+Zarr v3 reader, and each array's own ``zarr.json`` remains the truth
+about that array -- this is a writer default, not a claim about what is
+on disk, which is why it is a field rather than a ``format_capabilities``
+token.  A 0.9.2 reader ignoring the key reads the store correctly.
+
+Also in 0.9.3, both additive in the same sense:
+
+* The root ``ome`` scene's ``world`` coordinate system carries ``id``
+  beside ``name``, so a collection elsewhere can bind an edge to it; a
+  reader that looks for ``name`` finds it unchanged.
+* A per-chunk array may omit ``nonempty_chunks``, meaning presence is
+  not recorded and a reader takes it from the store.  That happens only
+  while a level declares ``zarr_vectors_presence: "deferred"`` -- a
+  build-time state that the coordinator's rebuild ends, restoring every
+  manifest -- so a finished store is readable by a 0.9.2 reader.  One
+  caught mid-build is not: that reader treats the missing manifest as an
+  empty array.
 
 0.9.2: optional, backward-compatible ``ome`` block on the root (absent ⇒
 the prior behaviour, so 0.9.0 and 0.9.1 stores read unchanged).  It is an
@@ -192,6 +236,12 @@ CAP_FRAGMENT_INDEX: str = "fragment_index"
 """The store uses the v0.6 fragment-index encoding for ``vertex_fragments``
 and ``link_fragments`` (single uint8 blob per chunk; see
 :mod:`zarr_vectors.encoding.fragments`)."""
+
+CAP_DENSE_MANIFESTS: str = "dense_manifests"
+"""At least one level's object index is (or will be written) in the
+dense layout, ``"dense_manifests_v1"``: fixed-width integer arrays
+rather than one vlen blob per object. Stamped with the root's
+``manifest_layout: "dense"``."""
 
 CAP_MULTISCALE_LINKS: str = "multiscale_links"
 """Store uses the multiscale links layout (``links/<delta>/<offsets>/``
@@ -399,6 +449,29 @@ VALID_ENCODINGS: frozenset[str] = frozenset({
     ENCODING_RAW,
     ENCODING_DRACO,
 })
+
+#: ``encoding`` stamped on a dictionary-encoded (categorical) attribute:
+#: integer codes, with ``categories[code]`` recovering the value.
+DICTIONARY_ENCODING: str = "dictionary"
+
+# ---------------------------------------------------------------------------
+# OME-Zarr root node (NGFF RFC 8)
+# ---------------------------------------------------------------------------
+
+#: Root-attribute key the ``ome`` block lives under.  Reserved by NGFF 0.5+.
+OME_ATTRS_KEY: str = "ome"
+
+OME_VERSION: str = "0.6"
+"""NGFF version stamped on the node.
+
+The one field here that cannot yet be got right.  RFC 8 is a proposal, so
+the version it lands under is not settled; ``"0.5"`` is the current NGFF
+release and the version RFC 8's own examples carry.  It is a single
+constant precisely so that correcting it is a one-line change.
+
+RFC 8 requires ``version`` on the root node of a document and forbids it
+on any other, so it appears here and nowhere else in the store.
+"""
 
 # ---------------------------------------------------------------------------
 # Multi-resolution defaults

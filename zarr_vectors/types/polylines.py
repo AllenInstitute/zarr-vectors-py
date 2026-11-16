@@ -14,7 +14,7 @@ the segment-to-segment bridges are ever stored.
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Literal
 
 import numpy as np
 import numpy.typing as npt
@@ -117,7 +117,7 @@ def write_polylines(
     chunk_by_attribute: str | None = None,
     out_of_bounds: str = DEFAULT_OOB_POLICY,
     compressor: Any = None,
-    shard_shape: int | tuple[int, ...] | None = None,
+    shard_shape: int | tuple[int, ...] | None | Literal["inherit"] = "inherit",
 ) -> dict[str, Any]:
     """Write polylines/streamlines to a new zarr vectors store.
 
@@ -183,6 +183,10 @@ def write_polylines(
         bounds=bounds_list,
         chunk_shape=tuple(chunk_shape),
         ndim=ndim,
+        # Only meaningful when this call CREATES the store; an existing
+        # one keeps its own declaration. "inherit" means the caller said
+        # nothing, so there is nothing to declare on a fresh store.
+        shard_shape=None if shard_shape == "inherit" else shard_shape,
     )
     _apply_out_of_bounds_policy(root, all_pts, policy=out_of_bounds)
 

@@ -33,10 +33,10 @@ Public surface mirrors the legacy :class:`FsGroup` for back-compat:
 from __future__ import annotations
 
 import warnings
-from collections.abc import Iterable, Iterator, Sequence
+from collections.abc import Callable, Iterable, Iterator, Sequence
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any, Literal, NamedTuple
 
 import numpy as np
 import zarr
@@ -59,7 +59,7 @@ from zarr_vectors.core._vlen import (
 from zarr_vectors.core._vlen import (
     region_to_bytes as _vlen_region_to_bytes,
 )
-from zarr_vectors.exceptions import ShardedPresenceError, StoreError
+from zarr_vectors.exceptions import ArrayError, ShardedPresenceError, StoreError
 
 # Where ``LevelMetadata`` lives on a level group's attrs.  Duplicated
 # rather than imported because ``core.metadata`` imports this module.
@@ -143,6 +143,17 @@ class Group:
     # without needing to remember to set the attributes.
     # Queued cell writes: (array_name, chunk_key, data, record_presence).
     _pending_writes: list[tuple[str, str, bytes, bool]] | None = None
+    # An open :meth:`shard_transaction`: cell writes are staged in it, and
+    # reads of the cells it owns see its view.
+    _shard_txn: Any = None
+    # Collected presence stamps: (array_name, chunk_key, present).  Set by
+    # :meth:`collect_presence`; while it is set the two stamp sites append
+    # here instead of writing ``nonempty_chunks``, and the PAYLOADS still
+    # go out inline -- which is the whole difference from
+    # ``_pending_writes``.  Deliberately NOT propagated to derived Groups:
+    # a collecting token is per-worker state, and sharing it across
+    # threads would reintroduce the interleaving this exists to remove.
+    _pending_presence: list[tuple[str, str, bool]] | None = None
     _pending_array_metas: dict[str, dict[str, Any]] | None = None
     _prefetch_cache: dict[tuple[str, str], bytes] | None = None
     # ``{RangeRequest: bytes}`` while a :meth:`batched_range_reads` block
@@ -195,6 +206,15 @@ class Group:
     # as ``_node_cache`` and keyed the same way.  See
     # :meth:`_chunk_listing` and :class:`_ChunkListing`.
     _listing_cache: dict[str, _ChunkListing] | None = None
+    # Per-array direct-read specs, for the same session and keyed the same
+    # way, but apart from the listings: a spec depends only on the array's
+    # metadata, and building a listing to hold one derives presence, which
+    # on a deferred level reads every shard.  See :meth:`_direct_spec_cached`.
+    _spec_cache: dict[str, Any] | None = None
+    # ``chunk_exists`` membership sets, keyed by array path and tied to
+    # the exact manifest list they were built from.  See
+    # :meth:`_presence_contains`.
+    _presence_sets: dict[str, tuple[list[str], frozenset[str] | None]] | None = None
     # Active offline-read snapshot, or None for normal store-backed
     # reads.  When set, reads must not touch the store: a miss records
     # itself and raises rather than falling through to a synchronous GET.
@@ -213,6 +233,7 @@ class Group:
         # against the underlying Store on context exit.
         self._pending_writes = None
         self._pending_array_metas = None
+        self._pending_presence = None
         # Prefetch cache activated by :meth:`batched_reads`.  When set,
         # :meth:`read_bytes` looks here first before hitting the store.
         self._prefetch_cache = None
@@ -223,10 +244,14 @@ class Group:
         self._node_cache = None
         self._node_cache_readonly = False
         self._listing_cache = None
+        self._spec_cache = None
         self._tiling_claim_settled = False
         self._alignment_claim_settled = False
         self._vertex_rows_written = None
         self._object_id_lookup_cache = None
+        # A composite level's source resolver (zarr_vectors.core.sources):
+        # None until first asked, False for an ordinary group.
+        self._chunk_sources_state = None
 
     @classmethod
     def _from_zarr(
@@ -236,6 +261,7 @@ class Group:
         instance._zarr = zarr_group
         instance._pending_writes = None
         instance._pending_array_metas = None
+        instance._pending_presence = None
         instance._prefetch_cache = None
         instance._range_cache = None
         instance._active_codecs = None
@@ -259,6 +285,7 @@ class Group:
         instance._node_cache = _parent._node_cache if share else None
         instance._node_cache_readonly = share
         instance._listing_cache = _parent._listing_cache if share else None
+        instance._spec_cache = _parent._spec_cache if share else None
         return instance
 
     @classmethod
@@ -282,7 +309,7 @@ class Group:
 
     @property
     def attrs(self) -> _Attrs:
-        return _Attrs(self._zarr.attrs)
+        return _Attrs(self._zarr.attrs, self._zarr)
 
     # ---------------- sub-groups ----------------
 
@@ -408,6 +435,9 @@ class Group:
     ) -> None:
         """Write one spatial chunk's payload into ``array_name``'s cell.
 
+        A composite level (:mod:`zarr_vectors.core.sources`) writes only its
+        own cells, source ``0``: a source is never written through it.
+
         ``array_name`` must already hold the multidim vlen-bytes Zarr
         array whose shape is the level's chunk grid — every ZV
         per-spatial-chunk array (vertices, fragments, ``links/<delta>/
@@ -429,6 +459,10 @@ class Group:
                 finish.  Cell payloads themselves are independent objects
                 and never race.
         """
+        if self._source_cell(chunk_key) is not None:
+            raise ArrayError(
+                f"{array_name}/{chunk_key}: a composite level writes only its own "
+                f"cells (source 0); a source is never written through it")
         if array_name in (_VERTICES_ARRAY, _VERTEX_FRAGMENTS_ARRAY):
             # Either write can break the tiling a level may be claiming:
             # the index directly, the buffer by changing its row count.
@@ -451,6 +485,9 @@ class Group:
             )
         index = _coord_to_index(coords, _grid_origin(sharded_arr))
         _check_coords_in_bounds(index, sharded_arr.shape, array_name)
+        if self._shard_txn is not None:
+            self._shard_txn.write_cells(array_name, [(chunk_key, bytes(data))])
+            return
         # Batched mode: queue the cell write; the batch flush writes
         # every cell of an array in one concurrent
         # ``set_coordinate_selection`` and stamps ``nonempty_chunks``
@@ -462,7 +499,12 @@ class Group:
             return
         _vlen_set_cell(sharded_arr, index, bytes(data))
         if record_presence:
-            _record_nonempty_chunk(sharded_arr, chunk_key, present=bool(data))
+            if self._pending_presence is not None:
+                self._pending_presence.append((array_name, chunk_key, bool(data)))
+            else:
+                _record_nonempty_chunk(
+                    sharded_arr, array_name, chunk_key, present=bool(data),
+                )
 
     def write_cells(
         self,
@@ -495,6 +537,7 @@ class Group:
         origin = _grid_origin(sharded_arr)
         shape = sharded_arr.shape
         pending = self._pending_writes
+        txn = self._shard_txn
         n = 0
         for chunk_key, data in cells:
             coords = _parse_chunk_coords(chunk_key)
@@ -506,18 +549,30 @@ class Group:
             index = _coord_to_index(coords, origin)
             _check_coords_in_bounds(index, shape, array_name)
             n += 1
+            if txn is not None:
+                txn.write_cells(array_name, [(chunk_key, bytes(data))])
+                continue
             if pending is not None:
                 pending.append((array_name, chunk_key, bytes(data), record_presence))
                 continue
             _vlen_set_cell(sharded_arr, index, bytes(data))
             if record_presence:
-                _record_nonempty_chunk(sharded_arr, chunk_key, present=bool(data))
+                if self._pending_presence is not None:
+                    self._pending_presence.append(
+                        (array_name, chunk_key, bool(data))
+                    )
+                else:
+                    _record_nonempty_chunk(
+                        sharded_arr, array_name, chunk_key, present=bool(data),
+                    )
         return n
 
     @contextmanager
     def batched_reads(
         self,
         plan: list[tuple[str, list[str]]],
+        *,
+        tolerant: bool = False,
     ) -> Iterator[None]:
         """Prefetch every chunk in ``plan`` via one
         :func:`asyncio.gather` and serve subsequent :meth:`read_bytes`
@@ -540,6 +595,10 @@ class Group:
 
         Nesting is not supported and raises :class:`StoreError`.
         Writes inside the block are unaffected.
+
+        ``tolerant=True`` keeps one failing cell from failing the whole
+        prefetch: it is left uncached, and reading it inside the block
+        raises its own error while every other cell is served.
 
         Example::
 
@@ -588,6 +647,7 @@ class Group:
             self._zarr, plan,
             {name: self._sharded_chunk_array(name) for name in names},
             specs={name: self._direct_spec_cached(name) for name in names},
+            tolerant=tolerant,
         )
         # No node cache opened here, deliberately: :meth:`read_bytes`
         # answers from ``_prefetch_cache`` before it resolves a node, so
@@ -677,12 +737,14 @@ class Group:
         self._node_cache = {}
         self._node_cache_readonly = True
         self._listing_cache = {}
+        self._spec_cache = {}
         try:
             yield
         finally:
             self._node_cache = None
             self._node_cache_readonly = False
             self._listing_cache = None
+            self._spec_cache = None
 
     def prime_nodes(self, paths: Sequence[str]) -> None:
         """Resolve several nodes in one round-trip, into the active cache.
@@ -819,7 +881,9 @@ class Group:
             self._active_codecs = previous
 
     @contextmanager
-    def batched_writes(self, compressor: Any = None) -> Iterator[None]:
+    def batched_writes(
+        self, compressor: Any = None, *, durable: bool = False,
+    ) -> Iterator[None]:
         """Defer every :meth:`write_bytes` and :meth:`write_array_meta`
         call inside the block and flush them in a single
         :func:`asyncio.gather` on exit.
@@ -839,6 +903,12 @@ class Group:
                 # TODO: per-array-type codec dict (vertices vs fragments
                 # vs links) — future work; today every chunk gets the
                 # same codec.
+            durable: On a local store, have everything the block wrote
+                on disk when it returns: each cell object (a shard, when
+                sharded) is fsynced before its rename, then the metadata
+                documents written and every directory changed. For a
+                caller whose own record of "done" is durable. A no-op on
+                an object store, where a returned PUT already is.
 
         Nesting is not supported and raises :class:`StoreError`.  Reads
         inside the block are unaffected and execute synchronously.
@@ -855,6 +925,19 @@ class Group:
         """
         if self._pending_writes is not None:
             raise StoreError("batched_writes() does not support nesting")
+        if self._shard_txn is not None:
+            raise StoreError(
+                "batched_writes() cannot run inside a shard transaction, "
+                "which stages every cell write itself"
+            )
+        if self._pending_presence is not None:
+            raise StoreError(
+                "batched_writes() cannot run inside collect_presence(): this "
+                "block stamps nonempty_chunks itself when it flushes, which "
+                "would land the very stamps the collecting block is holding "
+                "back -- and land them on the flush's thread, outside "
+                "whatever lock the caller meant to apply them under."
+            )
         from zarr_vectors.encoding.compression import resolve_compressor
 
         codecs = resolve_compressor(compressor)
@@ -882,6 +965,7 @@ class Group:
                     pending_writes,
                     array_metas=pending_metas,
                     codecs=codecs,
+                    durable=durable,
                 )
         finally:
             # On normal exit the queues are already None.  On an
@@ -894,6 +978,139 @@ class Group:
             # freshly-resolved nodes, so anything held here is stale the
             # moment the session ends.
             self._node_cache = None
+
+    @contextmanager
+    def shard_transaction(
+        self,
+        shard_coords: Sequence[int],
+        *,
+        arrays: Iterable[str] | None = None,
+        mode: Literal["replace", "merge"] = "replace",
+        durable: bool = True,
+        io_threads: int | None = None,
+        sweep: bool = True,
+    ) -> Iterator[Any]:
+        """Stage one shard's cell writes, and publish them on exit.
+
+        See :mod:`zarr_vectors.core.shard_txn` and
+        :func:`zarr_vectors.building.shard_transaction`.
+        """
+        from zarr_vectors.core.shard_txn import ShardTransaction
+
+        if self._shard_txn is not None:
+            raise StoreError("shard transactions do not nest")
+        if self._pending_writes is not None or self._pending_presence is not None:
+            raise StoreError(
+                "a shard transaction cannot run inside batched_writes() or "
+                "collect_presence(): it stages every cell write itself"
+            )
+        if not self.presence_deferred():
+            raise StoreError(
+                "a shard transaction needs the level's presence deferred "
+                "(defer_presence): nonempty_chunks is shared by every cell, so "
+                "stamping it would race with every other task"
+            )
+        txn = ShardTransaction(
+            self, shard_coords, arrays=arrays, mode=mode, durable=durable,
+            io_threads=io_threads,
+        )
+        if sweep:
+            txn.sweep_partials()
+        self._shard_txn = txn
+        try:
+            yield txn
+        finally:
+            self._shard_txn = None
+        txn.publish()
+
+    @contextmanager
+    def collect_presence(self) -> Iterator[list[tuple[str, str, bool]]]:
+        """Defer the ``nonempty_chunks`` stamps inside the block, so the
+        caller decides when, and under what lock, to apply them.
+
+        Writes that would stamp instead append ``(array_name, chunk_key,
+        present)`` to the yielded list; payloads still go out inline.
+        Leaving the block does not apply them, even on error; pass the
+        list to :meth:`apply_presence`.  ``record_presence=False`` is still
+        honoured.  The list and this Group belong to one thread.  Nesting
+        or use inside :meth:`batched_writes` raises :class:`StoreError`.
+        See ``docs/how_to/hpc_pipelines.md``::
+
+            with level_group.collect_presence() as pending:
+                flush(level_group)          # payloads, no lock held
+            with store_write_lock(path):
+                level_group.apply_presence(pending)
+        """
+        if self._pending_presence is not None:
+            raise StoreError("collect_presence() does not support nesting")
+        if self._pending_writes is not None:
+            raise StoreError(
+                "collect_presence() cannot run inside batched_writes(): that "
+                "block defers the cell payloads and stamps nonempty_chunks "
+                "itself when it flushes, so the stamps are not this block's "
+                "to collect. Use chunk_array_codecs() if what you wanted was "
+                "the codec selection without the deferred writes."
+            )
+        pending: list[tuple[str, str, bool]] = []
+        self._pending_presence = pending
+        try:
+            yield pending
+        finally:
+            self._pending_presence = None
+
+    def apply_presence(self, pending: list[tuple[str, str, bool]]) -> int:
+        """Apply stamps collected by :meth:`collect_presence`.
+
+        One read-modify-write of ``nonempty_chunks`` per array; entries
+        fold in order, so the last stamp for a chunk key wins.  Arrays are
+        re-resolved by name.  An empty ``pending`` is a no-op.
+
+        Returns:
+            How many arrays were stamped.  An array with no manifest (a
+            deferred level) is skipped and not counted.
+
+        Raises:
+            StoreError: If an array named in ``pending`` is gone.
+        """
+        if not pending:
+            return 0
+
+        # dict assignment gives last-write-wins.
+        by_array: dict[str, dict[str, bool]] = {}
+        for array_name, chunk_key, present in pending:
+            by_array.setdefault(array_name, {})[chunk_key] = present
+        skipped = 0
+
+        for array_name, stamps in by_array.items():
+            arr = self._sharded_chunk_array(array_name)
+            if arr is None:
+                raise StoreError(
+                    f"Cannot apply presence to {array_name!r} in "
+                    f"{self._zarr.path or '<root>'}: no chunk array at that "
+                    f"path. The cells were written, so the array existed "
+                    f"when they landed; it has been deleted or replaced "
+                    f"since. Rebuild with rebuild_presence() instead."
+                )
+            current = arr.attrs.get(_NONEMPTY_CHUNKS_ATTR)
+            if current is None:
+                # Deferred level: a list of just these keys would hide
+                # every other cell.
+                skipped += 1
+                continue
+            keys = set(current)
+            for chunk_key, present in stamps.items():
+                if present:
+                    keys.add(chunk_key)
+                else:
+                    keys.discard(chunk_key)
+            arr.attrs[_NONEMPTY_CHUNKS_ATTR] = sorted(keys)
+            # ``_chunk_listing`` memoizes the manifest; drop the stale entry.
+            if self._listing_cache:
+                self._listing_cache.pop(self._full_path(array_name), None)
+            for chunk_key, present in stamps.items():
+                _emit_presence(array_name, chunk_key, present)
+
+        return len(by_array) - skipped
 
     @contextmanager
     def native_sharded_arrays(
@@ -954,7 +1171,41 @@ class Group:
         finally:
             self._native_sharded_config = None
 
+    def _source_cell(self, chunk_key: str):
+        """``(resolver, source, spatial key)`` when *chunk_key* is a composite level's
+        cell of another store, else ``None`` (cheap after the first call)."""
+        # getattr: groups built without __init__ (FsGroup, _from_zarr) start
+        # with no cache attribute at all.
+        state = getattr(self, "_chunk_sources_state", None)
+        if state is False:
+            return None
+        if state is None:
+            from zarr_vectors.core.sources import resolver_for
+
+            state = resolver_for(self)
+            if state is None:
+                return None
+        from zarr_vectors.core.sources import split_source_key
+
+        split = split_source_key(chunk_key)
+        if split is None or split[0] == 0:
+            return None
+        return state, split[0], split[1]
+
     def read_bytes(self, array_name: str, chunk_key: str) -> bytes:
+        # A composite level's cell of another store (zarr_vectors.core.sources)
+        # is that store's cell, read through its transform: never this
+        # store's transaction, prefetch or offline snapshot.
+        source = self._source_cell(chunk_key)
+        if source is not None:
+            resolver, s, spatial = source
+            return resolver.read_bytes(s, array_name, spatial)
+        # Inside a shard transaction its own cells come from it: written
+        # ones as written, and under "replace" unwritten ones as empty.
+        if self._shard_txn is not None:
+            staged = self._shard_txn.lookup(array_name, chunk_key)
+            if staged is not None:
+                return staged
         # Batched-read mode (see :meth:`batched_reads`): serve from the
         # prefetch cache when possible.  Cache misses fall through to
         # the sync path below — useful when a caller under-specifies
@@ -1016,7 +1267,14 @@ class Group:
         start, stop = int(start), int(stop)
         if stop <= start:
             return b""
-        if self._offline is None:
+        # Another store's cell (chunk_sources) or one staged in a shard
+        # transaction is not at this store's byte offsets: read_bytes
+        # resolves both, so slice what it returns.
+        staged = (
+            self._shard_txn is not None
+            and self._shard_txn.lookup(array_name, chunk_key) is not None
+        )
+        if self._source_cell(chunk_key) is None and not staged and self._offline is None:
             if self._prefetch_cache is not None:
                 cell = self._prefetch_cache.get((array_name, chunk_key))
                 if cell is not None:
@@ -1106,12 +1364,16 @@ class Group:
         )
 
     def chunk_exists(self, array_name: str, chunk_key: str) -> bool:
+        if self._shard_txn is not None:
+            staged = self._shard_txn.lookup(array_name, chunk_key)
+            if staged is not None:
+                return bool(staged)
         sharded_arr = self._sharded_chunk_array(array_name)
         if sharded_arr is None:
             return False
         present = sharded_arr.attrs.get(_NONEMPTY_CHUNKS_ATTR)
         if present is not None:
-            return chunk_key in present
+            return self._presence_contains(array_name, present, chunk_key)
         # Fall back to inspecting the cell — slow path used when the
         # presence manifest is missing (e.g. mid-migration, or before a
         # coordinator's ``derive_nonempty_chunks``).  That inspection is
@@ -1130,6 +1392,37 @@ class Group:
         if index is None or not _coords_in_bounds(index, sharded_arr.shape):
             return False
         return _vlen_get_cell(sharded_arr, index) != b""
+
+    def _derived_listing(self, array_name: str, arr: zarr.Array) -> list[str]:
+        """Presence for an array without ``nonempty_chunks`` (deferred
+        level), derived from the store.  Empty when offline or when the
+        store cannot list."""
+        if self._offline is not None:
+            return []
+        if not getattr(self._zarr.store, "supports_listing", True):
+            return []
+        return self._presence_from_store(array_name, arr, verify=False)
+
+    def _presence_contains(
+        self, array_name: str, present: list[str], chunk_key: str,
+    ) -> bool:
+        """``chunk_key in present``; builds a set on the second sighting of
+        the same list object (stamps always assign a new list, so identity
+        is an exact staleness test).  Not bisected: foreign writers may
+        not sort."""
+        cache = self._presence_sets
+        if cache is None:
+            cache = self._presence_sets = {}
+        key = self._full_path(array_name)
+        hit = cache.get(key)
+        if hit is None or hit[0] is not present:
+            cache[key] = (present, None)
+            return chunk_key in present
+        members = hit[1]
+        if members is None:
+            members = frozenset(present)
+            cache[key] = (present, members)
+        return chunk_key in members
 
     def _chunk_listing(self, array_name: str) -> _ChunkListing:
         """The presence manifest for ``array_name``, session-cached.
@@ -1154,6 +1447,8 @@ class Group:
         present = (
             arr.attrs.get(_NONEMPTY_CHUNKS_ATTR) if arr is not None else None
         )
+        if present is None and arr is not None:
+            present = self._derived_listing(array_name, arr)
         listing = _ChunkListing(sorted(present) if present else [])
         if cache is not None:
             cache[key] = listing
@@ -1227,24 +1522,29 @@ class Group:
         one-point read, paid again on every read of a session even though
         the node it describes was resolved once.
 
-        Outside a :meth:`cached_nodes` block it is derived per call, as
-        before; caching there would mean building a throwaway listing
-        record to hold it.
+        Inside a :meth:`cached_nodes` block it is kept in its own cache,
+        never on the array's listing: building a listing while presence
+        is deferred derives it from the store, which for a sharded array
+        reads every shard, and ``batched_reads`` asks for the spec of
+        every array in its plan.  (BRIDGE's graph tasks prefetched their
+        cells that way, and each task read every shard written so far:
+        a 50 um graph stage went from minutes to 9 h.)  Outside a block
+        it is derived per call.  ``None`` -- not direct-readable -- is
+        cached like any other answer.
         """
         from zarr_vectors.core._batch_reader import _direct_spec
 
-        cache = self._listing_cache
+        cache = self._spec_cache
         if cache is None:
             return _direct_spec(
                 self._zarr, array_name, self._sharded_chunk_array(array_name),
             )
-        listing = self._chunk_listing(array_name)
-        if not listing.spec_known:
-            listing.set_spec(_direct_spec(
-                self._zarr, array_name,
-                self._sharded_chunk_array(array_name),
-            ))
-        return listing.spec
+        key = self._full_path(array_name)
+        if key not in cache:
+            cache[key] = _direct_spec(
+                self._zarr, array_name, self._sharded_chunk_array(array_name),
+            )
+        return cache[key]
 
     def chunk_grid_bounds(
         self, array_name: str,
@@ -1274,7 +1574,7 @@ class Group:
         # through the group-meta flush.
         sharded_arr = self._sharded_chunk_array(array_name)
         if sharded_arr is not None:
-            sharded_arr.attrs.update(_json_safe(meta))
+            _merge_attributes(sharded_arr, _json_safe(meta))
             return
         # Otherwise ``array_name`` is a group — a ``links/<delta>``
         # family, an attribute namespace, ``object_index``.  Batched-write
@@ -1290,7 +1590,7 @@ class Group:
             self._pending_array_metas[array_name] = merged
             return
         arr_group = self._zarr.require_group(array_name)
-        arr_group.attrs.update(_json_safe(meta))
+        _merge_attributes(arr_group, _json_safe(meta))
 
     def read_array_meta(self, array_name: str) -> dict[str, Any]:
         node = self._lookup_node(array_name)
@@ -1322,6 +1622,7 @@ class Group:
         fill_value: Any = None,
         attributes: dict[str, Any] | None = None,
         compressors: Any = None,
+        shards: tuple[int, ...] | None = None,
     ) -> None:
         """Write a chunked Zarr v3 array at ``path``.
 
@@ -1342,6 +1643,9 @@ class Group:
             compressors: Override the codec pipeline.  ``None`` uses the
                 active session codec (from :meth:`batched_writes`) or
                 zarr v3's default (``bytes`` + ``zstd``).
+            shards: Outer chunk (shard) shape, a multiple of ``chunks``;
+                ``None`` for one object per chunk.  Zarr's own
+                ``sharding_indexed``, so any Zarr v3 reader reads it.
         """
         arr_data = np.asarray(data)
         if chunks is None:
@@ -1361,6 +1665,8 @@ class Group:
         }
         if fill_value is not None:
             create_kwargs["fill_value"] = fill_value
+        if shards is not None:
+            create_kwargs["shards"] = tuple(int(s) for s in shards)
 
         resolved = self._resolve_codecs(compressors)
         if resolved is not None:
@@ -1371,7 +1677,7 @@ class Group:
         arr[:] = arr_data
 
         if attributes:
-            arr.attrs.update(_json_safe(attributes))
+            _merge_attributes(arr, _json_safe(attributes))
 
     def extend_array(
         self,
@@ -1379,6 +1685,7 @@ class Group:
         rows: Any,
         *,
         attributes: dict[str, Any] | None = None,
+        _node: Any = None,
     ) -> int:
         """Append ``rows`` along axis 0, leaving existing rows untouched.
 
@@ -1411,7 +1718,9 @@ class Group:
             StoreError: If ``path`` does not exist or is not an array.
             ValueError: If the tail dimensions do not match.
         """
-        arr = self._require_array_node(path)
+        # ``_node``: a caller that has just resolved the array hands it over
+        # rather than paying a second lookup for it.
+        arr = _node if _node is not None else self._require_array_node(path)
         row_data = np.asarray(rows)
         if tuple(row_data.shape[1:]) != tuple(arr.shape[1:]):
             raise ValueError(
@@ -1421,15 +1730,27 @@ class Group:
             )
         n0 = int(arr.shape[0])
         total = n0 + int(row_data.shape[0])
-        if total != n0:
-            arr.resize((total,) + tuple(arr.shape[1:]))
-            arr[n0:total] = row_data.astype(arr.dtype, copy=False)
         stamped = dict(attributes) if attributes else {}
         if "shape" in arr.attrs:
             stamped["shape"] = [total, *arr.shape[1:]]
-        if stamped:
-            arr.attrs.update(_json_safe(stamped))
-        self._invalidate_node(path)
+        try:
+            if total != n0:
+                # One ``zarr.json`` write, not two.  ``resize`` saves a
+                # shallow copy of this metadata, attributes dict included,
+                # so staging the attributes on the handle first makes the
+                # resize's own write carry them; a separate update after
+                # it rewrote the document a second time.  Staged before
+                # the rows land, exactly as the grown shape is.
+                if stamped:
+                    arr.metadata.attributes.update(_json_safe(stamped))
+                arr.resize((total,) + tuple(arr.shape[1:]))
+                arr[n0:total] = row_data.astype(arr.dtype, copy=False)
+            elif stamped:
+                _merge_attributes(arr, _json_safe(stamped))
+        finally:
+            # Also on failure: a handle whose staged attributes never
+            # reached the store must not keep answering with them.
+            self._invalidate_node(path)
         return total
 
     def read_array(self, path: str) -> np.ndarray:
@@ -1512,7 +1833,7 @@ class Group:
             arr[:] = obj
 
         if attributes:
-            arr.attrs.update(_json_safe(attributes))
+            _merge_attributes(arr, _json_safe(attributes))
 
     def read_vlen_array(self, path: str) -> list[bytes]:
         """Read a vlen-bytes Zarr array at ``path`` as a list of bytes."""
@@ -1521,6 +1842,21 @@ class Group:
             return [bytes(b) for b in cached]
         node = self._require_array_node(path)
         return [bytes(b) for b in node[:]]
+
+    def read_vlen_array_raw(self, path: str, stop: int | None = None) -> Any:
+        """Rows ``[0, stop)`` of a vlen-bytes array as zarr returns them:
+        an object array, without :meth:`read_vlen_array`'s per-row
+        ``bytes()`` conversion.
+        """
+        cached = self._offline_array(path)
+        if cached is not None:
+            rows = np.asarray(cached, dtype=object).reshape(-1)
+            return rows if stop is None else rows[:stop]
+        node = self._require_array_node(path)
+        n = int(node.shape[0]) if stop is None else min(int(stop), int(node.shape[0]))
+        if n == 0:
+            return np.empty(0, dtype=object)
+        return np.asarray(node[:n], dtype=object).reshape(-1)
 
     def read_vlen_element(self, path: str, index: int) -> bytes:
         """Read ONE element of the vlen-bytes array at ``path``.
@@ -1683,7 +2019,7 @@ class Group:
         # write per attribute on top of the creation itself — three writes
         # of the same object where one does.  Writers that allocate an
         # array per offsets segment pay that per array.
-        initial_attrs: dict[str, Any] = {_NONEMPTY_CHUNKS_ATTR: []}
+        initial_attrs: dict[str, Any] = self._initial_presence_attrs()
         # Store the grid origin so cell ``index = coord - origin``.
         # Only when non-trivial — a zero origin is the common case
         # and its absence means "coords are array indices".
@@ -1758,7 +2094,7 @@ class Group:
         }
         if shard_shape is not None:
             base_kwargs["shards"] = tuple(shard_shape)
-        base_attrs: dict[str, Any] = {_NONEMPTY_CHUNKS_ATTR: []}
+        base_attrs: dict[str, Any] = self._initial_presence_attrs()
         if origin is not None and any(int(o) != 0 for o in origin):
             base_attrs[_CHUNK_GRID_ORIGIN_ATTR] = [int(o) for o in origin]
 
@@ -1943,13 +2279,30 @@ class Group:
         # The id table is a node like any other, so a write that
         # replaces it must drop the lookup built from it.
         self._object_id_lookup_cache = None
-        for cache in (self._node_cache, self._listing_cache):
+        for cache in (self._node_cache, self._listing_cache, self._spec_cache):
             if not cache:
                 continue
             for key in [
                 k for k in cache if k == full or k.startswith(prefix)
             ]:
                 del cache[key]
+
+    def presence_deferred(self) -> bool:
+        """Whether this level declares its presence deferred.
+
+        See :func:`zarr_vectors.building.defer_presence`.  Read from the
+        handle's metadata, so only as fresh as the handle: open the level
+        after the coordinator declares.
+        """
+        try:
+            return self._zarr.attrs.get(_PRESENCE_DECL_ATTR) == _PRESENCE_DEFERRED
+        except Exception:  # noqa: BLE001 - a node with no readable attrs
+            return False
+
+    def _initial_presence_attrs(self) -> dict[str, Any]:
+        """A new chunk array's presence attrs: an empty manifest, or none in
+        a deferred level (absence tells readers to ask the store)."""
+        return {} if self.presence_deferred() else {_NONEMPTY_CHUNKS_ATTR: []}
 
     def _sharded_chunk_array(self, array_name: str) -> zarr.Array | None:
         """Return the multidim vlen-bytes Zarr array at ``array_name``
@@ -1965,43 +2318,25 @@ class Group:
         self,
         array_name: str,
         *,
-        on_sharded: Literal["raise", "skip"] = "raise",
+        on_sharded: Literal["derive", "skip", "raise"] = "derive",
     ) -> list[str]:
-        """Rebuild ``array_name``'s ``nonempty_chunks`` from the store listing.
+        """Rebuild ``array_name``'s ``nonempty_chunks`` from what is on disk.
 
-        The coordinator half of ``write_bytes(..., record_presence=False)``:
-        workers write cell payloads without touching the shared manifest
-        attribute, then one caller runs this once to restore it.  The
-        listing bounds *which* cells to consider; the cells themselves
-        still have to be read, because a cell written with an empty
-        payload is an object on disk that must not be recorded as
-        present.  Those reads go out as one :func:`asyncio.gather` — the
-        same prefetch :meth:`batched_reads` uses — so the cost is one
-        listing plus one round-trip per array rather than a GET per cell.
-
-        Only meaningful for an **unsharded** array, where each cell is its
-        own object at ``<array>/c/i/j/k`` and therefore visible in the
-        listing.  A sharded array packs many cells into one object whose
-        inner index is not derivable from key names — so sharding stays a
-        coordinator pass that runs *after* this, which is the same
-        ordering :func:`zarr_vectors.sharding.shard_store` already
-        requires.  Returns the sorted keys now recorded.
+        The coordinator half of ``write_bytes(..., record_presence=False)``.
+        Candidate cells come from one store listing and are read in one
+        batch, so cells holding an empty payload are not recorded.  For a
+        sharded array each listed shard is answered from its index (see
+        ``docs/spec/chunking/sharding.md``).  Not reported to
+        :func:`observe_presence_writes`.
 
         Args:
-            on_sharded: What to do when ``array_name`` *is* natively
-                sharded.  ``"raise"`` (the default) raises
-                :class:`~zarr_vectors.exceptions.ShardedPresenceError`;
-                ``"skip"`` returns the manifest already recorded, without
-                rewriting it, for a caller legitimately looping over a
-                level's mixed arrays.
+            on_sharded: For a natively sharded array: ``"derive"`` rebuilds
+                it, ``"skip"`` returns the recorded manifest unchanged,
+                ``"raise"`` raises
+                :class:`~zarr_vectors.exceptions.ShardedPresenceError`.
 
-        Until this guard existed the ordering above was documented here
-        and enforced nowhere: running against a sharded array rewrote the
-        manifest from a listing that resolves nothing, so a store with
-        1605 recorded cells came back with 2 and the rest became
-        unreachable through ``list_chunks`` — no exception, no warning.
-        Returning an empty list under ``"skip"`` would be the same bug
-        wearing a keyword, hence the read.
+        Returns the sorted keys now recorded; raises :class:`StoreError`
+        if ``array_name`` is not a chunk array.
         """
         arr = self._sharded_chunk_array(array_name)
         if arr is None:
@@ -2009,23 +2344,33 @@ class Group:
                 f"{array_name!r} in {self._zarr.path or '<root>'} is not a "
                 f"chunk array; nothing to derive presence for"
             )
-        if getattr(arr, "shards", None) is not None:
+        shards = getattr(arr, "shards", None)
+        if shards is not None:
             if on_sharded == "skip":
                 return sorted(arr.attrs.get(_NONEMPTY_CHUNKS_ATTR, []) or [])
-            raise ShardedPresenceError(
-                f"Cannot derive presence for {array_name!r} in "
-                f"{self._zarr.path or '<root>'}: it is natively sharded, so "
-                f"its cells are packed into shard objects the key listing "
-                f"cannot resolve and the manifest would be rewritten to "
-                f"(almost) empty. Rebuild presence BEFORE sharding, or pass "
-                f"on_sharded='skip' to leave this array's manifest alone."
-            )
+            if on_sharded == "raise":
+                raise ShardedPresenceError(
+                    f"Cannot derive presence for {array_name!r} in "
+                    f"{self._zarr.path or '<root>'}: it is natively sharded "
+                    f"and on_sharded='raise' was requested. Pass "
+                    f"on_sharded='derive' (the default) to rebuild it, or "
+                    f"'skip' to leave this array's manifest alone."
+                )
+            keys = self._derive_presence_sharded(arr, array_name, tuple(shards))
+            arr.attrs[_NONEMPTY_CHUNKS_ATTR] = sorted(keys)
+            return sorted(keys)
+        keys = self._presence_from_store(array_name, arr, verify=True)
+        arr.attrs[_NONEMPTY_CHUNKS_ATTR] = keys
+        return keys
+
+    def _stored_cell_keys(self, array_name: str, arr: zarr.Array) -> list[str]:
+        """Chunk keys of the cell objects an unsharded array has: one listing,
+        no cell reads (so a cell stored empty is still listed)."""
         base = self._zarr.path.strip("/")
         prefix = f"{base}/{array_name}/c/" if base else f"{array_name}/c/"
         origin = _grid_origin(arr)
         candidates: list[str] = []
         for stored in _list_store_prefix(self._zarr.store, prefix):
-            # ``c/i/j/k`` → cell index (i, j, k) → absolute coord.
             parts = stored[len(prefix):].split("/")
             if len(parts) != arr.ndim:
                 continue
@@ -2038,21 +2383,108 @@ class Group:
                 else tuple(i + o for i, o in zip(index, origin))
             )
             candidates.append(_format_chunk_key(coords))
+        return candidates
+
+    def _presence_from_store(
+        self, array_name: str, arr: zarr.Array, *, verify: bool,
+    ) -> list[str]:
+        """``array_name``'s populated cells from the store, sorted.
+        ``verify=True`` reads each unsharded candidate and drops empty ones;
+        ``verify=False`` trusts the listing.  Sharded arrays are always read."""
+        shards = getattr(arr, "shards", None)
+        if shards is not None:
+            return sorted(
+                self._derive_presence_sharded(arr, array_name, tuple(shards))
+            )
+        candidates = self._stored_cell_keys(array_name, arr)
+        if not verify or not candidates:
+            return sorted(candidates)
+        from zarr_vectors.core._batch_reader import flush_prefetch
+
+        # flush_prefetch omits cells that read back empty or missing.
+        cells = flush_prefetch(self._zarr, [(array_name, candidates)])
+        return sorted(
+            chunk_key for (_name, chunk_key), data in cells.items() if data
+        )
+
+    def _array_has_stored_data(self, array_name: str) -> bool:
+        """Whether ``array_name`` has any chunk object on disk, asked of the
+        store because ``nonempty_chunks`` may under-report.  Stops at the
+        first key."""
+        from zarr.core.sync import sync
+
+        base = self._zarr.path.strip("/")
+        prefix = f"{base}/{array_name}/c/" if base else f"{array_name}/c/"
+        return bool(sync(_any_key_under(self._zarr.store, prefix)))
+
+    def _derive_presence_sharded(
+        self, arr: zarr.Array, array_name: str, shards: tuple[int, ...],
+    ) -> set[str]:
+        """The sharded half of :meth:`derive_nonempty_chunks`: stored keys
+        name shards; each is answered from its index, or by reading its
+        cell region whole (see :meth:`_shard_presence`)."""
+        base = self._zarr.path.strip("/")
+        prefix = f"{base}/{array_name}/c/" if base else f"{array_name}/c/"
+        origin = _grid_origin(arr)
+        ndim = arr.ndim
+
+        listed: list[tuple[int, ...]] = []
+        for stored in _list_store_prefix(self._zarr.store, prefix):
+            parts = stored[len(prefix):].split("/")
+            if len(parts) != ndim:
+                continue
+            try:
+                listed.append(tuple(int(p) for p in parts))
+            except ValueError:
+                continue
 
         keys: set[str] = set()
-        if candidates:
-            from zarr_vectors.core._batch_reader import flush_prefetch
+        for cells in self._shard_presence(arr, shards, listed).values():
+            for index in cells:
+                coords = (
+                    index if origin is None
+                    else tuple(i + o for i, o in zip(index, origin))
+                )
+                keys.add(_format_chunk_key(coords))
+        return keys
 
-            # flush_prefetch applies the grid origin itself and omits any
-            # cell that reads back empty or missing, so a key surviving in
-            # the cache is exactly the ``if _vlen_get_cell(...)`` this
-            # replaced.  It also carries the icechunk serial fallback.
-            cells = flush_prefetch(self._zarr, [(array_name, candidates)])
-            keys = {
-                chunk_key for (_name, chunk_key), data in cells.items() if data
-            }
-        arr.attrs[_NONEMPTY_CHUNKS_ATTR] = sorted(keys)
-        return sorted(keys)
+    def _shard_presence(
+        self, arr: zarr.Array, shards: tuple[int, ...], shard_indices: list[tuple[int, ...]],
+    ) -> dict[tuple[int, ...], list[tuple[int, ...]]]:
+        """The cells (array indices) each shard holds with a payload, from
+        :func:`~zarr_vectors.core._cells_on_disk.shard_cells` where the
+        index is readable, else by reading the shard's region whole."""
+        from zarr_vectors.core._cells_on_disk import shard_cells
+
+        shape = arr.shape
+        by_index = shard_cells(arr, shard_indices) if shard_indices else {}
+        out: dict[tuple[int, ...], list[tuple[int, ...]]] = {}
+        for shard_index in shard_indices:
+            cells = None if by_index is None else by_index.get(shard_index)
+            if cells is not None:
+                out[shard_index] = [tuple(c) for c in cells.tolist()]
+                continue
+            # Clip to the array: edge shards (or ones larger than the
+            # array) are only partly in bounds.
+            starts = tuple(i * s for i, s in zip(shard_index, shards))
+            stops = tuple(
+                min(start + s, dim)
+                for start, s, dim in zip(starts, shards, shape)
+            )
+            found: list[tuple[int, ...]] = []
+            out[shard_index] = found
+            if any(stop <= start for start, stop in zip(starts, stops)):
+                continue
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore", UnstableSpecificationWarning)
+                block = np.asarray(
+                    arr[tuple(slice(a, b) for a, b in zip(starts, stops))]
+                )
+            for offset in np.ndindex(block.shape):
+                if block[offset]:
+                    found.append(tuple(a + o for a, o in zip(starts, offset)))
+            del block
+        return out
 
     def read_array_attrs(self, path: str) -> dict[str, Any]:
         """Read the ``attributes`` block of a Zarr array at ``path``.
@@ -2177,8 +2609,9 @@ class _Attrs:
     ``attrs[k]``, ``attrs.get(k, default)``, ``k in attrs``.
     """
 
-    def __init__(self, zarr_attrs: Any) -> None:
+    def __init__(self, zarr_attrs: Any, node: Any = None) -> None:
         self._attrs = zarr_attrs
+        self._node = node
 
     def __getitem__(self, key: str) -> Any:
         return self._attrs[key]
@@ -2196,7 +2629,10 @@ class _Attrs:
             return default
 
     def update(self, other: dict[str, Any]) -> None:
-        self._attrs.update(_json_safe(other))
+        if self._node is None:
+            self._attrs.update(_json_safe(other))
+        else:
+            _merge_attributes(self._node, _json_safe(other))
 
     def to_dict(self) -> dict[str, Any]:
         return dict(self._attrs)
@@ -2253,6 +2689,71 @@ def _local_root(store: LocalStore) -> Path:
 # scanning every shard tail.
 _NONEMPTY_CHUNKS_ATTR = "nonempty_chunks"
 
+#: Level-group attribute declaring that the level's presence is deferred
+#: to a coordinator: its per-chunk arrays carry no ``nonempty_chunks``
+#: while it is set, so no write touches state shared between cells, and
+#: readers derive presence from the store instead.  Set by
+#: :func:`zarr_vectors.building.defer_presence`, cleared by the level-wide
+#: :func:`zarr_vectors.building.rebuild_presence`.
+_PRESENCE_DECL_ATTR = "zarr_vectors_presence"
+_PRESENCE_DEFERRED = "deferred"
+
+
+class PresenceEvent(NamedTuple):
+    """One stamp applied to an array's ``nonempty_chunks`` manifest, as
+    delivered by :func:`observe_presence_writes`.  ``present`` is True when
+    the key was added, False when discarded.
+    """
+
+    array_name: str
+    chunk_key: str
+    present: bool
+
+
+# Installed by :func:`observe_presence_writes`.  A list rather than a
+# single slot so the block nests, and module-level rather than per-Group
+# because the writers that stamp are spread across Group, the batch
+# flush and apply_presence.
+_presence_observers: list[Callable[[PresenceEvent], None]] = []
+
+
+@contextmanager
+def observe_presence_writes(
+    callback: Callable[[PresenceEvent], None],
+) -> Iterator[None]:
+    """Call ``callback`` for every incremental ``nonempty_chunks`` stamp.
+
+    A test instrument for asserting where a stamp happened (inside a lock,
+    on which thread).  ``callback`` runs synchronously on the writing
+    thread as the stamp lands; keep it cheap, since an exception
+    propagates into the writer.  Covers :meth:`Group.write_bytes`,
+    :meth:`Group.write_cells`, :meth:`Group.apply_presence` and the
+    :meth:`Group.batched_writes` flush, not
+    :meth:`Group.derive_nonempty_chunks`.  Blocks nest.
+
+    Example::
+
+        seen = []
+        with observe_presence_writes(seen.append):
+            write_chunk_vertices(level_group, (0, 0, 0), positions)
+        assert [e.chunk_key for e in seen] == ["0.0.0"]
+    """
+    _presence_observers.append(callback)
+    try:
+        yield
+    finally:
+        _presence_observers.remove(callback)
+
+
+def _emit_presence(array_name: str, chunk_key: str, present: bool) -> None:
+    """Notify observers that ``chunk_key``'s stamp just landed."""
+    if not _presence_observers:
+        return
+    event = PresenceEvent(array_name, chunk_key, present)
+    # Copy: a callback is allowed to unwind its own block.
+    for callback in tuple(_presence_observers):
+        callback(event)
+
 # Per-array attribute holding the chunk-grid origin (``floor(min_corner
 # / chunk_shape)`` per axis).  A single vlen array is 0-indexed, so a
 # spatial chunk at coord ``c`` lands in cell ``c - origin``.  Absent (the
@@ -2268,22 +2769,42 @@ def _grid_origin(arr: zarr.Array) -> tuple[int, ...] | None:
     return tuple(int(x) for x in raw)
 
 
+def _listable_prefix(cells_prefix: str) -> str:
+    """The array node a ``<array>/c/`` prefix lives under.  Listings start
+    here and filter to cells because icechunk rejects a ``c/`` prefix."""
+    if not cells_prefix.endswith("c/"):
+        raise ValueError(f"not a cell prefix: {cells_prefix!r}")
+    return cells_prefix[: -len("c/")]
+
+
 async def _collect_store_prefix(store: Any, prefix: str) -> list[str]:
-    return [key async for key in store.list_prefix(prefix)]
+    return [
+        key async for key in store.list_prefix(_listable_prefix(prefix))
+        if key.startswith(prefix)
+    ]
 
 
 def _list_store_prefix(store: Any, prefix: str) -> list[str]:
-    """List every stored key under ``prefix`` (a zarr Store is async-only)."""
+    """List every stored key under the cell prefix ``<array>/c/``."""
     from zarr.core.sync import sync
 
     return sync(_collect_store_prefix(store, prefix))
 
 
+async def _any_key_under(store: Any, prefix: str) -> bool:
+    async for key in store.list_prefix(_listable_prefix(prefix)):
+        if key.startswith(prefix):
+            return True
+    return False
+
+
 def _coord_to_index(
     coords: tuple[int, ...], origin: tuple[int, ...] | None,
 ) -> tuple[int, ...]:
-    """Translate an absolute chunk coord to a 0-based array index."""
-    if origin is None:
+    """Translate an absolute chunk coord to a 0-based array index.  A rank
+    mismatch with the origin returns ``coords`` unchanged (not zipped), so
+    the caller's bounds check rejects it instead of aliasing cells."""
+    if origin is None or len(coords) != len(origin):
         return coords
     return tuple(c - o for c, o in zip(coords, origin))
 
@@ -2297,10 +2818,7 @@ class _ChunkListing:
     resolves a bounding box never builds the spatial index.
     """
 
-    __slots__ = (
-        "keys", "_coords", "_present", "_by_spatial", "_by_spatial_nd",
-        "_spec", "_spec_known",
-    )
+    __slots__ = ("keys", "_coords", "_present", "_by_spatial", "_by_spatial_nd")
 
     def __init__(self, keys: list[str]) -> None:
         self.keys = keys
@@ -2308,24 +2826,6 @@ class _ChunkListing:
         self._present: frozenset[tuple[int, ...]] | None = None
         self._by_spatial: dict[tuple[int, ...], list[tuple[int, ...]]] | None = None
         self._by_spatial_nd: int | None = None
-        # The direct-read spec rides along: it is per-array, has the same
-        # lifetime, and is dropped by the same invalidation.  Tracked with
-        # a separate flag because ``None`` is a real answer -- it means
-        # "this array is not direct-readable", which is worth caching too.
-        self._spec: Any = None
-        self._spec_known = False
-
-    @property
-    def spec_known(self) -> bool:
-        return self._spec_known
-
-    @property
-    def spec(self) -> Any:
-        return self._spec
-
-    def set_spec(self, spec: Any) -> None:
-        self._spec = spec
-        self._spec_known = True
 
     def coords(self) -> list[tuple[int, ...]]:
         """The keys parsed to coordinate tuples, in numeric order.
@@ -2396,6 +2896,14 @@ def _coords_in_bounds(coords: tuple[int, ...], shape: tuple[int, ...]) -> bool:
 def _check_coords_in_bounds(
     coords: tuple[int, ...], shape: tuple[int, ...], array_name: str,
 ) -> None:
+    if len(coords) != len(shape):
+        raise StoreError(
+            f"Chunk coords {coords} have rank {len(coords)} but array "
+            f"{array_name!r} has grid {shape}, rank {len(shape)}. The "
+            f"array was allocated at the wrong rank for this level; if "
+            f"the level is chunked by an attribute its keys carry a "
+            f"leading bin axis that the array does not have."
+        )
     if not _coords_in_bounds(coords, shape):
         raise StoreError(
             f"Chunk coords {coords} out of grid {shape} for "
@@ -2449,7 +2957,7 @@ def _vlen_set_cell(
 
 
 def _record_nonempty_chunk(
-    arr: zarr.Array, chunk_key: str, *, present: bool,
+    arr: zarr.Array, array_name: str, chunk_key: str, *, present: bool,
 ) -> None:
     """Update the per-array ``nonempty_chunks`` manifest.
 
@@ -2457,18 +2965,34 @@ def _record_nonempty_chunk(
     consulted by :meth:`Group.list_chunks` and :meth:`chunk_exists` so
     those calls don't have to scan every shard tail just to enumerate
     non-empty cells.
+
+    ``array_name`` is carried only to name the array in the
+    :func:`observe_presence_writes` event; ``arr`` is what gets written.
     """
     current = arr.attrs.get(_NONEMPTY_CHUNKS_ATTR)
-    keys = set(current) if current else set()
+    if current is None:
+        # An array with no manifest derives presence from the store (see
+        # ``_PRESENCE_DECL_ATTR``).  Starting a list here would claim this
+        # is its only cell, hiding every other one from ``list_chunks``.
+        return
+    keys = set(current)
     if present:
         keys.add(chunk_key)
     else:
         keys.discard(chunk_key)
     arr.attrs[_NONEMPTY_CHUNKS_ATTR] = sorted(keys)
+    _emit_presence(array_name, chunk_key, present)
 
 
 def _json_safe(d: dict[str, Any]) -> dict[str, Any]:
     return {k: _json_safe_value(v) for k, v in d.items()}
+
+
+def _merge_attributes(node: zarr.Array | zarr.Group, attrs: dict[str, Any]) -> None:
+    """Merge ``attrs`` into ``node``'s attributes in ONE ``zarr.json`` write
+    (``attrs.update`` writes once per key); ``node`` stays current."""
+    if attrs:
+        node.update_attributes(attrs)
 
 
 def _json_safe_value(v: Any) -> Any:

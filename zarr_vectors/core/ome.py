@@ -35,6 +35,12 @@ Two shapes are written:
     into a level, which costs nothing today — there is nothing in a level
     it could render.
 
+    The level leaves are the only entries this package owns.  Anything
+    else in the list — a node some other tool put there, such as a
+    back-reference to the collection this store sits in — is *foreign*,
+    and :func:`refresh_root_node` carries it through a level refresh
+    unchanged.  See :func:`is_owned_node` for the exact rule.
+
 ``attributes.scene``
     An RFC 8 ``scene`` declaring one RFC 5 coordinate system, ``world``,
     carrying the store's axes and units.  This is what makes membership
@@ -42,6 +48,17 @@ Two shapes are written:
     beside an image pyramid.  ZV vertices are already stored in world
     coordinates, so there are no edges and
     ``coordinateTransformations`` is empty.
+
+    The system carries ``"id": "world"`` as well as ``"name": "world"``.
+    RFC 8 identifies a coordinate system by ``id`` — ``name`` is optional
+    and descriptive there — so the ``id`` is what lets a collection
+    *elsewhere* bind to this frame with a ``Reference``::
+
+        {"path": {"type": "zarr", "path": "./skeleton.zarrvectors"},
+         "id": "world"}
+
+    ``name`` stays because it is the RFC 5 spelling of the identifier,
+    and a reader written against that draft looks for it.
 
 Nothing here reads the bare-root ``multiscales`` block, whose ``scale`` is
 a dimensionless bin ratio sitting in a slot NGFF defines as
@@ -54,6 +71,10 @@ from __future__ import annotations
 from typing import TYPE_CHECKING, Any
 from urllib.parse import unquote, urlparse
 
+# The key and version are format names, so they live in ``constants``;
+# re-exported here, where this module's readers look for them.
+from zarr_vectors.constants import OME_ATTRS_KEY, OME_VERSION
+
 if TYPE_CHECKING:  # pragma: no cover - typing only
     from zarr_vectors.core.group import Group
 
@@ -64,24 +85,11 @@ __all__ = [
     "ZV_PREFIX",
     "build_root_node",
     "derive_store_name",
+    "is_owned_node",
     "read_root_node",
     "refresh_root_node",
 ]
 
-#: Root-attribute key the block lives under.  Reserved by NGFF 0.5+.
-OME_ATTRS_KEY: str = "ome"
-
-OME_VERSION: str = "0.6"
-"""NGFF version stamped on the node.
-
-The one field here that cannot yet be got right.  RFC 8 is a proposal, so
-the version it lands under is not settled; ``"0.5"`` is the current NGFF
-release and the version RFC 8's own examples carry.  It is a single
-constant precisely so that correcting it is a one-line change.
-
-RFC 8 requires ``version`` on the root node of a document and forbids it
-on any other, so it appears here and nowhere else in the store.
-"""
 
 #: Extension prefix registered for this format.  RFC 8 reserves unprefixed
 #: identifiers for the core spec and lets a third party use a prefixed one
@@ -96,8 +104,11 @@ NODE_TYPE_LEVEL: str = f"{ZV_PREFIX}:level"
 #: a collection of levels.
 NODE_TYPE_COLLECTION: str = "collection"
 
-#: Name of the one coordinate system every ZV store declares.  Vertices are
-#: stored in it directly.
+#: Identifier of the one coordinate system every ZV store declares.
+#: Vertices are stored in it directly.  Written as both ``id`` and
+#: ``name``: RFC 8 identifies a coordinate system by ``id`` -- it is what a
+#: ``Reference`` from another document binds to -- and leaves ``name``
+#: descriptive, while RFC 5 readers know only ``name``.
 WORLD: str = "world"
 
 #: Used when a store's name cannot be derived from its URL (a store opened
@@ -175,10 +186,14 @@ def build_scene(axes: list[dict[str, str]] | None) -> dict[str, Any]:
     list is written rather than omitted because its emptiness is the
     claim: a reader learns the store needs no edge, instead of having to
     guess whether one is missing.
+
+    The system carries ``id`` as well as ``name`` so a collection
+    elsewhere can bind an edge to it -- ``{"path": ..., "id": "world"}``
+    -- instead of redeclaring the frame.  See :data:`WORLD`.
     """
     return {
         "coordinateSystems": [
-            {"name": WORLD, "axes": _clean_axes(axes)},
+            {"id": WORLD, "name": WORLD, "axes": _clean_axes(axes)},
         ],
         "coordinateTransformations": [],
     }
@@ -231,22 +246,20 @@ def refresh_root_node(
     name: str | None = None,
     axes: list[dict[str, str]] | None = None,
 ) -> dict[str, Any]:
-    """Rebuild the root ``ome`` block from what is on disk, and write it.
+    """Rebuild the root ``ome`` block from the level groups on disk, and write it.
 
-    The level list is derived from the store's level groups rather than
-    maintained alongside them, so it cannot drift: every path that adds or
-    removes a level calls this and the answer comes from the same place a
-    reader would look.  (The same reasoning as
-    :func:`zarr_vectors.building.refresh_arrays_present`.)
+    Rebuilds ``version``, ``type``, ``name``, ``attributes.scene`` and the
+    level entries of ``nodes``; every other key, and every foreign child
+    (see :func:`is_owned_node`) in its original order after the levels, is
+    kept.  A foreign child that is not a JSON object, or that is named
+    like a level, is dropped with a :class:`UserWarning`.
 
     Args:
         root: Store root group.
-        name: Store name.  ``None`` keeps the name already recorded, and
-            derives one from the store URL when there is none — so a name
-            set once is not overwritten by a later level being added.
-        axes: NGFF axis descriptors.  ``None`` reads them from the
-            existing ``world`` declaration, falling back to
-            ``multiscales[0].axes``.
+        name: Store name.  ``None`` keeps the recorded name, else derives
+            one from the store URL.
+        axes: NGFF axis descriptors.  ``None`` reads the existing
+            ``world`` declaration, falling back to ``multiscales[0].axes``.
 
     Returns:
         The block as written.
@@ -270,22 +283,68 @@ def refresh_root_node(
         name=name, axes=axes, levels=list_resolution_levels(root),
     )
 
-    # Preserve anything a caller put on the node that this function does
-    # not own -- a ``zv:companionImage`` reference, say.  Only the four
-    # keys built above are authoritative.
     merged_attributes = dict(existing.get("attributes") or {})
     merged_attributes.update(node["attributes"])
-    node = {**existing, **node, "attributes": merged_attributes}
+    merged_nodes = node["nodes"] + _foreign_nodes(
+        existing.get("nodes"),
+        level_names={child["name"] for child in node["nodes"]},
+    )
+    node = {
+        **existing, **node,
+        "attributes": merged_attributes, "nodes": merged_nodes,
+    }
 
     root.attrs.update({OME_ATTRS_KEY: node})
     return node
 
 
+def is_owned_node(child: Any) -> bool:
+    """Whether a child of the root's ``nodes`` list is one this package writes.
+
+    True iff it is a JSON object whose ``type`` is exactly
+    :data:`NODE_TYPE_LEVEL` (not any ``zv:`` type).  Owned children are
+    regenerated by every refresh; all others are carried through unchanged.
+    """
+    return isinstance(child, dict) and child.get("type") == NODE_TYPE_LEVEL
+
+
+def _foreign_nodes(
+    existing: Any, *, level_names: set[str],
+) -> list[dict[str, Any]]:
+    """The children of an existing ``nodes`` list that a refresh keeps
+    (see :func:`refresh_root_node`)."""
+    import warnings
+
+    kept: list[dict[str, Any]] = []
+    for child in existing if isinstance(existing, list) else []:
+        if is_owned_node(child):
+            continue
+        if not isinstance(child, dict):
+            warnings.warn(
+                f"dropping {child!r} from the root 'ome' node's children: "
+                f"an RFC 8 node is a JSON object",
+                UserWarning, stacklevel=3,
+            )
+            continue
+        if child.get("name") in level_names:
+            warnings.warn(
+                f"dropping the foreign {child.get('type')!r} node named "
+                f"{child.get('name')!r} from the root 'ome' node: a "
+                f"resolution level has that name, and RFC 8 requires "
+                f"child names to be unique within a collection",
+                UserWarning, stacklevel=3,
+            )
+            continue
+        kept.append(dict(child))
+    return kept
+
+
 def _axes_from_node(node: dict[str, Any]) -> list[dict[str, str]] | None:
-    """The ``world`` axes already declared on a node, if any."""
+    """The ``world`` axes already declared on a node, matched by ``id`` or
+    (older stores) ``name``."""
     scene = (node.get("attributes") or {}).get("scene") or {}
     for system in scene.get("coordinateSystems") or []:
-        if system.get("name") == WORLD:
+        if WORLD in (system.get("id"), system.get("name")):
             axes = system.get("axes")
             return list(axes) if axes else None
     return None

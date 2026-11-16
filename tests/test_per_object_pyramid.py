@@ -299,3 +299,61 @@ def test_object_attribute_present_mask_roundtrip(tmp_path):
             assert out[oid] == oid
         else:
             assert np.isnan(out[oid])
+
+
+# ===================================================================
+# A failed step leaves nothing behind, and a step never merges
+# ===================================================================
+
+
+def _store_state(store):
+    root = open_store(str(store))
+    zv_block = root.attrs.to_dict()["zarr_vectors"]
+    from zarr_vectors.core.arrays import list_link_deltas
+
+    return {
+        "levels": list_resolution_levels(root),
+        "multiscales": root.attrs.to_dict().get("multiscales"),
+        "capabilities": sorted(zv_block.get("format_capabilities", [])),
+        "level0_deltas": sorted(list_link_deltas(get_resolution_level(root, 0))),
+        "level0_attrs": get_resolution_level(root, 0).attrs.to_dict(),
+    }
+
+
+def test_a_failed_coarsen_rolls_back_the_partial_level(tmp_path, monkeypatch):
+    """It fails after the +1 family and every root stamp have landed."""
+    from zarr_vectors.multiresolution import coarsen
+
+    store = _build_store(tmp_path)
+    before = _store_state(store)
+    real = coarsen.write_cross_level_links
+
+    def _fail_on_the_mirror(*args, delta, **kw):
+        if delta < 0:
+            raise RuntimeError("injected failure")
+        return real(*args, delta=delta, **kw)
+
+    monkeypatch.setattr(coarsen, "write_cross_level_links", _fail_on_the_mirror)
+    with pytest.raises(RuntimeError, match="injected failure"):
+        coarsen_level(
+            str(store), 0, 1, coarsen_factor=2.0, cross_level_storage="explicit",
+        )
+
+    assert _store_state(store) == before
+
+    monkeypatch.undo()
+    coarsen_level(str(store), 0, 1, coarsen_factor=2.0, cross_level_storage="explicit")
+    assert list_resolution_levels(open_store(str(store))) == [0, 1]
+
+
+def test_coarsening_into_an_existing_level_raises(tmp_path):
+    from zarr_vectors.exceptions import CoarseningError
+
+    store = _build_store(tmp_path)
+    coarsen_level(str(store), 0, 1, coarsen_factor=2.0)
+    first = read_level_metadata(open_store(str(store)), 1).vertex_count
+
+    with pytest.raises(CoarseningError, match="already exists"):
+        coarsen_level(str(store), 0, 1, coarsen_factor=4.0)
+
+    assert read_level_metadata(open_store(str(store)), 1).vertex_count == first

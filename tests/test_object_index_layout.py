@@ -33,6 +33,8 @@ from zarr_vectors.core.arrays import (
 from zarr_vectors.core.store import open_store
 from zarr_vectors.types.polylines import write_polylines
 
+pytestmark = pytest.mark.vlen_only
+
 
 CHUNK = (200.0, 200.0, 200.0)
 BIN = (50.0, 50.0, 50.0)

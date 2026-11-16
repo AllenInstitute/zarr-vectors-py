@@ -35,8 +35,16 @@ because a name used from ``core`` is a name nobody knows is load-bearing.
 
 from __future__ import annotations
 
+from collections.abc import Iterable, Mapping
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
+
+import numpy as np
+import zarr
+from zarr.core.sync import sync
+
+from zarr_vectors._api_version import parse_version
 
 # --- array names and layout sentinels --------------------------------
 from zarr_vectors.constants import (
@@ -65,17 +73,24 @@ from zarr_vectors.constants import (
     XLEVEL_NONE,
 )
 from zarr_vectors.core.arrays import (
+    OBJECT_INDEX_LAYOUT_DENSE,
     OBJECT_INDEX_LAYOUT_V1,
+    OBJECT_INDEX_LAYOUT_V2,
+    OBJECT_INDEX_MANIFEST_BUCKET,
+    OBJECT_SHARD_ROW_MULTIPLE,
+    ManifestCSR,
     attribute_layout,
     # --- links ---
     cell_endpoint_chunks,
     chunk_vertex_count,
+    commit_object_index,
     # --- allocation ---
     create_attribute_array,
     create_fragment_attribute_array,
     create_groupings_array,
     create_groupings_attributes_array,
     create_link_attributes_array,
+    create_link_segments,
     create_links_array,
     create_links_family,
     create_object_attributes_array,
@@ -95,10 +110,13 @@ from zarr_vectors.core.arrays import (
     list_link_deltas,
     list_link_offsets,
     object_count,
+    object_shard_rows,
     # --- write sessions ---
     open_write_session,
+    patch_object_manifests,
     read_all_groupings,
     read_all_object_manifests,
+    read_all_object_manifests_csr,
     read_attribute_fragment,
     read_chunk_attributes,
     read_chunk_fragment_attributes,
@@ -117,6 +135,7 @@ from zarr_vectors.core.arrays import (
     read_object_attribute_present_mask,
     read_object_attributes,
     read_object_manifests,
+    read_object_manifests_csr,
     read_object_vertices,
     read_vertex_fragment_index,
     # --- writing ---
@@ -132,10 +151,44 @@ from zarr_vectors.core.arrays import (
     write_link_attributes,
     write_link_cells,
     write_links,
+    write_object_attribute_columns,
     write_object_attributes,
     write_object_index,
 )
-from zarr_vectors.core.group import Group
+from zarr_vectors.core.cells import (
+    ArrayRead,
+    CellBatch,
+    CellColumn,
+    CellReadError,
+    FragmentColumn,
+    read_cells,
+    read_neighbourhood,
+)
+from zarr_vectors.core import dense_manifests as dense
+from zarr_vectors.core._batch_writer import _stamp_presence
+from zarr_vectors.core.arrays import _is_per_chunk_array
+from zarr_vectors.core.group import (
+    _NONEMPTY_CHUNKS_ATTR,
+    _PRESENCE_DECL_ATTR,
+    _PRESENCE_DEFERRED,
+    Group,
+    _coord_to_index,
+    _coords_in_bounds,
+    _format_chunk_key,
+    _grid_origin,
+    _list_store_prefix,
+    _parse_chunk_coords,
+    observe_presence_writes,
+)
+from zarr_vectors.core.user_metadata import Metadata
+from zarr_vectors.core.sources import (
+    SOURCE_AXIS,
+    chunk_sources,
+    is_composite,
+    set_chunk_sources,
+    source_fingerprint,
+    verify_chunk_sources,
+)
 from zarr_vectors.core.metadata import (
     LevelMetadata,
     RootMetadata,
@@ -156,6 +209,11 @@ from zarr_vectors.core.multiscale import (
     read_multiscale_metadata,
     upsert_level_transform,
     write_multiscale_metadata,
+)
+from zarr_vectors.core.object_rows import (
+    aligned_regions,
+    concurrency_contract,
+    reserve_object_rows,
 )
 from zarr_vectors.core.paths import (
     intra_offsets,
@@ -181,12 +239,21 @@ from zarr_vectors.core.store import (
     update_level_metadata,
     update_root_metadata,
 )
+from zarr_vectors.core.manifest_writer import ObjectManifestWriter, object_manifest_writer
 from zarr_vectors.core.streaming import ObjectIndexAppender
 from zarr_vectors.encoding.fragments import (
+    decode_fragments,
     decode_object_manifest_blocks,
+    decode_object_manifests_csr,
     encode_object_manifest_blocks,
+    encode_object_manifests_csr,
 )
-from zarr_vectors.exceptions import StoreError
+from zarr_vectors.exceptions import (
+    ArrayError,
+    PresenceMismatchError,
+    ShardOwnershipError,
+    StoreError,
+)
 from zarr_vectors.multiresolution.registry import (
     register_coarsen_strategy,
     register_selection_strategy,
@@ -201,6 +268,7 @@ from zarr_vectors.rechunk import RechunkSpec, rechunk, rechunk_by_attribute
 from zarr_vectors.sharding.io import (
     get_shard_info,
     reshard,
+    shard_object_layer,
     shard_store,
     unshard_store,
 )
@@ -265,7 +333,7 @@ GROUP_SUPPORTED_METHODS: frozenset[str] = frozenset({
     "attrs", "children", "create_group", "require_group",
     "array_exists", "standalone_array_exists", "delete_subtree",
     # per-chunk cell I/O
-    "read_bytes", "write_bytes", "chunk_exists", "list_chunks",
+    "read_bytes", "write_bytes", "write_cells", "chunk_exists", "list_chunks",
     "create_sharded_chunk_array",
     # per-array metadata
     "read_array_meta", "write_array_meta", "read_array_attrs",
@@ -275,7 +343,12 @@ GROUP_SUPPORTED_METHODS: frozenset[str] = frozenset({
     "read_vlen_element", "read_vlen_elements",
     # batching + presence
     "batched_reads", "batched_writes", "offline_reads", "chunk_array_codecs",
+    # a read-only node cache, and resolving several nodes into it at once
+    "cached_nodes", "prime_nodes",
+    # one shard written privately, published on exit
+    "shard_transaction",
     "derive_nonempty_chunks", "native_sharded_arrays",
+    "collect_presence", "apply_presence", "presence_deferred",
     # identity
     "url", "prefix", "path",
 })
@@ -392,6 +465,216 @@ def array_is_sharded(level_group: Group, array_name: str) -> bool:
     return bool(node is not None and _is_native_sharded(node))
 
 
+def decode_fragment_index(blob: bytes) -> Any:
+    """Decode a ``vertex_fragments`` / ``link_fragments`` cell's bytes.
+
+    The decode half of :func:`read_vertex_fragment_index`, for bytes already
+    held; returns the same ``ChunkFragmentIndex``.
+    """
+    return decode_fragments(blob)
+
+
+def user_metadata(group: Group) -> Any:
+    """The user-metadata namespaces on ``group``.
+
+    The object :attr:`zarr_vectors.api.Dataset.metadata` returns:
+    ``user_metadata(g)["ns"]`` is one application's ``MutableMapping``, kept
+    apart from the format's own attributes; ``names()`` lists them.
+    """
+    return Metadata(group)
+
+
+def is_dense_index(level_group: Group) -> bool:
+    """Whether the level's object index uses the dense layout.
+
+    Decided by the ``layout`` stamp, else the arrays on disk; ``False`` when
+    the level has no object index.
+    """
+    if not level_group.array_exists(OBJECT_INDEX):
+        return False
+    return dense.is_dense(level_group)
+
+
+def cell_objects(
+    level_group: Group, array_name: str, chunk_coords: Iterable[Any],
+) -> list[str]:
+    """The store key of the object holding each of these cells.
+
+    One key per cell, in order: the cell's own object when unsharded, the
+    shard holding it when sharded. Keys are relative to the store root.
+
+    Args:
+        chunk_coords: Absolute chunk coordinates, as tuples or rows of a
+            ``(C, K)`` array.
+
+    Raises:
+        StoreError: ``array_name`` is not a per-chunk array here.
+        ArrayError: A cell lies outside the array's grid.
+    """
+    arr = level_group._sharded_chunk_array(array_name)
+    if arr is None:
+        raise StoreError(
+            f"cell_objects: {array_name!r} is not a per-chunk array of "
+            f"{level_group.zarr_group.path or '<root>'}"
+        )
+    origin = _grid_origin(arr)
+    shape = tuple(int(n) for n in arr.shape)
+    # The array's grid chunk is its shard when sharded, else one cell.
+    outer = tuple(int(n) for n in arr.metadata.chunk_grid.chunk_shape)
+    base = arr.path
+    keys = []
+    for coords in chunk_coords:
+        coords = tuple(int(c) for c in coords)
+        index = _coord_to_index(coords, origin)
+        if not _coords_in_bounds(index, shape):
+            raise ArrayError(
+                f"cell_objects: {coords} is not a cell of {array_name!r} "
+                f"(grid origin {origin or (0,) * len(shape)}, shape {shape})"
+            )
+        key = arr.metadata.encode_chunk_key(tuple(i // o for i, o in zip(index, outer)))
+        keys.append(f"{base}/{key}" if base else key)
+    return keys
+
+
+#: The oldest zarr-vectors that reads each layout feature a store can use.
+#: The single-array chunk layout (0.9.0) is the floor.
+_FIRST_READER: dict[str, str] = {
+    "single_array_chunks": "0.9.0",
+    OBJECT_INDEX_LAYOUT_V2: "0.9.2",
+    "presence_deferred": "0.9.3",
+    OBJECT_INDEX_LAYOUT_DENSE: "0.9.4",
+}
+
+
+@dataclass(frozen=True)
+class StoreLayout:
+    """How a store's bytes are laid out, as read from the store.
+
+    Attributes:
+        created_by: ``zv_version`` stamped at creation (never updated).
+        format_capabilities: Capability tokens the store declares.
+        shard_shape: Declared cells per shard; ``None`` for one object per cell.
+        object_index: The level's object-index layout, or ``None``.
+        link_policy: ``{delta: (directed, store)}`` for each link family.
+        presence_deferred: The level is under :func:`defer_presence`.
+        min_reader: Oldest zarr-vectors format that reads this layout.
+        object_shard_rows: Rows per shard of the object layer
+            (:func:`shard_object_layer`); ``None`` if unsharded.
+    """
+
+    created_by: str | None
+    format_capabilities: tuple[str, ...]
+    shard_shape: tuple[int, ...] | int | None
+    object_index: str | None
+    link_policy: dict[int, tuple[bool, str]] = field(default_factory=dict)
+    presence_deferred: bool = False
+    min_reader: str = "0.9.0"
+    object_shard_rows: int | None = None
+
+
+def store_layout(root_or_level: Group, *, level: int = 0) -> StoreLayout:
+    """The layout of a store, and of one of its levels, as one object.
+
+    Given a level group, describes that level; given the root, level
+    ``level``. Read structure by structure, since not every layout change
+    moved ``FORMAT_VERSION``.
+    """
+    group = root_or_level
+    if "zarr_vectors" in (group.attrs.to_dict() or {}):
+        root = group
+        try:
+            level_group = get_resolution_level(root, level)
+        except StoreError:
+            level_group = None
+    else:
+        level_group = group
+        root = type(group)._from_zarr(
+            zarr.open_group(group._zarr.store, path="/", mode="r"),
+        )
+    meta = read_root_metadata(root)
+    shard = meta.shard_shape
+    object_index = None
+    links: dict[int, tuple[bool, str]] = {}
+    deferred = False
+    object_rows = None
+    if level_group is not None:
+        object_rows = object_shard_rows(level_group)
+        if level_group.array_exists(OBJECT_INDEX):
+            object_index = (
+                OBJECT_INDEX_LAYOUT_DENSE if is_dense_index(level_group)
+                else (level_group.read_array_meta(OBJECT_INDEX) or {}).get("layout")
+                or OBJECT_INDEX_LAYOUT_V1
+            )
+        for delta in list_link_deltas(level_group):
+            policy = link_family_policy(level_group, delta)
+            if policy is not None:
+                links[int(delta)] = (bool(policy[2]), str(policy[3]))
+        deferred = level_group.presence_deferred()
+    features = ["single_array_chunks"]
+    if object_index in _FIRST_READER:
+        features.append(object_index)
+    if deferred:
+        features.append("presence_deferred")
+    min_reader = max((_FIRST_READER[f] for f in features), key=parse_version)
+    return StoreLayout(
+        created_by=meta.zv_version,
+        format_capabilities=tuple(meta.format_capabilities or ()),
+        shard_shape=tuple(shard) if isinstance(shard, list) else shard,
+        object_index=object_index,
+        link_policy=links,
+        presence_deferred=deferred,
+        min_reader=min_reader,
+        object_shard_rows=object_rows,
+    )
+
+
+def shard_transaction(
+    level_group: Group,
+    shard_coords: Iterable[int],
+    *,
+    arrays: Iterable[str] | None = None,
+    mode: str = "replace",
+    durable: bool = True,
+    io_threads: int | None = None,
+    sweep: bool = True,
+) -> Any:
+    """Stage one shard's cell writes privately, and publish them on exit.
+
+    A context manager. Every cell written inside it must lie in shard
+    ``shard_coords`` (:func:`shard_of`) of ``arrays`` (default: every per-chunk
+    array), else :class:`~zarr_vectors.exceptions.ShardOwnershipError`.
+    ``mode="replace"`` rebuilds each owned shard from the staged cells alone
+    (unwritten owned cells read empty); ``"merge"`` merges into what is stored.
+    On exit each changed shard is written as a ``.partial`` (fsynced if
+    ``durable``, from ``io_threads`` threads) and renamed into place once all
+    are written; an exception publishes nothing. Atomic per object: after a
+    crash, re-running the task converges. Needs presence deferred
+    (:func:`defer_presence`) and every array allocated and sharded first;
+    writes no metadata (``tx.written`` feeds :func:`set_presence`). ``sweep``
+    removes a failed attempt's ``.partial`` files on entry. See
+    :mod:`zarr_vectors.core.shard_txn`.
+    """
+    return level_group.shard_transaction(
+        tuple(shard_coords), arrays=arrays, mode=mode, durable=durable,
+        io_threads=io_threads, sweep=sweep,
+    )
+
+
+def shard_of(
+    level_group: Group, chunk_coords: Iterable[int], array_name: str = VERTICES,
+) -> tuple[int, ...]:
+    """The index of the shard holding cell ``chunk_coords`` of ``array_name``.
+
+    What :func:`shard_transaction` takes. A level's arrays normally share
+    grid origin and shard shape, so one answer serves them all.
+    """
+    arr = level_group._sharded_chunk_array(array_name)
+    if arr is None or arr.shards is None:
+        raise ArrayError(f"shard_of: {array_name!r} is not a sharded per-chunk array")
+    index = _coord_to_index(tuple(int(c) for c in chunk_coords), _grid_origin(arr))
+    return tuple(int(i) // int(s) for i, s in zip(index, arr.shards))
+
+
 def is_sharded(level_group: Group, array_name: str) -> bool:
     """Deprecated alias for :func:`array_is_sharded`."""
     import warnings
@@ -453,35 +736,160 @@ def link_endpoint_scales(
 
 def write_object_manifests(
     level_group: Group,
-    manifest_blobs: list[bytes],
+    manifest_blobs: Any = None,
     *,
+    chunk_coords: Any = None,
+    fragment_idx: Any = None,
+    manifest_offsets: Any = None,
+    ids: Any = None,
     mode: str = "replace",
     at: int | None = None,
-) -> None:
-    """Write ``object_index/manifests`` as one ragged vlen-bytes array.
+    layout: str | None = None,
+    block_at: int | None = None,
+    block_dtype: Any = None,
+) -> tuple[int, int]:
+    """Write object manifests to the level's object index.
 
-    The promoted spelling of an internal that two consuming call sites
-    use, so that writing an object index does not require a private name.
-    Takes already-encoded blobs -- one per object, in object-id order --
-    which is what those call sites already have; encode them with
-    :func:`encode_object_manifest_blocks`.
+    Give the manifests one of two ways:
+
+    - ``manifest_blobs``: already-encoded blobs, one per object, in
+      object order (encode them with :func:`encode_object_manifest_blocks`);
+    - as arrays: object ``o`` owns blocks
+      ``manifest_offsets[o]:manifest_offsets[o + 1]``, block ``b`` naming
+      fragment ``fragment_idx[b]`` of chunk ``chunk_coords[b]``. Without
+      ``manifest_offsets`` every object owns one block. Encoded with no
+      Python object per object, to the same bytes; device arrays are
+      copied to the host once each.
+
+    The index is vlen (one blob per object) or dense (fixed-width integer
+    arrays; see :mod:`zarr_vectors.core.dense_manifests`). An existing
+    index keeps its layout; a new one takes ``layout``, or the store's
+    ``manifest_layout``. On a dense index the array form is written as it
+    is -- no blob per object is ever built, and device arrays are copied
+    to the host once each.
+
+    Only the manifests (and, on an index that stores ids, the id table)
+    are written: committing the index's metadata (``num_objects`` and the
+    rest) stays the caller's step, which :func:`commit_object_index` is.
 
     Args:
         level_group: Resolution level group.
-        manifest_blobs: Encoded manifests, one per object.  Under the
-            default ``mode="replace"`` these are the WHOLE index; under
-            ``mode="append"`` they are only the new objects.
+        manifest_blobs: Encoded manifests (list of bytes or object array).
+        chunk_coords: ``(M, sid_ndim)`` block chunk coordinates.
+        fragment_idx: ``(M,)`` block fragment indices.
+        manifest_offsets: ``(n + 1,)`` CSR offsets of blocks per object.
+        ids: Object ids of the rows written, for an index that stores
+            ids rather than using rows as ids; see below.
         mode: ``"replace"`` rewrites every row.  ``"append"`` extends the
             existing array, touching only the zarr chunks the new rows fall
             in — the write a per-chunk emitter wants, since replacing costs
-            the whole index once per chunk.
+            the whole index once per chunk.  ``"place"`` writes rows
+            ``[at, at + n)`` of an index sized by
+            :func:`reserve_object_rows` and nothing else -- no resize, no
+            padding, no metadata -- so several processes may place
+            disjoint, aligned ranges at once (see
+            :func:`concurrency_contract`).
         at: Row index the appended blobs must start at (``mode="append"``
             only).  Pass the object-id being claimed so a torn previous
             flush cannot shift ids; ``None`` appends at the current end.
-    """
-    from zarr_vectors.core.arrays import _write_object_index_manifests
+        layout: ``"vlen"`` or ``"dense"`` for an index this call creates.
+        block_at: ``mode="place"`` on a dense index: the first row of
+            ``manifest_blocks`` this call's fragments occupy.
+        block_dtype: Dense only: ``"int64"`` or ``"int32"``, the dtype of
+            the ``manifest_blocks`` this call creates (default: the
+            store's ``manifest_block_dtype``, else int64). An index keeps
+            the dtype it was created with: an append or a placement into
+            it refuses another value, ``mode="replace"`` rewrites it in
+            the one given (else the one it had). Every block written into
+            an int32 index is checked, and one that does not fit raises
+            :class:`ArrayError` before anything is written. Ignored for a
+            vlen index.
 
-    _write_object_index_manifests(level_group, manifest_blobs, mode=mode, at=at)
+    On an index that stores its object ids (layout V2), an append extends
+    the id table with ``ids``, or with the rows when the table is simply
+    the rows; otherwise it raises, where it used to add rows with no id
+    that a read by id could not find.
+
+    Returns:
+        ``(first_row, n)``: where the written manifests start, and how many.
+    """
+    from zarr_vectors import _xp
+    from zarr_vectors.core.arrays import (
+        _index_layout_for_write,
+        _index_sid_ndim,
+        _write_dense_index,
+        _write_object_index_manifests,
+    )
+    from zarr_vectors.core.dense_manifests import check_block_dtype
+    from zarr_vectors.encoding.fragments import encode_object_manifests_csr
+
+    check_block_dtype(block_dtype)
+    as_arrays = chunk_coords is not None or fragment_idx is not None
+    if as_arrays == (manifest_blobs is not None) or (
+        as_arrays and (chunk_coords is None or fragment_idx is None)
+    ):
+        raise ArrayError(
+            "give manifest_blobs, or chunk_coords and fragment_idx "
+            "(optionally with manifest_offsets), not both"
+        )
+    if mode == "place":
+        import numpy as np
+
+        from zarr_vectors.core.object_rows import place_manifests
+
+        if at is None:
+            raise ArrayError('mode="place" needs at=')
+        if not as_arrays:
+            return place_manifests(
+                level_group, at, manifest_blobs=manifest_blobs,
+                ids=None if ids is None else _xp.to_host(ids), block_dtype=block_dtype,
+            )
+        fi = _xp.to_host(fragment_idx, dtype=np.int64).reshape(-1)
+        off = (
+            np.arange(fi.size + 1, dtype=np.int64) if manifest_offsets is None
+            else _xp.to_host(manifest_offsets, dtype=np.int64)
+        )
+        return place_manifests(
+            level_group, at, offsets=off, frags=fi,
+            coords=_xp.to_host(chunk_coords, dtype=np.int64),
+            ids=None if ids is None else _xp.to_host(ids), block_at=block_at,
+            block_dtype=block_dtype,
+        )
+    if as_arrays and _index_layout_for_write(level_group, layout) == "dense":
+        import numpy as np
+
+        cc = _xp.to_host(chunk_coords, dtype=np.int64)
+        fi = _xp.to_host(fragment_idx, dtype=np.int64).reshape(-1)
+        sid = _index_sid_ndim(level_group)
+        cc = cc.reshape(-1, sid)
+        off = (
+            np.arange(fi.size + 1, dtype=np.int64) if manifest_offsets is None
+            else _xp.to_host(manifest_offsets, dtype=np.int64)
+        )
+        if off.size == 0 or off[0] != 0 or off[-1] != fi.size or np.any(np.diff(off) < 0):
+            raise ArrayError(
+                f"manifest_offsets must start at 0, end at {fi.size} and not decrease"
+            )
+        first = _write_dense_index(
+            level_group, off, cc, fi, mode=mode, at=at,
+            ids=None if ids is None else _xp.to_host(ids), sid_ndim=sid,
+            block_dtype=block_dtype,
+        )
+        return int(first), int(off.size - 1)
+    if as_arrays:
+        try:
+            sid = int((level_group.read_array_meta(OBJECT_INDEX) or {}).get("sid_ndim"))
+        except Exception:
+            sid = None
+        manifest_blobs = encode_object_manifests_csr(
+            chunk_coords, fragment_idx, manifest_offsets, sid_ndim=sid,
+        )
+    first = _write_object_index_manifests(
+        level_group, manifest_blobs, mode=mode, at=at,
+        ids=None if ids is None else _xp.to_host(ids), layout=layout,
+        block_dtype=block_dtype,
+    )
+    return int(first), len(manifest_blobs)
 
 
 def per_chunk_array_paths(level_group: Group) -> list[str]:
@@ -558,11 +966,39 @@ def build_fragment_owner_index(store_path, *, level: int | None = None) -> int:
     return total
 
 
+def defer_presence(level_group: Group) -> list[str]:
+    """Declare this level's presence deferred to one coordinator rebuild.
+
+    For many workers writing one level: ``nonempty_chunks`` is one attribute
+    per array, so concurrent stamps race. Every per-chunk array drops its
+    manifest, arrays allocated later are born without one, and writes into
+    them stamp nothing, whatever ``record_presence`` says. Readers ask the
+    store instead, except offline-read sessions, stores that cannot list and
+    zarr-vectors older than 0.9.3, which see nothing until
+    :func:`rebuild_presence` (or :func:`set_presence`) writes the manifests
+    and clears the declaration. Call it before workers open the level: a
+    handle opened earlier still allocates arrays with a manifest.
+
+    Returns:
+        Every per-chunk array path in the level.
+    """
+    # Declared first, so an array allocated while the manifests are
+    # being dropped is born without one rather than slipping between.
+    level_group.attrs.update({_PRESENCE_DECL_ATTR: _PRESENCE_DEFERRED})
+    names = per_chunk_array_paths(level_group)
+    for name in names:
+        arr = level_group._sharded_chunk_array(name)
+        if arr is not None and _NONEMPTY_CHUNKS_ATTR in arr.attrs:
+            del arr.attrs[_NONEMPTY_CHUNKS_ATTR]
+            level_group._invalidate_node(name)
+    return names
+
+
 def rebuild_presence(
     level_group: Group,
     array_name: str | None = None,
     *,
-    on_sharded: str = "skip",
+    on_sharded: str = "derive",
 ) -> list[str]:
     """Rebuild ``nonempty_chunks`` from the store — one array, or the level.
 
@@ -571,21 +1007,32 @@ def rebuild_presence(
     one attribute shared by every cell, so stamping it races.  This
     rebuilds it once, afterwards.
 
+    Covers sharded arrays.  It did not, and defaulted to ``"skip"``,
+    while a sharded array's manifest could not be rebuilt from a per-cell
+    listing — safe then, because sharding ran after the rebuild by
+    contract, so anything sharded was already correct.  A store can now
+    be born sharded, and under that premise "skip" quietly declined to
+    repair the arrays most in need of it.
+
+    The level-wide form also ends a :func:`defer_presence` declaration,
+    once every manifest is written: arrays allocated afterwards get a
+    manifest again, and stamps resume.  The single-array form leaves the
+    declaration alone.
+
     Args:
         array_name: One array's path, or ``None`` (the default) to walk
             every per-chunk array in the level — the shape a coordinator
             actually needs after a parallel phase.
         on_sharded: Forwarded to
-            :meth:`Group.derive_nonempty_chunks`.  Defaults to ``"skip"``
-            here, not ``"raise"``: this verb legitimately runs over a
-            level's mixed arrays, and a sharded one already has a correct
-            manifest because sharding runs after the rebuild by contract.
-            Pass ``"raise"`` to assert that ordering instead.
+            :meth:`Group.derive_nonempty_chunks`.  ``"derive"`` (the
+            default) rebuilds sharded arrays like any other; ``"skip"``
+            leaves them alone; ``"raise"`` asserts none are sharded.
 
     Returns:
         The sorted keys recorded, for the single-array form; for the
-        level-wide form, the array paths whose manifests were rebuilt
-        (sharded arrays are skipped and therefore absent).
+        level-wide form, every per-chunk array path walked.  Under
+        ``on_sharded="skip"`` a sharded array is left alone and therefore
+        absent, so the return still says what was actually rebuilt.
     """
     if array_name is not None:
         return level_group.derive_nonempty_chunks(
@@ -594,20 +1041,252 @@ def rebuild_presence(
 
     rebuilt: list[str] = []
     for name in per_chunk_array_paths(level_group):
-        if array_is_sharded(level_group, name):
+        if on_sharded == "skip" and array_is_sharded(level_group, name):
             # Consult before the call so the caller learns which arrays
             # were rebuilt; "skip" alone would return a manifest and make
             # a skipped array indistinguishable from a rebuilt one.
             continue
         level_group.derive_nonempty_chunks(name, on_sharded=on_sharded)
         rebuilt.append(name)
+
+    # Last, so a rebuild that fails part-way leaves the level still
+    # declared -- and its remaining arrays still derived, not trusted.
+    _clear_deferral(level_group)
     return rebuilt
+
+
+def _clear_deferral(level_group: Group) -> None:
+    """Remove the level's deferral declaration; the one place that does."""
+    if level_group.presence_deferred():
+        del level_group.zarr_group.attrs[_PRESENCE_DECL_ATTR]
+
+
+def _array_objects(level_group: Group, arr: Any) -> dict[tuple[int, ...], str]:
+    """``{grid index: store key}`` of every object ``arr`` stores (cells, or
+    shards when sharded), from one prefix listing; non-chunk keys such as
+    ``zarr.json`` or a ``.partial`` are skipped."""
+    store = level_group.zarr_group.store
+    base = arr.path
+    head = f"{base}/" if base else ""
+    encoding = arr.metadata.chunk_key_encoding.to_dict()
+    name = encoding.get("name")
+    sep = (encoding.get("configuration") or {}).get(
+        "separator", "/" if name == "default" else ".",
+    )
+    if name == "default" and sep == "/":
+        keys = _list_store_prefix(store, f"{head}c/")
+    else:
+        async def _all() -> list[str]:
+            return [k async for k in store.list_prefix(head)]
+
+        keys = sync(_all())
+    out: dict[tuple[int, ...], str] = {}
+    for key in keys:
+        rel = key[len(head):]
+        if name == "default":
+            if not rel.startswith(f"c{sep}"):
+                continue
+            rel = rel[2:]
+        parts = rel.split(sep)
+        if len(parts) != arr.ndim:
+            continue
+        try:
+            out[tuple(int(p) for p in parts)] = key
+        except ValueError:
+            continue
+    return out
+
+
+def stored_objects(level_group: Group, array_name: str) -> list[str]:
+    """The store keys of the objects a per-chunk array holds, sorted.
+
+    One per stored cell, or per shard when sharded, from a prefix listing on
+    any store that lists; no object is read. The keys are those
+    :func:`cell_objects` names, so the two compare directly.
+
+    Raises:
+        StoreError: ``array_name`` is not a per-chunk array here.
+    """
+    arr = level_group._sharded_chunk_array(array_name)
+    if arr is None or not _is_per_chunk_array(array_name):
+        raise StoreError(
+            f"stored_objects: {array_name!r} is not a per-chunk array of "
+            f"{level_group.zarr_group.path or '<root>'}"
+        )
+    return sorted(_array_objects(level_group, arr).values())
+
+
+def _presence_mismatch(
+    level_group: Group, arr: Any, keys: list[str], mode: str,
+) -> dict[str, list[str]] | None:
+    """What the store holds against the claimed ``keys``, or ``None`` if
+    they agree under ``mode`` (see :func:`set_presence`)."""
+    origin = _grid_origin(arr)
+    shape = tuple(int(n) for n in arr.shape)
+    outer = tuple(int(n) for n in arr.metadata.chunk_grid.chunk_shape)
+    sharded = getattr(arr, "shards", None) is not None
+
+    def key_of(index: tuple[int, ...]) -> str:
+        return _format_chunk_key(
+            index if origin is None else tuple(i + o for i, o in zip(index, origin))
+        )
+
+    claimed: dict[tuple[int, ...], set[tuple[int, ...]]] = {}
+    for key in keys:
+        index = _coord_to_index(_parse_chunk_coords(key), origin)
+        claimed.setdefault(tuple(i // o for i, o in zip(index, outer)), set()).add(index)
+    stored = _array_objects(level_group, arr)
+    missing = [key_of(c) for obj, cs in claimed.items() if obj not in stored for c in cs]
+    unclaimed = [obj for obj in stored if obj not in claimed]
+    # Unsharded, an object is a cell: name it by its chunk key.
+    extra_objects = sorted(stored[obj] for obj in unclaimed) if sharded else []
+    extra: list[str] = [] if sharded else [key_of(obj) for obj in unclaimed]
+    if sharded:
+        def capacity(obj: tuple[int, ...]) -> int:
+            return int(np.prod([
+                min(o * s + s, dim) - o * s for o, s, dim in zip(obj, outer, shape)
+            ]))
+
+        check = [
+            obj for obj, cs in claimed.items()
+            if obj in stored and (mode == "index" or len(cs) < capacity(obj))
+        ]
+        held = level_group._shard_presence(arr, outer, check) if check else {}
+        for obj in check:
+            present = set(held.get(obj, ()))
+            extra.extend(key_of(c) for c in present - claimed[obj])
+            if mode == "index":
+                missing.extend(key_of(c) for c in claimed[obj] - present)
+    if not (missing or extra or extra_objects):
+        return None
+    return {"missing": sorted(missing), "extra": sorted(extra), "extra_objects": extra_objects}
+
+
+def set_presence(
+    level_group: Group,
+    cells: Mapping[str, Iterable[Any]],
+    *,
+    end_deferral: bool = False,
+    verify: str | None = None,
+    on_mismatch: str = "raise",
+) -> list[str]:
+    """Record each named array's presence as exactly the cells given.
+
+    For a coordinator that knows which cells its workers filled, instead of
+    :func:`rebuild_presence` reading the store back. ``cells`` maps array
+    name to ``"i.j.k"`` keys or tuples, in absolute chunk coordinates; it
+    must be the union over all workers, name every array they wrote and be
+    passed once they finish. Unnamed arrays are left alone. Every key is
+    validated before anything is written: ``StoreError`` for an array that
+    is not per-chunk here, ``ArrayError`` for a key outside its grid.
+
+    ``verify="objects"`` first checks one listing per array: claimed objects
+    are stored, every stored object holds a claimed cell, and a partly
+    claimed shard's other cells are empty. ``"index"`` also requires each
+    claimed cell of a shard to hold a payload. On a mismatch,
+    ``on_mismatch="raise"`` raises :class:`~zarr_vectors.exceptions.PresenceMismatchError`
+    before writing; ``"derive"`` takes the failing arrays from the store.
+    ``end_deferral`` then calls :func:`end_presence_deferral`. Returns the
+    array names written, sorted.
+    """
+    if verify not in (None, "objects", "index"):
+        raise ArrayError(f"verify={verify!r}; expected None, 'objects' or 'index'")
+    if on_mismatch not in ("raise", "derive"):
+        raise ArrayError(f"on_mismatch={on_mismatch!r}; expected 'raise' or 'derive'")
+    stamps = []
+    for name in sorted(cells):
+        arr = level_group._sharded_chunk_array(name)
+        if arr is None or not _is_per_chunk_array(name):
+            raise StoreError(
+                f"set_presence: {name!r} is not a per-chunk array of "
+                f"{level_group.zarr_group.path or '<root>'}"
+            )
+        origin = _grid_origin(arr)
+        shape = tuple(int(n) for n in arr.shape)
+        keys: set[str] = set()
+        for key in cells[name]:
+            coords = (
+                _parse_chunk_coords(key) if isinstance(key, str)
+                else tuple(int(c) for c in key)
+            )
+            if coords is None or not _coords_in_bounds(_coord_to_index(coords, origin), shape):
+                raise ArrayError(
+                    f"set_presence: {key!r} is not a cell of {name!r} "
+                    f"(grid origin {origin or (0,) * len(shape)}, shape {shape})"
+                )
+            keys.add(_format_chunk_key(coords))
+        stamps.append((name, arr, sorted(keys), {}))
+    if verify is not None:
+        mismatches = {}
+        for name, arr, keys, _extra in stamps:
+            found = _presence_mismatch(level_group, arr, keys, verify)
+            if found is not None:
+                mismatches[name] = found
+        if mismatches and on_mismatch == "raise":
+            raise PresenceMismatchError(mismatches)
+        stamps = [
+            (name, arr, level_group._presence_from_store(name, arr, verify=True), extra)
+            if name in mismatches else (name, arr, keys, extra)
+            for name, arr, keys, extra in stamps
+        ]
+    _stamp_presence(stamps)
+    if level_group._listing_cache:
+        for name, *_ in stamps:
+            level_group._listing_cache.pop(level_group._full_path(name), None)
+    if end_deferral:
+        end_presence_deferral(level_group)
+    return [name for name, *_ in stamps]
+
+
+def end_presence_deferral(
+    level_group: Group, *, missing: str = "raise",
+) -> list[str]:
+    """End the level's :func:`defer_presence` declaration.
+
+    For a coordinator that recorded presence itself (:func:`set_presence`, or
+    a rebuild split across processes); :func:`rebuild_presence` ends it on
+    its own. Arrays allocated afterwards get a manifest, and stamps resume.
+
+    Args:
+        missing: For per-chunk arrays still without a manifest, which would
+            otherwise stay store-derived for good: ``"raise"`` (default)
+            names them and changes nothing; ``"derive"`` rebuilds each first.
+
+    Returns:
+        The arrays derived under ``missing="derive"`` (empty otherwise).
+    """
+    if missing not in ("raise", "derive"):
+        raise ArrayError(f"missing={missing!r}; expected 'raise' or 'derive'")
+    lacking = []
+    for name in per_chunk_array_paths(level_group):
+        arr = level_group._sharded_chunk_array(name)
+        if arr is not None and _NONEMPTY_CHUNKS_ATTR not in arr.attrs:
+            lacking.append(name)
+    if lacking and missing == "raise":
+        raise StoreError(
+            f"Cannot end the presence deferral of "
+            f"{level_group.zarr_group.path or '<root>'}: {len(lacking)} per-chunk "
+            f"array(s) have no manifest ({', '.join(lacking[:5])}"
+            f"{', ...' if len(lacking) > 5 else ''}). Record them with "
+            f"set_presence, or pass missing='derive' to rebuild them "
+            f"from the store."
+        )
+    for name in lacking:
+        level_group.derive_nonempty_chunks(name)
+    _clear_deferral(level_group)
+    return lacking
 
 
 __all__ = [
     "MeshChunkInfo",
     "MeshReader",
     "CAP_FRAGMENT_INDEX",
+    "ArrayRead",
+    "CellBatch",
+    "CellColumn",
+    "CellReadError",
+    "FragmentColumn",
+    "ManifestCSR",
     "CAP_MULTISCALE_LINKS",
     "CAP_PRESERVED_OBJECT_IDS",
     "CAP_SHARED_FRAGMENTS",
@@ -628,15 +1307,29 @@ __all__ = [
     "LevelMetadata",
     "OBJECT_ATTRIBUTES",
     "OBJECT_INDEX",
+    "OBJECT_INDEX_LAYOUT_DENSE",
     "OBJECT_INDEX_LAYOUT_V1",
+    "OBJECT_INDEX_LAYOUT_V2",
+    # Exported so a consumer can audit an existing store's manifest chunking
+    # without importing from ``core``: the number is fixed at array-creation
+    # time and cannot be changed afterwards, so "is this store chunked
+    # correctly?" is a question only an outside reader can answer, and it needs
+    # the reference value to answer it against.
+    "OBJECT_INDEX_MANIFEST_BUCKET",
+    "OBJECT_SHARD_ROW_MULTIPLE",
     "ObjectIndexAppender",
+    "ObjectManifestWriter",
+    "PresenceMismatchError",
+    "ShardOwnershipError",
     "RechunkSpec",
     "RootMetadata",
+    "StoreLayout",
     "VERTEX_ATTRIBUTES",
     "VERTEX_FRAGMENTS",
     "VERTICES",
     "XLEVEL_EXPLICIT",
     "XLEVEL_NONE",
+    "aligned_regions",
     "apply_perm_inverse",
     "array_is_sharded",
     "assign_chunks",
@@ -649,14 +1342,18 @@ __all__ = [
     "chunk_scale_from_root",
     "chunks_intersecting_bbox",
     "commit",
+    "cell_objects",
+    "commit_object_index",
     "compute_bin_ratio",
     "compute_bin_shape",
     "compute_grid_shape",
+    "concurrency_contract",
     "create_attribute_array",
     "create_fragment_attribute_array",
     "create_groupings_array",
     "create_groupings_attributes_array",
     "create_link_attributes_array",
+    "create_link_segments",
     "create_links_array",
     "create_links_family",
     "create_object_attributes_array",
@@ -664,9 +1361,14 @@ __all__ = [
     "create_resolution_level",
     "create_store",
     "create_vertices_array",
+    "decode_fragment_index",
     "decode_object_manifest_blocks",
+    "defer_presence",
+    "end_presence_deferral",
     "decompose_tree_to_paths",
+    "decode_object_manifests_csr",
     "encode_object_manifest_blocks",
+    "encode_object_manifests_csr",
     "expand_manifest_blocks",
     "finalize_links",
     "finalize_skeleton_store",
@@ -679,6 +1381,7 @@ __all__ = [
     "get_shard_info",
     "init_skeleton_store",
     "intra_offsets",
+    "is_dense_index",
     "is_intra",
     "is_sharded",
     "iter_link_cells",
@@ -702,14 +1405,20 @@ __all__ = [
     "list_resolution_levels",
     "neighbouring_chunk_keys",
     "object_count",
+    "object_manifest_writer",
+    "object_shard_rows",
+    "observe_presence_writes",
     "open_store",
     "open_write_session",
     "parse_offsets",
     "partition_cross_level_edges",
+    "patch_object_manifests",
     "per_chunk_array_paths",
     "read_all_groupings",
     "read_all_object_manifests",
+    "read_all_object_manifests_csr",
     "read_attribute_fragment",
+    "read_cells",
     "read_chunk_attributes",
     "read_chunk_fragment_attributes",
     "read_chunk_link_attributes",
@@ -721,6 +1430,7 @@ __all__ = [
     "read_groupings_attributes",
     "read_level_metadata",
     "read_link_arrays",
+    "read_neighbourhood",
     "read_link_attributes",
     "read_links",
     "read_links_for_tuple",
@@ -728,6 +1438,7 @@ __all__ = [
     "read_object_attribute_present_mask",
     "read_object_attributes",
     "read_object_manifests",
+    "read_object_manifests_csr",
     "read_object_vertices",
     "read_root_metadata",
     "read_skeleton_by_segment_id",
@@ -738,18 +1449,26 @@ __all__ = [
     "rechunk_by_attribute",
     "refresh_arrays_present",
     "stamp_ome_node",
+    "store_layout",
     "register_coarsen_strategy",
     "register_selection_strategy",
     "remove_resolution_level",
     "reshard",
+    "reserve_object_rows",
     "session_for",
     "set_coordinate_offset",
+    "set_presence",
+    "stored_objects",
+    "shard_object_layer",
+    "shard_of",
     "shard_store",
+    "shard_transaction",
     "split_polyline_at_boundaries",
     "unshard_store",
     "update_level_metadata",
     "update_root_metadata",
     "upsert_level_transform",
+    "user_metadata",
     "validate_bin_shape_divides_chunk",
     "validate_level_chunk_shape_against_root",
     "write_chunk_attributes",
@@ -768,8 +1487,16 @@ __all__ = [
     "write_links",
     "write_mesh",
     "write_multiscale_metadata",
+    "write_object_attribute_columns",
     "write_object_attributes",
     "write_object_index",
+    # Composite levels: a leading "source" chunk axis naming other stores.
+    "SOURCE_AXIS",
+    "chunk_sources",
+    "is_composite",
+    "set_chunk_sources",
+    "source_fingerprint",
+    "verify_chunk_sources",
     "write_object_manifests",
     "write_points",
     "write_polylines",

@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 import numpy as np
 
@@ -230,6 +230,9 @@ def validate_consistency(store_path: str | Path | Group) -> ValidationResult:
         except Exception:
             pass
 
+        for problem in _dense_index_problems(lg):
+            result.add_error(f"{prefix}: {problem}")
+
         try:
             ids, manifests = read_object_manifest_rows(lg)
             for oid, mf in zip(ids.tolist(), manifests):
@@ -358,3 +361,57 @@ def validate_consistency(store_path: str | Path | Group) -> ValidationResult:
             )
 
     return result
+
+
+def _dense_index_problems(lg: Any) -> list[str]:
+    """What is wrong with a dense object index's arrays (spec L1/L2)."""
+    from zarr_vectors.core import dense_manifests as dense
+
+    try:
+        if not dense.is_dense(lg):
+            return []
+        meta = lg.read_array_meta("object_index") or {}
+    except Exception:
+        return []
+    problems = []
+    for path in (dense.SPANS_PATH, dense.BLOCKS_PATH, "object_index/object_ids"):
+        if not lg.array_exists(path):
+            problems.append(f"dense object_index is missing {path}")
+    if lg.array_exists("object_index/manifests"):
+        problems.append("dense object_index also has a vlen manifests array")
+    if problems:
+        return problems
+    spans = np.asarray(lg.read_array(dense.SPANS_PATH))
+    blocks_node = lg.zarr_group[dense.BLOCKS_PATH]
+    blocks_shape = blocks_node.shape
+    blocks_dtype = np.dtype(blocks_node.dtype)
+    if spans.dtype != np.int64:
+        problems.append(f"manifest_spans is {spans.dtype}; expected int64")
+    if blocks_dtype.name not in dense.BLOCK_DTYPES:
+        problems.append(
+            f"manifest_blocks is {blocks_dtype}; expected one of "
+            f"{', '.join(dense.BLOCK_DTYPES)}"
+        )
+    stamped = meta.get(dense.BLOCK_DTYPE_ATTR)
+    if stamped is not None and stamped != blocks_dtype.name:
+        problems.append(
+            f"object_index says {dense.BLOCK_DTYPE_ATTR}={stamped!r}, but "
+            f"manifest_blocks is {blocks_dtype}"
+        )
+    n, sid = int(meta.get("num_objects", spans.shape[0])), int(meta.get("sid_ndim", 0))
+    if spans.ndim != 2 or spans.shape[1] != 2 or spans.shape[0] < n:
+        problems.append(f"manifest_spans has shape {spans.shape}; expected ({n}, 2)")
+        return problems
+    if sid and blocks_shape[1:] != (sid + 1,):
+        problems.append(
+            f"manifest_blocks has shape {blocks_shape}; expected (n, {sid + 1})"
+        )
+    used = spans[:n]
+    if (used[:, 1] < 0).any():
+        problems.append("manifest_spans has a negative count")
+    live = used[used[:, 1] > 0]
+    if live.size and (
+        (live[:, 0] < 0).any() or (live[:, 0] + live[:, 1] > blocks_shape[0]).any()
+    ):
+        problems.append("manifest_spans reaches past the end of manifest_blocks")
+    return problems

@@ -114,6 +114,7 @@ chunking/chunk_vs_bin
 chunking/attribute_chunking
 chunking/rechunking
 chunking/sharding
+chunking/chunk_sources
 multiscale/multiscale_metadata
 multiscale/pyramid_construction
 multiscale/sparsity
@@ -133,4 +134,5 @@ comparisons/ome_zarr
 contributing/spec_change_process
 contributing/adding_geometry_types
 contributing/test_compliance
+contributing/implementation_notes
 ```

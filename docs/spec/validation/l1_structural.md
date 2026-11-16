@@ -3,9 +3,9 @@
 ## Terms
 
 **Structural check**
-: A validation check that examines only the presence of paths and
-  root attribute blocks in the store, without reading array data or
-  interpreting metadata values.
+: A validation check that examines the store's node layout: which nodes
+  exist, the root attribute blocks, and the shape of the per-chunk arrays'
+  cell grids. It reads no cell data.
 
 **Required path**
 : A store path that must exist for a valid Zarr Vectors store. Missing required
@@ -24,9 +24,10 @@
 
 L1 validation answers the question: "does this store have the right shape?"
 It checks that the store opens, the root carries a `zarr_vectors`
-metadata block, and each resolution
-level's required paths are present. It does not read any array data and
-does not interpret metadata values.
+metadata block, each resolution level's required nodes are present, and
+each level's per-chunk arrays agree on the rank of the chunk grid they
+share. It reads no cell data, and it interprets metadata only as far as
+the rank check needs.
 
 L1 is the fastest validation level and is appropriate as a first triage
 step when opening an unfamiliar store. An L1 failure means the store is
@@ -36,12 +37,14 @@ structurally incomplete and cannot be read by any Zarr Vectors reader.
 
 L1 is deliberately **narrow**, and narrower than a reader's needs:
 
-- It checks **presence only**. It opens the store through the same
-  `open_store` machinery the readers use (so it works on local paths,
-  URLs, pre-opened `Group` handles and any supported backend, not just
-  directories), but it does not read array data, does not parse
-  `zarr_vectors` values, and does not verify Zarr node types. A path
-  that exists as the wrong node type passes L1 and fails later.
+- It asks the store, not a filesystem, so it works on local paths, URLs,
+  open `Group` handles and any backend a reader can open. It resolves nodes through the same lookup readers
+  use.
+- It opens each per-chunk array's `zarr.json` for one purpose: its
+  **rank**, and the arity of the keys in its `nonempty_chunks`
+  manifest (see *Chunk grid rank* below). A rank skew is structural:
+  the array cannot address the cells its level's keys name, so no
+  later level can be trusted over it.
 - It is **not** parameterised by geometry type. L1 applies one required
   set to every store, so it cannot express "streamlines must have
   links". Type-specific connectivity requirements are checked at **L4**
@@ -65,10 +68,10 @@ do not carry stable machine-readable check IDs (see
 
 | Rule | Failure type |
 |------|--------------|
-| The store can be opened (`open_store(..., require_zv=False)`) | Error (returns immediately) |
-| The root attributes contain a `zarr_vectors` block | Error |
-| The root attributes contain an RFC 8 `ome` node | Warning |
-| At least one level group exists | Error (returns immediately) |
+| The store opens (path, URL or open `Group`) | Error (returns immediately) |
+| The root attributes carry a `zarr_vectors` block | Error |
+| The root attributes carry an RFC 8 `ome` node | Warning |
+| At least one resolution level exists | Error (returns immediately) |
 
 The `ome` node is optional (format 0.9.2): a store without one is valid
 and fully readable, but cannot be resolved as a member of an OME
@@ -76,8 +79,8 @@ collection. The warning's remedy is
 `zarr_vectors.building.stamp_ome_node(store)`, which adds the node
 without rewriting data.
 
-The first and last failures are **fatal to the walk**: `validate_structure`
-returns as soon as one trips, so no per-level results follow. A missing
+The two immediate returns are **fatal to the walk**: no per-level
+results follow them. A missing
 `zarr_vectors` block is recorded and the walk continues.
 
 ##### Per level directory
@@ -118,6 +121,42 @@ not parse offsets segments, and does not require `links/` to exist for
 any geometry type. Offsets-segment grammar is checked at
 [L3](l3_consistency.md); type-specific connectivity requirements at L4.
 
+> **Legacy tolerance.** `structure.py` applies the same scan to a
+> `cross_chunk_links/` directory if one is present. That family was
+> merged into `links/` and is never written by a current writer; the
+> branch only keeps L1 from being silent about a pre-merge store. It
+> imposes no requirement, and a store MUST NOT rely on it.
+
+#### Chunk grid rank
+
+A level's per-chunk arrays (`vertices`, `vertex_fragments`,
+`vertex_attributes/<n>`, `fragment_attributes/<n>`, `links/<d>/<off>`,
+`link_attributes/…`) are cells of one chunk grid, so they share one
+rank: `sid_ndim`, plus one when the level is chunked by an attribute.
+`object_index/`, `object_attributes/` and `groups/` have no chunk grid
+and are not checked.
+
+| Rule | Failure type |
+|------|--------------|
+| Every key in an array's `nonempty_chunks` has as many components as the array has dimensions | Error |
+| Every per-chunk array has the same rank as `N/vertices` | Error |
+| On a level with `chunk_attribute_values`, `N/vertices` has rank `sid_ndim + 1` | Error |
+| On such a level, the leading axis of `N/vertices` has `len(chunk_attribute_values)` entries | Error |
+
+An array with no `nonempty_chunks` attribute lists no keys. That is not
+an error, because a `record_presence=False` write leaves it that way until
+its rebuild.
+
+Both of the first two rules are needed.
+`derive_nonempty_chunks` rebuilds a manifest at its array's own rank, so
+after a rebuild a mis-ranked array agrees with its own keys, and only
+the comparison with `vertices` catches it. The last rule holds because a
+reader resolves an attribute value to a bin by its position in
+`chunk_attribute_values`. A leading axis with more entries than that list
+means some bin is unreachable, or readable under another bin's label.
+`chunk_attribute_values` is read leniently: a level whose metadata
+does not parse is reported at L2, and this rule is skipped for it.
+
 ### Example L1 report
 
 ```
@@ -130,13 +169,15 @@ Level 1 validation: FAIL
 ```
 
 Passing messages take the form `Store root opened`,
-`Root metadata file found`, `RFC 8 'ome' node found`, `Found 2 resolution level(s)`,
-`0/vertices/ exists`, and `0/links/ exists (deltas: 0,+1)`.
+`Root metadata file found`, `RFC 8 'ome' node found`,
+`Found 2 resolution level(s)`, `0/vertices/ exists`,
+`0/links/ exists (deltas: 0,+1)`, and
+`0/ per-chunk arrays share rank 4 (3 arrays)`.
 
 ### Implementation notes for contributors
 
-L1 opens the store as a `Group` and checks for the presence of required
-paths:
+L1 walks the store through `open_store`, checks for the required
+nodes, and reads each per-chunk array's shape and presence manifest:
 
 ```python
 from zarr_vectors.validate.structure import validate_structure

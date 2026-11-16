@@ -113,6 +113,15 @@ reads of the level's attributes will not find them, and
 `update_level_metadata` refuses to write them (or `chunk_shape` / `bounds`)
 because that would produce keys no reader consults.
 
+#### Build-time keys
+
+Carried only while a level is being written, and absent from a finished
+store.
+
+| Key | Type | Description |
+|-----|------|-------------|
+| `zarr_vectors_presence` | `"deferred"` | The level's presence is deferred to one coordinator rebuild. Its per-chunk arrays carry no `nonempty_chunks`, so concurrent writers share no state between cells, and a reader takes presence from the store (see [Chunk arrays](chunk_arrays.md)). A writer allocating an array in such a level creates it without a manifest, and a write into an array without one records nothing. Removed by the rebuild. Since 0.9.3. |
+
 ### Level 0 special case
 
 Level 0 is always the full-resolution level. Its `zarr_vectors_level` must satisfy:

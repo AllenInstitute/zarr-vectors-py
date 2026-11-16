@@ -36,6 +36,18 @@
       "title": "AttributeMeta",
       "type": "object"
     },
+    "AttributeSpecs": {
+      "additionalProperties": true,
+      "description": "What the store declares its attributes to be, keyed by scope (``vertex`` / ``object`` / ``link``) and then by attribute name. Modelled as an open dict for the same reason as ``CRS``: the value is a nested mapping, and the generators render a plain ``range: string`` slot as a string -- which would reject the very payload the runtime writes.  The per-entry shape is documented on the slot.",
+      "title": "AttributeSpecs",
+      "type": [
+        "null",
+        "boolean",
+        "object",
+        "number",
+        "string"
+      ]
+    },
     "Axis": {
       "additionalProperties": false,
       "description": "One axis of the spatial index.  Mirrors the OME-Zarr NGFF axis object (RFC 4/5).",
@@ -62,6 +74,18 @@
       ],
       "title": "Axis",
       "type": "object"
+    },
+    "BinLabel": {
+      "additionalProperties": true,
+      "description": "One entry of ``chunk_attribute_values``: a string or a number. Modelled as ``linkml:Any`` so the slot's ``any_of`` is the whole constraint -- a plain slot takes the schema's default ``string`` range as well, and the generated JSON Schema then demands both.",
+      "title": "BinLabel",
+      "type": [
+        "null",
+        "boolean",
+        "object",
+        "number",
+        "string"
+      ]
     },
     "BoundingBox": {
       "additionalProperties": false,
@@ -295,9 +319,20 @@
           ]
         },
         "chunk_attribute_values": {
-          "description": "Ordered list mapping attribute-bin index to original attribute value.  Must be non-empty when set, and coherent with ``chunk_attribute_name`` (both set or both absent).\n",
+          "description": "One label per leading-axis bin, in bin order: entry ``i`` is what a reader's ``attribute_filter`` names to select bin ``i``, so its length is the bin count.  A categorical bin is labelled by its value (a string or a number), a bin cut by edges by its lower edge, and a group bin by its group index (``-1`` for ungrouped objects, which are the last bin).  Must be non-empty when set, and coherent with ``chunk_attribute_name`` (both set or both absent).\n",
           "items": {
-            "type": "string"
+            "$ref": "#/$defs/BinLabel",
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "integer"
+              },
+              {
+                "type": "number"
+              }
+            ]
           },
           "type": [
             "array",
@@ -328,6 +363,13 @@
           "description": "How this level was generated (e.g. \"grid_metanode\").",
           "type": [
             "string",
+            "null"
+          ]
+        },
+        "fragments_tile": {
+          "description": "True when every chunk in this level has a vertex fragment index that tiles its buffer, so the concatenation of a chunk's fragments IS its vertex buffer and a bulk read may skip ``vertex_fragments`` entirely.  Unlike the other flags here this is a claim about what has NOT happened since: it is stamped by a bulk writer and cleared by any later write to ``vertices`` or ``vertex_fragments``. Readers MUST treat an absent value as False.\n",
+          "type": [
+            "boolean",
             "null"
           ]
         },
@@ -603,6 +645,24 @@
       "title": "LinksMeta",
       "type": "object"
     },
+    "ManifestBlockDtype": {
+      "description": "Integer dtype a store creates new dense indexes' ``manifest_blocks`` in.",
+      "enum": [
+        "int64",
+        "int32"
+      ],
+      "title": "ManifestBlockDtype",
+      "type": "string"
+    },
+    "ManifestLayout": {
+      "description": "Object-index layout a store creates new indexes in.",
+      "enum": [
+        "vlen",
+        "dense"
+      ],
+      "title": "ManifestLayout",
+      "type": "string"
+    },
     "ObjectAttributeMeta": {
       "additionalProperties": false,
       "description": "``.zattrs`` for each ``object_attributes/<name>/`` array.",
@@ -646,10 +706,24 @@
       "title": "ObjectIndexConvention",
       "type": "string"
     },
+    "ObjectIndexLayout": {
+      "description": "How one object index stores its manifests.",
+      "enum": [
+        "vlen_manifests_v1",
+        "vlen_manifests_v2",
+        "dense_manifests_v1"
+      ],
+      "title": "ObjectIndexLayout",
+      "type": "string"
+    },
     "ObjectIndexMeta": {
       "additionalProperties": false,
       "description": "``.zattrs`` for ``object_index/``.",
       "properties": {
+        "layout": {
+          "$ref": "#/$defs/ObjectIndexLayout",
+          "description": "The object index's storage layout: ``vlen_manifests_v1`` (vlen blobs, rows are ids), ``vlen_manifests_v2`` (vlen blobs, ids in ``object_ids``) or ``dense_manifests_v1`` (``manifest_spans`` into ``manifest_blocks``, ids in ``object_ids``; 0.9.4).\n"
+        },
         "num_objects": {
           "description": "Total object count this array carries.",
           "minimum": 0,
@@ -678,6 +752,17 @@
       "additionalProperties": false,
       "description": "Root-level ``.zattrs`` payload, persisted under the key ``zarr_vectors``.  Validates the runtime :class:`zarr_vectors.core.metadata.RootMetadata` dataclass. Note: the canonical axis list lives in ``multiscales[0].axes`` at root level (NGFF-style), NOT under ``zarr_vectors`` \u2014 see ``MultiscalesMetadata``.",
       "properties": {
+        "attribute_specs": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/AttributeSpecs"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "What the store declares its attributes to be, keyed by scope (``vertex`` / ``object`` / ``link``) and then by attribute name. Each entry carries ``dtype`` and optionally ``channels``, ``categorical``, ``unit`` and ``description``.  Optional and backward-compatible from 0.9.1: absent means undeclared, which is every store written before it.  A declaration is not a promise the array exists -- the array appears when data is written -- but it is what lets a Schema round-trip and what ``open_or_create`` compares against.  ``unit`` and ``description`` are additionally stamped on the attribute array's own metadata block.\n"
+        },
         "base_bin_shape": {
           "description": "Supervoxel bin edge lengths at level 0.  When set, every value must be > 0 and ``chunk_shape`` must be an integer multiple along every axis (enforced runtime-side in ``RootMetadata.validate``).\n",
           "items": {
@@ -746,6 +831,14 @@
         "links_convention": {
           "$ref": "#/$defs/LinksConvention"
         },
+        "manifest_block_dtype": {
+          "$ref": "#/$defs/ManifestBlockDtype",
+          "description": "``int32`` when dense object indexes are created with ``int32`` ``manifest_blocks``, absent for the ``int64`` default. A default for indexes created later; each index's ``manifest_blocks`` dtype (its ``zarr.json``) is the truth about it, and every reader widens the blocks to ``int64``. Optional and additive.\n"
+        },
+        "manifest_layout": {
+          "$ref": "#/$defs/ManifestLayout",
+          "description": "``dense`` when object indexes are created in the dense layout (``manifest_spans`` + ``manifest_blocks``: fixed-width integer arrays), absent for the vlen default of one blob per object. Optional and additive from 0.9.4. A default for indexes created later; an existing index's own ``layout`` is the truth about it.\n"
+        },
         "object_index_convention": {
           "$ref": "#/$defs/ObjectIndexConvention"
         },
@@ -754,6 +847,17 @@
           "minimum": 2,
           "type": [
             "integer",
+            "null"
+          ]
+        },
+        "shard_shape": {
+          "description": "Cells per shard per axis, or absent for one storage object per cell.  The store's declared packing, read by every path that allocates a per-chunk array -- including the ones that run long after creation, inside workers that never saw the argument.  Units are grid cells, so one declaration is meaningful at every level of a pyramid even though their grids differ.  A store where every axis agrees writes the scalar edge; the multivalued form carries a per-axis shape.  Optional and additive from 0.9.3: absent means unsharded, which is every store written before it.  It is a writer default, not a claim about what is on disk -- an array's own ``zarr.json`` remains the truth about that array.\n",
+          "items": {
+            "minimum": 1,
+            "type": "integer"
+          },
+          "type": [
+            "array",
             "null"
           ]
         },

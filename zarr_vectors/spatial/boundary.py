@@ -854,8 +854,18 @@ def partition_link_arrays(
         carries one -- and ``input_indices`` says which input record each
         row came from.  Rows keep their input order within a bucket.
     """
-    chunks = np.asarray(chunks, dtype=np.int64)
-    vi = np.asarray(vi, dtype=np.int64)
+    from zarr_vectors import _xp
+
+    # Device arrays are partitioned where they are; what comes back is the
+    # grouped rows, which the writer needs on the host anyway.
+    on_device = _xp.encode_on_device(chunks, vi)
+    if on_device:
+        import cupy as xp
+    else:
+        xp = np
+        chunks, vi = _xp.to_host(chunks), _xp.to_host(vi)
+    chunks = xp.asarray(chunks).astype(xp.int64, copy=False)
+    vi = xp.asarray(vi).astype(xp.int64, copy=False)
     L = int(link_width)
     if chunks.ndim != 3 or chunks.shape[1:] != (L, sid_ndim):
         raise ChunkingError(
@@ -882,53 +892,60 @@ def partition_link_arrays(
         return {}
 
     # --- placement: which input endpoint leads, and in what order -----
-    intra = np.all(chunks == chunks[:, :1, :], axis=(1, 2))
+    intra = xp.all(chunks == chunks[:, :1, :], axis=(1, 2))
+    identity = xp.arange(L, dtype=xp.int64)
     if cross_level or directed or L == 1:
-        sigma = np.broadcast_to(np.arange(L, dtype=np.int64), (n, L))
+        sigma = xp.broadcast_to(identity, (n, L))
     else:
         # The canonical order of each record's endpoints, by
         # (chunk_coords, vi): one lexsort over every endpoint of every
         # record with the record as primary key, stable like the sorted()
         # it replaces.  Intra-chunk records keep input order, as
         # _cell_placements does.
-        rec = np.repeat(np.arange(n, dtype=np.int64), L)
+        rec = xp.repeat(xp.arange(n, dtype=xp.int64), L)
         keys = [vi.reshape(-1)]
         flat_chunks = chunks.reshape(-1, sid_ndim)
         keys += [flat_chunks[:, d] for d in range(sid_ndim - 1, -1, -1)]
         keys.append(rec)
-        order = np.lexsort(keys)
-        sigma = order.reshape(n, L) - (np.arange(n, dtype=np.int64) * L)[:, None]
-        sigma = np.where(intra[:, None], np.arange(L, dtype=np.int64)[None, :], sigma)
+        order = xp.lexsort(xp.stack(keys))
+        sigma = order.reshape(n, L) - (xp.arange(n, dtype=xp.int64) * L)[:, None]
+        sigma = xp.where(intra[:, None], identity[None, :], sigma)
 
-    rowsel = np.arange(n, dtype=np.int64)[:, None]
+    rowsel = xp.arange(n, dtype=xp.int64)[:, None]
     placed_chunks = chunks[rowsel, sigma]          # (n, L, D)
     placed_vi = vi[rowsel, sigma]                  # (n, L)
     if cross_level or directed or L == 1:
-        perm = np.zeros(n, dtype=np.int64)
+        perm = xp.zeros(n, dtype=xp.int64)
     else:
         table, radix = _lehmer_table(L)
-        perm = table[sigma @ radix]
+        perm = xp.asarray(table)[(sigma * xp.asarray(radix)).sum(axis=1)]
 
     # --- anchor and offsets -------------------------------------------
-    rs = np.asarray(scale_src, dtype=np.int64)
-    rt = np.asarray(scale_trg, dtype=np.int64)
+    rs = xp.asarray(np.asarray(scale_src, dtype=np.int64))
+    rt = xp.asarray(np.asarray(scale_trg, dtype=np.int64))
     src = placed_chunks[:, 0, :]
     anchor = (src * rs) // rt
     offsets = placed_chunks[:, 1:, :] - anchor[:, None, :]   # (n, L-1, D)
 
     # --- group by (source chunk, offsets) -----------------------------
-    key = np.concatenate([src, offsets.reshape(n, -1)], axis=1)
-    order = np.lexsort(key.T[::-1])
+    key = xp.concatenate([src, offsets.reshape(n, -1)], axis=1)
+    order = xp.lexsort(key.T[::-1])
     key_sorted = key[order]
-    starts = np.flatnonzero(
-        np.concatenate((
-            [True], np.any(key_sorted[1:] != key_sorted[:-1], axis=1),
+    starts = xp.flatnonzero(
+        xp.concatenate((
+            xp.ones(1, dtype=bool), xp.any(key_sorted[1:] != key_sorted[:-1], axis=1),
         ))
     )
-    ends = np.append(starts[1:], n)
 
     placed_vi = placed_vi[order]
     perm = perm[order]
+    heads = key_sorted[starts]
+    if on_device:
+        # Four downloads: the grouped rows and where each group starts.
+        placed_vi, perm, order, heads, starts = (
+            _xp.to_host(a) for a in (placed_vi, perm, order, heads, starts)
+        )
+    ends = np.append(starts[1:], n)
     out: dict[
         tuple[str, ChunkCoords], tuple[npt.NDArray[np.int64], npt.NDArray[np.int64]]
     ] = {}
@@ -936,8 +953,7 @@ def partition_link_arrays(
     # Every group's key as Python ints in one conversion; a line store
     # has a bucket per cell, a hundred thousand of them, and converting
     # each head element by element was most of this function.
-    heads = key_sorted[starts].tolist()
-    for head, start, end in zip(heads, starts.tolist(), ends.tolist()):
+    for head, start, end in zip(heads.tolist(), starts.tolist(), ends.tolist()):
         src_chunk = tuple(head[:sid_ndim])
         flat_offsets = tuple(head[sid_ndim:])
         seg = segments.get(flat_offsets)

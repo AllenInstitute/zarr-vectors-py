@@ -31,7 +31,7 @@ from __future__ import annotations
 #: Version of the Python API surface.  Bump the minor when a supported
 #: name is added, the major when one is removed or changes meaning.
 #: Independent of both ``__version__`` and the on-disk format.
-__api_version__ = (1, 0)
+__api_version__ = (1, 5)
 
 #: Capabilities a caller may branch on, each True only when usable.
 FEATURES: frozenset[str] = frozenset({
@@ -54,6 +54,120 @@ FEATURES: frozenset[str] = frozenset({
     # coarsen_level/build_pyramid forward options= to a registered
     # strategy, and api.coarsen_methods() lists what is installed.
     "coarsen-strategy-options",
+    # zarr_vectors.runtime_capabilities() reports what this install can
+    # do, including whether device arrays are usable.
+    "runtime-capabilities",
+    # building.read_cells / read_neighbourhood: many cells of many arrays
+    # in one prefetch, as CSR; flat readers and ReadResult take device=.
+    "read-cells",
+    # write_chunk_fragments(csr=(indices, offsets)): fragments as arrays,
+    # and appends that concatenate sections instead of re-encoding.
+    "csr-fragments",
+    # write_object_manifests(chunk_coords=, fragment_idx=, ...) and
+    # read_all_object_manifests_csr: manifests as arrays both ways.
+    "array-manifests",
+    # building.object_manifest_writer(level, at=): write_object_manifests
+    # as a stream, the layout resolved once, rows written in whole shards.
+    "object-manifest-writer",
+    # write_object_attribute_columns: many object attribute columns in
+    # one call, grown in place concurrently.
+    "object-attribute-columns",
+    # write_link_cells(chunks=, vids=, attributes=): link records and
+    # their attributes as arrays, one read-modify-write per cell.
+    "array-link-cells",
+    # create_store(manifest_layout="dense") and write_object_index /
+    # write_object_manifests(layout=): object indexes as fixed-width
+    # integer arrays (format 0.9.4).
+    "dense-manifests",
+    # read_cells(device="cuda", decode=...): cells decoded on the device.
+    "device-decode",
+    # read_cells(device="cuda", io=...): the local-file read path chosen
+    # per call, auto following cuFile's GPUDirect Storage verdict.
+    "device-io",
+    # CellBatch.io / io_seconds: how each array of a read was served
+    # (gds, kvikio-compat, pinned-host, store, host) and where the time
+    # went; runtime_capabilities(probe_device=True)["gds"].
+    "read-io-report",
+    # zarr_vectors.gpu.decode_zstd: zstd frames a caller fetched into
+    # device memory, structure-checked before nvCOMP decodes them.
+    "decode-zstd",
+    # read_cells(fragments=True): each cell's vertex fragment index as
+    # flat arrays (FragmentColumn), in the same prefetch.
+    "read-cells-fragments",
+    # ChunkFragmentIndex.gather(frags) -> (rows, lengths): many fragments'
+    # vertex rows in one vectorised pass.
+    "fragment-gather",
+    # The shared reader and writer pools are dropped in a forked child,
+    # which builds fresh ones on first use: a child of a process that had
+    # used them no longer hangs on its first pooled read or write.
+    "fork-safe-pools",
+    # LevelMetadata.chunk_sources: a composite level whose leading "source"
+    # chunk axis names other stores; their cells are read through
+    # Group.read_bytes (vertices transformed), never written; a rebuilt
+    # source is refused by its fingerprint (zarr_vectors.core.sources).
+    "chunk-sources",
+    # building.set_presence / end_presence_deferral: presence recorded
+    # from the cells a caller says it wrote, and a deferral ended without
+    # a store-wide rebuild; finalize_links leaves a deferred level alone.
+    "supplied-presence",
+    # set_presence(verify="objects"|"index", on_mismatch=) and
+    # building.stored_objects: supplied presence checked against the
+    # store's listing and shard indexes, on any store that lists; a
+    # sharded array's presence derived from its shard indexes.
+    "verified-presence",
+    # building.commit_object_index: the object index's metadata committed
+    # after manifest writes, num_present counted rather than carried.
+    "commit-object-index",
+    # batched_writes / open_write_session(durable=True): local writes
+    # fsynced before the block returns; building.cell_objects names the
+    # object (or shard) holding each cell.
+    "durable-writes",
+    # building.store_layout: a store's layout resolved from what it holds,
+    # with min_reader, the oldest zarr-vectors that reads all of it.
+    "store-layout",
+    # building.shard_object_layer / shard_store(object_shard_rows=): the
+    # object layer sharded along rows, by zarr's own codec (no format key);
+    # writers keep a sharded layer sharded.
+    "object-layer-shards",
+    # zarr_vectors.concurrency_contract(), building.reserve_object_rows and
+    # mode="place" on the object-layer writers: disjoint row ranges filled
+    # by several processes at once.
+    "concurrency-contract",
+    # building.shard_transaction / shard_of: one shard of every per-chunk
+    # array staged privately and published by rename on exit.
+    "shard-transaction",
+    # shard_transaction(io_threads=N): objects encoded, written and fsynced
+    # on N lanes, renamed once all are on disk; the publish reopens no
+    # array by path, and stores open without v2 metadata probes.
+    "shard-transaction-io-threads",
+    # shard_transaction(sweep=False): no listing of the owned shards'
+    # directories for a failed attempt's partials on entry.
+    "transaction-sweep",
+    # No ceiling on an object index's rows: OBJECT_INDEX_MAX_ROWS bounds
+    # only the empty rows write_object_index(total_objects=) declares, so
+    # patch_object_manifests and the writers take indexes past 2**26.
+    "object-count-unbounded",
+    # Group.cached_nodes keeps direct-read specs apart from presence, so
+    # batched_reads inside it on a deferred level reads its plan's cells
+    # and derives no presence (no whole-shard reads).
+    "spec-without-presence",
+    # read_object_manifests_csr on a dense index reads ascending ids'
+    # blocks as slices, with no unique or searchsorted.
+    "manifests-csr-ascending",
+    # A new object index's integer arrays (manifest_spans, manifest_blocks,
+    # object_ids) are created at zstd level 9, a write session's lower zstd
+    # level raised to it; an index that exists keeps its codecs.
+    "manifest-codec",
+    # A new dense index chunks manifest_blocks at 65,536 rows (spans and
+    # ids keep 16,384); concurrency_contract's block_alignment is the
+    # index's own chunk, 16,384 on an index created before.
+    "manifest-blocks-64k",
+    # create_store(manifest_block_dtype="int32") and block_dtype= on
+    # write_object_manifests / write_object_index / reserve_object_rows /
+    # object_manifest_writer: a dense index's manifest_blocks as int32,
+    # kept for its life, every write into it range-checked (ArrayError,
+    # never a wrapped value); readers return int64 either way.
+    "manifest-block-dtype",
 })
 
 
