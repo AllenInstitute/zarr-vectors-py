@@ -1,23 +1,9 @@
-"""The ``zarr_vectors_octree_chunks`` codec: an octree level's per-chunk arrays carry it.
+"""The ``zarr_vectors_octree_chunks`` codec, carried by an octree level's per-chunk arrays.
 
-An octree-chunked level (:mod:`zarr_vectors.octree_chunks`) stores each
-leaf at its anchor cell, so its ``vertices`` array is a valid zarr array
-whose cells are *not* the uniform cells its grid suggests.  A reader that
-does not know octree chunks -- an older zarr-vectors, or anything else
-that reads zarr -- would take each leaf for one cell and return the
-wrong points and edges without an error.  Metadata cannot stop it: such
-a reader ignores level attributes and capabilities it does not know, and
-zarr-vectors before octree chunks never refuses a newer ``zv_version``.
-
-Zarr itself can.  A codec in an array's chain is something every zarr
-reader must understand to decode a single cell, and one it does not know
-fails the array at open (``UnknownCodecError`` in zarr-python).  So the
-conversion to octree chunks puts this codec in the cell codecs of every
-per-chunk array it writes, and the conversion back writes them without
-it.  It changes no bytes (encode and decode are the identity), so the
-cells are exactly what they would be without it; registering it is all
-a reader that understands octree chunks needs, and importing
-:mod:`zarr_vectors` does that.
+An identity bytes-to-bytes codec: a zarr reader that does not know octree
+chunks fails to open the arrays (``UnknownCodecError``) instead of reading
+leaves as uniform cells.  Importing :mod:`zarr_vectors` registers it.  See
+``docs/spec/chunking/octree_chunks.md`` (Compatibility).
 """
 
 from __future__ import annotations
@@ -74,6 +60,19 @@ def is_marker(codec: Any) -> bool:
     return isinstance(codec, OctreeChunksMarker)
 
 
+def cell_codecs(array: Any) -> list[Any]:
+    """The codec objects ``array``'s cells pass through (inside its sharding codec, if any)."""
+    codecs = list(array.metadata.codecs)
+    if codecs and "sharding" in str(codecs[0].to_dict().get("name", "")):
+        codecs = list(getattr(codecs[0], "codecs", ()))
+    return codecs
+
+
+def has_marker(array: Any) -> bool:
+    """Whether ``array``'s cell codecs hold the marker."""
+    return any(is_marker(c) for c in cell_codecs(array))
+
+
 register_codec(OCTREE_MARKER_CODEC, OctreeChunksMarker)
 
-__all__ = ["OCTREE_MARKER_CODEC", "OctreeChunksMarker", "is_marker"]
+__all__ = ["OCTREE_MARKER_CODEC", "OctreeChunksMarker", "cell_codecs", "has_marker", "is_marker"]

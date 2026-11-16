@@ -1,34 +1,11 @@
 """Convert a level between uniform chunks and octree chunks, both ways.
 
-Octree chunks are optional: every writer still writes uniform chunks, and
-a level becomes octree-chunked only by :func:`to_octree`, which plans
-leaves over the level's own cells (the uniform chunk is the finest leaf)
-and rewrites the per-chunk arrays leaf by leaf.  :func:`to_uniform` undoes
-it: every cell gets back its vertex rows in their order, its fragments,
-its objects' manifest entries (under their own object ids) and its links.
-
-A leaf's vertex block is its cells' blocks laid end to end (cells in Z
-order) and its fragments are theirs, so the conversion moves rows without
-regrouping them; ``octree_chunks/cells`` records which cell each run came
-from, which is what makes the way back exact.
-
-On a sharded level no leaf is larger than a shard or crosses a shard
-boundary (:func:`~zarr_vectors.octree_chunks.table.plan_leaves` with the
-level's shard grid) -- unless ``to_octree(fit_shards=False)`` opts out --
-and both conversions keep the level's packing: the rewritten arrays are
-sharded as the level's own ``vertices`` are.
-
-Both conversions are safe to interrupt.  Everything that can fail on the
-input -- unsupported content, links longer than a cell, manifests or
-links naming rows that are not there -- is checked while the level is
-only being read.  The new layout is then written into a staging group
-under the level (``<level>/octree_chunks_staging``), which readers never
-look at, and swapped in array by array.  The swap starts by marking the
-level ``converting``, so a reader refuses it rather than mixing the two
-layouts; running the same conversion (or the other one) again finishes
-an interrupted swap, and discards a staging group whose swap never
-started.  So a failure or kill at any point leaves the old level intact,
-or a level the next call completes.
+:func:`to_octree` regroups a level's uniform cells into octree leaves;
+:func:`to_uniform` restores the uniform chunks exactly.  Both check
+everything before writing, write into a staging group and swap it in, so
+a failure or kill leaves the old level or one the next call completes.
+See ``docs/spec/chunking/octree_chunks.md`` (Layout, Leaves and shards,
+Converting safely).
 """
 
 from __future__ import annotations
@@ -85,10 +62,15 @@ from zarr_vectors.core.store import (
     read_root_metadata,
 )
 from zarr_vectors.encoding.compression import codecs_for_create_array, resolve_compressor
-from zarr_vectors.encoding.octree_marker import OCTREE_MARKER_CODEC, is_marker
+from zarr_vectors.encoding.octree_marker import OCTREE_MARKER_CODEC, cell_codecs, is_marker
 from zarr_vectors.encoding.ragged import decode_ragged_blob, encode_ragged_blob
-from zarr_vectors.exceptions import ArrayError
-from zarr_vectors.octree_chunks.guard import LEVEL_KEY, LEVEL_META_KEY, converting
+from zarr_vectors.octree_chunks.guard import (
+    LEVEL_KEY,
+    LEVEL_META_KEY,
+    converting,
+    octree_meta,
+    unfinished,
+)
 from zarr_vectors.octree_chunks.table import (
     LeafTable,
     OctreeError,
@@ -104,24 +86,12 @@ LEAVES_TABLE = f"{TABLES}/leaves"    # (N, 5): depth, i, j, k, weight
 CELLS_TABLE = f"{TABLES}/cells"      # (C, 6): cell i, j, k, leaf, vertices, fragments
 STAGING = "octree_chunks_staging"    # group a conversion writes into before the swap
 _STAGING_KEY = "octree_chunks_staging"  # its record: direction, arrays, final metadata
-_LEVEL_META_KEY = LEVEL_META_KEY
 _PER_CHUNK = (VERTICES, VERTEX_FRAGMENTS, LINKS, LINK_FRAGMENTS, OBJECT_INDEX)
 _SWAPPED = (*_PER_CHUNK, TABLES)     # every array a conversion replaces or removes
 _REQUIRED = "required_capabilities"  # the root list a reader must implement all of
 
 
 # -- reading the level's octree state -----------------------------------------
-
-def octree_meta(level_group: Any) -> dict[str, Any] | None:
-    """The level's octree block, or ``None`` for a uniform level.
-
-    A level whose conversion is part way through its swap holds
-    ``{"converting": "to_octree" | "to_uniform"}`` here.
-    """
-    level = level_group.attrs.get(_LEVEL_META_KEY)
-    block = level.get(LEVEL_KEY) if isinstance(level, dict) else None
-    return dict(block) if isinstance(block, dict) else None
-
 
 def leaf_table(level_group: Any) -> LeafTable:
     """The level's :class:`LeafTable`; raises on a uniform level, and on
@@ -130,10 +100,7 @@ def leaf_table(level_group: Any) -> LeafTable:
     if meta is None:
         raise OctreeError("this level has uniform chunks, not octree chunks")
     if "converting" in meta:
-        raise OctreeError(
-            f"this level is part way through {meta['converting']} (interrupted?); "
-            f"run zarr_vectors.octree_chunks.{meta['converting']} on it again to finish"
-        )
+        raise OctreeError(f"this level is {unfinished(meta)}")
     cache = level_group.__dict__.setdefault("_octree_leaf_table", {})
     key = (meta.get("max_depth"), tuple(meta.get("origin_cell", ())), meta.get("leaves"))
     if key not in cache:
@@ -150,10 +117,8 @@ def cell_table(level_group: Any) -> npt.NDArray[np.int64]:
 
 def array_shard_grid(level_group: Any, name: str = VERTICES
                      ) -> tuple[tuple[int, ...] | None, tuple[int, ...]] | None:
-    """``(shard_shape, origin)`` of the level's per-chunk array ``name``, in
-    cells: its cells per shard (``None`` when unsharded) and the cell its
-    grid starts at, where the first shard starts.  ``None`` when the level
-    has no such array."""
+    """``(shard_shape, origin)`` in cells of the level's per-chunk array ``name``
+    (``shard_shape`` ``None`` when unsharded), or ``None`` when there is no such array."""
     import zarr
 
     try:
@@ -166,8 +131,7 @@ def array_shard_grid(level_group: Any, name: str = VERTICES
     codecs = tuple(getattr(meta, "codecs", ()))
     shard = None
     if codecs and type(codecs[0]).__name__ in ("ShardingCodec", "OctreeShardingCodec"):
-        # Zarr-vectors cells are the inner chunks, one per cell, so the
-        # outer (stored) chunk is the shard.
+        # Cells are the inner chunks, so the outer (stored) chunk is the shard.
         shard = tuple(int(c) for c in meta.chunk_grid.chunk_shape)
     raw = node.attrs.get("chunk_grid_origin")
     origin = tuple(int(o) for o in raw) if raw else (0,) * len(meta.shape)
@@ -176,11 +140,8 @@ def array_shard_grid(level_group: Any, name: str = VERTICES
 
 def _level_packing(root_meta: Any, level_group: Any, chunk_shape: tuple[float, ...]
                    ) -> tuple[tuple[int, ...] | None, tuple[int, ...]]:
-    """The shard grid a conversion writes the level in: the shard shape of
-    the level's ``vertices`` (the store's declaration when it has none) and
-    the grid origin the level's bounds give, where the rewritten arrays
-    start.  A conversion keeps the level's packing: a level sharded by
-    ``shard_store`` without a root declaration stays sharded."""
+    """``(shard_shape, origin)`` to rewrite the level with: its ``vertices``' shard
+    shape (else the root's declaration) and the grid origin of the level's bounds."""
     origin, _ = level_grid_layout(root_meta.bounds, chunk_shape)
     found = array_shard_grid(level_group)
     shard = found[0] if found is not None else normalise_shard_shape(root_meta.shard_shape, len(origin))
@@ -188,8 +149,7 @@ def _level_packing(root_meta: Any, level_group: Any, chunk_shape: tuple[float, .
 
 
 def _check_staged_packing(stage: Any, shard: tuple[int, ...] | None, origin: tuple[int, ...]) -> None:
-    """Refuse, before the swap, staged arrays not packed on the shard grid
-    the leaves were planned for (their leaves could straddle its shards)."""
+    """Refuse staged arrays not packed on the shard grid the leaves were planned for."""
     found = array_shard_grid(stage)
     if found is None:
         return
@@ -203,24 +163,17 @@ def _check_staged_packing(stage: Any, shard: tuple[int, ...] | None, origin: tup
 # -- helpers -------------------------------------------------------------------
 
 def _level_compressors(level_group: Any) -> list[dict[str, Any]] | None:
-    """The cell compressors of the level's ``vertices`` array, to keep on
-    rewrite (without the octree marker codec, which :func:`_marked` sets)."""
+    """The level's ``vertices`` cell compressors, without the marker (:func:`_marked` sets it)."""
     try:
-        codecs = level_group._zarr[VERTICES].metadata.to_dict()["codecs"]
+        codecs = [c.to_dict() for c in cell_codecs(level_group._zarr[VERTICES]) if not is_marker(c)]
     except Exception:
         return None
-    if codecs and "sharding" in str(codecs[0].get("name", "")):
-        codecs = codecs[0]["configuration"]["codecs"]
-    out = [c for c in codecs
-           if c.get("name") not in ("vlen-bytes", "bytes", "vlen-utf8") and not is_marker(c)]
+    out = [c for c in codecs if c.get("name") not in ("vlen-bytes", "bytes", "vlen-utf8")]
     return out or None
 
 
 def _marked(compressor: Any, octree: bool) -> list[dict[str, Any]] | None:
-    """``compressor`` as a codec list, ending in the octree marker codec
-    (:mod:`zarr_vectors.encoding.octree_marker`) when ``octree``, without it
-    otherwise.  The marker makes zarr readers that do not know octree
-    chunks refuse the level's arrays instead of reading leaves as cells."""
+    """``compressor`` as a codec list, ending in the octree marker codec only when ``octree``."""
     codecs = [c for c in codecs_for_create_array(resolve_compressor(compressor)) if not is_marker(c)]
     if octree:
         codecs.append({"name": OCTREE_MARKER_CODEC})
@@ -243,18 +196,22 @@ def _check_convertible(root: Any, level_group: Any, level: int) -> tuple[Any, tu
         fam = level_group.read_array_meta(f"{LINKS}/0") or {}
         if fam.get("directed") or fam.get("store", "canonical") != "canonical" or int(fam.get("link_width", 2)) != 2:
             raise OctreeError("octree chunks support undirected two-endpoint links stored once (canonical)")
-    try:
-        level_meta = read_level_metadata(root, level)
-    except Exception:
-        level_meta = None
+    level_meta = _level_meta(root, level)
     if level_meta is not None and level_meta.chunk_dims:
         raise OctreeError("an attribute-chunked level cannot be converted")
     return meta, tuple(get_level_chunk_shape(meta, level_meta))
 
 
+def _level_meta(root: Any, level: int) -> Any:
+    """The level's metadata, or ``None`` when it has none readable."""
+    try:
+        return read_level_metadata(root, level)
+    except Exception:
+        return None
+
+
 def _check_no_cross_level_links(root: Any, level: int) -> None:
-    """Refuse when any level holds links into or out of ``level``: they
-    address its vertices by cell and row, which a conversion changes."""
+    """Refuse when any level holds links into or out of ``level`` (they name its cells and rows)."""
     for m in list_resolution_levels(root):
         lg = get_resolution_level(root, m)
         if not lg.array_exists(LINKS):
@@ -275,22 +232,18 @@ def _check_no_cross_level_links(root: Any, level: int) -> None:
 
 
 def _set_level_block(level_group: Any, block: dict[str, Any] | None) -> None:
-    level = dict(level_group.attrs.get(_LEVEL_META_KEY) or {})
+    level = dict(level_group.attrs.get(LEVEL_META_KEY) or {})
     if block is None:
         level.pop(LEVEL_KEY, None)
     else:
         level[LEVEL_KEY] = block
-    level_group.attrs.update({_LEVEL_META_KEY: level})
+    level_group.attrs.update({LEVEL_META_KEY: level})
 
 
 def _set_capability(root: Any, on: bool) -> None:
-    """``octree_chunks`` in the root's ``format_capabilities`` and
-    ``required_capabilities`` while ``on``, out of both otherwise, in one
-    write of the root; other entries (``additive_levels``, say) stay as
-    they are, and a ``required_capabilities`` that is not a list is left
-    untouched.  ``required_capabilities`` is dropped when taking ours out
-    leaves it empty, so a store that had no list has none again after
-    its last octree level is converted back."""
+    """Put ``octree_chunks`` in (``on``) or out of both root capability lists, in
+    one write; a non-list ``required_capabilities`` is left alone, and one our
+    removal leaves empty is dropped."""
     block = dict(root.attrs.to_dict().get("zarr_vectors", {}))
     caps = [c for c in block.get("format_capabilities") or [] if c != CAP_OCTREE_CHUNKS]
     if on:
@@ -410,13 +363,9 @@ class _Objects:
 
 
 def _read_objects(level_group: Any) -> _Objects | None:
-    """The level's object index, or ``None`` when it has none.
-
-    Ids come from the index's id table, so sparse ids (``7, 1007, ...``)
-    survive the rewrite; rows must be in increasing id order, the order
-    :func:`write_object_index` writes, so object attribute rows stay
-    aligned with them.
-    """
+    """The level's object index, or ``None``.  Ids come from its id table (sparse
+    ids survive) and must increase, as :func:`write_object_index` writes them,
+    so object attribute rows stay aligned."""
     from zarr_vectors.core import dense_manifests as dense
 
     if not level_group.array_exists(OBJECT_INDEX):
@@ -576,22 +525,20 @@ def read_octree_link_cells(level_group: Any, table: LeafTable, leaves: npt.Array
 # -- staging and the swap ------------------------------------------------------------
 
 def _open_staging(level_group: Any) -> Any:
-    """A fresh staging group under the level, carrying the level's metadata
-    (without its octree block), so writers size and pack arrays as the
-    level's own."""
+    """A fresh staging group carrying the level's metadata minus its octree block."""
     level_group.delete_subtree(STAGING)
     stage = level_group.require_group(STAGING)
     attrs = dict(level_group.attrs.to_dict())
-    level = dict(attrs.get(_LEVEL_META_KEY) or {})
+    level = dict(attrs.get(LEVEL_META_KEY) or {})
     level.pop(LEVEL_KEY, None)
-    attrs[_LEVEL_META_KEY] = level
+    attrs[LEVEL_META_KEY] = level
     stage.attrs.update(attrs)
     return stage
 
 
 def _seal(stage: Any, direction: str, block: dict[str, Any] | None, summary: dict[str, Any]) -> None:
     """Record that ``stage`` is complete, with the level metadata it implies."""
-    level = dict(stage.attrs.get(_LEVEL_META_KEY) or {})
+    level = dict(stage.attrs.get(LEVEL_META_KEY) or {})
     level.pop(LEVEL_KEY, None)
     if block is not None:
         level[LEVEL_KEY] = block
@@ -610,14 +557,9 @@ def _summary(rec: dict[str, Any]) -> dict[str, Any]:
 
 
 def _move(level_group: Any, stage: Any, name: str) -> None:
-    """Put ``<level>/<STAGING>/<name>`` where ``<level>/<name>`` was.
-
-    Idempotent across a kill: the staged node stays until it is in
-    place (a rename on a local store; elsewhere a copy, then ``name``
-    stamped ``moved`` in the staging record, then a delete -- a delete
-    cut short leaves a partial staged node that :func:`_swap` must not
-    copy again).
-    """
+    """Put ``<level>/<STAGING>/<name>`` where ``<level>/<name>`` was; idempotent across
+    a kill (a rename locally; elsewhere copy, record ``moved``, then delete, so a
+    partial staged node left by a cut-short delete is never copied again)."""
     from zarr.core.buffer import default_buffer_prototype
     from zarr.core.sync import sync
     from zarr.storage import LocalStore
@@ -647,12 +589,8 @@ def _move(level_group: Any, stage: Any, name: str) -> None:
 
 
 def _swap(root: Any, level_group: Any, stage: Any) -> dict[str, Any]:
-    """Replace the level's arrays with the staged ones.
-
-    Marking the level ``converting`` is the commit point: from there on
-    readers refuse the level and :func:`_resume` finishes the swap
-    instead of discarding the staging group.
-    """
+    """Replace the level's arrays with the staged ones.  Marking the level
+    ``converting`` is the commit point: after it :func:`_resume` finishes the swap."""
     rec = dict(stage.attrs.get(_STAGING_KEY))
     with converting(level_group, stage, root):
         _set_level_block(level_group, {"converting": rec["direction"]})
@@ -663,7 +601,7 @@ def _swap(root: Any, level_group: Any, stage: Any) -> dict[str, Any]:
                     _move(level_group, stage, name)
             else:
                 level_group.delete_subtree(name)
-        level_group.attrs.update({_LEVEL_META_KEY: rec["level"]})
+        level_group.attrs.update({LEVEL_META_KEY: rec["level"]})
         level_group.delete_subtree(STAGING)
         level_group.__dict__.pop("_octree_leaf_table", None)
         _set_capability(root, _any_octree_level(root))
@@ -671,13 +609,8 @@ def _swap(root: Any, level_group: Any, stage: Any) -> dict[str, Any]:
 
 
 def _resume(root: Any, level_group: Any) -> dict[str, Any] | None:
-    """Deal with what an interrupted conversion left; returns its record
-    when it finished one, else ``None``.
-
-    A staging group whose swap never started is discarded (the level is
-    as it was, and may have changed since the staging copy was made); a
-    swap that started is finished.
-    """
+    """Finish a swap an interrupted conversion started (returning its record), or
+    discard a staging group whose swap never started (returning ``None``)."""
     block = octree_meta(level_group)
     marked = block is not None and "converting" in block
     if STAGING not in level_group:
@@ -710,39 +643,19 @@ def to_octree(store: Any, *, target: float, level: int = 0, balanced: bool = Tru
               compressor: Any = "inherit", backend: str | None = None) -> dict[str, Any]:
     """Rewrite a uniform level with octree chunks of at most ``target`` vertices.
 
-    The uniform chunk is the finest leaf: no leaf is smaller, and a cell
-    heavier than ``target`` stays one leaf.  Links must not be longer than
-    a cell (they never are between adjacent cells' leaves), and no level
-    may hold links into or out of this one.  Object ids are kept.  An
-    empty level becomes an octree level with no leaves.
+    A cell heavier than ``target`` stays one leaf.  On a sharded level every
+    leaf lies inside one shard unless ``fit_shards=False``; ``max_leaf_cells``
+    (a power of two) caps the leaf side.  Links must join adjacent cells, and
+    no level may link into or out of this one.  Object ids and packing are
+    kept.  See ``docs/spec/chunking/octree_chunks.md``.
 
-    On a sharded level every leaf lies inside one shard: the root cube
-    starts on a shard boundary and no leaf is wider than the largest power
-    of two dividing every shard side (so a shard of ``(6, 6, 6)`` cells
-    takes leaves of up to 2).  ``max_leaf_cells`` (a power of two) caps
-    the leaf side further, or on an unsharded level at all; it may not
-    exceed the shard's cap.  The cap and the shard grid are recorded in
-    the level's octree block (``max_leaf_cells``, ``shard_shape``,
-    ``shard_origin``).  The level keeps its packing (the shard shape of
-    its ``vertices``).
+    Nothing changes when the level cannot be converted.  An interrupted
+    conversion of this level is finished first (returning its summary with
+    ``"resumed": True`` if it was a ``to_octree``).
 
-    ``fit_shards=False`` opts out on a sharded level: the plan is the one
-    an unsharded level gets (no shard-boundary origin, no shard cap,
-    ``max_leaf_cells`` any power of two or ``None``), so a leaf may
-    straddle shards -- fewer, larger leaves where space is sparse, but a
-    leaf's cells no longer share one shard.  The block then records
-    ``"fit_shards": false`` with ``shard_shape`` and ``shard_origin``
-    ``null`` (no grid was fitted), and ``validate`` does not report the
-    straddling leaves.  On an unsharded level it changes nothing but the
-    record.
-
-    Nothing is changed when the level cannot be converted.  When a
-    previous conversion of this level was interrupted during its swap,
-    this finishes it first (returning that conversion's summary, with
-    ``"resumed": True``, if it was a ``to_octree``).
-
-    Returns a summary: leaf count, the largest leaf, the depths used, the
-    leaf side cap (``max_leaf_cells``, ``None`` when uncapped).
+    Returns:
+        Leaf and cell counts, links, the largest leaf and cell, the depths
+        used, and ``max_leaf_cells`` (``None`` when uncapped).
     """
     root = open_store(store, mode="r+", backend=backend)
     level_group = get_resolution_level(root, level)
@@ -860,9 +773,9 @@ def to_uniform(store: Any, *, level: int = 0, compressor: Any = "inherit",
                backend: str | None = None) -> dict[str, Any]:
     """Rewrite an octree-chunked level with its original uniform chunks.
 
-    Refused while any level holds links into or out of this one.  As for
-    :func:`to_octree`, nothing is changed when it fails, and a conversion
-    of this level interrupted during its swap is finished first.
+    Refused while any level links into or out of this one.  As for
+    :func:`to_octree`, nothing changes on failure and an interrupted
+    conversion is finished first.
     """
     root = open_store(store, mode="r+", backend=backend)
     level_group = get_resolution_level(root, level)
@@ -873,11 +786,7 @@ def to_uniform(store: Any, *, level: int = 0, compressor: Any = "inherit",
     _check_no_cross_level_links(root, level)
     cells_t = cell_table(level_group)
     meta = read_root_metadata(root)
-    try:
-        level_meta = read_level_metadata(root, level)
-    except Exception:
-        level_meta = None
-    chunk_shape = tuple(get_level_chunk_shape(meta, level_meta))
+    chunk_shape = tuple(get_level_chunk_shape(meta, _level_meta(root, level)))
     shard, _ = _level_packing(meta, level_group, chunk_shape)
     dtype = _vertex_dtype(level_group)
     comp = _marked(_level_compressors(level_group) if compressor == "inherit" else compressor, False)
@@ -963,6 +872,6 @@ def to_uniform(store: Any, *, level: int = 0, compressor: Any = "inherit",
 
 
 __all__ = [
-    "ArrayError", "array_shard_grid", "cell_table", "leaf_table", "octree_meta", "read_octree_link_cells",
+    "array_shard_grid", "cell_table", "leaf_table", "octree_meta", "read_octree_link_cells",
     "refresh_capabilities", "to_octree", "to_uniform",
 ]

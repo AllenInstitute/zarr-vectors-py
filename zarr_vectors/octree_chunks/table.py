@@ -1,42 +1,14 @@
 """Octree leaves over a level's chunk grid: planning, addressing, link naming.
 
-A level with octree chunks keeps the uniform chunk grid as its finest
-grid -- the store's ``chunk_shape`` is the finest leaf -- and groups its
-cells into **leaves**: aligned cubes of ``2**(D - d)`` cells per side, ``d``
-the leaf's depth below a root cube of ``2**D`` cells.  Each leaf is one
-chunk: it holds its vertices, fragments and links, and is stored at its
-**anchor**, its minimum-corner cell, so every zarr array stays a plain
-array over the finest grid.
-
-Addresses.  A leaf is ``depth/i.j.k``: its position on the grid of its own
-depth.  The path form names one octant per depth from the root, e.g.
-``111/001/010`` is ``3/4.5.6``.  A cell of the uniform grid is a leaf at
-depth ``D``.
-
-Links between leaves.  A record is filed under its finer endpoint (same
-depth: the one with the smaller anchor).  The other endpoint, ``Δ`` depths
-coarser, is named by the offset of its leaf from the source's ancestor at
-its own depth -- always one grid step, in ``{-1, 0, 1}**3`` -- plus ``Δ``::
-
-    +1.0.0      same depth, one leaf along +x
-    +1.0.0^1    one depth coarser, the leaf along +x of the source's parent
-
-so the other endpoint is ``(d - Δ, (ijk >> Δ) + o)``.  A 2:1-balanced plan
-(adjacent leaves differ by at most one depth) needs at most 26 + 26
-offset arrays besides the intra-leaf one.
-
-Leaves and shards.  On a sharded level no leaf is larger than a shard or
-crosses a shard boundary, so each leaf's data lives in one shard and a
-shard can be written, rewritten or read on its own.  The plan's root
-cube starts on a shard boundary and no leaf is wider than
-:func:`shard_leaf_cap` -- the largest power of two dividing every shard
-side -- so leaves tile shards exactly.  ``fit_shards=False`` opts out:
-the plan is then the unsharded one, and leaves may straddle shards.
+A leaf is an aligned cube of ``2**(D - d)`` cells per side, addressed
+``depth/i.j.k`` (or by octant path, ``111/001/010``) and stored at its
+anchor cell.  See ``docs/spec/chunking/octree_chunks.md`` (Terms, Leaves
+and shards, Links).
 """
 
 from __future__ import annotations
 
-from collections.abc import Iterable, Sequence
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -84,13 +56,8 @@ def _is_power_of_two(n: int) -> bool:
 
 
 def shard_leaf_cap(shard_shape: Sequence[int]) -> int:
-    """Widest leaf (cells per side) that tiles shards of ``shard_shape``.
-
-    The largest power of two dividing every shard side: ``(4, 4, 4)`` gives
-    4, ``(4, 2, 8)`` gives 2, and ``(6, 6, 6)`` gives 2, as a leaf of 4 cells
-    would cross the boundary at 6.  With the root cube on a shard boundary,
-    every leaf of this side or less lies in one shard.
-    """
+    """Widest leaf (cells per side) that tiles shards of ``shard_shape``: the
+    largest power of two dividing every side (``(6, 6, 6)`` gives 2)."""
     sides = [int(s) for s in shard_shape]
     if not sides or min(sides) < 1:
         raise OctreeError(f"bad shard shape {tuple(sides)}")
@@ -98,12 +65,9 @@ def shard_leaf_cap(shard_shape: Sequence[int]) -> int:
 
 
 def leaf_cap(max_leaf_cells: int | None, shard_shape: Sequence[int] | None) -> int | None:
-    """The leaf side cap a plan uses: ``max_leaf_cells``, or on a sharded level
-    the shard's (:func:`shard_leaf_cap`) when that is not given or smaller.
-
-    Raises when ``max_leaf_cells`` is not a power of two, or is wider than a
-    sharded level allows (a leaf must never be larger than a shard).
-    """
+    """The leaf side cap a plan uses: ``max_leaf_cells``, else on a sharded level
+    :func:`shard_leaf_cap`.  Raises when ``max_leaf_cells`` is not a power of
+    two or wider than the shard's cap."""
     if max_leaf_cells is not None and not _is_power_of_two(int(max_leaf_cells)):
         raise OctreeError(f"max_leaf_cells must be a power of two, got {max_leaf_cells}")
     if shard_shape is None:
@@ -130,36 +94,19 @@ def plan_leaves(
     shard_origin: Sequence[int] | None = None,
     fit_shards: bool = True,
 ) -> LeafTable:
-    """Split the root cube until every leaf weighs at most ``target``.
+    """The non-empty leaves of the root cube split until each weighs at most ``target``.
 
     Args:
         cells: ``(N, 3)`` cell coordinates on the uniform grid.
-        weights: ``(N,)`` weight of each cell (e.g. its vertex count).
-        target: Largest leaf weight wanted.  A single cell heavier than it
-            cannot be split and stays one leaf.
-        origin_cell: Grid position of the root cube's minimum corner;
-            defaults to the cells' minimum, or ``0`` where that is
-            non-negative -- moved down to a shard boundary when the plan
-            is fitted to ``shard_shape``.
-        max_depth: ``D``; defaults to the smallest root cube covering the
-            cells.
-        balanced: Split further until adjacent leaves (faces, edges and
-            corners) differ by at most one depth.
-        max_leaf_cells: Widest leaf allowed, in cells per side (a power of
-            two).  ``None``: the shard's cap when the plan is fitted to
-            ``shard_shape`` (:func:`shard_leaf_cap`), no cap otherwise.
-        shard_shape: Cells per shard per axis when the level is sharded:
-            the plan then keeps every leaf inside one shard.
-        shard_origin: The cell a shard starts at (the arrays' grid
-            origin); defaults to ``0``.
-        fit_shards: ``False`` ignores ``shard_shape`` and ``shard_origin``:
-            no shard-boundary origin, no shard cap, ``max_leaf_cells`` any
-            power of two -- the plan is the unsharded one, and leaves may
-            straddle shards.  Recorded in the table (and the level's
-            octree block) so ``validate`` does not report them.
-
-    Returns:
-        The non-empty leaves.
+        weights: ``(N,)`` weight of each cell; a cell heavier than ``target`` stays one leaf.
+        origin_cell: The root cube's minimum corner; defaults to the cells'
+            minimum (or ``0`` if non-negative), moved down to a shard boundary.
+        max_depth: ``D``; defaults to the smallest root cube covering the cells.
+        balanced: Split until adjacent leaves differ by at most one depth.
+        max_leaf_cells: Leaf side cap (a power of two); see :func:`leaf_cap`.
+        shard_shape, shard_origin: The shard grid (origin default ``0``); every
+            leaf is kept inside one shard.
+        fit_shards: ``False`` ignores the shard grid (leaves may straddle shards).
     """
     cells = np.asarray(cells, dtype=np.int64).reshape(-1, 3)
     weights = np.asarray(weights, dtype=np.float64).reshape(-1)
@@ -497,11 +444,3 @@ def parse_link_segment(segment: str) -> tuple[tuple[int, int, int], int]:
     if len(parts) != 3:
         raise OctreeError(f"bad octree link segment {segment!r}")
     return tuple(parse_delta(p) for p in parts), int(d) if d else 0  # type: ignore[return-value]
-
-
-def iter_segments(table: LeafTable) -> Iterable[str]:  # pragma: no cover - documentation helper
-    """Every segment a plan can produce (26 per depth change, plus intra)."""
-    yield format_link_segment((0, 0, 0), 0)
-    for delta in (0, 1) if table.balanced else range(table.max_depth + 1):
-        for o in _DIRECTIONS.tolist():
-            yield format_link_segment(o, delta)

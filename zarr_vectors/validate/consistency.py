@@ -372,34 +372,17 @@ def validate_consistency(store_path: str | Path | Group) -> ValidationResult:
 
 
 def _validate_octree_level(lg: Any, ndim: int, prefix: str, result: ValidationResult) -> None:
-    """Level 3 checks for a level with octree chunks (:mod:`zarr_vectors.octree_chunks`).
-
-    Each leaf is one chunk at its anchor cell, so the uniform checks do
-    not apply.  These do: the leaf and cell tables read; every leaf, and
-    nothing else, has a vertex chunk at its anchor, holding the vertices
-    and fragments both tables say; the level's ``vertex_count``; object
-    manifests naming ``(anchor, fragment)`` of a leaf; every link joining
-    stored leaves at rows they hold, as many as its family records; no
-    links to other levels; the marker codec that makes readers without
-    octree chunks refuse the level; and, on a sharded level, every leaf
-    inside one shard (:func:`_check_octree_shards`).
-    """
+    """Level 3 checks for a level with octree chunks, in place of the uniform ones
+    (see ``docs/spec/chunking/octree_chunks.md``, Compatibility)."""
     from zarr_vectors.constants import VERTEX_FRAGMENTS, VERTICES
     from zarr_vectors.core.arrays import list_link_deltas
-    from zarr_vectors.encoding.octree_marker import OCTREE_MARKER_CODEC, is_marker
-    from zarr_vectors.octree_chunks.convert import (
-        cell_table,
-        leaf_table,
-        octree_meta,
-        read_octree_link_cells,
-    )
+    from zarr_vectors.encoding.octree_marker import OCTREE_MARKER_CODEC, has_marker
+    from zarr_vectors.octree_chunks.convert import cell_table, leaf_table, read_octree_link_cells
+    from zarr_vectors.octree_chunks.guard import octree_meta, unfinished
 
     block = octree_meta(lg) or {}
     if "converting" in block:
-        result.add_error(
-            f"{prefix}: part way through {block['converting']} (interrupted?); run "
-            f"zarr_vectors.octree_chunks.{block['converting']} on it again to finish"
-        )
+        result.add_error(f"{prefix}: {unfinished(block)}")
         return
     try:
         table = leaf_table(lg)
@@ -497,10 +480,7 @@ def _validate_octree_level(lg: Any, ndim: int, prefix: str, result: ValidationRe
                              f"{family['num_physical_records']} != {n_links} stored")
 
     try:
-        codecs = lg.zarr_group[VERTICES].metadata.codecs if stored else []
-        if codecs and type(codecs[0]).__name__ in ("ShardingCodec", "OctreeShardingCodec"):
-            codecs = codecs[0].codecs
-        if stored and not any(is_marker(c) for c in codecs):
+        if stored and not has_marker(lg.zarr_group[VERTICES]):
             result.add_warning(
                 f"{prefix}: octree chunks, but vertices lacks the {OCTREE_MARKER_CODEC} "
                 f"codec: a reader without octree chunks would read its leaves as cells"
@@ -513,20 +493,9 @@ def _validate_octree_level(lg: Any, ndim: int, prefix: str, result: ValidationRe
 
 
 def _check_octree_shards(lg: Any, table: Any, prefix: str, result: ValidationResult) -> None:
-    """No leaf wider than the level's recorded cap, nor -- the level being
-    sharded -- outside one shard of its arrays' current shard grid.
-
-    ``to_octree`` fits the leaves to the shards, but the shard repackers
-    (``shard_store``, ``reshard``) move cells unchanged and may be given
-    a shard shape that splits leaves.  On a level converted with a cap
-    (its octree block's ``max_leaf_cells``) that is an error; on one
-    converted without (unsharded then, or by a ``to_octree`` before the
-    cap) a warning.  Either way ``to_uniform`` then ``to_octree`` fits
-    the leaves to the shards again.  A level converted with
-    ``fit_shards=False`` asked for leaves that may straddle shards, so
-    they are not reported at all (its ``max_leaf_cells``, if any, still
-    is).
-    """
+    """No leaf wider than the level's ``max_leaf_cells``, nor outside one shard of
+    its arrays' current shard grid (a resharding may split leaves): an error
+    with a recorded cap, a warning without, unreported with ``fit_shards=False``."""
     from zarr_vectors.octree_chunks.convert import array_shard_grid
 
     if not len(table):

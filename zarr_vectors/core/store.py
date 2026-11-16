@@ -740,14 +740,7 @@ def _write_root_attrs(
             int(shard_shape) if isinstance(shard_shape, int)
             else [int(x) for x in shard_shape]
         )
-    if octree_sharding is not None:
-        # Absent means sharding_indexed, so only an octree store carries
-        # the key and its capability.
-        if shard_shape is None and zv.get("shard_shape") is None:
-            raise MetadataError(
-                "octree_sharding needs shard_shape: the octree groups the "
-                "cells of a shard, so the store must be sharded"
-            )
+    if octree_sharding is not None:  # create_store has checked shard_shape
         zv["octree_sharding"] = dict(octree_sharding)
         caps = list(zv.get("format_capabilities") or [])
         if CAP_OCTREE_SHARDING not in caps:
@@ -1690,9 +1683,7 @@ def update_level_metadata(
     import dataclasses
 
     if "octree_chunks" in fields:
-        # Only the conversions set or clear it (and with the arrays it
-        # describes); anyone else would leave leaves read as cells, or
-        # cells read as leaves.
+        # Only the conversions may change it, together with the arrays.
         from zarr_vectors.octree_chunks.guard import is_converting
 
         if not is_converting(level_group):

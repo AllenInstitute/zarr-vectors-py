@@ -86,9 +86,7 @@ def cell_source(name: str, node: Any, *, any_codecs: bool = False) -> CellSource
         return None
     if not codecs or type(codecs[0]).__name__ != "VLenBytesCodec":
         return None
-    # The octree marker (zarr_vectors.encoding.octree_marker) is the
-    # identity on bytes: it only makes readers without octree chunks
-    # refuse the array, so the stored bytes are as if it were not there.
+    # The octree marker codec is the identity on bytes: skip it.
     byte_codecs = [c for c in codecs[1:] if type(c).__name__ != "OctreeChunksMarker"]
     rest = [type(c).__name__ for c in byte_codecs]
     if any_codecs:
@@ -396,10 +394,8 @@ _AUTO_GAP, _AUTO_SPAN = 64 << 10, 1 << 20
 
 
 def _spans(rows: list[tuple[int, Any, int, int, int, tuple[str, int, int]]]) -> list[tuple[int, int, list[int]]]:
-    """``rows`` -- (row id, object, offset, size, run, coalescing), sorted by
-    object then offset -- grouped into ``(start, stop, row ids)`` reads, each
-    within one object.  ``coalescing`` is the :func:`_coalescing` of the
-    row's array, and so the same for every row of an object."""
+    """Group ``rows`` -- (row id, object, offset, size, run, :func:`_coalescing`),
+    sorted by object then offset -- into ``(start, stop, row ids)`` reads."""
     out: list[tuple[int, int, list[int]]] = []
     prev_obj, prev_run = None, -1
     for row, obj, off, size, run, (mode, gap, span) in rows:

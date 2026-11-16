@@ -226,20 +226,8 @@ def validate_metadata(store_path: str | Path | Group) -> ValidationResult:
 
 def _check_octree_capabilities(root: Group, meta: Any, levels: list[int],
                                result: ValidationResult) -> None:
-    """The root lists ``octree_chunks`` in ``format_capabilities`` and in
-    ``required_capabilities`` exactly while a level has an octree block
-    (octree chunks, or a conversion not finished).
-
-    Warnings, not errors, either way, and the same for both lists.  A
-    missing entry misleads no reader: every per-chunk array of an octree
-    level carries the marker codec, which stops a reader without octree
-    chunks on its own; ``required_capabilities`` only gives a viewer that
-    checks it a clearer refusal (stores converted before it was written
-    lack it).  A stale entry -- the root updated after the level, by a
-    ``to_uniform`` killed in between -- makes such a viewer refuse a store
-    it could read.  ``zarr_vectors.octree_chunks.refresh_capabilities``
-    fixes both.
-    """
+    """Warn unless both root capability lists hold ``octree_chunks`` exactly while
+    a level has an octree block (see ``docs/spec/chunking/octree_chunks.md``)."""
     from zarr_vectors.constants import CAP_OCTREE_CHUNKS
     from zarr_vectors.octree_chunks.guard import is_octree_level
 

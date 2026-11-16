@@ -137,8 +137,7 @@ class ZVWriter:
         )
         self._level = level
         self._group = level._group
-        # Every mutation below addresses uniform cells; an octree level
-        # (zarr_vectors.octree_chunks) has none, so it is refused here.
+        # Every mutation below addresses uniform cells, which an octree level lacks.
         from zarr_vectors.octree_chunks.guard import refuse_octree_write
 
         refuse_octree_write(self._group, "ZVWriter")

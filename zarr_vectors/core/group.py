@@ -85,17 +85,9 @@ _MISS_ROW = "row"
 
 
 def _shard_codec(ndim: int, compressors: list[Any], octree: dict[str, Any] | None) -> Any:
-    """The sharding codec for a store marked octree, or None for the default.
-
-    ``octree`` is the store's marker (root ``zarr_vectors.octree_sharding``,
-    see :data:`zarr_vectors.constants.CAP_OCTREE_SHARDING`): zarr-octree's
-    ``zarr_octree_sharding`` codec with that configuration (a sparse index,
-    and cells grouped into the leaves of an octree aimed at a target size,
-    100,000 by default).  It needs the zarr-octree package, to write and to
-    read; ``None`` (every unmarked store) keeps ``sharding_indexed`` and
-    zarr-octree is never imported.  The cells' codecs are the ones
-    ``shards=`` would put inside ``sharding_indexed``.
-    """
+    """zarr-octree's ``zarr_octree_sharding`` codec configured by the store's
+    ``octree`` marker (:data:`zarr_vectors.constants.CAP_OCTREE_SHARDING`), or
+    None for ``sharding_indexed`` (zarr-octree is then never imported)."""
     if octree is None:
         return None
     from zarr.codecs import VLenBytesCodec
@@ -103,6 +95,15 @@ def _shard_codec(ndim: int, compressors: list[Any], octree: dict[str, Any] | Non
     return _octree_codec_class()(
         chunk_shape=(1,) * ndim, codecs=[VLenBytesCodec(), *compressors], **dict(octree),
     )
+
+
+def _shard(kwargs: dict[str, Any], ndim: int, shard_shape: Sequence[int], octree: Any) -> None:
+    """Shard ``create_array`` ``kwargs``: ``shards=``, or :func:`_shard_codec`'s codec."""
+    shard_codec = _shard_codec(ndim, kwargs["compressors"], octree)
+    if shard_codec is None:
+        kwargs["shards"] = tuple(shard_shape)
+    else:  # same array, same inner cells and keys; another sharding codec
+        kwargs.update(chunks=tuple(shard_shape), serializer=shard_codec, compressors=None)
 
 
 def _octree_codec_class() -> Any:
@@ -119,15 +120,8 @@ def _octree_codec_class() -> Any:
 
 
 def check_octree_sharding(octree: Any, ndim: int) -> dict[str, Any]:
-    """An octree marker, checked before anything is written; returned as a dict.
-
-    ``octree`` is the ``zarr_octree_sharding`` codec's configuration, as
-    stamped on the root (``{}`` for its defaults).  The codec is built
-    from it once, so a key it does not take, a value it refuses, or a
-    missing zarr-octree fails at the call that asked for the marker --
-    ``create_store`` (so ``zv.create``), ``set_octree`` -- rather than in
-    whichever writer first allocates a sharded array, after the store
-    exists.
+    """An octree marker (the ``zarr_octree_sharding`` configuration, ``{}`` for its
+    defaults), checked by building the codec once before anything is written.
 
     Raises:
         ValueError: zarr-octree is not installed (the message says where
@@ -2062,11 +2056,9 @@ class Group:
             attributes: Per-array metadata merged into the array's
                 ``zarr.json`` ``attributes`` block (the standard Zarr
                 v3 location for user metadata).
-            octree: The sharding codec, for a caller converting between
-                them (:func:`zarr_vectors.sharding.set_octree`): the
-                ``zarr_octree_sharding`` configuration, or ``None`` for
-                ``sharding_indexed``.  Omitted, the store's marker decides
-                (:meth:`_store_octree`), as for every writer.
+            octree: The ``zarr_octree_sharding`` configuration, or ``None`` for
+                ``sharding_indexed`` (for :func:`zarr_vectors.sharding.set_octree`);
+                omitted, the store's marker decides (:meth:`_store_octree`).
         """
         ndim = len(grid_shape)
         if shard_shape is not None and len(shard_shape) != ndim:
@@ -2097,19 +2089,10 @@ class Group:
             "compressors": list(compressors) if compressors else [],
         }
         if shard_shape is not None:
-            shard_codec = _shard_codec(
-                ndim, create_kwargs["compressors"],
-                self._store_octree() if octree is _ABSENT else octree,
-            )
-            if shard_codec is None:
-                # Zarr 3.2 high-level ``shards=`` kwarg: wraps the inner
-                # ``chunks=`` codec in ``sharding_indexed`` automatically.
-                create_kwargs["shards"] = tuple(shard_shape)
-            else:
-                # Same array, same inner cells and keys; another sharding codec.
-                create_kwargs.update(
-                    chunks=tuple(shard_shape), serializer=shard_codec, compressors=None,
-                )
+            # Zarr 3.2 high-level ``shards=`` kwarg: wraps the inner
+            # ``chunks=`` codec in ``sharding_indexed`` automatically.
+            octree = self._store_octree() if octree is _ABSENT else octree
+            _shard(create_kwargs, ndim, shard_shape, octree)
 
         # Every attribute is passed to ``create_array`` rather than
         # assigned afterwards: each ``arr.attrs[...] = ...`` rewrites the
@@ -2138,16 +2121,9 @@ class Group:
             self._node_cache[self._full_path(array_name)] = arr
 
     def _store_octree(self) -> dict[str, Any] | None:
-        """The store's octree marker (root ``zarr_vectors.octree_sharding``),
-        or None; read once per group, as the store's ``shard_shape`` is.
-
-        Only a genuinely absent marker is None: no root group (a bare
-        group, which no store root declares anything for) or a root that
-        does not carry the key.  Any other failure to read the root -- a
-        throttled or failed request -- raises and is not cached; answering
-        None there would allocate ``sharding_indexed`` arrays in a store
-        marked octree, for the rest of this handle's life.
-        """
+        """The store's octree marker (root ``zarr_vectors.octree_sharding``) or None
+        (bare group, or no key), cached per group.  Other read failures raise
+        uncached, so a failed request never allocates ``sharding_indexed`` arrays."""
         from zarr.errors import GroupNotFoundError
 
         if "_octree_sharding" in self.__dict__:
@@ -2217,11 +2193,7 @@ class Group:
             "compressors": list(compressors) if compressors else [],
         }
         if shard_shape is not None:
-            shard_codec = _shard_codec(ndim, base_kwargs["compressors"], self._store_octree())
-            if shard_codec is None:
-                base_kwargs["shards"] = tuple(shard_shape)
-            else:  # as in create_sharded_chunk_array
-                base_kwargs.update(chunks=tuple(shard_shape), serializer=shard_codec, compressors=None)
+            _shard(base_kwargs, ndim, shard_shape, self._store_octree())
         base_attrs: dict[str, Any] = self._initial_presence_attrs()
         if origin is not None and any(int(o) != 0 for o in origin):
             base_attrs[_CHUNK_GRID_ORIGIN_ATTR] = [int(o) for o in origin]
@@ -2385,22 +2357,10 @@ class Group:
         self._drop_level_claim("link_fragments_aligned")
 
     def _refuse_octree_write(self, verb: str, name: str) -> None:
-        """Refuse a write to a level with octree chunks.
+        """Refuse a write to an octree level (:mod:`zarr_vectors.octree_chunks.guard`)."""
+        from zarr_vectors.octree_chunks.guard import is_octree_level, refuse_octree_write
 
-        Its cells are leaves stored at their anchors, which no writer but
-        the conversions (and the shard repackers, which move cells without
-        changing them) knows how to keep consistent with the leaf and
-        cell tables -- see :mod:`zarr_vectors.octree_chunks.guard`.  A
-        dict lookup on attributes already in memory unless the level is
-        one, so every cell write can afford it.
-        """
-        try:
-            level = self._zarr.attrs.get(_LEVEL_META_KEY)
-        except Exception:
-            return
-        if isinstance(level, dict) and isinstance(level.get("octree_chunks"), dict):
-            from zarr_vectors.octree_chunks.guard import refuse_octree_write
-
+        if is_octree_level(self):
             refuse_octree_write(self, f"{verb} {name}")
 
     def _drop_level_claim(self, key: str) -> None:

@@ -194,9 +194,8 @@ def coarsen_level(
     return strategy(**kwargs, **(options or {}))
 
 def _refuse_octree_levels(store_path: Any, levels: list[int] | None, what: str) -> None:
-    """Refuse when any of ``levels`` (all when ``None``) has octree chunks
-    (:mod:`zarr_vectors.octree_chunks`).  A store that does not open has
-    no octree level to protect; the coarsener reports that its own way."""
+    """Refuse when any of ``levels`` (all when ``None``) has octree chunks;
+    a store that does not open is left for the coarsener to report."""
     from zarr_vectors.core.store import open_store
     from zarr_vectors.exceptions import StoreError
     from zarr_vectors.octree_chunks.guard import refuse_octree_levels

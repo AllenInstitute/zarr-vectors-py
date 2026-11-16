@@ -319,10 +319,8 @@ def edit_link_in_session(
     if new_endpoints is not None:
         src, dst = int(new_endpoints[0]), int(new_endpoints[1])
         new_row = np.asarray([src, dst], dtype=group.dtype)
-        # On a skeleton a branch record names its child's parent, and the
-        # reader takes every record as an edge; appending would leave the
-        # child with its old parent as well, so a re-point always rewrites
-        # the record in place.
+        # A skeleton reader takes every record as an edge, so appending
+        # would keep the old parent too: rewrite in place.
         from zarr_vectors.core.metadata import RootMetadata
         conv = RootMetadata.from_dict(
             session.root.attrs.to_dict(),

@@ -985,9 +985,7 @@ class EditSession:
     # ------------------------------------------------------------------
 
     def _check_level(self, level: int) -> None:
-        """Refuse a level with octree chunks before anything is staged
-        for it: its chunks are leaves, not the uniform cells every edit
-        reads and rewrites (see :mod:`zarr_vectors.octree_chunks.guard`)."""
+        """Refuse a level with octree chunks before anything is staged for it."""
         if level in self._checked_levels:
             return
         from zarr_vectors.octree_chunks.guard import refuse_octree_levels
@@ -1040,8 +1038,7 @@ class EditSession:
         # finalize_links pass once every cell is on disk.
         touched_link_families: set[tuple[int, int]] = set()
 
-        # Nothing is written to any level until every level about to be
-        # written has been checked: an octree level refuses the flush.
+        # Check every level about to be written before writing any.
         pending_levels = (
             {lv for lv, _ in self._builders}
             | {lv for lv, _ in self._manifest_ops}

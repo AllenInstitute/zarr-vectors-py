@@ -261,9 +261,7 @@ class Layout:
 
         chunk_shape = self._chunk_shape(extent, ndim, schema)
         bin_shape = self._bin_shape(chunk_shape)
-        # ``{}`` (the codec's defaults, and what ``Schema.from_store`` gives
-        # back for ``octree=True``) asks for the octree as much as True does,
-        # so it is tested by identity, never by truth value.
+        # ``{}`` (the codec's defaults) asks for the octree too: not a truth test.
         wants_octree = self.octree is not False and self.octree is not None
         if self.shard_cells != "auto":
             # Said outright: neither ``pack`` nor ``store_kind`` gets a vote.

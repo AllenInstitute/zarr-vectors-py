@@ -348,8 +348,7 @@ def requires_object_index(convention: str, num_chunks: int) -> bool:
 # ===================================================================
 
 def _capability_list(value: Any) -> list[str]:
-    """``required_capabilities`` as read: the list's string entries, and
-    nothing for a value that is not a list (it is left alone on disk)."""
+    """The string entries of a list value; ``[]`` for anything else."""
     if not isinstance(value, (list, tuple)):
         return []
     return [c for c in value if isinstance(c, str)]
@@ -904,10 +903,6 @@ class LevelMetadata:
     written before this field says, and costs only the read it would
     otherwise have saved."""
     link_fragments_aligned: bool = False
-    #: Octree chunks (``zarr_vectors.octree_chunks``): the plan's
-    #: ``max_depth``, ``origin_cell``, ``target``, ``balanced``; ``None`` for
-    #: a uniform level, which is every level unless converted.
-    octree_chunks: dict[str, Any] | None = None
     """True when, in EVERY chunk of this level, the intra-chunk link
     array at delta 0 carries one link fragment per vertex fragment, and
     link fragment ``k`` holds exactly the records whose first stored
@@ -926,6 +921,9 @@ class LevelMetadata:
     records silently, so absent (the default, and what every earlier
     store says) means "unknown" and readers fall back to filtering the
     whole cell."""
+    octree_chunks: dict[str, Any] | None = None
+    """The octree plan (``max_depth``, ``origin_cell``, ``target``, ``balanced``),
+    or ``None`` for a uniform level; see :doc:`/spec/chunking/octree_chunks`."""
 
     def to_dict(self) -> dict[str, Any]:
         """Serialise to a JSON-compatible dict."""

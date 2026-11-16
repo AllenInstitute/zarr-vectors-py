@@ -1,9 +1,7 @@
 """Reading a level with octree chunks: by leaf, box or object, and its seams.
 
-Every read resolves to a set of leaves.  A leaf's vertices are one chunk;
-its links are those filed under it (``links/0/<offset>[^Δ]``) plus, for a
-set of leaves, those filed under the others in the set.  A link is kept
-when both endpoints were read, as in a uniform read.
+Every read resolves to a set of leaves; a link is kept when both endpoints
+were read.  See ``docs/spec/chunking/octree_chunks.md`` (Links).
 """
 
 from __future__ import annotations
@@ -14,12 +12,7 @@ from typing import Any
 import numpy as np
 import numpy.typing as npt
 
-from zarr_vectors.constants import (
-    GEOM_GRAPH,
-    OBJECT_INDEX,
-    VERTEX_FRAGMENTS,
-    VERTICES,
-)
+from zarr_vectors.constants import GEOM_GRAPH, VERTEX_FRAGMENTS, VERTICES
 from zarr_vectors.core.arrays import (
     _chunk_key,
     read_chunk_vertices,
@@ -27,13 +20,13 @@ from zarr_vectors.core.arrays import (
     read_vertex_fragment_index,
 )
 from zarr_vectors.core.metadata import get_level_chunk_shape
-from zarr_vectors.core.store import (
-    get_resolution_level,
-    open_store,
-    read_level_metadata,
-    read_root_metadata,
+from zarr_vectors.core.store import get_resolution_level, open_store, read_root_metadata
+from zarr_vectors.octree_chunks.convert import (
+    _level_meta,
+    _vertex_dtype,
+    leaf_table,
+    read_octree_link_cells,
 )
-from zarr_vectors.octree_chunks.convert import leaf_table, read_octree_link_cells
 from zarr_vectors.octree_chunks.table import LeafTable, OctreeError
 
 
@@ -54,18 +47,8 @@ def _open(store: Any, level: int, backend: str | None) -> tuple[Any, Any, LeafTa
     root = open_store(store, backend=backend)
     level_group = get_resolution_level(root, level)
     meta = read_root_metadata(root)
-    try:
-        level_meta = read_level_metadata(root, level)
-    except Exception:
-        level_meta = None
-    return root, level_group, leaf_table(level_group), meta, tuple(get_level_chunk_shape(meta, level_meta))
-
-
-def _dtype(level_group: Any) -> np.dtype:
-    try:
-        return np.dtype(level_group.read_array_meta(VERTICES).get("dtype", "float32"))
-    except Exception:
-        return np.dtype("float32")
+    chunk_shape = tuple(get_level_chunk_shape(meta, _level_meta(root, level)))
+    return root, level_group, leaf_table(level_group), meta, chunk_shape
 
 
 def read_leaves(level_group: Any, table: LeafTable, leaves: npt.ArrayLike, *, with_links: bool = True,
@@ -76,7 +59,7 @@ def read_leaves(level_group: Any, table: LeafTable, leaves: npt.ArrayLike, *, wi
     row in that leaf), ``edges`` (output rows) and ``leaf_offsets``.
     """
     leaves = np.unique(np.asarray(leaves, dtype=np.int64))
-    dtype = dtype or _dtype(level_group)
+    dtype = dtype or _vertex_dtype(level_group)
     anchors = table.anchors()
     keys = [_chunk_key(tuple(anchors[n].tolist())) for n in leaves.tolist()]
     positions, leaf_col, row_col = [], [], []
@@ -165,7 +148,7 @@ def _read_objects(level_group: Any, table: LeafTable, object_ids: Sequence[int],
     anchor_leaf = {tuple(a): n for n, a in enumerate(anchors.tolist())}
     entries = [(oid, anchor_leaf[tuple(int(c) for c in cc)], int(f))
                for oid in wanted for cc, f in manifests.get(oid, ())]
-    dtype = _dtype(level_group)
+    dtype = _vertex_dtype(level_group)
     is_graph = level_group.array_exists("links/0")
     if not entries:
         out = {"positions": np.zeros((0, 3), dtype=dtype), "leaf": np.zeros(0, np.int64),
@@ -259,4 +242,4 @@ def read_graph_octree(root: Any, *, level: int, bbox: Any, object_ids: Any, chun
     return res
 
 
-__all__ = ["read_graph_octree", "read_points_octree", "leaves_in_box", "read_leaves", "read_octree", "read_seams", "OBJECT_INDEX"]
+__all__ = ["read_graph_octree", "read_points_octree", "leaves_in_box", "read_leaves", "read_octree", "read_seams"]

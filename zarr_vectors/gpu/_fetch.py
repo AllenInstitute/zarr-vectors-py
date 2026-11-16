@@ -57,21 +57,11 @@ class RawCells:
 
 
 def locate_store(src: CellSource, cells: np.ndarray) -> tuple[list[_Range | None], dict[int, str]]:
-    """The byte range holding each of ``cells`` in a store that is not local.
-
-    Shard indexes are read by the core's ranged reader, which knows both
-    ``sharding_indexed``'s dense index and zarr-octree's sparse one (a
-    zarr-octree index read as dense rows would give garbage ranges). An
-    index that cannot be read is an error for each of its shard's cells.
-    """
+    """The byte range holding each of ``cells`` in a non-local store, via
+    :func:`read_indexes` (dense or zarr-octree); an unreadable index is an
+    error for each of its shard's cells."""
     cells = np.asarray(cells, dtype=np.int64).reshape(-1, len(src.shape))
-    if src.index_format not in ("dense", "zarr_octree"):
-        raise ValueError(f"unknown shard index format {src.index_format!r}")
-
-    def by_key(keys: list[str]) -> dict[str, Any]:
-        return dict(zip(keys, read_indexes(src, keys)))
-
-    return _locate(src, cells, by_key)
+    return _locate(src, cells, lambda keys: dict(zip(keys, read_indexes(src, keys))))
 
 
 # --------------------------------------------------------------------

@@ -754,34 +754,17 @@ def read_object_links(
     """The named objects' vertex rows and the links among their chunks.
 
     Shared by the mesh and graph object reads.  The object index names
-    each object's ``(chunk, fragment)`` pairs, and ``write_mesh`` and
-    ``write_graph`` both write one fragment per object per chunk, so the
-    vertices are exactly those fragments' rows.  Links come from the
+    each object's ``(chunk, fragment)`` pairs; links come from the
     link cells wholly inside the objects' chunks
-    (:func:`link_cells_within`), or touching them under ``touching``.
-    No vertex outside the objects' chunks is read.
+    (:func:`link_cells_within`), or also those touching them under
+    ``touching`` (read whole, as a skeleton read needs to find roots).
+    ``scope`` narrows the chunks read; ``aligned`` is the level's
+    ``link_fragments_aligned`` claim.
 
-    ``scope`` is the chunk set a ``bbox`` / ``chunks`` / attribute filter
-    narrowed the read to, or ``None``; fragments outside it are dropped.
-
-    ``aligned`` is the level's ``link_fragments_aligned`` claim.  Under
-    it a chunk's intra-chunk links are filed one link fragment per vertex
-    fragment, so only the objects' own link fragments are taken from
-    each cell; without it the whole cell is taken.
-
-    ``touching`` also takes the link cells that merely touch the
-    objects' chunks (``link_cells_within(touching=True)``), whose other
-    endpoints lie elsewhere.  A skeleton read needs them: the record of a
-    child whose parent is in a chunk not read -- outside the scope, or
-    another object's -- is what makes that child a root rather than the
-    next row of its fragment.  Those cells are read whole; their
-    unread endpoints come back as ``-1``.
-
-    Returns ``(positions, owners, link_rows, fragment_starts)`` -- the
-    rows grouped by object in the order asked for, each row's object,
-    every link read as output rows (``-1`` for an endpoint that is not
-    one of ours; the caller decides what that means), and the output row
-    each fragment starts at -- or ``None`` when no fragment is in scope.
+    Returns ``(positions, owners, link_rows, fragment_starts)`` -- rows
+    grouped by object in the order asked for, each row's object, links as
+    output rows (``-1`` for an endpoint not ours), each fragment's first
+    output row -- or ``None`` when no fragment is in scope.
     """
     wanted: list[int] = list(dict.fromkeys(int(o) for o in object_ids))
     manifests = read_object_manifests(level_group, ids=wanted) if wanted else {}
@@ -869,8 +852,7 @@ def read_object_links(
                     read_fragment(level_group, cc, frag, dtype=dtype, ndim=ndim),
                 )
                 owners.append(np.full(len(rows), oid, dtype=np.int64))
-                # An empty fragment starts no row: recorded, its start
-                # could equal the row count and index past the end.
+                # An empty fragment's start could index past the end.
                 if len(rows):
                     starts.append(running)
                 running += len(rows)

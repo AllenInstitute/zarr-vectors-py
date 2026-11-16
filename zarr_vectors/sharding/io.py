@@ -96,9 +96,7 @@ if TYPE_CHECKING:  # pragma: no cover - typing only
 
 
 def _is_native_sharded(zarr_node) -> bool:
-    """True iff ``zarr_node`` is a Zarr Array using a sharding codec:
-    ``sharding_indexed``, or one built on zarr's ``ShardingCodec`` (such as
-    zarr-octree's ``zarr_octree_sharding``), whose shards zarr reports the same way."""
+    """True iff ``zarr_node`` is a Zarr Array using a sharding codec (any ``ShardingCodec``)."""
     import zarr
     from zarr.codecs.sharding import ShardingCodec
 
@@ -128,9 +126,7 @@ def _codec_name(codec: Any) -> str | None:
 
 
 def _repacking(level: Group) -> Any:
-    """Mark ``level`` as rewritten without changing its cells, for the
-    duration of the block, so a level with octree chunks lets the write
-    through (see :mod:`zarr_vectors.octree_chunks.guard`)."""
+    """Let a cells-unchanged repack write through an octree level's guard."""
     from zarr_vectors.octree_chunks.guard import converting
 
     return converting(level)
@@ -150,12 +146,9 @@ def _octree_chunks_marker(zarr_node: Any) -> list[dict[str, Any]] | None:
     the marker is kept, since without it a reader that does not know
     octree chunks would read the level's leaves as uniform cells.
     """
-    from zarr_vectors.encoding.octree_marker import OCTREE_MARKER_CODEC, is_marker
+    from zarr_vectors.encoding.octree_marker import OCTREE_MARKER_CODEC, has_marker
 
-    codecs = list(zarr_node.metadata.codecs)
-    if codecs and _codec_name(codecs[0]) in ("sharding_indexed", "zarr_octree_sharding"):
-        codecs = list(getattr(codecs[0], "codecs", ()))
-    return [{"name": OCTREE_MARKER_CODEC}] if any(is_marker(c) for c in codecs) else None
+    return [{"name": OCTREE_MARKER_CODEC}] if has_marker(zarr_node) else None
 
 
 def _list_array_names(level_group, requested: list[str] | None) -> list[str]:
@@ -608,8 +601,7 @@ def reshard(
 
 
 def _octree_codec_matches(existing: Any, octree: dict[str, Any] | None) -> bool:
-    """Whether a sharded array's codec is the one ``octree`` (the store's
-    marker, or None for ``sharding_indexed``) would give it."""
+    """Whether ``existing``'s codec is the one ``octree`` (marker or None) gives."""
     codec = existing.metadata.codecs[0]
     if octree is None:
         return _codec_name(codec) == "sharding_indexed"
@@ -630,45 +622,17 @@ def set_octree(
 ) -> dict[str, Any]:
     """Mark a sharded store octree, or unmark it, and repack its shards to match.
 
-    ``octree=True`` (or the codec's configuration, e.g. ``{"target":
-    100_000}``) stamps the root's ``octree_sharding`` marker and
-    :data:`~zarr_vectors.constants.CAP_OCTREE_SHARDING`, then rewrites every
-    sharded per-chunk array with zarr-octree's ``zarr_octree_sharding``
-    codec; ``octree=False`` rewrites them with ``sharding_indexed`` and
-    then removes both -- the store as it would have been written
-    unmarked.  Cells, keys, grid, each array's inner codecs and
-    attributes are kept; only the bytes inside each shard change.  A
-    store sharded after the fact (:func:`shard_store`, which records no
-    root ``shard_shape``) is accepted: its arrays' shard shape is stamped
-    on the root with the marker.
-
-    Each array is converted into a scratch copy (``<level>/__set_octree``)
-    and swapped in only once that copy is complete, so the array's cells
-    exist somewhere on disk at every moment.  A run that is interrupted --
-    killed, preempted, a failed write -- is finished by running the call
-    again: it first completes or discards the conversion it finds in
-    flight (a complete copy is swapped in, an incomplete one dropped, the
-    source being untouched until then), then skips every array already in
-    the wanted codec.  Between the two runs a local store reads correctly
-    (each array's ``zarr.json`` says which codec it is in) unless the
-    kill fell between a swap's two renames; on any other store a kill
-    during a swap's copy leaves that array missing (``validate`` reports
-    it) until the call is run again.  A
-    coordinator operation: nothing else may write the store meanwhile,
-    and two runs must not overlap.
-
-    The marker is written first when the store is being marked (so the
-    capability says zarr-octree is needed before any array needs it) and
-    removed last when it is being unmarked.  With ``arrays=`` the marker
-    changes only once every sharded array of the store is in the wanted
-    codec; until then it is left as it was, and the capability stays on
-    the root while any array is ``zarr_octree_sharding``.  Needs the
-    zarr-octree package for either direction when an octree array is
-    involved.
+    ``octree=True`` (or a codec configuration, e.g. ``{"target": 100_000}``)
+    stamps the root's ``octree_sharding`` marker and
+    :data:`~zarr_vectors.constants.CAP_OCTREE_SHARDING` and rewrites every
+    sharded array with ``zarr_octree_sharding``; ``False`` reverses it.  Only
+    the bytes inside each shard change.  Each array goes through a scratch copy
+    (``<level>/__set_octree``), so a re-run finishes an interrupted one.  A
+    coordinator operation: no concurrent writers.  With ``arrays=`` the marker
+    changes only once every sharded array is in the wanted codec.
 
     Returns:
-        ``{"octree": the configuration asked for or None, "arrays_repacked",
-        "chunks_repacked"}``.
+        ``{"octree": config or None, "arrays_repacked", "chunks_repacked"}``.
     """
     import zarr
 
@@ -688,9 +652,7 @@ def set_octree(
     if config is not None and meta.shard_shape is None:
         stamp_shape = _common_shard_shape(root, ndim)
     if config is not None and arrays is None:
-        # The marker first: every array allocated from here on, by a
-        # writer, takes its codec from it, and the capability is on the
-        # root before the first octree array is.
+        # Marker first: the capability is on the root before any octree array.
         _write_octree_block(root, config, needs_octree=True, shard_shape=stamp_shape)
 
     repacked = chunks = 0
@@ -728,8 +690,9 @@ _OCTREE_SCRATCH_STATE = "set_octree"
 def _convert_sharded_array(
     level: Group, array_name: str, existing: Any, config: dict[str, Any] | None,
 ) -> int:
-    """Rewrite one sharded array in the codec ``config`` names, via the
-    scratch copy; returns the number of cells carried over."""
+    """Rewrite one sharded array in ``config``'s codec via the scratch copy.
+
+    Returns the cell count."""
     grid_shape = tuple(int(s) for s in existing.shape)
     shard_shape = tuple(int(s) for s in existing.shards)
     raw_origin = existing.attrs.get("chunk_grid_origin")
@@ -742,11 +705,8 @@ def _convert_sharded_array(
     preserved_attrs.pop("nonempty_chunks", None)
     preserved_attrs.pop("chunk_grid_origin", None)
 
-    # The copy is built beside the source, which is not touched until the
-    # copy is complete and says so.  The scratch group is created with its
-    # state: its existence alone means "a conversion of this array began".
-    # Never over an existing one (_finish_interrupted_octree has dropped
-    # any): one there now is another run's, which must not overlap this.
+    # The source is untouched until the copy is stamped complete.  Never
+    # created over an existing scratch group: one there now is another run's.
     state = {"array": array_name, "complete": False, "swapped": False}
     scratch = level.zarr_group.create_group(
         _OCTREE_SCRATCH, attributes={_OCTREE_SCRATCH_STATE: state},
@@ -767,24 +727,16 @@ def _convert_sharded_array(
 
 
 def _finish_interrupted_octree(level: Group) -> None:
-    """Complete or discard the conversion an interrupted :func:`set_octree`
-    left under ``level``.
-
-    A copy stamped complete is the array's cells in the new codec: it is
-    swapped in, whatever state the swap had reached (the source may be
-    gone, or half deleted, or half overwritten by a copy on an object
-    store).  A copy not stamped complete is dropped: the source is intact,
-    since nothing touches it before that stamp.
-    """
+    """Finish an interrupted :func:`set_octree` under ``level``: swap in a copy
+    stamped complete (whatever state the swap reached), else drop it (the
+    source is intact until that stamp)."""
     from zarr.errors import GroupNotFoundError
 
     zg = level.zarr_group
     try:
         scratch = _open_scratch(zg)
     except (KeyError, GroupNotFoundError):
-        # No scratch group, or only what an interrupted drop of one left
-        # (objects under it, its zarr.json already gone): garbage either
-        # way, since a conversion stamps its state there before anything else.
+        # None, or the remains of an interrupted drop: garbage either way.
         _drop_scratch(level)
         return
     state = scratch.attrs.get(_OCTREE_SCRATCH_STATE) or {}
@@ -793,10 +745,8 @@ def _finish_interrupted_octree(level: Group) -> None:
         if _key_exists(zg.store, _join(zg.path, _OCTREE_SCRATCH, name, "zarr.json")):
             _swap_in_octree_copy(level, scratch, name)
             return
-        # No copy and not stamped swapped: only a local swap (one rename)
-        # gets here, after the rename -- the copy IS the array now.  Were
-        # the array missing too, something else removed both: say so
-        # rather than drop the evidence and report success.
+        # Only a local swap gets here, after its rename: the copy IS the
+        # array.  If the array is missing too, refuse rather than report success.
         if not _key_exists(zg.store, _join(zg.path, name, "zarr.json")):
             from zarr_vectors.exceptions import StoreError
 
@@ -821,15 +771,10 @@ def _open_scratch(zg: Any) -> Any:
 def _swap_in_octree_copy(level: Group, scratch: Any, array_name: str) -> None:
     """Put the complete copy ``<scratch>/<array_name>`` where the array is.
 
-    On a local store, the source's directory is renamed aside (into the
-    scratch group, dropped with it) and the copy's renamed into its place:
-    two renames, so the array is missing only between them, never for the
-    length of a delete.  On
-    any other store the copy's objects are copied over (``zarr.json``
-    last, so a reader meanwhile finds no array rather than a part of one),
-    ``swapped`` is stamped, and only then is the copy deleted.  Either way
-    a crash at any point leaves a complete copy to swap in again, or a
-    finished swap.
+    Local store: two renames (source aside into the scratch group, copy into
+    place).  Elsewhere: copy the objects over (``zarr.json`` last), stamp
+    ``swapped``, then delete the copy.  A crash anywhere leaves a complete
+    copy to swap in again, or a finished swap.
     """
     import os
 
@@ -892,8 +837,7 @@ def _key_exists(store: Any, key: str) -> bool:
 
 
 def _sharded_arrays(root: Group):
-    """Every natively sharded per-chunk array of the store, as
-    ``(level index, array path, zarr array)``."""
+    """Yield ``(level index, array path, zarr array)`` per sharded per-chunk array."""
     import zarr
 
     for level_idx in list_resolution_levels(root):
@@ -908,9 +852,7 @@ def _sharded_arrays(root: Group):
 
 
 def _common_shard_shape(root: Group, ndim: int) -> list[int]:
-    """The spatial shard shape every sharded array of a store sharded
-    after the fact shares (its root records none); ValueError if there
-    is none, or more than one."""
+    """The one spatial shard shape all sharded arrays share; ValueError if none or several."""
     shapes = {
         tuple(int(s) for s in node.shards)[-ndim:]
         for _, _, node in _sharded_arrays(root)
@@ -935,10 +877,8 @@ def _write_octree_block(
     needs_octree: bool,
     shard_shape: list[int] | None = None,
 ) -> None:
-    """Set the root's octree marker (``None`` removes it) and its
-    capability (present iff ``needs_octree``), and with ``shard_shape``
-    the root shard shape when it records none.  Writes the root only if
-    something changes."""
+    """Set the root's octree marker (``None`` removes it), its capability (iff
+    ``needs_octree``) and, if unset, ``shard_shape``; writes only on change."""
     from zarr_vectors.constants import CAP_OCTREE_SHARDING
 
     block = dict(root.attrs.to_dict().get("zarr_vectors", {}))
@@ -956,23 +896,16 @@ def _write_octree_block(
         new["format_capabilities"] = [c for c in caps if c != CAP_OCTREE_SHARDING]
     if new != block:
         root.attrs.update({"zarr_vectors": new})
-    # A handle caches the marker for the arrays it allocates; this one
-    # must see the new one.
+    # Drop the handle's cached marker.
     root.__dict__.pop("_octree_sharding", None)
 
 
 def _settle_octree_marker(
     root: Group, wanted: dict[str, Any] | None, *, shard_shape: list[int] | None = None,
 ) -> None:
-    """Make the root agree with the arrays after a conversion.
-
-    The marker becomes ``wanted`` only when every sharded array of the
-    store is in the codec ``wanted`` names (vacuously so when none is
-    sharded); otherwise it is left as it was -- a conversion limited by
-    ``arrays=``, or one interrupted, has not got there yet.  The
-    capability says whether reading the store needs zarr-octree: present
-    while the store is marked or any array is ``zarr_octree_sharding``.
-    """
+    """Make the root agree with the arrays: the marker becomes ``wanted`` only
+    once every sharded array is in its codec; the capability stays while the
+    store is marked or any array is ``zarr_octree_sharding``."""
     all_match = True
     any_octree = False
     for _, _, node in _sharded_arrays(root):

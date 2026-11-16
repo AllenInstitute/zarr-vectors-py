@@ -12,8 +12,7 @@ Public API:
     shard_store("scan.zv", shard_shape=8)        # 8x8x8 = 512 chunks/shard
     info = get_shard_info("scan.zv")
     unshard_store("scan.zv")                     # back to flat
-    set_octree("scan.zv")                        # optional: zarr-octree's codec (needs zarr-octree)
-    set_octree("scan.zv", False)                 # and back to sharding_indexed
+    set_octree("scan.zv")                        # zarr-octree's codec; False undoes
 
 See :doc:`/spec/chunking/sharding` for the full design rationale.
 """

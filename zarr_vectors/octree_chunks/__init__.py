@@ -1,19 +1,13 @@
 """Octree chunks: an optional, convertible chunking of a level.
 
-A level normally has uniform chunks.  :func:`to_octree` regroups its cells
-into octree leaves sized by vertex count -- each leaf one chunk, so no
-chunk holds more than ``target`` vertices unless a single cell does --
-and :func:`to_uniform` restores the uniform chunks exactly.  See
-:mod:`zarr_vectors.octree_chunks.table` for addresses and link naming, and
-:mod:`zarr_vectors.octree_chunks.guard` for telling an octree level, and
-the conversion's own writes to it, apart -- and for the refusals every
-other writer and uniform-only reader raises on an octree level.
+:func:`to_octree` regroups a level's uniform cells into octree leaves of
+at most ``target`` vertices (one chunk each); :func:`to_uniform` restores
+the uniform chunks exactly.  See ``docs/spec/chunking/octree_chunks.md``.
 """
 
 from zarr_vectors.octree_chunks.convert import (
     cell_table,
     leaf_table,
-    octree_meta,
     refresh_capabilities,
     to_octree,
     to_uniform,
@@ -23,6 +17,7 @@ from zarr_vectors.octree_chunks.guard import (
     is_converting,
     is_octree_level,
     octree_levels,
+    octree_meta,
     refuse_octree_levels,
     refuse_octree_read,
     refuse_octree_write,
