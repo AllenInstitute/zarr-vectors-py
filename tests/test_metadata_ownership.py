@@ -53,15 +53,17 @@ def _store(**kw) -> str:
 class TestArraysPresentIsDerived:
     """B3."""
 
-    def test_it_repairs_the_list_an_ordinary_write_gets_wrong(self):
+    def test_it_repairs_a_list_that_has_drifted(self):
         path = _store(vertex_attributes={"x": np.zeros(600, np.float32)})
         root = open_store(path, mode="r+")
-        before = read_level_metadata(root, 0).arrays_present
-        # vertex_fragments is on disk from the very first write and has
-        # never been declared.
-        assert "vertex_fragments" not in before
+        # The writer now declares vertex_fragments itself; drop it by hand
+        # to stand in for a list that drifted (e.g. a store written before
+        # writers declared it).
+        assert "vertex_fragments" in read_level_metadata(root, 0).arrays_present
+        lg = get_resolution_level(root, 0)
+        update_level_metadata(lg, arrays_present=["vertices", "object_index"])
 
-        got = refresh_arrays_present(get_resolution_level(root, 0))
+        got = refresh_arrays_present(lg)
         assert "vertex_fragments" in got
         after = read_level_metadata(open_store(path, mode="r"), 0).arrays_present
         assert sorted(after) == sorted(got)

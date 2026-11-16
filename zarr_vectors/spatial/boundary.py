@@ -805,6 +805,27 @@ def _lehmer_table(link_width: int) -> tuple[npt.NDArray[np.int64], npt.NDArray[n
     return table, radix
 
 
+def _pack_rows(rows: npt.NDArray[np.int64]) -> npt.NDArray[np.int64] | None:
+    """Each row of a 2-D integer array as one int64, ordered as the rows
+    sort lexicographically (first column most significant), or None
+    when the columns' ranges do not fit in 63 bits."""
+    if rows.shape[0] == 0:
+        return None
+    # Per column: faster than an axis-0 reduction on a narrow array.
+    lo = np.array([rows[:, c].min() for c in range(rows.shape[1])], dtype=rows.dtype)
+    span = np.array([rows[:, c].max() for c in range(rows.shape[1])], dtype=rows.dtype) - lo + 1
+    total = 1
+    for s in span.tolist():
+        total *= int(s)
+    if total >= (1 << 62):
+        return None
+    out = np.zeros(rows.shape[0], dtype=np.int64)
+    for c in range(rows.shape[1]):
+        out *= int(span[c])
+        out += rows[:, c] - lo[c]
+    return out
+
+
 def partition_link_arrays(
     chunks: npt.NDArray[np.int64],
     vi: npt.NDArray[np.int64],
@@ -892,7 +913,10 @@ def partition_link_arrays(
         return {}
 
     # --- placement: which input endpoint leads, and in what order -----
-    intra = xp.all(chunks == chunks[:, :1, :], axis=(1, 2))
+    intra = xp.ones(n, dtype=bool)
+    for j in range(1, L):
+        for d in range(sid_ndim):
+            intra &= chunks[:, j, d] == chunks[:, 0, d]
     identity = xp.arange(L, dtype=xp.int64)
     if cross_level or directed or L == 1:
         sigma = xp.broadcast_to(identity, (n, L))
@@ -902,13 +926,19 @@ def partition_link_arrays(
         # record with the record as primary key, stable like the sorted()
         # it replaces.  Intra-chunk records keep input order, as
         # _cell_placements does.
-        rec = xp.repeat(xp.arange(n, dtype=xp.int64), L)
-        keys = [vi.reshape(-1)]
-        flat_chunks = chunks.reshape(-1, sid_ndim)
-        keys += [flat_chunks[:, d] for d in range(sid_ndim - 1, -1, -1)]
-        keys.append(rec)
-        order = xp.lexsort(xp.stack(keys))
-        sigma = order.reshape(n, L) - (xp.arange(n, dtype=xp.int64) * L)[:, None]
+        packed = None if on_device else _pack_rows(
+            np.concatenate([chunks, vi[:, :, None]], axis=2).reshape(-1, sid_ndim + 1)
+        )
+        if packed is not None:
+            sigma = np.argsort(packed.reshape(n, L), axis=1, kind="stable")
+        else:
+            rec = xp.repeat(xp.arange(n, dtype=xp.int64), L)
+            keys = [vi.reshape(-1)]
+            flat_chunks = chunks.reshape(-1, sid_ndim)
+            keys += [flat_chunks[:, d] for d in range(sid_ndim - 1, -1, -1)]
+            keys.append(rec)
+            order = xp.lexsort(xp.stack(keys))
+            sigma = order.reshape(n, L) - (xp.arange(n, dtype=xp.int64) * L)[:, None]
         sigma = xp.where(intra[:, None], identity[None, :], sigma)
 
     rowsel = xp.arange(n, dtype=xp.int64)[:, None]
@@ -929,13 +959,21 @@ def partition_link_arrays(
 
     # --- group by (source chunk, offsets) -----------------------------
     key = xp.concatenate([src, offsets.reshape(n, -1)], axis=1)
-    order = xp.lexsort(key.T[::-1])
-    key_sorted = key[order]
-    starts = xp.flatnonzero(
-        xp.concatenate((
-            xp.ones(1, dtype=bool), xp.any(key_sorted[1:] != key_sorted[:-1], axis=1),
-        ))
-    )
+    packed = None if on_device else _pack_rows(key)
+    if packed is not None:
+        # Same order as the lexsort below.
+        order = np.argsort(packed, kind="stable")
+        ps = packed[order]
+        key_sorted = key[order]
+        starts = np.flatnonzero(np.concatenate(([True], ps[1:] != ps[:-1])))
+    else:
+        order = xp.lexsort(key.T[::-1])
+        key_sorted = key[order]
+        starts = xp.flatnonzero(
+            xp.concatenate((
+                xp.ones(1, dtype=bool), xp.any(key_sorted[1:] != key_sorted[:-1], axis=1),
+            ))
+        )
 
     placed_vi = placed_vi[order]
     perm = perm[order]
@@ -977,6 +1015,86 @@ def partition_link_arrays(
     return out
 
 
+def partition_link_indices(
+    chunk_table: npt.NDArray[np.int64],
+    cidx: npt.NDArray[np.int64],
+    vi: npt.NDArray[np.int64],
+    *,
+    sid_ndim: int,
+    intra: npt.NDArray[np.bool_] | None = None,
+) -> dict[tuple[str, ChunkCoords], tuple[npt.NDArray[np.int64], npt.NDArray[np.int64]]]:
+    """``partition_link_arrays(chunk_table[cidx], vi, ...)`` for same-level
+    undirected records, with intra-chunk records grouped by a sort alone.
+
+    Args:
+        chunk_table: ``(C, sid_ndim)`` distinct chunk coords, sorted.
+        cidx: ``(M, L)`` index into ``chunk_table`` of every endpoint.
+        vi: ``(M, L)`` chunk-local vertex index of every endpoint.
+        sid_ndim: Spatial index dimensionality.
+        intra: ``(M,)`` whether a record lies in one chunk, if known.
+
+    Returns:
+        As :func:`partition_link_arrays`.
+    """
+    chunk_table = np.asarray(chunk_table, dtype=np.int64)
+    cidx = np.asarray(cidx, dtype=np.int64)
+    vi = np.asarray(vi, dtype=np.int64)
+    n, L = vi.shape
+    if L > _MAX_ARRAY_LINK_WIDTH:
+        raise ChunkingError(
+            f"partition_link_indices: link_width {L} exceeds "
+            f"{_MAX_ARRAY_LINK_WIDTH}; use partition_records_by_offset"
+        )
+    if intra is None:
+        intra = np.all(cidx == cidx[:, :1], axis=1)
+    intra_idx = np.flatnonzero(intra)
+    cross_idx = np.flatnonzero(~intra)
+    intra_buckets: list[
+        tuple[tuple[str, ChunkCoords], tuple[npt.NDArray[np.int64], npt.NDArray[np.int64]]]
+    ] = []
+    if intra_idx.size:
+        src = cidx[intra_idx, 0]
+        # numpy sorts 16-bit keys stably by radix, in linear time.
+        key = src.astype(np.uint16) if len(chunk_table) <= (1 << 16) else src
+        sort = np.argsort(key, kind="stable")
+        order = intra_idx[sort]
+        src = src[sort]
+        rows = vi[order]
+        starts = np.flatnonzero(np.concatenate(([True], src[1:] != src[:-1])))
+        ends = np.append(starts[1:], order.size)
+        segment = format_offsets(((0,) * sid_ndim,) * (L - 1))
+        heads = chunk_table[src[starts]].tolist()
+        for head, start, end in zip(heads, starts.tolist(), ends.tolist()):
+            intra_buckets.append(
+                ((segment, tuple(head)), (rows[start:end], order[start:end])),
+            )
+    cross: dict[
+        tuple[str, ChunkCoords], tuple[npt.NDArray[np.int64], npt.NDArray[np.int64]]
+    ] = {}
+    if cross_idx.size:
+        unit = [1] * sid_ndim
+        cross = partition_link_arrays(
+            chunk_table[cidx[cross_idx]], vi[cross_idx],
+            link_width=L, sid_ndim=sid_ndim, scale_src=unit, scale_trg=unit,
+        )
+    # Merge in partition_link_arrays order; a chunk's intra bucket (zero
+    # offsets) leads its crossing ones.
+    out: dict[
+        tuple[str, ChunkCoords], tuple[npt.NDArray[np.int64], npt.NDArray[np.int64]]
+    ] = {}
+    pending = iter(intra_buckets)
+    nxt = next(pending, None)
+    for bucket, (rows, idx) in cross.items():
+        while nxt is not None and nxt[0][1] <= bucket[1]:
+            out[nxt[0]] = nxt[1]
+            nxt = next(pending, None)
+        out[bucket] = (rows, cross_idx[idx])
+    while nxt is not None:
+        out[nxt[0]] = nxt[1]
+        nxt = next(pending, None)
+    return out
+
+
 # ===================================================================
 # Vertex assignment helpers
 # ===================================================================
@@ -998,12 +1116,13 @@ def build_vertex_chunk_mapping(
             sorted from chunk_assignments keys.
 
     Returns:
-        vertex_chunks: ``(N,)`` int64 — index into *chunk_coords_list*
-            for each vertex.
-        vertex_local_indices: ``(N,)`` int64 — local index within the
-            chunk for each vertex (i.e. position within the chunk's
-            vertex array).
-        chunk_coords_list: The chunk coordinate ordering used.
+        A tuple ``(vertex_chunks, vertex_local_indices, chunk_coords_list)``:
+
+        - ``vertex_chunks``: ``(N,)`` int64, the index into
+          ``chunk_coords_list`` for each vertex (``-1`` if unassigned).
+        - ``vertex_local_indices``: ``(N,)`` int64, each vertex's position
+          within its chunk's vertex array (``-1`` if unassigned).
+        - ``chunk_coords_list``: the chunk coordinate ordering used.
     """
     if chunk_coords_list is None:
         chunk_coords_list = sorted(chunk_assignments.keys())

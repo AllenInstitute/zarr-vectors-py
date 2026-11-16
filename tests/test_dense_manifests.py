@@ -336,6 +336,30 @@ def test_validation_passes_a_dense_store_and_catches_a_bad_span(tmp_path):
     assert "manifest_blocks" in result.summary()
 
 
+def test_write_polylines_creates_a_dense_store_on_request(tmp_path):
+    from zarr_vectors.types.polylines import read_polylines, write_polylines
+
+    rng = np.random.default_rng(6)
+    lines = [rng.uniform(5, 95, (12, 3)).astype("float32") for _ in range(40)]
+    kw = dict(chunk_shape=(25.0,) * 3, bounds=([0.0] * 3, [100.0] * 3))
+    write_polylines(tmp_path / "v", lines, **kw)
+    write_polylines(tmp_path / "d", lines, manifest_layout="dense", **kw)
+    vlen, dense_root = open_store(str(tmp_path / "v")), open_store(str(tmp_path / "d"))
+    meta = read_root_metadata(dense_root)
+    assert meta.manifest_layout == "dense"
+    assert CAP_DENSE_MANIFESTS in meta.format_capabilities
+    assert dense.is_dense(get_resolution_level(dense_root, 0))
+    assert read_root_metadata(vlen).manifest_layout is None
+    box = ([20.0] * 3, [60.0] * 3)
+    for kwargs in ({}, {"bbox": box}, {"object_ids": [3, 17, 39]}):
+        a, b = read_polylines(vlen, **kwargs), read_polylines(dense_root, **kwargs)
+        assert a["object_ids"] == b["object_ids"]
+        assert a["vertex_count"] == b["vertex_count"]
+        for fa, fb in zip(a["polylines"], b["polylines"], strict=True):
+            for x, y in zip(fa, fb, strict=True):
+                np.testing.assert_array_equal(x, y)
+
+
 @pytest.mark.parametrize("layout", ["vlen", "dense"])
 def test_the_id_table_is_chunked_at_the_bucket(tmp_path, layout):
     """Written as one chunk, a 10^9-object id table was one 8 GB object."""

@@ -39,6 +39,7 @@ import numpy.typing as npt
 
 from zarr_vectors._engine.plan import CellRequest, ReadPlan
 from zarr_vectors.constants import (
+    GEOM_POINT_CLOUD,
     OBJECT_ATTRIBUTES,
     OBJECT_INDEX,
     VERTEX_ATTRIBUTES,
@@ -85,6 +86,11 @@ class LevelContext:
     that cannot enumerate falls back to naming the node and letting the
     fetcher fan out.
     """
+    kind: str | None = None
+    """The level's geometry kind, when known."""
+    fragments_tile: bool = False
+    """``LevelMetadata.fragments_tile``: a whole-level point read then needs
+    ``vertex_fragments`` for one cell only, to re-check the claim."""
 
     @property
     def prefix(self) -> str:
@@ -106,6 +112,7 @@ class _Wanted:
 
 def _arrays_for(
     ctx: LevelContext, attributes: Sequence[str] | str, *, by_object: bool = False,
+    bulk: bool = False,
 ) -> _Wanted:
     """The arrays a read of this level touches.
 
@@ -120,6 +127,9 @@ def _arrays_for(
     manifests and reading all of them.  What it does take whole is the
     id table, which maps those ids to rows and is one integer per
     object.
+
+    ``vertex_fragments`` is left out of a ``bulk`` (unnarrowed) read of a
+    ``fragments_tile`` point level with no attribute to read.
     """
     arrays = list(_CORE_ARRAYS)
     if attributes == "all":
@@ -129,6 +139,11 @@ def _arrays_for(
         arrays += [
             f"{VERTEX_ATTRIBUTES}/{n}" for n in ctx.attribute_names if n in wanted
         ]
+    if (
+        bulk and ctx.fragments_tile and ctx.kind == GEOM_POINT_CLOUD
+        and len(arrays) == len(_CORE_ARRAYS)
+    ):
+        arrays.remove(VERTEX_FRAGMENTS)
     whole = []
     if ctx.has_object_index:
         dense = ctx.manifest_layout == "dense"
@@ -257,17 +272,28 @@ def resolve(selection: Any, ctx: LevelContext) -> ReadPlan:
         getattr(selection, "objects", None) is not None
         or getattr(selection, "groups", None) is not None
     )
+    bbox = getattr(selection, "bbox", None)
+    near = getattr(selection, "near", None)
+    explicit = getattr(selection, "cells", None)
+    # Bulk: nothing narrows the read (a limit does: it picks cells).
+    bulk = not by_object and all(
+        getattr(selection, term, None) is None
+        for term in ("bbox", "near", "cells", "where", "limit")
+    )
     wanted = _arrays_for(
         ctx, getattr(selection, "attributes", "all"),
         by_object=by_object and ctx.has_object_index,
+        bulk=bulk,
     )
-    plan = ReadPlan.of(
-        nodes=[ctx.prefix],
-        arrays=wanted.whole_arrays,
-    )
+    plan = ReadPlan.of(nodes=[ctx.prefix], arrays=wanted.whole_arrays)
+    if VERTEX_FRAGMENTS not in wanted.arrays:
+        # The reader still re-checks the tiling claim on its first cell.
+        frag = ctx.path(VERTEX_FRAGMENTS)
+        plan = plan.merge(ReadPlan.of(
+            nodes=[frag],
+            cells=[CellRequest(frag, k) for k in ctx.known_cells[:1]],
+        ))
 
-    bbox = getattr(selection, "bbox", None)
-    near = getattr(selection, "near", None)
     if near is not None:
         centre = np.asarray(near[0], dtype=np.float64)
         radius = float(near[1])
@@ -277,7 +303,6 @@ def resolve(selection: Any, ctx: LevelContext) -> ReadPlan:
             np.minimum(np.asarray(bbox[1], dtype=np.float64), sphere[1]),
         )
 
-    explicit = getattr(selection, "cells", None)
     if explicit is not None:
         # The caller named the region in grid terms, so the region is
         # theirs and is not re-derived. Cells the level is known not to
@@ -362,7 +387,17 @@ def context_from_level(level: Any) -> LevelContext:
             "dense" if getattr(root, "manifest_layout", None) == "dense" else "vlen"
         ),
         known_cells=_known_cells(level),
+        kind=_or(lambda: level.kind, None),
+        fragments_tile=_or(lambda: bool(getattr(level._metadata(), "fragments_tile", False))),
     )
+
+
+def _or(get: Any, default: Any = False) -> Any:
+    """``get()``, or ``default`` when the level cannot answer."""
+    try:
+        return get()
+    except Exception:  # noqa: BLE001
+        return default
 
 
 def _known_cells(level: Any) -> tuple[str, ...]:

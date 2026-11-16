@@ -55,8 +55,8 @@ companion package `zarr-vectors-tools`.
 
 ### Arrays present
 
-Identical to `graph`. Two writers exist, with one difference in the link
-family (see below).
+Identical to `graph`, except that a streamed skeleton store's link
+family is written `directed=True` (see below).
 
 | Array path | Required | Description |
 |-----------|----------|-------------|
@@ -102,42 +102,62 @@ endpoints are in different chunks. `read_graph` rebuilds the full edge list.
 
 ### The link family for skeletons
 
-Skeleton stores have one `links/0/` family (`link_width=2`). Whether it is
-**directed** depends on the writer:
+A skeleton store has **one** `links/0/` family, written with
+`link_width=2`. The streaming writers (`init_skeleton_store`,
+`write_skeleton_chunk`, `write_skeleton_cross_chunk_links`) declare it —
+uniquely among the core geometry types — **`directed=True`**.
+`write_graph(kind="skeleton")` keeps an undirected, canonical family whose
+`perm_idx` restores each record's `[child, parent]` input order on read;
+downstream tools tell the two skeleton layouts apart by this flag. Either
+way a reader sees `[child, parent]`.
 
-| Writer | Family `directed` | Endpoint order |
-|--------|-------------------|----------------|
-| `write_graph(kind="skeleton")` | `false` (canonical) | `[child, parent]`; input order recovered via `perm_idx` |
-| Streaming: `init_skeleton_store`, `write_skeleton_chunk`, `write_skeleton_cross_chunk_links` | `true` | intra array `[child_local, parent_local]`; cross-chunk records lead with the **parent** |
+`directed=True` is family policy set at creation
+(`create_links_array(..., directed=True)`). It suppresses the canonical
+sort, which matters because child→parent order is *data*: sorting
+endpoints by `(chunk_coords, vertex_index)` would silently swap parent
+and child whenever the child's chunk sorts before the parent's.
+
+The consequence for the layout: a directed family stores `A→B` and
+`B→A` under **opposite offsets** (`0.0.+1` vs `0.0.-1`) in different
+cells, rather than deduplicating them into one lexicographically
+positive offset. Offsets in a directed family are therefore **not**
+constrained to be lex-non-negative, and [L3](../validation/l3_consistency.md)
+skips that check for them (`enforce_canonical` requires `not directed`).
+`perm_idx` is `0` throughout, since no permutation is applied.
+
+Three writers populate this family:
+
+| Writer | Lands in | Endpoint order |
+|--------|----------|----------------|
+| `write_skeleton_chunk` | all-zero offsets (`0.0.0`) | `[child_local, parent_local]` |
+| `write_skeleton_cross_chunk_links` | non-zero offsets | `[child, parent]` |
+| `write_graph(kind="skeleton")` | all offsets (undirected, `perm_idx`) | `[child, parent]` after `perm_idx` |
+
+Intra-chunk branch links are written per-cell (`write_chunk_links`),
+not through `write_links`, because they are already chunk-local and
+all-zero-offset and must stay **one group per fragment** for
+`read_chunk_link_fragment` to slice them back out — `write_links` files
+a cell's records as a single group. Intra-chunk records are stored in
+input order regardless of the `directed` policy, so branch links are
+unaffected by it.
+
+Every record in a skeleton's link family, intra- or cross-chunk, is
+`[child, parent]`: endpoint 0 is the child, endpoint 1 its parent. Readers
+(`read_graph`, `read_skeleton_by_segment_id`, the pyramid coarsener) apply
+that one rule to every array of the family.
+
+For cross-chunk records the source is the **child's** chunk, so the
+offsets name where the parent's chunk sits relative to the child's.
+
+This is a key distinction from `polyline` links, where direction encodes
+traversal order and the family is undirected. For skeletons, direction
+encodes the tree's child↔parent relationship and is preserved
+explicitly.
 
 The streaming writers (module `zarr_vectors.types.skeletons`) are for
-scale-out ingestion where many workers each write some chunks. They set
-`directed=True` because parent→child order is data: it suppresses the
-canonical sort, which would otherwise swap parent and child whenever the
-child's chunk sorts first. A directed family stores `A→B` and `B→A` under
-**opposite offsets** (`0.0.+1` vs `0.0.-1`), so offsets are not constrained
-to be lex-non-negative, and [L3](../validation/l3_consistency.md) skips the
-canonical-offset check for them (`enforce_canonical` requires
-`not directed`). `perm_idx` is `0` throughout a directed family.
-
-Intra-chunk branch links from `write_skeleton_chunk` are written per cell
-(`write_chunk_links`) as **one group per fragment** so
-`read_chunk_link_fragment` can slice them back out, with an explicit
-`[root_local, -1]` row per fragment.
-
-> **Known inconsistency.** Within the streaming writers' directed family,
-> the intra array is `[child, parent]` while the cross-chunk records lead
-> with the parent. Because `directed=True` preserves input order verbatim,
-> nothing on disk distinguishes them; a reader must know which writer
-> produced a record. Treat the endpoint order of a streamed skeleton link
-> as writer-dependent.
-
-For cross-chunk records of the streaming writer the source is the
-**parent's** chunk, so the offsets name where the child's chunk sits
-relative to the parent's.
-
-Streaming-writer stores also carry a `segment_id` fragment attribute and
-a `coordinate_offset` key in the root `zarr_vectors` block (stored vertices
+scale-out ingestion, where many workers each write some chunks. Their
+stores also carry a `segment_id` fragment attribute and a
+`coordinate_offset` key in the root `zarr_vectors` block (stored vertices
 are `world - coordinate_offset`). `read_skeleton_by_segment_id(path, id)`
 reads one skeleton back from such a store and returns `positions`,
 `edges` (`[child, parent]`), `attributes` and `fragment_count`, or `None`

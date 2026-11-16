@@ -119,6 +119,10 @@ class Grid:
     :attr:`anchor` is the cell this corner falls in.
     """
 
+    extent: tuple[float, ...] = ()
+    """Physical span of the planned bounds per axis (empty if unknown),
+    so :meth:`capacity` divides by covered rather than allocated cells."""
+
     @classmethod
     def plan(
         cls,
@@ -167,7 +171,10 @@ class Grid:
         from zarr_vectors.spatial.chunking import grid_layout
 
         _origin, shape = grid_layout((lo, hi), size)
-        return cls(shape=shape, cell_shape=size, origin=tuple(lo))
+        return cls(
+            shape=shape, cell_shape=size, origin=tuple(lo),
+            extent=tuple(float(e) for e in extent),
+        )
 
     # ---------------- geometry ----------------
 
@@ -263,7 +270,7 @@ class Grid:
         """
         cells = self.cells
         per_cell = (
-            (n_vertices / cells) * ndim * bytes_per_coordinate
+            (n_vertices / self._covered_cells()) * ndim * bytes_per_coordinate
             if n_vertices and cells else 0.0
         )
         reason = None
@@ -280,6 +287,17 @@ class Grid:
             cells=cells, shape=self.shape, est_bytes_per_cell=per_cell,
             fits=fits, reason=reason,
         )
+
+    def _covered_cells(self) -> float:
+        """Cells' worth of volume the data spans: per axis ``extent /
+        cell_shape`` clamped to ``[1, shape]``; :attr:`cells` if unknown."""
+        if len(self.extent) != len(self.shape) or not self.shape:
+            return float(self.cells)
+        covered = 1.0
+        for e, c, s in zip(self.extent, self.cell_shape, self.shape):
+            per_axis = (float(e) / float(c)) if c else float(s)
+            covered *= min(float(s), max(1.0, per_axis))
+        return covered
 
     def holds(self, ref: CellRef) -> bool:
         """Whether ``ref`` is inside this grid's allocation.

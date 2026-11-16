@@ -31,6 +31,7 @@ from zarr_vectors.constants import (
     OBJECT_INDEX,
     OBJIDX_STANDARD,
     RESOLUTION_PREFIX,
+    VERTEX_ATTRIBUTES,
     VERTEX_FRAGMENTS,
     VERTICES,
 )
@@ -42,12 +43,12 @@ from zarr_vectors.core.arrays import (
     create_object_index_array,
     create_vertices_array,
     link_cells_within,
-    link_endpoints_to_rows,
     link_range_requests,
     list_link_offsets,
     read_chunk_vertices,
     read_fragment,
     read_link_arrays,
+    read_link_rows,
     read_object_manifests,
     read_vertex_fragment_index,
     resolve_chunk_keys,
@@ -85,6 +86,7 @@ from zarr_vectors.exceptions import ArrayError
 from zarr_vectors.spatial.boundary import (
     build_vertex_chunk_mapping,
     partition_faces,
+    partition_link_indices,
 )
 from zarr_vectors.spatial.chunking import (
     assign_chunks,
@@ -129,7 +131,8 @@ def write_mesh(
         vertices: ``(V, D)`` vertex positions.
         faces: ``(F, L)`` face index array (L=3 triangles, L=4 quads).
         chunk_shape: Spatial chunk size per dimension.
-        encoding: ``"raw"`` or ``"draco"``.
+        encoding: ``"raw"`` or ``"draco"`` (3-D triangles only; other
+            vertices are written raw).
         vertex_attributes: Per-vertex attributes ``{name: (V,) or (V,C)}``.
         object_ids: ``(V,)`` array assigning vertices to mesh objects.
             If None, all vertices belong to object 0.
@@ -176,6 +179,24 @@ def write_mesh(
             "Use 'raise' (default) or 'expand', or pre-filter vertices "
             "and remap faces upstream."
         )
+    is_draco = encoding == ENCODING_DRACO and ndim == 3
+    stored_encoding = ENCODING_DRACO if is_draco else (
+        ENCODING_RAW if encoding == ENCODING_DRACO else encoding
+    )
+    if is_draco:
+        # Fail before anything is created.
+        from zarr_vectors.encoding.draco import draco_backend_available
+        from zarr_vectors.exceptions import DracoError
+        if link_width != 3:
+            raise ArrayError(
+                f"encoding='draco' encodes triangles only; faces have "
+                f"{link_width} vertices each. Use encoding='raw'."
+            )
+        if not draco_backend_available():
+            raise DracoError(
+                "encoding='draco' needs DracoPy or the draco_encoder CLI, "
+                "and neither was found. Install with: pip install DracoPy"
+            )
     root = _create_or_open_store(
         store_path,
         backend=backend,
@@ -221,14 +242,23 @@ def write_mesh(
                 f"of length n_verts={n_verts}, got shape {src_values.shape}"
             )
         vertex_attr_bins, attr_bin_values = assign_attribute_bins(src_values)
-        for oid in np.unique(object_ids):
-            mask = object_ids == oid
-            unique_bins = np.unique(vertex_attr_bins[mask])
-            if len(unique_bins) > 1:
+        # One sort by object, then each object's lowest and highest bin.
+        _bins = np.asarray(vertex_attr_bins, dtype=np.int64)
+        _order = np.argsort(object_ids, kind="stable")
+        _oids = np.asarray(object_ids)[_order]
+        _starts = np.flatnonzero(np.r_[True, _oids[1:] != _oids[:-1]]) if n_verts else _order
+        if n_verts:
+            _sb = _bins[_order]
+            _mixed = np.flatnonzero(
+                np.minimum.reduceat(_sb, _starts) != np.maximum.reduceat(_sb, _starts)
+            )
+            if _mixed.size:
+                _s = int(_starts[_mixed[0]])
+                _e = int(_starts[_mixed[0] + 1]) if _mixed[0] + 1 < _starts.size else n_verts
                 raise ArrayError(
                     f"chunk_by_attribute={chunk_by_attribute!r} requires "
-                    f"per-object uniformity for meshes; object {int(oid)} "
-                    f"has {len(unique_bins)} distinct attribute values"
+                    f"per-object uniformity for meshes; object {int(_oids[_s])} "
+                    f"has {len(np.unique(_sb[_s:_e]))} distinct attribute values"
                 )
 
     level_chunk_dims: list[str] | None = None
@@ -241,7 +271,13 @@ def write_mesh(
     level_meta = LevelMetadata(
         level=0,
         vertex_count=n_verts,
-        arrays_present=[VERTICES, "links", "object_index"],
+        # ``links`` always exists: the backstop below creates it.
+        arrays_present=[
+            VERTICES, VERTEX_FRAGMENTS, "links", LINK_FRAGMENTS,
+            "object_index",
+            *([VERTEX_ATTRIBUTES] if vertex_attributes else []),
+            *(["object_attributes"] if object_attributes else []),
+        ],
         chunk_dims=level_chunk_dims,
         chunk_attribute_name=chunk_by_attribute,
         chunk_attribute_values=attr_bin_values,
@@ -255,10 +291,14 @@ def write_mesh(
         prefixed: dict[ChunkCoords, npt.NDArray[np.int64]] = {}
         for spatial_cc, gi in chunk_assignments.items():
             gi = np.asarray(gi, dtype=np.int64)
-            chunk_bins = vertex_attr_bins[gi]
-            for ab in np.unique(chunk_bins):
-                mask = chunk_bins == ab
-                prefixed[(int(ab),) + spatial_cc] = gi[mask]
+            chunk_bins = np.asarray(vertex_attr_bins)[gi]
+            # Stable sort by bin keeps each bin's vertices in order.
+            order = np.argsort(chunk_bins, kind="stable")
+            sb = chunk_bins[order]
+            cuts = np.flatnonzero(sb[1:] != sb[:-1]) + 1
+            for part in np.split(order, cuts):
+                if part.size:
+                    prefixed[(int(chunk_bins[part[0]]),) + spatial_cc] = gi[part]
         chunk_assignments = prefixed
     # Group each chunk's vertices by object, so that every fragment written
     # below belongs to exactly one object and a manifest entry can name
@@ -287,8 +327,9 @@ def write_mesh(
     # record reaches ``write_links``.
     f_chunk = vertex_chunks[faces]                      # (F, L)
     f_local = vertex_local[faces]                       # (F, L)
-    is_intra_face = np.all(f_chunk == f_chunk[:, :1], axis=1)
-    is_draco = encoding == ENCODING_DRACO and ndim == 3
+    is_intra_face = np.ones(len(f_chunk), dtype=bool)
+    for col in range(1, f_chunk.shape[1]):
+        is_intra_face &= f_chunk[:, col] == f_chunk[:, 0]
 
     # Draco embeds a chunk's intra-chunk faces in that chunk's own
     # bitstream, in chunk-local indices, so only the boundary-crossing
@@ -299,23 +340,28 @@ def write_mesh(
             faces, vertex_chunks, vertex_local, chunk_list
         )
         store_rows = np.flatnonzero(~is_intra_face)
+        link_cidx = f_chunk[store_rows]
+        link_vi = f_local[store_rows]
+        link_intra = is_intra_face[store_rows]
     else:
-        store_rows = np.arange(n_faces, dtype=np.int64)
+        link_cidx, link_vi, link_intra = f_chunk, f_local, is_intra_face
 
     # Records stay in face order, which the partitioner preserves within
-    # each cell.  Held as arrays -- ``(F, L, D)`` endpoint chunks and
-    # ``(F, L)`` local indices -- rather than one list of tuples per
-    # face: building those and taking them apart again was 3 s of a
-    # half-million-face write before anything was partitioned.
-    link_chunks = np.asarray(chunk_list, dtype=np.int64)[f_chunk[store_rows]]
-    link_vi = f_local[store_rows]
+    # each cell.  Chunk indices rather than coords, so the intra-chunk
+    # faces group by one small-integer sort.
+    idx_ndim = ndim + 1 if vertex_attr_bins is not None else ndim
+    link_buckets: dict[tuple[str, ChunkCoords], Any] = {}
+    if len(link_vi):
+        link_buckets = partition_link_indices(
+            np.asarray(chunk_list, dtype=np.int64), link_cidx, link_vi,
+            sid_ndim=idx_ndim, intra=link_intra,
+        )
 
     # Write vertices per chunk, one fragment per object in the chunk.
     object_manifests: dict[int, ObjectManifest] = {}
     # First row of each chunk's vertex fragments, so write_links can file
     # each chunk's intra-chunk faces one link fragment per vertex fragment.
     fragment_starts: dict[ChunkCoords, npt.NDArray[np.int64]] = {}
-    idx_ndim = ndim + 1 if vertex_attr_bins is not None else ndim
 
     # Collapse all per-array zarr.json + per-chunk byte writes into one
     # asyncio.gather (mirrors points.py:300).  ``shard_shape`` also
@@ -331,7 +377,9 @@ def write_mesh(
         bounds=bounds_list, chunk_shape=chunk_shape,
         bin_count=session_bin_count,
     ):
-        create_vertices_array(level_group, dtype=dtype, encoding=encoding)
+        create_vertices_array(
+            level_group, dtype=dtype, encoding=stored_encoding,
+        )
         create_object_index_array(level_group)
         # The links family is created by ``write_links`` below, stamped
         # with the real face arity.  The pre-merge cross-chunk family was
@@ -340,7 +388,14 @@ def write_mesh(
 
         if vertex_attributes:
             for name, data in vertex_attributes.items():
-                create_attribute_array(level_group, name, dtype=str(data.dtype))
+                # Channel names carry the row shape of a (V, C) column.
+                create_attribute_array(
+                    level_group, name, dtype=str(data.dtype),
+                    channel_names=(
+                        [f"ch{i}" for i in range(data.shape[1])]
+                        if np.ndim(data) == 2 else None
+                    ),
+                )
         if object_attributes:
             for _name in object_attributes:
                 create_object_attributes_array(level_group, _name)
@@ -400,10 +455,11 @@ def write_mesh(
         # Intra-chunk faces are filed one link fragment per vertex
         # fragment -- i.e. per object -- so an object read can take its
         # own faces without decoding its neighbours'.
-        if len(link_vi):
+        if link_buckets:
             write_links(
                 level_group, [], idx_ndim, delta=0,
-                link_width=link_width, _arrays=(link_chunks, link_vi),
+                link_width=link_width, _prepartitioned=link_buckets,
+                _num_records=len(link_vi),
                 fragment_starts=fragment_starts or None,
             )
         # Backstop: `arrays_present` advertises the family, and the
@@ -659,30 +715,28 @@ def _read_mesh(
         positions_out = np.concatenate(all_positions, axis=0)
 
         # Faces: one family, so intra and cross records come back from one
-        # call already in global ``(chunk, local_idx)`` form — a single
-        # remap covers both, with winding restored from ``perm_idx``.  A
-        # face touching a chunk outside ``chunk_keys`` has no offset and is
-        # dropped, which is what applies the bbox/chunks filter to faces.
-        all_faces: list[npt.NDArray] = []
-        # As arrays, not one tuple per face: the remap is a gather.
-        face_chunks, face_vi = read_link_arrays(
-            level_group, delta=0, cells=link_cells,
-        )
-        if face_vi.shape[0] and face_vi.shape[1] == link_width:
-            rows = link_endpoints_to_rows(face_chunks, face_vi, chunk_offsets)
-            keep = (rows >= 0).all(axis=1)
-            if keep.any():
-                all_faces.append(rows[keep])
-
-        if all_faces:
-            faces_out = np.concatenate(all_faces, axis=0)
-        else:
-            faces_out = np.zeros((0, link_width), dtype=np.int64)
-
+        # call, with winding restored from ``perm_idx``.  Each chunk's rows
+        # map to output rows, ``-1`` where the bbox/chunks filter drops them.
         if bbox is not None:
-            positions_out, faces_out, _ = _bbox_filter(
-                positions_out, faces_out, bbox, link_width,
+            bbox_min, bbox_max = np.asarray(bbox[0]), np.asarray(bbox[1])
+            node_mask = np.all(
+                (positions_out >= bbox_min) & (positions_out <= bbox_max),
+                axis=1,
             )
+            row_of = np.cumsum(node_mask, dtype=np.int64) - 1
+            row_of[~node_mask] = -1
+            if not node_mask.all():
+                positions_out = positions_out[node_mask]
+        else:
+            row_of = np.arange(running, dtype=np.int64)
+        starts = list(chunk_offsets.items())
+        ends = [start for _, start in starts[1:]] + [running]
+        row_maps = {
+            cc: row_of[start:end] for (cc, start), end in zip(starts, ends)
+        }
+        faces_out = read_link_rows(level_group, row_maps, cells=link_cells)
+        if faces_out.shape[1] != link_width:
+            faces_out = np.zeros((0, link_width), dtype=np.int64)
 
         return {
             "vertices": positions_out,

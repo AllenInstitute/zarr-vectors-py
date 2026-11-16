@@ -30,12 +30,15 @@ from __future__ import annotations
 
 import asyncio
 import os
+import struct
 import threading
+import time
 from typing import Any, NamedTuple
 
 import numpy as np
 import zarr
 from numcodecs.vlen import VLenBytes
+from zarr.abc.codec import BytesBytesCodec
 from zarr.core.array_spec import ArraySpec
 from zarr.core.buffer import default_buffer_prototype
 from zarr.core.sync import sync
@@ -60,6 +63,9 @@ _VLEN_BYTES = VLenBytes()
 # process that reconfigures zarr's buffer prototype mid-run would need a
 # restart, which nothing in ZV does.
 _BUFFER_PROTOTYPE = default_buffer_prototype()
+
+# numcodecs' VLenBytes header: item count, then the first item's length.
+_VLEN_COUNT_LENGTH = struct.Struct("<II")
 
 
 def _is_icechunk_store(store: Any) -> bool:
@@ -347,10 +353,26 @@ def _decode_direct(spec: _DirectSpec, raw: bytes | None) -> bytes | None:
     """
     if raw is None:
         return b""
-    buffer = spec.spec.prototype.buffer.from_bytes(raw)
-    for codec in reversed(spec.codecs):
-        buffer = codec._decode_sync(buffer, spec.spec)
-    decoded = _VLEN_BYTES.decode(buffer.as_numpy_array())
+    codecs = spec.codecs
+    if all(type(codec).__name__ == "ZstdCodec" for codec in codecs):
+        # The mirror of the writer's ``_encode_direct``, minus the Buffer
+        # wrapping around every call.
+        frame: Any = raw
+        for codec in reversed(codecs):
+            frame = codec._zstd_codec.decode(frame)
+    else:
+        buffer = spec.spec.prototype.buffer.from_bytes(raw)
+        for codec in reversed(codecs):
+            buffer = codec._decode_sync(buffer, spec.spec)
+        frame = buffer.as_numpy_array()
+    # A cell holds one vlen item, so its payload is the frame past the
+    # header; any other frame takes VLenBytes.
+    view = memoryview(frame)
+    if view.nbytes >= _VLEN_COUNT_LENGTH.size:
+        count, length = _VLEN_COUNT_LENGTH.unpack_from(view)
+        if count == 1 and length == view.nbytes - _VLEN_COUNT_LENGTH.size:
+            return bytes(view[_VLEN_COUNT_LENGTH.size:])
+    decoded = _VLEN_BYTES.decode(frame)
     if decoded.size != 1:
         return None
     value = decoded.flat[0]
@@ -373,6 +395,75 @@ def _direct_read(spec: _DirectSpec, chunk_key: str) -> bytes | None:
     return _decode_direct(spec, _read_file(path))
 
 
+def direct_elements(node: Any, indices: Any) -> np.ndarray | None:
+    """Elements ``indices`` of a 1-D local array, read off the filesystem.
+
+    Each chunk file is decoded through the array's own codecs, so the
+    values are the ones a zarr selection returns.  Returns them in the
+    order asked, or None for anything not recognised (not a local
+    unsharded v3 array, other codecs, an index off the array, a missing
+    chunk), which the caller reads through zarr instead.
+    """
+    store = node.store_path.store
+    if type(store).__name__ != "LocalStore":
+        return None
+    meta = node.metadata
+    if getattr(meta, "zarr_format", None) != 3 or len(meta.shape) != 1:
+        return None
+    if getattr(meta, "storage_transformers", ()):
+        return None
+    chunk_shape = getattr(getattr(meta, "chunk_grid", None), "chunk_shape", None)
+    if chunk_shape is None or len(chunk_shape) != 1:
+        return None
+    serializer, *bytes_codecs = meta.codecs
+    if type(serializer).__name__ not in ("VLenBytesCodec", "BytesCodec"):
+        return None
+    if not all(
+        isinstance(c, BytesBytesCodec) and hasattr(c, "_decode_sync")
+        for c in bytes_codecs
+    ):
+        return None
+    cke = meta.chunk_key_encoding.to_dict()
+    if cke.get("name") != "default":
+        return None
+    separator = (cke.get("configuration") or {}).get("separator", "/")
+
+    idx = np.asarray(indices, dtype=np.int64).ravel()
+    n = int(meta.shape[0])
+    if idx.size == 0 or int(idx.min()) < 0 or int(idx.max()) >= n:
+        return None
+    rows = int(chunk_shape[0])
+    try:
+        spec = ArraySpec(
+            shape=(rows,),
+            dtype=meta.data_type,
+            fill_value=meta.fill_value,
+            config=node._async_array.config,
+            prototype=_BUFFER_PROTOTYPE,
+        )
+    except Exception:
+        return None
+
+    root = os.path.join(str(store.root), node.store_path.path, "c")
+    chunk_of = idx // rows
+    out: np.ndarray | None = None
+    for c in np.unique(chunk_of).tolist():
+        raw = _read_file(f"{root}{separator}{c}")
+        if raw is None:
+            return None
+        buffer = _BUFFER_PROTOTYPE.buffer.from_bytes(raw)
+        for codec in reversed(bytes_codecs):
+            buffer = codec._decode_sync(buffer, spec)
+        values = serializer._decode_sync(buffer, spec).as_numpy_array()
+        if values.shape != (rows,):
+            return None
+        at = chunk_of == c
+        if out is None:
+            out = np.empty(idx.size, dtype=values.dtype)
+        out[at] = values[idx[at] - c * rows]
+    return out
+
+
 #: Cells above which the direct path reads in parallel.
 #:
 #: The direct reader exists to skip zarr's async machinery per chunk,
@@ -391,8 +482,16 @@ def _direct_read(spec: _DirectSpec, chunk_key: str) -> bytes | None:
 #: than where parallelism first helps: below it nothing changes, above
 #: it a slow store stops being read one file at a time. ``open`` and
 #: ``read`` release the GIL, so the threads genuinely overlap; decoding
-#: stays on the calling thread.
+#: has its own threshold, :data:`_PARALLEL_DECODE_MIN_BYTES`.  Above it,
+#: files are still read serially (on a warm store the pool is a loss) until
+#: a run of :data:`_READ_PROBE` averages over :data:`_SLOW_READ_S` a file.
 _PARALLEL_READ_MIN = 256
+_READ_PROBE = 32
+_SLOW_READ_S = 200e-6
+
+#: Compressed bytes above which a plan's cells are decoded on the reader
+#: pool: zstd releases the GIL; an uncompressed cell's copy does not.
+_PARALLEL_DECODE_MIN_BYTES = 32 << 20
 _PARALLEL_READ_WORKERS = min(16, (os.cpu_count() or 4) * 2)
 
 _READ_POOL: Any = None
@@ -429,6 +528,24 @@ def _reset_read_pool_after_fork() -> None:
 
 if hasattr(os, "register_at_fork"):
     os.register_at_fork(after_in_child=_reset_read_pool_after_fork)
+
+
+def _read_files(paths: list[str]) -> list[bytes | None]:
+    """:func:`_read_file` for each of ``paths``, in order; serial while the
+    store answers quickly (see :data:`_PARALLEL_READ_MIN`)."""
+    if len(paths) < _PARALLEL_READ_MIN:
+        return [_read_file(p) for p in paths]
+    raws: list[bytes | None] = []
+    for start in range(0, len(paths), _READ_PROBE):
+        run = paths[start:start + _READ_PROBE]
+        t0 = time.perf_counter()
+        raws.extend(_read_file(p) for p in run)
+        if time.perf_counter() - t0 > _SLOW_READ_S * len(run):
+            raws.extend(
+                _read_pool().map(_read_file, paths[start + len(run):])
+            )
+            break
+    return raws
 
 
 def _direct_read_many(
@@ -470,23 +587,50 @@ def _direct_read_plan(
                 wanted.append((array_name, spec, chunk_key, path))
     if not wanted:
         return {}
-    if len(wanted) >= _PARALLEL_READ_MIN:
-        raws = list(
-            _read_pool().map(_read_file, [w[3] for w in wanted])
-        )
+    raws = _read_files([w[3] for w in wanted])
+    specs = [w[1] for w in wanted]
+    compressed = sum(
+        len(raw) for spec, raw in zip(specs, raws)
+        if raw is not None and spec.codecs
+    )
+    if len(wanted) > 1 and compressed >= _PARALLEL_DECODE_MIN_BYTES:
+        # A few slices per worker rather than a future per cell, so a
+        # plan of many small cells does not pay a hand-off for each.
+        step = -(-len(wanted) // (4 * _PARALLEL_READ_WORKERS))
+        starts = range(0, len(wanted), step)
+        decoded = [
+            data
+            for part in _read_pool().map(
+                _decode_all,
+                [specs[i:i + step] for i in starts],
+                [raws[i:i + step] for i in starts],
+            )
+            for data in part
+        ]
     else:
-        raws = [_read_file(w[3]) for w in wanted]
+        decoded = _decode_all(specs, raws)
     out: dict[tuple[str, str], bytes] = {}
-    for (array_name, spec, chunk_key, _path), raw in zip(wanted, raws):
-        try:
-            data = _decode_direct(spec, raw)
-        except Exception:
+    for (array_name, _spec, chunk_key, _path), data in zip(wanted, decoded):
+        if isinstance(data, Exception):
             # Tolerant: the cell is left out, and its sync read raises.
             if not tolerant:
-                raise
+                raise data
             continue
         if data is not None:
             out[(array_name, chunk_key)] = data
+    return out
+
+
+def _decode_all(specs: list[_DirectSpec], raws: list[bytes | None]) -> list[Any]:
+    """:func:`_decode_direct` over paired cells, returning rather than
+    raising each cell's error, so a pooled decode reports the first
+    failing cell in plan order and a tolerant one skips just that cell."""
+    out: list[Any] = []
+    for spec, raw in zip(specs, raws):
+        try:
+            out.append(_decode_direct(spec, raw))
+        except Exception as exc:
+            out.append(exc)
     return out
 
 
@@ -598,9 +742,7 @@ SHARD_READERS = ("auto", "standard", "optimised", "zarr")
 def shard_reader() -> str:
     """How sharded arrays are read: ``ZARR_VECTORS_SHARD_READER``.
 
-    ``auto`` (the default): per array, by its sharding codec -- an array
-    written with zarr-octree's ``zarr_octree_sharding`` is read as
-    ``optimised``, every other array exactly as ``standard`` (see
+    ``auto`` (the default): ``optimised``, for every sharding codec (see
     :func:`shard_reader_for`).  ``standard``: as zarr-vectors always has
     -- a local store's shards read off the filesystem, each shard's index
     once for a batch and one range per wanted cell; any other store
@@ -624,19 +766,14 @@ def shard_reader() -> str:
 def shard_reader_for(src: Any, mode: str | None = None) -> str:
     """The reader one array gets: ``standard``, ``optimised`` or ``zarr``.
 
-    ``mode`` (default :func:`shard_reader`) as it stands, but for ``auto``,
-    which is decided by the array -- ``src``, its
-    :class:`~zarr_vectors.core._cells_on_disk.CellSource`: ``optimised``
-    for a zarr-octree shard index, which only that reader reads by run;
-    ``standard`` for anything else (``sharding_indexed``, unsharded, or
-    ``None``: no layout recognised), so a store without zarr-octree reads
-    as it always has.  Decided once per array, never per cell.
+    ``mode`` (default :func:`shard_reader`) as it stands, but ``auto`` is
+    ``optimised`` for every array ``src`` (its
+    :class:`~zarr_vectors.core._cells_on_disk.CellSource`), whatever its
+    shard index.  Decided once per array, never per cell.
     """
     if mode is None:
         mode = shard_reader()
-    if mode != "auto":
-        return mode
-    return "optimised" if getattr(src, "index_format", None) == "zarr_octree" else "standard"
+    return "optimised" if mode == "auto" else mode
 
 
 class _ShardedSpec(NamedTuple):
@@ -650,8 +787,8 @@ class _ShardedSpec(NamedTuple):
 def _sharded_spec(node: Any) -> _ShardedSpec | None:
     """A :class:`_ShardedSpec` for a sharded vlen array, else None: always
     under :func:`shard_reader` ``zarr``, and for a store that is not local
-    when the array is read ``standard`` (see :func:`shard_reader_for`:
-    under the default ``auto``, every array but a zarr-octree one).
+    when the array is read ``standard`` (see :func:`shard_reader_for`;
+    never under the default ``auto``).
 
     zarr reads a sharded cell through the sharding codec one cell at a
     time -- the shard's index, then the cell's range, each a round trip
@@ -699,6 +836,8 @@ def _sharded_read_plan(
     """
     from zarr_vectors.core._cells_on_disk import read_cells
 
+    if sum(len(k) for *_, k in entries) >= _BATCH_CELLS * len(entries):
+        return _sharded_read_batched(entries, tolerant=tolerant)
     requests, wanted = [], []
     for array_name, spec, chunk_keys in entries:
         src = spec.source
@@ -725,6 +864,113 @@ def _sharded_read_plan(
                 if isinstance(raw, Exception):
                     raise raw
                 data = _decode_direct(spec, raw)
+            except Exception:
+                if not tolerant:
+                    raise
+                continue
+            if data is not None:
+                out[(array_name, chunk_key)] = data
+    return out
+
+
+#: Cells per array, on average, from which :func:`_sharded_read_batched`
+#: takes a read (it has a fixed cost per array).
+_BATCH_CELLS = 32
+
+
+def _cells_of(src: Any, chunk_keys: list[str]) -> tuple[np.ndarray, list[str]]:
+    """The ``(C, K)`` cell indices of the keys ``src`` can hold, and those
+    keys: :func:`_parse_coords`, the origin and the grid as arrays."""
+    ndim = len(src.shape)
+    try:
+        if any(k.count(".") != ndim - 1 for k in chunk_keys):
+            raise ValueError
+        cells = np.asarray(list(map(int, ".".join(chunk_keys).split("."))), dtype=np.int64)
+    except ValueError:  # some key is not ndim integers: judged one by one
+        parsed = [(_parse_coords(k), k) for k in chunk_keys]
+        parsed = [(c, k) for c, k in parsed if c is not None and len(c) == ndim]
+        chunk_keys = [k for _, k in parsed]
+        cells = np.asarray([c for c, _ in parsed], dtype=np.int64)
+    cells = cells.reshape(-1, ndim)
+    if src.origin is not None:
+        cells = cells - np.asarray(src.origin, dtype=np.int64)
+    inside = np.all((cells >= 0) & (cells < np.asarray(src.shape, dtype=np.int64)), axis=1)
+    if not inside.all():
+        cells = cells[inside]
+        chunk_keys = [k for k, ok in zip(chunk_keys, inside.tolist()) if ok]
+    return cells, list(chunk_keys)
+
+
+def _zstd_steps(codecs: tuple[Any, ...]) -> list[Any] | None:
+    """The decompressions a cell's stored bytes go through, last codec
+    first, when every codec is zstd (or the octree marker, the identity
+    on bytes); else None."""
+    from numcodecs import zstd
+
+    steps = []
+    for codec in reversed(codecs):
+        if type(codec).__name__ == "OctreeChunksMarker":
+            continue
+        if type(codec).__name__ != "ZstdCodec" or type(codec._zstd_codec) is not zstd.Zstd:
+            return None
+        steps.append(zstd.decompress)
+    return steps
+
+
+def _sharded_read_batched(
+    entries: list[tuple[str, _ShardedSpec, list[str]]],
+    *,
+    tolerant: bool = False,
+) -> dict[tuple[str, str], bytes]:
+    """:func:`_sharded_read_plan` with the per-cell work done as arrays,
+    when a read averages ``_BATCH_CELLS`` or more cells an array: keys
+    parsed, cells located and their reads planned for all cells at once (see
+    :func:`~zarr_vectors.core._cells_on_disk.read_cell_spans`), and each
+    cell decompressed straight out of its read. Same reads, same results.
+    """
+    from zarr_vectors.core._cells_on_disk import read_cell_spans
+
+    requests, wanted = [], []
+    for array_name, spec, chunk_keys in entries:
+        cells, keys = _cells_of(spec.source, chunk_keys)
+        if keys:
+            requests.append((spec.source, cells))
+            wanted.append((array_name, spec, keys))
+    if not requests:
+        return {}
+    located, reads = read_cell_spans(requests)
+    views = [memoryview(r) if isinstance(r, bytes) else r for r in reads]
+    # A read's length; -1 for a non-bytes read and for no read (the last).
+    lengths = np.asarray(
+        [len(v) if isinstance(v, memoryview) else -1 for v in views] + [-1], dtype=np.int64,
+    )
+    header = _VLEN_COUNT_LENGTH.size
+    unpack = _VLEN_COUNT_LENGTH.unpack_from
+    out: dict[tuple[str, str], bytes] = {}
+    for (array_name, spec, keys), (read, start, stop, errors) in zip(wanted, located):
+        steps = _zstd_steps(spec.codecs)
+        whole = (lengths[np.where(read >= 0, read, -1)] >= stop).tolist()
+        cells = zip(keys, whole, read.tolist(), start.tolist(), stop.tolist())
+        for i, (chunk_key, served, r, a, b) in enumerate(cells):
+            try:
+                if served and steps is not None:
+                    frame: Any = views[r][a:b]
+                    for step in steps:
+                        frame = step(frame)
+                    if len(frame) >= header:
+                        count, length = unpack(frame)
+                        if count == 1 and length == len(frame) - header:
+                            out[(array_name, chunk_key)] = bytes(frame[header:])
+                            continue
+                view = views[r] if r >= 0 else errors.get(i)
+                if view is None:  # nothing stored
+                    out[(array_name, chunk_key)] = b""
+                    continue
+                if isinstance(view, Exception):
+                    raise view
+                if b > len(view):
+                    raise ValueError("short read")
+                data = _decode_direct(spec, bytes(view[a:b]))
             except Exception:
                 if not tolerant:
                     raise

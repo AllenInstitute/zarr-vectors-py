@@ -22,6 +22,7 @@ from zarr_vectors.core.store import (
     read_root_metadata,
 )
 from zarr_vectors.typing import ChunkCoords
+from zarr_vectors.validate.metadata import level_fields
 from zarr_vectors.validate.structure import ValidationResult
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
@@ -94,8 +95,8 @@ def validate_consistency(store_path: str | Path | Group) -> ValidationResult:
 
         # Determine effective bin shape for this level
         try:
-            la = lg.attrs
-            level_bin_shape = la.get("bin_shape") or la.get("bin_size")
+            la = level_fields(root, li, lg)
+            level_bin_shape = la.get("bin_shape")
             if level_bin_shape is not None:
                 level_bin_shape = tuple(float(x) for x in level_bin_shape)
             elif li == 0:
@@ -104,10 +105,16 @@ def validate_consistency(store_path: str | Path | Group) -> ValidationResult:
                 level_bin_shape = level_chunk_shape  # unknown — skip bin checks
         except Exception:
             level_bin_shape = level_chunk_shape
+        if any(
+            bs <= 0 or abs(cs / bs - round(cs / bs)) > 1e-9
+            for cs, bs in zip(level_chunk_shape, level_bin_shape)
+        ):
+            # Non-tiling bins have no per-bin layout; level 2 judges them.
+            level_bin_shape = level_chunk_shape
 
         # Compute bins_per_chunk for this level
         level_bins_per_chunk = tuple(
-            int(round(cs / bs))
+            max(1, int(round(cs / bs)))
             for cs, bs in zip(level_chunk_shape, level_bin_shape)
         )
         max_fragments = 1
@@ -228,11 +235,25 @@ def validate_consistency(store_path: str | Path | Group) -> ValidationResult:
         )
 
         try:
-            la = lg.attrs
-            evc = la.get("vertex_count")
+            evc = level_fields(root, li, lg).get("vertex_count")
             if evc is not None:
-                if total_verts != evc:
-                    result.add_error(f"{prefix}: metadata vertex_count={evc}, actual={total_verts}")
+                # Stored rows, not summed fragment lengths: fragments may
+                # share rows.
+                from zarr_vectors.core.arrays import chunk_vertex_count
+                n_rows = sum(
+                    chunk_vertex_count(lg, ck) for ck in chunk_fragment_counts
+                )
+                if evc == 0 and n_rows:
+                    # 0 is a placeholder some build paths never refresh.
+                    result.add_warning(
+                        f"{prefix}: metadata vertex_count=0 (not recorded), "
+                        f"actual={n_rows} stored vertex rows"
+                    )
+                elif n_rows != evc:
+                    result.add_error(
+                        f"{prefix}: metadata vertex_count={evc}, "
+                        f"actual={n_rows} stored vertex rows"
+                    )
                 else:
                     result.add_pass(f"{prefix}: vertex_count matches")
         except Exception:

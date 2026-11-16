@@ -14,7 +14,7 @@ the segment-to-segment bridges are ever stored.
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Any, Literal
+from typing import TYPE_CHECKING, Any, Literal, NamedTuple
 
 import numpy as np
 import numpy.typing as npt
@@ -33,6 +33,8 @@ from zarr_vectors.constants import (
     VERTICES,
 )
 from zarr_vectors.core.arrays import (
+    _read_chunk_fragments,
+    _reshape_vertex_buffer,
     attribute_layout,
     create_attribute_array,
     create_fragment_attribute_array,
@@ -41,22 +43,23 @@ from zarr_vectors.core.arrays import (
     create_object_attributes_array,
     create_object_index_array,
     create_vertices_array,
+    read_all_object_manifests_csr,
     read_chunk_attributes,
-    read_chunk_vertices,
     read_fragment,
     read_group_object_ids,
     read_object_manifest_rows,
     read_object_manifests,
+    read_vertex_fragment_index,
     resolve_chunk_keys,
     stamp_fragments_tile,
     write_chunk_attributes,
     write_chunk_fragment_attributes,
-    write_chunk_vertices,
+    write_chunk_vertex_runs,
     write_groupings,
     write_groupings_attributes,
     write_links,
     write_object_attributes,
-    write_object_index,
+    write_object_index_arrays,
 )
 from zarr_vectors.core.attr_chunking import (
     assign_attribute_bins,
@@ -78,9 +81,9 @@ from zarr_vectors.core.store import (
     read_level_metadata,
     read_root_metadata,
 )
-from zarr_vectors.exceptions import ArrayError, StoreError
+from zarr_vectors.exceptions import ArrayError, ChunkingError, StoreError
 from zarr_vectors.spatial.boundary import (
-    split_polyline_at_boundaries,
+    _pack_rows,
 )
 from zarr_vectors.spatial.chunking import (
     compute_bounds,
@@ -90,13 +93,129 @@ from zarr_vectors.typing import (
     BoundingBox,
     ChunkCoords,
     ChunkShape,
-    CrossChunkLink,
     FragmentRef,
     ObjectManifest,
 )
 
 if TYPE_CHECKING:
+    from collections.abc import Sequence
+
     from zarr_vectors.core.store import ReadSource, WriteTarget
+
+
+class _FragmentPlan(NamedTuple):
+    """Per-fragment chunk placement; chunk ``c`` is rows
+    ``chunk_rows[c]:chunk_rows[c+1]`` of ``flat[rows]`` and fragments
+    ``chunk_frags[c]:chunk_frags[c+1]``, in polyline order."""
+
+    seg_poly: npt.NDArray[np.int64]
+    seg_key: npt.NDArray[np.int64]
+    seg_len: npt.NDArray[np.int64]
+    frag: npt.NDArray[np.int64]
+    first: npt.NDArray[np.int64]
+    rows: npt.NDArray[np.int64]
+    sorted_len: npt.NDArray[np.int64]
+    chunk_keys: npt.NDArray[np.int64]
+    chunk_rows: npt.NDArray[np.int64]
+    chunk_frags: npt.NDArray[np.int64]
+
+
+def _plan_fragments(
+    flat: npt.NDArray[np.floating],
+    lengths: npt.NDArray[np.int64],
+    chunk_shape: Any,
+    attr_bins: npt.NDArray[np.int64] | None = None,
+) -> _FragmentPlan:
+    """Split the concatenated polylines ``flat`` at chunk-key changes
+    (attribute bin, then spatial chunk); a stable sort keeps polyline
+    order within each chunk."""
+    n, ndim = flat.shape
+    if len(chunk_shape) != ndim:
+        raise ChunkingError(
+            f"chunk_shape length {len(chunk_shape)} != vertex ndim {ndim}"
+        )
+    cs = np.array(chunk_shape, dtype=np.float64)
+    keys = np.floor(flat / cs).astype(np.int64)
+    if attr_bins is not None:
+        keys = np.concatenate([attr_bins.astype(np.int64)[:, None], keys], axis=1)
+    poly_starts = np.zeros(len(lengths), dtype=np.int64)
+    np.cumsum(lengths[:-1], out=poly_starts[1:])
+    new_seg = np.zeros(n, dtype=bool)
+    new_seg[poly_starts[lengths > 0]] = True
+    new_seg[1:] |= np.any(keys[1:] != keys[:-1], axis=1)
+    seg_start = np.flatnonzero(new_seg)
+    seg_len = np.diff(np.append(seg_start, n))
+    seg_poly = np.searchsorted(poly_starts, seg_start, side="right") - 1
+    seg_key = keys[seg_start]
+    n_seg = len(seg_start)
+
+    packed = _pack_rows(seg_key)
+    if packed is not None:
+        order = np.argsort(packed, kind="stable")
+        sorted_packed = packed[order]
+        new_chunk = np.ones(n_seg, dtype=bool)
+        new_chunk[1:] = sorted_packed[1:] != sorted_packed[:-1]
+    else:
+        order = np.lexsort(seg_key.T[::-1])
+        sorted_key = seg_key[order]
+        new_chunk = np.ones(n_seg, dtype=bool)
+        new_chunk[1:] = np.any(sorted_key[1:] != sorted_key[:-1], axis=1)
+    chunk_first = np.flatnonzero(new_chunk)
+    chunk_of = np.cumsum(new_chunk) - 1
+    sorted_len = seg_len[order]
+    row_start = np.cumsum(sorted_len) - sorted_len
+    frag = np.empty(n_seg, dtype=np.int64)
+    frag[order] = np.arange(n_seg) - chunk_first[chunk_of]
+    first = np.empty(n_seg, dtype=np.int64)
+    first[order] = row_start - row_start[chunk_first][chunk_of]
+    rows = np.repeat(seg_start[order] - row_start, sorted_len) + np.arange(n)
+    return _FragmentPlan(
+        seg_poly=seg_poly,
+        seg_key=seg_key,
+        seg_len=seg_len,
+        frag=frag,
+        first=first,
+        rows=rows,
+        sorted_len=sorted_len,
+        chunk_keys=seg_key[order[chunk_first]],
+        chunk_rows=np.append(row_start[chunk_first], n),
+        chunk_frags=np.append(chunk_first, n_seg),
+    )
+
+
+def _check_vertex_attribute_rows(
+    name: str, arrays: list[npt.NDArray], lengths: npt.NDArray[np.int64],
+) -> None:
+    """Raise unless ``arrays`` holds one entry per polyline, each with
+    one row per vertex."""
+    if len(arrays) != len(lengths):
+        raise ArrayError(
+            f"vertex_attributes[{name!r}] has {len(arrays)} entries but "
+            f"there are {len(lengths)} polylines"
+        )
+    counts = np.fromiter((len(a) for a in arrays), dtype=np.int64, count=len(arrays))
+    if not np.array_equal(counts, lengths):
+        k = int(np.flatnonzero(counts != lengths)[0])
+        raise ArrayError(
+            f"vertex_attributes[{name!r}][{k}] has {counts[k]} rows but "
+            f"polyline {k} has {lengths[k]} vertices"
+        )
+
+
+def _concat_vertex_attribute(
+    name: str, arrays: list[npt.NDArray], lengths: npt.NDArray[np.int64],
+) -> npt.NDArray:
+    """Concatenate per-polyline arrays, cast to the first entry's dtype."""
+    _check_vertex_attribute_rows(name, arrays, lengths)
+    try:
+        return np.concatenate(
+            arrays, axis=0, dtype=np.asarray(arrays[0]).dtype, casting="unsafe",
+        )
+    except ValueError as exc:
+        raise ArrayError(
+            f"vertex_attributes[{name!r}] entries differ in shape past "
+            f"the first axis"
+        ) from exc
 
 
 def write_polylines(
@@ -118,6 +237,7 @@ def write_polylines(
     out_of_bounds: str = DEFAULT_OOB_POLICY,
     compressor: Any = None,
     shard_shape: int | tuple[int, ...] | None | Literal["inherit"] = "inherit",
+    manifest_layout: str | None = None,
 ) -> dict[str, Any]:
     """Write polylines/streamlines to a new zarr vectors store.
 
@@ -139,6 +259,9 @@ def write_polylines(
         group_attributes: Per-group attributes ``{name: (G,) or (G,C)}``.
         dtype: Numpy dtype for positions.
         geometry_type: ``"streamline"`` or ``"polyline"``.
+        manifest_layout: ``"dense"`` for a fixed-width object index
+            (see :func:`~zarr_vectors.core.store.create_store`); only
+            used when this call creates the store.
 
     Returns:
         Summary dict.
@@ -164,7 +287,7 @@ def write_polylines(
     # bin_shape is retained in the store metadata (``base_bin_shape``)
     # for downstream attribute-chunking / spatial-index sub-binning, but
     # the polyline writer itself splits at chunk boundaries only — see
-    # the call to ``split_polyline_at_boundaries`` below.
+    # the call to ``_plan_fragments`` below.
 
     # Checked before anything is created.  It used to be rejected after
     # ``_create_or_open_store``, which left an empty store on disk for a
@@ -187,6 +310,7 @@ def write_polylines(
         # one keeps its own declaration. "inherit" means the caller said
         # nothing, so there is nothing to declare on a fresh store.
         shard_shape=None if shard_shape == "inherit" else shard_shape,
+        manifest_layout=manifest_layout,
     )
     _apply_out_of_bounds_policy(root, all_pts, policy=out_of_bounds)
 
@@ -205,7 +329,10 @@ def write_polylines(
     # per-vertex array; vertex_attributes[<name>] is the same list-of-
     # arrays shape (one per polyline).  Bin assignment is computed
     # globally across all polylines so bin indices are consistent.
-    per_poly_attr_bins: list[npt.NDArray[np.int64]] | None = None
+    lengths = np.fromiter(
+        (len(p) for p in polylines), dtype=np.int64, count=n_polylines,
+    )
+    attr_bins: npt.NDArray[np.int64] | None = None
     attr_bin_values: list[Any] | None = None
     if chunk_by_attribute is not None:
         if not vertex_attributes or chunk_by_attribute not in vertex_attributes:
@@ -220,22 +347,48 @@ def write_polylines(
                 f"chunk_by_attribute list length {len(attr_lists)} != "
                 f"n_polylines {n_polylines}"
             )
-        concat = np.concatenate(attr_lists)
-        bins_concat, attr_bin_values = assign_attribute_bins(concat)
-        per_poly_attr_bins = []
-        offset = 0
-        for arr in attr_lists:
-            n = len(arr)
-            per_poly_attr_bins.append(bins_concat[offset:offset + n])
-            offset += n
+        _check_vertex_attribute_rows(chunk_by_attribute, attr_lists, lengths)
+        attr_bins, attr_bin_values = assign_attribute_bins(
+            np.concatenate(attr_lists),
+        )
         # The chunk-by attribute is implicit in the leading chunk axis.
         vertex_attributes = {
             k: v for k, v in vertex_attributes.items() if k != chunk_by_attribute
         }
 
-    arrays_present = [VERTICES, "object_index"]
+    # Split at chunk (and attribute-bin) boundaries, never bin_shape:
+    # implicit_sequential has nowhere to keep same-chunk fragment edges.
+    flat_verts = np.ascontiguousarray(all_pts, dtype=np_dtype)
+    plan = _plan_fragments(flat_verts, lengths, chunk_shape, attr_bins)
+    flat_attrs = {
+        name: _concat_vertex_attribute(name, attr_list, lengths)[plan.rows]
+        for name, attr_list in (vertex_attributes or {}).items()
+    }
+    chunk_verts = flat_verts[plan.rows]
+
+    # Bridge: last vertex of a fragment -> first of the polyline's next.
+    bridge = np.flatnonzero(plan.seg_poly[1:] == plan.seg_poly[:-1])
+    bridge_chunks = np.stack(
+        [plan.seg_key[bridge], plan.seg_key[bridge + 1]], axis=1,
+    )
+    bridge_rows = np.stack(
+        [plan.first[bridge] + plan.seg_len[bridge] - 1, plan.first[bridge + 1]],
+        axis=1,
+    )
+
+    arrays_present = [VERTICES, VERTEX_FRAGMENTS, "object_index"]
+    if vertex_attributes:
+        arrays_present.append(VERTEX_ATTRIBUTES)
     if fragment_attributes:
         arrays_present.append(FRAGMENT_ATTRIBUTES)
+    if object_attributes:
+        arrays_present.append("object_attributes")
+    if groups:
+        arrays_present.append("groups")
+    if group_attributes:
+        arrays_present.append("group_attributes")
+    if len(bridge):
+        arrays_present.append("links")
     level_chunk_dims: list[str] | None = None
     if chunk_by_attribute is not None:
         level_chunk_dims = compute_chunk_dim_names(
@@ -252,119 +405,7 @@ def write_polylines(
     )
     level_group = create_resolution_level(root, 0, level_meta)
 
-    # Split each polyline at chunk boundaries and accumulate per-chunk data
-    # chunk_data[chunk_coords] = list of (polyline_id, segment_vertices, segment_attrs)
-    chunk_data: dict[ChunkCoords, list[tuple[int, npt.NDArray, dict[str, npt.NDArray]]]] = {}
-    object_manifests: dict[int, ObjectManifest] = {}
-    all_cross_links: list[CrossChunkLink] = []
-
-    def _slice_attrs(poly_id: int, start: int, end: int) -> dict[str, npt.NDArray]:
-        out: dict[str, npt.NDArray] = {}
-        if not vertex_attributes:
-            return out
-        for attr_name, attr_list in vertex_attributes.items():
-            out[attr_name] = attr_list[poly_id][start:end]
-        return out
-
-    # Per-chunk running offset into the chunk's vertices array — used
-    # to compute chunk-local vertex indices for the cross-chunk link
-    # endpoints below.  Each new fragment's first local vertex is the
-    # current offset; its last local vertex is offset + len - 1.
-    chunk_vertex_offsets: dict[ChunkCoords, int] = {}
-
-    for poly_id, poly_verts in enumerate(polylines):
-        poly_verts = np.asarray(poly_verts, dtype=np_dtype)
-
-        # Split at SPATIAL CHUNK boundaries, not bin boundaries.  Per the
-        # zarr-vectors spec, each (object, chunk) contributes ONE
-        # fragment with implicit_sequential edges; intra-chunk vertices
-        # are connected by implicit edges, and cross-chunk transitions
-        # become cross-chunk links (non-zero-offset records in the links
-        # family) with real chunk-local vertex indices.
-        # Splitting at bin boundaries would create multiple same-chunk
-        # fragments per object, leaving no place for the intra-chunk
-        # bin-boundary edges (implicit_sequential has no explicit links
-        # array to hold them).  bin_shape remains in effect for
-        # attribute-bin partitioning (poly_attr_bins) when that is
-        # configured.
-        segments = split_polyline_at_boundaries(poly_verts, chunk_shape)
-
-        if not segments:
-            object_manifests[poly_id] = []
-            continue
-
-        poly_attr_bins = (
-            per_poly_attr_bins[poly_id]
-            if per_poly_attr_bins is not None
-            else None
-        )
-
-        # Build a flat list of sub-segments: each is one contiguous run
-        # of polyline vertices that share (a) a spatial chunk and
-        # (b) — when attribute chunking is active — an attribute bin.
-        seg_lengths = [len(s[1]) for s in segments]
-        seg_offsets = np.cumsum([0, *seg_lengths[:-1]]).astype(np.int64)
-
-        sub_entries: list[tuple[ChunkCoords, npt.NDArray, dict[str, npt.NDArray]]] = []
-        for seg_idx, (spatial_cc, seg_verts) in enumerate(segments):
-            seg_off = int(seg_offsets[seg_idx])
-            seg_len = seg_lengths[seg_idx]
-
-            if poly_attr_bins is None:
-                sa = _slice_attrs(poly_id, seg_off, seg_off + seg_len)
-                sub_entries.append((spatial_cc, seg_verts, sa))
-                continue
-
-            seg_attr_bins = poly_attr_bins[seg_off:seg_off + seg_len]
-            transitions = np.where(np.diff(seg_attr_bins) != 0)[0] + 1
-            starts = np.concatenate([[0], transitions])
-            ends = np.concatenate([transitions, [seg_len]])
-            for s, e in zip(starts, ends):
-                ab = int(seg_attr_bins[int(s)])
-                prefixed = (ab,) + tuple(spatial_cc)
-                sa = _slice_attrs(
-                    poly_id, seg_off + int(s), seg_off + int(e),
-                )
-                sub_entries.append((prefixed, seg_verts[int(s):int(e)], sa))
-
-        # manifest_with_indices augments each manifest entry with the
-        # chunk-local vertex range of its fragment, used by the
-        # cross-chunk link writer below to record proper endpoints.
-        manifest: ObjectManifest = []
-        manifest_with_indices: list[
-            tuple[ChunkCoords, int, int, int]
-        ] = []  # (chunk_coords, fragment_idx, first_local_vert, last_local_vert)
-        for chunk_coords, sub_verts, sa in sub_entries:
-            if chunk_coords not in chunk_data:
-                chunk_data[chunk_coords] = []
-                chunk_vertex_offsets[chunk_coords] = 0
-            fragment_idx = len(chunk_data[chunk_coords])
-            first_local = chunk_vertex_offsets[chunk_coords]
-            last_local = first_local + len(sub_verts) - 1
-            chunk_vertex_offsets[chunk_coords] = first_local + len(sub_verts)
-            chunk_data[chunk_coords].append((poly_id, sub_verts, sa))
-            manifest.append((chunk_coords, fragment_idx))
-            manifest_with_indices.append(
-                (chunk_coords, fragment_idx, first_local, last_local)
-            )
-
-        object_manifests[poly_id] = manifest
-
-        # Cross-chunk links: one record per consecutive-fragment pair in
-        # different chunks.  Endpoint vertex indices are real chunk-
-        # local indices (last vertex of segment k → first vertex of
-        # segment k+1) so a reader can resolve the bridge without
-        # consulting the manifest.  With the per-chunk-only fragment
-        # split above, consecutive same-chunk entries cannot occur for
-        # a single polyline (would be merged into one fragment).
-        if len(manifest_with_indices) > 1:
-            for i in range(len(manifest_with_indices) - 1):
-                cc_a, _, _, last_a = manifest_with_indices[i]
-                cc_b, _, first_b, _ = manifest_with_indices[i + 1]
-                if cc_a != cc_b:
-                    all_cross_links.append(((cc_a, last_a), (cc_b, first_b)))
-
-    idx_ndim = ndim + 1 if per_poly_attr_bins is not None else ndim
+    idx_ndim = ndim + 1 if attr_bins is not None else ndim
     # Collapse all per-array zarr.json + per-chunk byte writes into one
     # asyncio.gather (mirrors points.py:300).  ``shard_shape`` also
     # activates native ``sharding_indexed`` for per-chunk arrays.
@@ -372,7 +413,7 @@ def write_polylines(
     # chunk_by_attribute prepends a leading attr-bin axis to every chunk
     # key; size the vlen array grid to match that rank.
     session_bin_count = (
-        len(attr_bin_values) if per_poly_attr_bins is not None else None
+        len(attr_bin_values) if attr_bins is not None else None
     )
     with open_write_session(
         level_group, compressor=compressor, shard_shape=shard_shape,
@@ -414,27 +455,24 @@ def write_polylines(
                     channel_names=channel_names,
                 )
 
-        for chunk_coords in sorted(chunk_data.keys()):
-            entries = chunk_data[chunk_coords]
-            vert_groups = [e[1] for e in entries]
-            write_chunk_vertices(
-                level_group, chunk_coords, vert_groups, dtype=np_dtype,
+        chunk_rows = plan.chunk_rows.tolist()
+        chunk_frags = plan.chunk_frags.tolist()
+        for c, key in enumerate(plan.chunk_keys.tolist()):
+            chunk_coords = tuple(key)
+            r0, r1 = chunk_rows[c], chunk_rows[c + 1]
+            write_chunk_vertex_runs(
+                level_group, chunk_coords, chunk_verts[r0:r1],
+                plan.sorted_len[chunk_frags[c]:chunk_frags[c + 1]],
+                dtype=np_dtype,
             )
-
-            # Write attributes per chunk
-            if vertex_attributes:
-                for attr_name in vertex_attributes:
-                    attr_groups = [e[2].get(attr_name) for e in entries]
-                    # Filter out None (shouldn't happen but be safe)
-                    attr_groups = [a for a in attr_groups if a is not None]
-                    if attr_groups:
-                        write_chunk_attributes(
-                            level_group, attr_name, chunk_coords, attr_groups,
-                            dtype=attr_groups[0].dtype,
-                        )
+            for attr_name, attr_rows in flat_attrs.items():
+                write_chunk_attributes(
+                    level_group, attr_name, chunk_coords, [attr_rows[r0:r1]],
+                    dtype=attr_rows.dtype,
+                )
 
             if fragment_attributes:
-                num_fragments = len(vert_groups)
+                num_fragments = chunk_frags[c + 1] - chunk_frags[c]
                 for fname, per_chunk in fragment_attributes.items():
                     if chunk_coords not in per_chunk:
                         continue
@@ -452,14 +490,23 @@ def write_polylines(
 
         # Write object index — chunk coords gain a leading dim when
         # attribute-chunked, so widen sid_ndim accordingly.
-        write_object_index(level_group, object_manifests, sid_ndim=idx_ndim)
+        manifest_offsets = np.zeros(n_polylines + 1, dtype=np.int64)
+        np.cumsum(
+            np.bincount(plan.seg_poly, minlength=n_polylines),
+            out=manifest_offsets[1:],
+        )
+        write_object_index_arrays(
+            level_group, manifest_offsets, plan.seg_key, plan.frag,
+            sid_ndim=idx_ndim,
+        )
 
         # Write the segment-to-segment bridges.  ``write_links`` routes
         # each one to the offsets array naming where its far endpoint sits
         # relative to the near one.
-        if all_cross_links:
+        if len(bridge):
             write_links(
-                level_group, all_cross_links, idx_ndim, delta=0, link_width=2,
+                level_group, [], idx_ndim, delta=0, link_width=2,
+                _arrays=(bridge_chunks, bridge_rows),
             )
 
         # Write object attributes
@@ -488,11 +535,11 @@ def write_polylines(
     return {
         "polyline_count": n_polylines,
         "vertex_count": total_vertices,
-        "chunk_count": len(chunk_data),
+        "chunk_count": len(plan.chunk_keys),
         # Every record is boundary-crossing by construction — one is
         # appended only where consecutive fragments landed in different
         # chunks, which is exactly the non-``is_intra`` offsets case.
-        "cross_chunk_link_count": len(all_cross_links),
+        "cross_chunk_link_count": len(bridge),
         "group_count": n_groups,
     }
 
@@ -690,6 +737,19 @@ def _read_polylines(
             )
         )
 
+    # A box alone: narrow to the objects whose manifests touch it.
+    touching_manifests: dict[int, ObjectManifest] | None = None
+    if (
+        target_chunks is not None
+        and not explicit_subset
+        and chunk_whitelist is None
+        and filter_bin is None
+    ):
+        touching = _objects_touching(level_group, target_chunks)
+        if touching is not None:
+            object_ids, touching_manifests = touching
+            explicit_subset = True
+
     result_polylines: list[list[npt.NDArray]] = []
     # One entry per emitted polyline, mirroring ``result_polylines``:
     # ``{name: [rows_per_fragment, ...]}``.
@@ -715,6 +775,18 @@ def _read_polylines(
         except Exception:
             continue
 
+    # The whole level, unfiltered: vectorised fast path, else the loop below.
+    if (
+        not explicit_subset
+        and target_chunks is None
+        and chunk_whitelist is None
+        and filter_bin is None
+        and not attr_layouts
+    ):
+        whole = _read_whole_level(level_group, len(object_ids), dtype, ndim)
+        if whole is not None:
+            return whole
+
     # Choose between a selective read (an explicit object/group subset —
     # read only those objects' manifests and the chunks they reference,
     # O(subset)) and a full read (decode every manifest + vertex chunk
@@ -728,12 +800,15 @@ def _read_polylines(
         # it takes to read every polyline in it. Missing and
         # out-of-range ids are simply absent from the result, which is
         # what the per-id ``except: continue`` was for.
-        try:
-            manifest_by_oid = read_object_manifests(
-                level_group, ids=[int(o) for o in object_ids],
-            )
-        except Exception:
-            manifest_by_oid = {}
+        if touching_manifests is not None:
+            manifest_by_oid = touching_manifests
+        else:
+            try:
+                manifest_by_oid = read_object_manifests(
+                    level_group, ids=[int(o) for o in object_ids],
+                )
+            except Exception:
+                manifest_by_oid = {}
         for m in manifest_by_oid.values():
             for cc, _fi in m:
                 needed_chunks.add(cc)
@@ -801,10 +876,10 @@ def _read_polylines(
         # Decode each materialised chunk's fragments exactly once.  The
         # per-object dispatch then slices from this cache — O(K_per_chunk)
         # per chunk instead of per-call offset recomputation.
-        chunk_cache: dict[ChunkCoords, list[npt.NDArray]] = {}
+        chunk_cache: dict[ChunkCoords, Sequence[npt.NDArray]] = {}
         for cc in chunk_iter:
             try:
-                chunk_cache[cc] = read_chunk_vertices(
+                chunk_cache[cc] = _read_chunk_fragments(
                     level_group, cc, dtype=dtype, ndim=ndim,
                 )
             except ArrayError:
@@ -967,6 +1042,210 @@ def _read_polylines(
         "ndim": ndim,
         "polyline_count": len(result_polylines),
         "vertex_count": total_verts,
+    }
+
+
+def _objects_touching(
+    level_group: Any, target_chunks: set[ChunkCoords],
+) -> tuple[list[int], dict[int, ObjectManifest] | None] | None:
+    """Ids (ascending) and manifests of objects with a fragment in
+    ``target_chunks``; manifests None on duplicate ids, everything None
+    when the manifests can't be read as arrays."""
+    from zarr_vectors.core.arrays import (
+        _manifest_csr_arrays,
+        _object_id_lookup,
+        read_object_id_table,
+    )
+    from zarr_vectors.core.dense_manifests import manifests_from_csr
+
+    if not target_chunks:
+        return [], {}
+    try:
+        offsets, coords, frags = _manifest_csr_arrays(level_group)
+        offsets = np.asarray(offsets, dtype=np.int64)
+        coords = np.asarray(coords, dtype=np.int64)
+        frags = np.asarray(frags, dtype=np.int64)
+        lookup = _object_id_lookup(level_group)
+        ids = None
+        if lookup is not None and lookup[0] != "identity":
+            ids = read_object_id_table(level_group)
+    except Exception:
+        return None
+    n_obj = int(offsets.shape[0]) - 1
+    if n_obj <= 0 or coords.shape[0] == 0:
+        return [], {}
+    targets = np.asarray(sorted(target_chunks), dtype=np.int64)
+    if targets.ndim != 2 or targets.shape[1] != coords.shape[1]:
+        return None
+    # Per-column min/max: faster than an axis-0 reduction here.
+    cols = range(coords.shape[1])
+    lo = [min(int(coords[:, d].min()), int(targets[:, d].min())) for d in cols]
+    span = [
+        max(int(coords[:, d].max()), int(targets[:, d].max())) - lo[d] + 1
+        for d in cols
+    ]
+    total = 1
+    for v in span:
+        total *= v
+    if total >= (1 << 62):
+        return None
+
+    def pack(a: npt.NDArray[np.int64]) -> npt.NDArray[np.int64]:
+        out = np.zeros(a.shape[0], dtype=np.int64)
+        for d in cols:
+            out *= span[d]
+            out += a[:, d] - lo[d]
+        return out
+
+    hit = np.isin(pack(coords), pack(targets))
+    owner = np.repeat(np.arange(n_obj, dtype=np.int64), np.diff(offsets))
+    rows = np.unique(owner[hit])
+    if ids is not None:
+        ids = ids[:n_obj]
+        oids = ids[rows]
+        if lookup[1].size > 1 and not np.all(lookup[1][1:] != lookup[1][:-1]):
+            return np.sort(oids).tolist(), None
+    else:
+        oids = rows
+    starts = offsets[rows]
+    counts = offsets[rows + 1] - starts
+    bounds = np.zeros(rows.size + 1, dtype=np.int64)
+    np.cumsum(counts, out=bounds[1:])
+    sel = np.repeat(starts - bounds[:-1], counts) + np.arange(int(bounds[-1]))
+    manifests = manifests_from_csr(bounds, coords[sel], frags[sel])
+    by_id = dict(zip(oids.tolist(), manifests))
+    return np.sort(oids).tolist(), by_id
+
+
+def _packable(span: npt.NDArray[np.int64]) -> bool:
+    """Whether coordinates over ``span`` pack into one int64 each."""
+    total = 1
+    for v in span.tolist():
+        total *= int(v)
+    return total < (1 << 62)
+
+
+def _pack_coords(
+    coords: npt.NDArray[np.int64],
+    lo: npt.NDArray[np.int64],
+    span: npt.NDArray[np.int64],
+) -> npt.NDArray[np.int64]:
+    """Each ``(D,)`` row of ``coords`` as one integer, row-major over ``span``."""
+    out = np.zeros(coords.shape[0], dtype=np.int64)
+    for d in range(coords.shape[1]):
+        out *= int(span[d])
+        out += coords[:, d] - lo[d]
+    return out
+
+
+def _read_whole_level(
+    level_group: Any,
+    num_objects: int,
+    dtype: np.dtype,
+    ndim: int,
+) -> dict[str, Any] | None:
+    """The per-object full read of :func:`_read_polylines`, from CSR
+    manifests; None for any case that loop handles specially (bad
+    manifests/chunks, explicit fragments, duplicate ids)."""
+    try:
+        csr = read_all_object_manifests_csr(level_group)
+    except Exception:
+        return None
+    offsets = np.asarray(csr.offsets, dtype=np.int64)
+    coords = np.asarray(csr.chunk_coords, dtype=np.int64)
+    fragment_idx = np.asarray(csr.fragment_idx, dtype=np.int64)
+    n_rows = int(offsets.shape[0]) - 1
+    per_row = np.diff(offsets)
+    if csr.object_ids is None:
+        ids = np.arange(n_rows, dtype=np.int64)
+        listed = ids < num_objects
+    else:
+        ids = np.asarray(csr.object_ids, dtype=np.int64)
+        if ids.shape[0] != n_rows:
+            return None
+        listed = (ids >= 0) & (ids < num_objects)
+        named = np.sort(ids[listed])
+        if named.size > 1 and bool((named[1:] == named[:-1]).any()):
+            return None
+    # Ascending by id, as the per-object loop emits them.
+    rows = np.flatnonzero(listed & (per_row > 0))
+    rows = rows[np.argsort(ids[rows], kind="stable")]
+    if rows.size == 0:
+        return _empty_polyline_result(ndim)
+
+    per = per_row[rows]
+    ends = np.cumsum(per)
+    entries = np.repeat(offsets[rows] - (ends - per), per) + np.arange(
+        int(ends[-1]), dtype=np.int64,
+    )
+    entry_coords = coords[entries]
+    lo = entry_coords.min(axis=0)
+    span = entry_coords.max(axis=0) - lo + 1
+    if not _packable(span):
+        return None
+    packed, entry_chunk = np.unique(
+        _pack_coords(entry_coords, lo, span), return_inverse=True,
+    )
+    chunk_coords = np.empty((packed.shape[0], coords.shape[1]), dtype=np.int64)
+    rest = packed
+    for d in range(coords.shape[1] - 1, -1, -1):
+        chunk_coords[:, d] = rest % span[d] + lo[d]
+        rest = rest // span[d]
+    chunk_list = [tuple(cc) for cc in chunk_coords.tolist()]
+    keys = [".".join(str(c) for c in cc) for cc in chunk_list]
+
+    buffers: list[npt.NDArray] = []
+    tables: list[npt.NDArray[np.int64]] = []
+    base = 0
+    with level_group.batched_reads([(VERTICES, keys), (VERTEX_FRAGMENTS, keys)]):
+        for cc, key in zip(chunk_list, keys):
+            try:
+                raw = level_group.read_bytes(VERTICES, key)
+                fi = read_vertex_fragment_index(level_group, cc)
+            except Exception:
+                return None
+            table = fi.ranges()
+            if table is None:
+                return None
+            full = _reshape_vertex_buffer(raw, dtype, ndim)
+            table = np.asarray(table, dtype=np.int64).reshape(-1, 2)
+            if table.shape[0] and (
+                int(table[:, 0].min()) < 0
+                or int(table[:, 1].min()) < 0
+                or int((table[:, 0] + table[:, 1]).max()) > full.shape[0]
+            ):
+                return None
+            buffers.append(full)
+            tables.append(table + np.array([base, 0], dtype=np.int64))
+            base += full.shape[0]
+    n_fragments = np.array([t.shape[0] for t in tables], dtype=np.int64)
+    entry_fragment = fragment_idx[entries]
+    if bool(
+        ((entry_fragment < 0) | (entry_fragment >= n_fragments[entry_chunk])).any()
+    ):
+        return None
+    first = np.concatenate(([0], np.cumsum(n_fragments)[:-1]))
+    spans = np.concatenate(tables)[first[entry_chunk] + entry_fragment]
+    vertices = np.concatenate(buffers) if len(buffers) > 1 else buffers[0]
+    # Read-only, like the other read paths' buffers.
+    vertices.flags.writeable = False
+
+    starts = spans[:, 0]
+    stops = starts + spans[:, 1]
+    fragments = [
+        vertices[a:b] for a, b in zip(starts.tolist(), stops.tolist())
+    ]
+    bounds = [0, *ends.tolist()]
+    polylines = [
+        fragments[a:b] for a, b in zip(bounds[:-1], bounds[1:])
+    ]
+    return {
+        "polylines": polylines,
+        "object_ids": ids[rows].tolist(),
+        "vertex_attributes": {},
+        "ndim": ndim,
+        "polyline_count": len(polylines),
+        "vertex_count": int(spans[:, 1].sum()),
     }
 
 

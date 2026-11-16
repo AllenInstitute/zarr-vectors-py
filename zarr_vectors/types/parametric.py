@@ -6,7 +6,7 @@ the ``/parametric/`` group at the store root, outside the resolution
 level hierarchy — they are resolution-independent.
 
 Each object is stored as a type tag followed by its coefficients.
-A type registry in ``/parametric/.zattrs`` maps type IDs to names
+A type registry in the ``/parametric/`` group's attributes maps type IDs to names
 and coefficient schemas so readers can parse any object without
 hardcoded knowledge of every type.
 
@@ -199,6 +199,8 @@ def write_parametric_objects(
             para.write_array(
                 full_name, arr,
                 attributes={
+                    "zv_array": "object_attribute",
+                    "name": attr_name,
                     "dtype": str(arr.dtype),
                     "shape": list(arr.shape),
                 },
@@ -214,7 +216,7 @@ def write_parametric_objects(
         ]
         para.write_vlen_array(
             "groups", blobs,
-            attributes={"num_groups": max_gid + 1},
+            attributes={"zv_array": "groups", "num_groups": max_gid + 1},
         )
 
     if group_attributes:
@@ -224,6 +226,8 @@ def write_parametric_objects(
             para.write_array(
                 full_name, arr,
                 attributes={
+                    "zv_array": "groupings_attribute",
+                    "name": attr_name,
                     "dtype": str(arr.dtype),
                     "shape": list(arr.shape),
                 },

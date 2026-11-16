@@ -32,6 +32,7 @@ Public surface mirrors the legacy :class:`FsGroup` for back-compat:
 
 from __future__ import annotations
 
+import os
 import warnings
 from collections.abc import Callable, Iterable, Iterator, Sequence
 from contextlib import contextmanager
@@ -53,6 +54,7 @@ from zarr_vectors.constants import (
 from zarr_vectors.constants import (
     VERTICES as _VERTICES_ARRAY,
 )
+from zarr_vectors.core._local_meta import resolve_local_node
 from zarr_vectors.core._vlen import (
     cell_region as _vlen_cell_region,
 )
@@ -462,9 +464,17 @@ class Group:
         """
         if self._offline is not None:
             return self.children()
+        store_path = self._zarr.store_path
+        if isinstance(store_path.store, LocalStore):
+            try:
+                names = os.listdir(
+                    os.path.join(str(store_path.store.root), store_path.path)
+                )
+            except (FileNotFoundError, NotADirectoryError):
+                return []
+            return sorted(n for n in names if n != "zarr.json")
         from zarr.core.sync import sync
 
-        store_path = self._zarr.store_path
         prefix = f"{store_path.path}/" if store_path.path else ""
 
         async def _collect() -> list[str]:
@@ -849,6 +859,17 @@ class Group:
             return
         missing = {p for p in paths if self._full_path(p) not in cache}
         if not missing:
+            return
+        try:
+            # A local store answers on this thread faster than the
+            # gather below can be scheduled.
+            for path in sorted(missing):
+                node = resolve_local_node(self._zarr, path)
+                cache[self._full_path(path)] = _ABSENT if node is None else node
+            return
+        except NotImplementedError:
+            pass
+        except Exception:
             return
         from zarr.core.sync import sync
 
@@ -1998,8 +2019,13 @@ class Group:
         offline = self._offline_rows(path, indices)
         if offline is not None:
             return offline
+        from zarr_vectors.core._batch_reader import direct_elements
+
         node = self._require_array_node(path)
         idx = np.asarray(indices, dtype=np.int64)
+        direct = direct_elements(node, idx)
+        if direct is not None:
+            return [bytes(b) for b in direct]
         try:
             selected = node.get_coordinate_selection((idx,))
         except Exception:
@@ -2281,6 +2307,12 @@ class Group:
           async path exists to avoid, so it raises instead.
         """
         offline = self._offline
+        if offline is None:
+            from zarr_vectors._query_nodes import lookup
+
+            primed = lookup(self._zarr.store, self._full_path(path))
+            if primed is not None:
+                return None if primed is _ABSENT else primed
         if offline is not None:
             full = self._full_path(path)
             hit = offline.nodes.get(full)
@@ -2313,8 +2345,17 @@ class Group:
             if hit is not None:
                 return None if hit is _ABSENT else hit
         try:
-            node = self._zarr[path]
-        except KeyError:
+            node = resolve_local_node(self._zarr, path)
+        except NotImplementedError:
+            try:
+                node = self._zarr[path]
+            except KeyError:
+                node = None
+        if offline is None:
+            from zarr_vectors._query_nodes import remember
+
+            remember(self._zarr.store, self._full_path(path), _ABSENT if node is None else node)
+        if node is None:
             return None
         if cache is not None and (
             isinstance(node, zarr.Array) or self._node_cache_readonly

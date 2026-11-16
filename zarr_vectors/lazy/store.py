@@ -29,7 +29,7 @@ from zarr_vectors.lazy.level import ZVLevel
 class ZVStore:
     """Lazy handle to a zarr vectors store.
 
-    Attributes are read from ``.zattrs`` on first access and cached.
+    Attributes are read from the root ``zarr.json`` on first access and cached.
     Resolution levels are accessed by integer index via ``__getitem__``.
 
     Args:

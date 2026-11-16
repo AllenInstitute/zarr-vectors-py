@@ -16,7 +16,8 @@ asks for less.
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+import contextlib
+from collections.abc import Iterator, Sequence
 from typing import TYPE_CHECKING, Any
 
 import numpy as np
@@ -168,7 +169,7 @@ def _rows_in(
 class Level:
     """One resolution level of a :class:`~zarr_vectors.api.dataset.Dataset`."""
 
-    __slots__ = ("_dataset", "_index", "_meta", "_attr_names")
+    __slots__ = ("_dataset", "_index", "_meta", "_attr_names", "_held")
 
     def __init__(self, dataset: Dataset, index: int) -> None:
         self._dataset = dataset
@@ -178,6 +179,8 @@ class Level:
         # this handle exactly as ``_meta`` does: the Dataset drops its
         # Levels on every write it performs.
         self._attr_names: dict[str, tuple[str, ...]] = {}
+        # The level group while a query holds it (:meth:`_held_store`).
+        self._held: Any = None
 
     # ---------------- identity ----------------
 
@@ -347,9 +350,25 @@ class Level:
         ``building`` writer a handle it reads as a level — allocating the
         array families at the store root.
         """
+        held = self._held
+        if held is not None:
+            return held
         from zarr_vectors.core.store import get_resolution_level
 
         return get_resolution_level(self._dataset._group, self._index)
+
+    @contextlib.contextmanager
+    def _held_store(self) -> Iterator[None]:
+        """Resolve :attr:`store` once and reuse it until the block ends;
+        a read never creates or removes the level, so it cannot go stale."""
+        if self._held is not None:
+            yield
+            return
+        self._held = self.store
+        try:
+            yield
+        finally:
+            self._held = None
 
     def select(self, **kw: Any) -> Query:
         """Build a query against this level.  Nothing is read yet."""
@@ -387,6 +406,9 @@ class Level:
         outcome -- and is said here in the caller's own terms rather
         than as a reader parameter they never passed.
         """
+        if selection.objects is None and selection.groups is None:
+            return
+        self._check_has_objects(selection)
         if selection.groups is None:
             return
         if self.kind not in (GEOM_MESH, GEOM_GRAPH, GEOM_SKELETON):
@@ -397,6 +419,146 @@ class Level:
             f"group's objects with objects=, or use a geometry that "
             f"supports groups (point clouds, polylines)."
         )
+
+    def _touched_object_ids(self, selection: Selection) -> npt.NDArray[Any]:
+        """Distinct ids of the objects with a vertex in ``selection``.
+
+        Cheapest route first: ids the read carries; all present objects
+        if nothing narrows; a re-read with ``objects=`` for points and
+        meshes; otherwise the manifests tested against the region.
+        """
+        from zarr_vectors.api.select import SelectionError
+
+        empty = np.zeros((0,), dtype=np.int64)
+        result = self._execute(selection)
+        for source in (result.part_objects, result.object_ids):
+            if source is not None and len(source):
+                return np.unique(np.asarray(source))
+        if result.vertex_count == 0:
+            return empty
+        target = self._target(selection)
+        try:
+            present = np.asarray(target.objects.ids(), dtype=np.int64)
+        except (ArrayError, StoreError, MetadataError, KeyError):
+            return empty
+        if present.size == 0:
+            return empty
+        if not _narrows(selection) and selection.limit is None:
+            return np.unique(present)
+        if selection.limit is not None:
+            raise SelectionError(
+                f"object_ids() with limit= is not supported on a "
+                f"{self.kind!r} level: its reader does not tag vertices "
+                f"with their object, so which objects the first "
+                f"{selection.limit} vertices belong to is not known. "
+                f"Drop the limit, or read with objects=."
+            )
+        if self.kind in (GEOM_POINT_CLOUD, GEOM_MESH):
+            from dataclasses import replace as _replace
+
+            tagged = self._execute(
+                _replace(selection, objects=[int(i) for i in present]),
+            )
+            ids = tagged.object_ids
+            if ids is None or not len(ids):
+                return empty
+            return np.unique(np.asarray(ids))
+        if selection.where is not None:
+            raise SelectionError(
+                f"object_ids() with where= is not supported on a "
+                f"{self.kind!r} level: its reader does not tag vertices "
+                f"with their object. Drop where=, or filter the result."
+            )
+        return self._object_ids_by_region(target, selection)
+
+    def _object_ids_by_region(
+        self, target: Level, selection: Selection,
+    ) -> npt.NDArray[Any]:
+        """Objects with a fragment vertex inside the selection's ``bbox`` /
+        ``near`` / ``cells`` region, found through the manifests."""
+        from zarr_vectors.core.arrays import (
+            read_chunk_vertices,
+            read_object_manifest_rows,
+        )
+
+        level_group = target.store
+        ids, manifests = read_object_manifest_rows(level_group)
+        ndim = self._dataset.ndim
+        lo = hi = None
+        if selection.bbox is not None:
+            lo = np.asarray(selection.bbox[0], dtype=np.float64)
+            hi = np.asarray(selection.bbox[1], dtype=np.float64)
+        wanted_cells = None
+        cell = None
+        if selection.cells is not None:
+            cell = np.asarray(target.grid.cell_shape, dtype=np.float64)
+            wanted_cells = {
+                tuple(int(c) for c in getattr(ref, "coords", ref))[-ndim:]
+                for ref in selection.cells
+            }
+
+        def _keep(points: npt.NDArray[Any]) -> bool:
+            if not len(points):
+                return False
+            p = np.asarray(points, dtype=np.float64).reshape(-1, ndim)
+            mask = np.ones(len(p), dtype=bool)
+            if lo is not None and hi is not None:
+                mask &= np.all((p >= lo) & (p <= hi), axis=1)
+            if selection.near is not None:
+                centre, radius = selection.near
+                off = p - np.asarray(centre, dtype=np.float64)
+                mask &= (off ** 2).sum(axis=1) <= float(radius) ** 2
+            if wanted_cells is not None and cell is not None:
+                idx = np.floor(p / cell).astype(np.int64)
+                mask &= _rows_in(idx, wanted_cells)
+            return bool(mask.any())
+
+        fragments: dict[tuple[int, ...], list[Any]] = {}
+        hit: dict[tuple[tuple[int, ...], int], bool] = {}
+        out: list[int] = []
+        for oid, manifest in zip(ids.tolist(), manifests):
+            for cc, fi in manifest:
+                key = tuple(int(c) for c in cc)
+                if key not in fragments:
+                    try:
+                        fragments[key] = read_chunk_vertices(
+                            level_group, key, ndim=ndim,
+                        )
+                    except (ArrayError, StoreError, KeyError):
+                        fragments[key] = []
+                slot = (key, int(fi))
+                if slot not in hit:
+                    frags = fragments[key]
+                    hit[slot] = int(fi) < len(frags) and _keep(frags[int(fi)])
+                if hit[slot]:
+                    out.append(int(oid))
+                    break
+        return np.unique(np.asarray(out, dtype=np.int64))
+
+    def _check_has_objects(self, selection: Selection) -> None:
+        """Refuse ``objects=`` / ``groups=`` on a level that has none."""
+        from zarr_vectors.api.select import SelectionError
+        from zarr_vectors.constants import GROUPS
+
+        target = self._target(selection)
+        if selection.objects is not None and len(target.objects) == 0:
+            raise SelectionError(
+                f"select(objects=...) on level {target.index}: this "
+                f"{self.kind!r} level holds no object ids (it was written "
+                f"without object_ids=), so there are no objects to select."
+            )
+        if selection.groups is not None:
+            group = target.store
+            try:
+                present = group.array_exists(GROUPS) or group.standalone_array_exists(GROUPS)
+            except Exception:  # noqa: BLE001 - unknown: let the reader decide
+                present = True
+            if not present:
+                raise SelectionError(
+                    f"select(groups=...) on level {target.index}: this "
+                    f"{self.kind!r} level holds no groups (it was written "
+                    f"without groups=), so there are none to select."
+                )
 
     def _reader_kwargs(self, selection: Selection, supports: Sequence[str]) -> dict[str, Any]:
         """Selection terms this reader can express, with ``"all"`` resolved.
@@ -603,11 +765,18 @@ class Level:
         which case the batched attempt was at fault and no caller should
         care — or it raises the genuine error, unobscured.  The cost is
         having done the work twice on the rare read that needs it.
+
+        Levels with octree chunks or deferred presence (see
+        :func:`zarr_vectors.building.defer_presence`) skip the engine and
+        call the reader once: its plan and offline replay assume uniform,
+        listed cells.
         """
         self._check_supported(selection)
         reader, supports, adapter = self._reader()
         kwargs = self._reader_kwargs(selection, supports)
         group = self._dataset._group
+        if self._octree_read_once(selection) or self._presence_deferred(selection):
+            return self._finish(reader(group, **kwargs), adapter, selection)
         try:
             from zarr_vectors._engine.execute import execute
             from zarr_vectors._engine.fetch import GroupFetcher
@@ -638,18 +807,46 @@ class Level:
             raw = reader(group, **kwargs)
         return self._finish(raw, adapter, selection)
 
+    def _target(self, selection: Selection) -> Level:
+        return (
+            self if selection.level in (None, self._index)
+            else self._dataset.level(selection.level)
+        )
+
+    def _presence_deferred(self, selection: Selection) -> bool:
+        """Whether the selection's level declares its presence deferred."""
+        try:
+            return self._target(selection).store.presence_deferred()
+        except (ArrayError, StoreError, KeyError):
+            return False
+
+    def _octree_read_once(self, selection: Selection) -> bool:
+        """Whether the selection's level has octree chunks."""
+        target = self._target(selection)
+        try:
+            meta = target._metadata()
+        except (ArrayError, StoreError, MetadataError, KeyError):
+            return False
+        return getattr(meta, "octree_chunks", None) is not None
+
     async def _aexecute(self, selection: Selection) -> ReadResult:
         """The same read, with its I/O awaited.
 
         Reuses :func:`zarr_vectors.core.aio.read_async`, which supplies
         any reader's I/O up front and replays it offline — so the async
-        path is the sync reader, not a second implementation of it.
+        path is the sync reader, not a second implementation of it.  A
+        deferred-presence level runs its reader in a worker thread.
         """
         from zarr_vectors.core.aio import read_async
 
         self._check_supported(selection)
         reader, supports, adapter = self._reader()
         kwargs = self._reader_kwargs(selection, supports)
+        if self._presence_deferred(selection):
+            import asyncio
+
+            raw = await asyncio.to_thread(reader, self._dataset._group, **kwargs)
+            return self._finish(raw, adapter, selection)
         raw = await read_async(reader, self._dataset._group, **kwargs)
         return self._finish(raw, adapter, selection)
 

@@ -150,3 +150,57 @@ depth-first from every root in index order, then from unreached vertices
 returns the induced subgraph, and a skeleton reads the link cells *touching*
 the objects' chunks, so a record whose parent was not read makes its child a
 root instead of inheriting the previous row.
+
+## Read and write paths
+
+**Local metadata cache** (`core._local_meta`). Parsed `zarr.json` metadata is
+cached process-wide and checked on every hit with one `os.stat`: an entry is
+served only while the file's inode, size, mtime and ctime match. Writers replace
+`zarr.json` by tmp-and-rename (new inode) and an in-place rewrite changes the
+times. The one blind spot, two same-size rewrites within one timestamp tick on a
+recycled inode, is closed with git's racy-clean rule: a document modified less
+than `_RACY_NS` before it was read is never cached. Only metadata is cached,
+never nodes, and each hit gets a fresh attributes dict, because zarr and the
+writers here update attributes in place.
+
+**Spatial rechunk** (`rechunk.spatial`). A level is read as one vertex table
+plus fragments, not per object: coarse levels share fragments between objects
+(metavertices), and a manifest is an ordered walk that may revisit a fragment,
+so per-object reads would drop or duplicate geometry. Each source fragment is
+cut into runs per new chunk, keeping vertex order; shared fragments are written
+once, and private runs merge with neighbouring private runs of the same walk in
+the same chunk. The base bin is the source's effective one (coarse `bin_ratio`
+is relative to it), and a level's `bin_shape` is copied rather than derived from
+`2**level`. Fragment and link attributes are refused: they are tied to the
+source's fragments and link cells.
+
+**Point bbox targeting** (`types.points._read_points`). Reading fragment k as
+bin k is valid only where a level was written one fragment per root bin on the
+root chunk grid. Coarsened levels, levels with their own grid or bin, and levels
+with an object index use chunk-level targeting, which is exact because the bbox
+mask runs on every row.
+
+**Polyline splitting** (`types.polylines.write_polylines`). Lines split at chunk
+boundaries and attribute-bin changes, never at `bin_shape` boundaries: several
+same-chunk fragments per object would leave nowhere to store their edges, since
+`implicit_sequential` has no explicit links array.
+
+**Link partitioning** (`spatial.boundary.partition_link_indices`). Equals
+`partition_link_arrays` with delta-0 scales: intra-chunk records group by a
+stable sort of chunk index, and the merge relies on crossing offsets being
+lexicographically positive, so a chunk's intra bucket precedes its crossing ones.
+
+**Skeleton links** (`types.graphs`, `types.skeletons`). `link_attributes/`
+mirrors stored records row for row, so with edge attributes every edge is
+stored explicitly (restating an implied parent is a legal no-op). A cross-chunk
+link lands in the child's chunk, under the offsets naming the parent's chunk;
+the coarsener merges an object's fragments once both ends share a coarser chunk.
+Per-chunk writers never touch shared level metadata, so `finalize_skeleton_store`
+stamps `vertex_count` from the fragment indices.
+
+**Metadata and validation.** `bin_shape` / `bin_ratio` live only in the NGFF
+multiscales block; coarse levels inheriting the root grid need not tile the
+chunk. `vertex_count` counts stored vertex rows, not summed fragment lengths,
+since fragments can share rows. `rebuild_pyramid_from_level` drops the coarsest
+level first (levels stay contiguous) and clears cross-level links pointing at
+dropped levels before rebuilding.

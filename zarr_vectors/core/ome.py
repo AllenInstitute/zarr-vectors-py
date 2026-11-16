@@ -61,8 +61,8 @@ Two shapes are written:
     and a reader written against that draft looks for it.
 
 Nothing here reads the bare-root ``multiscales`` block, whose ``scale`` is
-a dimensionless bin ratio sitting in a slot NGFF defines as
-world-units-per-index.  That block is why ``world`` is declared afresh
+a bin ratio in older stores (newer ones repeat level 0's transform).
+That block is why ``world`` is declared afresh
 rather than derived from a transform.
 """
 

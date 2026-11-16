@@ -35,7 +35,7 @@ from zarr_vectors.api.result import ReadResult
 from zarr_vectors.api.schema import Layout, Schema, SchemaConflict, StorageOptions
 from zarr_vectors.api.select import Query
 from zarr_vectors.constants import GEOM_POLYLINE
-from zarr_vectors.exceptions import MetadataError, StoreError, ZVError
+from zarr_vectors.exceptions import ArrayError, MetadataError, StoreError, ZVError
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
     from zarr_vectors.core.group import Group
@@ -256,6 +256,17 @@ class Dataset:
         """Write a point cloud."""
         from zarr_vectors.types.points import write_points
 
+        n = _n_rows(positions, "positions")
+        _check_rows("object_ids", object_ids, n, "points")
+        _check_columns("attributes", attributes, n, "points")
+        _check_groups(groups)
+        if object_attributes:
+            n_objects = (
+                n if object_ids is None
+                else len(np.unique(np.asarray(object_ids)))
+            )
+            _check_columns("object_attributes", object_attributes, n_objects, "objects")
+
         return self._write(
             write_points, positions,
             vertex_attributes=dict(attributes or {}) or None,
@@ -276,9 +287,31 @@ class Dataset:
         streamlines: bool = False,
         on_out_of_bounds: Literal["raise", "ignore", "expand"] = "raise",
     ) -> dict[str, Any]:
-        """Write polylines, or streamlines when ``streamlines=True``."""
+        """Write polylines, or streamlines when ``streamlines=True``.
+
+        Each ``attributes`` value is a list of one array per polyline.
+        """
         from zarr_vectors.constants import GEOM_STREAMLINE
         from zarr_vectors.types.polylines import write_polylines
+
+        polylines = list(polylines)
+        lengths = [_n_rows(p, f"polylines[{i}]") for i, p in enumerate(polylines)]
+        for name, value in (attributes or {}).items():
+            if not hasattr(value, "__len__") or (len(value) and np.ndim(value[0]) == 0):
+                raise ArrayError(
+                    f"attributes[{name!r}] must be one array per polyline -- "
+                    f"a list of {len(polylines)} arrays, each with one row "
+                    f"per vertex of its polyline -- not a single flat array."
+                )
+            if len(value) != len(polylines):
+                raise ArrayError(
+                    f"attributes[{name!r}] has {len(value)} arrays but there "
+                    f"are {len(polylines)} polylines."
+                )
+            for i, (part, n_i) in enumerate(zip(value, lengths)):
+                _check_rows(f"attributes[{name!r}][{i}]", part, n_i, f"vertices in polyline {i}")
+        _check_columns("object_attributes", object_attributes, len(polylines), "polylines")
+        _check_groups(groups)
 
         return self._write(
             write_polylines, polylines,
@@ -306,6 +339,8 @@ class Dataset:
         """
         from zarr_vectors.types.lines import write_lines
 
+        _check_columns("object_attributes", object_attributes, _n_rows(endpoints, "endpoints"), "lines")
+
         return self._write(
             write_lines, endpoints,
             vertex_attributes=dict(attributes or {}) or None,
@@ -326,6 +361,15 @@ class Dataset:
     ) -> dict[str, Any]:
         """Write a triangulated surface."""
         from zarr_vectors.types.meshes import write_mesh
+
+        n = _n_rows(vertices, "vertices")
+        _check_rows("object_ids", object_ids, n, "vertices")
+        _check_columns("attributes", attributes, n, "vertices")
+        if object_attributes and object_ids is not None:
+            _check_columns(
+                "object_attributes", object_attributes,
+                len(np.unique(np.asarray(object_ids))), "objects",
+            )
 
         return self._write(
             write_mesh, vertices, faces,
@@ -351,6 +395,16 @@ class Dataset:
         """Write a graph, or a skeleton when ``tree=True``."""
         from zarr_vectors.types.graphs import write_graph
 
+        n = _n_rows(positions, "positions")
+        _check_rows("object_ids", object_ids, n, "nodes")
+        _check_columns("attributes", attributes, n, "nodes")
+        _check_columns("edge_attributes", edge_attributes, _n_rows(edges, "edges"), "edges")
+        if object_attributes and object_ids is not None:
+            _check_columns(
+                "object_attributes", object_attributes,
+                len(np.unique(np.asarray(object_ids))), "objects",
+            )
+
         # ``kind=``, not the ``is_tree=`` alias: that alias is deprecated
         # and warns on every call, so the supported surface was emitting a
         # DeprecationWarning about its own implementation on every
@@ -375,9 +429,17 @@ class Dataset:
         first, rather than on whatever grid the caller happened to pass.
         """
         schema = Schema.from_store(self._root_meta)
-        effective = layout or schema.layout
+        self._refuse_overwrite()
+        effective = (
+            schema.layout if layout is None
+            else _inherit_grid(layout, schema.layout)
+        )
         resolved = effective.resolve(schema, store_kind=self._store_kind())
+        if layout is not None:
+            _check_layout_matches_store(self.url, schema, resolved)
         kwargs = {k: v for k, v in kwargs.items() if v is not None}
+        # The schema's position dtype; the writers default to float32.
+        kwargs.setdefault("dtype", self._position_dtype())
         # Checked BEFORE the write: a declaration the data contradicts is
         # worth catching while the store is still as it was.
         _check_declared(schema, kwargs)
@@ -393,6 +455,35 @@ class Dataset:
         )
         _stamp_declared(self, schema, kwargs)
         return report
+
+    def _refuse_overwrite(self) -> None:
+        """Raise if level 0 already holds geometry: ``add_*`` cannot append."""
+        if 0 not in self.levels:
+            return
+        try:
+            count = int(self.level(0).vertex_count)
+        except (MetadataError, StoreError, KeyError):
+            return
+        if count > 0:
+            raise StoreError(
+                f"{self.url} already holds {count} vertices at level 0. "
+                f"Dataset.add_* writes a store's geometry once; it cannot "
+                f"append, and calling it again would partly overwrite what "
+                f"is there. Concatenate the batches and write them in one "
+                f"call, or write each batch to its own store."
+            )
+
+    def _position_dtype(self) -> str:
+        """The vertex dtype level 0 declares; ``float32`` when it has none."""
+        from zarr_vectors.core.arrays import vertices_dtype
+        from zarr_vectors.core.store import get_resolution_level
+
+        try:
+            return np.dtype(
+                vertices_dtype(get_resolution_level(self._group, 0))
+            ).name
+        except Exception:  # noqa: BLE001 - no level 0 yet: writer default
+            return "float32"
 
     def _store_kind(self) -> str:
         from zarr_vectors.core.backends import detect_scheme
@@ -508,7 +599,7 @@ def open(
     group = open_store(
         source, mode,
         backend=storage.resolve_backend(str(source)),
-        storage_options=dict(storage.options) or None,
+        storage_options=storage.resolve_options(str(source)),
     )
     return Dataset(group, storage=storage)
 
@@ -545,7 +636,7 @@ def create(
         geometry_types=[schema.kind] if schema.kind else None,
         attribute_specs=schema.to_root_block() or None,
         backend=storage.resolve_backend(str(target)),
-        storage_options=dict(storage.options) or None,
+        storage_options=storage.resolve_options(str(target)),
     )
     return Dataset(group, storage=storage)
 
@@ -577,7 +668,7 @@ def open_or_create(
         group = open_store(
             target, "r+",
             backend=storage.resolve_backend(str(target)),
-            storage_options=dict(storage.options) or None,
+            storage_options=storage.resolve_options(str(target)),
         )
     except (StoreError, FileNotFoundError, KeyError):
         return create(target, schema=schema, storage=storage)
@@ -612,7 +703,7 @@ async def aopen(source: Any, *, storage: StorageOptions | None = None) -> Datase
     group = await open_store_async(
         source,
         backend=storage.resolve_backend(str(source)),
-        storage_options=dict(storage.options) or None,
+        storage_options=storage.resolve_options(str(source)),
     )
     return Dataset(group, storage=storage)
 
@@ -716,6 +807,88 @@ def _stamp_declared(
                     level.write_array_meta(path, extra)
             except Exception:  # noqa: BLE001 - annotation, never fatal
                 continue
+
+
+def _n_rows(value: Any, what: str) -> int:
+    arr = np.asarray(value)
+    if arr.ndim == 0:
+        raise ArrayError(f"{what} must be an array with one row per item, not a scalar.")
+    return int(arr.shape[0])
+
+
+def _check_rows(what: str, value: Any, expected: int, of: str) -> None:
+    """Raise unless ``value`` has exactly ``expected`` rows."""
+    if value is None:
+        return
+    got = _n_rows(value, what)
+    if got != expected:
+        raise ArrayError(
+            f"{what} has {got} rows but there are {expected} {of}; it needs "
+            f"exactly one row per item."
+        )
+
+
+def _check_columns(
+    what: str, columns: Mapping[str, Any] | None, expected: int, of: str,
+) -> None:
+    for name, value in (columns or {}).items():
+        _check_rows(f"{what}[{name!r}]", value, expected, of)
+
+
+def _check_groups(groups: Mapping[Any, Any] | None) -> None:
+    """Raise unless every group id is an integer."""
+    import numbers
+
+    for key in (groups or {}):
+        if isinstance(key, bool) or not isinstance(key, numbers.Integral):
+            raise TypeError(
+                f"groups keys are integer group ids, got {key!r} "
+                f"({type(key).__name__}). Key groups= by integer id; give "
+                f"them names afterwards with Dataset.groups.name_rows()."
+            )
+
+
+def _inherit_grid(layout: Layout, stored: Layout) -> Layout:
+    """``layout`` with every grid field it leaves on "auto" taken from the
+    store, so a caller passing ``Layout(compression=...)`` alone is not
+    read as asking for a one-cell grid."""
+    from dataclasses import replace
+
+    changes: dict[str, Any] = {}
+    if layout.cell_size is None and layout.cells == "auto":
+        changes["cell_size"] = stored.cell_size
+    if layout.subcells == "auto":
+        changes["subcells"] = stored.subcells
+    if layout.shard_cells == "auto":
+        changes["shard_cells"] = stored.shard_cells
+    return replace(layout, **changes) if changes else layout
+
+
+def _check_layout_matches_store(
+    url: str, schema: Schema, resolved: Any,
+) -> None:
+    """Refuse a ``layout=`` whose grid differs from the store's: the root
+    declares one grid, and chunk keys on another are unreadable."""
+    stored = schema.layout.resolve(schema)
+    problems = []
+    for name, mine, theirs in (
+        ("cell size", resolved.chunk_shape, stored.chunk_shape),
+        ("subcell size", resolved.bin_shape, stored.bin_shape),
+    ):
+        if not np.allclose(
+            np.asarray(mine, dtype=np.float64),
+            np.asarray(theirs, dtype=np.float64),
+            rtol=1e-9, atol=0.0,
+        ):
+            problems.append(f"{name}: {list(mine)} != store's {list(theirs)}")
+    if problems:
+        raise SchemaConflict(
+            f"layout= asks for a grid {url} was not created with:\n  "
+            + "\n  ".join(problems)
+            + "\nA store has one grid, fixed when it is created. Omit "
+            "layout= (or leave its grid fields on 'auto') to write on the "
+            "store's grid, or create a new store with the layout you want."
+        )
 
 
 def _kind_of_url(url: str) -> str:

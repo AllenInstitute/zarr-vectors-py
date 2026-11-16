@@ -27,7 +27,7 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from typing import TYPE_CHECKING, Any, Literal
 
-from zarr_vectors.constants import GEOM_POINT_CLOUD
+from zarr_vectors.constants import GEOM_POINT_CLOUD, VALID_GEOMETRY_TYPES
 from zarr_vectors.exceptions import MetadataError
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
@@ -386,6 +386,8 @@ class StorageOptions:
     backend: str | None = None
     options: Mapping[str, Any] = field(default_factory=dict)
     branch: str | None = None
+    """The icechunk branch to open (default ``"main"``); any other backend
+    raises."""
 
     def resolve_backend(self, url: str) -> str | None:
         """Explicit, then ``$ZARR_VECTORS_BACKEND``, then scheme detection.
@@ -396,6 +398,26 @@ class StorageOptions:
         if self.backend:
             return self.backend
         return os.environ.get("ZARR_VECTORS_BACKEND") or None
+
+    def resolve_options(self, url: str) -> dict[str, Any] | None:
+        """:attr:`options` plus :attr:`branch` for opening ``url``, or None."""
+        opts = dict(self.options)
+        if self.branch is not None:
+            backend = self.resolve_backend(url)
+            if backend != "icechunk":
+                raise ValueError(
+                    f"StorageOptions.branch={self.branch!r} needs the "
+                    f"icechunk backend (the only one with branches), but "
+                    f"{url!r} resolves to {backend or 'auto-detected'!r}. "
+                    f"Pass backend='icechunk', or drop branch=."
+                )
+            if "branch" in opts and opts["branch"] != self.branch:
+                raise ValueError(
+                    f"StorageOptions.branch={self.branch!r} contradicts "
+                    f"options['branch']={opts['branch']!r}."
+                )
+            opts["branch"] = self.branch
+        return opts or None
 
 
 @dataclass(frozen=True, slots=True)
@@ -426,6 +448,11 @@ class Schema:
     layout: Layout = field(default_factory=Layout)
 
     def __post_init__(self) -> None:
+        if self.kind and self.kind not in VALID_GEOMETRY_TYPES:
+            raise MetadataError(
+                f"Schema.kind={self.kind!r} is not a geometry type; expected "
+                f"one of {sorted(VALID_GEOMETRY_TYPES)}."
+            )
         if self.bounds is not None:
             lo, hi = self.bounds
             if len(lo) != len(hi):

@@ -37,6 +37,7 @@ from zarr_vectors.constants import (
     OBJECT_INDEX,
     OBJIDX_STANDARD,
     RESOLUTION_PREFIX,
+    VERTEX_ATTRIBUTES,
     VERTEX_FRAGMENTS,
     VERTICES,
 )
@@ -48,10 +49,9 @@ from zarr_vectors.core.arrays import (
     create_object_index_array,
     create_vertices_array,
     link_cells_within,
-    link_endpoints_to_rows,
     list_link_offsets,
     read_chunk_vertices,
-    read_link_arrays,
+    read_link_rows,
     resolve_chunk_keys,
     stamp_fragments_tile,
     write_chunk_attributes,
@@ -147,7 +147,8 @@ def write_graph(
         vertex_attributes: Per-node attributes ``{name: (N,) or (N,C)}``.
             (Spec name; replaces ``node_attributes``.)
         link_attributes: Per-edge attributes ``{name: (M,) or (M,C)}``.
-            (Spec name; replaces ``edge_attributes``.)
+            (Spec name; replaces ``edge_attributes``.)  With
+            ``kind="skeleton"`` every edge is then stored explicitly.
         fragment_attributes: Per-fragment attributes, keyed per chunk:
             ``{name: {chunk_coords: ndarray}}``.  Each per-chunk ndarray
             has shape ``(num_fragments_in_chunk,)`` or
@@ -333,18 +334,6 @@ def write_graph(
             spatial_dim_names=[a["name"] for a in axes],
         )
 
-    arrays_present_list = [VERTICES, "links", "object_index"]
-    if fragment_attributes:
-        arrays_present_list.append(FRAGMENT_ATTRIBUTES)
-    level_meta = LevelMetadata(
-        level=0,
-        vertex_count=n_nodes,
-        arrays_present=arrays_present_list,
-        chunk_dims=level_chunk_dims,
-        chunk_attribute_name=chunk_by_attribute,
-        chunk_attribute_values=attr_bin_values,
-    )
-    level_group = create_resolution_level(root, 0, level_meta)
     link_width = 2
 
     # Assign nodes to chunks.  When attribute-chunked, prefix each
@@ -456,9 +445,35 @@ def write_graph(
         )
         store_mask = ~implied
         _check_one_root_per_object(edges, object_ids, n_nodes)
+        if edge_attributes:
+            # ``link_attributes/`` mirrors stored records, so store every
+            # edge; restating an implied parent is a no-op override.
+            store_mask = np.ones(n_edges, dtype=bool)
     else:
         store_mask = np.ones(n_edges, dtype=bool)
     store_rows = np.flatnonzero(store_mask)
+
+    # ``links`` always exists: the backstop below creates it.
+    arrays_present_list = [
+        VERTICES, VERTEX_FRAGMENTS, "links", LINK_FRAGMENTS, "object_index",
+    ]
+    if node_attributes:
+        arrays_present_list.append(VERTEX_ATTRIBUTES)
+    if fragment_attributes:
+        arrays_present_list.append(FRAGMENT_ATTRIBUTES)
+    if edge_attributes and len(store_rows) > 0:
+        arrays_present_list.append("link_attributes")
+    if object_attributes:
+        arrays_present_list.append("object_attributes")
+    level_meta = LevelMetadata(
+        level=0,
+        vertex_count=n_nodes,
+        arrays_present=arrays_present_list,
+        chunk_dims=level_chunk_dims,
+        chunk_attribute_name=chunk_by_attribute,
+        chunk_attribute_values=attr_bin_values,
+    )
+    level_group = create_resolution_level(root, 0, level_meta)
 
     # Records stay in edge order, which the partitioner preserves within
     # each cell — that is what lets the per-edge attribute rows below be
@@ -492,7 +507,14 @@ def write_graph(
         # below, which know the offsets arrays each record lands in.
         if node_attributes:
             for name, data in node_attributes.items():
-                create_attribute_array(level_group, name, dtype=str(data.dtype))
+                # Channel names carry the row shape of a (V, C) column.
+                create_attribute_array(
+                    level_group, name, dtype=str(data.dtype),
+                    channel_names=(
+                        [f"ch{i}" for i in range(data.shape[1])]
+                        if np.ndim(data) == 2 else None
+                    ),
+                )
         if object_attributes:
             for _name in object_attributes:
                 create_object_attributes_array(level_group, _name)
@@ -864,17 +886,17 @@ def _read_graph(
         # touching a chunk outside ``chunk_keys`` has no offset and is
         # dropped, which is what applies the bbox/chunks filter to edges.
         all_edges: list[npt.NDArray] = []
-        # As arrays, not one tuple per edge: the remap is a gather.
-        edge_chunks, edge_vi = read_link_arrays(
-            level_group, delta=0, cells=link_cells,
+        row_of = np.arange(running, dtype=np.int64)
+        starts = list(chunk_offsets.items())
+        ends = [start for _, start in starts[1:]] + [running]
+        rows = read_link_rows(
+            level_group,
+            {cc: row_of[start:end] for (cc, start), end in zip(starts, ends)},
+            delta=0, cells=link_cells, touching=is_tree,
         )
-        if edge_vi.shape[0] and edge_vi.shape[1] == 2:
-            rows = link_endpoints_to_rows(edge_chunks, edge_vi, chunk_offsets)
-            # A skeleton keeps every record whose child was read; a
-            # parent of -1 (not read) makes that child a root below.
-            keep = rows[:, 0] >= 0 if is_tree else (rows >= 0).all(axis=1)
-            if keep.any():
-                all_edges.append(np.ascontiguousarray(rows[keep]))
+        # A parent of -1 (not read) makes that child a root below.
+        if rows.shape[0] and rows.shape[1] == 2:
+            all_edges.append(np.ascontiguousarray(rows))
 
         # For skeletons: reconstruct full edge set from implicit sequential + branch links
         if is_tree:

@@ -121,16 +121,22 @@ async def _resolve_nodes(
     it answers "yes", or an ``array_exists`` probe for a legitimately
     missing array would look like a prefetch gap and loop forever.
     """
+    from zarr_vectors._query_nodes import lookup, remember
+
     async def one(path: str) -> tuple[str, Any]:
+        primed = lookup(root.store, path)
+        if primed is not None:
+            return path, primed
         try:
             node = await root.getitem(path)
         except KeyError:
+            remember(root.store, path, _ABSENT)
             return path, _ABSENT
         # Wrap in the sync facade the readers expect.  Both wrappers are
         # plain dataclasses over the async object — no I/O here.
-        if isinstance(node, zarr.AsyncArray):
-            return path, zarr.Array(node)
-        return path, zarr.Group(node)
+        wrapped = zarr.Array(node) if isinstance(node, zarr.AsyncArray) else zarr.Group(node)
+        remember(root.store, path, wrapped)
+        return path, wrapped
 
     if not paths:
         return {}
@@ -187,7 +193,7 @@ async def _fetch_chunks(
         if sync_root is not None and isinstance(node, zarr.Array):
             spec = _direct_spec(sync_root, array_path, node)
             # The optimised reader's arrays (see shard_reader_for: under
-            # the default, zarr-octree ones); the rest gather, as always.
+            # the default, every sharded one); the rest gather, as always.
             if spec is None and shard_reader() != "standard":
                 shard_spec = _sharded_spec(node)
                 if shard_spec is not None and shard_reader_for(shard_spec.source) == "optimised":
@@ -257,9 +263,17 @@ async def _fetch_arrays(
     object attributes — which readers consume end-to-end rather than a
     cell at a time.
     """
+    from zarr_vectors._query_nodes import lookup
+
     async def one(path: str) -> tuple[str, Any]:
+        primed = lookup(root.store, path)
+        if primed is _ABSENT:
+            return path, None
         try:
-            node = await root.getitem(path)
+            node = (
+                primed._async_array if isinstance(primed, zarr.Array)
+                else await root.getitem(path)
+            )
         except KeyError:
             return path, None
         if not isinstance(node, zarr.AsyncArray):
@@ -284,7 +298,13 @@ async def _fetch_listings(
     :func:`read_async` reports which read needed listing instead of
     spinning.
     """
+    from zarr_vectors._query_nodes import listing as primed_listing
+    from zarr_vectors._query_nodes import remember
+
     async def one(path: str) -> tuple[str, list[str]] | None:
+        known = primed_listing(root.store, path)
+        if known is not None:
+            return path, known
         try:
             node = await root.getitem(path) if path else root
         except KeyError:
@@ -292,8 +312,15 @@ async def _fetch_listings(
         if not isinstance(node, zarr.AsyncGroup):
             return path, []
         try:
-            names = {k async for k in node.array_keys()}
-            names |= {k async for k in node.group_keys()}
+            # One pass (each loads every child's zarr.json); children kept.
+            names = set()
+            async for name, child in node.members():
+                names.add(name)
+                wrapped = (
+                    zarr.Array(child) if isinstance(child, zarr.AsyncArray)
+                    else zarr.Group(child)
+                )
+                remember(root.store, f"{path}/{name}" if path else name, wrapped)
         except Exception:
             return None
         return path, sorted(names)

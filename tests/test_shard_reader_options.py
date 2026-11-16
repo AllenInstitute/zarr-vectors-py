@@ -190,7 +190,7 @@ def test_a_marked_store_writes_every_sharded_array_octree(tmp_path, kind):
     pos = rng.uniform(5, 95, (600, 3)).astype(np.float32)
     if kind == "point_cloud":
         ds.add_points(pos, object_ids=np.arange(600) // 50)
-        zv.open(str(p), mode="r+").add_points(pos + 1, object_ids=np.arange(600) // 50 + 12)  # a later write
+        zv.open(str(p), mode="r+").build_pyramid(factors=[(2.0, 1.0)])  # a later write
     elif kind == "mesh":
         faces = np.stack([np.arange(0, 597, 3), np.arange(1, 598, 3), np.arange(2, 599, 3)], 1)
         ds.add_mesh(pos, faces, object_ids=np.arange(600) // 60)

@@ -1,7 +1,7 @@
 """OME-Zarr compatible multiscale metadata for zarr vectors stores.
 
 Generates and reads ``multiscales`` metadata blocks in the root
-``.zattrs``, following the OME-NGFF spec (v0.4).  This allows
+``zarr.json`` attributes, following the OME-NGFF spec (v0.4).  This allows
 OME-Zarr-aware viewers to discover the resolution pyramid structure.
 
 NGFF v0.5 nests OME metadata under ``attributes.ome`` inside Zarr v3
@@ -25,7 +25,6 @@ from zarr_vectors.constants import RESOLUTION_PREFIX
 from zarr_vectors.core.store import (
     FsGroup,
     list_resolution_levels,
-    read_level_metadata,
     read_root_metadata,
 )
 
@@ -40,7 +39,7 @@ def upsert_level_transform(
     """Upsert one level's entry in the NGFF ``multiscales[0].datasets`` list.
 
     This is the **authoritative** writer for per-level spatial transforms
-    under the 0.5+ format: ``bin_ratio`` lives as the ``scale`` factor
+    in a store: ``bin_ratio`` lives as the ``scale`` factor
     and ``bin_shape / 2`` lives as the ``translation`` offset.  Callers
     in :mod:`zarr_vectors.core.store` invoke this inside
     :func:`create_resolution_level` and :func:`add_resolution_level`
@@ -121,7 +120,7 @@ def read_level_transform(
 
 
 def write_multiscale_metadata(root: FsGroup) -> list[dict[str, Any]]:
-    """Generate and write OME-Zarr multiscale metadata to root .zattrs.
+    """Generate and write OME-Zarr multiscale metadata to the root attributes.
 
     Reads all existing resolution levels and their bin shapes to
     compute scale and translation transforms.
@@ -130,7 +129,7 @@ def write_multiscale_metadata(root: FsGroup) -> list[dict[str, Any]]:
         root: Root store group.
 
     Returns:
-        The ``multiscales`` list written to ``.zattrs``.
+        The ``multiscales`` list written to the root attributes.
     """
     meta = read_root_metadata(root)
     base_bin = meta.effective_bin_shape
@@ -151,54 +150,22 @@ def write_multiscale_metadata(root: FsGroup) -> list[dict[str, Any]]:
             out["unit"] = unit
         axes.append(out)
 
-    # Build datasets array (one per level)
+    # Build datasets array (one per level).  Every level's vertices are
+    # in level-0 coordinates, so every level gets level 0's transform.
+    scale0 = [1.0] * ndim
+    translation0 = [bs / 2.0 for bs in base_bin]
+    transforms0: list[dict[str, Any]] = [{"type": "scale", "scale": scale0}]
+    if any(t != 0 for t in translation0):
+        transforms0.append({"type": "translation", "translation": translation0})
+
     datasets: list[dict[str, Any]] = []
     for lvl in levels:
-        path = f"{RESOLUTION_PREFIX}{lvl}"
-
-        if lvl == 0:
-            # Level 0: scale = 1.0, translation = base_bin/2
-            scale = [1.0] * ndim
-            translation = [bs / 2.0 for bs in base_bin]
-        else:
-            try:
-                lm = read_level_metadata(root, lvl)
-                if lm.bin_ratio is not None:
-                    scale = [float(r) for r in lm.bin_ratio]
-                elif lm.bin_shape is not None:
-                    # Plain float division, not compute_bin_ratio: the
-                    # NGFF scale is a float multiplier with no integer
-                    # requirement, unlike the separately-typed
-                    # ``bin_ratio: tuple[int, ...]`` field.  A fractional
-                    # cumulative coarsen factor must not fail here — and
-                    # because this block is wrapped in ``except
-                    # Exception`` below, an integer-ratio failure would
-                    # not surface as an error at all: it would silently
-                    # degrade the transform to scale=1.0.
-                    scale = [
-                        (float(bs) / float(bb)) if bb else 1.0
-                        for bb, bs in zip(base_bin, lm.bin_shape)
-                    ]
-                else:
-                    scale = [1.0] * ndim
-
-                if lm.bin_shape is not None:
-                    translation = [bs / 2.0 for bs in lm.bin_shape]
-                else:
-                    translation = [bs / 2.0 for bs in base_bin]
-            except Exception:
-                scale = [1.0] * ndim
-                translation = [bs / 2.0 for bs in base_bin]
-
-        transforms: list[dict[str, Any]] = [
-            {"type": "scale", "scale": scale},
-        ]
-        if any(t != 0 for t in translation):
-            transforms.append({"type": "translation", "translation": translation})
-
+        if lvl != 0:
+            # Older stores kept a coarse level's bins only in this entry.
+            _migrate_level_bins(root, lvl)
         datasets.append({
-            "path": path,
-            "coordinateTransformations": transforms,
+            "path": f"{RESOLUTION_PREFIX}{lvl}",
+            "coordinateTransformations": [dict(t) for t in transforms0],
         })
 
     multiscales = [{
@@ -220,8 +187,32 @@ def write_multiscale_metadata(root: FsGroup) -> list[dict[str, Any]]:
     return multiscales
 
 
+def _migrate_level_bins(root: FsGroup, level: int) -> None:
+    """Copy a coarse level's NGFF-encoded bin geometry into its own block.
+
+    No-op when the level already carries ``bin_shape`` / ``bin_ratio``.
+    """
+    from zarr_vectors.core.store import get_resolution_level
+
+    try:
+        lg = get_resolution_level(root, level)
+        attrs = lg.attrs.to_dict()
+        zvl = dict(attrs.get("zarr_vectors_level") or {})
+        if not zvl or zvl.get("bin_shape") or zvl.get("bin_ratio"):
+            return
+        scale, translation = read_level_transform(root, level)
+    except Exception:
+        return
+    if scale is None:
+        return
+    zvl["bin_ratio"] = [float(x) for x in scale]
+    if translation is not None:
+        zvl["bin_shape"] = [2.0 * float(t) for t in translation]
+    lg.attrs.update({"zarr_vectors_level": zvl})
+
+
 def read_multiscale_metadata(root: FsGroup) -> list[dict[str, Any]] | None:
-    """Read OME-Zarr multiscale metadata from root .zattrs.
+    """Read OME-Zarr multiscale metadata from the root attributes.
 
     Args:
         root: Root store group.

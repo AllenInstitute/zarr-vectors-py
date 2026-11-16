@@ -186,7 +186,8 @@ def _list_array_names(level_group, requested: list[str] | None) -> list[str]:
             _walk(f"{prefix}{name}/", group[name])
 
     _walk("", level_group.zarr_group)
-    return names
+    # Stores list keys in any order; callers want a stable one.
+    return sorted(names)
 
 
 # ===================================================================
@@ -386,7 +387,8 @@ def unshard_store(
     storage object per spatial chunk (``<array>/c/i/j/k``).
 
     The logical single-array layout is unchanged; only the Zarr v3
-    ``sharding_indexed`` packing is removed.  Useful for write-heavy
+    ``sharding_indexed`` packing is removed; with ``arrays=None`` the
+    root ``shard_shape`` is cleared too.  Useful for write-heavy
     workflows where shard read-modify-write contention hurts throughput,
     or when a reader prefers one file per chunk.  On a store marked octree
     (:func:`set_octree`) the marker and its capability are removed once no
@@ -448,6 +450,13 @@ def unshard_store(
 
             arrays_unsharded += 1
             chunks_extracted += len(chunk_payloads)
+
+    # Arrays allocated later honour the root shard_shape.
+    if arrays is None:
+        attrs = root.attrs.to_dict()
+        block = dict(attrs.get("zarr_vectors", {}))
+        if block.pop("shard_shape", None) is not None:
+            root.attrs.update({"zarr_vectors": block})
 
     # A store marked octree whose octree arrays are gone is no longer
     # octree: the marker and its capability follow the arrays (see
@@ -948,7 +957,7 @@ def get_shard_info(store_path: str | Path | Group) -> dict[str, Any]:
 
     * ``sharded`` — bool, mirrors :func:`is_sharded`.
     * ``arrays`` — list of ``{name, shard_shape, grid_shape}`` dicts,
-      one per native-sharded array.
+      one per native-sharded array, ordered by level then array path.
     * ``shard_count`` — total shard files across all arrays.
     """
     import zarr

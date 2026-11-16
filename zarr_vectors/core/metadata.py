@@ -480,7 +480,7 @@ class RootMetadata:
         #                 were duplicated under
         #                 ``zarr_vectors.spatial_index_dims``; per-array
         #                 ``.zattrs`` carried a redundant ``dtype`` field.
-        #   - pre-0.6.0 : ``vertex_fragments`` instead of
+        #   - pre-0.6.0 : ``vertex_group_offsets`` instead of
         #                 ``vertex_fragments``; links carried an inline
         #                 self-describing header; ``object_index`` used
         #                 the flat quad encoding.
@@ -632,14 +632,17 @@ class RootMetadata:
         the NGFF ``multiscales[0].axes`` block, written separately by
         :func:`zarr_vectors.core.multiscale.write_multiscale_metadata`.
         Combine the two when writing root attrs.
+
+        ``format_capabilities`` (possibly empty) is always written; ``crs``
+        and the other optional keys only when they carry a value.
         """
         d = {
             "zarr_vectors": {
                 "zv_version": self.zv_version,
+                "format_capabilities": list(self.format_capabilities),
                 "chunk_shape": list(self.chunk_shape),
                 "bounds": [list(self.bounds[0]), list(self.bounds[1])],
                 "geometry_types": self.geometry_types,
-                "crs": self.crs,
                 "links_convention": self.links_convention,
                 "object_index_convention": self.object_index_convention,
                 "cross_chunk_strategy": self.cross_chunk_strategy,
@@ -662,8 +665,8 @@ class RootMetadata:
             d["zarr_vectors"]["manifest_layout"] = "dense"
         if self.manifest_block_dtype == "int32":
             d["zarr_vectors"]["manifest_block_dtype"] = "int32"
-        if self.format_capabilities:
-            d["zarr_vectors"]["format_capabilities"] = list(self.format_capabilities)
+        if self.crs is not None:
+            d["zarr_vectors"]["crs"] = self.crs
         if self.required_capabilities:
             d["zarr_vectors"]["required_capabilities"] = list(self.required_capabilities)
         if self.attribute_specs:
@@ -676,7 +679,7 @@ class RootMetadata:
 
     @classmethod
     def from_dict(cls, d: dict[str, Any], *, strict: bool = True) -> RootMetadata:
-        """Deserialise from a dict (as stored in ``.zattrs``).
+        """Deserialise from a dict (as stored in the root attributes).
 
         Args:
             d: The full root-attrs dict — must contain a
@@ -1326,7 +1329,7 @@ def validate_bin_shape_divides_chunk(
 
 @dataclass
 class ArrayMetadata:
-    """Per-array metadata (stored in each array's ``.zattrs``).
+    """Per-array metadata (stored in each array's ``zarr.json`` attributes).
 
     Attributes:
         name: Array name (e.g. ``"vertices"``, ``"attributes/radius"``).
@@ -1663,6 +1666,36 @@ def level_chunk_scale(
             )
         out.append(ratio_i)
     return tuple(out)
+
+
+def check_bin_shape_tiles_chunk(
+    chunk_shape: Sequence[float],
+    bin_shape: Sequence[float],
+    *,
+    name: str = "bin_shape",
+) -> None:
+    """Raise unless ``bin_shape`` tiles ``chunk_shape`` on every axis
+    (each chunk holds a whole number of level-0 bins).
+
+    Raises:
+        MetadataError: On a rank mismatch, a non-positive bin, or a bin
+            that does not divide its chunk.
+    """
+    if len(bin_shape) != len(chunk_shape):
+        raise MetadataError(
+            f"{name} has {len(bin_shape)} axes but chunk_shape has "
+            f"{len(chunk_shape)}"
+        )
+    for i, (cs, bs) in enumerate(zip(chunk_shape, bin_shape)):
+        if not bs > 0:
+            raise MetadataError(f"{name}[{i}]={bs} must be > 0")
+        ratio = float(cs) / float(bs)
+        if ratio < 1 - 1e-9 or abs(ratio - round(ratio)) > 1e-9:
+            raise MetadataError(
+                f"{name}[{i}]={bs} does not divide chunk_shape[{i}]={cs}: "
+                f"each chunk must hold a whole number of bins "
+                f"(chunk / bin = {ratio:.6g})"
+            )
 
 
 def validate_level_chunk_shape_against_root(

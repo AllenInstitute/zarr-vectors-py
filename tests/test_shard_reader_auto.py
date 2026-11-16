@@ -1,11 +1,11 @@
-"""The default shard reader, ``auto``: optimised where octree sharding is in use.
+"""The default shard reader, ``auto``: the optimised reader for every sharded array.
 
-``ZARR_VECTORS_SHARD_READER`` unset (or ``auto``) picks a reader per array,
-by its sharding codec: an array written with zarr-octree's
-``zarr_octree_sharding`` is read by the optimised reader -- each shard's
-index once, the wanted cells' ranges coalesced by run -- and every other
-array exactly as ``standard`` reads it.  So a store without zarr-octree
-reads as it always has, request for request, and only octree arrays change.
+``ZARR_VECTORS_SHARD_READER`` unset (or ``auto``) reads every sharded
+array -- ``sharding_indexed`` or zarr-octree's ``zarr_octree_sharding`` --
+with the optimised reader: each shard's index once, the wanted cells'
+ranges coalesced.  Behind an object store the ``standard`` reader goes
+through zarr's sharding codec one cell at a time, so the default makes
+fewer requests than ``standard`` on either codec and answers the same.
 
 Every request a read makes is recorded -- each ``get`` of a store that is
 not local (a :class:`~zarr.storage.WrapperStore`), and on a local store
@@ -227,7 +227,7 @@ def _total(log, kinds=("store get",)):
 
 
 @needs_octree
-def test_the_default_is_auto_and_decides_per_array(stores, monkeypatch):
+def test_the_default_is_auto_and_reads_every_array_optimised(stores, monkeypatch):
     from zarr_vectors.core._cells_on_disk import cell_source
 
     src = {name: cell_source("", zv.open(str(p)).level(0).store.zarr_group["vertices"], any_codecs=True)
@@ -237,23 +237,22 @@ def test_the_default_is_auto_and_decides_per_array(stores, monkeypatch):
     monkeypatch.delenv("ZARR_VECTORS_SHARD_READER", raising=False)
     monkeypatch.delenv("ZARR_VECTORS_COALESCE", raising=False)
     assert _batch_reader.shard_reader() == "auto"
-    assert _batch_reader.shard_reader_for(src["octree"]) == "optimised"
-    assert _batch_reader.shard_reader_for(src["indexed"]) == "standard"
-    assert _batch_reader.shard_reader_for(None) == "standard"
-    assert _cells_on_disk._coalescing(src["octree"])[0] == "auto"
-    assert _cells_on_disk._coalescing(src["indexed"]) == ("none", 0, 0)
-    assert _cells_on_disk._coalescing() == ("none", 0, 0)
+    for s in (src["octree"], src["indexed"], None):
+        assert _batch_reader.shard_reader_for(s) == "optimised"
+    want = ("auto", _cells_on_disk._AUTO_GAP, _cells_on_disk._AUTO_SPAN)
+    assert _cells_on_disk._coalescing(src["octree"]) == _cells_on_disk._coalescing(src["indexed"]) == want
+    assert _cells_on_disk._coalescing() == want
 
-    monkeypatch.setenv("ZARR_VECTORS_COALESCE", "gap:10:20")  # the optimised reader's setting, octree arrays only
+    monkeypatch.setenv("ZARR_VECTORS_COALESCE", "gap:10:20")  # the optimised reader's setting, every array
     assert _cells_on_disk._coalescing(src["octree"]) == ("gap", 10, 20)
-    assert _cells_on_disk._coalescing(src["indexed"]) == ("none", 0, 0)
+    assert _cells_on_disk._coalescing(src["indexed"]) == ("gap", 10, 20)
 
     for value, want in (("AUTO", "auto"), ("standard", "standard"), ("optimised", "optimised"),
                         ("optimized", "optimised"), ("zarr", "zarr")):
         monkeypatch.setenv("ZARR_VECTORS_SHARD_READER", value)
         assert _batch_reader.shard_reader() == want
-        if want != "auto":  # an explicit reader is every array's, whatever its codec
-            assert {_batch_reader.shard_reader_for(s) for s in src.values()} == {want}
+        assert {_batch_reader.shard_reader_for(s) for s in src.values()} == {
+            "optimised" if want == "auto" else want}
     for value, octree, indexed in (("standard", "none", "none"), ("optimised", "gap", "gap"), ("zarr", "none", "none")):
         monkeypatch.setenv("ZARR_VECTORS_SHARD_READER", value)
         assert (_cells_on_disk._coalescing(src["octree"])[0], _cells_on_disk._coalescing(src["indexed"])[0]) == (octree, indexed)
@@ -264,34 +263,34 @@ def test_the_default_is_auto_and_decides_per_array(stores, monkeypatch):
 
 
 # ---------------------------------------------------------------------------
-# 1. Without zarr-octree: request for request what standard does
+# 1. sharding_indexed: the optimised reader
 # ---------------------------------------------------------------------------
 
 
 @pytest.mark.parametrize("query", list(QUERIES))
 @pytest.mark.parametrize("where", ["local", "store"])
-def test_an_indexed_store_reads_exactly_as_standard(stores, record, monkeypatch, where, query):
+def test_an_indexed_store_reads_as_optimised(stores, record, monkeypatch, where, query):
+    """The optimised reader's requests exactly, the standard reader's
+    answer, and on a store that is not local fewer requests."""
     path = stores["indexed"]
-    want, want_log = _read(record, monkeypatch, path, where, "standard", query)
-    got, got_log = _read(record, monkeypatch, path, where, None, query)
+    want, standard = _read(record, monkeypatch, path, where, "standard", query)
+    got, default = _read(record, monkeypatch, path, where, None, query)
+    _, optimised = _read(record, monkeypatch, path, where, "optimised", query)
     _equal(got, want)
-    assert want_log and got_log == want_log  # same requests, same ranges, same bytes
+    assert default and default == optimised
     if where == "store":
-        assert _total(got_log)[0] > 0
+        assert _total(default)[0] < _total(standard)[0], (_total(standard), _total(default))
 
 
-def test_an_indexed_store_never_coalesces(stores, record, monkeypatch):
-    """No zarr-octree array, no optimised reader: not one coalesced range,
-    and a store that is not local still read cell by cell through zarr."""
-    seen = []
-    real = _cells_on_disk.read_cells
-    monkeypatch.setattr(_cells_on_disk, "read_cells",
-                        lambda reqs: seen.append([(s.local_root, s.index_format) for s, _ in reqs]) or real(reqs))
-    monkeypatch.setenv("ZARR_VECTORS_COALESCE", "gap:1000000:100000000")  # would merge everything if consulted
-    for where in ("local", "store"):
-        for query in QUERIES:
-            _read(record, monkeypatch, stores["indexed"], where, None, query)
-    assert seen and all(root is not None and fmt == "dense" for batch in seen for root, fmt in batch)
+def test_an_indexed_store_never_goes_through_zarrs_per_cell_read(stores, monkeypatch):
+    async def _no(*a, **k):
+        raise AssertionError("an indexed cell went through zarr's per-cell read")
+
+    monkeypatch.delenv("ZARR_VECTORS_SHARD_READER", raising=False)
+    monkeypatch.setattr(_batch_reader, "_async_get_sharded_cell", _no)
+    ds = _open(stores["indexed"], "store")
+    assert len(ds.select(bbox=([0, 0, 0], [BOX, BOX, BOX])).read().positions) == 3_000
+    assert len(_cells(ds)) > 0
 
 
 # ---------------------------------------------------------------------------
@@ -352,15 +351,10 @@ def mixed(stores, tmp_path_factory):
     return path
 
 
-def _of(log, array, octree):
-    """The entries of ``log`` for ``array`` (``octree``) or for every other array."""
-    return collections.Counter({k: c for k, c in log.items() if (f"/{array}/" in f"/{k[1]}") == octree})
-
-
 @needs_octree
 @pytest.mark.parametrize("query", list(QUERIES))
 @pytest.mark.parametrize("where", ["local", "store"])
-def test_a_mixed_store_reads_each_array_by_its_codec(stores, mixed, record, monkeypatch, where, query):
+def test_a_mixed_store_reads_every_array_optimised(stores, mixed, record, monkeypatch, where, query):
     import json
 
     codecs = {a: json.loads((mixed / "0" / a / "zarr.json").read_text())["codecs"][0]["name"]
@@ -371,16 +365,12 @@ def test_a_mixed_store_reads_each_array_by_its_codec(stores, mixed, record, monk
     plain = QUERIES[query](_open(stores["indexed"], "local"))
     want, standard = _read(record, monkeypatch, mixed, where, "standard", query)
     got, default = _read(record, monkeypatch, mixed, where, None, query)
+    _, optimised = _read(record, monkeypatch, mixed, where, "optimised", query)
     _equal(want, plain)
     _equal(got, plain)
-    # Every array but vertices: exactly the standard reader's requests.
-    assert _of(default, "vertices", False) == _of(standard, "vertices", False)
-    # vertices: the optimised reader's, which are fewer on a store that is
-    # not local (read by run rather than through zarr's per-cell codec).
+    assert default and default == optimised
     if where == "store":
-        n_std, b_std = _total(_of(standard, "vertices", True))
-        n_def, b_def = _total(_of(default, "vertices", True))
-        assert n_def < n_std and b_def < b_std, (n_std, b_std, n_def, b_def)
+        assert _total(default)[0] < _total(standard)[0], (_total(standard), _total(default))
 
 
 # ---------------------------------------------------------------------------

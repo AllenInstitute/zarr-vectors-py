@@ -77,12 +77,9 @@ CrossChunkLink: TypeAlias = tuple[
 ]
 """One link record as a pair of ``(chunk_coords, local_vertex_index)``.
 
-Named for the pre-0.9 layout, where cross-chunk links were their own
-family.  Since 0.9.0 connectivity is one family and a record whose
-endpoints share a chunk is simply one whose relative offset is zero, so
-this shape describes *any* 2-endpoint link -- ``write_links`` accepts it
-for both.  Kept under the old name because it is the spelling every
-caller already uses.
+Connectivity is one family: a record whose endpoints share a chunk is
+simply one whose relative offset is zero, so despite the name this shape
+describes *any* 2-endpoint link, and ``write_links`` accepts it for both.
 """
 
 # ---------------------------------------------------------------------------

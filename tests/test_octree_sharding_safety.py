@@ -348,9 +348,13 @@ def test_unshard_store_leaves_an_unmarked_root_alone(tmp_path):
     from zarr_vectors.sharding import unshard_store
 
     p = _make(tmp_path / "s.zv")
-    before = (p / "zarr.json").read_bytes()
+    before = json.loads((p / "zarr.json").read_text())
     unshard_store(str(p))
-    assert (p / "zarr.json").read_bytes() == before
+    after = json.loads((p / "zarr.json").read_text())
+    # A whole-store unshard clears the root shard_shape; the octree marker
+    # and its capability are not added, and nothing else changes.
+    before["attributes"]["zarr_vectors"].pop("shard_shape")
+    assert after == before
 
 
 def test_set_octree_false_leaves_an_unmarked_store_alone(tmp_path):
@@ -381,8 +385,9 @@ def test_set_octree_accepts_a_store_sharded_by_shard_store(tmp_path):
     assert _root(p)["shard_shape"] == [4, 4, 4] and _root(p)["octree_sharding"] == TARGET
     assert np.array_equal(_positions(p), want)
     # A later write allocates octree arrays, as in a store born marked.
-    pts, ids = _points(300, seed=5)
-    zv.open(str(p), mode="r+").add_points(pts, object_ids=ids + 100)
+    n = len(_codecs(p))
+    zv.open(str(p), mode="r+").build_pyramid(factors=[(2.0, 1.0)])
+    assert len(_codecs(p)) > n
     assert set(_codecs(p).values()) == {"zarr_octree_sharding"}
 
 
