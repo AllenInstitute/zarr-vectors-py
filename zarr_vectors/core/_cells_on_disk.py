@@ -435,11 +435,15 @@ def read_cells(
             for i, message in errors.items():
                 out[r][i] = ValueError(message)
         rows += [(local[lr], i, None, path, off, size, run) for lr, i, path, off, size, run in flat]
+    indexes = _prefetch_indexes(requests)
     for r, (src, cells) in enumerate(requests):
         if src.local_root is not None:
             continue
         cells = np.asarray(cells, dtype=np.int64).reshape(-1, len(src.shape))
-        ranges, errors = _locate(src, cells, lambda keys, src=src: dict(zip(keys, read_indexes(src, keys))))
+        if r in indexes:
+            ranges, errors = _locate(src, cells, lambda keys, got=indexes[r]: {k: got[k] for k in keys})
+        else:
+            ranges, errors = _locate(src, cells, lambda keys, src=src: dict(zip(keys, read_indexes(src, keys))))
         for i, message in errors.items():
             out[r][i] = ValueError(message)
         rows += [(r, i, src.store, rng.key, rng.offset, rng.size, rng.run) for i, rng in enumerate(ranges) if rng is not None]
@@ -476,6 +480,160 @@ def read_cells(
                 part = blob[off - lo: off - lo + size]
                 out[r][i] = part if len(part) == size else ValueError("short read")
     return out
+
+
+def _prefetch_indexes(
+    requests: list[tuple[CellSource, np.ndarray]],
+) -> dict[int, dict[str, Any]]:
+    """The shard indexes every store-backed request needs, read at once.
+
+    Experiment ``gather_indexes``.  Without it each array's indexes are
+    gathered in turn, so a read of several arrays (vertices, fragments,
+    links) spends one round trip per array before any cell is fetched.
+    Returns ``{request: {shard key: index}}``; empty when off or when at
+    most one array would read indexes.
+    """
+    from zarr_vectors._experiments import enabled
+
+    if not enabled("gather_indexes"):
+        return {}
+    wanted: list[tuple[int, CellSource, list[str]]] = []
+    for r, (src, cells) in enumerate(requests):
+        if src.local_root is not None or src.shard_shape is None:
+            continue
+        cells = np.asarray(cells, dtype=np.int64).reshape(-1, len(src.shape))
+        shards = cells // np.asarray(src.shard_shape, dtype=np.int64)
+        wanted.append((r, src, sorted({_key(src, tuple(s)) for s in shards.tolist()})))
+    if len(wanted) < 2:
+        return {}
+    from concurrent.futures import ThreadPoolExecutor
+
+    # Each read_indexes call gathers its own shards; running them side by
+    # side puts every array's indexes in the same round.
+    with ThreadPoolExecutor(len(wanted)) as pool:
+        got = list(pool.map(lambda w: dict(zip(w[2], read_indexes(w[1], w[2]))), wanted))
+    return {r: g for (r, _, _), g in zip(wanted, got)}
+def _span_starts(
+    src: CellSource, shard: np.ndarray, off: np.ndarray, end: np.ndarray, run: np.ndarray | None,
+) -> np.ndarray:
+    """Which stored cells -- sorted by shard then offset -- start a read,
+    grouped as :func:`_spans` groups them under :func:`_coalescing` of
+    ``src``, but as arrays: a loop runs per read, never per cell.
+
+    A cell joins the read before it by gap when it starts within ``gap``
+    bytes of the previous cells' furthest end, which is that read's end
+    for cells that do not overlap -- the cells of any shard zarr writes.
+    """
+    mode, gap, span = _coalescing(src)
+    new = np.ones(len(off), dtype=bool)
+    same = shard[1:] == shard[:-1]
+    if mode in ("runs", "auto") and run is not None:  # zarr-octree: by run
+        new[1:] = ~(same & (run[1:] == run[:-1]))
+        return new
+    if mode not in ("gap", "auto") or not len(off):
+        return new
+    # The furthest end so far, within each shard: lifted by shard so a
+    # running maximum does not carry over from one shard to the next.
+    lift = shard * (int(end.max()) + 1)
+    reach = np.maximum.accumulate(end + lift) - lift
+    new[1:] = ~(same & (off[1:] - reach[:-1] <= gap))
+    starts = np.flatnonzero(new).tolist() + [len(off)]
+    for lo, hi in zip(starts[:-1], starts[1:]):  # then no read longer than span
+        if int(reach[hi - 1]) - int(off[lo]) <= span:
+            continue
+        ends = np.maximum.accumulate(end[lo:hi])
+        i = lo
+        while i < hi:
+            new[i] = True
+            i = max(i + 1, lo + int(np.searchsorted(ends, int(off[i]) + span, side="right")))
+    return new
+
+
+def read_cell_spans(
+    requests: list[tuple[CellSource, np.ndarray]],
+) -> tuple[list[tuple[np.ndarray, np.ndarray, np.ndarray, dict[int, Exception]]], list[Any]]:
+    """:func:`read_cells` for sharded arrays, with cells located as arrays.
+
+    The same index reads and the same coalesced ranges as
+    :func:`read_cells`, but each shard's index is looked up for all its
+    cells at once and no cell's bytes are cut out of their read. Returns,
+    per request, ``(read, start, stop, errors)`` -- cell ``i``'s stored
+    bytes are ``reads[read[i]][start[i]:stop[i]]``; ``read[i]`` -1 is a
+    cell with nothing stored, -2 one whose shard index could not be read,
+    its error in ``errors[i]`` -- and the ``reads``: bytes, None for an
+    object gone since its index was read, or an exception.
+    """
+    located: list[tuple[np.ndarray, np.ndarray, np.ndarray, dict[int, Exception]]] = []
+    on_disk: list[tuple[int, tuple[str, int, int]]] = []
+    in_store: dict[int, list[tuple[int, Any, str, int, int]]] = {}
+    n_reads = 0
+    for src, cells in requests:
+        cells = np.asarray(cells, dtype=np.int64).reshape(-1, len(src.shape))
+        read = np.full(len(cells), -1, dtype=np.int64)
+        start = np.zeros(len(cells), dtype=np.int64)
+        stop = np.zeros(len(cells), dtype=np.int64)
+        errors: dict[int, Exception] = {}
+        located.append((read, start, stop, errors))
+        if not len(cells):
+            continue
+        shard_shape = np.asarray(src.shard_shape, dtype=np.int64)
+        grid = -(-np.asarray(src.shape, dtype=np.int64) // shard_shape)
+        shards, which = np.unique(
+            np.ravel_multi_index((cells // shard_shape).T, grid), return_inverse=True,
+        )
+        inner = np.ravel_multi_index((cells % shard_shape).T, src.shard_shape)
+        shard_coords = np.stack(np.unravel_index(shards, grid), axis=1)
+        keys = [_key(src, tuple(s)) for s in shard_coords.tolist()]
+        indexes = read_indexes(src, keys)
+        width = 3 if src.index_format == "zarr_octree" else 2
+        rows = np.full((len(cells), width), _EMPTY, dtype=np.uint64)
+        bad = np.zeros(len(cells), dtype=bool)
+        by_shard = np.argsort(which, kind="stable")
+        bounds = np.searchsorted(which[by_shard], np.arange(len(keys) + 1))
+        for s, index in enumerate(indexes):  # each shard's cells at once
+            mine = by_shard[bounds[s]:bounds[s + 1]]
+            if isinstance(index, Exception):
+                bad[mine] = True
+            elif index is not None:
+                rows[mine] = index[inner[mine]]
+        for i in np.flatnonzero(bad).tolist():
+            index = indexes[which[i]]
+            errors[i] = ValueError(f"{type(index).__name__}: {index}")
+            read[i] = -2
+        stored = np.flatnonzero(~bad & ~((rows[:, 0] == _EMPTY) & (rows[:, 1] == _EMPTY)))
+        if not len(stored):
+            continue
+        stored = stored[np.lexsort((rows[stored, 0], which[stored]))]
+        shard, off = which[stored], rows[stored, 0].astype(np.int64)
+        end = off + rows[stored, 1].astype(np.int64)
+        new = _span_starts(src, shard, off, end, rows[stored, 2] if width == 3 else None)
+        firsts = np.flatnonzero(new)
+        number = np.cumsum(new) - 1
+        lo = off[firsts]
+        hi = np.maximum.reduceat(end, firsts)
+        read[stored] = n_reads + number
+        start[stored] = off - lo[number]
+        stop[stored] = end - lo[number]
+        for k, (s, a, b) in enumerate(zip(shard[firsts].tolist(), lo.tolist(), hi.tolist())):
+            if src.local_root is not None:
+                on_disk.append((n_reads + k, (_file(src, keys[s]), a, b - a)))
+            else:
+                item = (n_reads + k, src.store, keys[s], a, b)
+                in_store.setdefault(id(src.store), []).append(item)
+        n_reads += len(firsts)
+    reads: list[Any] = [None] * n_reads
+    for (k, _), blob in zip(on_disk, _batched_groups(_read_ranges, [item for _, item in on_disk])):
+        reads[k] = blob
+    if in_store:
+        from zarr.abc.store import RangeByteRequest
+
+        for items in in_store.values():
+            got = _store_get_many(
+                items[0][1], [(key, RangeByteRequest(a, b)) for _, _, key, a, b in items],
+            )
+            for (k, *_), blob in zip(items, got):
+                reads[k] = blob
+    return located, reads
 
 
 # --------------------------------------------------------------------

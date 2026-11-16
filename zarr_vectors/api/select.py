@@ -21,6 +21,7 @@ would be a behaviour change and every caller would have to be revisited.
 
 from __future__ import annotations
 
+import contextlib
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, Any
@@ -236,7 +237,16 @@ class Query:
 
     def read(self) -> ReadResult:
         """Execute and return the whole answer."""
-        return self._level._execute(self._selection)
+        from zarr_vectors._experiments import enabled
+
+        with contextlib.ExitStack() as stack:
+            if enabled("prime_nodes"):
+                from zarr_vectors._query_nodes import primed
+
+                stack.enter_context(primed(self._level._dataset._group, self._level.index))
+            if enabled("level_handle"):
+                stack.enter_context(self._level._held_store())
+            return self._level._execute(self._selection)
 
     async def aread(self) -> ReadResult:
         """Execute without ever blocking on zarr's ``sync()`` bridge.

@@ -16,7 +16,8 @@ asks for less.
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+import contextlib
+from collections.abc import Iterator, Sequence
 from typing import TYPE_CHECKING, Any
 
 import numpy as np
@@ -168,7 +169,7 @@ def _rows_in(
 class Level:
     """One resolution level of a :class:`~zarr_vectors.api.dataset.Dataset`."""
 
-    __slots__ = ("_dataset", "_index", "_meta", "_attr_names")
+    __slots__ = ("_dataset", "_index", "_meta", "_attr_names", "_held")
 
     def __init__(self, dataset: Dataset, index: int) -> None:
         self._dataset = dataset
@@ -178,6 +179,8 @@ class Level:
         # this handle exactly as ``_meta`` does: the Dataset drops its
         # Levels on every write it performs.
         self._attr_names: dict[str, tuple[str, ...]] = {}
+        # The level group while a query holds it (:meth:`_held_store`).
+        self._held: Any = None
 
     # ---------------- identity ----------------
 
@@ -347,9 +350,30 @@ class Level:
         ``building`` writer a handle it reads as a level — allocating the
         array families at the store root.
         """
+        held = self._held
+        if held is not None:
+            return held
         from zarr_vectors.core.store import get_resolution_level
 
         return get_resolution_level(self._dataset._group, self._index)
+
+    @contextlib.contextmanager
+    def _held_store(self) -> Iterator[None]:
+        """Resolve :attr:`store` once and reuse it until the block ends.
+
+        One query asks for the level group several times (attribute
+        names, metadata, known cells); each ask is a lookup of the
+        level's ``zarr.json``.  Nothing in a read creates or removes the
+        level, so the handle cannot go stale inside the block.
+        """
+        if self._held is not None:
+            yield
+            return
+        self._held = self.store
+        try:
+            yield
+        finally:
+            self._held = None
 
     def select(self, **kw: Any) -> Query:
         """Build a query against this level.  Nothing is read yet."""
@@ -772,11 +796,19 @@ class Level:
         which case the batched attempt was at fault and no caller should
         care — or it raises the genuine error, unobscured.  The cost is
         having done the work twice on the rare read that needs it.
+
+        With the ``octree_read_once`` experiment, a level with octree
+        chunks skips the engine: the reader is called once, directly.
         """
         self._check_supported(selection)
         reader, supports, adapter = self._reader()
         kwargs = self._reader_kwargs(selection, supports)
         group = self._dataset._group
+        if self._octree_read_once(selection):
+            # The reader resolves the leaves and batches their reads
+            # itself; the engine's plan names uniform cells, so its
+            # prefetch is wasted and each replay re-reads the leaf table.
+            return self._finish(reader(group, **kwargs), adapter, selection)
         try:
             from zarr_vectors._engine.execute import execute
             from zarr_vectors._engine.fetch import GroupFetcher
@@ -806,6 +838,23 @@ class Level:
             )
             raw = reader(group, **kwargs)
         return self._finish(raw, adapter, selection)
+
+    def _octree_read_once(self, selection: Selection) -> bool:
+        """Whether ``octree_read_once`` is on and the selection's level
+        has octree chunks, from the level metadata the plan reads anyway."""
+        from zarr_vectors._experiments import enabled
+
+        if not enabled("octree_read_once"):
+            return False
+        target = (
+            self if selection.level in (None, self._index)
+            else self._dataset.level(selection.level)
+        )
+        try:
+            meta = target._metadata()
+        except (ArrayError, StoreError, MetadataError, KeyError):
+            return False
+        return getattr(meta, "octree_chunks", None) is not None
 
     async def _aexecute(self, selection: Selection) -> ReadResult:
         """The same read, with its I/O awaited.

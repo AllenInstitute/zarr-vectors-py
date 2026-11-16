@@ -870,8 +870,11 @@ def _sharded_read_plan(
     hold are omitted, a cell with nothing stored reads as ``b""``, and a
     cell that cannot be read is omitted (``tolerant``) or raises.
     """
+    from zarr_vectors._experiments import enabled
     from zarr_vectors.core._cells_on_disk import read_cells
 
+    if enabled("batch_cells") and sum(len(k) for *_, k in entries) >= _BATCH_CELLS * len(entries):
+        return _sharded_read_batched(entries, tolerant=tolerant)
     requests, wanted = [], []
     for array_name, spec, chunk_keys in entries:
         src = spec.source
@@ -898,6 +901,117 @@ def _sharded_read_plan(
                 if isinstance(raw, Exception):
                     raise raw
                 data = _decode_direct(spec, raw)
+            except Exception:
+                if not tolerant:
+                    raise
+                continue
+            if data is not None:
+                out[(array_name, chunk_key)] = data
+    return out
+
+
+#: Cells per array, on average, from which :func:`_sharded_read_batched`
+#: takes a read: it costs ~0.15 ms an array however few cells it holds,
+#: the per-cell path ~15 us a cell (local, warm cache).
+_BATCH_CELLS = 32
+
+
+def _cells_of(src: Any, chunk_keys: list[str]) -> tuple[np.ndarray, list[str]]:
+    """The ``(C, K)`` cell indices of the keys ``src`` can hold, and those
+    keys: :func:`_parse_coords`, the origin and the grid as arrays."""
+    ndim = len(src.shape)
+    try:
+        if any(k.count(".") != ndim - 1 for k in chunk_keys):
+            raise ValueError
+        cells = np.asarray(list(map(int, ".".join(chunk_keys).split("."))), dtype=np.int64)
+    except ValueError:  # some key is not ndim integers: judged one by one
+        parsed = [(_parse_coords(k), k) for k in chunk_keys]
+        parsed = [(c, k) for c, k in parsed if c is not None and len(c) == ndim]
+        chunk_keys = [k for _, k in parsed]
+        cells = np.asarray([c for c, _ in parsed], dtype=np.int64)
+    cells = cells.reshape(-1, ndim)
+    if src.origin is not None:
+        cells = cells - np.asarray(src.origin, dtype=np.int64)
+    inside = np.all((cells >= 0) & (cells < np.asarray(src.shape, dtype=np.int64)), axis=1)
+    if not inside.all():
+        cells = cells[inside]
+        chunk_keys = [k for k, ok in zip(chunk_keys, inside.tolist()) if ok]
+    return cells, list(chunk_keys)
+
+
+def _zstd_steps(codecs: tuple[Any, ...]) -> list[Any] | None:
+    """The decompressions a cell's stored bytes go through, last codec
+    first, when every codec is zstd (or the octree marker, the identity
+    on bytes); else None. ``numcodecs.zstd.decompress`` is what the
+    codec's own decode calls, minus its checks of the argument."""
+    from numcodecs import zstd
+
+    steps = []
+    for codec in reversed(codecs):
+        if type(codec).__name__ == "OctreeChunksMarker":
+            continue
+        if type(codec).__name__ != "ZstdCodec" or type(codec._zstd_codec) is not zstd.Zstd:
+            return None
+        steps.append(zstd.decompress)
+    return steps
+
+
+def _sharded_read_batched(
+    entries: list[tuple[str, _ShardedSpec, list[str]]],
+    *,
+    tolerant: bool = False,
+) -> dict[tuple[str, str], bytes]:
+    """:func:`_sharded_read_plan` with the per-cell work done as arrays
+    (experiment ``batch_cells``): keys parsed, cells located and their
+    reads planned for all cells at once (see
+    :func:`~zarr_vectors.core._cells_on_disk.read_cell_spans`), and each
+    cell decompressed straight out of its read. Same reads, same results.
+    """
+    from zarr_vectors.core._cells_on_disk import read_cell_spans
+
+    requests, wanted = [], []
+    for array_name, spec, chunk_keys in entries:
+        cells, keys = _cells_of(spec.source, chunk_keys)
+        if keys:
+            requests.append((spec.source, cells))
+            wanted.append((array_name, spec, keys))
+    if not requests:
+        return {}
+    located, reads = read_cell_spans(requests)
+    views = [memoryview(r) if isinstance(r, bytes) else r for r in reads]
+    # A read's length, -1 for one that is not bytes and for no read at
+    # all (the last): a cell is served straight from its read when that
+    # read holds all of it.
+    lengths = np.asarray(
+        [len(v) if isinstance(v, memoryview) else -1 for v in views] + [-1], dtype=np.int64,
+    )
+    header = _VLEN_COUNT_LENGTH.size
+    unpack = _VLEN_COUNT_LENGTH.unpack_from
+    out: dict[tuple[str, str], bytes] = {}
+    for (array_name, spec, keys), (read, start, stop, errors) in zip(wanted, located):
+        steps = _zstd_steps(spec.codecs)
+        whole = (lengths[np.where(read >= 0, read, -1)] >= stop).tolist()
+        cells = zip(keys, whole, read.tolist(), start.tolist(), stop.tolist())
+        for i, (chunk_key, served, r, a, b) in enumerate(cells):
+            try:
+                if served and steps is not None:
+                    frame: Any = views[r][a:b]
+                    for step in steps:
+                        frame = step(frame)
+                    if len(frame) >= header:
+                        count, length = unpack(frame)
+                        if count == 1 and length == len(frame) - header:
+                            out[(array_name, chunk_key)] = bytes(frame[header:])
+                            continue
+                view = views[r] if r >= 0 else errors.get(i)
+                if view is None:  # nothing stored
+                    out[(array_name, chunk_key)] = b""
+                    continue
+                if isinstance(view, Exception):
+                    raise view
+                if b > len(view):
+                    raise ValueError("short read")
+                data = _decode_direct(spec, bytes(view[a:b]))
             except Exception:
                 if not tolerant:
                     raise

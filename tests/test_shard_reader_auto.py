@@ -284,9 +284,10 @@ def test_an_indexed_store_never_coalesces(stores, record, monkeypatch):
     """No zarr-octree array, no optimised reader: not one coalesced range,
     and a store that is not local still read cell by cell through zarr."""
     seen = []
-    real = _cells_on_disk.read_cells
-    monkeypatch.setattr(_cells_on_disk, "read_cells",
-                        lambda reqs: seen.append([(s.local_root, s.index_format) for s, _ in reqs]) or real(reqs))
+    for name in ("read_cells", "read_cell_spans"):  # the latter under experiment batch_cells
+        real = getattr(_cells_on_disk, name)
+        monkeypatch.setattr(_cells_on_disk, name, lambda reqs, real=real: seen.append(
+            [(s.local_root, s.index_format) for s, _ in reqs]) or real(reqs))
     monkeypatch.setenv("ZARR_VECTORS_COALESCE", "gap:1000000:100000000")  # would merge everything if consulted
     for where in ("local", "store"):
         for query in QUERIES:
