@@ -92,9 +92,20 @@ def assign_chunks(
     if n == 0:
         return {}
 
+    # Vectorised chunk coordinate computation, one column at a time into
+    # a column-major array: numpy's reductions and arithmetic over a tall
+    # (N, D) array along axis 0 are several times slower than D passes
+    # over contiguous columns.  Each column is divided in the same dtype
+    # as ``positions / chunk_shape`` would be, so the floors are the same.
     cs = np.array(chunk_shape, dtype=np.float64)
-    # Vectorised chunk coordinate computation
-    chunk_ints = np.floor(positions / cs).astype(np.int64)  # (N, D)
+    div_dtype = np.result_type(positions.dtype, cs.dtype)
+    chunk_ints = np.empty((n, ndim), dtype=np.int64, order="F")  # (N, D)
+    scratch = np.empty(n, dtype=div_dtype)
+    for k in range(ndim):
+        np.divide(positions[:, k], cs[k], out=scratch, dtype=div_dtype)
+        np.floor(scratch, out=scratch)
+        chunk_ints[:, k] = scratch
+    del scratch
 
     # Group indices by unique chunk coordinate rows
     # Convert to structured array for np.unique
@@ -106,7 +117,10 @@ def assign_chunks(
     # object path; the packed form sorts one column and finds the group
     # boundaries with one diff.  Packing is exact whenever the coord
     # ranges multiply to under 2**63, which is any grid a store can
-    # allocate; anything wider takes the lexsort path.
+    # allocate; anything wider takes the lexsort path.  A grid of at
+    # most 65536 cells packs into uint16, whose stable argsort is numpy's
+    # radix sort rather than a timsort: the same order, several times
+    # faster.
     packed = _pack_coords(chunk_ints)
     if packed is not None:
         sort_idx = np.argsort(packed, kind="stable")
@@ -151,18 +165,32 @@ def assign_chunks(
     return result
 
 
-def _pack_coords(coords: npt.NDArray[np.int64]) -> npt.NDArray[np.int64] | None:
-    """``(N, D)`` integer coords as one int64 key per row, ordering rows
+def _pack_coords(
+    coords: npt.NDArray[np.int64],
+) -> npt.NDArray[np.int64] | npt.NDArray[np.uint16] | None:
+    """``(N, D)`` integer coords as one integer key per row, ordering rows
     exactly as a lexicographic sort of the coords would.
 
+    The keys are uint16 when every row fits in 16 bits, int64 otherwise.
     ``None`` when the per-axis ranges are too wide to pack exactly.
     """
-    lo = coords.min(axis=0)
-    span = (coords.max(axis=0) - lo + 1).astype(np.float64)
+    ndim = coords.shape[1]
+    lo = np.array([coords[:, k].min() for k in range(ndim)], dtype=np.int64)
+    hi = np.array([coords[:, k].max() for k in range(ndim)], dtype=np.int64)
+    span_int = hi - lo + 1
+    span = span_int.astype(np.float64)
     if float(np.prod(span)) >= 2.0 ** 62:
         return None
     strides = np.cumprod(np.concatenate(([1.0], span[::-1][:-1])))[::-1].astype(np.int64)
-    return (coords - lo) @ strides
+    packed = coords[:, 0] - lo[0]
+    packed *= strides[0]
+    for k in range(1, ndim):
+        term = coords[:, k] - lo[k]
+        term *= strides[k]
+        packed += term
+    if (span_int > 0).all() and float(np.prod(span)) <= 2.0 ** 16:
+        return packed.astype(np.uint16)
+    return packed
 
 
 def compute_chunk_coords(

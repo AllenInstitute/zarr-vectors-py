@@ -1803,9 +1803,51 @@ def write_chunk_vertices(
         should use :func:`read_vertex_fragment_index`).
     """
     dtype = np.dtype(dtype)
-    key = _chunk_key(chunk_coords)
-
     raw_bytes, vertex_byte_offsets = encode_ragged_floats(groups, dtype)
+    counts = np.fromiter(
+        (int(np.asarray(g).shape[0]) for g in groups), dtype=np.int64, count=len(groups),
+    )
+    _write_vertex_cell(
+        level_group, _chunk_key(chunk_coords), raw_bytes, counts,
+        record_presence=record_presence,
+    )
+    return vertex_byte_offsets
+
+
+def write_chunk_vertex_runs(
+    level_group: Group,
+    chunk_coords: ChunkCoords,
+    vertices: npt.NDArray[np.floating],
+    counts: npt.NDArray[np.integer],
+    dtype: np.dtype | str = np.float32,
+    *,
+    record_presence: bool = True,
+) -> None:
+    """:func:`write_chunk_vertices` for fragments already laid end to end.
+
+    ``vertices`` is the chunk's ``(N, D)`` rows and ``counts`` the row
+    count of each fragment in order, so the cell is written from one
+    buffer without splitting it into a list of groups first.  The bytes
+    are the same as for ``write_chunk_vertices`` with those groups.
+    """
+    _write_vertex_cell(
+        level_group, _chunk_key(chunk_coords),
+        np.ascontiguousarray(vertices, dtype=np.dtype(dtype)).tobytes(),
+        np.asarray(counts, dtype=np.int64),
+        record_presence=record_presence,
+    )
+
+
+def _write_vertex_cell(
+    level_group: Group,
+    key: str,
+    raw_bytes: bytes,
+    counts: npt.NDArray[np.int64],
+    *,
+    record_presence: bool,
+) -> None:
+    """Write one vertex cell and its fragment index, each fragment the
+    next ``counts[k]`` rows."""
     # record_presence: see write_chunk_attributes.  nonempty_chunks is
     # array-wide, so stamping it rewrites the shared zarr.json once per
     # cell; concurrent writers over disjoint cells still collide there.
@@ -1814,9 +1856,6 @@ def write_chunk_vertices(
     )
 
     # Express each group as a contiguous (start_row, count) fragment.
-    counts = np.fromiter(
-        (int(np.asarray(g).shape[0]) for g in groups), dtype=np.int64, count=len(groups),
-    )
     cumulative = int(counts.sum())
     level_group.write_bytes(
         VERTEX_FRAGMENTS, key,
@@ -1829,7 +1868,6 @@ def write_chunk_vertices(
     # stamp can check the fragment index against it without reading the
     # buffer back.  See :meth:`Group.note_vertex_rows`.
     level_group.note_vertex_rows(key, cumulative)
-    return vertex_byte_offsets
 
 
 def _infer_link_width(link_groups: Sequence[npt.NDArray[np.integer]]) -> int:
@@ -2356,6 +2394,54 @@ def write_object_index(
         "num_present": sum(1 for blob in manifest_blobs if blob != _empty_manifest),
         "sid_ndim": sid_ndim,
         "layout": OBJECT_INDEX_LAYOUT_V2,
+        OBJECT_IDS_SORTED_ATTR: True,
+    })
+
+
+def write_object_index_arrays(
+    level_group: Group,
+    offsets: npt.NDArray[np.integer],
+    coords: npt.NDArray[np.integer],
+    frags: npt.NDArray[np.integer],
+    sid_ndim: int,
+) -> None:
+    """:func:`write_object_index` for objects ``0..len(offsets)-2`` whose
+    manifests are held as CSR arrays.
+
+    Object ``o`` owns rows ``offsets[o]:offsets[o+1]`` of ``coords``
+    (``(B, sid_ndim)``) and ``frags`` (``(B,)``), each one
+    ``(chunk_coords, fragment_index)`` pair.  The index written is the
+    one ``write_object_index`` writes for the same manifests, in the
+    layout it would choose, without a Python tuple per pair.
+    """
+    from zarr_vectors.encoding.fragments import encode_object_manifests_csr
+
+    offsets = np.asarray(offsets, dtype=np.int64)
+    coords = np.asarray(coords, dtype=np.int64).reshape(-1, sid_ndim)
+    frags = np.asarray(frags, dtype=np.int64)
+    n = len(offsets) - 1
+    if _index_layout_for_write(level_group, None) == "dense":
+        from zarr_vectors.core import dense_manifests as dense
+
+        _write_dense_index(
+            level_group, offsets, coords, frags,
+            mode="replace", at=None, ids=None, sid_ndim=sid_ndim, block_dtype=None,
+        )
+        layout = dense.OBJECT_INDEX_LAYOUT_DENSE
+    else:
+        _write_object_index_manifests(
+            level_group,
+            encode_object_manifests_csr(coords, frags, offsets, sid_ndim=sid_ndim),
+            layout="vlen",
+        )
+        layout = OBJECT_INDEX_LAYOUT_V2
+    _write_object_id_table(level_group, range(n))
+    level_group.write_array_meta(OBJECT_INDEX, {
+        "zv_array": "object_index",
+        "num_objects": n,
+        "num_present": int(np.count_nonzero(np.diff(offsets))),
+        "sid_ndim": sid_ndim,
+        "layout": layout,
         OBJECT_IDS_SORTED_ATTR: True,
     })
 
@@ -5425,6 +5511,59 @@ def read_chunk_vertices(
     # A leaf is no uniform cell: only the octree readers (``_leaf``) read one.
     if not _leaf:
         refuse_octree_read(level_group, "read_chunk_vertices")
+    full, fi = _read_chunk_buffer(level_group, chunk_coords, dtype, ndim)
+    return [] if full is None else _partition_rows(full, fi)
+
+
+def _read_chunk_fragments(
+    level_group: Group,
+    chunk_coords: ChunkCoords,
+    dtype: np.dtype | str | None = None,
+    ndim: int = 3,
+) -> Sequence[npt.NDArray[np.floating]]:
+    """:func:`read_chunk_vertices`, cutting range fragments on access.
+
+    A reader that needs a few fragments of a chunk -- a box query reads
+    the neighbour chunks its objects reach into for a handful of their
+    thousands of fragments -- otherwise builds a view per fragment it
+    never looks at.  The same arrays, indexed the same way.
+    """
+    full, fi = _read_chunk_buffer(level_group, chunk_coords, dtype, ndim)
+    if full is None:
+        return []
+    table = fi.ranges()
+    if table is None:
+        return _partition_rows(full, fi)
+    return _RangeFragments(full, table)
+
+
+class _RangeFragments(Sequence):
+    """``full`` as a sequence of row ranges, each a view cut when indexed."""
+
+    __slots__ = ("_full", "_starts", "_stops")
+
+    def __init__(self, full: npt.NDArray, table: npt.NDArray[np.int64]) -> None:
+        self._full = full
+        self._starts = table[:, 0].tolist()
+        self._stops = (table[:, 0] + table[:, 1]).tolist()
+
+    def __len__(self) -> int:
+        return len(self._starts)
+
+    def __getitem__(self, f: Any) -> Any:
+        if isinstance(f, slice):
+            return [self[i] for i in range(*f.indices(len(self)))]
+        return self._full[self._starts[f] : self._stops[f]]
+
+
+def _read_chunk_buffer(
+    level_group: Group,
+    chunk_coords: ChunkCoords,
+    dtype: np.dtype | str | None,
+    ndim: int,
+) -> tuple[npt.NDArray | None, ChunkFragmentIndex]:
+    """A chunk's ``(N, D)`` vertex buffer and fragment index; the buffer
+    is ``None`` when the chunk holds no fragments."""
     key = _chunk_key(chunk_coords)
     # Default to the declared dtype rather than float32.  Nothing in the
     # blob records the element type, so an assumed dtype is not checkable
@@ -5443,9 +5582,8 @@ def read_chunk_vertices(
         fi = read_vertex_fragment_index(level_group, chunk_coords)
 
     if fi.num_fragments == 0:
-        return []
-    full = _reshape_vertex_buffer(raw, dtype, ndim)
-    return _partition_rows(full, fi)
+        return None, fi
+    return _reshape_vertex_buffer(raw, dtype, ndim), fi
 
 
 def _partition_rows(

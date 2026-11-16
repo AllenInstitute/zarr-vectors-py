@@ -927,6 +927,16 @@ def _apply_out_of_bounds_policy(
         )
     bmin = np.asarray(cur_bounds[0], dtype=positions.dtype)
     bmax = np.asarray(cur_bounds[1], dtype=positions.dtype)
+    # Per-column extremes first: when they sit inside the bounds every
+    # point does, and 2*D column reductions cost a fraction of the
+    # (N, D) masks below.  A NaN makes its column's min and max NaN,
+    # which fails this test and takes the exact path.
+    ndim = positions.shape[1]
+    if bmin.shape == bmax.shape == (ndim,) and all(
+        positions[:, k].min() >= bmin[k] and positions[:, k].max() <= bmax[k]
+        for k in range(ndim)
+    ):
+        return positions, np.ones(len(positions), dtype=bool)
     in_bounds = np.all(
         (positions >= bmin) & (positions <= bmax), axis=1,
     )
@@ -1068,6 +1078,7 @@ def _create_or_open_store(
     geometry_types: list[str] | None = None,
     ndim: int | None = None,
     shard_shape: int | Sequence[int] | None = None,
+    manifest_layout: str | None = None,
     level: int = 0,
     **backend_kwargs: Any,
 ) -> Group:
@@ -1085,7 +1096,7 @@ def _create_or_open_store(
     root = _create_or_open(
         path, backend=backend, bounds=bounds, chunk_shape=chunk_shape, axes=axes,
         geometry_types=geometry_types, ndim=ndim, shard_shape=shard_shape,
-        **backend_kwargs,
+        manifest_layout=manifest_layout, **backend_kwargs,
     )
     from zarr_vectors.octree_chunks.guard import refuse_octree_levels
 
@@ -1103,6 +1114,7 @@ def _create_or_open(
     geometry_types: list[str] | None = None,
     ndim: int | None = None,
     shard_shape: int | Sequence[int] | None = None,
+    manifest_layout: str | None = None,
     **backend_kwargs: Any,
 ) -> Group:
     """Body of :func:`_create_or_open_store`, without the level check.
@@ -1112,7 +1124,8 @@ def _create_or_open(
     — this lets callers write through a handle they already hold.
 
     The create-only kwargs (``bounds`` / ``chunk_shape`` / ``axes`` /
-    ``geometry_types`` / ``ndim`` / ``shard_shape``) are forwarded to
+    ``geometry_types`` / ``ndim`` / ``shard_shape`` /
+    ``manifest_layout``) are forwarded to
     :func:`create_store` on a fresh path and ignored when opening an
     existing store — the existing store's structural metadata stays
     authoritative.
@@ -1142,6 +1155,8 @@ def _create_or_open(
         creator_kwargs["ndim"] = ndim
     if shard_shape is not None:
         creator_kwargs["shard_shape"] = shard_shape
+    if manifest_layout is not None:
+        creator_kwargs["manifest_layout"] = manifest_layout
 
     if backend == "icechunk":
         try:
