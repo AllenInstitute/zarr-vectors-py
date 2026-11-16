@@ -17,6 +17,13 @@ This page covers choosing a resolution level before reading anything, reading
 one grid cell at a time to stay under a memory budget, splitting that work
 across workers, and reading a single object without decoding the whole store.
 
+**Prerequisites:** the [Quickstart](../../getting_started/quickstart.md), and
+two stores built there: `scan.zarrvectors` with a three-level pyramid and an
+`intensity` attribute (the [point-cloud
+tutorial](../data_types/point_clouds.md) builds the same thing), and
+`tracts.zarrvectors` with 500 streamlines in two groups. The vertex counts
+printed below are for those stores.
+
 ---
 
 ## `zarr_vectors.lazy` is not the way to do this
@@ -97,9 +104,9 @@ for index in ds.levels:
 
 ```text
 Dataset('file:///.../scan.zarrvectors', point_cloud, levels=[0, 1, 2])
-(0, 1, 2) ('point_cloud',) 3 (0, 9, 1)
+(0, 1, 2) ('point_cloud',) 3 (0, 9, 2)
 (array([0., 0., 0.]), array([1000., 1000., 1000.]))
-0 100000 (200.0, 200.0, 200.0) (50.0, 50.0, 50.0) (5, 5, 5)
+0 100000 (200.0, 200.0, 200.0) (50.0, 50.0, 50.0) (6, 6, 6)
 1 1000 (400.0, 400.0, 400.0) (100.0, 100.0, 100.0) (3, 3, 3)
 2 125 (800.0, 800.0, 800.0) (200.0, 200.0, 200.0) (2, 2, 2)
 ```

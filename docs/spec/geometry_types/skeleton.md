@@ -9,29 +9,31 @@
   exactly one parent except the root, which has none.
 
 **`GEOM_SKELETON`**
-: The geometry type constant `"skeleton"`.
+: The geometry type constant `"skeleton"`, recorded as
+  `"geometry_types": ["skeleton"]` in the root `zarr_vectors` block.
 
 **SWC convention**
 : The de facto standard file format for neuronal morphology, defined by
   Cannon et al. (1998). An SWC file stores one vertex per row with columns:
-  `id, type, x, y, z, radius, parent_id`. Zarr Vectors skeletons follow the SWC
-  vertex type taxonomy and store `radius` and `type` as per-vertex
-  attributes.
+  `id, type, x, y, z, radius, parent_id`. Zarr Vectors does not require SWC
+  semantics: `radius` and `type` are ordinary per-vertex attributes whose
+  names and values you choose (this page uses `radius` and `swc_type`).
 
 **Vertex type**
 : An integer label from the SWC taxonomy identifying the anatomical role
-  of a vertex: 1 = undefined, 2 = soma, 3 = axon, 4 = basal dendrite,
-  5 = apical dendrite, 6 = custom, 7 = custom. Stored as per-vertex
-  attribute `"swc_type"` (int32).
+  of a vertex (table below). A producer convention only; nothing in
+  `zarr-vectors-py` reads or enforces it.
 
 **Radius**
-: The estimated radius of the tubular structure at a given vertex.
-  Stored as per-vertex attribute `"radius"` (float32). Unit follows
-  `axis_units` from root `.zattrs`.
+: The estimated radius of the tubular structure at a given vertex, as a
+  per-vertex attribute. Its unit is the unit of the store's axes
+  (`multiscales[0].axes`).
 
 **Root vertex**
 : The vertex with no parent, representing the origin of the tree (typically
-  the soma centre for a neuron). Identified by a parent edge index of `-1`.
+  the soma centre for a neuron). With `write_graph` the root simply has no
+  `[child, parent]` edge; the streaming writer records an explicit
+  `[root_local, -1]` row per fragment.
 
 ---
 
@@ -44,8 +46,8 @@ structured shape that will be read by or compared to SWC-compatible tools.
 
 Zarr Vectors skeletons store all the information present in an SWC file (position,
 radius, type, parent relationship) plus the spatial indexing and multi-
-resolution features of Zarr Vectors. The `ingest_swc` and `export_swc` functions
-provide lossless round-tripping between SWC and Zarr Vectors for standard SWC files.
+resolution features of Zarr Vectors. SWC converters live in the
+companion package `zarr-vectors-tools`.
 
 ---
 
@@ -58,34 +60,45 @@ family is written `directed=True` (see below).
 
 | Array path | Required | Description |
 |-----------|----------|-------------|
-| `vertices/` | Yes | Node positions (x, y, z) |
+| `vertices/` | Yes | Node positions |
 | `vertex_fragments/` | Yes | Fragment index over `vertices/` rows |
-| `links/0/0.0.0/` | Yes | Intra-chunk branch links; one group per fragment |
-| `links/0/<offsets>/` | Yes* | Parent–child edges crossing a chunk boundary |
-| `link_fragments/` | Yes (with `links/0/0.0.0/`) | Fragment index over the intra array's rows |
-| `object_index/` | Yes | One manifest blob per skeleton (one component = one object) |
-| `attributes/swc_type/` | Recommended | int32 per vertex: SWC compartment type |
-| `attributes/radius/` | Recommended | float32 per vertex: estimated radius |
-| `attributes/swc_id/` | Optional | int64 per vertex: original SWC row ID (for round-trips) |
+| `links/0/<offsets>/` | Yes | The edges the reader cannot imply: branch points and fragment starts (intra-chunk, `0.0.0`), and **every** edge crossing a chunk boundary (non-zero offsets) |
+| `link_fragments/` | With `links/0/0.0.0/` | Fragment index over the intra array's rows |
+| `object_index/` | Yes | One manifest per object (`object_ids=` entry; default: the whole store is object 0) |
+| `vertex_attributes/<name>/` | No | e.g. `radius` (float32), `swc_type` (int32); names are yours to choose |
 | `object_attributes/<name>/` | No | Per-skeleton attributes |
 
-### Root `.zattrs` type-specific keys
+### Root metadata
 
 ```json
 {
-  "geometry_type":    "skeleton",
-  "links_convention": "implicit_sequential_with_branches"
+  "zarr_vectors": {
+    "geometry_types":   ["skeleton"],
+    "links_convention": "implicit_sequential_with_branches"
+  }
 }
 ```
 
-Skeleton-ness is carried by `geometry_type` and `links_convention`.
+(Alongside the usual `zarr_vectors` keys.) Skeleton-ness is carried by
+`geometry_types` and `links_convention`. L4 accepts either
+`implicit_sequential_with_branches` or `explicit` for a skeleton.
 
 > **`is_tree` and `swc_compatible` are not root metadata keys.** Neither
 > is written or read by any shipped code. `is_tree` survives only as a
 > deprecated `write_graph` argument (see [Graph](graph.md)); there is no
 > `swc_compatible` key, argument, or check anywhere. SWC round-tripping
-> is a property of which `attributes/` a store happens to carry, not of
-> a declared flag.
+> is a property of which `vertex_attributes/` a store happens to carry,
+> not of a declared flag.
+
+### Implicit edges
+
+With `implicit_sequential_with_branches`, a reader infers
+`parent[i] = i - 1` over the concatenated read order (chunks in order,
+fragments within a chunk), except at the start of a fragment, which has
+no implied parent. Edges are `[child, parent]`. `write_graph(kind="skeleton")`
+reorders nodes depth-first and stores in `links/` only the edges this rule
+does not already give: branch points, fragment starts, and every edge whose
+endpoints are in different chunks. `read_graph` rebuilds the full edge list.
 
 ### The link family for skeletons
 
@@ -141,6 +154,15 @@ traversal order and the family is undirected. For skeletons, direction
 encodes the tree's child↔parent relationship and is preserved
 explicitly.
 
+The streaming writers (module `zarr_vectors.types.skeletons`) are for
+scale-out ingestion, where many workers each write some chunks. Their
+stores also carry a `segment_id` fragment attribute and a
+`coordinate_offset` key in the root `zarr_vectors` block (stored vertices
+are `world - coordinate_offset`). `read_skeleton_by_segment_id(path, id)`
+reads one skeleton back from such a store and returns `positions`,
+`edges` (`[child, parent]`), `attributes` and `fragment_count`, or `None`
+for an unknown id.
+
 ### SWC type taxonomy
 
 | Code | Anatomical meaning |
@@ -150,13 +172,10 @@ explicitly.
 | 2 | Axon |
 | 3 | Basal dendrite |
 | 4 | Apical dendrite |
-| 5 | Custom (fork point) |
-| 6 | Custom (end point) |
-| 7 | Custom (unspecified) |
+| 5+ | Custom |
 
-Note: some SWC conventions use `1` for soma and `2` for axon. The mapping
-above follows the NeuroMorpho / SWC+ convention. The `ingest_swc` function
-detects the convention from the input file header.
+This is the standard SWC convention, given for producers. It is not
+stored in or enforced by the format.
 
 ### Ingest and export
 
@@ -169,7 +188,16 @@ the companion package **`zarr-vectors-tools`**.
 import numpy as np
 from zarr_vectors.types.graphs import write_graph
 
-# positions: (n_nodes, 3), edges: (n_nodes-1, 2) [child, parent]; root has parent=-1
+# A 5-node tree: 0 is the root; edges are [child, parent] and the root
+# has no edge.
+node_positions = np.array(
+    [[0, 0, 0], [10, 0, 0], [20, 0, 0], [20, 10, 0], [30, 0, 0]],
+    dtype=np.float32,
+)
+parent_child_pairs = np.array(
+    [[1, 0], [2, 1], [3, 2], [4, 2]], dtype=np.int64
+)
+
 write_graph(
     "neuron.zarrvectors",
     positions=node_positions,
@@ -177,8 +205,8 @@ write_graph(
     chunk_shape=(200., 200., 200.),
     kind="skeleton",
     vertex_attributes={
-        "radius":   radii,       # float32
-        "swc_type": swc_types,   # int32
+        "radius":   np.full(5, 1.5, dtype=np.float32),
+        "swc_type": np.full(5, 3, dtype=np.int32),
     },
 )
 ```
@@ -200,47 +228,50 @@ objects A and B needs both.  `edit_link(new_endpoints=...)` on a branch
 record re-points the child's parent: it rewrites the record in place,
 under `atomic=True` too.
 
+Through the dataset API: `ds.add_graph(positions, edges, tree=True, ...)`.
+
 ### Multi-skeleton stores
 
-For connectome-scale datasets with thousands of neurons in a shared
-coordinate space, a single `skeleton` store is more efficient than
-separate per-neuron files:
+For many neurons in a shared coordinate space, pass `object_ids` (one entry
+per node) so each tree is its own object; `write_graph` rejects an object
+with more than one root. `read_graph(object_ids=...)` is **not
+implemented** (it raises `NotImplementedError`), so there is no
+by-object read for `write_graph` stores; read a region with `bbox=` or
+`chunks=` instead:
 
 ```python
+import numpy as np
 from zarr_vectors.types.graphs import read_graph
 
-# Read one skeleton by ID
-result = read_graph("connectome.zarrvectors", object_ids=[1042])
-print(result["node_count"])    # nodes in skeleton 1042
-print(result["attributes"]["radius"])
-
-# Spatial query — returns all skeletons with nodes in the region
 result = read_graph(
     "connectome.zarrvectors",
     bbox=(np.array([1000., 2000., 500.]),
           np.array([1200., 2200., 700.])),
 )
+print(result["node_count"], result["edge_count"])
 ```
+
+`read_graph` returns no attributes. For stores written with the streaming
+writers, `read_skeleton_by_segment_id` pulls one skeleton with its
+attributes.
 
 ### Validation
 
 L1, L2: same as `graph`.
 
 L3: offsets segments parse; `num_physical_records` matches the rows on
-disk; every record's endpoint chunks exist at the level. **The
-lex-non-negative and non-decreasing offset checks do not apply** —
-`enforce_canonical` requires `not directed`, and skeleton families are
-`directed=True`. This is correct: a directed family legitimately carries
-`0.0.-1` alongside `0.0.+1`.
+disk; every record's endpoint chunks exist at the level. For a **directed**
+(streaming-writer) family the lex-non-negative and non-decreasing offset
+checks do not apply, since `enforce_canonical` requires `not directed`; a
+`write_graph` skeleton family is undirected and canonical, so they do.
 
 L4: `links_convention` MUST be `implicit_sequential_with_branches` or
 `explicit` for `skeleton`
 ([`GEOMETRY_LINK_REQ`](../../../zarr_vectors/validate/conformance.py)).
 
-**Not checked at any level:** that each skeleton is a valid tree
-(connected, acyclic, single root), that link endpoints reference valid
+`write_graph(kind="skeleton")` itself rejects an object with more than one
+root. **Not checked at any validation level:** that each skeleton is a valid
+tree (connected, acyclic, single root), that link endpoints reference valid
 vertex indices within their chunk, that `[child, parent]` direction is
-consistent with tree depth, or anything about `swc_type` / `radius`
-value ranges. The SWC taxonomy below is a convention for producers, not
-an enforced constraint. See
-[Validation overview](../validation/overview.md).
+consistent with tree depth, or anything about `swc_type` / `radius` value
+ranges. See [Validation overview](../validation/overview.md).

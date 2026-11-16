@@ -23,8 +23,8 @@
 
 **Object fragment list**
 : The ordered list of fragment addresses belonging to one object.
-  Encoded as the per-object manifest in `object_index/data` (see
-  [Object manifest](object_manifest.md)).
+  Encoded as the per-object manifest, one row of `object_index/manifests`
+  (see [Object manifest](object_manifest.md)).
 
 ---
 
@@ -35,65 +35,80 @@ bin-level spatial queries of Zarr Vectors. A small binary **fragment index**
 sits alongside each chunk's vertex payload, naming the row ranges
 that belong to each fragment.
 
-At level 0 with the default writer, fragments line up with bins
-one-to-one: each non-empty bin emits exactly one range fragment.
-The coarsening pipeline relaxes that correspondence — at coarsened
-pyramid levels with `LevelMetadata.shared_fragments=True` a single
-fragment may represent a metavertex referenced by several objects'
-manifests, and the bin model is supplanted by the fragment as the
-addressing primitive.
+What a fragment *is* depends on the geometry type and writer — the format
+only says that a fragment is a set of rows of the chunk's `vertices` cell:
 
-This page describes the level-0 write path (where fragments and bins
-align one-to-one), the fragment addressing scheme, the read path, and
-what changes at coarsened levels.
+| Writer | Fragments in a chunk |
+|--------|----------------------|
+| `write_points`, no objects | one fragment per **bin**, in row-major bin order — including empty bins, which are zero-count ranges |
+| `write_points` with `object_ids` / objects / groups | one fragment per **object** in the chunk, ordered by object id |
+| `write_polylines`, `write_lines`, `write_graph`, `write_mesh` | one fragment per object per chunk (a polyline split by an attribute bin contributes one per piece) |
+| coarsened level, `shared_fragments=True` | one fragment per distinct **metavertex** in the chunk; several objects' manifests may name it |
+
+So "bins ↔ fragments one-to-one" holds only for undifferentiated point clouds
+(the case `bin_shape` is designed for; see [Bin shape](../chunking/bin_shape.md)).
+For every other type `bin_shape` is stored as `base_bin_shape` but the writers
+split at chunk boundaries only.
+
+This page describes the point-cloud bin write path, the fragment addressing
+scheme, the read path, and what changes at coarsened levels.
 
 ---
 
 ## Technical reference
 
-### Fragment creation during write (level 0)
+### Fragment creation during write (point cloud, no objects)
 
-When a chunk is written, its vertices are first sorted into bin
-order; then one range fragment is emitted per non-empty bin:
+When a point-cloud chunk is written, its vertices are sorted into bin order
+and **one range fragment is emitted for every bin of the chunk**, empty or not.
+The fragment index therefore *is* the row-major (C-order) bin index within the
+chunk, and a chunk has exactly `B_per_chunk` fragments:
 
 ```python
-def build_level0_fragments(positions, chunk_coord, chunk_shape, bin_shape):
-    """Compute fragment list for one chunk's vertices."""
-    D          = len(chunk_shape)
-    bpc_shape  = tuple(int(c / b) for c, b in zip(chunk_shape, bin_shape))
+def build_pointcloud_fragments(positions, chunk_coord, chunk_shape, bin_shape):
+    """Fragment list for one chunk's vertices (undifferentiated point cloud)."""
+    bpc_shape = tuple(int(round(c / b)) for c, b in zip(chunk_shape, bin_shape))
+    n_bins    = int(np.prod(bpc_shape))
 
-    # 1. Compute bin flat index for each vertex
-    local      = positions - np.array(chunk_coord) * np.array(chunk_shape)
-    bin_coords = np.floor(local / np.array(bin_shape)).astype(int)
-    bin_flats  = np.ravel_multi_index(bin_coords.T, bpc_shape)
+    # 1. Row-major bin index of each vertex within the chunk
+    #    (zarr_vectors.spatial.chunking.bin_to_fragment_index)
+    bin_coords = np.floor(positions / np.array(bin_shape)).astype(int)
+    local      = bin_coords - np.array(chunk_coord) * np.array(bpc_shape)
+    frag_idx   = np.ravel_multi_index(local.T, bpc_shape)
 
-    # 2. Sort vertices into bin order (stable sort within each bin)
-    order      = np.argsort(bin_flats, kind="stable")
-    sorted_pos = positions[order]
-    sorted_bin = bin_flats[order]
+    # 2. Sort vertices into bin order (stable within a bin)
+    order      = np.argsort(frag_idx, kind="stable")
 
-    # 3. Emit one range fragment per non-empty bin
-    unique_bins, first_occ, counts = np.unique(
-        sorted_bin, return_index=True, return_counts=True,
-    )
-    fragments = [
-        (int(first_occ[i]), int(counts[i]))
-        for i in range(len(unique_bins))
-    ]
+    # 3. One (start, count) range per bin; count == 0 for an empty bin
+    counts     = np.bincount(frag_idx, minlength=n_bins)
+    starts     = np.cumsum(counts) - counts
+    fragments  = list(zip(starts.tolist(), counts.tolist()))
 
-    # 4. Encode and write
-    blob = encode_fragments(fragments)
-    return sorted_pos, order, blob
+    return order, encode_fragments(fragments)
 ```
 
-The `order` permutation is applied to attribute arrays in the same
-way: `sorted_attributes = attributes[order]`. Attribute row `k` always
-corresponds to vertex row `k` in the chunk.
+A worked example: `chunk_shape = (200, 200, 200)`, `bin_shape = (100, 100, 200)`
+gives `bpc_shape = (2, 2, 1)` and four fragments per chunk. If the chunk holds
+3 points in bin `(0,0,0)`, 2 in bin `(1,0,0)` and none elsewhere, its fragment
+index is `[(0, 3), (3, 0), (3, 2), (5, 0)]` — fragment 2 is bin `(1, 0, 0)`.
 
-Empty bins do not contribute a fragment — the pre-0.6 `(0, 0)` and
-`(-1, -1)` filler rows are gone. The total fragment count `F` in a
-level-0 chunk equals the number of non-empty bins, bounded above by
-`B_per_chunk`.
+The `order` permutation is applied to attribute arrays in the same way:
+`sorted_attributes = attributes[order]`. Attribute row `k` always corresponds
+to vertex row `k` in the chunk.
+
+Consequences worth knowing:
+
+- Empty bins **do** occupy a fragment slot (a 16-byte `(start, 0)` range
+  entry), so a point-cloud chunk's fragment index has a fixed size of
+  `16 + 8 + 16·B_per_chunk + 4` bytes (header, bitmap rounded up to one
+  8-byte word for `B ≤ 64`, range table, one CSR offset). The pre-0.6
+  `(0, 0)` / `(-1, -1)` filler rows are gone, but the slot per bin is not.
+- `rebin_level` is different: it rewrites a chunk with one fragment per
+  **occupied** bin only, sorted by bin coordinate, so after a rebin fragment
+  `f` is no longer the bin with linear index `f`. Do not derive a bin from a
+  fragment index without checking the store was not rebinned.
+- For stores written with objects (or any non-point type) there is no
+  bin ↔ fragment relationship at all.
 
 ### Fragment addressing
 
@@ -116,14 +131,19 @@ manifest blob without a ravel-multi-index step.
 Reading a specific fragment given its address:
 
 ```python
-def read_fragment_vertices(level_group, chunk_coords, fragment_index):
-    """Read the vertices of a single fragment."""
-    fidx     = read_fragment_index(
-        level_group, VERTEX_FRAGMENTS, chunk_coords,
-    )
-    rows     = fidx.indices(fragment_index)
-    vertices = level_group.read_vertices(chunk_coords)
-    return vertices[rows, :]
+from zarr_vectors.core.arrays import read_fragment
+
+vertices = read_fragment(level_group, chunk_coords, fragment_index,
+                         dtype="float32", ndim=3)          # (n, 3)
+```
+
+which is, in outline:
+
+```python
+fidx     = read_fragment_index(level_group, VERTEX_FRAGMENTS, chunk_coords)
+rows     = fidx.indices(fragment_index)
+cell     = np.frombuffer(read_bytes("vertices", chunk_coords), dtype).reshape(-1, ndim)
+vertices = cell[rows, :]
 ```
 
 For range fragments, `fidx.indices(f)` materialises `arange(start,
@@ -142,15 +162,16 @@ the in-process chunk cache.
 ### Fragments and the object model
 
 For discrete-object geometry types (polyline, streamline, graph,
-skeleton, mesh), `object_index/data` stores each object's full
+skeleton, mesh), `object_index/manifests` stores each object's full
 manifest — the ordered list of `(chunk_coords, fragment_ref)` blocks
 that span the object. The first block names the object's primary
 fragment:
 
 - For **polylines and streamlines**, blocks are in traversal order.
   A single chunk's contribution may be one fragment (mode 0), a
-  contiguous range of adjacent-bin fragments (mode 1), or an
-  arbitrary list (mode 2 — most common after coarsening).
+  contiguous range of fragments (mode 1), or an arbitrary list (mode 2).
+  The core writers currently emit mode 0 only; the other modes are format
+  options readers must accept.
 - For **graphs and skeletons**, block order is implementation-defined;
   connectivity is recovered from the `links/<delta>/<offsets>/` family
   (intra-chunk edges and boundary-crossing edges alike — they differ
@@ -162,13 +183,11 @@ Reading a multi-chunk object is a single decode of the object's
 manifest blob followed by parallel chunk reads — no link-walk loop:
 
 ```python
+from zarr_vectors.core.arrays import read_object_vertices
+
 def read_object(level_group, object_id):
-    blocks = decode_object_manifest(level_group, object_id)
-    chunks = [
-        read_chunk_fragments(level_group, coords, fragment_ref)
-        for coords, fragment_ref in blocks
-    ]
-    return np.concatenate(chunks, axis=0)
+    fragments = read_object_vertices(level_group, object_id, dtype="float32", ndim=3)
+    return np.concatenate(fragments, axis=0)    # manifest order
 ```
 
 Pre-0.6 stores required walking `cross_chunk_links/` forward from
@@ -180,32 +199,34 @@ but is not used for chunk discovery during object reads.
 
 ### Fragment count at coarser levels
 
-The intuition "`B_per_chunk` shrinks with `bin_ratio` until each
-chunk is one fragment at the all-coarse level" is true only when the
-default writer is in use *and* the level does not share fragments.
-
-For levels with `shared_fragments=False`:
+For a level with `shared_fragments=False`, a fragment is whatever the writer
+that produced the level emitted (above): for an undifferentiated point cloud
+`F == B_per_chunk` at *that level's* bin shape, which shrinks as the bin
+grows:
 
 ```
-Level 0: bpc_shape = (4, 4, 4) → max F per chunk = 64
-Level 1: bpc_shape = (2, 2, 2) → max F per chunk = 8   (bin_ratio = (2,2,2))
-Level 2: bpc_shape = (1, 1, 1) → max F per chunk = 1   (bin_ratio = (4,4,4))
+Level 0: bpc_shape = (4, 4, 4) → F per chunk = 64
+Level 1: bpc_shape = (2, 2, 2) → F per chunk = 8   (bin 2x the base)
+Level 2: bpc_shape = (1, 1, 1) → F per chunk = 1   (bin 4x the base)
 ```
 
-For levels with `shared_fragments=True`, `F` equals the number of
-distinct metavertices in the chunk after coarsening — there is no
-fixed relationship to `B_per_chunk`. `F` is typically smaller than
-`B_per_chunk` (each metavertex represents many original vertices)
-but can in principle exceed it when many objects converge on
-non-aligned positions inside one bin.
+assuming the chunk shape is unchanged. A level may carry its own coarser
+`chunk_shape` (an integer multiple of the root's), in which case the bins per
+chunk are `level_chunk_shape / level_bin_shape`.
+
+For levels with `shared_fragments=True` — every level `coarsen_level` /
+`build_pyramid` writes — `F` equals the number of distinct metavertices in the
+chunk after coarsening; there is no fixed relationship to `B_per_chunk`. `F`
+is typically smaller than `B_per_chunk` but can in principle exceed it when
+many objects converge on non-aligned positions inside one bin.
 
 ### Invariants maintained by the writer
 
 A writer SHALL preserve:
 
-1. **Bin order at level 0.** Vertices within a chunk are stored in
-   ascending bin-flat-index order. Attribute row `k` corresponds to
-   vertex row `k`.
+1. **Row alignment.** Attribute row `k` corresponds to vertex row `k` of the
+   same cell. For an undifferentiated point cloud the vertices are
+   additionally stored in ascending bin-flat-index order.
 2. **Fragment-blob well-formedness.** Every chunk's `vertex_fragments/`
    blob conforms to the v1 byte layout — magic `'ZVFG'`, version 1,
    `R == popcount(bitmap[0:F])`, monotone CSR offsets. See
@@ -213,17 +234,17 @@ A writer SHALL preserve:
    invariants".
 3. **Index bounds.** Every range fragment's `[start, start + count)`
    and every explicit fragment's indices lie in `[0, len(vertices[chunk_coords]))`.
-4. **Fragment order at level 0 (default writer).** Fragments are
-   emitted in ascending bin-flat-index order, so readers that need
-   a bin ↔ fragment map at level 0 can derive it from the writer's
-   emission order without a separate sidecar.
-5. **Attribute row alignment.** Attribute arrays for chunk `c` are
-   row-aligned with `vertices/<c>`. Attribute access for fragment
-   `f` goes via `attributes[chunk][fidx.indices(f)]`; no separate
-   attribute index is maintained.
-6. **Manifest consistency.** The manifest in `object_index/data`
-   for object `oid` names only fragments that exist in the named
-   chunks' fragment-index blobs.
+4. **Fragment order (undifferentiated point clouds).** Fragments are
+   emitted in ascending bin-flat-index order, one per bin including empty
+   ones, so fragment `f` *is* bin `f` and no separate sidecar is needed —
+   until `rebin_level` has been run (see above).
+5. **Attribute row alignment.** `vertex_attributes/<name>` cell `c` is
+   row-aligned with `vertices` cell `c`. Attribute access for fragment `f`
+   goes via `attributes[chunk][fidx.indices(f)]`; no separate attribute index
+   is maintained.
+6. **Manifest consistency.** The manifest in `object_index/manifests` for
+   object `oid` names only fragments that exist in the named chunks'
+   fragment-index blobs.
 7. **Sharing discipline.** When `LevelMetadata.shared_fragments=False`,
    no fragment is named by more than one object's manifest. When
    `True`, sharing is permitted and readers MUST NOT assume
@@ -248,4 +269,4 @@ mapping useful:
 | `(B_per_chunk × 16-byte)` empty-bin overhead | Zero overhead for empty bins |
 | n/a | Explicit fragment (mode-2; arbitrary index list) |
 | n/a | Shared fragment (named by ≥ 2 manifests) |
-| Object manifest reconstructed via `cross_chunk_links/` walk | Object manifest enumerated directly in `object_index/data` |
+| Object manifest reconstructed via `cross_chunk_links/` walk | Object manifest enumerated directly in `object_index/manifests` |

@@ -5,25 +5,32 @@
 **RFC (Request for Comments)**
 : A structured discussion issue proposing a change to the Zarr Vectors specification.
   An RFC is required before opening a PR that changes the format
-  (`.zattrs` schema, array schemas, validation rules, or geometry type
+  (root / level attribute schemas, array schemas, validation rules, or geometry type
   definitions). Code-only changes (bug fixes, new ingest formats, new
   export targets) do not require an RFC.
 
 **Breaking change**
 : A spec change that makes existing valid stores invalid, or that changes
   the semantics of existing keys in a backward-incompatible way. Breaking
-  changes require incrementing the spec version and providing a migration
-  path.
+  changes increment the format version. So far (all `0.x`) they have
+  incremented the **minor** component, shipped **no compatibility shim**,
+  and told users to rewrite stores from source (see the version history in
+  the docstring of `FORMAT_VERSION` in `zarr_vectors/constants.py`: for
+  example 0.8.x → 0.9.0).
 
 **Additive change**
-: A spec change that adds new optional keys, new geometry types, or new
-  validation levels without affecting the validity of existing stores.
-  Additive changes do not require a version increment.
+: A spec change that adds new *optional*, backward-compatible keys without
+  affecting the validity or reading of existing stores. Historically these
+  have incremented the **patch** component (0.9.0 → 0.9.1 added
+  `attribute_specs`; 0.9.1 → 0.9.2 added the `ome` block; a missing
+  block means the prior behaviour).
 
 **Spec version**
-: The value of `zarr_vectors_version` in root `.zattrs`. Current version:
-  `"1.0"`. Spec versions follow semantic versioning: `MAJOR.MINOR`.
-  Breaking changes increment `MAJOR`; additive changes increment `MINOR`.
+: The value of `zv_version` in the root `zarr_vectors` attribute block,
+  equal to `FORMAT_VERSION` in `zarr_vectors/constants.py`. Current
+  version: `"0.9.2"`. It is `MAJOR.MINOR.PATCH`. A reader rejects stores
+  older than 0.9.0 (`RootMetadata.validate`). The release workflow refuses
+  to publish a release whose tag differs from `FORMAT_VERSION`.
 
 ---
 
@@ -46,14 +53,15 @@ changes are discussed before implementation, catching design issues early.
 ### When an RFC is required
 
 **RFC required:**
-- Adding, renaming, or removing a required or optional key in root `.zattrs`
-  or per-level `.zattrs`.
+- Adding, renaming, or removing a required or optional key in the root
+  `zarr_vectors` / `multiscales` / `ome` blocks or the per-level
+  `zarr_vectors_level` block.
 - Changing the dtype, shape, or semantics of any array defined in the spec.
 - Adding a new geometry type.
 - Adding or modifying validation rules.
 - Changing the coordinate transform encoding or multiscale metadata schema.
-- Any change that would cause existing L1–L3 validators to produce different
-  results on existing stores.
+- Any change that would cause existing validators (L1–L5) to produce
+  different results on existing stores.
 
 **RFC not required (direct PR acceptable):**
 - Bug fixes in `zarr-vectors-py` that do not change the format.
@@ -101,11 +109,14 @@ it (GitHub 👍 reaction or comment). Once ratified, the RFC is labelled
 
 The implementation PR must:
 - Update the relevant spec pages in `docs/spec/`.
-- Update the validator to reflect new rules.
+- Update the validator to reflect new rules (`zarr_vectors/validate/`).
+- Update `schema/zarr_vectors.linkml.yaml` and re-run `python schema/regen.py`.
+- Bump `FORMAT_VERSION` and add a note to its docstring if the format changes.
 - Add or update reference fixtures (see
   [Compliance testing](test_compliance.md)).
 - Update the write functions to produce conforming stores.
-- Include a changelog entry.
+- Describe the change in the PR (the repository has no changelog file;
+  the `FORMAT_VERSION` docstring is the format history).
 
 **Step 5 — Merge.**
 
@@ -114,16 +125,20 @@ The PR requires approval from at least two maintainers and passing CI
 
 ### Breaking changes and migration
 
-When a breaking change is ratified, the spec version `MAJOR` component
-is incremented. The implementation PR must also:
+When a breaking change is ratified, the format version is incremented
+(minor, while the format is `0.x`). The implementation PR should also:
 
-- Add a migration guide to `docs/how_to/migrate_v<old>_to_v<new>.md`.
-- Add a `zarr-vectors migrate` CLI command that upgrades existing stores.
-- Ensure the validator produces a clear, actionable error message for
-  stores at the old version.
+- Make the validator or reader produce a clear, actionable error for
+  stores at the old version (as `RootMetadata.validate` does for
+  pre-0.9.0 stores: "no backwards-compat shim ... Rewrite from source").
+- Document the migration path in the PR and in the `FORMAT_VERSION`
+  docstring. For additive changes an in-place upgrade is preferable where
+  possible (for example `zarr_vectors.building.stamp_ome_node` brings an
+  older store up to the 0.9.2 `ome` block without rewriting data).
 
-Stores at version `1.x` are not required to be readable by a `2.x`
-implementation without explicit migration.
+A store at an older version is not required to be readable by a newer
+implementation without explicit migration. This repository currently has
+no `zarr-vectors migrate` command and no `docs/how_to/migrate_*` pages.
 
 ### PR etiquette
 
