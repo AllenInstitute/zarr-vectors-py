@@ -355,14 +355,18 @@ class ShardTransaction:
             key, value, written = self._encode_one(name)
             tmp = None
             if isinstance(value, bytes):
+                # Not fsynced here: every partial is written first, then all
+                # are fsynced together below, before any rename (group commit).
                 tmp = _write_partial(
                     str(root / key), value,
-                    durable=self.durable, touched=touched, partials=partials,
+                    durable=False, touched=touched, partials=partials,
                 )
             return (key, value, written), tmp
 
         try:
             staged = _map_lanes(stage, list(self._owned), self._threads())
+            if self.durable:
+                _map_lanes(_fsync_path, [tmp for _e, tmp in staged if tmp], self._threads())
         except BaseException:
             _remove_all(partials)
             raise
@@ -449,6 +453,14 @@ def _write_partial(
         _remove_all([tmp])
         raise
     return tmp
+
+
+def _fsync_path(path: str) -> None:
+    fd = os.open(path, os.O_RDONLY)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
 
 
 def _remove_all(paths: Iterable[str]) -> None:

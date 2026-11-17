@@ -4,7 +4,14 @@ zarr's temp-file-and-rename is atomic but not durable. A durable write
 fsyncs each file *before* its rename (a rename can reach disk before its
 data), then each directory it added an entry to, once, before the block
 returns. zarr-vectors' direct writer uses :func:`write_file`; zarr's store
-path is hooked through :class:`DurableLocalStore`. Local filesystems only:
+path is hooked through :class:`DurableLocalStore`.
+
+Group commit: a :class:`Touched` made with ``defer=True`` holds each written
+``.partial`` instead of fsyncing and renaming it at once; :meth:`Touched.land`
+then fsyncs them all together and renames them. Each file is still fsynced
+before its rename, so the crash guarantee is unchanged; what changes is that
+the fsyncs no longer interleave with the writes, which on slow-fsync
+filesystems (rotational disks, FUSE such as ntfs-3g) is several times faster. Local filesystems only:
 on an object store a returned PUT is already durable, on icechunk the commit.
 """
 
@@ -22,11 +29,54 @@ from zarr.storage import LocalStore, WrapperStore
 
 
 class Touched:
-    """Directories whose entries a block changed, to fsync at the end."""
+    """Directories whose entries a block changed, to fsync at the end.
 
-    def __init__(self) -> None:
+    With ``defer=True`` it also holds the block's written-but-unrenamed
+    partials (:meth:`defer`) until :meth:`land` (or :meth:`discard`).
+    """
+
+    def __init__(self, *, defer: bool = False) -> None:
         self._dirs: set[str] = set()
         self._lock = threading.Lock()
+        self.deferring = bool(defer)
+        self._pending: list[tuple[str, str]] = []
+
+    def defer(self, tmp: str, path: str) -> None:
+        """Hold ``tmp`` (written, not fsynced) to be renamed onto ``path`` by :meth:`land`."""
+        with self._lock:
+            self._pending.append((tmp, path))
+
+    def land(self, lanes: int = 16) -> None:
+        """Fsync every held partial (concurrently), then rename each into place.
+
+        Renames run in the order the partials were deferred, so a path
+        written twice ends with its later value. A failure removes the
+        partials not yet renamed and re-raises.
+        """
+        with self._lock:
+            pending, self._pending = self._pending, []
+        if not pending:
+            return
+        from zarr_vectors.core.shard_txn import _map_lanes
+
+        try:
+            _map_lanes(_fsync_path, [tmp for tmp, _ in pending], lanes)
+        except BaseException:
+            _remove_quietly(tmp for tmp, _ in pending)
+            raise
+        for i, (tmp, path) in enumerate(pending):
+            try:
+                os.replace(tmp, path)
+            except BaseException:
+                _remove_quietly(t for t, _ in pending[i:])
+                raise
+            self.add(os.path.dirname(path))
+
+    def discard(self) -> None:
+        """Remove every held partial (a failed block)."""
+        with self._lock:
+            pending, self._pending = self._pending, []
+        _remove_quietly(tmp for tmp, _ in pending)
 
     def add(self, directory: str) -> None:
         with self._lock:
@@ -71,6 +121,22 @@ def fsync_dirs(dirs: Iterable[str]) -> None:
             os.close(fd)
 
 
+def _fsync_path(path: str) -> None:
+    fd = os.open(path, os.O_RDONLY)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
+def _remove_quietly(paths: Iterable[str]) -> None:
+    for p in paths:
+        try:
+            os.remove(p)
+        except OSError:
+            pass
+
+
 def fsync_files(paths: Iterable[str]) -> None:
     """Fsync files already written in place (metadata documents)."""
     for p in paths:
@@ -88,15 +154,23 @@ def write_file(path: str, data: bytes, touched: Touched, *, exclusive: bool = Fa
     """Write ``data`` to ``path`` durably: temporary, fsync, rename.
 
     The directory is recorded in ``touched``, to be fsynced once per block.
+    When ``touched`` defers (and the write is not ``exclusive``), the
+    temporary is written and handed to it; :meth:`Touched.land` fsyncs and
+    renames it.
     """
     directory = os.path.dirname(path)
     touched.makedirs(directory)
     tmp = f"{path}.{uuid.uuid4().hex}.partial"
+    defer = touched.deferring and not exclusive
     try:
         with open(tmp, "wb") as fh:
             fh.write(data)
-            fh.flush()
-            os.fsync(fh.fileno())
+            if not defer:
+                fh.flush()
+                os.fsync(fh.fileno())
+        if defer:
+            touched.defer(tmp, path)
+            return
         if exclusive:
             os.link(tmp, path)  # raises FileExistsError, as zarr's does
             os.unlink(tmp)
