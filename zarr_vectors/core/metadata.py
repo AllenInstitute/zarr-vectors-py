@@ -37,7 +37,7 @@ from zarr_vectors.constants import (
     VALID_OBJIDX_CONVENTIONS,
     VALID_XLEVEL_STORAGE,
 )
-from zarr_vectors.exceptions import ConventionError, MetadataError
+from zarr_vectors.exceptions import ConventionError, MetadataError, ZVDeprecationWarning
 
 
 class NgffAxis(TypedDict, total=False):
@@ -1542,7 +1542,7 @@ def chunk_scale_factor(
         "It is ROOT-relative, whereas coarsen_level(chunk_scale_factor=) is "
         "PARENT-relative; the shared name hid that they are different "
         "quantities on any pyramid with more than one coarser level.",
-        DeprecationWarning,
+        ZVDeprecationWarning,
         stacklevel=2,
     )
     return chunk_scale_from_root(root_meta, level_meta)

@@ -11,6 +11,7 @@ from zarr_vectors.core.metadata import (
     LevelMetadata,
     RootMetadata,
     chunk_scale_factor,
+    chunk_scale_from_root,
     get_level_chunk_shape,
     validate_level_chunk_shape_against_root,
 )
@@ -65,12 +66,12 @@ def test_get_level_chunk_shape_returns_override_when_set() -> None:
     assert get_level_chunk_shape(rm, lm) == (400.0, 400.0, 400.0)
 
 
-def test_chunk_scale_factor_root_default_is_all_ones() -> None:
+def test_chunk_scale_from_root_root_default_is_all_ones() -> None:
     rm = _minimal_root_meta()
-    assert chunk_scale_factor(rm, None) == (1, 1, 1)
+    assert chunk_scale_from_root(rm, None) == (1, 1, 1)
 
 
-def test_chunk_scale_factor_extracts_per_axis_ratio() -> None:
+def test_chunk_scale_from_root_extracts_per_axis_ratio() -> None:
     rm = _minimal_root_meta()
     lm = LevelMetadata(
         level=1,
@@ -80,10 +81,10 @@ def test_chunk_scale_factor_extracts_per_axis_ratio() -> None:
         chunk_shape=(400.0, 200.0, 600.0),  # 2×, 1×, 3×
         parent_level=0,
     )
-    assert chunk_scale_factor(rm, lm) == (2, 1, 3)
+    assert chunk_scale_from_root(rm, lm) == (2, 1, 3)
 
 
-def test_chunk_scale_factor_rejects_non_integer_ratio() -> None:
+def test_chunk_scale_from_root_rejects_non_integer_ratio() -> None:
     rm = _minimal_root_meta()
     lm = LevelMetadata(
         level=1,
@@ -94,7 +95,13 @@ def test_chunk_scale_factor_rejects_non_integer_ratio() -> None:
         parent_level=0,
     )
     with pytest.raises(MetadataError, match="integer multiple"):
-        chunk_scale_factor(rm, lm)
+        chunk_scale_from_root(rm, lm)
+
+
+def test_chunk_scale_factor_is_a_deprecated_alias() -> None:
+    rm = _minimal_root_meta()
+    with pytest.warns(DeprecationWarning, match="chunk_scale_from_root"):
+        assert chunk_scale_factor(rm, None) == (1, 1, 1)
 
 
 def test_validate_level_chunk_shape_passes_for_nested_grid() -> None:
@@ -205,11 +212,11 @@ def test_pyramid_with_chunk_scale_factor_writes_per_level_metadata(tmp_path: Pat
 
     lm1 = read_level_metadata(root, 1)
     assert lm1.chunk_shape == (400.0, 400.0, 400.0)
-    assert chunk_scale_factor(rm, lm1) == (2, 2, 2)
+    assert chunk_scale_from_root(rm, lm1) == (2, 2, 2)
 
     lm2 = read_level_metadata(root, 2)
     assert lm2.chunk_shape == (800.0, 800.0, 800.0)
-    assert chunk_scale_factor(rm, lm2) == (4, 4, 4)
+    assert chunk_scale_from_root(rm, lm2) == (4, 4, 4)
 
 
 def test_per_level_chunk_shape_round_trips_through_read_points(tmp_path: Path) -> None:

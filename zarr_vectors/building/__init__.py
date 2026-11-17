@@ -253,6 +253,7 @@ from zarr_vectors.exceptions import (
     PresenceMismatchError,
     ShardOwnershipError,
     StoreError,
+    ZVDeprecationWarning,
 )
 from zarr_vectors.multiresolution.registry import (
     register_coarsen_strategy,
@@ -684,7 +685,7 @@ def is_sharded(level_group: Group, array_name: str) -> bool:
         "collided with sharding.io.is_sharded(store_path), which answers a "
         "different question over a different argument, and swapping the two "
         "returned False instead of raising.",
-        DeprecationWarning,
+        ZVDeprecationWarning,
         stacklevel=2,
     )
     return array_is_sharded(level_group, array_name)

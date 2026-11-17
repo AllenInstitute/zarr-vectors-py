@@ -18,6 +18,7 @@ from __future__ import annotations
 import numpy as np
 import pytest
 
+from tests._deprecated import open_zv
 from zarr_vectors.constants import (
     CAP_PRESERVED_OBJECT_IDS,
     CAP_SHARED_FRAGMENTS,
@@ -36,7 +37,6 @@ from zarr_vectors.core.store import (
     read_level_metadata,
     read_root_metadata,
 )
-from zarr_vectors.lazy.store import open_zv
 from zarr_vectors.multiresolution.coarsen import build_pyramid, coarsen_level
 from zarr_vectors.spatial.chunking import neighbouring_chunk_keys
 from zarr_vectors.types.polylines import write_polylines

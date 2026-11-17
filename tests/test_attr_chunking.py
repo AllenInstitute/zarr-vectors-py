@@ -13,10 +13,10 @@ import pathlib
 import numpy as np
 import pytest
 
+from tests._deprecated import open_zv
 from zarr_vectors.core.attr_chunking import assign_attribute_bins
 from zarr_vectors.core.store import open_store, read_level_metadata
 from zarr_vectors.exceptions import ArrayError
-from zarr_vectors.lazy.store import open_zv
 from zarr_vectors.types.graphs import read_graph, write_graph
 from zarr_vectors.types.lines import read_lines, write_lines
 from zarr_vectors.types.meshes import read_mesh, write_mesh

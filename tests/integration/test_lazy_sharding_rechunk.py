@@ -48,7 +48,7 @@ class TestLazyFilterChain:
 
     def test_lazy_filter_pipeline(self, tmp_path: Path) -> None:
         from zarr_vectors.types.polylines import write_polylines
-        from zarr_vectors.lazy import open_zv
+        from tests._deprecated import open_zv
 
         rng = np.random.default_rng(42)
         polys = _make_streamlines(rng, 100)
@@ -91,7 +91,7 @@ class TestLazyDaskParallel:
         # jsonschema tests already use.
         dask = pytest.importorskip("dask")
         from zarr_vectors.types.points import write_points
-        from zarr_vectors.lazy import open_zv
+        from tests._deprecated import open_zv
 
         rng = np.random.default_rng(42)
         store = str(tmp_path / "pts.zv")
@@ -390,7 +390,7 @@ class TestRechunkViaLazy:
 
     def test_lazy_rechunk(self, tmp_path: Path) -> None:
         from zarr_vectors.types.polylines import write_polylines
-        from zarr_vectors.lazy import open_zv
+        from tests._deprecated import open_zv
 
         rng = np.random.default_rng(42)
         polys = _make_streamlines(rng, 40)
@@ -417,7 +417,7 @@ class TestCompositeStore:
         from zarr_vectors.types.points import write_points, read_points
         from zarr_vectors.composite import add_geometry, read_composite
         from zarr_vectors.validate import validate
-        from zarr_vectors.lazy import open_zv
+        from tests._deprecated import open_zv
 
         rng = np.random.default_rng(42)
         store = str(tmp_path / "brain.zv")

@@ -13,7 +13,7 @@ import tempfile
 import numpy as np
 import pytest
 
-from zarr_vectors.lazy import open_zv
+from tests._deprecated import open_zv
 from zarr_vectors.types.points import write_points
 
 

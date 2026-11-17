@@ -7,13 +7,13 @@ import asyncio
 import numpy as np
 import pytest
 
+from tests._deprecated import open_zv, zv_writer
 from zarr_vectors.core.arrays import read_all_object_manifests
 from zarr_vectors.core.store import (
     get_resolution_level,
     open_store,
     read_root_metadata,
 )
-from zarr_vectors.lazy.store import open_zv
 from zarr_vectors.types.points import read_points, write_points
 
 
@@ -44,7 +44,7 @@ def test_add_attribute_round_trip(tmp_path):
 
     async def go():
         zv = open_zv(str(store))
-        async with zv[0].writer() as w:
+        async with zv_writer(zv[0]) as w:
             await w.add_attribute("normal", normals)
 
     _run(go())
@@ -61,7 +61,7 @@ def test_add_attribute_sync_mirror(tmp_path):
     intensities = rng.uniform(0, 1, 120).astype("f4")
 
     zv = open_zv(str(store))
-    with zv[0].writer() as w:
+    with zv_writer(zv[0]) as w:
         w.add_attribute_sync("intensity", intensities)
 
     out = read_points(str(store), attribute_names=["intensity"])
@@ -74,7 +74,7 @@ def test_add_attribute_length_mismatch_raises(tmp_path):
 
     async def go():
         zv = open_zv(str(store))
-        async with zv[0].writer() as w:
+        async with zv_writer(zv[0]) as w:
             await w.add_attribute("bad", bad)
 
     from zarr_vectors.exceptions import ArrayError
@@ -88,7 +88,7 @@ def test_add_object_attribute(tmp_path):
 
     async def go():
         zv = open_zv(str(store))
-        async with zv[0].writer() as w:
+        async with zv_writer(zv[0]) as w:
             await w.add_object_attribute("score", np.arange(80, dtype="f4"))
 
     _run(go())
@@ -111,7 +111,7 @@ def test_append_vertices_grows_store(tmp_path):
 
     async def go():
         zv = open_zv(str(store))
-        async with zv[0].writer() as w:
+        async with zv_writer(zv[0]) as w:
             result = await w.append_vertices(new_pos)
             return result
 
@@ -133,7 +133,7 @@ def test_append_then_compact_is_a_no_op(tmp_path):
 
     async def go():
         zv = open_zv(str(store))
-        async with zv[0].writer() as w:
+        async with zv_writer(zv[0]) as w:
             await w.append_vertices(
                 np.random.default_rng(4).uniform(0, 100, (10, 3)).astype("f4")
             )
@@ -142,7 +142,7 @@ def test_append_then_compact_is_a_no_op(tmp_path):
 
     async def do_compact():
         zv = open_zv(str(store))
-        async with zv[0].writer() as w:
+        async with zv_writer(zv[0]) as w:
             return await w.compact()
 
     result = _run(do_compact())
@@ -157,12 +157,12 @@ def test_two_sequential_appends_merge_into_object_index(tmp_path):
 
     async def go():
         zv = open_zv(str(store))
-        async with zv[0].writer() as w:
+        async with zv_writer(zv[0]) as w:
             await w.append_vertices(
                 np.random.default_rng(5).uniform(0, 100, (5, 3)).astype("f4")
             )
         zv = open_zv(str(store))
-        async with zv[0].writer() as w:
+        async with zv_writer(zv[0]) as w:
             await w.append_vertices(
                 np.random.default_rng(6).uniform(0, 100, (7, 3)).astype("f4")
             )
@@ -181,7 +181,7 @@ def test_append_vertices_overlap_oid_raises(tmp_path):
 
     async def go():
         zv = open_zv(str(store))
-        async with zv[0].writer() as w:
+        async with zv_writer(zv[0]) as w:
             await w.append_vertices(
                 np.zeros((3, 3), dtype="f4"),
                 object_ids=overlap,
@@ -272,7 +272,7 @@ def test_add_attribute_prefetches_the_level_once(tmp_path, monkeypatch):
     lg = get_resolution_level(open_store(str(store)), 0)
     assert len(lg.list_chunks("vertices")) == 8
     zv = open_zv(str(store))
-    w = zv[0].writer()
+    w = zv_writer(zv[0])
 
     calls = []
     real = Group.batched_reads
@@ -317,7 +317,7 @@ def test_add_attribute_on_a_float64_store_lines_up_with_the_vertices(tmp_path, p
     # The x column, in the order the level stores its vertices.
     xs = np.concatenate([cells[cc][:, 0] for cc in keys])
 
-    w = open_zv(store)[0].writer()
+    w = zv_writer(open_zv(store)[0])
     if path == "sync":
         w.add_attribute_sync("x", xs)
     else:

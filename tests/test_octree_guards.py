@@ -366,16 +366,12 @@ def test_the_per_cell_readers_refuse_an_octree_level(tmp_path):
 
 
 def test_lazy_writer_and_level_metadata_refuse(tmp_path):
-    import warnings
-
+    from tests._deprecated import open_zv, zv_writer
     from zarr_vectors.core.store import update_level_metadata
     from zarr_vectors.exceptions import MetadataError
-    from zarr_vectors.lazy.store import open_zv
 
     p = _points(tmp_path / "p.zv")
-    with warnings.catch_warnings():
-        warnings.simplefilter("ignore", DeprecationWarning)
-        _refused(p, lambda: open_zv(p)[0].writer(), match="ZVWriter")
+    _refused(p, lambda: zv_writer(open_zv(p)[0]), match="ZVWriter")
     lg = get_resolution_level(open_store(p, mode="r+"), 0)
     before = _digest(p)
     with pytest.raises(MetadataError, match="octree_chunks"):
