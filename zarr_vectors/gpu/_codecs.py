@@ -44,16 +44,15 @@ def zstd_decode(
 
     stream = stream if stream is not None else cp.cuda.get_current_stream()
     codec = _codec(mod, int(stream.ptr))
-    srcs = [mod.as_array(f) for f in frames]
     if out is None:
-        decoded = list(codec.decode(srcs))
+        decoded = list(_decode_batch(mod, codec, frames))
         stream.synchronize()
         return decoded
     try:
-        got = list(codec.decode(srcs, out=[mod.as_array(o) for o in out]))
+        got = list(_decode_batch(mod, codec, frames, out=out))
     except TypeError:
         # nvCOMP before 5 has no out=: decode, then copy into place.
-        got = list(codec.decode(srcs))
+        got = list(_decode_batch(mod, codec, frames))
         for o, d in zip(out, got):
             cp.cuda.runtime.memcpyAsync(
                 device_pointer(o), device_pointer(d),
@@ -67,6 +66,27 @@ def zstd_decode(
         cp.asarray(o).reshape(-1).view(cp.uint8)[:min(device_nbytes(o), device_nbytes(d))]
         for o, d in zip(out, got)
     ]
+
+
+def _batch(mod: Any, buffers: list[Any]) -> Any:
+    """``buffers`` as ``Codec.decode`` takes a batch: a list of ``Array``
+    (nvCOMP 4 and 5), or a ``BatchArray`` (nvCOMP 6, which rejects lists)."""
+    if _takes_batch_array(mod):
+        return mod.as_arrays(list(buffers))
+    return [mod.as_array(b) for b in buffers]
+
+
+@functools.cache
+def _takes_batch_array(mod: Any) -> bool:
+    # Read off decode's (pybind11) signature: the batch overload names
+    # ``BatchArray`` from nvCOMP 6 on, ``list[Array]`` before.
+    doc = getattr(mod.Codec.decode, "__doc__", None) or ""
+    return hasattr(mod, "as_arrays") and "BatchArray" in doc and "list[" not in doc.lower()
+
+
+def _decode_batch(mod: Any, codec: Any, srcs: list[Any], **kwargs: Any) -> Any:
+    """``codec.decode`` on a batch, in whichever form this nvCOMP takes."""
+    return codec.decode(_batch(mod, srcs), **{k: _batch(mod, v) for k, v in kwargs.items()})
 
 
 def _codec(mod: Any, stream_ptr: int = 0) -> Any:
