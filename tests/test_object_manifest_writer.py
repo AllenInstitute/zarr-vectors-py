@@ -121,6 +121,7 @@ CASES = [
 ]
 
 
+@pytest.mark.slow
 @pytest.mark.parametrize("sharded", [False, True], ids=["unsharded", "sharded"])
 @pytest.mark.parametrize(("layout", "scenario", "ids"), CASES)
 def test_the_stream_stores_what_per_call_writes_store(

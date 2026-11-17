@@ -100,6 +100,7 @@ def pyramid(tmp_path: Path) -> Path:
     return path
 
 
+@pytest.mark.slow
 def test_pyramid_round_trips_exactly(pyramid, tmp_path):
     out = tmp_path / "out.zarr"
     rechunk_spatial(pyramid, out, (50.0,) * 3)
@@ -153,6 +154,7 @@ def test_refusal_leaves_an_existing_output_alone(pyramid, tmp_path):
     assert (out / "keep.txt").exists()
 
 
+@pytest.mark.slow
 def test_mesh_faces_keep_their_winding(tmp_path):
     from zarr_vectors.types.meshes import write_mesh
 

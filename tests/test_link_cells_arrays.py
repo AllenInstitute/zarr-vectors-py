@@ -61,6 +61,7 @@ def _as_records(chunks, vids):
     (2, True, "canonical", False),
     (2, False, "duplicate", False),   # the record-placement fallback
 ])
+@pytest.mark.slow
 def test_arrays_leave_the_store_records_do(tmp_path, L, directed, store, int32):
     path_a, lg_a = _level(tmp_path, "records")
     path_b, lg_b = _level(tmp_path, "arrays")

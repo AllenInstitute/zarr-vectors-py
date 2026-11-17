@@ -1,144 +1,92 @@
 # Compliance testing
 
+How the test suite checks that `zarr-vectors-py` writes conforming
+stores and reads them back, and how to run it.
+
 ## Terms
 
-**Fixture (pytest)**
-: A function in `tests/conftest.py` (or a test module) that builds small,
-  deterministic synthetic data, such as seeded random point clouds. The
-  repository currently has **no committed reference stores**:
-  `tests/fixtures/` holds only an empty package marker. Tests write their
-  stores into pytest's `tmp_path` and read them back.
+**Conformance test**
+: A test that writes a store from synthetic data and asserts that
+  `zarr_vectors.validate.validate(path, level=5)` passes.
 
 **Round-trip test**
-: A pytest test that writes a store with `zarr-vectors-py`, reads it back
-  and asserts the data survived.
+: A test that writes a store and asserts that reading it returns the
+  data written.
 
-**Writer conformance test**
-: A pytest test that writes a store and then runs the validator
-  (`zarr_vectors.validate.validate`) to confirm the output is conforming.
-  These tests guard against regressions in the writer.
-
-**Reference fixture / golden output**
-: Not yet in use. A committed store plus expected outputs would let a reader be
-  tested against stores written by *another* implementation. If you add
-  one, keep it small and generate it deterministically.
-
----
+**Byte-level comparison**
+: A test that writes the same input through two code paths and asserts
+  the stores are identical on disk (`assert_stores_identical` in
+  `tests/_store_compare.py`).
 
 ## Introduction
 
-The test suite guards the reader and writer against regressions, and
-documents the format in executable form: the tests are concrete examples of
-valid stores that contributors can inspect. It does not yet include
-cross-implementation compliance fixtures.
-
-For contributors adding a new feature or fixing a bug, the test suite is
-the primary quality gate. All PRs must pass the full test suite. PRs that
-add new functionality must include new tests.
-
----
+The validator is the executable form of this specification. So the
+main compliance check is that every writer's output validates at
+level 5 and reads back unchanged. Tests build data with seeded random
+generators and write stores under pytest's `tmp_path`; the repository
+holds no reference stores (`tests/fixtures/` is an empty package), so
+nothing yet tests reading stores written by another implementation.
 
 ## Technical reference
 
-### Repository test layout
+### Test layout
 
-Tests are flat modules in `tests/`, named by area, plus a small
-`tests/integration/` directory:
+| Path | Content |
+|---|---|
+| `tests/conftest.py` | Shared fixtures and the `--manifest-layout` option |
+| `tests/_store_compare.py` | `assert_stores_identical` |
+| `tests/_reference.py` | Frozen copies of write paths, for byte-level comparison |
+| `tests/test_<feature>.py` | One module per feature or geometry type, such as `test_points.py` |
+| `tests/test_linkml_schema.py` | Stored metadata against the JSON Schema; `VALID_*` sets against the schema enums; pins `FORMAT_VERSION` |
+| `tests/integration/` | Longer end-to-end tests, not run by the workflow |
+| `tests/gpu/` | Tests marked `gpu`, skipped without CuPy and a CUDA device |
 
-```
-tests/
-├── conftest.py            ← shared fixtures: tmp_store_path, rng, simple_points_3d, ...
-├── fixtures/              ← empty package marker (no committed stores)
-├── integration/           ← slower tests, excluded from CI (see below)
-├── test_points.py         ← per-geometry: test_points / test_lines_parametric /
-├── test_polylines.py        test_polylines / test_graphs / test_skeletons / test_meshes
-├── test_graphs.py
-├── test_meshes.py
-├── test_multiscale_links.py, test_per_object_pyramid.py, ...   ← pyramids
-├── test_links_*.py, test_link_offsets.py, test_paths.py ...    ← link families
-├── test_icechunk_backend.py, test_backends.py ...              ← backends
-├── test_linkml_schema.py  ← keeps schema/ artefacts in sync with the code
-└── …                      ← validators, API facade, edits, rechunking, etc.
-```
+Fixtures in `conftest.py`: `rng` (seed 42), `simple_points_3d`,
+`two_chunk_points`, `simple_streamlines`, `simple_skeleton`,
+`simple_graph`, `simple_mesh`, `tmp_store_path`, `tmp_dir`,
+`assert_arrays_close` and `assert_arrays_equal`.
 
-Use `ls tests/` for the current list.
-
-### Writing a round-trip and writer-conformance test
+### Example
 
 ```python
-# tests/test_points.py (illustrative)
 import numpy as np
-from zarr_vectors.types.points import write_points, read_points
+
+from zarr_vectors.types.points import read_points, write_points
 from zarr_vectors.validate import validate
 
 
-def test_write_conformance(tmp_path):
+def test_points_round_trip_and_validate(tmp_path):
     rng = np.random.default_rng(0)
-    positions = rng.uniform(0, 500, (10_000, 3)).astype(np.float32)
-    intensity = rng.uniform(0, 1, 10_000).astype(np.float32)
+    positions = rng.uniform(0, 500, (2_000, 3)).astype(np.float32)
+    path = str(tmp_path / "points.zarrvectors")
 
-    path = str(tmp_path / "test.zarrvectors")
-    write_points(
-        path, positions,
-        chunk_shape=(100., 100., 100.),
-        bin_shape=(25., 25., 25.),
-        vertex_attributes={"intensity": intensity},
-    )
+    write_points(path, positions, chunk_shape=(100.0, 100.0, 100.0))
 
-    # Validate at full depth: result.ok is True when there are no errors
     result = validate(path, level=5)
     assert result.ok, result.summary()
 
-    # Round-trip (attributes must be requested by name)
-    out = read_points(path, attribute_names=["intensity"])
-    assert out["vertex_count"] == len(positions)
-    np.testing.assert_allclose(
-        np.sort(out["positions"], axis=0),
-        np.sort(positions, axis=0),
-        rtol=1e-6,
-    )
-    assert out["vertex_attributes"]["intensity"].shape == (10_000,)
+    lo, hi = np.zeros(3), np.full(3, 100.0)
+    box = read_points(path, bbox=(lo, hi))
+    inside = np.all((positions >= lo) & (positions < hi), axis=1)
+    assert box["vertex_count"] == int(inside.sum())
 ```
 
-`ValidationResult` has `ok`, `passed`, `warnings`, `errors` and
-`summary()`; it has no `is_valid` or `report()`.
+`validate` returns a `ValidationResult`: `ok` is true when there are no
+errors, `passed`, `warnings` and `errors` hold the messages, and
+`summary()` lists them all.
 
-### Running the test suite
+### Running the tests
+
+The test workflow (`.github/workflows/tests.yml`) runs on pushes to `main` and
+pull requests, on Python 3.11 and 3.12 (there is no nightly job):
 
 ```bash
-# Full suite (what CI runs)
+uv sync --frozen --extra all --extra dev
+uv run python schema/regen.py --check
 uv run pytest tests/ --ignore=tests/integration -v
-
-# Everything, including integration tests
-uv run pytest tests/ -v
-
-# Single test module
-uv run pytest tests/test_polylines.py -v
-
-# With coverage (if pytest-cov is installed)
-uv run pytest tests/ --cov=zarr_vectors --cov-report=term-missing
 ```
 
-The repository defines no custom pytest markers, so there is no
-`-m "not slow"` selection.
+`uv run pytest tests/` also runs `tests/integration/`.
 
-### CI pipeline
-
-`.github/workflows/tests.yml` runs on pushes and pull requests (an approval
-gate lets outside contributors' PRs run once a maintainer applies the
-`ci-approved` label). One job, `pytest`, runs on Python 3.11 and 3.12 after
-`uv sync --frozen --extra all --extra dev` and executes
-`pytest tests/ --ignore=tests/integration -v`. There is no nightly job.
-`.github/workflows/release.yml` builds and publishes releases and checks the
-release version against `FORMAT_VERSION`.
-
-### Adding tests for a new geometry type
-
-1. Add a `tests/test_<type>.py` with a seeded-random round trip, a bbox
-   read, a pyramid build/read, and a `validate(path, level=5)` assertion.
-2. Add shared data builders to `tests/conftest.py` if several tests need
-   them.
-3. If you change the format, update the LinkML schema and re-run
-   `python schema/regen.py` (`--check` reports drift);
-   `tests/test_linkml_schema.py` checks the dataclasses against the
-   committed JSON Schema.
+`pytest tests/ --manifest-layout dense` (or `vlen`) forces the layout
+of every new object index, except in tests marked `vlen_only`.

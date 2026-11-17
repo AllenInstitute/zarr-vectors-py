@@ -95,6 +95,8 @@ all = [
 ]
 dev = [
     "pytest>=7.0",
+    "pytest-xdist>=3.5",
+    "pytest-timeout>=2.3",
     "ruff>=0.4",
     "mypy>=1.10",
     # Build-time-only schema toolchain.  End users never need these;
@@ -133,6 +135,7 @@ warn_unused_configs = true
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 markers = [
+    "slow: takes seconds, not milliseconds; PR CI skips it (-m 'not slow'), main and nightly run it",
     "gpu: needs cupy and a CUDA device (skipped without them)",
     "vlen_only: tests the vlen object-index layout itself; --manifest-layout does not apply",
 ]

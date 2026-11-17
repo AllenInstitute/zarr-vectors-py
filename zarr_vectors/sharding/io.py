@@ -652,14 +652,15 @@ def set_octree(
     _refuse_unfinished_conversions(root, "set_octree")
     meta = read_root_metadata(root)
     ndim = len(meta.bounds[0])
-    config = (
-        None if octree is False or octree is None
-        # zarr-octree present and the configuration valid, before anything changes
-        else check_octree_sharding({} if octree is True else octree, ndim)
-    )
+    marking = not (octree is False or octree is None)
     stamp_shape = None
-    if config is not None and meta.shard_shape is None:
+    if marking and meta.shard_shape is None:
+        # An unsharded store is refused first, whether or not zarr-octree is installed.
         stamp_shape = _common_shard_shape(root, ndim)
+    config = (
+        # zarr-octree present and the configuration valid, before anything changes
+        check_octree_sharding({} if octree is True else octree, ndim) if marking else None
+    )
     if config is not None and arrays is None:
         # Marker first: the capability is on the root before any octree array.
         _write_octree_block(root, config, needs_octree=True, shard_shape=stamp_shape)

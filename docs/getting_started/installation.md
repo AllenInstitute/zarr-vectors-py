@@ -1,150 +1,79 @@
 # Installation
 
-`zarr-vectors` requires **Python 3.11 or later** (3.11 and 3.12 are the
-tested versions) and depends on `zarr>=3.0`, `numpy>=1.24`, and `numcodecs`.
-All mandatory dependencies are installed automatically by `pip`. Check yours
-with `python --version`; a virtual environment (`python -m venv .venv`, or
-`uv venv`) keeps it separate from other projects.
-
-## Standard install
+`zarr-vectors` requires Python 3.11 or later; the tests run on 3.11 and 3.12.
+It reads and writes Zarr v3 stores only.
 
 ```bash
 pip install zarr-vectors
 ```
 
-This installs the core read/write/validate API for all seven geometry types
-(point clouds, lines, polylines, streamlines, graphs, skeletons and meshes). It
-does not include format converters, cloud-store drivers, or Draco mesh
-compression — those are available as optional extras described below. The
-`zarr-vectors` *command-line tool* is also not part of this package: this
-package installs no console scripts (see below).
-
-Once installed, the [Quickstart](quickstart.md) is the next stop.
+This installs `zarr>=3.0`, `numpy>=1.24` and `numcodecs>=0.12`, and gives you
+reading, writing and validation for all seven geometry types. The package
+installs no command-line tools.
 
 ## Optional extras
 
-### Ingest and export formats
+Install an extra with `pip install "zarr-vectors[<extra>]"`.
 
-Format converters and the `zarr-vectors` CLI live in the companion
-package **`zarr-vectors-tools`** (`pip install zarr-vectors-tools`) — install
-that separately if you need to read/write LAS, PLY, CSV/XYZ, TRK, TCK, TRX,
-SWC, GraphML, OBJ, or STL files.
+| Extra | Adds | See |
+|-------|------|-----|
+| `draco` | `DracoPy`, needed to read Draco-compressed meshes | |
+| `obstore` (alias `cloud`) | Amazon S3, Google Cloud Storage and Azure through `obstore` | [Cloud stores](../how_to/cloud_stores.md) |
+| `fsspec` | The same clouds through `s3fs`, `gcsfs` and `adlfs` | [Cloud stores](../how_to/cloud_stores.md) |
+| `icechunk` | The Icechunk transactional store; needs Python 3.12 or later | [Cloud stores](../how_to/cloud_stores.md) |
+| `gpu` | cupy (`cupy-cuda12x`) device arrays; Linux only | [GPU arrays](../how_to/gpu.md) |
+| `gpu-codecs` | `gpu` plus nvCOMP, to decompress zstd cells on the device | [GPU arrays](../how_to/gpu.md) |
+| `gpu-io` | `gpu` plus kvikio, to read local files into device memory | [GPU arrays](../how_to/gpu.md) |
+| `all` | `draco`, `obstore`, `fsspec` and `icechunk` | |
 
-### Draco mesh compression
+`all` leaves out the GPU extras (`gpu`, `gpu-codecs`, `gpu-io`), because they
+are tied to a CUDA version. In a conda environment, install cupy from
+conda-forge instead of using `[gpu]`, and kvikio from the `rapidsai` channel
+instead of using `[gpu-io]`.
 
-```bash
-pip install "zarr-vectors[draco]"
-```
-
-Enables Google Draco encoding and decoding for the `mesh` geometry type.
-Requires `DracoPy`. Draco-compressed stores are not readable without this
-extra installed.
-
-### Cloud object-store backends
-
-```bash
-pip install "zarr-vectors[obstore]"   # preferred (Rust-based); "[cloud]" is an alias for it
-pip install "zarr-vectors[fsspec]"    # fallback: fsspec + s3fs, gcsfs, adlfs
-```
-
-Enables reading from and writing to Amazon S3, Google Cloud Storage, and
-Azure Blob Storage, either through `obstore` or through `fsspec` with
-`s3fs`/`gcsfs`/`adlfs`. See [Cloud stores](../tutorials/io/cloud_stores.md)
-for configuration details.
-
-### Transactional stores (Icechunk)
+Octree-sharded stores (the `zarr_octree_sharding` codec) need the
+`zarr-octree` package, which is not on PyPI:
 
 ```bash
-pip install "zarr-vectors[icechunk]"
+pip install "git+https://github.com/Andrew-Keenlyside/zarr-octree"
 ```
 
-Selected explicitly with `StorageOptions(backend="icechunk")`; it is never
-auto-detected from a URL. The extra resolves only on Python 3.12 or later.
+A store that is not octree-sharded never imports it. See
+[Sharding](../spec/chunking/sharding.md).
 
-### GPU arrays
-
-```bash
-pip install "zarr-vectors[gpu]"
-```
-
-Lets the array-form readers and writers take and return device (cupy)
-arrays: `device="cuda"` on a reader, or a cupy array passed to a writer.
-With it, `read_cells` decodes uncompressed cells on the device, and
-writers encode device arrays there. Linux only; it installs
-`cupy-cuda12x`. In a conda environment install cupy from conda-forge
-instead (`conda install -c conda-forge cupy`): the extra would add a
-second, pip-built cupy.
-
-Two more extras build on it:
-
-- `[gpu-codecs]` adds nvCOMP, so `read_cells(..., decode="device")` can
-  decompress zstd cells on the device. Its wheel carries only nvCOMP, so
-  it is safe in a conda environment too.
-- `[gpu-io]` adds kvikio, for reading local files straight into device
-  memory where the system has GPUDirect Storage. It is for pip
-  environments only; its wheel pins its own cupy, so in conda install
-  kvikio from the `rapidsai` channel instead.
-
-Nothing needs any of them: every call works with numpy, and a store
-written from device arrays is byte-identical to one written from numpy.
-See [GPU arrays](../how_to/gpu.md).
-
-### Everything
-
-```bash
-pip install "zarr-vectors[all]"
-```
-
-Installs all optional extras (`draco`, `obstore`, `fsspec`, `icechunk`) in a
-single command. The GPU extras (`[gpu]`, `[gpu-codecs]`, `[gpu-io]`) are not
-included: they are tied to a CUDA version, so ask for them explicitly.
+Format converters (LAS, PLY, TRK, SWC, OBJ and others) and the `zvtools`
+command are in the separate package `zarr-vectors-tools`; see
+[Ingesting other formats](../how_to/convert_files.md).
 
 ## Development install
-
-To install from source with all development dependencies:
 
 ```bash
 git clone https://github.com/AllenInstitute/zarr-vectors-py.git
 cd zarr-vectors-py
 pip install -e ".[all,dev]"
-pip install -r docs/requirements-docs.txt   # if building the docs locally
+pip install -r docs/requirements-docs.txt   # to build the docs
+pytest tests/
 ```
 
-Run the test suite to verify the install:
+`dev` adds `pytest`, `ruff` and `mypy`, and the schema tooling one test module
+uses. The tests need no network access or external data.
 
-```bash
-pytest tests/ -v
-```
-
-`dev` adds `pytest`, `ruff` and `mypy` (and the schema tooling used by one
-test module). The suite is intended to run without network access or external
-data files.
-
-## Verifying the install
+## Check the install
 
 ```python
-import zarr_vectors as zv
-from zarr_vectors.constants import GEOM_POINT_CLOUD, GEOM_STREAMLINE
+import zarr_vectors
 
-print(zv.__version__)
-print(GEOM_POINT_CLOUD, GEOM_STREAMLINE)
+print(zarr_vectors.__version__)
 ```
 
-```text
-<your installed version>
-point_cloud streamline
-```
-
-(The version comes from the git tag the release was built from, so a
-development checkout prints a `.devN+g<hash>` version.)
+This prints the installed version. The version comes from the release's git
+tag, so a development checkout prints a `.devN+g<hash>` version.
 
 ## Dependency notes
 
-`zarr-vectors` targets **Zarr v3** exclusively (`zarr>=3.0`; Zarr 2 cannot read
-these stores, because the layout uses Zarr v3's variable-length bytes codec).
-Zarr v2 stores are not supported and cannot be opened with this package; the
-data has to be re-written into a Zarr Vectors store from its source.
+Zarr 2 cannot read these stores, because the layout uses Zarr v3's
+variable-length bytes codec. This package does not open Zarr v2 stores; write
+the data into a new store from its source.
 
-`numpy>=1.24` is required, with no upper bound declared. Importing the package
-silences zarr's `UnstableSpecificationWarning` (the variable-length dtypes it
-complains about are a deliberate choice of the format).
+Importing `zarr_vectors` silences zarr's `UnstableSpecificationWarning`
+about variable-length dtypes, which the format uses on purpose.

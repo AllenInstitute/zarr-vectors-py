@@ -59,6 +59,7 @@ def _same(a, b):
     assert a[1:] == b[1:]
 
 
+@pytest.mark.slow
 @pytest.mark.parametrize("kind", ["point_cloud", "mesh", "graph"])
 @pytest.mark.parametrize("shard", [None, 2])
 def test_a_deferred_level_reads_what_it_holds(tmp_path, kind, shard):

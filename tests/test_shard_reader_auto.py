@@ -378,6 +378,7 @@ def test_a_mixed_store_reads_every_array_optimised(stores, mixed, record, monkey
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.slow
 @pytest.mark.parametrize("octree", [False, True], ids=["indexed", "octree"])
 @pytest.mark.parametrize("kind", ["point_cloud", "mesh", "graph"])
 def test_every_kind_reads_the_same_under_the_default(tmp_path, monkeypatch, kind, octree):
