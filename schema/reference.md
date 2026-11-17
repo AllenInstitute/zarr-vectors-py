@@ -13,24 +13,24 @@ Name: zarr_vectors
 
 | Class | Description |
 | --- | --- |
-| [AttributeMeta](AttributeMeta.md) | `` |
+| [AttributeMeta](AttributeMeta.md) | Attributes for each ``attributes/<name>/`` array |
 | [AttributeSpecs](AttributeSpecs.md) | What the store declares its attributes to be, keyed by scope (``vertex`` / ``... |
 | [Axis](Axis.md) | One axis of the spatial index |
 | [BinLabel](BinLabel.md) | One entry of ``chunk_attribute_values``: a string or a number |
 | [BoundingBox](BoundingBox.md) | Two parallel ``ndim``-length arrays representing the global ``(min_corner, ma... |
 | [CRS](CRS.md) | Free-form coordinate reference system metadata |
-| [FragmentAttributeMeta](FragmentAttributeMeta.md) | `` |
-| [GroupingsAttributeMeta](GroupingsAttributeMeta.md) | `` |
-| [GroupingsMeta](GroupingsMeta.md) | `` |
-| [LevelMetadata](LevelMetadata.md) | Per-resolution-level `` |
-| [LinkAttributeFamilyMeta](LinkAttributeFamilyMeta.md) | `` |
-| [LinkAttributeMeta](LinkAttributeMeta.md) | `` |
-| [LinksFamilyMeta](LinksFamilyMeta.md) | `` |
-| [LinksMeta](LinksMeta.md) | `` |
-| [ObjectAttributeMeta](ObjectAttributeMeta.md) | `` |
-| [ObjectIndexMeta](ObjectIndexMeta.md) | `` |
-| [RootMetadata](RootMetadata.md) | Root-level `` |
-| [VerticesMeta](VerticesMeta.md) | `` |
+| [FragmentAttributeMeta](FragmentAttributeMeta.md) | Attributes for each ``fragment_attributes/<name>/`` array |
+| [GroupingsAttributeMeta](GroupingsAttributeMeta.md) | Attributes for each ``groupings_attributes/<name>/`` array |
+| [GroupingsMeta](GroupingsMeta.md) | Attributes for ``groupings/`` |
+| [LevelMetadata](LevelMetadata.md) | Per-resolution-level attributes payload, persisted under the key ``zarr_vecto... |
+| [LinkAttributeFamilyMeta](LinkAttributeFamilyMeta.md) | Attributes for a ``link_attributes/<name>/<delta>/`` **group** |
+| [LinkAttributeMeta](LinkAttributeMeta.md) | Attributes for one ``link_attributes/<name>/<delta>/<offsets>/`` array |
+| [LinksFamilyMeta](LinksFamilyMeta.md) | Attributes for a ``links/<delta>/`` **group** — the family-wide policy every ... |
+| [LinksMeta](LinksMeta.md) | Attributes for a single ``links/<delta>/<offsets>/`` array: a rank-D vlen arr... |
+| [ObjectAttributeMeta](ObjectAttributeMeta.md) | Attributes for each ``object_attributes/<name>/`` array |
+| [ObjectIndexMeta](ObjectIndexMeta.md) | Attributes for ``object_index/`` |
+| [RootMetadata](RootMetadata.md) | Root-level attributes payload, persisted under the key ``zarr_vectors`` |
+| [VerticesMeta](VerticesMeta.md) | Attributes for the ``vertices/`` array |
 
 
 
@@ -92,7 +92,7 @@ Name: zarr_vectors
 | [type](type.md) | NGFF axis type — "space", "time", or "channel" |
 | [unit](unit.md) | NGFF unit string (e |
 | [vertex_count](vertex_count.md) | Total number of vertices at this level |
-| [zv_array](zv_array.md) | Discriminator slot identifying the kind of per-array `` |
+| [zv_array](zv_array.md) | Discriminator slot identifying the kind of per-array attributes block |
 | [zv_version](zv_version.md) | ZV spec version this store was written against (e |
 
 
@@ -111,7 +111,7 @@ Name: zarr_vectors
 | [ManifestLayout](ManifestLayout.md) | Object-index layout a store creates new indexes in |
 | [ObjectIndexConvention](ObjectIndexConvention.md) | How the object_id → fragment mapping is encoded |
 | [ObjectIndexLayout](ObjectIndexLayout.md) | How one object index stores its manifests |
-| [ZvArrayTag](ZvArrayTag.md) | Discriminator value for per-array `` |
+| [ZvArrayTag](ZvArrayTag.md) | Discriminator value for per-array attributes blocks (slot ``zv_array``) |
 
 
 ## Types
@@ -203,7 +203,7 @@ URI: [zv:AttributeMeta](https://w3id.org/zarr-vectors/schema/0.9/AttributeMeta)
 
 | Name | Cardinality and Range | Description | Inheritance |
 | ---  | --- | --- | --- |
-| [zv_array](zv_array.md) | 1 <br/> [ZvArrayTag](ZvArrayTag.md) | Discriminator slot identifying the kind of per-array `` | direct |
+| [zv_array](zv_array.md) | 1 <br/> [ZvArrayTag](ZvArrayTag.md) | Discriminator slot identifying the kind of per-array attributes block | direct |
 | [name](name.md) | 1 <br/> [String](String.md) | NGFF axis or attribute name (e | direct |
 | [dtype](dtype.md) | 1 <br/> [String](String.md) | Numpy dtype string of the array's value type (e | direct |
 | [channel_names](channel_names.md) | * <br/> [String](String.md) | For multi-channel per-vertex attributes, the channel labels | direct |
@@ -255,7 +255,7 @@ URI: [zv:AttributeMeta](https://w3id.org/zarr-vectors/schema/0.9/AttributeMeta)
 <details>
 ```yaml
 name: AttributeMeta
-description: 'Attributes for each ``attributes/<name>/`` array.'
+description: Attributes for each ``attributes/<name>/`` array.
 from_schema: https://w3id.org/zarr-vectors/schema/0.9
 rank: 1000
 slots:
@@ -277,7 +277,7 @@ slot_usage:
 <details>
 ```yaml
 name: AttributeMeta
-description: 'Attributes for each ``attributes/<name>/`` array.'
+description: Attributes for each ``attributes/<name>/`` array.
 from_schema: https://w3id.org/zarr-vectors/schema/0.9
 rank: 1000
 slot_usage:
@@ -1341,7 +1341,8 @@ permissible_values:
   explicit_links:
     text: explicit_links
     description: 'Links with a non-zero offsets segment bridge the boundary. This
-      value is semantic — it records the authoring intent, not a distinct physical family: a boundary-crossing link is an ordinary record in ``links/<delta>/<offsets>/``
+      value is semantic — it records the authoring intent, not a distinct physical
+      family: a boundary-crossing link is an ordinary record in ``links/<delta>/<offsets>/``
       whose offsets are not all zero.
 
       '
@@ -2021,7 +2022,7 @@ URI: [zv:FormatCapability](https://w3id.org/zarr-vectors/schema/0.9/FormatCapabi
 | --- | --- | --- |
 | preserved_object_ids | None | At least one level was written with ID-preserving sparsification (``LevelMeta... |
 | shared_fragments | None | At least one level stores per-chunk fragments that may be referenced by multi... |
-| fragment_index | None | The store uses the v0 |
+| fragment_index | None | The store uses the fragment-index encoding for ``vertex_fragments`` and ``lin... |
 | multiscale_links | None | Store uses the multiscale links layout (``links/<delta>/<offsets>/`` and ``li... |
 | octree_chunks | None | At least one level has octree chunks: its chunks are octree leaves of several... |
 
@@ -2083,7 +2084,8 @@ permissible_values:
   shared_fragments:
     text: shared_fragments
     description: 'At least one level stores per-chunk fragments that may be referenced
-      by multiple objects'' manifests (the sharing primitive is a fragment, not a contiguous-byte vertex group).
+      by multiple objects'' manifests (the sharing primitive is a fragment, not a
+      contiguous-byte vertex group).
 
       '
   fragment_index:
@@ -2097,7 +2099,9 @@ permissible_values:
     text: multiscale_links
     description: 'Store uses the multiscale links layout (``links/<delta>/<offsets>/``
       and ``link_attributes/<name>/<delta>/<offsets>/``) and may contain cross-pyramid-level
-      edges (``delta != 0``).  There is no separate cross-chunk family — a cross-chunk link is a link with a non-zero offsets segment — so this token marks only the presence of ``delta != 0`` arrays.
+      edges (``delta != 0``).  There is no separate cross-chunk family — a cross-chunk
+      link is a link with a non-zero offsets segment — so this token marks only the
+      presence of ``delta != 0`` arrays.
 
       '
   octree_chunks:
@@ -2174,7 +2178,7 @@ URI: [zv:FragmentAttributeMeta](https://w3id.org/zarr-vectors/schema/0.9/Fragmen
 
 | Name | Cardinality and Range | Description | Inheritance |
 | ---  | --- | --- | --- |
-| [zv_array](zv_array.md) | 1 <br/> [ZvArrayTag](ZvArrayTag.md) | Discriminator slot identifying the kind of per-array `` | direct |
+| [zv_array](zv_array.md) | 1 <br/> [ZvArrayTag](ZvArrayTag.md) | Discriminator slot identifying the kind of per-array attributes block | direct |
 | [name](name.md) | 1 <br/> [String](String.md) | NGFF axis or attribute name (e | direct |
 | [dtype](dtype.md) | 1 <br/> [String](String.md) | Numpy dtype string of the array's value type (e | direct |
 | [channel_names](channel_names.md) | * <br/> [String](String.md) | For multi-channel per-vertex attributes, the channel labels | direct |
@@ -2226,11 +2230,11 @@ URI: [zv:FragmentAttributeMeta](https://w3id.org/zarr-vectors/schema/0.9/Fragmen
 <details>
 ```yaml
 name: FragmentAttributeMeta
-description: 'Attributes for each ``fragment_attributes/<name>/`` array.  Stored
-  as a dense per-chunk byte blob; each chunk holds a row per fragment, with shape
-  ``(num_fragments_in_chunk,)`` or ``(num_fragments_in_chunk, len(channel_names))``.  Per-chunk
-  fragment counts are derived from ``vertex_fragments/<chunk>`` at read time.  Replace-only
-  at the chunk level.
+description: 'Attributes for each ``fragment_attributes/<name>/`` array.  Stored as
+  a dense per-chunk byte blob; each chunk holds a row per fragment, with shape ``(num_fragments_in_chunk,)``
+  or ``(num_fragments_in_chunk, len(channel_names))``.  Per-chunk fragment counts
+  are derived from ``vertex_fragments/<chunk>`` at read time.  Replace-only at the
+  chunk level.
 
   '
 from_schema: https://w3id.org/zarr-vectors/schema/0.9
@@ -2254,11 +2258,11 @@ slot_usage:
 <details>
 ```yaml
 name: FragmentAttributeMeta
-description: 'Attributes for each ``fragment_attributes/<name>/`` array.  Stored
-  as a dense per-chunk byte blob; each chunk holds a row per fragment, with shape
-  ``(num_fragments_in_chunk,)`` or ``(num_fragments_in_chunk, len(channel_names))``.  Per-chunk
-  fragment counts are derived from ``vertex_fragments/<chunk>`` at read time.  Replace-only
-  at the chunk level.
+description: 'Attributes for each ``fragment_attributes/<name>/`` array.  Stored as
+  a dense per-chunk byte blob; each chunk holds a row per fragment, with shape ``(num_fragments_in_chunk,)``
+  or ``(num_fragments_in_chunk, len(channel_names))``.  Per-chunk fragment counts
+  are derived from ``vertex_fragments/<chunk>`` at read time.  Replace-only at the
+  chunk level.
 
   '
 from_schema: https://w3id.org/zarr-vectors/schema/0.9
@@ -2496,7 +2500,7 @@ URI: [zv:GroupingsAttributeMeta](https://w3id.org/zarr-vectors/schema/0.9/Groupi
 
 | Name | Cardinality and Range | Description | Inheritance |
 | ---  | --- | --- | --- |
-| [zv_array](zv_array.md) | 1 <br/> [ZvArrayTag](ZvArrayTag.md) | Discriminator slot identifying the kind of per-array `` | direct |
+| [zv_array](zv_array.md) | 1 <br/> [ZvArrayTag](ZvArrayTag.md) | Discriminator slot identifying the kind of per-array attributes block | direct |
 | [name](name.md) | 1 <br/> [String](String.md) | NGFF axis or attribute name (e | direct |
 | [dtype](dtype.md) | 1 <br/> [String](String.md) | Numpy dtype string of the array's value type (e | direct |
 | [shape](shape.md) | 1..* <br/> [Integer](Integer.md) | Shape of a dense per-object/per-group array | direct |
@@ -2548,7 +2552,7 @@ URI: [zv:GroupingsAttributeMeta](https://w3id.org/zarr-vectors/schema/0.9/Groupi
 <details>
 ```yaml
 name: GroupingsAttributeMeta
-description: 'Attributes for each ``groupings_attributes/<name>/`` array.'
+description: Attributes for each ``groupings_attributes/<name>/`` array.
 from_schema: https://w3id.org/zarr-vectors/schema/0.9
 rank: 1000
 slots:
@@ -2570,7 +2574,7 @@ slot_usage:
 <details>
 ```yaml
 name: GroupingsAttributeMeta
-description: 'Attributes for each ``groupings_attributes/<name>/`` array.'
+description: Attributes for each ``groupings_attributes/<name>/`` array.
 from_schema: https://w3id.org/zarr-vectors/schema/0.9
 rank: 1000
 slot_usage:
@@ -2707,7 +2711,7 @@ URI: [zv:GroupingsMeta](https://w3id.org/zarr-vectors/schema/0.9/GroupingsMeta)
 
 | Name | Cardinality and Range | Description | Inheritance |
 | ---  | --- | --- | --- |
-| [zv_array](zv_array.md) | 1 <br/> [ZvArrayTag](ZvArrayTag.md) | Discriminator slot identifying the kind of per-array `` | direct |
+| [zv_array](zv_array.md) | 1 <br/> [ZvArrayTag](ZvArrayTag.md) | Discriminator slot identifying the kind of per-array attributes block | direct |
 | [num_groups](num_groups.md) | 1 <br/> [Integer](Integer.md) | Total grouping count | direct |
 
 
@@ -2757,7 +2761,7 @@ URI: [zv:GroupingsMeta](https://w3id.org/zarr-vectors/schema/0.9/GroupingsMeta)
 <details>
 ```yaml
 name: GroupingsMeta
-description: 'Attributes for ``groupings/``.'
+description: Attributes for ``groupings/``.
 from_schema: https://w3id.org/zarr-vectors/schema/0.9
 rank: 1000
 slots:
@@ -2777,7 +2781,7 @@ slot_usage:
 <details>
 ```yaml
 name: GroupingsMeta
-description: 'Attributes for ``groupings/``.'
+description: Attributes for ``groupings/``.
 from_schema: https://w3id.org/zarr-vectors/schema/0.9
 rank: 1000
 slot_usage:
@@ -3398,7 +3402,8 @@ attributes:
   shared_fragments:
     name: shared_fragments
     description: 'True when per-chunk fragments may be referenced by multiple objects''
-      manifests (shared metavertices in the per-object pyramid regime).  Readers MAY use this to short-circuit dedup work.
+      manifests (shared metavertices in the per-object pyramid regime).  Readers MAY
+      use this to short-circuit dedup work.
 
       '
     from_schema: https://w3id.org/zarr-vectors/schema/0.9
@@ -3489,7 +3494,7 @@ URI: [zv:LinkAttributeFamilyMeta](https://w3id.org/zarr-vectors/schema/0.9/LinkA
 
 | Name | Cardinality and Range | Description | Inheritance |
 | ---  | --- | --- | --- |
-| [zv_array](zv_array.md) | 1 <br/> [ZvArrayTag](ZvArrayTag.md) | Discriminator slot identifying the kind of per-array `` | direct |
+| [zv_array](zv_array.md) | 1 <br/> [ZvArrayTag](ZvArrayTag.md) | Discriminator slot identifying the kind of per-array attributes block | direct |
 | [name](name.md) | 1 <br/> [String](String.md) | NGFF axis or attribute name (e | direct |
 | [level_delta](level_delta.md) | 1 <br/> [Integer](Integer.md) | Pyramid-level delta between the source side (the level that owns this array) ... | direct |
 | [num_links](num_links.md) | 0..1 <br/> [Integer](Integer.md) | Family-wide *logical* link count — one per input record, however many physica... | direct |
@@ -3633,8 +3638,9 @@ attributes:
   level_delta:
     name: level_delta
     description: 'Pyramid-level delta between the source side (the level that owns
-      this array) and the target side of the edges.  ``0`` for intra-level arrays, ``+N`` for edges from this level to ``this_level
-      + N`` (coarser), ``-N`` for edges to ``this_level - N`` (finer).
+      this array) and the target side of the edges.  ``0`` for intra-level arrays,
+      ``+N`` for edges from this level to ``this_level + N`` (coarser), ``-N`` for
+      edges to ``this_level - N`` (finer).
 
       '
     from_schema: https://w3id.org/zarr-vectors/schema/0.9
@@ -3734,7 +3740,7 @@ URI: [zv:LinkAttributeMeta](https://w3id.org/zarr-vectors/schema/0.9/LinkAttribu
 
 | Name | Cardinality and Range | Description | Inheritance |
 | ---  | --- | --- | --- |
-| [zv_array](zv_array.md) | 1 <br/> [ZvArrayTag](ZvArrayTag.md) | Discriminator slot identifying the kind of per-array `` | direct |
+| [zv_array](zv_array.md) | 1 <br/> [ZvArrayTag](ZvArrayTag.md) | Discriminator slot identifying the kind of per-array attributes block | direct |
 | [name](name.md) | 1 <br/> [String](String.md) | NGFF axis or attribute name (e | direct |
 | [dtype](dtype.md) | 1 <br/> [String](String.md) | Numpy dtype string of the array's value type (e | direct |
 | [offsets](offsets.md) | 1 <br/> [Integer](Integer.md) | The ``link_width - 1`` relative offsets naming this array, each of ``sid_ndim... | direct |
@@ -3941,8 +3947,9 @@ attributes:
   level_delta:
     name: level_delta
     description: 'Pyramid-level delta between the source side (the level that owns
-      this array) and the target side of the edges.  ``0`` for intra-level arrays, ``+N`` for edges from this level to ``this_level
-      + N`` (coarser), ``-N`` for edges to ``this_level - N`` (finer).
+      this array) and the target side of the edges.  ``0`` for intra-level arrays,
+      ``+N`` for edges from this level to ``this_level + N`` (coarser), ``-N`` for
+      edges to ``this_level - N`` (finer).
 
       '
     from_schema: https://w3id.org/zarr-vectors/schema/0.9
@@ -4133,7 +4140,7 @@ URI: [zv:LinksFamilyMeta](https://w3id.org/zarr-vectors/schema/0.9/LinksFamilyMe
 
 | Name | Cardinality and Range | Description | Inheritance |
 | ---  | --- | --- | --- |
-| [zv_array](zv_array.md) | 1 <br/> [ZvArrayTag](ZvArrayTag.md) | Discriminator slot identifying the kind of per-array `` | direct |
+| [zv_array](zv_array.md) | 1 <br/> [ZvArrayTag](ZvArrayTag.md) | Discriminator slot identifying the kind of per-array attributes block | direct |
 | [level_delta](level_delta.md) | 1 <br/> [Integer](Integer.md) | Pyramid-level delta between the source side (the level that owns this array) ... | direct |
 | [link_width](link_width.md) | 1 <br/> [Integer](Integer.md) | Width of a links row (1 for parent→child metanode references, 2 for edges, 3 ... | direct |
 | [directed](directed.md) | 0..1 <br/> [Boolean](Boolean.md) | When true, endpoint order is meaningful and preserved (no canonical sort): ``... | direct |
@@ -4193,8 +4200,8 @@ description: 'Attributes for a ``links/<delta>/`` **group** — the family-wide 
   every offsets array beneath it decodes against, which is why it lives on the group
   rather than being repeated per array.
 
-  Connectivity is one family.  An intra-chunk link is a link whose relative offsets are all zero; a cross-chunk link
-  is one whose offsets are non-zero.
+  Connectivity is one family.  An intra-chunk link is a link whose relative offsets
+  are all zero; a cross-chunk link is one whose offsets are non-zero.
 
   Two policy flags govern how a boundary-crossing record is placed: ``directed`` (endpoint
   order is data, so ``A→B`` and ``B→A`` stay distinct) and ``store`` (``canonical``
@@ -4246,8 +4253,8 @@ description: 'Attributes for a ``links/<delta>/`` **group** — the family-wide 
   every offsets array beneath it decodes against, which is why it lives on the group
   rather than being repeated per array.
 
-  Connectivity is one family.  An intra-chunk link is a link whose relative offsets are all zero; a cross-chunk link
-  is one whose offsets are non-zero.
+  Connectivity is one family.  An intra-chunk link is a link whose relative offsets
+  are all zero; a cross-chunk link is one whose offsets are non-zero.
 
   Two policy flags govern how a boundary-crossing record is placed: ``directed`` (endpoint
   order is data, so ``A→B`` and ``B→A`` stay distinct) and ``store`` (``canonical``
@@ -4306,8 +4313,9 @@ attributes:
   level_delta:
     name: level_delta
     description: 'Pyramid-level delta between the source side (the level that owns
-      this array) and the target side of the edges.  ``0`` for intra-level arrays, ``+N`` for edges from this level to ``this_level
-      + N`` (coarser), ``-N`` for edges to ``this_level - N`` (finer).
+      this array) and the target side of the edges.  ``0`` for intra-level arrays,
+      ``+N`` for edges from this level to ``this_level + N`` (coarser), ``-N`` for
+      edges to ``this_level - N`` (finer).
 
       '
     from_schema: https://w3id.org/zarr-vectors/schema/0.9
@@ -4483,7 +4491,7 @@ URI: [zv:LinksMeta](https://w3id.org/zarr-vectors/schema/0.9/LinksMeta)
 
 | Name | Cardinality and Range | Description | Inheritance |
 | ---  | --- | --- | --- |
-| [zv_array](zv_array.md) | 1 <br/> [ZvArrayTag](ZvArrayTag.md) | Discriminator slot identifying the kind of per-array `` | direct |
+| [zv_array](zv_array.md) | 1 <br/> [ZvArrayTag](ZvArrayTag.md) | Discriminator slot identifying the kind of per-array attributes block | direct |
 | [dtype](dtype.md) | 1 <br/> [String](String.md) | Numpy dtype string of the array's value type (e | direct |
 | [offsets](offsets.md) | 1 <br/> [Integer](Integer.md) | The ``link_width - 1`` relative offsets naming this array, each of ``sid_ndim... | direct |
 | [has_perm](has_perm.md) | 1 <br/> [Boolean](Boolean.md) | Whether each row of this links array carries a leading ``perm_idx`` column — ... | direct |
@@ -4707,8 +4715,9 @@ attributes:
   level_delta:
     name: level_delta
     description: 'Pyramid-level delta between the source side (the level that owns
-      this array) and the target side of the edges.  ``0`` for intra-level arrays, ``+N`` for edges from this level to ``this_level
-      + N`` (coarser), ``-N`` for edges to ``this_level - N`` (finer).
+      this array) and the target side of the edges.  ``0`` for intra-level arrays,
+      ``+N`` for edges from this level to ``this_level + N`` (coarser), ``-N`` for
+      edges to ``this_level - N`` (finer).
 
       '
     from_schema: https://w3id.org/zarr-vectors/schema/0.9
@@ -5084,7 +5093,7 @@ URI: [zv:ObjectAttributeMeta](https://w3id.org/zarr-vectors/schema/0.9/ObjectAtt
 
 | Name | Cardinality and Range | Description | Inheritance |
 | ---  | --- | --- | --- |
-| [zv_array](zv_array.md) | 1 <br/> [ZvArrayTag](ZvArrayTag.md) | Discriminator slot identifying the kind of per-array `` | direct |
+| [zv_array](zv_array.md) | 1 <br/> [ZvArrayTag](ZvArrayTag.md) | Discriminator slot identifying the kind of per-array attributes block | direct |
 | [name](name.md) | 1 <br/> [String](String.md) | NGFF axis or attribute name (e | direct |
 | [dtype](dtype.md) | 1 <br/> [String](String.md) | Numpy dtype string of the array's value type (e | direct |
 | [shape](shape.md) | 1..* <br/> [Integer](Integer.md) | Shape of a dense per-object/per-group array | direct |
@@ -5136,7 +5145,7 @@ URI: [zv:ObjectAttributeMeta](https://w3id.org/zarr-vectors/schema/0.9/ObjectAtt
 <details>
 ```yaml
 name: ObjectAttributeMeta
-description: 'Attributes for each ``object_attributes/<name>/`` array.'
+description: Attributes for each ``object_attributes/<name>/`` array.
 from_schema: https://w3id.org/zarr-vectors/schema/0.9
 rank: 1000
 slots:
@@ -5158,7 +5167,7 @@ slot_usage:
 <details>
 ```yaml
 name: ObjectAttributeMeta
-description: 'Attributes for each ``object_attributes/<name>/`` array.'
+description: Attributes for each ``object_attributes/<name>/`` array.
 from_schema: https://w3id.org/zarr-vectors/schema/0.9
 rank: 1000
 slot_usage:
@@ -5484,7 +5493,7 @@ URI: [zv:ObjectIndexMeta](https://w3id.org/zarr-vectors/schema/0.9/ObjectIndexMe
 
 | Name | Cardinality and Range | Description | Inheritance |
 | ---  | --- | --- | --- |
-| [zv_array](zv_array.md) | 1 <br/> [ZvArrayTag](ZvArrayTag.md) | Discriminator slot identifying the kind of per-array `` | direct |
+| [zv_array](zv_array.md) | 1 <br/> [ZvArrayTag](ZvArrayTag.md) | Discriminator slot identifying the kind of per-array attributes block | direct |
 | [num_objects](num_objects.md) | 1 <br/> [Integer](Integer.md) | Total object count this array carries | direct |
 | [sid_ndim](sid_ndim.md) | 1 <br/> [Integer](Integer.md) | Number of spatial-index dimensions encoded in chunk keys | direct |
 | [layout](layout.md) | 0..1 <br/> [ObjectIndexLayout](ObjectIndexLayout.md) | The object index's storage layout: ``vlen_manifests_v1`` (vlen blobs, rows ar... | direct |
@@ -5536,7 +5545,7 @@ URI: [zv:ObjectIndexMeta](https://w3id.org/zarr-vectors/schema/0.9/ObjectIndexMe
 <details>
 ```yaml
 name: ObjectIndexMeta
-description: 'Attributes for ``object_index/``.'
+description: Attributes for ``object_index/``.
 from_schema: https://w3id.org/zarr-vectors/schema/0.9
 rank: 1000
 slots:
@@ -5558,7 +5567,7 @@ slot_usage:
 <details>
 ```yaml
 name: ObjectIndexMeta
-description: 'Attributes for ``object_index/``.'
+description: Attributes for ``object_index/``.
 from_schema: https://w3id.org/zarr-vectors/schema/0.9
 rank: 1000
 slot_usage:
@@ -6001,9 +6010,8 @@ rank: 1000
 attributes:
   zv_version:
     name: zv_version
-    description: 'ZV spec version this store was written against (e.g. "0.5.0"). Renamed
-      from ``format_version`` in 0.5.0 to disambiguate from Zarr v3''s ``zarr_format``
-      field.
+    description: 'ZV spec version this store was written against (e.g. "0.9.4"). Distinct
+      from Zarr v3''s ``zarr_format`` field.
 
       '
     from_schema: https://w3id.org/zarr-vectors/schema/0.9
@@ -6157,7 +6165,7 @@ attributes:
       default empty.  A store with an octree-chunked level lists ``octree_chunks``.
 
       '
-    from_schema: https://w3id.org/zarr-vectors/schema/0.5
+    from_schema: https://w3id.org/zarr-vectors/schema/0.9
     rank: 1000
     owner: RootMetadata
     domain_of:
@@ -6627,7 +6635,7 @@ URI: [zv:VerticesMeta](https://w3id.org/zarr-vectors/schema/0.9/VerticesMeta)
 
 | Name | Cardinality and Range | Description | Inheritance |
 | ---  | --- | --- | --- |
-| [zv_array](zv_array.md) | 1 <br/> [ZvArrayTag](ZvArrayTag.md) | Discriminator slot identifying the kind of per-array `` | direct |
+| [zv_array](zv_array.md) | 1 <br/> [ZvArrayTag](ZvArrayTag.md) | Discriminator slot identifying the kind of per-array attributes block | direct |
 | [dtype](dtype.md) | 1 <br/> [String](String.md) | Numpy dtype string of the array's value type (e | direct |
 | [encoding](encoding.md) | 0..1 <br/> [Encoding](Encoding.md) | How the chunk bytes are encoded | direct |
 
@@ -6678,7 +6686,7 @@ URI: [zv:VerticesMeta](https://w3id.org/zarr-vectors/schema/0.9/VerticesMeta)
 <details>
 ```yaml
 name: VerticesMeta
-description: 'Attributes for the ``vertices/`` array.'
+description: Attributes for the ``vertices/`` array.
 from_schema: https://w3id.org/zarr-vectors/schema/0.9
 rank: 1000
 slots:
@@ -6699,7 +6707,7 @@ slot_usage:
 <details>
 ```yaml
 name: VerticesMeta
-description: 'Attributes for the ``vertices/`` array.'
+description: Attributes for the ``vertices/`` array.
 from_schema: https://w3id.org/zarr-vectors/schema/0.9
 rank: 1000
 slot_usage:
@@ -6790,7 +6798,7 @@ URI: [zv:ZvArrayTag](https://w3id.org/zarr-vectors/schema/0.9/ZvArrayTag)
 | Value | Meaning | Description |
 | --- | --- | --- |
 | vertices | None |  |
-| vertex_fragments | None | Per-chunk fragment-index group for ``vertices/<chunk>`` (v0 |
+| vertex_fragments | None | Per-chunk fragment-index group for ``vertices/<chunk>`` |
 | link_fragments | None | Per-chunk fragment-index group for the intra-chunk link array at ``links/0/<a... |
 | links_family | None | The ``links/<delta>/`` group carrying family-wide policy for every offsets ar... |
 | links | None | One ``links/<delta>/<offsets>/`` array — a rank-D vlen array whose cell is th... |
@@ -6810,7 +6818,7 @@ URI: [zv:ZvArrayTag](https://w3id.org/zarr-vectors/schema/0.9/ZvArrayTag)
 
 | Name | Description |
 | ---  | --- |
-| [zv_array](zv_array.md) | Discriminator slot identifying the kind of per-array `` |
+| [zv_array](zv_array.md) | Discriminator slot identifying the kind of per-array attributes block |
 
 
 
@@ -6943,7 +6951,7 @@ URI: [zv:arrays_present](https://w3id.org/zarr-vectors/schema/0.9/arrays_present
 
 | Name | Description | Modifies Slot |
 | --- | --- | --- |
-| [LevelMetadata](LevelMetadata.md) | Per-resolution-level `` |  no  |
+| [LevelMetadata](LevelMetadata.md) | Per-resolution-level attributes payload, persisted under the key ``zarr_vecto... |  no  |
 
 
 
@@ -7048,7 +7056,7 @@ URI: [zv:attribute_specs](https://w3id.org/zarr-vectors/schema/0.9/attribute_spe
 
 | Name | Description | Modifies Slot |
 | --- | --- | --- |
-| [RootMetadata](RootMetadata.md) | Root-level `` |  no  |
+| [RootMetadata](RootMetadata.md) | Root-level attributes payload, persisted under the key ``zarr_vectors`` |  no  |
 
 
 
@@ -7158,7 +7166,7 @@ URI: [zv:base_bin_shape](https://w3id.org/zarr-vectors/schema/0.9/base_bin_shape
 
 | Name | Description | Modifies Slot |
 | --- | --- | --- |
-| [RootMetadata](RootMetadata.md) | Root-level `` |  no  |
+| [RootMetadata](RootMetadata.md) | Root-level attributes payload, persisted under the key ``zarr_vectors`` |  no  |
 
 
 
@@ -7263,7 +7271,7 @@ URI: [zv:bin_ratio](https://w3id.org/zarr-vectors/schema/0.9/bin_ratio)
 
 | Name | Description | Modifies Slot |
 | --- | --- | --- |
-| [LevelMetadata](LevelMetadata.md) | Per-resolution-level `` |  no  |
+| [LevelMetadata](LevelMetadata.md) | Per-resolution-level attributes payload, persisted under the key ``zarr_vecto... |  no  |
 
 
 
@@ -7366,7 +7374,7 @@ URI: [zv:bin_shape](https://w3id.org/zarr-vectors/schema/0.9/bin_shape)
 
 | Name | Description | Modifies Slot |
 | --- | --- | --- |
-| [LevelMetadata](LevelMetadata.md) | Per-resolution-level `` |  no  |
+| [LevelMetadata](LevelMetadata.md) | Per-resolution-level attributes payload, persisted under the key ``zarr_vecto... |  no  |
 
 
 
@@ -7470,7 +7478,7 @@ URI: [zv:bounds](https://w3id.org/zarr-vectors/schema/0.9/bounds)
 
 | Name | Description | Modifies Slot |
 | --- | --- | --- |
-| [RootMetadata](RootMetadata.md) | Root-level `` |  no  |
+| [RootMetadata](RootMetadata.md) | Root-level attributes payload, persisted under the key ``zarr_vectors`` |  no  |
 
 
 
@@ -7571,8 +7579,8 @@ URI: [zv:channel_names](https://w3id.org/zarr-vectors/schema/0.9/channel_names)
 
 | Name | Description | Modifies Slot |
 | --- | --- | --- |
-| [AttributeMeta](AttributeMeta.md) | `` |  no  |
-| [FragmentAttributeMeta](FragmentAttributeMeta.md) | `` |  no  |
+| [AttributeMeta](AttributeMeta.md) | Attributes for each ``attributes/<name>/`` array |  no  |
+| [FragmentAttributeMeta](FragmentAttributeMeta.md) | Attributes for each ``fragment_attributes/<name>/`` array |  no  |
 
 
 
@@ -7674,7 +7682,7 @@ URI: [zv:chunk_attribute_name](https://w3id.org/zarr-vectors/schema/0.9/chunk_at
 
 | Name | Description | Modifies Slot |
 | --- | --- | --- |
-| [LevelMetadata](LevelMetadata.md) | Per-resolution-level `` |  no  |
+| [LevelMetadata](LevelMetadata.md) | Per-resolution-level attributes payload, persisted under the key ``zarr_vecto... |  no  |
 
 
 
@@ -7775,7 +7783,7 @@ URI: [zv:chunk_attribute_values](https://w3id.org/zarr-vectors/schema/0.9/chunk_
 
 | Name | Description | Modifies Slot |
 | --- | --- | --- |
-| [LevelMetadata](LevelMetadata.md) | Per-resolution-level `` |  no  |
+| [LevelMetadata](LevelMetadata.md) | Per-resolution-level attributes payload, persisted under the key ``zarr_vecto... |  no  |
 
 
 
@@ -7900,7 +7908,7 @@ URI: [zv:chunk_dims](https://w3id.org/zarr-vectors/schema/0.9/chunk_dims)
 
 | Name | Description | Modifies Slot |
 | --- | --- | --- |
-| [LevelMetadata](LevelMetadata.md) | Per-resolution-level `` |  no  |
+| [LevelMetadata](LevelMetadata.md) | Per-resolution-level attributes payload, persisted under the key ``zarr_vecto... |  no  |
 
 
 
@@ -8004,8 +8012,8 @@ URI: [zv:chunk_shape](https://w3id.org/zarr-vectors/schema/0.9/chunk_shape)
 
 | Name | Description | Modifies Slot |
 | --- | --- | --- |
-| [RootMetadata](RootMetadata.md) | Root-level `` |  no  |
-| [LevelMetadata](LevelMetadata.md) | Per-resolution-level `` |  yes  |
+| [RootMetadata](RootMetadata.md) | Root-level attributes payload, persisted under the key ``zarr_vectors`` |  no  |
+| [LevelMetadata](LevelMetadata.md) | Per-resolution-level attributes payload, persisted under the key ``zarr_vecto... |  yes  |
 
 
 
@@ -8109,7 +8117,7 @@ URI: [zv:coarsening_method](https://w3id.org/zarr-vectors/schema/0.9/coarsening_
 
 | Name | Description | Modifies Slot |
 | --- | --- | --- |
-| [LevelMetadata](LevelMetadata.md) | Per-resolution-level `` |  no  |
+| [LevelMetadata](LevelMetadata.md) | Per-resolution-level attributes payload, persisted under the key ``zarr_vecto... |  no  |
 
 
 
@@ -8203,7 +8211,7 @@ URI: [zv:cross_chunk_strategy](https://w3id.org/zarr-vectors/schema/0.9/cross_ch
 
 | Name | Description | Modifies Slot |
 | --- | --- | --- |
-| [RootMetadata](RootMetadata.md) | Root-level `` |  no  |
+| [RootMetadata](RootMetadata.md) | Root-level attributes payload, persisted under the key ``zarr_vectors`` |  no  |
 
 
 
@@ -8303,7 +8311,7 @@ URI: [zv:cross_level_depth](https://w3id.org/zarr-vectors/schema/0.9/cross_level
 
 | Name | Description | Modifies Slot |
 | --- | --- | --- |
-| [RootMetadata](RootMetadata.md) | Root-level `` |  no  |
+| [RootMetadata](RootMetadata.md) | Root-level attributes payload, persisted under the key ``zarr_vectors`` |  no  |
 
 
 
@@ -8417,7 +8425,7 @@ URI: [zv:cross_level_storage](https://w3id.org/zarr-vectors/schema/0.9/cross_lev
 
 | Name | Description | Modifies Slot |
 | --- | --- | --- |
-| [RootMetadata](RootMetadata.md) | Root-level `` |  no  |
+| [RootMetadata](RootMetadata.md) | Root-level attributes payload, persisted under the key ``zarr_vectors`` |  no  |
 
 
 
@@ -8522,7 +8530,7 @@ URI: [schema:coordinateReferenceSystem](http://schema.org/coordinateReferenceSys
 
 | Name | Description | Modifies Slot |
 | --- | --- | --- |
-| [RootMetadata](RootMetadata.md) | Root-level `` |  no  |
+| [RootMetadata](RootMetadata.md) | Root-level attributes payload, persisted under the key ``zarr_vectors`` |  no  |
 
 
 
@@ -8629,7 +8637,7 @@ URI: [zv:directed](https://w3id.org/zarr-vectors/schema/0.9/directed)
 
 | Name | Description | Modifies Slot |
 | --- | --- | --- |
-| [LinksFamilyMeta](LinksFamilyMeta.md) | `` |  no  |
+| [LinksFamilyMeta](LinksFamilyMeta.md) | Attributes for a ``links/<delta>/`` **group** — the family-wide policy every ... |  no  |
 
 
 
@@ -8733,13 +8741,13 @@ URI: [zv:dtype](https://w3id.org/zarr-vectors/schema/0.9/dtype)
 
 | Name | Description | Modifies Slot |
 | --- | --- | --- |
-| [VerticesMeta](VerticesMeta.md) | `` |  no  |
-| [LinksMeta](LinksMeta.md) | `` |  no  |
-| [AttributeMeta](AttributeMeta.md) | `` |  no  |
-| [FragmentAttributeMeta](FragmentAttributeMeta.md) | `` |  no  |
-| [ObjectAttributeMeta](ObjectAttributeMeta.md) | `` |  no  |
-| [GroupingsAttributeMeta](GroupingsAttributeMeta.md) | `` |  no  |
-| [LinkAttributeMeta](LinkAttributeMeta.md) | `` |  no  |
+| [VerticesMeta](VerticesMeta.md) | Attributes for the ``vertices/`` array |  no  |
+| [LinksMeta](LinksMeta.md) | Attributes for a single ``links/<delta>/<offsets>/`` array: a rank-D vlen arr... |  no  |
+| [AttributeMeta](AttributeMeta.md) | Attributes for each ``attributes/<name>/`` array |  no  |
+| [FragmentAttributeMeta](FragmentAttributeMeta.md) | Attributes for each ``fragment_attributes/<name>/`` array |  no  |
+| [ObjectAttributeMeta](ObjectAttributeMeta.md) | Attributes for each ``object_attributes/<name>/`` array |  no  |
+| [GroupingsAttributeMeta](GroupingsAttributeMeta.md) | Attributes for each ``groupings_attributes/<name>/`` array |  no  |
+| [LinkAttributeMeta](LinkAttributeMeta.md) | Attributes for one ``link_attributes/<name>/<delta>/<offsets>/`` array |  no  |
 
 
 
@@ -8846,7 +8854,7 @@ URI: [zv:encoding](https://w3id.org/zarr-vectors/schema/0.9/encoding)
 
 | Name | Description | Modifies Slot |
 | --- | --- | --- |
-| [VerticesMeta](VerticesMeta.md) | `` |  no  |
+| [VerticesMeta](VerticesMeta.md) | Attributes for the ``vertices/`` array |  no  |
 
 
 
@@ -8945,7 +8953,7 @@ URI: [zv:format_capabilities](https://w3id.org/zarr-vectors/schema/0.9/format_ca
 
 | Name | Description | Modifies Slot |
 | --- | --- | --- |
-| [RootMetadata](RootMetadata.md) | Root-level `` |  no  |
+| [RootMetadata](RootMetadata.md) | Root-level attributes payload, persisted under the key ``zarr_vectors`` |  no  |
 
 
 
@@ -9048,7 +9056,7 @@ URI: [zv:fragments_tile](https://w3id.org/zarr-vectors/schema/0.9/fragments_tile
 
 | Name | Description | Modifies Slot |
 | --- | --- | --- |
-| [LevelMetadata](LevelMetadata.md) | Per-resolution-level `` |  no  |
+| [LevelMetadata](LevelMetadata.md) | Per-resolution-level attributes payload, persisted under the key ``zarr_vecto... |  no  |
 
 
 
@@ -9154,7 +9162,7 @@ URI: [zv:geometry_types](https://w3id.org/zarr-vectors/schema/0.9/geometry_types
 
 | Name | Description | Modifies Slot |
 | --- | --- | --- |
-| [RootMetadata](RootMetadata.md) | Root-level `` |  no  |
+| [RootMetadata](RootMetadata.md) | Root-level attributes payload, persisted under the key ``zarr_vectors`` |  no  |
 
 
 
@@ -9261,7 +9269,7 @@ URI: [zv:has_perm](https://w3id.org/zarr-vectors/schema/0.9/has_perm)
 
 | Name | Description | Modifies Slot |
 | --- | --- | --- |
-| [LinksMeta](LinksMeta.md) | `` |  no  |
+| [LinksMeta](LinksMeta.md) | Attributes for a single ``links/<delta>/<offsets>/`` array: a rank-D vlen arr... |  no  |
 
 
 
@@ -9371,7 +9379,7 @@ URI: [zv:inherited_num_objects](https://w3id.org/zarr-vectors/schema/0.9/inherit
 
 | Name | Description | Modifies Slot |
 | --- | --- | --- |
-| [LevelMetadata](LevelMetadata.md) | Per-resolution-level `` |  no  |
+| [LevelMetadata](LevelMetadata.md) | Per-resolution-level attributes payload, persisted under the key ``zarr_vecto... |  no  |
 
 
 
@@ -9483,7 +9491,7 @@ URI: [zv:layout](https://w3id.org/zarr-vectors/schema/0.9/layout)
 
 | Name | Description | Modifies Slot |
 | --- | --- | --- |
-| [ObjectIndexMeta](ObjectIndexMeta.md) | `` |  no  |
+| [ObjectIndexMeta](ObjectIndexMeta.md) | Attributes for ``object_index/`` |  no  |
 
 
 
@@ -9586,7 +9594,7 @@ URI: [zv:level](https://w3id.org/zarr-vectors/schema/0.9/level)
 
 | Name | Description | Modifies Slot |
 | --- | --- | --- |
-| [LevelMetadata](LevelMetadata.md) | Per-resolution-level `` |  no  |
+| [LevelMetadata](LevelMetadata.md) | Per-resolution-level attributes payload, persisted under the key ``zarr_vecto... |  no  |
 
 
 
@@ -9697,10 +9705,10 @@ URI: [zv:level_delta](https://w3id.org/zarr-vectors/schema/0.9/level_delta)
 
 | Name | Description | Modifies Slot |
 | --- | --- | --- |
-| [LinksFamilyMeta](LinksFamilyMeta.md) | `` |  no  |
-| [LinksMeta](LinksMeta.md) | `` |  no  |
-| [LinkAttributeFamilyMeta](LinkAttributeFamilyMeta.md) | `` |  no  |
-| [LinkAttributeMeta](LinkAttributeMeta.md) | `` |  no  |
+| [LinksFamilyMeta](LinksFamilyMeta.md) | Attributes for a ``links/<delta>/`` **group** — the family-wide policy every ... |  no  |
+| [LinksMeta](LinksMeta.md) | Attributes for a single ``links/<delta>/<offsets>/`` array: a rank-D vlen arr... |  no  |
+| [LinkAttributeFamilyMeta](LinkAttributeFamilyMeta.md) | Attributes for a ``link_attributes/<name>/<delta>/`` **group** |  no  |
+| [LinkAttributeMeta](LinkAttributeMeta.md) | Attributes for one ``link_attributes/<name>/<delta>/<offsets>/`` array |  no  |
 
 
 
@@ -9761,8 +9769,9 @@ URI: [zv:level_delta](https://w3id.org/zarr-vectors/schema/0.9/level_delta)
 ```yaml
 name: level_delta
 description: 'Pyramid-level delta between the source side (the level that owns this
-  array) and the target side of the edges.  ``0`` for intra-level arrays, ``+N`` for edges from this level to ``this_level + N`` (coarser),
-  ``-N`` for edges to ``this_level - N`` (finer).
+  array) and the target side of the edges.  ``0`` for intra-level arrays, ``+N`` for
+  edges from this level to ``this_level + N`` (coarser), ``-N`` for edges to ``this_level
+  - N`` (finer).
 
   '
 from_schema: https://w3id.org/zarr-vectors/schema/0.9
@@ -9810,8 +9819,8 @@ URI: [zv:link_width](https://w3id.org/zarr-vectors/schema/0.9/link_width)
 
 | Name | Description | Modifies Slot |
 | --- | --- | --- |
-| [LinksFamilyMeta](LinksFamilyMeta.md) | `` |  no  |
-| [LinksMeta](LinksMeta.md) | `` |  no  |
+| [LinksFamilyMeta](LinksFamilyMeta.md) | Attributes for a ``links/<delta>/`` **group** — the family-wide policy every ... |  no  |
+| [LinksMeta](LinksMeta.md) | Attributes for a single ``links/<delta>/<offsets>/`` array: a rank-D vlen arr... |  no  |
 
 
 
@@ -9919,7 +9928,7 @@ URI: [zv:links_convention](https://w3id.org/zarr-vectors/schema/0.9/links_conven
 
 | Name | Description | Modifies Slot |
 | --- | --- | --- |
-| [RootMetadata](RootMetadata.md) | Root-level `` |  no  |
+| [RootMetadata](RootMetadata.md) | Root-level attributes payload, persisted under the key ``zarr_vectors`` |  no  |
 
 
 
@@ -10019,7 +10028,7 @@ URI: [zv:manifest_block_dtype](https://w3id.org/zarr-vectors/schema/0.9/manifest
 
 | Name | Description | Modifies Slot |
 | --- | --- | --- |
-| [RootMetadata](RootMetadata.md) | Root-level `` |  no  |
+| [RootMetadata](RootMetadata.md) | Root-level attributes payload, persisted under the key ``zarr_vectors`` |  no  |
 
 
 
@@ -10125,7 +10134,7 @@ URI: [zv:manifest_layout](https://w3id.org/zarr-vectors/schema/0.9/manifest_layo
 
 | Name | Description | Modifies Slot |
 | --- | --- | --- |
-| [RootMetadata](RootMetadata.md) | Root-level `` |  no  |
+| [RootMetadata](RootMetadata.md) | Root-level attributes payload, persisted under the key ``zarr_vectors`` |  no  |
 
 
 
@@ -10436,12 +10445,12 @@ URI: [schema:name](http://schema.org/name)
 | Name | Description | Modifies Slot |
 | --- | --- | --- |
 | [Axis](Axis.md) | One axis of the spatial index |  no  |
-| [AttributeMeta](AttributeMeta.md) | `` |  no  |
-| [FragmentAttributeMeta](FragmentAttributeMeta.md) | `` |  no  |
-| [ObjectAttributeMeta](ObjectAttributeMeta.md) | `` |  no  |
-| [GroupingsAttributeMeta](GroupingsAttributeMeta.md) | `` |  no  |
-| [LinkAttributeFamilyMeta](LinkAttributeFamilyMeta.md) | `` |  no  |
-| [LinkAttributeMeta](LinkAttributeMeta.md) | `` |  no  |
+| [AttributeMeta](AttributeMeta.md) | Attributes for each ``attributes/<name>/`` array |  no  |
+| [FragmentAttributeMeta](FragmentAttributeMeta.md) | Attributes for each ``fragment_attributes/<name>/`` array |  no  |
+| [ObjectAttributeMeta](ObjectAttributeMeta.md) | Attributes for each ``object_attributes/<name>/`` array |  no  |
+| [GroupingsAttributeMeta](GroupingsAttributeMeta.md) | Attributes for each ``groupings_attributes/<name>/`` array |  no  |
+| [LinkAttributeFamilyMeta](LinkAttributeFamilyMeta.md) | Attributes for a ``link_attributes/<name>/<delta>/`` **group** |  no  |
+| [LinkAttributeMeta](LinkAttributeMeta.md) | Attributes for one ``link_attributes/<name>/<delta>/<offsets>/`` array |  no  |
 
 
 
@@ -10550,7 +10559,7 @@ URI: [zv:num_groups](https://w3id.org/zarr-vectors/schema/0.9/num_groups)
 
 | Name | Description | Modifies Slot |
 | --- | --- | --- |
-| [GroupingsMeta](GroupingsMeta.md) | `` |  no  |
+| [GroupingsMeta](GroupingsMeta.md) | Attributes for ``groupings/`` |  no  |
 
 
 
@@ -10661,8 +10670,8 @@ URI: [zv:num_links](https://w3id.org/zarr-vectors/schema/0.9/num_links)
 
 | Name | Description | Modifies Slot |
 | --- | --- | --- |
-| [LinksFamilyMeta](LinksFamilyMeta.md) | `` |  no  |
-| [LinkAttributeFamilyMeta](LinkAttributeFamilyMeta.md) | `` |  no  |
+| [LinksFamilyMeta](LinksFamilyMeta.md) | Attributes for a ``links/<delta>/`` **group** — the family-wide policy every ... |  no  |
+| [LinkAttributeFamilyMeta](LinkAttributeFamilyMeta.md) | Attributes for a ``link_attributes/<name>/<delta>/`` **group** |  no  |
 
 
 
@@ -10775,7 +10784,7 @@ URI: [zv:num_objects](https://w3id.org/zarr-vectors/schema/0.9/num_objects)
 
 | Name | Description | Modifies Slot |
 | --- | --- | --- |
-| [ObjectIndexMeta](ObjectIndexMeta.md) | `` |  no  |
+| [ObjectIndexMeta](ObjectIndexMeta.md) | Attributes for ``object_index/`` |  no  |
 
 
 
@@ -10886,7 +10895,7 @@ URI: [zv:num_physical_records](https://w3id.org/zarr-vectors/schema/0.9/num_phys
 
 | Name | Description | Modifies Slot |
 | --- | --- | --- |
-| [LinksFamilyMeta](LinksFamilyMeta.md) | `` |  no  |
+| [LinksFamilyMeta](LinksFamilyMeta.md) | Attributes for a ``links/<delta>/`` **group** — the family-wide policy every ... |  no  |
 
 
 
@@ -10993,7 +11002,7 @@ URI: [zv:object_index_convention](https://w3id.org/zarr-vectors/schema/0.9/objec
 
 | Name | Description | Modifies Slot |
 | --- | --- | --- |
-| [RootMetadata](RootMetadata.md) | Root-level `` |  no  |
+| [RootMetadata](RootMetadata.md) | Root-level attributes payload, persisted under the key ``zarr_vectors`` |  no  |
 
 
 
@@ -11091,7 +11100,7 @@ URI: [zv:object_sparsity](https://w3id.org/zarr-vectors/schema/0.9/object_sparsi
 
 | Name | Description | Modifies Slot |
 | --- | --- | --- |
-| [LevelMetadata](LevelMetadata.md) | Per-resolution-level `` |  no  |
+| [LevelMetadata](LevelMetadata.md) | Per-resolution-level attributes payload, persisted under the key ``zarr_vecto... |  no  |
 
 
 
@@ -11202,8 +11211,8 @@ URI: [zv:offsets](https://w3id.org/zarr-vectors/schema/0.9/offsets)
 
 | Name | Description | Modifies Slot |
 | --- | --- | --- |
-| [LinksMeta](LinksMeta.md) | `` |  no  |
-| [LinkAttributeMeta](LinkAttributeMeta.md) | `` |  no  |
+| [LinksMeta](LinksMeta.md) | Attributes for a single ``links/<delta>/<offsets>/`` array: a rank-D vlen arr... |  no  |
+| [LinkAttributeMeta](LinkAttributeMeta.md) | Attributes for one ``link_attributes/<name>/<delta>/<offsets>/`` array |  no  |
 
 
 
@@ -11324,7 +11333,7 @@ URI: [zv:parent_level](https://w3id.org/zarr-vectors/schema/0.9/parent_level)
 
 | Name | Description | Modifies Slot |
 | --- | --- | --- |
-| [LevelMetadata](LevelMetadata.md) | Per-resolution-level `` |  no  |
+| [LevelMetadata](LevelMetadata.md) | Per-resolution-level attributes payload, persisted under the key ``zarr_vecto... |  no  |
 
 
 
@@ -11433,7 +11442,7 @@ URI: [zv:preserves_object_ids](https://w3id.org/zarr-vectors/schema/0.9/preserve
 
 | Name | Description | Modifies Slot |
 | --- | --- | --- |
-| [LevelMetadata](LevelMetadata.md) | Per-resolution-level `` |  no  |
+| [LevelMetadata](LevelMetadata.md) | Per-resolution-level attributes payload, persisted under the key ``zarr_vecto... |  no  |
 
 
 
@@ -11515,114 +11524,6 @@ search:
   boost: 5.0
 ---
 
-# Slot: required_capabilities 
-
-
-_Capabilities a reader must implement to read this store correctly; a reader that checks the list refuses a store naming one it does not implement.  Optional, default empty.  A store with an octree-chunked level lists ``octree_chunks``._
-
-__
-
-
-
-<div data-search-exclude markdown="1">
-
-
-
-URI: [zv:required_capabilities](https://w3id.org/zarr-vectors/schema/0.5/required_capabilities)
-<!-- no inheritance hierarchy -->
-
-
-
-
-
-## Applicable Classes
-
-| Name | Description | Modifies Slot |
-| --- | --- | --- |
-| [RootMetadata](RootMetadata.md) | Root-level `` |  no  |
-
-
-
-
-
-
-## Properties
-
-### Type and Range
-
-| Property | Value |
-| --- | --- |
-| Range | [FormatCapability](FormatCapability.md) |
-| Domain Of | [RootMetadata](RootMetadata.md) |
-### Cardinality and Requirements
-
-| Property | Value |
-| --- | --- |
-| Multivalued | Yes |
-
-
-
-
-
-
-
-
-
-
-
-
-## Identifier and Mapping Information
-
-
-
-
-
-### Schema Source
-
-
-* from schema: https://w3id.org/zarr-vectors/schema/0.5
-
-
-
-
-## Mappings
-
-| Mapping Type | Mapped Value |
-| ---  | ---  |
-| self | zv:required_capabilities |
-| native | zv:required_capabilities |
-
-
-
-
-## LinkML Source
-
-<details>
-```yaml
-name: required_capabilities
-description: 'Capabilities a reader must implement to read this store correctly; a
-  reader that checks the list refuses a store naming one it does not implement.  Optional,
-  default empty.  A store with an octree-chunked level lists ``octree_chunks``.
-
-  '
-from_schema: https://w3id.org/zarr-vectors/schema/0.5
-rank: 1000
-domain_of:
-- RootMetadata
-range: FormatCapability
-multivalued: true
-
-```
-</details></div>
-
-
----
-
----
-search:
-  boost: 5.0
----
-
 # Slot: reduction_factor 
 
 
@@ -11645,7 +11546,7 @@ URI: [zv:reduction_factor](https://w3id.org/zarr-vectors/schema/0.9/reduction_fa
 
 | Name | Description | Modifies Slot |
 | --- | --- | --- |
-| [RootMetadata](RootMetadata.md) | Root-level `` |  no  |
+| [RootMetadata](RootMetadata.md) | Root-level attributes payload, persisted under the key ``zarr_vectors`` |  no  |
 
 
 
@@ -11730,6 +11631,113 @@ search:
   boost: 5.0
 ---
 
+# Slot: required_capabilities 
+
+
+_Capabilities a reader must implement to read this store correctly; a reader that checks the list refuses a store naming one it does not implement.  Optional, default empty.  A store with an octree-chunked level lists ``octree_chunks``._
+
+__
+
+
+
+<div data-search-exclude markdown="1">
+
+
+
+URI: [zv:required_capabilities](https://w3id.org/zarr-vectors/schema/0.9/required_capabilities)
+<!-- no inheritance hierarchy -->
+
+
+
+
+
+## Applicable Classes
+
+| Name | Description | Modifies Slot |
+| --- | --- | --- |
+| [RootMetadata](RootMetadata.md) | Root-level attributes payload, persisted under the key ``zarr_vectors`` |  no  |
+
+
+
+
+
+
+## Properties
+
+### Type and Range
+
+| Property | Value |
+| --- | --- |
+| Range | [FormatCapability](FormatCapability.md) |
+| Domain Of | [RootMetadata](RootMetadata.md) |
+
+### Cardinality and Requirements
+
+| Property | Value |
+| --- | --- |
+| Multivalued | Yes |
+
+
+
+
+
+
+
+
+
+
+## Identifier and Mapping Information
+
+
+
+
+
+### Schema Source
+
+
+* from schema: https://w3id.org/zarr-vectors/schema/0.9
+
+
+
+
+## Mappings
+
+| Mapping Type | Mapped Value |
+| ---  | ---  |
+| self | zv:required_capabilities |
+| native | zv:required_capabilities |
+
+
+
+
+## LinkML Source
+
+<details>
+```yaml
+name: required_capabilities
+description: 'Capabilities a reader must implement to read this store correctly; a
+  reader that checks the list refuses a store naming one it does not implement.  Optional,
+  default empty.  A store with an octree-chunked level lists ``octree_chunks``.
+
+  '
+from_schema: https://w3id.org/zarr-vectors/schema/0.9
+rank: 1000
+domain_of:
+- RootMetadata
+range: FormatCapability
+multivalued: true
+
+```
+</details></div>
+
+
+---
+
+---
+search:
+  boost: 5.0
+---
+
 # Slot: row_shape 
 
 
@@ -11754,7 +11762,7 @@ URI: [zv:row_shape](https://w3id.org/zarr-vectors/schema/0.9/row_shape)
 
 | Name | Description | Modifies Slot |
 | --- | --- | --- |
-| [LinkAttributeMeta](LinkAttributeMeta.md) | `` |  no  |
+| [LinkAttributeMeta](LinkAttributeMeta.md) | Attributes for one ``link_attributes/<name>/<delta>/<offsets>/`` array |  no  |
 
 
 
@@ -11860,8 +11868,8 @@ URI: [zv:shape](https://w3id.org/zarr-vectors/schema/0.9/shape)
 
 | Name | Description | Modifies Slot |
 | --- | --- | --- |
-| [ObjectAttributeMeta](ObjectAttributeMeta.md) | `` |  no  |
-| [GroupingsAttributeMeta](GroupingsAttributeMeta.md) | `` |  no  |
+| [ObjectAttributeMeta](ObjectAttributeMeta.md) | Attributes for each ``object_attributes/<name>/`` array |  no  |
+| [GroupingsAttributeMeta](GroupingsAttributeMeta.md) | Attributes for each ``groupings_attributes/<name>/`` array |  no  |
 
 
 
@@ -11967,7 +11975,7 @@ URI: [zv:shard_shape](https://w3id.org/zarr-vectors/schema/0.9/shard_shape)
 
 | Name | Description | Modifies Slot |
 | --- | --- | --- |
-| [RootMetadata](RootMetadata.md) | Root-level `` |  no  |
+| [RootMetadata](RootMetadata.md) | Root-level attributes payload, persisted under the key ``zarr_vectors`` |  no  |
 
 
 
@@ -12088,7 +12096,7 @@ URI: [zv:shared_fragments](https://w3id.org/zarr-vectors/schema/0.9/shared_fragm
 
 | Name | Description | Modifies Slot |
 | --- | --- | --- |
-| [LevelMetadata](LevelMetadata.md) | Per-resolution-level `` |  no  |
+| [LevelMetadata](LevelMetadata.md) | Per-resolution-level attributes payload, persisted under the key ``zarr_vecto... |  no  |
 
 
 
@@ -12148,7 +12156,8 @@ URI: [zv:shared_fragments](https://w3id.org/zarr-vectors/schema/0.9/shared_fragm
 ```yaml
 name: shared_fragments
 description: 'True when per-chunk fragments may be referenced by multiple objects''
-  manifests (shared metavertices in the per-object pyramid regime).  Readers MAY use this to short-circuit dedup work.
+  manifests (shared metavertices in the per-object pyramid regime).  Readers MAY use
+  this to short-circuit dedup work.
 
   '
 from_schema: https://w3id.org/zarr-vectors/schema/0.9
@@ -12190,8 +12199,8 @@ URI: [zv:sid_ndim](https://w3id.org/zarr-vectors/schema/0.9/sid_ndim)
 
 | Name | Description | Modifies Slot |
 | --- | --- | --- |
-| [LinksFamilyMeta](LinksFamilyMeta.md) | `` |  yes  |
-| [ObjectIndexMeta](ObjectIndexMeta.md) | `` |  no  |
+| [LinksFamilyMeta](LinksFamilyMeta.md) | Attributes for a ``links/<delta>/`` **group** — the family-wide policy every ... |  yes  |
+| [ObjectIndexMeta](ObjectIndexMeta.md) | Attributes for ``object_index/`` |  no  |
 
 
 
@@ -12303,7 +12312,7 @@ URI: [zv:store](https://w3id.org/zarr-vectors/schema/0.9/store)
 
 | Name | Description | Modifies Slot |
 | --- | --- | --- |
-| [LinksFamilyMeta](LinksFamilyMeta.md) | `` |  no  |
+| [LinksFamilyMeta](LinksFamilyMeta.md) | Attributes for a ``links/<delta>/`` **group** — the family-wide policy every ... |  no  |
 
 
 
@@ -12606,7 +12615,7 @@ URI: [zv:vertex_count](https://w3id.org/zarr-vectors/schema/0.9/vertex_count)
 
 | Name | Description | Modifies Slot |
 | --- | --- | --- |
-| [LevelMetadata](LevelMetadata.md) | Per-resolution-level `` |  no  |
+| [LevelMetadata](LevelMetadata.md) | Per-resolution-level attributes payload, persisted under the key ``zarr_vecto... |  no  |
 
 
 
@@ -12727,17 +12736,17 @@ URI: [zv:zv_array](https://w3id.org/zarr-vectors/schema/0.9/zv_array)
 
 | Name | Description | Modifies Slot |
 | --- | --- | --- |
-| [VerticesMeta](VerticesMeta.md) | `` |  yes  |
-| [LinksFamilyMeta](LinksFamilyMeta.md) | `` |  yes  |
-| [LinksMeta](LinksMeta.md) | `` |  yes  |
-| [AttributeMeta](AttributeMeta.md) | `` |  yes  |
-| [FragmentAttributeMeta](FragmentAttributeMeta.md) | `` |  yes  |
-| [ObjectIndexMeta](ObjectIndexMeta.md) | `` |  yes  |
-| [ObjectAttributeMeta](ObjectAttributeMeta.md) | `` |  yes  |
-| [GroupingsMeta](GroupingsMeta.md) | `` |  yes  |
-| [GroupingsAttributeMeta](GroupingsAttributeMeta.md) | `` |  yes  |
-| [LinkAttributeFamilyMeta](LinkAttributeFamilyMeta.md) | `` |  yes  |
-| [LinkAttributeMeta](LinkAttributeMeta.md) | `` |  yes  |
+| [VerticesMeta](VerticesMeta.md) | Attributes for the ``vertices/`` array |  yes  |
+| [LinksFamilyMeta](LinksFamilyMeta.md) | Attributes for a ``links/<delta>/`` **group** — the family-wide policy every ... |  yes  |
+| [LinksMeta](LinksMeta.md) | Attributes for a single ``links/<delta>/<offsets>/`` array: a rank-D vlen arr... |  yes  |
+| [AttributeMeta](AttributeMeta.md) | Attributes for each ``attributes/<name>/`` array |  yes  |
+| [FragmentAttributeMeta](FragmentAttributeMeta.md) | Attributes for each ``fragment_attributes/<name>/`` array |  yes  |
+| [ObjectIndexMeta](ObjectIndexMeta.md) | Attributes for ``object_index/`` |  yes  |
+| [ObjectAttributeMeta](ObjectAttributeMeta.md) | Attributes for each ``object_attributes/<name>/`` array |  yes  |
+| [GroupingsMeta](GroupingsMeta.md) | Attributes for ``groupings/`` |  yes  |
+| [GroupingsAttributeMeta](GroupingsAttributeMeta.md) | Attributes for each ``groupings_attributes/<name>/`` array |  yes  |
+| [LinkAttributeFamilyMeta](LinkAttributeFamilyMeta.md) | Attributes for a ``link_attributes/<name>/<delta>/`` **group** |  yes  |
+| [LinkAttributeMeta](LinkAttributeMeta.md) | Attributes for one ``link_attributes/<name>/<delta>/<offsets>/`` array |  yes  |
 
 
 
@@ -12853,7 +12862,7 @@ URI: [schema:version](http://schema.org/version)
 
 | Name | Description | Modifies Slot |
 | --- | --- | --- |
-| [RootMetadata](RootMetadata.md) | Root-level `` |  no  |
+| [RootMetadata](RootMetadata.md) | Root-level attributes payload, persisted under the key ``zarr_vectors`` |  no  |
 
 
 
@@ -12921,9 +12930,8 @@ URI: [schema:version](http://schema.org/version)
 <details>
 ```yaml
 name: zv_version
-description: 'ZV spec version this store was written against (e.g. "0.5.0"). Renamed
-  from ``format_version`` in 0.5.0 to disambiguate from Zarr v3''s ``zarr_format``
-  field.
+description: 'ZV spec version this store was written against (e.g. "0.9.4"). Distinct
+  from Zarr v3''s ``zarr_format`` field.
 
   '
 from_schema: https://w3id.org/zarr-vectors/schema/0.9
