@@ -60,8 +60,10 @@ col.cell      # the cell index of every row
 ```
 
 `zb.read_cells(lg, cells, arrays, device="cuda")` reads any list of cells the
-same way. Pass `fragments=True` to get each cell's fragment index too, as
-`batch.fragments`. The result equals the host result, element for element.
+same way. Pass `fragments=True` to get each cell's vertex fragment index too,
+as `batch.fragments`; the `vertex_fragments` cells are decoded on the device
+under the same `decode=` rule as the other arrays. The result equals the host
+result, element for element, errors included.
 
 `decode=` chooses where cells are decoded:
 

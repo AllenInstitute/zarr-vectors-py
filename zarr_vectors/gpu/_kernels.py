@@ -139,6 +139,101 @@ void zv_zstd_walk(const u64* ptrs, const i64* sizes, int n, i64* declared, int* 
     declared[i] = fcs;
 }
 
+// Check one ZVFG fragment-index blob (zarr_vectors.encoding.fragments)
+// and report its header and section sizes. status: 0 ok (or empty),
+// 20 shorter than the header, 21 bad magic, 22 bad version, 23 flags set,
+// 24 R > F, 25-28 truncated in the bitmap / range table / explicit offsets /
+// explicit indices, 29 the bitmap's set bits are not R, 30 the explicit
+// offsets do not start at 0 or decrease.
+extern "C" __global__
+void zv_frag_header(const u64* ptrs, const i64* sizes, int n, i64* head, int* status) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    const u8* p = (const u8*)ptrs[i];
+    i64 size = sizes[i];
+    i64* h = head + 6 * i;          // magic, version, flags, F, R, T
+    for (int k = 0; k < 6; ++k) h[k] = 0;
+    status[i] = 0;
+    if (size == 0) return;
+    if (size < 16) { status[i] = 20; return; }
+    unsigned int magic = ld_u32(p);
+    unsigned int version = (unsigned int)p[4] | ((unsigned int)p[5] << 8);
+    unsigned int flags = (unsigned int)p[6] | ((unsigned int)p[7] << 8);
+    i64 f = (i64)ld_u32(p + 8), r = (i64)ld_u32(p + 12);
+    h[0] = magic; h[1] = version; h[2] = flags; h[3] = f; h[4] = r;
+    if (magic != 0x5A564647u) { status[i] = 21; return; }
+    if (version != 1u) { status[i] = 22; return; }
+    if (flags != 0u) { status[i] = 23; return; }
+    if (r > f) { status[i] = 24; return; }
+    if (f == 0) { h[3] = 0; h[4] = 0; return; }
+    i64 pos = 16;
+    i64 raw_bitmap = (f + 7) / 8;
+    i64 bitmap = (raw_bitmap + 7) & ~(i64)7;
+    if (size < pos + bitmap) { status[i] = 25; return; }
+    i64 bits = 0;
+    for (i64 b = 0; b < raw_bitmap; ++b) {
+        unsigned int byte = p[pos + b];
+        if (b == raw_bitmap - 1 && (f & 7)) byte &= (1u << (f & 7)) - 1u;
+        bits += __popc(byte);
+    }
+    pos += bitmap;
+    if (size < pos + 16 * r) { status[i] = 26; return; }
+    pos += 16 * r;
+    i64 e = f - r;
+    if (size < pos + 4 * (e + 1)) { status[i] = 27; return; }
+    unsigned int prev = ld_u32(p + pos);
+    bool monotone = prev == 0u;
+    for (i64 k = 1; k <= e && monotone; ++k) {
+        unsigned int cur = ld_u32(p + pos + 4 * k);
+        monotone = cur >= prev;
+        prev = cur;
+    }
+    i64 t = e > 0 ? (i64)ld_u32(p + pos + 4 * e) : 0;
+    pos += 4 * (e + 1);
+    if (size < pos + 8 * t) { status[i] = 28; return; }
+    if (bits != r) { status[i] = 29; return; }
+    if (!monotone) { status[i] = 30; return; }
+    h[5] = t;
+}
+
+// One thread per output fragment g of cell c = cell[g], local index
+// f = g - first[c]: is fragment f of its cell a range?
+extern "C" __global__
+void zv_frag_bits(const int* cell, const i64* first, const u64* bitmap, i64 n, u8* is_range) {
+    i64 g = (i64)blockIdx.x * blockDim.x + threadIdx.x;
+    if (g >= n) return;
+    int c = cell[g];
+    i64 f = g - first[c];
+    const u8* bm = (const u8*)bitmap[c];
+    is_range[g] = (bm[f >> 3] >> (f & 7)) & 1;
+}
+
+// One thread per output fragment: its (start, count, index count), from
+// the range table row ``rank[g]`` (range fragments before it in its cell)
+// or the explicit offsets of explicit fragment f - rank[g].
+extern "C" __global__
+void zv_frag_fill(const int* cell, const i64* first, const u64* table, const u64* offsets,
+                  const u8* is_range, const i64* rank, i64 n,
+                  i64* starts, i64* counts, i64* index_counts) {
+    i64 g = (i64)blockIdx.x * blockDim.x + threadIdx.x;
+    if (g >= n) return;
+    int c = cell[g];
+    i64 f = g - first[c];
+    i64 r = rank[g];
+    if (is_range[g]) {
+        const u8* row = (const u8*)table[c] + 16 * r;
+        starts[g] = ld_i64(row);
+        counts[g] = ld_i64(row + 8);
+        index_counts[g] = 0;
+    } else {
+        const u8* off = (const u8*)offsets[c] + 4 * (f - r);
+        i64 count = (i64)ld_u32(off + 4) - (i64)ld_u32(off);
+        starts[g] = -1;
+        counts[g] = count;
+        index_counts[g] = count;
+    }
+}
+
 extern "C" __global__
 void zv_gather(const u64* ptrs, const i64* lengths, const i64* dest, int n, u8* out) {
     for (int i = blockIdx.x; i < n; i += gridDim.x) {
@@ -202,6 +297,49 @@ def gather(ptrs: Any, lengths: np.ndarray, dest: np.ndarray, total: int) -> Any:
         np.int32(n), out,
     ), per_cell_block=True)
     return out
+
+
+def fragment_headers(ptrs: Any, sizes: Any) -> tuple[np.ndarray, np.ndarray]:
+    """Each ZVFG blob's ``(magic, version, flags, F, R, T)`` row and status (host)."""
+    n = int(ptrs.size)
+    head = cp.zeros((n, 6), dtype=cp.int64)
+    status = cp.zeros(n, dtype=cp.int32)
+    _launch("zv_frag_header", n, (ptrs, sizes, np.int32(n), head, status))
+    return head.get(), status.get()
+
+
+def fragment_rows(
+    first: Any, bitmap: Any, table: Any, offsets: Any, total: int,
+) -> tuple[Any, Any, Any]:
+    """``(starts, counts, index_counts)`` of every fragment of every cell.
+
+    Cell ``c``'s fragments are output rows ``first[c]:first[c + 1]``;
+    ``bitmap``, ``table`` and ``offsets`` are the device addresses of its
+    range bitmap, range table and explicit offsets.
+    """
+    n = int(total)
+    starts = cp.empty(n, dtype=cp.int64)
+    counts = cp.empty(n, dtype=cp.int64)
+    index_counts = cp.empty(n, dtype=cp.int64)
+    if n == 0:
+        return starts, counts, index_counts
+    g = cp.arange(n, dtype=cp.int64)
+    cell = (cp.searchsorted(first, g, side="right") - 1).astype(cp.int32)
+    is_range = cp.empty(n, dtype=cp.uint8)
+    blocks = ((n + 127) // 128,)
+    module = _module()
+    module.get_function("zv_frag_bits")(
+        blocks, (128,), (cell, first, bitmap, np.int64(n), is_range),
+    )
+    # Range fragments before each one, within its cell.
+    before = cp.cumsum(is_range, dtype=cp.int64) - is_range
+    # (An empty cell's first row may be n; no fragment looks it up.)
+    rank = before - before[cp.minimum(first[:-1], n - 1)][cell]
+    module.get_function("zv_frag_fill")(blocks, (128,), (
+        cell, first, table, offsets, is_range, rank, np.int64(n),
+        starts, counts, index_counts,
+    ))
+    return starts, counts, index_counts
 
 
 #: Human-readable reasons for :func:`unframe` statuses.

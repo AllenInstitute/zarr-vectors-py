@@ -73,7 +73,7 @@ def fetch_payloads(
     t0 = time.perf_counter()
     requests = []
     for src, keys, coords, _ in items:
-        cells = np.asarray(coords, dtype=np.int64).reshape(len(keys), -1)
+        cells = np.asarray(coords, dtype=np.int64).reshape(len(keys), len(src.shape))
         if src.origin is not None:
             cells = cells - np.asarray(src.origin, dtype=np.int64)
         requests.append((src, cells))
@@ -207,3 +207,79 @@ def column(
     if lay.kind == "links":
         data = data.astype(cp.int64, copy=False)
     return CellColumn(data=data, offsets=cp.asarray(offsets), _host_offsets=offsets)
+
+
+def fragment_column(
+    name: str,
+    payloads: Payloads,
+    keys: list[str],
+    on_error: str,
+    errors: list[Any],
+) -> Any:
+    """The fragment indices of the cells ``keys`` as a :class:`FragmentColumn`.
+
+    The device form of ``cells._fragment_column``: each ZVFG blob
+    (:mod:`zarr_vectors.encoding.fragments`) is checked by one thread, then
+    every fragment is decoded by its own, and the explicit indices are
+    gathered cell by cell. A malformed blob is reported with the host's
+    message and reads as no fragments.
+    """
+    from zarr_vectors.core.cells import CellReadError, FragmentColumn
+    from zarr_vectors.encoding.fragments import fragment_index_problem
+    from zarr_vectors.exceptions import ArrayError
+
+    head, status = _kernels.fragment_headers(
+        cp.asarray(payloads.ptrs, dtype=cp.uint64),
+        cp.asarray(payloads.lengths, dtype=cp.int64),
+    )
+    good = status == 0
+    for key in dict.fromkeys(keys):
+        j = payloads.index.get(key)
+        if j is None or good[j]:
+            continue
+        magic, version, flags, f, r, _ = (int(v) for v in head[j])
+        message = fragment_index_problem(
+            int(status[j]), nbytes=int(payloads.lengths[j]), magic=magic,
+            version=version, flags=flags, num_fragments=f, num_ranges=r,
+        )
+        if on_error == "raise":
+            raise ArrayError(message)
+        errors.append(CellReadError(name, key, f"ArrayError: {message}"))
+
+    rows = np.array([payloads.index.get(k, -1) for k in keys], dtype=np.int64)
+    live = rows >= 0
+    if not len(head):
+        head, good = np.zeros((1, 6), dtype=np.int64), np.zeros(1, dtype=bool)
+    live[live] = good[rows[live]]
+    pick = np.where(live, rows, 0)
+    num = np.where(live, head[pick, 3], 0)
+    num_ranges = np.where(live, head[pick, 4], 0)
+    total = np.where(live, head[pick, 5], 0)
+    base = np.where(live, payloads.ptrs[pick], 0).astype(np.uint64)
+    # Section addresses, per the v1 layout.
+    bitmap = base + np.uint64(16)
+    table = bitmap + (((num + 7) // 8 + 7) & ~7).astype(np.uint64)
+    offsets = table + (16 * num_ranges).astype(np.uint64)
+    indices = offsets + (4 * (num - num_ranges + 1)).astype(np.uint64)
+
+    first = np.concatenate([[0], np.cumsum(num)]).astype(np.int64)
+    starts, counts, index_counts = _kernels.fragment_rows(
+        cp.asarray(first), cp.asarray(bitmap), cp.asarray(table), cp.asarray(offsets),
+        int(first[-1]),
+    )
+    index_offsets = cp.concatenate([
+        cp.zeros(1, dtype=cp.int64), cp.cumsum(index_counts, dtype=cp.int64),
+    ])
+    nbytes = 8 * total
+    dest = np.concatenate([[0], np.cumsum(nbytes)[:-1]]).astype(np.int64)
+    flat = _kernels.gather(
+        cp.asarray(np.where(nbytes > 0, indices, 0).astype(np.uint64)),
+        nbytes, dest, int(nbytes.sum()),
+    )
+    return FragmentColumn(
+        cell_offsets=cp.asarray(first),
+        starts=starts,
+        counts=counts,
+        index_offsets=index_offsets,
+        indices=flat.view(cp.int64),
+    )
