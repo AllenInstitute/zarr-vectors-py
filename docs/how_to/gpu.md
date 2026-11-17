@@ -82,10 +82,18 @@ reports GPUDirect Storage, kvikio reads them straight into device memory.
 `ZARR_VECTORS_GPU_IO` for every call. `batch.io` records which path each
 array took.
 
-Other readers take `device=` too, such as `read_chunk_vertex_buffer` and
-`read_link_arrays`. They decode on the host and copy each array up once, as
-does `ReadResult.to_device("cuda")`. To decode zstd frames you fetched
-yourself, use `zarr_vectors.gpu.decode_zstd`.
+Other readers take `device=` too. `read_chunk_vertex_buffer`,
+`read_chunk_vertex_rows` (fragments gathered on the device),
+`read_chunk_fragment_attributes` and `read_link_attributes` read through
+`read_cells`' device path with `decode="auto"`. Where the device path could
+answer differently (a `dtype=` other than the stored one, a cell off the
+grid, a fragment that points outside its buffer, a read error), they run the
+host reader instead, so results and errors are the host's. The rest, such
+as `read_chunk_attribute_rows` and `read_link_arrays`, decode on the host and
+copy each array up once, as does `ReadResult.to_device("cuda")`. Inside a
+shard transaction or an offline session, and for a composite level's cells
+of another store, every read decodes on the host. To decode zstd frames you
+fetched yourself, use `zarr_vectors.gpu.decode_zstd`.
 
 ## Write from arrays
 

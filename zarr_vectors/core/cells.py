@@ -520,6 +520,10 @@ def _device_payloads(
         raise ArrayError(f"decode={decode!r}; expected 'auto', 'host' or 'device'")
     _xp._gpu()  # the extension, or the install hint
     from zarr_vectors.gpu import _read as device_read
+    from zarr_vectors.gpu._readers import served_by_store
+
+    if not served_by_store(level_group, keys):
+        return {}
 
     coords_of = dict(zip(keys, cc.tolist()))
     items, names = [], []
