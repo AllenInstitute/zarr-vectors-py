@@ -87,7 +87,7 @@ _MISS_ROW = "row"
 
 
 def _shard_codec(ndim: int, compressors: list[Any], octree: dict[str, Any] | None) -> Any:
-    """zarr-octree's ``zarr_octree_sharding`` codec configured by the store's
+    """zarr-octree's ``octree`` codec (``zarr_octree_sharding`` before 0.4) configured by the store's
     ``octree`` marker (:data:`zarr_vectors.constants.CAP_OCTREE_SHARDING`), or
     None for ``sharding_indexed`` (zarr-octree is then never imported)."""
     if octree is None:
@@ -113,10 +113,11 @@ def _octree_codec_class() -> Any:
     from zarr.registry import get_codec_class
 
     try:
+        # Registered under this name by every zarr-octree release (0.4 writes "octree").
         return get_codec_class("zarr_octree_sharding")
     except (KeyError, ImportError) as exc:  # not registered, or its package is gone
         raise ValueError(
-            "this store is marked octree (zarr_octree_sharding): pip install "
+            "this store is marked octree (zarr-octree's octree codec): pip install "
             "git+https://github.com/Andrew-Keenlyside/zarr-octree"
         ) from exc
 

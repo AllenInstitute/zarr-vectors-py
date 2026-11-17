@@ -24,6 +24,7 @@ import pytest
 from zarr.storage import LocalStore, WrapperStore
 
 import zarr_vectors as zv
+from zarr_vectors.constants import OCTREE_CODEC_NAMES
 from zarr_vectors.core import _batch_reader, _cells_on_disk
 
 try:
@@ -60,8 +61,10 @@ def _codecs(path):
     out = {}
     for z in path.rglob("zarr.json"):
         m = json.loads(z.read_text())
-        if m.get("node_type") == "array" and m["codecs"][0]["name"] in ("sharding_indexed", "zarr_octree_sharding"):
-            out[str(z.parent.relative_to(path))] = m["codecs"][0]["name"]
+        name = m["codecs"][0]["name"] if m.get("node_type") == "array" else None
+        name = "octree" if name in OCTREE_CODEC_NAMES else name  # either name zarr-octree writes
+        if name in ("sharding_indexed", "octree"):
+            out[str(z.parent.relative_to(path))] = name
     return out
 
 
@@ -72,7 +75,7 @@ def _root(path):
 def _write(path, codec):
     if codec != "sharding_indexed" and not HAVE_OCTREE:
         pytest.skip("zarr-octree is not installed")
-    name = "zarr_octree_sharding" if codec.startswith("zarr_octree") else codec
+    name = "octree" if codec.startswith("zarr_octree") else codec
     pts, ids = _points()
     ds = zv.create(str(path), schema=_schema(CODECS[codec]))
     ds.add_points(pts, object_ids=ids)
@@ -199,7 +202,7 @@ def test_a_marked_store_writes_every_sharded_array_octree(tmp_path, kind):
         edges = np.stack([np.arange(599), np.arange(1, 600)], 1)
         ds.add_graph(pos, edges, object_ids=np.zeros(600, dtype=np.int64))
     codecs = _codecs(p)
-    assert codecs and set(codecs.values()) == {"zarr_octree_sharding"}, codecs
+    assert codecs and set(codecs.values()) == {"octree"}, codecs
     if kind != "point_cloud":
         assert any("/links/" in a for a in codecs)
     root = _root(p)
@@ -239,7 +242,7 @@ def test_set_octree_converts_both_ways_and_back_is_the_unmarked_store(tmp_path, 
 
     out = set_octree(str(b), {"target": 3_000})
     assert out["arrays_repacked"] == len(_codecs(a)) > 0
-    assert set(_codecs(b).values()) == {"zarr_octree_sharding"}
+    assert set(_codecs(b).values()) == {"octree"}
     assert _root(b)["octree_sharding"] == {"target": 3_000}
     got = _answers(zv.open(str(b)))
     assert all(np.array_equal(x, y) for x, y in zip(got[0], want[0])) and np.array_equal(got[1], want[1])

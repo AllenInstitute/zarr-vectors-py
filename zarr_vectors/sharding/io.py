@@ -79,6 +79,7 @@ from collections.abc import Sequence
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
+from zarr_vectors.constants import OCTREE_CODEC_NAMES
 from zarr_vectors.core.group import _parse_chunk_coords
 from zarr_vectors.core.store import (
     get_resolution_level,
@@ -614,7 +615,7 @@ def _octree_codec_matches(existing: Any, octree: dict[str, Any] | None) -> bool:
     codec = existing.metadata.codecs[0]
     if octree is None:
         return _codec_name(codec) == "sharding_indexed"
-    if _codec_name(codec) != "zarr_octree_sharding":
+    if _codec_name(codec) not in OCTREE_CODEC_NAMES:
         return False
     from zarr_vectors.core.group import _shard_codec
 
@@ -919,7 +920,7 @@ def _settle_octree_marker(
     all_match = True
     any_octree = False
     for _, _, node in _sharded_arrays(root):
-        any_octree = any_octree or _codec_name(node.metadata.codecs[0]) == "zarr_octree_sharding"
+        any_octree = any_octree or _codec_name(node.metadata.codecs[0]) in OCTREE_CODEC_NAMES
         all_match = all_match and _octree_codec_matches(node, wanted)
     current = root.attrs.to_dict().get("zarr_vectors", {}).get("octree_sharding")
     marker = wanted if all_match else current

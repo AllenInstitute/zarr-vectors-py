@@ -14,6 +14,7 @@ from typing import TYPE_CHECKING, Any
 from zarr.abc.codec import BytesBytesCodec
 from zarr.core.common import parse_named_configuration
 from zarr.registry import register_codec
+from zarr_vectors.constants import OCTREE_CODEC_NAMES
 
 if TYPE_CHECKING:
     from zarr.core.array_spec import ArraySpec
@@ -63,7 +64,7 @@ def is_marker(codec: Any) -> bool:
 def cell_codecs(array: Any) -> list[Any]:
     """The codec objects ``array``'s cells pass through (inside its sharding codec, if any)."""
     codecs = list(array.metadata.codecs)
-    if codecs and "sharding" in str(codecs[0].to_dict().get("name", "")):
+    if codecs and codecs[0].to_dict().get("name") in ("sharding_indexed", *OCTREE_CODEC_NAMES):
         codecs = list(getattr(codecs[0], "codecs", ()))
     return codecs
 
