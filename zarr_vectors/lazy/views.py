@@ -22,6 +22,7 @@ from zarr_vectors.core.arrays import (
     read_chunk_vertices,
     read_fragment,
     read_object_vertices,
+    vertices_dtype,
 )
 from zarr_vectors.core.metadata import LevelMetadata, RootMetadata
 from zarr_vectors.core.store import FsGroup
@@ -200,7 +201,9 @@ class ZVView:
             ``object_ids``.
         """
         ndim = self._root_meta.sid_ndim
-        dtype = np.float32
+        # The dtype the level declares: a float64 cell read as float32
+        # decodes to garbage at twice the row count.
+        dtype = vertices_dtype(self._group)
 
         # Path 1: object-ID based read
         if self._spec.target_object_ids is not None:
@@ -522,16 +525,17 @@ def _read_polyline(
     ndim: int,
 ) -> npt.NDArray[np.floating]:
     """Read and reconstruct a single polyline from its manifest."""
+    dtype = vertices_dtype(group)
     try:
         verts_list = read_object_vertices(
-            group, object_id, dtype=np.float32, ndim=ndim,
+            group, object_id, dtype=dtype, ndim=ndim,
         )
         non_empty = [v for v in verts_list if len(v) > 0]
         if not non_empty:
-            return np.zeros((0, ndim), dtype=np.float32)
+            return np.zeros((0, ndim), dtype=dtype)
         return np.concatenate(non_empty, axis=0)
     except Exception:
-        return np.zeros((0, ndim), dtype=np.float32)
+        return np.zeros((0, ndim), dtype=dtype)
 
 
 def _delayed_read_polyline(group: FsGroup, object_id: int, ndim: int) -> Any:
