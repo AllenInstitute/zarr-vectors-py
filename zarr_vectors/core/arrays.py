@@ -272,20 +272,41 @@ def _parse_chunk_key(key: str) -> ChunkCoords:
     return tuple(int(x) for x in key.split("."))
 
 
-def _device_result(fn):
+def _device_result(fn=None, *, on_device: bool = False):
     """Add a keyword-only ``device=`` to a reader; moves numpy results there.
 
     See :mod:`zarr_vectors._xp`. Non-array results pass through untouched.
+    With ``on_device``, a ``"cuda"`` read first tries the reader of the same
+    name in :mod:`zarr_vectors.gpu._readers` (through ``read_cells``' device
+    path), which returns ``NotImplemented`` -- or raises ``ArrayError`` or
+    ``StoreError`` -- wherever the host reader should answer instead.
     """
     import functools
     import inspect
 
     from zarr_vectors import _xp
 
+    if fn is None:
+        return functools.partial(_device_result, on_device=on_device)
+
+    sig = inspect.signature(fn)
+
     @functools.wraps(fn)
     def wrapper(*args: Any, device: str | None = None, **kwargs: Any) -> Any:
-        out = fn(*args, **kwargs)
         target = _xp.resolve_device(device)
+        if target == "cuda" and on_device:
+            _xp._gpu()  # the extension, or the install hint
+            from zarr_vectors.gpu import _readers
+
+            bound = sig.bind(*args, **kwargs)
+            bound.apply_defaults()
+            try:
+                got = getattr(_readers, fn.__name__)(**bound.arguments)
+            except (ArrayError, StoreError):
+                got = NotImplemented
+            if got is not NotImplemented:
+                return got
+        out = fn(*args, **kwargs)
         if target == "cpu":
             return out
         if isinstance(out, np.ndarray):
@@ -294,7 +315,6 @@ def _device_result(fn):
             return tuple(_xp.to_device(o, target) for o in out)
         return out
 
-    sig = inspect.signature(fn)
     params = list(sig.parameters.values())
     params.append(inspect.Parameter(
         "device", inspect.Parameter.KEYWORD_ONLY, default=None,
@@ -5903,7 +5923,7 @@ def chunk_link_fragments_aligned(
     return True
 
 
-@_device_result
+@_device_result(on_device=True)
 def read_chunk_vertex_rows(
     level_group: Group,
     chunk_coords: ChunkCoords,
@@ -5978,7 +5998,7 @@ def read_chunk_vertex_rows(
     return np.concatenate(groups, axis=0) if groups else full[:0]
 
 
-@_device_result
+@_device_result(on_device=True)
 def read_chunk_vertex_buffer(
     level_group: Group,
     chunk_coords: ChunkCoords,
@@ -6599,7 +6619,7 @@ def read_attribute_fragment(
         return default
 
 
-@_device_result
+@_device_result(on_device=True)
 def read_chunk_fragment_attributes(
     level_group: Group,
     attr_name: str,
@@ -8607,7 +8627,7 @@ def read_links_for_tuple(
     return out
 
 
-@_device_result
+@_device_result(on_device=True)
 def read_link_attributes(
     level_group: Group,
     attr_name: str,

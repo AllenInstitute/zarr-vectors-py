@@ -376,12 +376,12 @@ def read_cells(
     errors: list[CellReadError] = []
     seconds: dict[str, float] = {}
     on_device = _device_payloads(
-        level_group, plan, layouts, keys, cc, decode if device == "cuda" else "host",
-        on_error, errors, io, seconds,
+        level_group, plan + ([fragment_plan] if fragment_plan else []), layouts,
+        keys, cc, decode if device == "cuda" else "host", on_error, errors, io, seconds,
     )
     raw: dict[tuple[str, str], bytes] = {}
     host_plan = [p for p in plan if p[0] not in on_device]
-    if fragment_plan is not None:
+    if fragment_plan is not None and VERTEX_FRAGMENTS not in on_device:
         host_plan.append(fragment_plan)
     t_host = time.perf_counter()
     with _prefetch(level_group, [p for p in host_plan if p[1]]):
@@ -429,7 +429,15 @@ def read_cells(
         columns[name] = _column(parts, lay, device)
         host_seconds += time.perf_counter() - t0
     fragment_column = None
-    if fragment_plan is not None:
+    if fragment_plan is not None and VERTEX_FRAGMENTS in on_device:
+        from zarr_vectors.gpu import _read as device_read
+
+        t0 = time.perf_counter()
+        fragment_column = device_read.fragment_column(
+            VERTEX_FRAGMENTS, on_device[VERTEX_FRAGMENTS], keys, on_error, errors,
+        )
+        seconds["decode"] = seconds.get("decode", 0.0) + time.perf_counter() - t0
+    elif fragment_plan is not None:
         t0 = time.perf_counter()
         fragment_column = _fragment_column(keys, raw, on_error, errors, device)
         host_seconds += time.perf_counter() - t0
@@ -460,7 +468,7 @@ def _fragment_column(
     device: str,
 ) -> FragmentColumn:
     """The requested cells' fragment indices, decoded, as one column."""
-    from zarr_vectors.encoding.fragments import decode_fragments
+    from zarr_vectors.encoding.fragments import check_fragment_index, decode_fragments
 
     empty = np.zeros(0, dtype=np.int64)
     decoded: dict[str, tuple[np.ndarray, ...]] = {}
@@ -470,7 +478,9 @@ def _fragment_column(
             decoded[key] = (empty,) * 4
             continue
         try:
-            decoded[key] = decode_fragments(blob).flat()
+            fi = decode_fragments(blob)
+            check_fragment_index(fi)
+            decoded[key] = fi.flat()
         except Exception as exc:  # noqa: BLE001 - recorded or re-raised
             if on_error == "raise":
                 raise
@@ -510,6 +520,10 @@ def _device_payloads(
         raise ArrayError(f"decode={decode!r}; expected 'auto', 'host' or 'device'")
     _xp._gpu()  # the extension, or the install hint
     from zarr_vectors.gpu import _read as device_read
+    from zarr_vectors.gpu._readers import served_by_store
+
+    if not served_by_store(level_group, keys):
+        return {}
 
     coords_of = dict(zip(keys, cc.tolist()))
     items, names = [], []

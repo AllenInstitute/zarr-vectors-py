@@ -139,3 +139,77 @@ def test_a_sharded_zarr_arrays_chunks_decode_from_their_stored_ranges(tmp_path):
         want = data[z * 16:(z + 1) * 16, y * 16:(y + 1) * 16, x * 16:(x + 1) * 16]
         got = o.view(cupy.uint16).reshape(16, 16, 16).get()
         np.testing.assert_array_equal(got, want)
+
+
+# Content checksums (zstd checksum=True) --------------------------------
+
+
+def _summed(raw):
+    return [
+        cupy.asarray(np.frombuffer(Zstd(level=3, checksum=True).encode(r), np.uint8))
+        for r in raw
+    ]
+
+
+def test_xxh64_matches_the_reference():
+    from zarr_vectors.gpu import _kernels
+
+    # Published XXH64 values, seed 0.
+    known = {b"": 0xEF46DB3751D8E999, b"a": 0xD24EC4F1A98C6E5B, b"abc": 0x44BC2CF5AD770999}
+    bufs = [cupy.asarray(np.frombuffer(k, np.uint8)) if k else cupy.empty(0, cupy.uint8)
+            for k in known]
+    got = _kernels.xxh64(
+        cupy.asarray(np.array([b.data.ptr for b in bufs], np.uint64)),
+        cupy.asarray(np.array([b.size for b in bufs], np.int64)),
+    )
+    assert got.tolist() == list(known.values())
+
+
+def test_every_length_and_alignment_checks_against_zstds_checksum():
+    rng = np.random.default_rng(5)
+    raw = [rng.integers(0, 9, n, dtype=np.uint8).tobytes()
+           for n in [*range(0, 70), 255, 256, 4097, 200_003]]
+    outputs, errors = decode_zstd(_summed(raw))
+    assert errors == {}
+    assert [o.get().tobytes() for o in outputs] == raw
+    # Into buffers at odd addresses: the hash reads them byte by byte.
+    # (Not an empty one: nvCOMP refuses its null address.)
+    raw = raw[1:]
+    big = cupy.empty(sum(len(r) + 1 for r in raw) + 1, cupy.uint8)
+    out, at = [], 1
+    for r in raw:
+        out.append(big[at:at + len(r)])
+        at += len(r) + 1
+    outputs, errors = decode_zstd(_summed(raw), out=out)
+    assert errors == {} and [o.get().tobytes() for o in outputs] == raw
+
+
+def _flip(frame, at):
+    host = frame.get()
+    host[at] ^= 0x40
+    return cupy.asarray(host)
+
+
+def test_wrong_bytes_are_caught_by_the_content_checksum():
+    rng = np.random.default_rng(6)
+    noise = rng.integers(0, 256, 3000, dtype=np.uint8).tobytes()   # a raw block
+    raw = [noise, b"abc" * 500, noise[:1000]]
+    frames = _summed(raw)
+    frames[0] = _flip(frames[0], frames[0].size - 4 - 100)   # inside the raw block
+    frames[2] = _flip(frames[2], frames[2].size - 1)         # in the checksum itself
+    for f in (frames[0], frames[2]):
+        with pytest.raises(RuntimeError, match="checksum"):
+            Zstd().decode(f.get().tobytes())                  # the host agrees
+    outputs, errors = decode_zstd(frames)
+    assert set(errors) == {0, 2} and all("checksum" in errors[j] for j in (0, 2))
+    assert outputs[0] is None and outputs[2] is None
+    assert outputs[1].get().tobytes() == raw[1]
+
+
+def test_frames_without_a_checksum_are_not_checked():
+    rng = np.random.default_rng(7)
+    noise = rng.integers(0, 256, 3000, dtype=np.uint8).tobytes()
+    frame = _flip(_frames([noise])[0], 200)
+    outputs, errors = decode_zstd([frame])
+    assert errors == {}   # undetectable without one: why checksum=True is worth it
+    assert outputs[0].get().tobytes() != noise

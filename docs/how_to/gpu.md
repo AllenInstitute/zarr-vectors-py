@@ -60,8 +60,10 @@ col.cell      # the cell index of every row
 ```
 
 `zb.read_cells(lg, cells, arrays, device="cuda")` reads any list of cells the
-same way. Pass `fragments=True` to get each cell's fragment index too, as
-`batch.fragments`. The result equals the host result, element for element.
+same way. Pass `fragments=True` to get each cell's vertex fragment index too,
+as `batch.fragments`; the `vertex_fragments` cells are decoded on the device
+under the same `decode=` rule as the other arrays. The result equals the host
+result, element for element, errors included.
 
 `decode=` chooses where cells are decoded:
 
@@ -74,16 +76,41 @@ same way. Pass `fragments=True` to get each cell's fragment index too, as
 Use `decode="device"` only on stores you trust. nvCOMP does not check the
 inside of a compressed block, and damaged data can kill the CUDA context.
 
+A store can also carry a content checksum in every zstd frame:
+
+```python
+root = zb.create_store(path, bounds=..., chunk_shape=...,
+                       compressor=[{"name": "zstd",
+                                    "configuration": {"level": 3, "checksum": True}}])
+```
+
+The checksum is part of the zstd frame format, so every zstd reader reads
+these frames, and the codec's `checksum` setting is part of the Zarr v3 zstd
+codec. The host decoder verifies it, and so does the device decoder (after
+nvCOMP, one GPU thread per cell): a cell whose decoded bytes do not match is
+an error, not data. A checksum catches wrong bytes only. It cannot stop
+nvCOMP from hanging or crashing on a damaged block, because it is checked
+after decompression. The rule for `decode="device"` still holds. Stores
+written without checksums are unchanged and read as before.
+
 Local files are read into pinned host memory and copied up once. When cuFile
 reports GPUDirect Storage, kvikio reads them straight into device memory.
 `io="kvikio"` or `io="host"` forces the choice for one call, and
 `ZARR_VECTORS_GPU_IO` for every call. `batch.io` records which path each
 array took.
 
-Other readers take `device=` too, such as `read_chunk_vertex_buffer` and
-`read_link_arrays`. They decode on the host and copy each array up once, as
-does `ReadResult.to_device("cuda")`. To decode zstd frames you fetched
-yourself, use `zarr_vectors.gpu.decode_zstd`.
+Other readers take `device=` too. `read_chunk_vertex_buffer`,
+`read_chunk_vertex_rows` (fragments gathered on the device),
+`read_chunk_fragment_attributes` and `read_link_attributes` read through
+`read_cells`' device path with `decode="auto"`. Where the device path could
+answer differently (a `dtype=` other than the stored one, a cell off the
+grid, a fragment that points outside its buffer, a read error), they run the
+host reader instead, so results and errors are the host's. The rest, such
+as `read_chunk_attribute_rows` and `read_link_arrays`, decode on the host and
+copy each array up once, as does `ReadResult.to_device("cuda")`. Inside a
+shard transaction or an offline session, and for a composite level's cells
+of another store, every read decodes on the host. To decode zstd frames you
+fetched yourself, use `zarr_vectors.gpu.decode_zstd`.
 
 ## Write from arrays
 

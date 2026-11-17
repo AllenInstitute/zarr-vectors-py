@@ -132,7 +132,9 @@ A blob is well formed when:
 
 `decode_fragments` raises `ArrayError` for a bad magic, version or flags,
 for `R > F`, and for a blob too short for its sections. It does not recount
-the bitmap against `R`.
+the bitmap against `R`. `read_cells(fragments=True)` also checks rules 2
+and 4 (`check_fragment_index`), on the host and on the device alike, and
+records a cell that fails any of these as an error with no fragments.
 
 [L1](../validation/l1_structural.md) warns when a level has no
 `vertex_fragments/`. [L3](../validation/l3_consistency.md) reports a

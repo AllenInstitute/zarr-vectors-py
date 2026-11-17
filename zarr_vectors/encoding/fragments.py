@@ -709,31 +709,64 @@ class ChunkFragmentIndex:
         return prefix
 
 
+def fragment_index_problem(
+    code: int, *, nbytes: int = 0, magic: int = 0, version: int = 0,
+    flags: int = 0, num_fragments: int = 0, num_ranges: int = 0,
+) -> str:
+    """Why a fragment-index blob is malformed, by problem ``code``.
+
+    Codes 20-28 are what :func:`decode_fragments` rejects; 29 and 30 are
+    validation rules 2 and 4 of the spec (``fragment_index_arrays.md``),
+    which :func:`check_fragment_index` checks. The device decoder
+    (``zarr_vectors.gpu``) reports the same codes, so both paths give the
+    same message.
+    """
+    messages = {
+        20: f"Fragment-index blob too short: {nbytes} < {_HEADER_BYTES}",
+        21: (f"Bad fragment-index magic: got 0x{magic:08X}, "
+             f"want 0x{FRAGMENT_INDEX_MAGIC:08X}"),
+        22: (f"Unsupported fragment-index version {version}; "
+             f"this code reads version {FRAGMENT_INDEX_VERSION}"),
+        23: f"Unsupported fragment-index flags 0x{flags:04X}; expected 0",
+        24: f"num_range_fragments {num_ranges} exceeds num_fragments {num_fragments}",
+        25: "Fragment-index blob truncated in bitmap region",
+        26: "Fragment-index blob truncated in range table",
+        27: "Fragment-index blob truncated in CSR offsets",
+        28: "Fragment-index blob truncated in CSR indices",
+        29: (f"Fragment-index range bitmap does not have num_range_fragments "
+             f"({num_ranges}) bits set"),
+        30: "Fragment-index explicit offsets do not start at 0 and never decrease",
+    }
+    return messages[code]
+
+
+def check_fragment_index(fi: ChunkFragmentIndex) -> None:
+    """Raise :class:`ArrayError` unless ``fi`` meets validation rules 2
+    and 4: its bitmap has ``R`` bits set, and its explicit offsets start
+    at 0 and never decrease. :meth:`ChunkFragmentIndex.flat` needs both."""
+    f = fi.num_fragments
+    bits = int(np.unpackbits(fi._bitmap, bitorder="little")[:f].sum()) if f else 0
+    r = int(fi._range_table.shape[0])
+    if bits != r:
+        raise ArrayError(fragment_index_problem(29, num_ranges=r))
+    offsets = fi._csr_offsets
+    if f and (int(offsets[0]) != 0 or bool(np.any(offsets[1:] < offsets[:-1]))):
+        raise ArrayError(fragment_index_problem(30))
+
+
 def decode_fragments(raw: bytes) -> ChunkFragmentIndex:
     """Parse a v1 fragment-index blob into a :class:`ChunkFragmentIndex`."""
     if len(raw) < _HEADER_BYTES:
-        raise ArrayError(
-            f"Fragment-index blob too short: {len(raw)} < {_HEADER_BYTES}",
-        )
+        raise ArrayError(fragment_index_problem(20, nbytes=len(raw)))
     magic, version, flags, f, r = _HEADER_STRUCT.unpack_from(raw, 0)
     if magic != FRAGMENT_INDEX_MAGIC:
-        raise ArrayError(
-            f"Bad fragment-index magic: got 0x{magic:08X}, "
-            f"want 0x{FRAGMENT_INDEX_MAGIC:08X}",
-        )
+        raise ArrayError(fragment_index_problem(21, magic=magic))
     if version != FRAGMENT_INDEX_VERSION:
-        raise ArrayError(
-            f"Unsupported fragment-index version {version}; "
-            f"this code reads version {FRAGMENT_INDEX_VERSION}",
-        )
+        raise ArrayError(fragment_index_problem(22, version=version))
     if flags != 0:
-        raise ArrayError(
-            f"Unsupported fragment-index flags 0x{flags:04X}; expected 0",
-        )
+        raise ArrayError(fragment_index_problem(23, flags=flags))
     if r > f:
-        raise ArrayError(
-            f"num_range_fragments {r} exceeds num_fragments {f}",
-        )
+        raise ArrayError(fragment_index_problem(24, num_fragments=f, num_ranges=r))
 
     if f == 0:
         return ChunkFragmentIndex(
@@ -749,9 +782,7 @@ def decode_fragments(raw: bytes) -> ChunkFragmentIndex:
     bitmap_raw_bytes = (f + 7) // 8
     bitmap_padded = _bitmap_padded_length(f)
     if len(raw) < offset + bitmap_padded:
-        raise ArrayError(
-            "Fragment-index blob truncated in bitmap region",
-        )
+        raise ArrayError(fragment_index_problem(25))
     # Copy out the unpadded portion as our canonical bitmap.  Copying
     # is cheap (≤ ceil(F/8) bytes) and avoids retaining the whole input
     # buffer just for a tiny view.
@@ -762,9 +793,7 @@ def decode_fragments(raw: bytes) -> ChunkFragmentIndex:
 
     range_table_bytes = r * 16
     if len(raw) < offset + range_table_bytes:
-        raise ArrayError(
-            "Fragment-index blob truncated in range table",
-        )
+        raise ArrayError(fragment_index_problem(26))
     range_table = np.frombuffer(
         raw, dtype=np.int64, count=r * 2, offset=offset,
     ).reshape(r, 2).copy()
@@ -773,9 +802,7 @@ def decode_fragments(raw: bytes) -> ChunkFragmentIndex:
     e = f - r
     csr_offsets_bytes = (e + 1) * 4
     if len(raw) < offset + csr_offsets_bytes:
-        raise ArrayError(
-            "Fragment-index blob truncated in CSR offsets",
-        )
+        raise ArrayError(fragment_index_problem(27))
     csr_offsets = np.frombuffer(
         raw, dtype=np.uint32, count=e + 1, offset=offset,
     ).copy()
@@ -784,9 +811,7 @@ def decode_fragments(raw: bytes) -> ChunkFragmentIndex:
     t = int(csr_offsets[e]) if e > 0 else 0
     csr_indices_bytes = t * 8
     if len(raw) < offset + csr_indices_bytes:
-        raise ArrayError(
-            "Fragment-index blob truncated in CSR indices",
-        )
+        raise ArrayError(fragment_index_problem(28))
     csr_indices = np.frombuffer(
         raw, dtype=np.int64, count=t, offset=offset,
     ).copy()
