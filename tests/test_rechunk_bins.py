@@ -217,3 +217,59 @@ def test_categorical_values_are_listed_in_bin_order(tmp_path, categorical):
     for value in (1, 2, 3):
         got = read_points(str(out), attribute_filter={"cluster": value})
         assert _rows(got["positions"]) == _rows(pos[labels == value])
+
+
+# --- the leading axis and the filter key share one name ---------------------
+
+
+@pytest.mark.parametrize(
+    ("spec", "name"),
+    [
+        (RechunkSpec(by="attribute:cluster"), "cluster"),
+        (RechunkSpec(by="attribute:cluster", prefix_dim_name="kind"), "kind"),
+        (RechunkSpec(by="object_id"), "object_id"),
+        (RechunkSpec(by="group"), "group"),
+    ],
+)
+def test_chunk_dims_and_chunk_attribute_name_agree(tmp_path, spec, name):
+    """``by="attribute:x"`` recorded ``x`` as the filter key but named the
+    axis ``attribute``; both are now the same name, and it selects bins."""
+    pos = np.array([[5, 5, 5], [60, 5, 5], [5, 60, 5], [60, 60, 5]], "float32")
+    labels = np.array([3, 1, 3, 2])
+    src = str(tmp_path / "src.zarrvectors")
+    write_points(
+        src, pos, chunk_shape=_CHUNK, object_ids=np.arange(4),
+        object_attributes={"cluster": labels}, groups={0: [0, 2], 1: [1, 3]},
+    )
+    out = tmp_path / "out.zarrvectors"
+
+    summary = rechunk(src, spec, output=str(out))
+
+    lm = _level_meta(out)
+    assert lm.chunk_dims[0] == lm.chunk_attribute_name == name
+    assert summary["rechunk_dims"][0] == name
+    label = lm.chunk_attribute_values[0]
+    got = read_points(str(out), attribute_filter={name: label})
+    assert len(got["positions"]) > 0
+
+
+def test_by_spatial_writes_no_leading_axis(tmp_path):
+    """``by="spatial"`` delegates to rechunk_spatial: rank-3 keys, no labels."""
+    pos = np.array([[5, 5, 5], [60, 5, 5], [5, 60, 5], [60, 60, 5]], "float32")
+    src = str(tmp_path / "src.zarrvectors")
+    write_points(src, pos, chunk_shape=_CHUNK, object_ids=np.arange(4))
+    out = tmp_path / "out.zarrvectors"
+
+    summary = rechunk(
+        src, RechunkSpec(by="spatial", spatial_chunk_shape=(100.0,) * 3),
+        output=str(out),
+    )
+
+    lm = _level_meta(out)
+    assert lm.chunk_attribute_name is None
+    assert lm.chunk_attribute_values is None
+    assert lm.chunk_dims is None or "spatial" not in lm.chunk_dims
+    assert len(summary["rechunk_dims"]) == 3
+    lg = get_resolution_level(open_store(str(out)), 0)
+    assert all(len(k) == 3 for k in lg.list_chunk_coords("vertices"))
+    assert _rows(read_points(str(out))["positions"]) == _rows(pos)

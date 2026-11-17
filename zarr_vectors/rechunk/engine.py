@@ -275,10 +275,9 @@ def rechunk(
     chunk_attribute_name: str | None = None
     chunk_attribute_values: list[Any] | None = None
     if obj_to_bin and spec.by != "spatial":
-        chunk_attribute_name = (
-            spec.by.split(":", 1)[1] if spec.by.startswith("attribute:")
-            else spec.dimension_name
-        )
+        # The same name as chunk_dims[0]: the leading axis is the bin
+        # axis, and a reader's attribute_filter keys on this name.
+        chunk_attribute_name = spec.dimension_name
         chunk_attribute_values = [mapper.labels[old] for old in used]
 
     # Create level 0

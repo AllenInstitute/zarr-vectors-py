@@ -111,7 +111,9 @@ writes chunk keys `(bin, x, y, z)`:
 | `"spatial"` | No leading axis: `rechunk_spatial` to `spatial_chunk_shape` |
 
 `spatial_chunk_shape` sets the output `chunk_shape`. `prefix_dim_name`
-names the leading axis (by default the part of `by` before `:`).
+names the leading axis, recorded as both `chunk_dims[0]` and
+`chunk_attribute_name` (by default the attribute's name for
+`"attribute:<name>"`, otherwise `by`).
 `rechunk_by_attribute(store, name)` is `rechunk` with
 `RechunkSpec(by="attribute:<name>", categorical=True, prefix_dim_name=name)`.
 Bin order and labels are listed in

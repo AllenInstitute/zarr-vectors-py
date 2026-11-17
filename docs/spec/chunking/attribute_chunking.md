@@ -149,8 +149,9 @@ The label is the value `attribute_filter` names:
 A bin cut by edges spans `[edges[i], edges[i + 1])`. Values below the
 first edge fall in the first bin and the last bin is open above:
 `bins=[0, 30, 80, inf]` puts 45 in the bin labelled `30`.
-`chunk_attribute_name` is the attribute's name, or `group`, `object_id`
-or `prefix_dim_name`. `by="spatial"` records no labels.
+`chunk_attribute_name` and `chunk_dims[0]` are the same name:
+`prefix_dim_name` when it is set, otherwise the attribute's name, `group`
+or `object_id`. `by="spatial"` records no labels.
 
 ### Pyramids
 

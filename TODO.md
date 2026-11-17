@@ -55,18 +55,11 @@ or only in narrow cases; 4 is a recorded constraint; 5 is housekeeping.
 
 **Severity: low.**
 
-- **`by="spatial"`** still writes a pointless extent-1 leading axis with
-  `chunk_dims[0] == "spatial"`, and records no labels. `rechunk_spatial`
-  (`rechunk/spatial.py:355`) does the spatial job losslessly; decide whether
-  `by="spatial"` should delegate to it or be removed.
 - **Object ids are renumbered** by a running counter in bin order, so they
   no longer join back to the source, and object attributes are not
   copied. Links are never copied either, so only a point cloud survives a
   non-spatial rechunk intact (see the module docstring of
   `rechunk/spatial.py`).
-- **`chunk_attribute_name` vs `chunk_dims[0]`** disagree for an explicit
-  `RechunkSpec(by="attribute:x")` without `prefix_dim_name`: the name is `x`,
-  the axis is `attribute`.
 
 ---
 
