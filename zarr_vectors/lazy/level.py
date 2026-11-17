@@ -9,7 +9,7 @@ import numpy as np
 import numpy.typing as npt
 
 from zarr_vectors.constants import VERTEX_ATTRIBUTES
-from zarr_vectors.core.arrays import list_chunk_keys
+from zarr_vectors.core.arrays import list_chunk_keys, vertices_dtype
 from zarr_vectors.core.metadata import LevelMetadata, RootMetadata
 from zarr_vectors.core.store import FsGroup
 from zarr_vectors.lazy.arrays import ZVAttributeCollection, ZVObjectIndex, ZVVertexCollection
@@ -259,7 +259,7 @@ class ZVLevel:
                 level_group=self._group,
                 chunk_keys=self.chunk_keys,
                 ndim=self._root_meta.sid_ndim,
-                dtype="float32",
+                dtype=vertices_dtype(self._group),
                 vertex_count=self.vertex_count,
             )
         return self._vertices_cache

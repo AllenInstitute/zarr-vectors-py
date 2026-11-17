@@ -213,15 +213,18 @@ class ZVWriter:
     ) -> None:
         """Per-face attribute on a mesh level.
 
-        Stored under ``face_attributes/<name>/<chunk_key>``.  Faces are
-        aligned 1:1 with the intra-chunk links array — values for a
-        chunk's ``F_local`` faces appear in the same order as the
-        decoded ``links/<chunk_key>``.
+        A face is a ``link_width=3`` record of the ``links/0/`` family, so
+        its attribute is stored where every per-record attribute is, in
+        ``link_attributes/<name>/0/<offsets>/`` -- the same layout
+        :func:`~zarr_vectors.types.graphs.write_graph` writes for
+        ``link_attributes=``.  Read it back with
+        :func:`~zarr_vectors.core.arrays.read_link_attributes`.
 
-        Note: faces whose vertices span chunks are just ``link_width=3``
-        records at non-zero offsets in the merged ``links/<delta>/<offsets>/``
-        family; per-face attributes for those records use the parallel
-        ``link_attributes/<name>/<delta>/<offsets>/`` array.
+        ``values`` holds one row per face (intra-chunk and cross-chunk
+        alike), in the order :func:`~zarr_vectors.core.arrays.read_links`
+        returns the records for ``delta=0``.  A ``store="duplicate"``
+        family is refused (its rows cannot be aligned without the link
+        writer's partition).
         """
         await self._write_per_face_attribute(
             name=name, values=values, dtype=dtype,
@@ -379,70 +382,45 @@ class ZVWriter:
         values: npt.NDArray,
         dtype: str | np.dtype | None,
     ) -> None:
-        # Face attributes are aligned with the intra-chunk links/faces.
-        # The number of faces per chunk is the row count of links/<cc>.
-        # We read each chunk's links via `read_chunk_links` to discover
-        # the size, then slice and write.
-        from zarr_vectors.core.arrays import (
-            read_chunk_links,
-        )
+        # A mesh face is a ``link_width=3`` record of the ``links/0/``
+        # family, and per-record data lives in the parallel
+        # ``link_attributes/<name>/0/<offsets>/`` arrays -- the layout
+        # ``write_graph(link_attributes=...)`` writes and
+        # ``read_link_attributes`` reads.  This used to write a
+        # ``face_attributes/<name>`` tree instead: no reader knew it, and
+        # it was created as a group, so the first cell write raised.
+        from zarr_vectors.core.arrays import read_links, write_link_attributes
+        from zarr_vectors.core.paths import links_group_path
 
         arr = np.asarray(values)
         if dtype is not None:
             arr = arr.astype(np.dtype(dtype), copy=False)
-
-        chunk_keys = await asyncio.to_thread(list_chunk_keys, self._group)
-
-        # Phase 1: per-chunk face counts, read in one thread.  Fanned out,
-        # each read opened its own prefetch, and those raced on the
-        # level's one prefetch slot.
-        def _counts() -> list[int]:
-            counts: list[int] = []
-            for cc in chunk_keys:
-                try:
-                    # delta=0: face counts come from intra-level links only.
-                    groups = read_chunk_links(self._group, cc, np.int64, delta=0)
-                except Exception:
-                    counts.append(0)
-                    continue
-                counts.append(sum(int(g.shape[0]) for g in groups))
-            return counts
-
-        per_chunk_counts = await asyncio.to_thread(_counts)
-        total_faces = sum(per_chunk_counts)
-        if arr.shape[0] != total_faces:
+        if arr.ndim < 1:
             raise ArrayError(
-                f"add_face_attribute({name!r}): values length "
-                f"{arr.shape[0]} != total intra-chunk face count "
-                f"{total_faces}"
+                f"face attribute values must be at least 1D; got shape {arr.shape}"
             )
+        group = self._group
 
-        # Phase 2: write slices in parallel.
-        cursor = 0
-        slices: list[tuple[ChunkCoords, npt.NDArray]] = []
-        for cc, count in zip(chunk_keys, per_chunk_counts):
-            if count == 0:
-                continue
-            slices.append((cc, arr[cursor:cursor + count]))
-            cursor += count
+        def _write() -> None:
+            fam_meta = group.read_array_meta(links_group_path(0)) or {}
+            if not fam_meta:
+                raise ArrayError(
+                    f"add_face_attribute({name!r}): level has no links/0 "
+                    f"family (no faces to attach values to)"
+                )
+            num_links = fam_meta.get("num_links")
+            if num_links is None:
+                num_links = len(read_links(group, delta=0))
+            num_links = int(num_links)
+            if arr.shape[0] != num_links:
+                raise ArrayError(
+                    f"add_face_attribute({name!r}): values length "
+                    f"{arr.shape[0]} != face count {num_links}"
+                )
+            write_link_attributes(group, name, arr, num_links=num_links, delta=0)
 
-        # Pre-create the parent face_attributes/<name> group to avoid
-        # concurrent require_group races during parallel writes.
-        await asyncio.to_thread(
-            self._group.require_group, f"face_attributes/{name}"
-        )
-
-        async def _write_one(cc: ChunkCoords, sub: npt.NDArray) -> None:
-            # One face attribute group per chunk; faces live in a single
-            # logical group per chunk in mesh stores today.
-            await asyncio.to_thread(
-                _write_custom_subpath,
-                self._group, "face_attributes", name, cc, [sub], arr.dtype,
-            )
-
-        await asyncio.gather(*(_write_one(cc, sub) for cc, sub in slices))
-
-        await asyncio.to_thread(self._touch_arrays_present, "face_attributes")
+        await asyncio.to_thread(_write)
+        await asyncio.to_thread(self._touch_arrays_present, "link_attributes")
 
     def _touch_arrays_present(self, entry: str) -> None:
         """Add ``entry`` to the level's ``arrays_present`` if missing."""
@@ -462,6 +440,7 @@ class ZVWriter:
         *,
         object_ids: npt.NDArray | None = None,
         dtype: str | np.dtype | None = None,
+        chunk_attribute: npt.ArrayLike | None = None,
     ) -> dict:
         """Append new vertices (and new objects) to this level.
 
@@ -480,6 +459,12 @@ class ZVWriter:
                 conflict with existing objects).  Defaults to a
                 contiguous range starting at the current count.
             dtype: Vertex dtype.  Defaults to the level's recorded dtype.
+            chunk_attribute: ``(N,)`` per-vertex values of the level's
+                ``chunk_attribute_name``.  Required on an attribute-chunked
+                level (it picks each vertex's leading bin) and refused on
+                any other.  Every value must already be one of the
+                level's ``chunk_attribute_values``: a new value would need
+                a new bin, which an append cannot add.
 
         Returns:
             Summary dict with ``vertices_added``, ``new_objects``,
@@ -526,10 +511,29 @@ class ZVWriter:
                     f"(min={int(object_ids.min())}, existing_num={existing_num})"
                 )
 
-        # Spatial assignment (per-vertex → chunk).
-        chunk_assignments = await asyncio.to_thread(
-            assign_chunks, positions, root_meta.chunk_shape,
-        )
+        # Leading attribute bin per vertex, or None on a spatial level.
+        # Resolved before anything is written so a bad call leaves the
+        # level untouched.
+        bins = self._append_bins(chunk_attribute, n_new, ndim)
+
+        # Spatial assignment (per-vertex → chunk), on the LEVEL's grid
+        # (a level may override the root chunk_shape).  On an
+        # attribute-chunked level every key leads with the bin, as the
+        # level's arrays do.
+        chunk_shape = tuple(self._level.chunk_shape)
+        if bins is None:
+            chunk_assignments = await asyncio.to_thread(
+                assign_chunks, positions, chunk_shape,
+            )
+        else:
+            chunk_assignments = {}
+            for b in np.unique(bins):
+                sel = np.flatnonzero(bins == b)
+                spatial = await asyncio.to_thread(
+                    assign_chunks, positions[sel], chunk_shape,
+                )
+                for cc, idx in spatial.items():
+                    chunk_assignments[(int(b), *cc)] = sel[idx]
 
         # Read every touched chunk's existing groups first, in one thread
         # under one prefetch (a new chunk reads as empty).  Reading inside
@@ -612,6 +616,61 @@ class ZVWriter:
             "new_objects": len(new_oids),
             "chunks_touched": len(results),
         }
+
+    def _append_bins(
+        self, chunk_attribute: npt.ArrayLike | None, n_new: int, ndim: int,
+    ) -> npt.NDArray[np.int64] | None:
+        """Leading-bin index per appended vertex (``None``: spatial level)."""
+        level = self._level
+        attr_name = level.chunk_attribute_name
+        dims = level.chunk_dims
+        n_leading = (len(dims) - ndim) if dims else 0
+        if attr_name is None:
+            if n_leading:
+                raise ArrayError(
+                    f"append_vertices: level chunk keys carry {n_leading} "
+                    f"non-spatial leading axes ({list(dims)[:n_leading]}) "
+                    f"that are not an attribute bin; appending to it is "
+                    f"not supported"
+                )
+            if chunk_attribute is not None:
+                raise ArrayError(
+                    "append_vertices: chunk_attribute= given but the level "
+                    "is not attribute-chunked"
+                )
+            return None
+        labels = level.attribute_values
+        if n_leading != 1 or not labels:
+            raise ArrayError(
+                f"append_vertices: attribute-chunked level "
+                f"({attr_name!r}) has inconsistent metadata "
+                f"(chunk_dims={dims}, chunk_attribute_values={labels})"
+            )
+        if chunk_attribute is None:
+            raise ArrayError(
+                f"append_vertices: level is chunked by attribute "
+                f"{attr_name!r}; pass chunk_attribute= with one value per "
+                f"vertex to place the new vertices"
+            )
+        vals = np.asarray(chunk_attribute)
+        if vals.shape != (n_new,):
+            raise ArrayError(
+                f"chunk_attribute shape {vals.shape} != (N,) = ({n_new},)"
+            )
+        lookup = {lab: i for i, lab in enumerate(labels)}
+        bins = np.empty(n_new, dtype=np.int64)
+        for i, v in enumerate(vals.tolist()):
+            if isinstance(v, bytes):
+                v = v.decode()
+            try:
+                bins[i] = lookup[v]
+            except (KeyError, TypeError):
+                raise ArrayError(
+                    f"append_vertices: chunk_attribute value {v!r} is not "
+                    f"one of the level's {attr_name!r} bins {labels}; an "
+                    f"append cannot add a bin"
+                ) from None
+        return bins
 
     def _current_num_objects(self) -> int:
         """Inspect existing object_index for total count."""
@@ -745,9 +804,11 @@ class ZVWriter:
         *,
         object_ids: npt.NDArray | None = None,
         dtype: str | np.dtype | None = None,
+        chunk_attribute: npt.ArrayLike | None = None,
     ) -> dict:
         return _run(self.append_vertices(
             positions, object_ids=object_ids, dtype=dtype,
+            chunk_attribute=chunk_attribute,
         ))
 
     def commit_sync(self) -> dict:
@@ -796,7 +857,7 @@ def _write_custom_subpath(
     """Write attribute bytes to ``<subpath>/<name>/<chunk_key>``.
 
     Mirrors :func:`write_chunk_attributes` but with a configurable
-    top-level subpath (e.g. ``"face_attributes"``).  Per-group byte
+    top-level subpath.  Per-group byte
     offsets are derived at read time from the parallel
     ``vertex_fragments`` table; no ``_offsets`` sibling is
     written.
