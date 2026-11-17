@@ -13,12 +13,22 @@ before its rename, so the crash guarantee is unchanged; what changes is that
 the fsyncs no longer interleave with the writes, which on slow-fsync
 filesystems (rotational disks, FUSE such as ntfs-3g) is several times faster. Local filesystems only:
 on an object store a returned PUT is already durable, on icechunk the commit.
+
+Three durability levels (``durable=``): ``False`` (atomic, never fsynced),
+``True`` (every object fsynced before its rename; the block returns with
+everything on disk) and ``"deferred"`` (atomic like ``False``, with the
+caller taking responsibility for durability later, once, through
+:func:`sync_store`: one ``syncfs`` of the store's filesystem covering every
+write of every process since). ``"deferred"`` is for callers that write
+many objects from many tasks and only need them durable at a checkpoint of
+their own, such as the end of a stage.
 """
 
 from __future__ import annotations
 
 import asyncio
 import os
+import sys
 import threading
 import uuid
 from collections.abc import Iterable
@@ -26,6 +36,80 @@ from pathlib import Path
 from typing import Any
 
 from zarr.storage import LocalStore, WrapperStore
+
+
+#: ``durable=`` value: atomic writes, made durable later by :func:`sync_store`.
+DEFERRED = "deferred"
+
+
+def fsyncs(durable: Any) -> bool:
+    """Whether a ``durable=`` value fsyncs as it writes; validates it.
+
+    ``True`` does; ``False``/``None`` and ``"deferred"`` do not (``"deferred"``
+    leaves durability to a later :func:`sync_store`).
+    """
+    if durable is True or durable is False or durable is None:
+        return bool(durable)
+    if durable == DEFERRED:
+        return False
+    raise ValueError(f"durable={durable!r}; expected True, False or {DEFERRED!r}")
+
+
+def sync_store(target: Any) -> str:
+    """Make every write already made to a local store durable, by any process.
+
+    ``target`` is a store path, a zarr-vectors root or level :class:`Group`,
+    or a zarr ``LocalStore``. On Linux this is one ``syncfs(2)`` of the
+    filesystem holding the store: file data, metadata and directory entries
+    written before the call, by this or any other process on this host, are
+    on stable storage when it returns. Elsewhere it falls back to
+    ``os.sync()``. A store that is not on a local filesystem needs nothing
+    (an object store's returned PUT already is durable).
+
+    Returns what it did: ``"syncfs"``, ``"sync"`` or ``"none"``.
+
+    Note that a write made on another host (a network filesystem) is only
+    covered once that host has closed the file; NFS clients flush on close.
+    """
+    root = _local_root(target)
+    if root is None:
+        return "none"
+    if sys.platform.startswith("linux"):
+        import ctypes
+        import ctypes.util
+
+        libc = ctypes.CDLL(ctypes.util.find_library("c") or "libc.so.6", use_errno=True)
+        fd = os.open(root, os.O_RDONLY)
+        try:
+            if libc.syncfs(fd) != 0:
+                err = ctypes.get_errno()
+                raise OSError(err, f"syncfs({root!r}) failed: {os.strerror(err)}")
+        finally:
+            os.close(fd)
+        return "syncfs"
+    os.sync()
+    return "sync"
+
+
+def _local_root(target: Any) -> str | None:
+    """The local directory behind ``target``, or None when it is not local."""
+    if isinstance(target, (str, os.PathLike)):
+        p = os.fspath(target)
+        if "://" in p and not p.startswith("file://"):
+            return None
+        p = p[len("file://"):] if p.startswith("file://") else p
+        return p if os.path.isdir(p) else None
+    store = getattr(target, "store", None)          # a zarr Group
+    zgroup = getattr(target, "zarr_group", None)   # a zarr-vectors Group
+    if zgroup is not None:
+        store = zgroup.store
+    if store is None:
+        store = target
+    while isinstance(store, WrapperStore):
+        store = store._store
+    if isinstance(store, LocalStore):
+        return str(store.root)
+    return None
 
 
 class Touched:

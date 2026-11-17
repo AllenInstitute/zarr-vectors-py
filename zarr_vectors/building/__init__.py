@@ -495,6 +495,20 @@ def is_dense_index(level_group: Group) -> bool:
     return dense.is_dense(level_group)
 
 
+def sync_store(target: Any) -> str:
+    """Make every write already made to a local store durable (one ``syncfs``).
+
+    The checkpoint for ``durable="deferred"`` writes
+    (:func:`shard_transaction`, :func:`batched_writes`): covers every file and
+    directory written to the store's filesystem by any process on this host
+    before the call. Returns ``"syncfs"``, ``"sync"`` (non-Linux fallback) or
+    ``"none"`` (not a local store). See :func:`zarr_vectors.core._durable.sync_store`.
+    """
+    from zarr_vectors.core._durable import sync_store as _sync_store
+
+    return _sync_store(target)
+
+
 def cell_objects(
     level_group: Group, array_name: str, chunk_coords: Iterable[Any],
 ) -> list[str]:
@@ -634,7 +648,7 @@ def shard_transaction(
     *,
     arrays: Iterable[str] | None = None,
     mode: str = "replace",
-    durable: bool = True,
+    durable: bool | str = True,
     io_threads: int | None = None,
     sweep: bool = True,
 ) -> Any:
@@ -645,9 +659,12 @@ def shard_transaction(
     array), else :class:`~zarr_vectors.exceptions.ShardOwnershipError`.
     ``mode="replace"`` rebuilds each owned shard from the staged cells alone
     (unwritten owned cells read empty); ``"merge"`` merges into what is stored.
-    On exit each changed shard is written as a ``.partial`` (fsynced if
-    ``durable``, from ``io_threads`` threads) and renamed into place once all
-    are written; an exception publishes nothing. Atomic per object: after a
+    On exit each changed shard is written as a ``.partial`` (from
+    ``io_threads`` threads) and renamed into place once all are written; an
+    exception publishes nothing. ``durable=True`` fsyncs every partial (all
+    together, after the writes) before the renames, then the directories;
+    ``durable="deferred"`` does not, leaving it to a later
+    :func:`sync_store`. Atomic per object: after a
     crash, re-running the task converges. Needs presence deferred
     (:func:`defer_presence`) and every array allocated and sharded first;
     writes no metadata (``tx.written`` feeds :func:`set_presence`). ``sweep``
@@ -1343,6 +1360,7 @@ __all__ = [
     "chunks_intersecting_bbox",
     "commit",
     "cell_objects",
+    "sync_store",
     "commit_object_index",
     "compute_bin_ratio",
     "compute_bin_shape",
