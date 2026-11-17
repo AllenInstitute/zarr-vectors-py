@@ -38,13 +38,14 @@ from __future__ import annotations
 import asyncio
 import os
 import threading
+from collections.abc import Mapping
 from typing import TYPE_CHECKING
 
 import numpy as np
 import numpy.typing as npt
 from zarr.core.sync import sync
 
-from zarr_vectors.constants import VERTEX_FRAGMENTS, VERTICES
+from zarr_vectors.constants import VERTEX_ATTRIBUTES, VERTEX_FRAGMENTS, VERTICES
 from zarr_vectors.core.arrays import (
     _chunk_key,
     _maybe_batched_reads,
@@ -52,6 +53,7 @@ from zarr_vectors.core.arrays import (
     object_count,
     patch_object_manifests,
     read_all_object_manifests,
+    read_chunk_attributes,
     read_chunk_vertices,
     vertices_dtype,
     write_chunk_attributes,
@@ -441,6 +443,7 @@ class ZVWriter:
         object_ids: npt.NDArray | None = None,
         dtype: str | np.dtype | None = None,
         chunk_attribute: npt.ArrayLike | None = None,
+        vertex_attributes: Mapping[str, npt.ArrayLike] | None = None,
     ) -> dict:
         """Append new vertices (and new objects) to this level.
 
@@ -465,6 +468,12 @@ class ZVWriter:
                 any other.  Every value must already be one of the
                 level's ``chunk_attribute_values``: a new value would need
                 a new bin, which an append cannot add.
+            vertex_attributes: ``{name: (N,) or (N, C)}`` values for the
+                new vertices, one entry for **every** per-vertex attribute
+                the level already has (no more, no fewer), so the
+                attribute arrays stay aligned with ``vertices``.  Values
+                are cast to each attribute's stored dtype; a cast that
+                would change kind (e.g. float to int) raises.
 
         Returns:
             Summary dict with ``vertices_added``, ``new_objects``,
@@ -515,6 +524,9 @@ class ZVWriter:
         # Resolved before anything is written so a bad call leaves the
         # level untouched.
         bins = self._append_bins(chunk_attribute, n_new, ndim)
+        new_attrs = await asyncio.to_thread(
+            self._append_attribute_values, vertex_attributes, n_new,
+        )
 
         # Spatial assignment (per-vertex → chunk), on the LEVEL's grid
         # (a level may override the root chunk_shape).  On an
@@ -539,17 +551,44 @@ class ZVWriter:
         # under one prefetch (a new chunk reads as empty).  Reading inside
         # the fan-out below opened a one-cell prefetch per task, and those
         # raced on the level's one prefetch slot.
-        def _read_existing() -> dict[ChunkCoords, list[npt.NDArray]]:
+        def _read_existing() -> tuple[
+            dict[ChunkCoords, list[npt.NDArray]],
+            dict[str, dict[ChunkCoords, list[npt.NDArray]]],
+        ]:
             keys = [_chunk_key(cc) for cc in chunk_assignments]
-            with _maybe_batched_reads(
-                self._group, [(VERTICES, keys), (VERTEX_FRAGMENTS, keys)],
-            ):
-                return {
+            plan = [(VERTICES, keys), (VERTEX_FRAGMENTS, keys)]
+            plan += [(f"{VERTEX_ATTRIBUTES}/{n}", keys) for n in new_attrs]
+            with _maybe_batched_reads(self._group, plan):
+                verts = {
                     cc: _safe_read_chunk_vertices(self._group, cc, dtype, ndim)
                     for cc in chunk_assignments
                 }
+                attrs: dict[str, dict[ChunkCoords, list[npt.NDArray]]] = {}
+                for name, (adtype, ncols, _vals) in new_attrs.items():
+                    per_cc = attrs[name] = {}
+                    for cc, groups in verts.items():
+                        if not groups:
+                            per_cc[cc] = []
+                            continue
+                        try:
+                            got = read_chunk_attributes(
+                                self._group, name, cc, adtype, ncols,
+                            )
+                        except ArrayError as e:
+                            raise ArrayError(
+                                f"append_vertices: cannot read existing "
+                                f"attribute {name!r} in chunk {cc}: {e}"
+                            ) from e
+                        if [len(g) for g in got] != [len(g) for g in groups]:
+                            raise ArrayError(
+                                f"append_vertices: attribute {name!r} in "
+                                f"chunk {cc} is not aligned with its vertices"
+                            )
+                        per_cc[cc] = got
+            return verts, attrs
 
-        existing = await asyncio.to_thread(_read_existing)
+        # Every read (and every check) happens here, before any write.
+        existing, existing_attrs = await asyncio.to_thread(_read_existing)
 
         # RMW per chunk in parallel.  Each chunk gets one new vertex
         # group per **unique** object id present in the chunk; an
@@ -567,9 +606,14 @@ class ZVWriter:
             # Append one new fragment per unique object in this chunk.
             chunk_assignments_per_oid: dict[int, int] = {}
             new_groups: list[npt.NDArray] = []
+            new_attr_groups: dict[str, list[npt.NDArray]] = {
+                n: [] for n in new_attrs
+            }
             for new_oid in np.unique(sub_oids):
                 mask = sub_oids == new_oid
                 new_groups.append(sub_positions[mask])
+                for n, (_dt, _nc, vals) in new_attrs.items():
+                    new_attr_groups[n].append(vals[indices][mask])
                 chunk_assignments_per_oid[int(new_oid)] = (
                     existing_count + len(new_groups) - 1
                 )
@@ -583,13 +627,23 @@ class ZVWriter:
                 write_chunk_vertices, self._group, cc, all_groups, dtype,
                 record_presence=False,
             )
+            # Same fragment order as the vertices: existing, then new.
+            for n, (adtype, _nc, _vals) in new_attrs.items():
+                await asyncio.to_thread(
+                    write_chunk_attributes, self._group, n, cc,
+                    existing_attrs[n][cc] + new_attr_groups[n], adtype,
+                    record_presence=False,
+                )
             results[cc] = chunk_assignments_per_oid
 
         await asyncio.gather(*(
             _rmw_chunk(cc, idxs) for cc, idxs in chunk_assignments.items()
         ))
 
-        for _arr in (VERTICES, VERTEX_FRAGMENTS):
+        for _arr in (
+            VERTICES, VERTEX_FRAGMENTS,
+            *(f"{VERTEX_ATTRIBUTES}/{n}" for n in new_attrs),
+        ):
             await asyncio.to_thread(self._group.derive_nonempty_chunks, _arr)
 
         # Build manifest entries per new object id.
@@ -616,6 +670,62 @@ class ZVWriter:
             "new_objects": len(new_oids),
             "chunks_touched": len(results),
         }
+
+    def _append_attribute_values(
+        self,
+        vertex_attributes: Mapping[str, npt.ArrayLike] | None,
+        n_new: int,
+    ) -> dict[str, tuple[np.dtype, int, npt.NDArray]]:
+        """Validate ``vertex_attributes`` against the level's attributes.
+
+        Returns ``{name: (stored dtype, ncols, values cast to it)}``.  The
+        level's per-vertex attributes are row-aligned with ``vertices``,
+        so an append must extend every one of them: a missing or unknown
+        name raises before anything is written.
+        """
+        from zarr_vectors.core.arrays import _resolve_attribute_layout
+
+        group = self._group
+        names: list[str] = []
+        if group.array_exists(VERTEX_ATTRIBUTES):
+            try:
+                names = sorted(group[VERTEX_ATTRIBUTES].children())
+            except Exception:
+                names = []
+        given = dict(vertex_attributes or {})
+        missing = [n for n in names if n not in given]
+        unknown = [n for n in given if n not in names]
+        if missing:
+            raise ArrayError(
+                f"append_vertices: the level has per-vertex attributes "
+                f"{missing} that the new vertices need values for; pass "
+                f"vertex_attributes={{name: values}} for every one of {names}"
+            )
+        if unknown:
+            raise ArrayError(
+                f"append_vertices: vertex_attributes names {unknown} are not "
+                f"attributes of this level ({names}); add them with "
+                f"add_attribute first"
+            )
+        out: dict[str, tuple[np.dtype, int, npt.NDArray]] = {}
+        for name in names:
+            adtype, ncols = _resolve_attribute_layout(
+                group, f"{VERTEX_ATTRIBUTES}/{name}", None, None,
+            )
+            vals = np.asarray(given[name])
+            want = (n_new,) if ncols == 1 else (n_new, ncols)
+            if vals.shape != want and not (ncols == 1 and vals.shape == (n_new, 1)):
+                raise ArrayError(
+                    f"append_vertices: vertex_attributes[{name!r}] shape "
+                    f"{vals.shape} != {want}"
+                )
+            if not np.can_cast(vals.dtype, adtype, casting="same_kind"):
+                raise ArrayError(
+                    f"append_vertices: vertex_attributes[{name!r}] dtype "
+                    f"{vals.dtype} cannot be stored as {adtype}"
+                )
+            out[name] = (adtype, ncols, vals.reshape(want).astype(adtype, copy=False))
+        return out
 
     def _append_bins(
         self, chunk_attribute: npt.ArrayLike | None, n_new: int, ndim: int,
@@ -805,10 +915,12 @@ class ZVWriter:
         object_ids: npt.NDArray | None = None,
         dtype: str | np.dtype | None = None,
         chunk_attribute: npt.ArrayLike | None = None,
+        vertex_attributes: Mapping[str, npt.ArrayLike] | None = None,
     ) -> dict:
         return _run(self.append_vertices(
             positions, object_ids=object_ids, dtype=dtype,
             chunk_attribute=chunk_attribute,
+            vertex_attributes=vertex_attributes,
         ))
 
     def commit_sync(self) -> dict:
