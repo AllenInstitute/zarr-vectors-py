@@ -1,7 +1,7 @@
 """The default shard reader, ``auto``: the optimised reader for every sharded array.
 
 ``ZARR_VECTORS_SHARD_READER`` unset (or ``auto``) reads every sharded
-array -- ``sharding_indexed`` or zarr-octree's ``zarr_octree_sharding`` --
+array -- ``sharding_indexed`` or zarr-octree's ``octree`` --
 with the optimised reader: each shard's index once, the wanted cells'
 ranges coalesced.  Behind an object store the ``standard`` reader goes
 through zarr's sharding codec one cell at a time, so the default makes
@@ -25,6 +25,7 @@ import pytest
 from zarr.storage import LocalStore, WrapperStore
 
 import zarr_vectors as zv
+from zarr_vectors.constants import OCTREE_CODEC_NAMES
 from zarr_vectors.core import _batch_reader, _cells_on_disk
 
 try:
@@ -359,7 +360,7 @@ def test_a_mixed_store_reads_every_array_optimised(stores, mixed, record, monkey
 
     codecs = {a: json.loads((mixed / "0" / a / "zarr.json").read_text())["codecs"][0]["name"]
               for a in ("vertices", "vertex_fragments")}
-    assert codecs == {"vertices": "zarr_octree_sharding", "vertex_fragments": "sharding_indexed"}
+    assert codecs["vertices"] in OCTREE_CODEC_NAMES and codecs["vertex_fragments"] == "sharding_indexed"
 
     _reader(monkeypatch, "zarr")
     plain = QUERIES[query](_open(stores["indexed"], "local"))

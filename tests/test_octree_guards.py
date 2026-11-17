@@ -32,6 +32,7 @@ import numpy as np
 import pytest
 
 import zarr_vectors as zv
+from zarr_vectors.constants import OCTREE_CODEC_NAMES
 from zarr_vectors.core.arrays import _ensure_array_dir, _ensure_chunk_arrays, open_write_session
 from zarr_vectors.core.metadata import LevelMetadata
 from zarr_vectors.core.store import (
@@ -112,7 +113,7 @@ def _digest(path):
 
 def _cell_codecs(path, array):
     codecs = json.loads(Path(path, "0", array, "zarr.json").read_text())["codecs"]
-    if "sharding" in codecs[0]["name"]:
+    if codecs[0]["name"] in ("sharding_indexed", *OCTREE_CODEC_NAMES):
         codecs = codecs[0]["configuration"]["codecs"]
     return [c["name"] for c in codecs]
 
@@ -272,7 +273,7 @@ def test_set_octree_keeps_the_marker(tmp_path):
     want = read_graph(src)["edge_count"]
     set_octree(src, True)
     codecs = json.loads(Path(src, "0", "vertices", "zarr.json").read_text())["codecs"]
-    assert codecs[0]["name"] == "zarr_octree_sharding"
+    assert codecs[0]["name"] in OCTREE_CODEC_NAMES
     assert OCTREE_MARKER_CODEC in [c["name"] for c in codecs[0]["configuration"]["codecs"]]
     assert read_graph(src)["edge_count"] == want
 
@@ -486,7 +487,7 @@ def _octree_arrays(path):
     for p in Path(path).rglob("zarr.json"):
         d = json.loads(p.read_text())
         if d.get("node_type") == "array" and d.get("codecs"):
-            names.add(d["codecs"][0]["name"])
+            names.add("octree" if d["codecs"][0]["name"] in OCTREE_CODEC_NAMES else d["codecs"][0]["name"])
     return names
 
 
@@ -498,7 +499,7 @@ def test_rechunk_spatial_carries_the_octree_sharding_marker(tmp_path):
     rechunk_spatial(src, str(out), (50.0,) * 3)
     meta = read_root_metadata(open_store(str(out)))
     assert meta.octree_sharding == read_root_metadata(open_store(src)).octree_sharding
-    assert "zarr_octree_sharding" in _octree_arrays(out)
+    assert "octree" in _octree_arrays(out)
     assert "sharding_indexed" not in _octree_arrays(out)
     assert read_graph(str(out))["node_count"] == read_graph(src)["node_count"]
 
@@ -513,7 +514,7 @@ def test_rechunk_carries_the_octree_sharding_marker(tmp_path):
     rechunk_by_attribute(src, "cluster", output=str(out))
     meta = read_root_metadata(open_store(str(out)))
     assert meta.octree_sharding == read_root_metadata(open_store(src)).octree_sharding
-    assert "zarr_octree_sharding" in _octree_arrays(Path(out, "0"))
+    assert "octree" in _octree_arrays(Path(out, "0"))
 
 
 # -- validate and the level api ---------------------------------------------------------
