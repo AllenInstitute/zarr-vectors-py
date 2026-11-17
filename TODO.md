@@ -1,84 +1,137 @@
-# Known issues
+# Known issues and next steps
 
-What is still open after the attribute-chunking backlog (validator rank
-rule, rechunk bins, pyramids, the lazy writer deadlock, spatial cell
-matching) was fixed on this branch. Each entry says what fails, why, and
-anything already decided. Line references are against this branch.
+What is left for the next few releases. The previous list (lazy-layer
+bugs, `build_pyramid` atomicity, `rechunk` ids, attributes and links,
+the GPU fragment decode and device readers, the stale schema reference,
+deprecated APIs in tests, lint in CI) was cleared; see the git log.
 
-In order of priority: 1 returns wrong data silently; 3 refuses only in
-narrow cases; 4 is a recorded constraint; 5 is housekeeping.
-
----
-
-## 1. The lazy layer's leftovers
-
-**Severity: medium.**
-
-- **The lazy readers read vertices as float32 whatever the level declares**,
-  and return the decoded positions, so a float64 level reads back as
-  garbage: `ZVLevel.vertices` (`lazy/level.py:262`), the view read path
-  (`lazy/views.py:203`), and `_read_polyline` (`lazy/views.py:527`). The
-  writer had the same hardcoded dtype but used only row counts, which come
-  from the fragment index, so it was harmless there; it now reads at the
-  declared dtype.
-- **`add_face_attribute` always raises `StoreError`.** `face_attributes/<n>`
-  is not a per-chunk array (`_is_per_chunk_array`, `core/arrays.py:885`
-  accepts only `vertex_attributes` and `fragment_attributes`), and the
-  writer creates it as a group (`lazy/writer.py:430`), so the first cell
-  write fails.
-- **`append_vertices` writes rank-3 keys into an attribute-chunked level.**
-  It assigns chunks with the root's spatial `chunk_shape` and no bin, so
-  every key is one component short of the level's arrays.
+Each entry says what is missing, why it matters, and anything already
+decided. Grouped by when it should land.
 
 ---
 
-## 2. `build_pyramid` leftovers
+## Before the next release
 
-None open: a build is atomic across levels, registered strategies over an
-attribute-chunked source are tested, and a stale `links/+1` is restored.
+**Publish zarr-octree to PyPI, then declare it.** zarr-octree is not on
+PyPI, so it is not a dependency or an extra: users get a git URL from an
+error message, and CI installs it from a pinned commit
+(`ZARR_OCTREE_REF` in `.github/workflows/tests.yml`). Once 0.4.0 is on
+PyPI:
+- add an `octree` extra (`zarr-octree>=0.4,<0.5`) and use it in CI in
+  place of the git install;
+- change the "pip install git+..." message in `core/group.py`
+  (`_octree_codec_class`) to `pip install zarr-vectors[octree]`.
 
----
+**Bump `ZARR_OCTREE_REF`** whenever zarr-octree's `main` moves. It
+points at the commit that renamed the codec `octree_sharding`; after that
+merges, point it at `main`'s merge commit.
 
-## 3. `rechunk` leftovers
-
-**Severity: low.** Non-spatial `rechunk` now keeps object ids and carries
-object attributes and `links/0` of any width. It still refuses, before
-writing: a fragment shared by objects in different bins (a vertex can be
-stored in one bin only), vertices no object names, levels above 0, and
-fragment/link attributes (`rechunk_spatial` refuses those too).
-
----
-
-## 4. What the GPU extension still leaves on the host
-
-**Severity: none today.** Done on `gpu-backend`:
-- `read_cells(device="cuda")` decodes cells on the device, uncompressed
-  by default and zstd through nvCOMP with `decode="device"`;
-- local files are read into pinned memory, or with kvikio;
-- writers encode fragments, manifests and link partitions on the device;
-- the dense manifest layout (0.9.4);
-- sharded stores read a shard index at a time on both paths.
-
-What is left:
-
-- **Fragment indices on the device.** `read_cells` rejects
-  `vertex_fragments` / `link_fragments`; the ZVFG blob would decode to
-  CSR with one more kernel (header, bitmap, range table, explicit CSR).
-- **Safe device zstd.** nvCOMP can hang or kill the CUDA context on a
-  corrupt block, so zstd decode on the device is opt-in. A per-cell
-  content checksum written with the frame (zstd `checksum=True`) and
-  verified after decode would catch wrong bytes, but not the hangs.
-- **Byte-range reads for range fragments.** `read_fragment` still fetches
-  the whole cell; only an uncompressed cell can be read by range.
-- **The other `device=` readers.** `read_chunk_vertex_buffer`,
-  `read_link_arrays` and the rest still decode on the host and upload.
-  Routing them through `read_cells`' device path would move them too.
+**Decide on Python 3.11.** zarr-octree needs Python >= 3.12 (as does
+zarr >= 3.2), so the 3.11 CI job skips every octree test. Either drop
+3.11 (`requires-python >= 3.12`, one CI job) or keep it and accept that
+octree sharding is 3.12+ only. Dropping it is simpler.
 
 ---
 
-## 5. Housekeeping
+## Next few releases
 
-**`schema/reference.md` is stale.** Regenerating it with `schema/regen.py`
-(linkml 1.11.0) changes about 10k lines before any schema edit, and CI only
-byte-checks the JSON Schema, so the `chunk_attribute_values` change was not
-carried into it. A plain regeneration belongs in a commit of its own.
+### Deprecations
+
+**Remove the lazy layer.** `open_zv()`, `ZVLevel`, `ZVView` and
+`ZVWriter` are deprecated in favour of `zarr_vectors.open()` /
+`Dataset`. Pick the removal release and say it in the warnings. Before
+removing:
+- `add_node_attribute_sync` / `add_face_attribute_sync` have no
+  `Dataset` replacement; the warning points at
+  `building.write_vertex_attribute`. Face attributes have none: add a
+  `building` entry point for per-face values (they are
+  `link_attributes/<name>/0`, as `ZVWriter.add_face_attribute` now
+  writes them).
+- the tests of the lazy layer go through `tests/_deprecated.py`; they go
+  with it.
+
+**`metadata.chunk_scale_factor()`** (renamed `chunk_scale_from_root()`)
+and **`write_points(attributes=)`** (now `vertex_attributes=`): remove in
+the same release.
+
+Deprecations now use `zarr_vectors.exceptions.ZVDeprecationWarning`,
+which the test suite turns into errors, so new uses fail.
+
+**The legacy codec name `zarr_octree_sharding`.** zarr-octree 0.4 writes
+`octree_sharding` and still reads the old name, so
+`constants.OCTREE_CODEC_NAMES` holds both. Keep reading it for at least
+two minor releases after zarr-octree 0.4, and only drop it once
+zarr-octree does.
+
+### API decisions
+
+**Per-array codecs** (`TODO` at `core/group.py`, "per-array-type codec
+dict"). One session-wide codec list (`_active_codecs`) is used for every
+array. Per-array codecs need:
+- a dict shape (keys for vertices, fragments, links, attributes,
+  object_index);
+- `_ensure_array_dir` / `_ensure_chunk_arrays` (`core/arrays.py`) and
+  `Group._resolve_codecs` to pick by array name;
+- `create_sharded_chunk_arrays`, which creates arrays in one batch with
+  one codec list, to group them by codec;
+- a rule for `dense_manifests.manifest_codecs`, which already raises the
+  zstd level for manifests;
+- the public side: `Layout(compression=)` / Schema and the writers'
+  `compressor=`.
+
+**`link_fragments` on the device.** `read_cells(fragments=True)` reads
+`vertex_fragments` only. The device decoder is generic, so adding
+`link_fragments` is a matter of the API (a parameter naming the
+fragments array), not kernels.
+
+### Remaining refusals in `rechunk`
+
+Non-spatial `rechunk` now keeps object ids, object attributes,
+groupings and links. It refuses, before touching an existing output:
+- a fragment shared by objects in different bins (a vertex lives in one
+  bin);
+- vertices that no object names;
+- levels above 0, and link or fragment attributes.
+`rechunk_spatial` is the lossless path for such stores. Lift a refusal
+only when a real store needs it.
+
+### GPU
+
+- **Readers still on the host:** `read_chunk_attribute_rows` (its row
+  width comes from the fragment index's vertex extent, not the vertex
+  row count) and `read_link_arrays` (it filters and assembles link
+  records). Each needs its own device path, not a reroute.
+- **zstd under `decode="auto"`** still decodes on the host and uploads.
+  `decode="device"` decodes on the GPU; it stays opt-in because nvCOMP
+  can hang or kill the CUDA context on a damaged block. Stores that opt
+  into zstd checksums (`{"name": "zstd", "configuration": {"checksum":
+  true}}`) now have them verified on the device after decode, which
+  catches wrong bytes but cannot prevent a hang.
+- **nvCOMP 6 rejects empty `out=` buffers** in `decode_zstd`
+  ("NULL CUDA buffer not accepted"). Skip the call for zero-length
+  outputs.
+- The per-cell header check and the XXH64 checksum run one thread per
+  cell; make them per-fragment / per-block if cells get very large.
+
+---
+
+## Design notes (no work planned)
+
+**Byte-range reads of compressed cells.** `read_fragment` reads an
+uncompressed cell by range, but a compressed cell whole. A zstd frame has
+no block index and its blocks refer back to earlier data, so part of a
+cell cannot be decoded without the data before it. Range reads would
+need independent frames per cell (or zstd's seekable format with a seek
+table), i.e. a new codec that other Zarr tools could not read. Stores
+that need per-object range reads can leave `vertices` uncompressed.
+Revisit only if large cells read one object at a time become common
+(for example a viewer streaming single objects from big shards).
+
+**The `bytes` (variable-length) data type has no Zarr v3 spec yet.**
+zarr-python warns that its representation may change. Every per-chunk
+array uses it. Follow the zarr-extensions data-types registry; nothing
+to do until a spec lands.
+
+**The ruff version.** CI pins `ruff==0.17.5`; the dev extra says
+`ruff>=0.4` and `uv.lock` has 0.15.12. Bump the lockfile to match
+when convenient.

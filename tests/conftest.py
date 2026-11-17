@@ -292,4 +292,7 @@ def pytest_sessionstart(session):
         try:
             import zarr_octree  # noqa: F401
         except ImportError as exc:
-            pytest.exit(f"ZV_REQUIRE_OCTREE is set but zarr-octree is not importable: {exc}", returncode=4)
+            pytest.exit(
+                f"ZV_REQUIRE_OCTREE is set but zarr-octree is not importable: {exc}",
+                returncode=4,
+            )
