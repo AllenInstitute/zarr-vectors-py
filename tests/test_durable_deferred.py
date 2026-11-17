@@ -120,7 +120,8 @@ def test_sync_store_syncs_the_filesystem_of_a_path_a_root_or_a_level(tmp_path):
 
 def test_sync_store_needs_nothing_off_a_local_filesystem(tmp_path):
     assert zb.sync_store("s3://bucket/store.zv") == "none"
-    assert zb.sync_store(str(tmp_path / "missing")) == "none"
+    with pytest.raises(FileNotFoundError):  # a local path that is not there is an error, not "none"
+        zb.sync_store(str(tmp_path / "missing"))
     from zarr.storage import MemoryStore
 
     assert zb.sync_store(MemoryStore()) == "none"

@@ -370,6 +370,8 @@ class ShardTransaction:
         try:
             staged = _map_lanes(stage, list(self._owned), self._threads())
             if self.durable:
+                from zarr_vectors.core._durable import _fsync_path
+
                 _map_lanes(_fsync_path, [tmp for _e, tmp in staged if tmp], self._threads())
         except BaseException:
             _remove_all(partials)
@@ -457,14 +459,6 @@ def _write_partial(
         _remove_all([tmp])
         raise
     return tmp
-
-
-def _fsync_path(path: str) -> None:
-    fd = os.open(path, os.O_RDONLY)
-    try:
-        os.fsync(fd)
-    finally:
-        os.close(fd)
 
 
 def _remove_all(paths: Iterable[str]) -> None:

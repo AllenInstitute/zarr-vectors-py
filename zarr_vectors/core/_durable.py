@@ -11,8 +11,9 @@ Group commit: a :class:`Touched` made with ``defer=True`` holds each written
 then fsyncs them all together and renames them. Each file is still fsynced
 before its rename, so the crash guarantee is unchanged; what changes is that
 the fsyncs no longer interleave with the writes, which on slow-fsync
-filesystems (rotational disks, FUSE such as ntfs-3g) is several times faster. Local filesystems only:
-on an object store a returned PUT is already durable, on icechunk the commit.
+filesystems (rotational disks, FUSE such as ntfs-3g) is several times
+faster. Local filesystems only: on an object store a returned PUT is already
+durable, on icechunk the commit.
 
 Three durability levels (``durable=``): ``False`` (atomic, never fsynced),
 ``True`` (every object fsynced before its rename; the block returns with
@@ -21,7 +22,9 @@ caller taking responsibility for durability later, once, through
 :func:`sync_store`: one ``syncfs`` of the store's filesystem covering every
 write of every process since). ``"deferred"`` is for callers that write
 many objects from many tasks and only need them durable at a checkpoint of
-their own, such as the end of a stage.
+their own, such as the end of a stage. It is refused on FUSE filesystems
+(ntfs-3g, sshfs, ...): Linux's ``syncfs`` does not ask a FUSE filesystem to
+flush, so it would return without the writes being durable.
 """
 
 from __future__ import annotations
@@ -36,7 +39,6 @@ from pathlib import Path
 from typing import Any
 
 from zarr.storage import LocalStore, WrapperStore
-
 
 #: ``durable=`` value: atomic writes, made durable later by :func:`sync_store`.
 DEFERRED = "deferred"
@@ -68,6 +70,14 @@ def sync_store(target: Any) -> str:
 
     Returns what it did: ``"syncfs"``, ``"sync"`` or ``"none"``.
 
+    Raises:
+        FileNotFoundError: ``target`` names a local path that does not exist
+            (a typo would otherwise sync nothing and report success).
+        OSError: the store is on a FUSE filesystem (ntfs-3g, sshfs, ...).
+            Linux's ``syncfs`` does not ask a FUSE filesystem to flush, so
+            nothing would be made durable; write with ``durable=True``
+            there (group-committed, so the fsyncs are batched).
+
     Note that a write made on another host (a network filesystem) is only
     covered once that host has closed the file; NFS clients flush on close.
     """
@@ -75,6 +85,13 @@ def sync_store(target: Any) -> str:
     if root is None:
         return "none"
     if sys.platform.startswith("linux"):
+        fstype = _fs_type(root)
+        if fstype is not None and (fstype == "fuse" or fstype.startswith(("fuse.", "fuseblk"))):
+            raise OSError(
+                f"sync_store: {root!r} is on a FUSE filesystem ({fstype}); syncfs does not "
+                "flush FUSE filesystems, so durable='deferred' cannot be made durable there. "
+                "Write with durable=True instead."
+            )
         import ctypes
         import ctypes.util
 
@@ -98,7 +115,9 @@ def _local_root(target: Any) -> str | None:
         if "://" in p and not p.startswith("file://"):
             return None
         p = p[len("file://"):] if p.startswith("file://") else p
-        return p if os.path.isdir(p) else None
+        if not os.path.isdir(p):
+            raise FileNotFoundError(f"sync_store: no store directory at {p!r}")
+        return p
     store = getattr(target, "store", None)          # a zarr Group
     zgroup = getattr(target, "zarr_group", None)   # a zarr-vectors Group
     if zgroup is not None:
@@ -112,6 +131,33 @@ def _local_root(target: Any) -> str | None:
     return None
 
 
+def _fs_type(path: str, mountinfo: str | None = None) -> str | None:
+    """The filesystem type of the mount holding ``path`` (Linux), from
+    ``/proc/self/mountinfo``; None when it cannot be read."""
+    if mountinfo is None:
+        try:
+            with open("/proc/self/mountinfo", encoding="utf-8") as fh:
+                mountinfo = fh.read()
+        except OSError:
+            return None
+    real = os.path.realpath(path)
+    best, best_type = "", None
+    for line in mountinfo.splitlines():
+        fields = line.split(" ")
+        try:
+            sep = fields.index("-")
+        except ValueError:
+            continue
+        if len(fields) <= sep + 1 or len(fields) < 5:
+            continue
+        # Mount points escape spaces etc. as octal (\040).
+        mount = fields[4].encode().decode("unicode_escape")
+        inside = real == mount or real.startswith(mount.rstrip("/") + "/")
+        if inside and len(mount) >= len(best):
+            best, best_type = mount, fields[sep + 1]
+    return best_type
+
+
 class Touched:
     """Directories whose entries a block changed, to fsync at the end.
 
@@ -123,22 +169,44 @@ class Touched:
         self._dirs: set[str] = set()
         self._lock = threading.Lock()
         self.deferring = bool(defer)
-        self._pending: list[tuple[str, str]] = []
+        # path -> its latest partial, in the order first deferred.
+        self._pending: dict[str, str] = {}
 
     def defer(self, tmp: str, path: str) -> None:
-        """Hold ``tmp`` (written, not fsynced) to be renamed onto ``path`` by :meth:`land`."""
+        """Hold ``tmp`` (written, not fsynced) to be renamed onto ``path`` by :meth:`land`.
+
+        A path deferred again replaces its earlier partial, which is removed.
+        """
         with self._lock:
-            self._pending.append((tmp, path))
+            old = self._pending.pop(path, None)
+            self._pending[path] = tmp
+        if old is not None:
+            _remove_quietly([old])
+
+    def is_pending(self, path: str) -> bool:
+        """Whether ``path`` has a held partial (written, not yet in place)."""
+        with self._lock:
+            return path in self._pending
+
+    def has_pending(self) -> bool:
+        with self._lock:
+            return bool(self._pending)
+
+    def drop(self, path: str) -> None:
+        """Forget ``path``'s held partial and remove it (the path is being deleted)."""
+        with self._lock:
+            tmp = self._pending.pop(path, None)
+        if tmp is not None:
+            _remove_quietly([tmp])
 
     def land(self, lanes: int = 16) -> None:
         """Fsync every held partial (concurrently), then rename each into place.
 
-        Renames run in the order the partials were deferred, so a path
-        written twice ends with its later value. A failure removes the
-        partials not yet renamed and re-raises.
+        A path written twice holds only its later value. A failure removes
+        the partials not yet renamed and re-raises.
         """
         with self._lock:
-            pending, self._pending = self._pending, []
+            pending, self._pending = [(t, p) for p, t in self._pending.items()], {}
         if not pending:
             return
         from zarr_vectors.core.shard_txn import _map_lanes
@@ -159,8 +227,8 @@ class Touched:
     def discard(self) -> None:
         """Remove every held partial (a failed block)."""
         with self._lock:
-            pending, self._pending = self._pending, []
-        _remove_quietly(tmp for tmp, _ in pending)
+            pending, self._pending = list(self._pending.values()), {}
+        _remove_quietly(pending)
 
     def add(self, directory: str) -> None:
         with self._lock:
@@ -206,7 +274,12 @@ def fsync_dirs(dirs: Iterable[str]) -> None:
 
 
 def _fsync_path(path: str) -> None:
-    fd = os.open(path, os.O_RDONLY)
+    """Fsync a regular file by path.
+
+    Opened for writing: on Windows ``os.fsync`` (``FlushFileBuffers``) needs
+    write access and fails on a read-only descriptor.
+    """
+    fd = os.open(path, os.O_RDWR | getattr(os, "O_BINARY", 0))
     try:
         os.fsync(fd)
     finally:
@@ -225,13 +298,9 @@ def fsync_files(paths: Iterable[str]) -> None:
     """Fsync files already written in place (metadata documents)."""
     for p in paths:
         try:
-            fd = os.open(p, os.O_RDONLY)
+            _fsync_path(p)
         except FileNotFoundError:
             continue
-        try:
-            os.fsync(fd)
-        finally:
-            os.close(fd)
 
 
 def write_file(path: str, data: bytes, touched: Touched, *, exclusive: bool = False) -> None:
@@ -299,5 +368,44 @@ class DurableLocalStore(WrapperStore[LocalStore]):
             pass
 
     async def delete(self, key: str) -> None:
+        # A write deferred in this block would otherwise land after the delete.
+        self._touched.drop(self._path(key))
         await self._store.delete(key)
         self._touched.add(os.path.dirname(self._path(key)))
+
+    # With a deferring Touched a written key is not in place until land().
+    # A read of such a key (or a listing, which cannot tell) lands the held
+    # partials first, so the block reads its own writes.  Reads of other keys
+    # (zarr reads every cell before writing it) do not, which keeps the batch.
+
+    async def _land_if(self, pending: bool) -> None:
+        if pending:
+            await asyncio.to_thread(self._touched.land)
+
+    async def get(self, key: str, *args: Any, **kwargs: Any) -> Any:
+        await self._land_if(self._touched.is_pending(self._path(key)))
+        return await self._store.get(key, *args, **kwargs)
+
+    async def get_partial_values(self, prototype: Any, key_ranges: Any) -> Any:
+        key_ranges = list(key_ranges)
+        await self._land_if(any(self._touched.is_pending(self._path(k)) for k, _ in key_ranges))
+        return await self._store.get_partial_values(prototype, key_ranges)
+
+    async def exists(self, key: str) -> bool:
+        await self._land_if(self._touched.is_pending(self._path(key)))
+        return await self._store.exists(key)
+
+    async def list(self) -> Any:
+        await self._land_if(self._touched.has_pending())
+        async for k in self._store.list():
+            yield k
+
+    async def list_prefix(self, prefix: str) -> Any:
+        await self._land_if(self._touched.has_pending())
+        async for k in self._store.list_prefix(prefix):
+            yield k
+
+    async def list_dir(self, prefix: str) -> Any:
+        await self._land_if(self._touched.has_pending())
+        async for k in self._store.list_dir(prefix):
+            yield k

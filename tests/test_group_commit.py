@@ -102,8 +102,8 @@ def _assert_group_committed(log, *, max_commits: int) -> None:
             group.append(log[k][1])
             k += 1
         for src in group:
-            assert synced_at.get(src, len(log)) < log.index(next(e for e in log if e[0] == "rename" and e[1] == src)), \
-                f"{src} renamed before its fsync"
+            renamed_at = log.index(next(e for e in log if e[0] == "rename" and e[1] == src))
+            assert synced_at.get(src, len(log)) < renamed_at, f"{src} renamed before its fsync"
         # The heart of group commit: nothing in this commit was written
         # after its fsyncs began.
         assert set(group) <= on_disk_at_first_fsync, "a partial was written after the fsyncs began"

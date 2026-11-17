@@ -816,7 +816,7 @@ def open_write_session(
     bounds: tuple[list[float], list[float]] | None = None,
     chunk_shape: tuple[float, ...] | None = None,
     bin_count: int | None = None,
-    durable: bool = False,
+    durable: bool | str = False,
 ):
     """Open the write session used by every type writer.
 
@@ -858,6 +858,9 @@ def open_write_session(
         durable: Forwarded to :meth:`Group.batched_writes`: on a local
             store, everything the session wrote is fsynced -- each cell
             object before its rename -- before the block returns.
+            ``"deferred"`` writes atomically without fsyncing; the caller
+            makes the writes durable later with
+            :func:`zarr_vectors.building.sync_store`.
     """
     from contextlib import ExitStack
 
