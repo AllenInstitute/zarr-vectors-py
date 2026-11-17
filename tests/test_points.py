@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import tempfile
 from pathlib import Path
 
 import numpy as np
@@ -10,7 +9,6 @@ import numpy as np
 from zarr_vectors.core.store import create_store, open_store
 from zarr_vectors.exceptions import MetadataError
 from zarr_vectors.types.points import read_points, write_points
-
 
 # ===================================================================
 # Undifferentiated point cloud (variant 1)
@@ -366,7 +364,6 @@ class TestAttributeDtypes:
         # On-disk array must be integer codes (not raw strings) with
         # an ``encoding="dictionary"`` marker in .zattrs.
         root = open_store(store)
-        attr_meta = root.attrs.to_dict()  # root attrs are unrelated; check level
         from zarr_vectors.core.store import get_resolution_level, read_root_metadata
         rm = read_root_metadata(root)  # noqa: F841 — sanity
         lg = get_resolution_level(root, 0)

@@ -21,7 +21,6 @@ import zarr
 from zarr_vectors.core.store import create_store
 from zarr_vectors.exceptions import StoreError
 
-
 # ---------------------------------------------------------------------------
 # write_array / read_array — dense chunked arrays
 # ---------------------------------------------------------------------------

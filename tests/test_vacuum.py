@@ -13,8 +13,6 @@ from zarr_vectors.core.arrays import (
 )
 from zarr_vectors.core.store import open_store
 from zarr_vectors.ops import (
-    EditSession,
-    VertexRef,
     vacuum,
 )
 from zarr_vectors.types.points import write_points
@@ -71,7 +69,7 @@ class TestCompactOids:
         from zarr_vectors.ops import edit_object
         edit_object(root, 0, level=0, new_manifest=[], atomic=False)
 
-        report = vacuum(root, compact_oids=True)
+        vacuum(root, compact_oids=True)
         arr = read_object_attributes(root["0"], "label")
         # Two live OIDs survive — the dropped one was OID 0 which had
         # label=100; the remaining values are [200, 300].

@@ -259,8 +259,9 @@ non-zero offsets segment — so this token now marks only the presence of
 
 CAP_OCTREE_SHARDING: str = "octree_sharding"
 """The store is marked octree: its sharded per-chunk arrays are written with
-zarr-octree's ``octree_sharding`` codec (``zarr_octree_sharding`` before 0.4; cells grouped into the leaves of
-an octree aimed at a target size, and a sparse shard index) instead of
+zarr-octree's ``octree_sharding`` codec (``zarr_octree_sharding`` before
+0.4; cells grouped into the leaves of an octree aimed at a target size, and a
+sparse shard index) instead of
 ``sharding_indexed``.  Stamped with the root's ``octree_sharding`` block (the
 codec's configuration); set at construction (``Layout(octree=...)``) or by
 :func:`zarr_vectors.sharding.set_octree`, which converts either way.  Reading

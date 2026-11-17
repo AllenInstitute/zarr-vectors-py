@@ -186,7 +186,9 @@ def test_source_vertices_come_back_in_the_composites_dtype(tmp_path):
     with open_write_session(lg, bounds=BOUNDS, chunk_shape=CHUNK, bin_count=len(table)):
         create_vertices_array(lg)
         create_object_index_array(lg)
-        write_object_index(lg, {0: [((1, *cc), f) for cc, f in read_all_object_manifests(src_lg)[0]]}, 4)
+        write_object_index(
+            lg, {0: [((1, *cc), f) for cc, f in read_all_object_manifests(src_lg)[0]]}, 4
+        )
     got = read_object_vertices(_composite({"comp": comp}), 0)
     assert all(np.asarray(g).dtype == np.float32 for g in got)
     np.testing.assert_allclose(np.concatenate(got), lines[0], atol=1e-5)

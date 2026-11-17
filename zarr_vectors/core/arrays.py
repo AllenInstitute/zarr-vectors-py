@@ -8161,7 +8161,16 @@ def read_link_arrays(
     inverse: npt.NDArray[np.int64] | None = None
     chunk_parts: list[npt.NDArray[np.int64]] = []
     vi_parts: list[npt.NDArray[np.int64]] = []
-    for (arr_name, offsets, has_perm, ncols, flat, cell_dtype, _keys, ranged), blobs in segment_rows:
+    for (
+        arr_name,
+        offsets,
+        has_perm,
+        ncols,
+        flat,
+        cell_dtype,
+        _keys,
+        ranged,
+    ), blobs in segment_rows:
         cell_rows: list[npt.NDArray[np.int64]] = []
         cell_chunks: list[tuple[ChunkCoords, ...]] = []
         for cell_key, blob in blobs:
@@ -8242,7 +8251,16 @@ def read_link_rows(
     link_width, _sid_ndim, scale_src, scale_trg, segment_rows = layout
     inverse: npt.NDArray[np.int64] | None = None
     parts: list[npt.NDArray[np.int64]] = []
-    for (arr_name, offsets, has_perm, ncols, flat, cell_dtype, _keys, _ranged), blobs in segment_rows:
+    for (
+        arr_name,
+        offsets,
+        has_perm,
+        ncols,
+        flat,
+        cell_dtype,
+        _keys,
+        _ranged,
+    ), blobs in segment_rows:
         for cell_key, blob in blobs:
             if not blob:
                 continue

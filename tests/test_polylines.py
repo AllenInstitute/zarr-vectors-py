@@ -7,9 +7,8 @@ from pathlib import Path
 import numpy as np
 import pytest
 
-from zarr_vectors.types.polylines import write_polylines, read_polylines
 from zarr_vectors.exceptions import ArrayError
-
+from zarr_vectors.types.polylines import read_polylines, write_polylines
 
 # ===================================================================
 # Basic write/read

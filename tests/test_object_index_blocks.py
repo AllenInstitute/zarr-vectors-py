@@ -14,7 +14,6 @@ from zarr_vectors.encoding.fragments import (
 )
 from zarr_vectors.exceptions import ArrayError
 
-
 # ---------------------------------------------------------------------------
 # Round-trip
 # ---------------------------------------------------------------------------

@@ -7,7 +7,6 @@ from pathlib import Path
 import numpy as np
 import pytest
 
-from zarr_vectors.core.arrays import read_object_manifest
 from zarr_vectors.core.store import open_store
 from zarr_vectors.exceptions import EditError
 from zarr_vectors.ops import (

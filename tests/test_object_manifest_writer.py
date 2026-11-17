@@ -200,7 +200,11 @@ def test_an_interrupted_stream_leaves_residue_the_next_one_replaces(
     lt = _level(torn)
     meta = lt.read_array_meta(OBJECT_INDEX)
     assert meta["num_objects"] == n0  # nothing committed
-    rows = dense.num_rows(lt) if layout == "dense" else int(lt.zarr_group[f"{OBJECT_INDEX}/manifests"].shape[0])
+    rows = (
+        dense.num_rows(lt)
+        if layout == "dense"
+        else int(lt.zarr_group[f"{OBJECT_INDEX}/manifests"].shape[0])
+    )
     assert n0 < rows < n0 + total  # residue, short of the whole stream
     if layout == "dense":
         # A row on disk never names a block that is not.
@@ -236,10 +240,16 @@ def test_errors_are_the_per_call_errors(tmp_path, layout):
     with zb.object_manifest_writer(lg, at=10) as w:
         w.write(chunk_coords=np.zeros((2, 3), np.int64), fragment_idx=[1, 2])
         with pytest.raises(ArrayError, match="not both"):
-            w.write(manifest_blobs=[b"x"], chunk_coords=np.zeros((1, 3), np.int64), fragment_idx=[1])
+            w.write(
+                manifest_blobs=[b"x"], chunk_coords=np.zeros((1, 3), np.int64), fragment_idx=[1]
+            )
         if layout == "dense":
             with pytest.raises(ArrayError, match="manifest_offsets"):
-                w.write(chunk_coords=np.zeros((2, 3), np.int64), fragment_idx=[1, 2], manifest_offsets=[0, 3])
+                w.write(
+                    chunk_coords=np.zeros((2, 3), np.int64),
+                    fragment_idx=[1, 2],
+                    manifest_offsets=[0, 3],
+                )
         with pytest.raises(ArrayError, match="ids for"):
             w.write(chunk_coords=np.zeros((2, 3), np.int64), fragment_idx=[1, 2], ids=[5])
         # Ids that are not the rows, then none: the table is no longer the

@@ -7,12 +7,10 @@ large enough to exercise multi-chunk and boundary logic.
 
 from __future__ import annotations
 
-import tempfile
 from pathlib import Path
 
 import numpy as np
 import pytest
-
 
 # ---------------------------------------------------------------------------
 # Temporary store paths
@@ -127,7 +125,6 @@ def simple_skeleton(rng: np.random.Generator) -> dict:
     parents[0] = -1  # root
     positions[0] = rng.uniform(0, 100, size=3)
 
-    idx = 1
     branch_points = [0, 10, 20, 30, 40]
 
     for i in range(1, n_nodes):

@@ -82,7 +82,6 @@ def vacuum(
         get_resolution_level,
         list_resolution_levels,
     )
-
     from zarr_vectors.octree_chunks.guard import refuse_octree_levels
 
     # Every level is rewritten below; refuse before the first one is.

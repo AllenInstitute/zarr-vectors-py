@@ -95,7 +95,7 @@ from zarr_vectors.encoding.categorical import (
     decode_categorical,
     encode_categorical,
 )
-from zarr_vectors.exceptions import ArrayError, StoreError
+from zarr_vectors.exceptions import ArrayError, StoreError, ZVDeprecationWarning
 from zarr_vectors.spatial.chunking import compute_bounds
 from zarr_vectors.typing import (
     BinShape,
@@ -179,7 +179,7 @@ def write_points(
         warnings.warn(
             "`attributes` is deprecated; use `vertex_attributes` "
             "(matches the on-disk `vertex_attributes/` directory).",
-            DeprecationWarning, stacklevel=2,
+            ZVDeprecationWarning, stacklevel=2,
         )
         vertex_attributes = attributes
     attributes = vertex_attributes  # internal alias for the rest of the body

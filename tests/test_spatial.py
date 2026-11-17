@@ -4,14 +4,7 @@ from __future__ import annotations
 
 import numpy as np
 
-from zarr_vectors.spatial.chunking import (
-    assign_chunks,
-    chunks_intersecting_bbox,
-    compute_bounds,
-    compute_chunk_coords,
-    compute_grid_shape,
-    positions_in_bbox,
-)
+from zarr_vectors.exceptions import ChunkingError
 from zarr_vectors.spatial.boundary import (
     build_reindex_map,
     build_vertex_chunk_mapping,
@@ -20,8 +13,14 @@ from zarr_vectors.spatial.boundary import (
     partition_faces,
     split_polyline_at_boundaries,
 )
-from zarr_vectors.exceptions import ChunkingError
-
+from zarr_vectors.spatial.chunking import (
+    assign_chunks,
+    chunks_intersecting_bbox,
+    compute_bounds,
+    compute_chunk_coords,
+    compute_grid_shape,
+    positions_in_bbox,
+)
 
 # ===================================================================
 # Chunk assignment

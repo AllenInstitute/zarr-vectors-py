@@ -120,7 +120,11 @@ _LOG: list | None = None
 
 def _note(kind, key, where, data):
     if _LOG is not None:
-        n = len(data) if isinstance(data, (bytes, bytearray)) else (0 if data is None or isinstance(data, Exception) else len(data))
+        n = (
+            len(data)
+            if isinstance(data, (bytes, bytearray))
+            else (0 if data is None or isinstance(data, Exception) else len(data))
+        )
         _LOG.append((kind, str(key), repr(where), n))
 
 
@@ -198,10 +202,18 @@ def _cells(ds):
 
     got = read_cells(ds.level(0).store, CELLS, ("vertices",), on_error="raise", fragments=True)
     frag = got.fragments
-    return np.concatenate([
-        np.asarray(a, dtype=np.float64).ravel()
-        for a in (got["vertices"].data, got["vertices"].offsets, frag.cell_offsets, frag.starts, frag.counts)
-    ])
+    return np.concatenate(
+        [
+            np.asarray(a, dtype=np.float64).ravel()
+            for a in (
+                got["vertices"].data,
+                got["vertices"].offsets,
+                frag.cell_offsets,
+                frag.starts,
+                frag.counts,
+            )
+        ]
+    )
 
 
 QUERIES = {
@@ -219,7 +231,9 @@ def _read(record, monkeypatch, path, where, reader, query):
 
 
 def _total(log, kinds=("store get",)):
-    return sum(c for k, c in log.items() if k[0] in kinds), sum(k[3] * c for k, c in log.items() if k[0] in kinds)
+    return sum(c for k, c in log.items() if k[0] in kinds), sum(
+        k[3] * c for k, c in log.items() if k[0] in kinds
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -231,8 +245,12 @@ def _total(log, kinds=("store get",)):
 def test_the_default_is_auto_and_reads_every_array_optimised(stores, monkeypatch):
     from zarr_vectors.core._cells_on_disk import cell_source
 
-    src = {name: cell_source("", zv.open(str(p)).level(0).store.zarr_group["vertices"], any_codecs=True)
-           for name, p in stores.items()}
+    src = {
+        name: cell_source(
+            "", zv.open(str(p)).level(0).store.zarr_group["vertices"], any_codecs=True
+        )
+        for name, p in stores.items()
+    }
     assert src["indexed"].index_format == "dense" and src["octree"].index_format == "zarr_octree"
 
     monkeypatch.delenv("ZARR_VECTORS_SHARD_READER", raising=False)
@@ -241,10 +259,16 @@ def test_the_default_is_auto_and_reads_every_array_optimised(stores, monkeypatch
     for s in (src["octree"], src["indexed"], None):
         assert _batch_reader.shard_reader_for(s) == "optimised"
     want = ("auto", _cells_on_disk._AUTO_GAP, _cells_on_disk._AUTO_SPAN)
-    assert _cells_on_disk._coalescing(src["octree"]) == _cells_on_disk._coalescing(src["indexed"]) == want
+    assert (
+        _cells_on_disk._coalescing(src["octree"])
+        == _cells_on_disk._coalescing(src["indexed"])
+        == want
+    )
     assert _cells_on_disk._coalescing() == want
 
-    monkeypatch.setenv("ZARR_VECTORS_COALESCE", "gap:10:20")  # the optimised reader's setting, every array
+    monkeypatch.setenv(
+        "ZARR_VECTORS_COALESCE", "gap:10:20"
+    )  # the optimised reader's setting, every array
     assert _cells_on_disk._coalescing(src["octree"]) == ("gap", 10, 20)
     assert _cells_on_disk._coalescing(src["indexed"]) == ("gap", 10, 20)
 
@@ -254,9 +278,16 @@ def test_the_default_is_auto_and_reads_every_array_optimised(stores, monkeypatch
         assert _batch_reader.shard_reader() == want
         assert {_batch_reader.shard_reader_for(s) for s in src.values()} == {
             "optimised" if want == "auto" else want}
-    for value, octree, indexed in (("standard", "none", "none"), ("optimised", "gap", "gap"), ("zarr", "none", "none")):
+    for value, octree, indexed in (
+        ("standard", "none", "none"),
+        ("optimised", "gap", "gap"),
+        ("zarr", "none", "none"),
+    ):
         monkeypatch.setenv("ZARR_VECTORS_SHARD_READER", value)
-        assert (_cells_on_disk._coalescing(src["octree"])[0], _cells_on_disk._coalescing(src["indexed"])[0]) == (octree, indexed)
+        assert (
+            _cells_on_disk._coalescing(src["octree"])[0],
+            _cells_on_disk._coalescing(src["indexed"])[0],
+        ) == (octree, indexed)
 
     monkeypatch.setenv("ZARR_VECTORS_SHARD_READER", "fast")
     with pytest.raises(ValueError, match="ZARR_VECTORS_SHARD_READER"):
@@ -355,12 +386,17 @@ def mixed(stores, tmp_path_factory):
 @needs_octree
 @pytest.mark.parametrize("query", list(QUERIES))
 @pytest.mark.parametrize("where", ["local", "store"])
-def test_a_mixed_store_reads_every_array_optimised(stores, mixed, record, monkeypatch, where, query):
+def test_a_mixed_store_reads_every_array_optimised(
+    stores, mixed, record, monkeypatch, where, query
+):
     import json
 
     codecs = {a: json.loads((mixed / "0" / a / "zarr.json").read_text())["codecs"][0]["name"]
               for a in ("vertices", "vertex_fragments")}
-    assert codecs["vertices"] in OCTREE_CODEC_NAMES and codecs["vertex_fragments"] == "sharding_indexed"
+    assert (
+        codecs["vertices"] in OCTREE_CODEC_NAMES
+        and codecs["vertex_fragments"] == "sharding_indexed"
+    )
 
     _reader(monkeypatch, "zarr")
     plain = QUERIES[query](_open(stores["indexed"], "local"))

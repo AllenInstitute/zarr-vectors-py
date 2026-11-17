@@ -57,7 +57,7 @@ from zarr_vectors.core.arrays import (
     write_chunk_attributes,
     write_chunk_vertices,
 )
-from zarr_vectors.exceptions import ArrayError
+from zarr_vectors.exceptions import ArrayError, ZVDeprecationWarning
 from zarr_vectors.spatial.boundary import chunk_local_to_global_offsets
 from zarr_vectors.spatial.chunking import assign_chunks
 from zarr_vectors.typing import ChunkCoords, ObjectManifest
@@ -132,7 +132,7 @@ class ZVWriter:
             "replacement on Dataset -- a bulk per-vertex attribute column is "
             "not an edit -- so use "
             "zarr_vectors.building.write_vertex_attribute for those.",
-            DeprecationWarning,
+            ZVDeprecationWarning,
             stacklevel=2,
         )
         self._level = level

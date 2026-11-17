@@ -144,4 +144,12 @@ markers = [
 # unstable-dtype warning here too so the summary is not flooded.
 filterwarnings = [
     "ignore::zarr.errors.UnstableSpecificationWarning",
+    # The package's own deprecations are errors, so nothing (tests
+    # included) drifts back onto a deprecated API. Tests that cover a
+    # deprecated API assert its warning with pytest.warns. This filters on
+    # the category, not on a module: a module filter such as
+    # "error::DeprecationWarning:zarr_vectors.*" matches the module the
+    # warning is attributed to, which stacklevel=2 makes the CALLER's, so
+    # it would miss every call from the tests.
+    "error::zarr_vectors.exceptions.ZVDeprecationWarning",
 ]

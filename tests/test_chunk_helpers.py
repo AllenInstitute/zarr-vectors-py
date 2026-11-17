@@ -14,7 +14,6 @@ from zarr_vectors.spatial.boundary import chunk_local_to_global_offsets
 from zarr_vectors.spatial.chunking import neighbouring_chunk_keys
 from zarr_vectors.types.points import write_points
 
-
 # ===================================================================
 # neighbouring_chunk_keys
 # ===================================================================
