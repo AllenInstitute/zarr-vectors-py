@@ -284,3 +284,15 @@ def _forced_manifest_layout(request, monkeypatch):
 
         monkeypatch.setattr(dense_manifests, "store_default", lambda _lg: layout)
     yield
+
+
+def pytest_sessionstart(session):
+    """With ``ZV_REQUIRE_OCTREE=1`` (CI, where zarr-octree is installed), a
+    missing zarr-octree fails the run instead of silently skipping its tests."""
+    import os
+
+    if os.environ.get("ZV_REQUIRE_OCTREE"):
+        try:
+            import zarr_octree  # noqa: F401
+        except ImportError as exc:
+            pytest.exit(f"ZV_REQUIRE_OCTREE is set but zarr-octree is not importable: {exc}", returncode=4)

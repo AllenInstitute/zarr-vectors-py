@@ -21,6 +21,10 @@ on:
 
 # Cancel superseded runs on the same ref (avoids piling up jobs when a
 # PR is force-pushed several times in a row).
+env:
+  # zarr-octree commit the octree tests run against (bump with zarr-octree).
+  ZARR_OCTREE_REF: b4c389a4e5154e1925c9cef34b860d7cfb4c487a
+
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
@@ -72,6 +76,14 @@ jobs:
       - name: Sync dependencies (frozen, all extras + dev)
         run: uv sync --frozen --extra all --extra dev
 
+      - name: Install zarr-octree (octree sharding tests)
+        # Not on PyPI yet, so not a declared extra: pinned here by commit.
+        # It needs Python >= 3.12, so the 3.11 job skips the octree tests.
+        if: matrix.python-version != '3.11'
+        run: >-
+          uv pip install
+          "zarr-octree @ git+https://github.com/Andrew-Keenlyside/zarr-octree@${ZARR_OCTREE_REF}"
+
       - name: Check schema artefacts are in sync
         # The JSON Schema and reference.md are GENERATED from the LinkML
         # source. Nothing regenerated them in CI, which is how they drifted
@@ -84,6 +96,8 @@ jobs:
         # that belong under @pytest.mark.slow.
         env:
           TIER: ${{ github.event_name == 'pull_request' && 'not slow' || '' }}
+          # Where zarr-octree is installed, its tests must run, not skip.
+          ZV_REQUIRE_OCTREE: ${{ matrix.python-version != '3.11' && '1' || '' }}
         run: >-
           uv run pytest tests/ --ignore=tests/integration
           -n auto --timeout=300 --durations=15 -q -rfE
