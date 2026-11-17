@@ -26,6 +26,7 @@ import pytest
 from zarr.storage import LocalStore, WrapperStore
 
 import zarr_vectors as zv
+from zarr_vectors.constants import OCTREE_CODEC_NAMES
 from zarr_vectors.exceptions import MetadataError
 
 try:
@@ -64,13 +65,21 @@ def _make(path, octree=False, kind="point_cloud", shard_cells=4):
     return path
 
 
+def _target(config):
+    """The octree codec's target: under ``layout`` since zarr-octree 0.4, top level before."""
+    layout = config.get("layout")
+    return (layout["configuration"] if isinstance(layout, dict) else config)["target"]
+
+
 def _codecs(path):
     """{array path: sharding codec name} for every sharded array of the store."""
     out = {}
     for z in path.rglob("zarr.json"):
         m = json.loads(z.read_text())
-        if m.get("node_type") == "array" and m["codecs"][0]["name"] in ("sharding_indexed", "zarr_octree_sharding"):
-            out[str(z.parent.relative_to(path))] = m["codecs"][0]["name"]
+        name = m["codecs"][0]["name"] if m.get("node_type") == "array" else None
+        name = "octree" if name in OCTREE_CODEC_NAMES else name  # either name zarr-octree writes
+        if name in ("sharding_indexed", "octree"):
+            out[str(z.parent.relative_to(path))] = name
     return out
 
 
@@ -206,7 +215,7 @@ def test_an_interrupted_set_octree_loses_nothing_and_a_rerun_finishes_it(
     p = _make(tmp_path / "s.zv", octree=False if direction == "mark" else TARGET)
     want = _positions(p)
     n_arrays = len(_codecs(p))
-    config, codec = (TARGET, "zarr_octree_sharding") if direction == "mark" else (False, "sharding_indexed")
+    config, codec = (TARGET, "octree") if direction == "mark" else (False, "sharding_indexed")
     op, match, nth, after, _ = STEPS[step]
 
     with pytest.raises(_Crash), monkeypatch.context() as m:
@@ -250,7 +259,7 @@ def test_a_crash_at_any_cell_write_is_recovered_by_a_rerun(tmp_path, where, nth)
         set_octree(_faulty(p, where, _Faults("set", lambda k: "/c/" in k, nth)), TARGET)
     set_octree(str(p), TARGET)
     assert np.array_equal(_positions(p), want)
-    assert set(_codecs(p).values()) == {"zarr_octree_sharding"}
+    assert set(_codecs(p).values()) == {"octree"}
 
 
 @needs_octree
@@ -271,8 +280,8 @@ def test_an_interrupted_swap_of_a_links_array_is_finished(tmp_path, monkeypatch,
             set_octree(_faulty(p, where, _Faults("delete_dir", lambda k: k == target, 1, after=True)), TARGET)
     assert not (p / target / "zarr.json").exists()  # the source is gone, the copy is in scratch
     set_octree(str(p), TARGET)
-    assert (p / target / "zarr.json").exists() and _codecs(p)[target] == "zarr_octree_sharding"
-    assert set(_codecs(p).values()) == {"zarr_octree_sharding"} and _no_scratch(p)
+    assert (p / target / "zarr.json").exists() and _codecs(p)[target] == "octree"
+    assert set(_codecs(p).values()) == {"octree"} and _no_scratch(p)
     assert np.array_equal(_positions(p), want)
     ds = zv.open(str(p))
     assert len(ds.read().positions) == len(want)
@@ -288,7 +297,7 @@ def test_a_rerun_with_another_configuration_redoes_the_array_it_finishes(tmp_pat
         _crash_once_moved_aside(m)
         set_octree(str(p), TARGET)
     set_octree(str(p), {"target": 5_000})
-    configs = {json.loads((p / a / "zarr.json").read_text())["codecs"][0]["configuration"]["target"]
+    configs = {_target(json.loads((p / a / "zarr.json").read_text())["codecs"][0]["configuration"])
                for a in _codecs(p)}
     assert configs == {5_000.0} and np.array_equal(_positions(p), want) and _no_scratch(p)
 
@@ -340,7 +349,7 @@ def test_unshard_store_with_arrays_keeps_the_marker_while_octree_arrays_remain(t
 
     p = _make(tmp_path / "s.zv", octree=TARGET)
     unshard_store(str(p), arrays=["vertices"])
-    assert "zarr_octree_sharding" in _codecs(p).values()
+    assert "octree" in _codecs(p).values()
     assert _root(p)["octree_sharding"] == TARGET and "octree_sharding" in _root(p)["format_capabilities"]
 
 
@@ -381,14 +390,14 @@ def test_set_octree_accepts_a_store_sharded_by_shard_store(tmp_path):
     assert _root(p).get("shard_shape") is None
     out = set_octree(str(p), TARGET)
     assert out["arrays_repacked"] == len(_codecs(p)) > 0
-    assert set(_codecs(p).values()) == {"zarr_octree_sharding"}
+    assert set(_codecs(p).values()) == {"octree"}
     assert _root(p)["shard_shape"] == [4, 4, 4] and _root(p)["octree_sharding"] == TARGET
     assert np.array_equal(_positions(p), want)
     # A later write allocates octree arrays, as in a store born marked.
     n = len(_codecs(p))
     zv.open(str(p), mode="r+").build_pyramid(factors=[(2.0, 1.0)])
     assert len(_codecs(p)) > n
-    assert set(_codecs(p).values()) == {"zarr_octree_sharding"}
+    assert set(_codecs(p).values()) == {"octree"}
 
 
 @needs_octree
@@ -437,7 +446,7 @@ def test_a_failed_marker_read_raises_and_is_not_cached(tmp_path):
         zb.create_attribute_array(level, "w", dtype="float32")
     codecs = _codecs(p)
     assert {"0/vertices", "0/vertex_attributes/w"} <= set(codecs), codecs
-    assert set(codecs.values()) == {"zarr_octree_sharding"}, codecs
+    assert set(codecs.values()) == {"octree"}, codecs
 
 
 def test_a_bare_group_is_unmarked(tmp_path):
@@ -465,7 +474,7 @@ def test_layout_octree_as_an_empty_mapping_shards_an_auto_store(tmp_path):
     pts, ids = _points()
     zv.create(str(p), schema=_schema({}, shard_cells="auto")).add_points(pts, object_ids=ids)
     assert _root(p)["octree_sharding"] == {} and _root(p)["shard_shape"] is not None
-    assert set(_codecs(p).values()) == {"zarr_octree_sharding"}
+    assert set(_codecs(p).values()) == {"octree"}
     # Round-tripped through Schema.from_store and resolved again.
     sch = zv.Schema.from_store(zv.open(str(p))._root_meta)
     assert sch.layout.octree == {}
