@@ -84,6 +84,16 @@ array. Per-array codecs need:
 `link_fragments` is a matter of the API (a parameter naming the
 fragments array), not kernels.
 
+### Lazy writer
+
+`ZVWriter.append_vertices` extends positions and per-vertex attributes
+(`vertex_attributes=`), but not `fragment_attributes`. It goes with the
+lazy layer's removal unless that slips.
+
+**Bbox views on binned levels** now read every touched chunk whole and
+mask it (the per-bin shortcut was wrong with object ids). Exact, but a
+small box decodes whole chunks; `Dataset` reads are the fast path.
+
 ### Remaining refusals in `rechunk`
 
 Non-spatial `rechunk` now keeps object ids, object attributes,
