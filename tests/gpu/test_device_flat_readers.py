@@ -185,3 +185,27 @@ def test_fragment_attributes(tmp_path, compressor, shard, served):
         if host_err is None:
             _same(dev, host)
     assert served.count("read_chunk_fragment_attributes") == 5
+
+
+def test_a_shard_transaction_is_read_on_the_host(tmp_path, served):
+    """Staged cells are only visible through Group.read_bytes."""
+    from zarr_vectors import building as zb
+    from zarr_vectors.core.cells import read_cells
+
+    bounds, chunk = ([0.0] * 3, [400.0] * 3), (100.0,) * 3
+    root = zb.create_store(str(tmp_path / "s.zv"), bounds=bounds, chunk_shape=chunk,
+                           shard_shape=2)
+    lg = zb.get_resolution_level(root, 0)
+    with zb.open_write_session(lg, bounds=bounds, chunk_shape=chunk):
+        zb.create_vertices_array(lg, dtype="float32")
+        zb.write_chunk_vertices(lg, (0, 0, 0), [np.zeros((3, 3), np.float32)])
+    zb.defer_presence(lg)
+    with zb.shard_transaction(lg, (0, 0, 0)):
+        zb.write_chunk_vertices(lg, (0, 0, 0), [np.ones((5, 3), np.float32)])
+        host = arrays.read_chunk_vertex_buffer(lg, (0, 0, 0))
+        assert host.shape == (5, 3)
+        _same(arrays.read_chunk_vertex_buffer(lg, (0, 0, 0), device="cuda"), host)
+        batch = read_cells(lg, np.asarray([(0, 0, 0)]), ["vertices"], device="cuda")
+        _same(batch["vertices"].data, host)
+        assert batch.io[0].path == "host"
+    assert served == []
