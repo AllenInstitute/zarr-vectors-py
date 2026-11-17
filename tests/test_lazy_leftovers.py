@@ -250,3 +250,149 @@ def test_append_vertices_spatial_rejects_chunk_attribute(tmp_path):
         w.append_vertices_sync(
             np.zeros((1, 3), "f4"), chunk_attribute=np.array([1]),
         )
+
+
+# ===================================================================
+# 4. View bbox read on a binned level with an object index
+# ===================================================================
+
+
+@pytest.mark.parametrize("dt", ["float32", "float64"])
+@pytest.mark.parametrize(
+    "box", [((0, 0, 0), (100, 100, 100)), ((10, 20, 5), (60, 70, 45))],
+)
+def test_view_bbox_on_binned_object_level_matches_eager(tmp_path, dt, box):
+    """The view read bin k as fragment k, but with object ids a chunk
+    holds one fragment per object, so the box came back short."""
+    rng = np.random.default_rng(12)
+    pos = (rng.uniform(0, 100, (150, 3)) + 1e-9).astype(dt)
+    store = str(tmp_path / "bo.zv")
+    write_points(
+        store, pos, dtype=dt, chunk_shape=(50.0, 50.0, 50.0),
+        bin_shape=(25.0, 25.0, 25.0), object_ids=np.arange(150),
+    )
+    lo, hi = np.asarray(box[0], float), np.asarray(box[1], float)
+    with pytest.warns(DeprecationWarning):
+        zv = open_zv(store)
+    got = zv[0].filter(bbox=(lo, hi)).compute()["positions"]
+    want = read_points(store, bbox=(lo, hi))["positions"]
+    inside = pos[np.all((pos >= lo) & (pos <= hi), axis=1)]
+    assert got.dtype == np.dtype(dt)
+    assert len(got) == len(inside) > 0
+    np.testing.assert_array_equal(_sorted_rows(got), _sorted_rows(want))
+    np.testing.assert_array_equal(_sorted_rows(got), _sorted_rows(inside))
+
+
+# ===================================================================
+# 5. append_vertices keeps vertex attributes aligned
+# ===================================================================
+
+
+def _rows_by_oid(store, names, n):
+    out = read_points(store, attribute_names=names, object_ids=list(range(n)))
+    order = np.argsort(out["object_ids"], kind="stable")
+    return (
+        out["object_ids"][order], out["positions"][order],
+        {n: np.asarray(out["vertex_attributes"][n])[order] for n in names},
+    )
+
+
+def _writer(store):
+    with pytest.warns(DeprecationWarning):
+        zv = open_zv(store)
+    with pytest.warns(DeprecationWarning):
+        return zv[0].writer()
+
+
+def test_append_vertices_extends_vertex_attributes(tmp_path):
+    rng = np.random.default_rng(13)
+    pos = rng.uniform(0, 100, (30, 3)).astype("f4")
+    inten = rng.uniform(0, 1, 30).astype("f4")
+    rgb = rng.integers(0, 255, (30, 3)).astype("u1")
+    store = str(tmp_path / "a.zv")
+    write_points(
+        store, pos, chunk_shape=(50.0,) * 3, object_ids=np.arange(30),
+        vertex_attributes={"intensity": inten, "rgb": rgb},
+    )
+    new = np.array([[5, 5, 5], [80, 80, 80], [5, 6, 7]], "f4")
+    new_inten = np.array([0.25, 0.5, 0.75])  # float64 -> stored float32
+    new_rgb = np.array([[1, 2, 3], [4, 5, 6], [7, 8, 9]], "u1")
+    w = _writer(store)
+    w.append_vertices_sync(
+        new, vertex_attributes={"intensity": new_inten, "rgb": new_rgb},
+    )
+    w.commit_sync()
+
+    oids, got_pos, attrs = _rows_by_oid(store, ["intensity", "rgb"], 33)
+    np.testing.assert_array_equal(oids, np.arange(33))
+    np.testing.assert_array_equal(got_pos, np.concatenate([pos, new]))
+    np.testing.assert_array_equal(
+        attrs["intensity"].ravel(),
+        np.concatenate([inten, new_inten.astype("f4")]),
+    )
+    np.testing.assert_array_equal(
+        attrs["rgb"].reshape(-1, 3), np.concatenate([rgb, new_rgb]),
+    )
+
+
+def test_append_vertices_refuses_without_attribute_values(tmp_path):
+    from zarr_vectors.core.arrays import read_chunk_vertices
+
+    store = str(tmp_path / "a.zv")
+    pos = np.random.default_rng(14).uniform(0, 100, (10, 3)).astype("f4")
+    write_points(
+        store, pos, chunk_shape=(50.0,) * 3, object_ids=np.arange(10),
+        vertex_attributes={"intensity": np.zeros(10, "f4")},
+    )
+
+    def snapshot():
+        lg = get_resolution_level(open_store(store), 0)
+        return {
+            cc: np.concatenate(read_chunk_vertices(lg, cc))
+            for cc in list_chunk_keys(lg)
+        }
+
+    before = snapshot()
+    w = _writer(store)
+    new = np.array([[1, 1, 1]], "f4")
+    with pytest.raises(ArrayError, match="need values for"):
+        w.append_vertices_sync(new)
+    with pytest.raises(ArrayError, match="not attributes of this level"):
+        w.append_vertices_sync(new, vertex_attributes={
+            "intensity": np.zeros(1, "f4"), "other": np.zeros(1, "f4"),
+        })
+    with pytest.raises(ArrayError, match="shape"):
+        w.append_vertices_sync(new, vertex_attributes={"intensity": np.zeros(2)})
+    with pytest.raises(ArrayError, match="cannot be stored"):
+        w.append_vertices_sync(new, vertex_attributes={"intensity": np.array(["x"])})
+    after = snapshot()
+    assert before.keys() == after.keys()
+    for cc in before:
+        np.testing.assert_array_equal(before[cc], after[cc])
+
+
+def test_append_vertices_attribute_chunked_with_attributes(tmp_path):
+    rng = np.random.default_rng(15)
+    pos = rng.uniform(0, 100, (20, 3)).astype("f4")
+    cell = np.array(["a", "b"] * 10)
+    score = np.arange(20, dtype="i4")
+    store = str(tmp_path / "ac.zv")
+    write_points(
+        store, pos, chunk_shape=(50.0,) * 3, object_ids=np.arange(20),
+        vertex_attributes={"cell": cell, "score": score},
+        chunk_by_attribute="cell",
+    )
+    new = np.array([[10, 10, 10], [90, 90, 90]], "f4")
+    w = _writer(store)
+    w.append_vertices_sync(
+        new, chunk_attribute=np.array(["b", "a"]),
+        vertex_attributes={"score": np.array([100, 101], "i4")},
+    )
+    w.commit_sync()
+
+    oids, got_pos, attrs = _rows_by_oid(store, ["score"], 22)
+    np.testing.assert_array_equal(oids, np.arange(22))
+    np.testing.assert_array_equal(got_pos, np.concatenate([pos, new]))
+    np.testing.assert_array_equal(
+        attrs["score"].ravel(), np.concatenate([score, [100, 101]]),
+    )
