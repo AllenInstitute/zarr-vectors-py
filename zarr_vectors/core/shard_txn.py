@@ -7,6 +7,15 @@ On exit each touched shard is encoded by zarr's sharding codec, written as
 object, not per set: after a crash mid-publish a re-run converges (same cells,
 same bytes). Writes no metadata; needs presence deferred and arrays allocated
 beforehand. See :func:`zarr_vectors.building.shard_transaction`.
+
+``prefetch=True`` (merge mode): on entry every owned shard object is read
+whole, in the background, while the caller computes. Reads of owned cells
+the transaction has not staged are then served from that copy, decoded once
+per array, and so is the merge at publish; a shard every cell of which the
+transaction rewrites is encoded without reading what it replaces. On a
+filesystem where each read is a round trip (NFS, a FUSE mount, a rotational
+disk) this turns many small reads on the caller's path into one parallel
+read per shard off it. Same bytes either way.
 """
 
 from __future__ import annotations
@@ -56,16 +65,23 @@ class _StagingStore(WrapperStore):
     zarr merges into what the store holds.
     """
 
-    def __init__(self, store: Any, hidden: Iterable[str]) -> None:
+    def __init__(
+        self, store: Any, hidden: Iterable[str],
+        preloaded: dict[str, bytes | None] | None = None,
+    ) -> None:
         super().__init__(store)
         self.hidden = set(hidden)
         self.captured: dict[str, bytes | None] = {}
+        # Objects already read (None: absent), served instead of the store.
+        self.preloaded = dict(preloaded or {})
 
     def _staged(self, key: str) -> tuple[bool, bytes | None]:
         if key in self.captured:
             return True, self.captured[key]
         if key in self.hidden:
             return True, None
+        if key in self.preloaded:
+            return True, self.preloaded[key]
         return False, None
 
     async def get(self, key: str, prototype: Any, byte_range: Any = None) -> Any:
@@ -133,6 +149,7 @@ class ShardTransaction:
         mode: Literal["replace", "merge"],
         durable: bool | str,
         io_threads: int | None = None,
+        prefetch: bool = False,
     ) -> None:
         from zarr_vectors.core.group import _grid_origin
 
@@ -152,6 +169,12 @@ class ShardTransaction:
         # "deferred" publish atomically without (see _durable.sync_store).
         self.durable = fsyncs(durable)
         self.io_threads = io_threads
+        # Merge mode only: replace never reads what it replaces.
+        self.prefetch = bool(prefetch) and mode == "merge"
+        self._loaded: dict[str, Any] = {}          # name -> Future[bytes | None]
+        self._decoded: dict[str, dict[tuple[int, ...], bytes]] = {}
+        self._decode_lock = threading.Lock()
+        self._prefetch_pool: Any = None
         self.written: dict[str, list[str]] = {}
         self.published: list[str] = []
         self._cells: dict[str, dict[str, bytes]] = {}
@@ -238,7 +261,77 @@ class ShardTransaction:
             return staged[chunk_key]
         if self.mode == "replace" and self.owns(array_name, chunk_key):
             return b""
+        if array_name in self._loaded and self.owns(array_name, chunk_key):
+            owned = self._owned[array_name]
+            return self._prefetched_cells(array_name).get(
+                self._index(owned, chunk_key), b"")
         return None
+
+    def serves(self, array_name: str, chunk_key: str) -> bool:
+        """Whether :meth:`lookup` answers for this cell without the store."""
+        staged = self._cells.get(array_name)
+        if staged is not None and chunk_key in staged:
+            return True
+        return (self.mode == "replace" or array_name in self._loaded) and self.owns(
+            array_name, chunk_key)
+
+    # ---------------------------------------------------------------
+    # Prefetch (merge mode)
+
+    def start_prefetch(self) -> None:
+        """Read every owned shard object in the background (``prefetch=True``)."""
+        if not self.prefetch or not self._owned or self._prefetch_pool is not None:
+            return
+        from concurrent.futures import ThreadPoolExecutor
+
+        store = self.level_group.zarr_group.store
+        lanes = max(4, int(self.io_threads or 0))
+        self._prefetch_pool = ThreadPoolExecutor(
+            max_workers=min(lanes, len(self._owned)), thread_name_prefix="zv-txn-prefetch",
+        )
+        for name, owned in self._owned.items():
+            self._loaded[name] = self._prefetch_pool.submit(_read_object, store, owned.key)
+
+    def _shard_bytes(self, name: str) -> bytes | None:
+        return self._loaded[name].result()
+
+    def _prefetched_cells(self, name: str) -> dict[tuple[int, ...], bytes]:
+        """Every non-empty cell of ``name``'s owned shard as prefetched, by index; decoded once."""
+        with self._decode_lock:
+            cells = self._decoded.get(name)
+            if cells is None:
+                cells = self._decode_shard(name)
+                self._decoded[name] = cells
+            return cells
+
+    def _decode_shard(self, name: str) -> dict[tuple[int, ...], bytes]:
+        import warnings
+
+        from zarr.errors import UnstableSpecificationWarning
+
+        from zarr_vectors.core._batch_writer import _array_on
+
+        raw = self._shard_bytes(name)
+        if raw is None:
+            return {}
+        owned = self._owned[name]
+        store = _StagingStore(self.level_group.zarr_group.store, [], {owned.key: raw})
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", UnstableSpecificationWarning)
+            region = _array_on(owned.arr, store)[
+                tuple(slice(a, b) for a, b in zip(owned.lo, owned.hi))]
+        out: dict[tuple[int, ...], bytes] = {}
+        for idx in np.ndindex(region.shape):
+            value = region[idx]
+            if isinstance(value, (bytes, bytearray, memoryview)) and len(value):
+                out[tuple(a + i for a, i in zip(owned.lo, idx))] = bytes(value)
+        return out
+
+    def close(self) -> None:
+        """Stop the prefetch (on publish or abort)."""
+        pool, self._prefetch_pool = self._prefetch_pool, None
+        if pool is not None:
+            pool.shutdown(wait=True, cancel_futures=True)
 
     # ---------------------------------------------------------------
     # On exit
@@ -258,7 +351,15 @@ class ShardTransaction:
         if not cells:
             return owned.key, (None if self.mode == "replace" else _UNCHANGED), None
         store = self.level_group.zarr_group.store
-        staging = _StagingStore(store, [owned.key] if self.mode == "replace" else [])
+        region = int(np.prod([b - a for a, b in zip(owned.lo, owned.hi)]))
+        # Every cell rewritten: nothing of the old shard survives, so do
+        # not read it (the same bytes as merging over it).
+        hide = self.mode == "replace" or len(cells) >= region
+        preloaded = (
+            {owned.key: self._shard_bytes(name)}
+            if not hide and name in self._loaded else None
+        )
+        staging = _StagingStore(store, [owned.key] if hide else [], preloaded)
         with warnings.catch_warnings():
             warnings.simplefilter("ignore", UnstableSpecificationWarning)
             # From the handle's metadata: opening by path re-reads zarr.json.
@@ -457,6 +558,21 @@ def _write_partial(
         _remove_all([tmp])
         raise
     return tmp
+
+
+def _read_object(store: Any, key: str) -> bytes | None:
+    """One whole store object, or None when absent (the prefetch's read)."""
+    if isinstance(store, LocalStore):
+        try:
+            with open(Path(store.root) / key, "rb") as fh:
+                return fh.read()
+        except FileNotFoundError:
+            return None
+    from zarr.core.buffer import default_buffer_prototype
+    from zarr.core.sync import sync
+
+    buf = sync(store.get(key, default_buffer_prototype()))
+    return None if buf is None else bytes(buf.to_bytes())
 
 
 def _fsync_path(path: str) -> None:

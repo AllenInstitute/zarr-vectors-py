@@ -651,6 +651,7 @@ def shard_transaction(
     durable: bool | str = True,
     io_threads: int | None = None,
     sweep: bool = True,
+    prefetch: bool = False,
 ) -> Any:
     """Stage one shard's cell writes privately, and publish them on exit.
 
@@ -668,12 +669,15 @@ def shard_transaction(
     crash, re-running the task converges. Needs presence deferred
     (:func:`defer_presence`) and every array allocated and sharded first;
     writes no metadata (``tx.written`` feeds :func:`set_presence`). ``sweep``
-    removes a failed attempt's ``.partial`` files on entry. See
+    removes a failed attempt's ``.partial`` files on entry. ``prefetch``
+    (``mode="merge"``) reads every owned shard whole in the background on
+    entry and serves owned-cell reads and the publish's merge from it; a shard
+    whose every cell is rewritten is not read. Same bytes either way. See
     :mod:`zarr_vectors.core.shard_txn`.
     """
     return level_group.shard_transaction(
         tuple(shard_coords), arrays=arrays, mode=mode, durable=durable,
-        io_threads=io_threads, sweep=sweep,
+        io_threads=io_threads, sweep=sweep, prefetch=prefetch,
     )
 
 

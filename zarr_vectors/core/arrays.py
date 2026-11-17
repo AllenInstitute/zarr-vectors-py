@@ -5115,21 +5115,29 @@ def _write_link_cells_arrays(
             delta == 0 and is_intra(offsets),
         )
 
-    # One prefetch of every cell this batch touches.
+    # One prefetch of every cell this batch touches -- except those an open
+    # shard transaction answers itself (staged, or prefetched with its shard).
+    txn = level_group._shard_txn
     plan: list[tuple[str, list[str]]] = []
     intra_keys: list[str] = []
+
+    def unserved(name: str, keys: list[str]) -> tuple[str, list[str]]:
+        if txn is None:
+            return name, keys
+        return name, [k for k in keys if not txn.serves(name, k)]
+
     for seg, cells in by_seg.items():
         offsets, _, flat = seg_info[seg]
         keys = [_chunk_key(src) for src, _, _ in cells]
-        plan.append((links_path(delta, offsets), keys))
-        plan += [(link_attributes_path(n, delta, offsets), keys) for n in attrs]
+        plan.append(unserved(links_path(delta, offsets), keys))
+        plan += [unserved(link_attributes_path(n, delta, offsets), keys) for n in attrs]
         if flat:
             intra_keys += keys
     if intra_keys:
-        plan.append((LINK_FRAGMENTS, sorted(set(intra_keys))))
-    cache = flush_prefetch(level_group._zarr, plan)
+        plan.append(unserved(LINK_FRAGMENTS, sorted(set(intra_keys))))
+    plan = [(name, keys) for name, keys in plan if keys]
+    cache = flush_prefetch(level_group._zarr, plan) if plan else {}
     # Cells staged in a shard transaction win over the store prefetch.
-    txn = level_group._shard_txn
 
     def raw(name: str, key: str) -> bytes:
         if txn is not None:
