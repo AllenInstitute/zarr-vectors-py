@@ -34,20 +34,10 @@ or only in narrow cases; 4 is a recorded constraint; 5 is housekeeping.
 
 ## 2. `build_pyramid` leftovers
 
-**Severity: low.**
-
-- **A pyramid is not atomic across levels.** Each `coarsen_level` step rolls
-  itself back, but a failure at level k keeps levels 1..k-1, and the
-  finalize pass (`±N`, N ≥ 2) does not run.
-- **Registered coarsen strategies** (`zarr-vectors-tools`) over an
-  attribute-chunked source are untested. They receive the same kwargs as
-  before; if they reach `_write_cross_level_edges` with mismatched ranks they
-  now get a `CoarseningError` naming both levels instead of the
-  partitioner's shape error.
-- **A pre-existing `links/+1` family on the source** cannot be restored by
-  the rollback once `write_links(mode="replace")` has rewritten it. It is
-  unreachable today: a target level must not exist, and only an old,
-  half-removed pyramid leaves a `+1` family behind.
+Done: a pyramid is atomic across levels (`_PyramidSnapshot`), a registered
+strategy over an attribute-chunked source is tested end to end
+(`tests/test_registered_coarsen_attr_chunked.py`), and a pre-existing
+`links/+1` family is put back by the rollback.
 
 ---
 
