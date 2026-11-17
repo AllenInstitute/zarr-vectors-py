@@ -114,7 +114,7 @@ only the comparison with `vertices` catches it.
 ## Octree sharding and octree chunks
 
 **Octree sharding codec** (`core.group._shard_codec`, `check_octree_sharding`).
-zarr-octree's `octree` codec (from the zarr-octree package, needed to write and to
+zarr-octree's `octree_sharding` codec (from the zarr-octree package, needed to write and to
 read; versions before 0.4 wrote it as `zarr_octree_sharding`, and both names are
 recognised everywhere a sharded array's codec is checked, via
 `constants.OCTREE_CODEC_NAMES`) has a sparse shard index and groups cells into the leaves of an octree

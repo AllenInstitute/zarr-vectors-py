@@ -1,7 +1,7 @@
 """The default shard reader, ``auto``: the optimised reader for every sharded array.
 
 ``ZARR_VECTORS_SHARD_READER`` unset (or ``auto``) reads every sharded
-array -- ``sharding_indexed`` or zarr-octree's ``octree`` --
+array -- ``sharding_indexed`` or zarr-octree's ``octree_sharding`` --
 with the optimised reader: each shard's index once, the wanted cells'
 ranges coalesced.  Behind an object store the ``standard`` reader goes
 through zarr's sharding codec one cell at a time, so the default makes
