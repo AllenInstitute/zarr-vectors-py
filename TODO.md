@@ -5,8 +5,8 @@ rule, rechunk bins, pyramids, the lazy writer deadlock, spatial cell
 matching) was fixed on this branch. Each entry says what fails, why, and
 anything already decided. Line references are against this branch.
 
-In order of priority: 1 returns wrong data silently; 2 and 3 fail loudly
-or only in narrow cases; 4 is a recorded constraint; 5 is housekeeping.
+In order of priority: 1 returns wrong data silently; 3 refuses only in
+narrow cases; 4 is a recorded constraint; 5 is housekeeping.
 
 ---
 
@@ -34,39 +34,18 @@ or only in narrow cases; 4 is a recorded constraint; 5 is housekeeping.
 
 ## 2. `build_pyramid` leftovers
 
-**Severity: low.**
-
-- **A pyramid is not atomic across levels.** Each `coarsen_level` step rolls
-  itself back, but a failure at level k keeps levels 1..k-1, and the
-  finalize pass (`±N`, N ≥ 2) does not run.
-- **Registered coarsen strategies** (`zarr-vectors-tools`) over an
-  attribute-chunked source are untested. They receive the same kwargs as
-  before; if they reach `_write_cross_level_edges` with mismatched ranks they
-  now get a `CoarseningError` naming both levels instead of the
-  partitioner's shape error.
-- **A pre-existing `links/+1` family on the source** cannot be restored by
-  the rollback once `write_links(mode="replace")` has rewritten it. It is
-  unreachable today: a target level must not exist, and only an old,
-  half-removed pyramid leaves a `+1` family behind.
+None open: a build is atomic across levels, registered strategies over an
+attribute-chunked source are tested, and a stale `links/+1` is restored.
 
 ---
 
 ## 3. `rechunk` leftovers
 
-**Severity: low.**
-
-- **`by="spatial"`** still writes a pointless extent-1 leading axis with
-  `chunk_dims[0] == "spatial"`, and records no labels. `rechunk_spatial`
-  (`rechunk/spatial.py:355`) does the spatial job losslessly; decide whether
-  `by="spatial"` should delegate to it or be removed.
-- **Object ids are renumbered** by a running counter in bin order, so they
-  no longer join back to the source, and object attributes are not
-  copied. Links are never copied either, so only a point cloud survives a
-  non-spatial rechunk intact (see the module docstring of
-  `rechunk/spatial.py`).
-- **`chunk_attribute_name` vs `chunk_dims[0]`** disagree for an explicit
-  `RechunkSpec(by="attribute:x")` without `prefix_dim_name`: the name is `x`,
-  the axis is `attribute`.
+**Severity: low.** Non-spatial `rechunk` now keeps object ids and carries
+object attributes and `links/0` of any width. It still refuses, before
+writing: a fragment shared by objects in different bins (a vertex can be
+stored in one bin only), vertices no object names, levels above 0, and
+fragment/link attributes (`rechunk_spatial` refuses those too).
 
 ---
 

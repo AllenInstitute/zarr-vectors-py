@@ -33,6 +33,7 @@ from zarr_vectors.constants import (
     GEOM_POLYLINE,
     GEOM_SKELETON,
     GEOM_STREAMLINE,
+    LINK_ATTRIBUTES,
     LINKS,
     OBJECT_ATTRIBUTES,
     VALID_XLEVEL_STORAGE,
@@ -116,7 +117,9 @@ def coarsen_level(
 
     If the step raises part-way, what it wrote is removed before the
     error propagates: the target level, a ``links/+1`` family it added to
-    the source level, and the root attributes it stamped.
+    the source level (or the one it replaced, which is put back), and the
+    root attributes it stamped.  A registered ``method`` gets the same
+    guarantee.
 
     Args:
         store_path: Path to the zarr vectors store.
@@ -206,7 +209,11 @@ def coarsen_level(
         summary = _per_object_coarsen(**kwargs)
         _refresh_arrays_present(store_path, (source_level, target_level))
         return summary
-    return strategy(**kwargs, **(options or {}))
+    # A registered strategy writes through its own code, so the step's
+    # rollback is the store-level one: whatever it created or rewrote is
+    # undone if it raises, as the built-in step undoes its own.
+    with _rollback_build_on_failure(store_path):
+        return strategy(**kwargs, **(options or {}))
 
 
 def _refuse_octree_levels(store_path: Any, levels: list[int] | None, what: str) -> None:
@@ -1003,13 +1010,20 @@ def _coarse_grid(
 @contextmanager
 def _rollback_level_on_failure(root, source_level: int, target_level: int):
     """Undo one coarsen step if it raises: drop the target level and any new
-    ``links/+1`` family, restore root/source attrs.  A cleanup failure is
-    added as a note on the original error."""
+    ``links/+1`` family, restore root/source attrs.  A ``links/+1`` family the
+    source already had (left by a half-removed pyramid) is copied aside first
+    and put back, since the step's ``write_links(mode="replace")`` rewrites
+    it.  A cleanup failure is added as a note on the original error."""
     src = get_resolution_level(root, source_level)
     root_before = root.attrs.to_dict()
     src_before = src.attrs.to_dict()
     had_links = src.array_exists(LINKS)
-    had_plus_one = src.array_exists(links_group_path(1))
+    plus_one = links_group_path(1)
+    had_plus_one = src.array_exists(plus_one)
+    saved_plus_one = (
+        _copy_out(src, plus_one) | _copy_out_key(src, f"{LINKS}/zarr.json")
+        if had_plus_one else {}
+    )
     try:
         yield
     except BaseException as exc:
@@ -1018,18 +1032,185 @@ def _rollback_level_on_failure(root, source_level: int, target_level: int):
                 remove_resolution_level(root, target_level)
             src = get_resolution_level(root, source_level)
             if not had_plus_one:
-                stray = links_group_path(1) if had_links else LINKS
+                stray = plus_one if had_links else LINKS
                 if src.array_exists(stray):
                     src.delete_subtree(stray)
+            else:
+                # Removing the target took the rewritten family with it
+                # (it points at the target); this puts the old one back.
+                if src.array_exists(plus_one):
+                    src.delete_subtree(plus_one)
+                _copy_back(src, saved_plus_one, (LINKS,))
             for group, before in ((root, root_before), (src, src_before)):
-                now = group.attrs.to_dict()
-                changed = {k: v for k, v in before.items() if now.get(k) != v}
-                if changed:
-                    group.attrs.update(changed)
+                _restore_attrs(group, before)
         except Exception as cleanup:
             exc.add_note(
                 f"rolling back level {target_level} also failed: {cleanup!r}"
             )
+        raise
+
+
+# -------------------------------------------------------------------
+# Raw copies of store nodes, for rollback
+# -------------------------------------------------------------------
+
+def _store_key(group, name: str) -> str:
+    return "/".join(p for p in (group.prefix.strip("/"), name) if p)
+
+
+def _copy_out(group, name: str) -> dict[str, Any]:
+    """Every stored key under ``group/name``, read into memory.
+
+    Store-generic (a directory move is not), and only ever used on
+    cross-level link families that exist *before* a build, which only a
+    half-removed pyramid leaves behind -- not on anything the build itself
+    writes, so the copy does not scale with the pyramid.
+    """
+    from zarr.core.buffer import default_buffer_prototype
+    from zarr.core.sync import sync
+
+    store = group.zarr_group.store
+    base = _store_key(group, name)
+
+    async def _collect() -> dict[str, Any]:
+        proto = default_buffer_prototype()
+        out: dict[str, Any] = {}
+        async for key in store.list_prefix(f"{base}/"):
+            value = await store.get(key, prototype=proto)
+            if value is not None:
+                out[key] = value
+        return out
+
+    return sync(_collect())
+
+
+def _copy_out_key(group, name: str) -> dict[str, Any]:
+    """One stored key (a group's ``zarr.json``), or nothing if absent."""
+    from zarr.core.buffer import default_buffer_prototype
+    from zarr.core.sync import sync
+
+    store = group.zarr_group.store
+    key = _store_key(group, name)
+    value = sync(store.get(key, prototype=default_buffer_prototype()))
+    return {} if value is None else {key: value}
+
+
+def _copy_back(group, saved: dict[str, Any], invalidate: tuple[str, ...]) -> None:
+    """Write keys saved by :func:`_copy_out` back, then drop cached nodes."""
+    from zarr.core.sync import sync
+
+    store = group.zarr_group.store
+
+    async def _put() -> None:
+        for key, value in saved.items():
+            await store.set(key, value)
+
+    if saved:
+        sync(_put())
+    for name in invalidate:
+        group._invalidate_node(name)
+
+
+def _restore_attrs(group, before: dict[str, Any]) -> None:
+    """Make ``group``'s attributes exactly ``before`` again, dropping keys a
+    failed build added rather than only resetting the ones it changed."""
+    if group.attrs.to_dict() != before:
+        group.zarr_group.attrs.put(before)
+
+
+def _cross_level_families(level_group) -> list[str]:
+    """Paths of the level's ``links/±k`` and ``link_attributes/<n>/±k``."""
+    out: list[str] = []
+    if level_group.array_exists(LINKS):
+        out += [f"{LINKS}/{n}" for n in level_group[LINKS]
+                if n[:1] in "+-"]
+    if level_group.array_exists(LINK_ATTRIBUTES):
+        for name in level_group[LINK_ATTRIBUTES]:
+            fam = f"{LINK_ATTRIBUTES}/{name}"
+            out += [f"{fam}/{n}" for n in level_group[fam] if n[:1] in "+-"]
+    return out
+
+
+def _link_groups(level_group) -> list[str]:
+    """The groups holding link families: ``links``, ``link_attributes`` and
+    ``link_attributes/<n>``, parents first."""
+    out = [g for g in (LINKS, LINK_ATTRIBUTES) if level_group.array_exists(g)]
+    if LINK_ATTRIBUTES in out:
+        out += [f"{LINK_ATTRIBUTES}/{n}" for n in level_group[LINK_ATTRIBUTES]]
+    return out
+
+
+class _PyramidSnapshot:
+    """What :func:`build_pyramid` may change, taken before it starts.
+
+    That is the root's and every existing level's attributes (NGFF
+    ``multiscales``, cross-level depth/storage, capabilities,
+    ``arrays_present``) and every existing cross-level link family, which
+    the inline ``+1`` and the finalize pass's ``±N`` writes replace.
+    :meth:`restore` deletes the levels the build created and puts the rest
+    back.  Same-level links (``links/0``) are never touched by a build, so
+    they are not copied.
+    """
+
+    def __init__(self, root) -> None:
+        self.levels = set(list_resolution_levels(root))
+        self.root_attrs = root.attrs.to_dict()
+        self.level_attrs: dict[int, dict[str, Any]] = {}
+        self.groups: dict[int, list[str]] = {}
+        self.saved: dict[int, dict[str, Any]] = {}
+        for lvl in self.levels:
+            lg = get_resolution_level(root, lvl)
+            self.level_attrs[lvl] = lg.attrs.to_dict()
+            self.groups[lvl] = _link_groups(lg)
+            saved: dict[str, Any] = {}
+            for grp in self.groups[lvl]:
+                saved |= _copy_out_key(lg, f"{grp}/zarr.json")
+            for fam in _cross_level_families(lg):
+                saved |= _copy_out(lg, fam)
+            self.saved[lvl] = saved
+
+    def restore(self, root) -> None:
+        from zarr_vectors.constants import RESOLUTION_PREFIX
+
+        for lvl in sorted(set(list_resolution_levels(root)) - self.levels,
+                          reverse=True):
+            # Directly, not via remove_resolution_level: that refuses a
+            # level with another above it, and what it also tidies (the
+            # finer levels' families pointing here, multiscales) is put
+            # back from the snapshot below anyway.
+            root.delete_subtree(f"{RESOLUTION_PREFIX}{lvl}")
+        for lvl in sorted(self.levels):
+            lg = get_resolution_level(root, lvl)
+            for fam in _cross_level_families(lg):
+                lg.delete_subtree(fam)
+            for grp in reversed(_link_groups(lg)):
+                if grp not in self.groups[lvl] and lg.array_exists(grp):
+                    lg.delete_subtree(grp)
+            _copy_back(lg, self.saved[lvl], (LINKS, LINK_ATTRIBUTES))
+            _restore_attrs(lg, self.level_attrs[lvl])
+        _restore_attrs(root, self.root_attrs)
+
+
+@contextmanager
+def _rollback_build_on_failure(store_path):
+    """Make a multi-level build all-or-nothing (see :class:`_PyramidSnapshot`).
+
+    A store that does not open is left for the build to report."""
+    from zarr_vectors.exceptions import StoreError
+
+    try:
+        root = open_store(store_path, mode="r+")
+        snapshot = _PyramidSnapshot(root)
+    except (StoreError, FileNotFoundError):
+        yield
+        return
+    try:
+        yield
+    except BaseException as exc:
+        try:
+            snapshot.restore(open_store(store_path, mode="r+"))
+        except Exception as cleanup:
+            exc.add_note(f"rolling back the pyramid also failed: {cleanup!r}")
         raise
 
 
@@ -1382,9 +1563,11 @@ def build_pyramid(
     are preserved across levels.  A store chunked by an attribute keeps
     its bins at every level (see :func:`coarsen_level`).
 
-    Each level is written by one :func:`coarsen_level` step, which rolls
-    itself back if it fails.  The pyramid as a whole is not atomic:
-    levels built before a failing step are kept.
+    The build is all-or-nothing: if any step or the finalize pass raises,
+    the levels it created are removed, and the root's and the existing
+    levels' attributes and cross-level link families (including a stale
+    ``links/+1`` left by a half-removed pyramid) are put back as they were
+    before the call, before the error propagates.
 
     Args:
         store_path: Path to the store with level 0.
@@ -1439,6 +1622,49 @@ def build_pyramid(
     # writes links into any level pair it finds.
     _refuse_octree_levels(store_path, None, "building a pyramid")
 
+    with _rollback_build_on_failure(store_path):
+        summaries = _build_levels(
+            store_path,
+            factors=factors,
+            chunk_scale_factors=chunk_scale_factors,
+            sparsity_strategy=sparsity_strategy,
+            sparsity_seed=sparsity_seed,
+            cross_level_depth=cross_level_depth,
+            cross_level_storage=cross_level_storage,
+            method=method,
+            options=options,
+            sparsity_attribute=sparsity_attribute,
+            sparsity_attribute_mode=sparsity_attribute_mode,
+        )
+
+    return {
+        "levels_created": len(summaries),
+        "level_specs": summaries,
+        # The method actually used, not the built-in: this reported
+        # "per_object" even when every level had been produced by a
+        # registered strategy, so the one field naming what built the
+        # pyramid was wrong exactly when it mattered.
+        "method": method,
+        "cross_level_depth": cross_level_depth,
+        "cross_level_storage": cross_level_storage,
+    }
+
+
+def _build_levels(
+    store_path: str | Path | Group,
+    *,
+    factors: list[tuple[float, float]],
+    chunk_scale_factors: list[int | tuple[int, ...]] | None,
+    sparsity_strategy: str,
+    sparsity_seed: int | None,
+    cross_level_depth: int,
+    cross_level_storage: str,
+    method: str,
+    options: dict[str, Any] | None,
+    sparsity_attribute: str | None,
+    sparsity_attribute_mode: str,
+) -> list[dict[str, Any]]:
+    """The steps and finalize pass of :func:`build_pyramid`, unguarded."""
     summaries: list[dict[str, Any]] = []
     for i, fac in enumerate(factors):
         if isinstance(fac, (tuple, list)) and len(fac) == 2:
@@ -1483,15 +1709,4 @@ def build_pyramid(
     # The finalize pass adds deeper link families after the per-step refresh.
     if cross_level_depth not in (0, 1) and cross_level_storage != XLEVEL_NONE:
         _refresh_arrays_present(store_path, range(len(factors) + 1))
-
-    return {
-        "levels_created": len(summaries),
-        "level_specs": summaries,
-        # The method actually used, not the built-in: this reported
-        # "per_object" even when every level had been produced by a
-        # registered strategy, so the one field naming what built the
-        # pyramid was wrong exactly when it mattered.
-        "method": method,
-        "cross_level_depth": cross_level_depth,
-        "cross_level_storage": cross_level_storage,
-    }
+    return summaries

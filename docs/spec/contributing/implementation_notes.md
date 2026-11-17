@@ -88,9 +88,8 @@ group or array, so cell listings start at the array prefix.
 
 **Leading grid axes** (`core.arrays._leading_grid_axes`). The attribute-bin
 grid extent comes from the allocated `vertices` array's extra axes and from
-`len(chunk_attribute_values)`: `rechunk` sets `chunk_dims` always but
-`chunk_attribute_*` only for `attribute:` specs, so group or object-id rechunks
-have a wider grid with no bin values. `chunk_dims` (names only, unvalidated) is
+`len(chunk_attribute_values)`: a store rechunked before bin labels were
+recorded for group and object-id specs has a wider grid with no bin values. `chunk_dims` (names only, unvalidated) is
 not consulted.
 
 **Shard shape** (`core.metadata.normalise_shard_shape`). Stored verbatim and

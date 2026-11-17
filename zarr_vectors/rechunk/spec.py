@@ -41,8 +41,10 @@ class RechunkSpec:
             unique values.
         spatial_chunk_shape: Override spatial chunk shape for the output
             store. If None, keeps the source chunk shape.
-        prefix_dim_name: Custom name for the prefix dimension in
-            metadata. Defaults to the ``by`` value.
+        prefix_dim_name: Name of the leading axis: ``chunk_dims[0]`` and
+            ``chunk_attribute_name``, the key a reader's
+            ``attribute_filter`` uses.  Defaults to the attribute's name
+            for ``"attribute:<name>"`` and to ``by`` otherwise.
         categorical: If True, treat the binning dimension as categorical
             — every unique value gets its own bin regardless of how many
             unique values there are.  Set this for gene labels, bundle
@@ -57,7 +59,18 @@ class RechunkSpec:
 
     @property
     def dimension_name(self) -> str:
-        return self.prefix_dim_name or self.by.split(":")[0]
+        """The leading axis's name, recorded as both ``chunk_dims[0]`` and
+        ``chunk_attribute_name``.
+
+        For ``"attribute:<name>"`` it is ``<name>``, as for a store written
+        with ``chunk_by_attribute``; it used to be ``"attribute"``, so the
+        axis and the filter key disagreed.
+        """
+        if self.prefix_dim_name:
+            return self.prefix_dim_name
+        if self.by.startswith("attribute:"):
+            return self.by.split(":", 1)[1]
+        return self.by
 
 
 class DimensionMapper:
