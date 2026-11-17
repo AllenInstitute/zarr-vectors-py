@@ -129,27 +129,18 @@ def test_group_bins_skip_empty_groups_and_put_the_ungrouped_last(tmp_path):
     assert validate_structure(str(out)).ok
 
 
-def test_group_rewrite_skips_objects_that_were_not_written(tmp_path, monkeypatch):
-    """An object with no vertices gets no output id, so no group entry."""
-    from zarr_vectors.rechunk import engine
-
+def test_groupings_keep_the_source_ids(tmp_path):
+    """Ids are preserved, so the groupings are the source's, verbatim."""
     polys = _polylines()[:5]
     src = str(tmp_path / "src.zarrvectors")
-    write_polylines(src, polys, chunk_shape=_CHUNK, groups={0: [0, 1, 2], 1: [3, 4]})
-    real = engine.read_object_vertices
-
-    def _object_1_is_empty(level_group, oid, **kw):
-        return [] if oid == 1 else real(level_group, oid, **kw)
-
-    monkeypatch.setattr(engine, "read_object_vertices", _object_1_is_empty)
+    write_polylines(src, polys, chunk_shape=_CHUNK, groups={0: [0, 3], 1: [1, 2, 4]})
     out = tmp_path / "grouped.zarrvectors"
 
     summary = rechunk(src, RechunkSpec(by="group"), output=str(out))
 
-    assert summary["objects_rechunked"] == 4
+    assert summary["objects_rechunked"] == 5
     groupings = read_all_groupings(get_resolution_level(open_store(str(out)), 0))
-    # Source 0, 2 -> output 0, 1; source 3, 4 -> output 2, 3.
-    assert [sorted(g) for g in groupings] == [[0, 1], [2, 3]]
+    assert [sorted(g) for g in groupings] == [[0, 3], [1, 2, 4]]
 
 
 # --- one object reads as one object ---------------------------------------

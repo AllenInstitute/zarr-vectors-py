@@ -132,18 +132,24 @@ The output level records `chunk_dims`, `chunk_attribute_name` and
 `chunk_attribute_values` (here `[0, 1, 2]`).
 
 The output holds level 0's vertices, vertex attributes, object index,
-object attributes, groups and group attributes, with object ids
-renumbered densely in bin order; no mapping to the old ids is stored. A
-path store with `links_convention="implicit_sequential"` gets delta-0
-links joining each object's consecutive fragments. `rechunk` raises
-before writing:
+object attributes, groups, group attributes and `links/0`. Object ids
+are kept, so object attributes, groups and group attributes are copied
+unchanged. Each vertex goes to its object's bin; fragments shared by
+objects of one bin stay shared. Every `links/0` record is re-addressed
+to its endpoints' new keys, whatever its `link_width`; a link between
+objects in different bins joins two bins. Under
+`links_convention="implicit_sequential"`, where the new grid cuts a
+fragment, a link joins the two runs. The summary counts the records
+written (`links`) and the source records naming no vertex, which are
+dropped (`dropped_links`). `rechunk` raises before writing:
 
 | Error | When |
 |-------|------|
 | `OctreeError` | Level 0 has octree chunks |
 | `NotImplementedError` | The store has levels above 0 (remove them and run `build_pyramid` on the output) |
 | `NotImplementedError` | Level 0 has a family it does not carry, such as `fragment_attributes/` or `link_attributes/` |
-| `NotImplementedError` | Level 0 has explicit links, or links at a delta other than 0; use `rechunk_spatial` |
+| `NotImplementedError` | Level 0 has links at a delta other than 0 (with no level to point at) |
+| `NotImplementedError` | A fragment is shared by objects in different bins, or level 0 has vertices no object names; use `rechunk_spatial` |
 | `ValueError` | `output` is the source |
 | `FileExistsError` | `output` exists and `overwrite` is false |
 

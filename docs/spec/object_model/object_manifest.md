@@ -101,9 +101,8 @@ from the level. A [sparsified](../multiscale/sparsity.md) level keeps a
 row for every id of its source level and empties the rows it drops.
 `read_object_manifest` raises `ArrayError` for an id with no row.
 
-Object ids are stable for the life of a store. `rechunk()` along a
-non-spatial dimension renumbers objects densely in bin order;
-`rechunk_spatial()` keeps their ids (see
+Object ids are stable for the life of a store. `rechunk()` and
+`rechunk_spatial()` keep them (see
 [Rechunking](../chunking/rechunking.md)).
 
 `write_object_index(..., total_objects=n)` declares rows `0 … n-1`

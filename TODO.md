@@ -5,8 +5,8 @@ rule, rechunk bins, pyramids, the lazy writer deadlock, spatial cell
 matching) was fixed on this branch. Each entry says what fails, why, and
 anything already decided. Line references are against this branch.
 
-In order of priority: 1 returns wrong data silently; 2 and 3 fail loudly
-or only in narrow cases; 4 is a recorded constraint; 5 is housekeeping.
+In order of priority: 1 returns wrong data silently; 3 refuses only in
+narrow cases; 4 is a recorded constraint; 5 is housekeeping.
 
 ---
 
@@ -34,22 +34,18 @@ or only in narrow cases; 4 is a recorded constraint; 5 is housekeeping.
 
 ## 2. `build_pyramid` leftovers
 
-Done: a pyramid is atomic across levels (`_PyramidSnapshot`), a registered
-strategy over an attribute-chunked source is tested end to end
-(`tests/test_registered_coarsen_attr_chunked.py`), and a pre-existing
-`links/+1` family is put back by the rollback.
+None open: a build is atomic across levels, registered strategies over an
+attribute-chunked source are tested, and a stale `links/+1` is restored.
 
 ---
 
 ## 3. `rechunk` leftovers
 
-**Severity: low.**
-
-- **Object ids are renumbered** by a running counter in bin order, so they
-  no longer join back to the source, and object attributes are not
-  copied. Links are never copied either, so only a point cloud survives a
-  non-spatial rechunk intact (see the module docstring of
-  `rechunk/spatial.py`).
+**Severity: low.** Non-spatial `rechunk` now keeps object ids and carries
+object attributes and `links/0` of any width. It still refuses, before
+writing: a fragment shared by objects in different bins (a vertex can be
+stored in one bin only), vertices no object names, levels above 0, and
+fragment/link attributes (`rechunk_spatial` refuses those too).
 
 ---
 
