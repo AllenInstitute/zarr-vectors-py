@@ -35,7 +35,7 @@ _SHARDS = [None, (2, 2, 2)]
 
 def _needs(compressor):
     """zstd on the device needs nvCOMP's Python bindings."""
-    if compressor == "zstd":
+    if compressor == "zstd" or isinstance(compressor, list):
         pytest.importorskip("nvidia.nvcomp")
 
 
@@ -328,3 +328,28 @@ def test_a_missing_shard_reads_as_empty(tmp_path):
         read_cells(lg, cells, ["vertices"]),
         read_cells(lg, cells, ["vertices"], device="cuda", decode="device"),
     )
+
+
+def test_a_content_checksum_catches_a_cell_on_both_paths(tmp_path):
+    """A store opting in to zstd content checksums: host and device verify them."""
+    lg = _points(
+        tmp_path / "p.zarrvectors",
+        [{"name": "zstd", "configuration": {"level": 3, "checksum": True}}], None,
+    )
+    cells = _cells(lg)
+    arrays = ["vertices", "vertex_attributes/i", "vertex_attributes/rgb"]
+    _assert_same(read_cells(lg, cells, arrays),
+                 read_cells(lg, cells, arrays, device="cuda", decode="device"))
+    victim = _one_cell_file(lg)
+    data = bytearray(open(victim, "rb").read())
+    assert data[4] & 0x04                  # the frame carries a content checksum
+    data[-1] ^= 0xFF
+    open(victim, "wb").write(bytes(data))
+    host = read_cells(lg, cells, ["vertices"])
+    dev = read_cells(lg, cells, ["vertices"], device="cuda", decode="device")
+    assert len(host.errors) == 1
+    assert {(e.array, e.chunk_key) for e in dev.errors} == {
+        (e.array, e.chunk_key) for e in host.errors
+    }
+    assert "checksum" in dev.errors[0].message
+    np.testing.assert_array_equal(dev["vertices"].data.get(), host["vertices"].data)

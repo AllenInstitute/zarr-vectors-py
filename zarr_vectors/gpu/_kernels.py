@@ -83,13 +83,15 @@ void zv_unframe(const u64* ptrs, const i64* sizes, int n, const unsigned char* r
 // bytes over, 15 a block header is invalid, 16 block sizes contradict the
 // declared content size, 17 no content size declared.
 extern "C" __global__
-void zv_zstd_walk(const u64* ptrs, const i64* sizes, int n, i64* declared, int* status) {
+void zv_zstd_walk(const u64* ptrs, const i64* sizes, int n, i64* declared, int* status,
+                  u8* has_checksum) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= n) return;
     const u8* p = (const u8*)ptrs[i];
     i64 size = sizes[i];
     declared[i] = -1;
     status[i] = 0;
+    has_checksum[i] = 0;
     if (size < 5 || ld_u32(p) != 0xFD2FB528u) { status[i] = 10; return; }
     unsigned int fhd = p[4];
     int fcs_flag = fhd >> 6, single = (fhd >> 5) & 1, checksum = (fhd >> 2) & 1;
@@ -137,6 +139,82 @@ void zv_zstd_walk(const u64* ptrs, const i64* sizes, int n, i64* declared, int* 
     if (pos != size) { status[i] = 14; return; }
     if (known > fcs || fcs > known + compressed * (i64)bmax) { status[i] = 16; return; }
     declared[i] = fcs;
+    has_checksum[i] = (u8)checksum;
+}
+
+// XXH64 (seed 0), the hash a zstd frame's content checksum is the low 32
+// bits of (RFC 8878, 3.1.1). One thread per buffer: the hash is serial.
+#define P1 0x9E3779B185EBCA87ull
+#define P2 0xC2B2AE3D27D4EB4Full
+#define P3 0x165667B19E3779F9ull
+#define P4 0x85EBCA77C2B2AE63ull
+#define P5 0x27D4EB2F165667C5ull
+
+__device__ u64 rotl64(u64 x, int r) { return (x << r) | (x >> (64 - r)); }
+__device__ u64 xxh_round(u64 acc, u64 v) { acc += v * P2; return rotl64(acc, 31) * P1; }
+__device__ u64 xxh_merge(u64 acc, u64 v) { acc ^= xxh_round(0, v); return acc * P1 + P4; }
+__device__ u64 ld_u64(const u8* p, bool aligned) {
+    return aligned ? *(const u64*)p : (u64)ld_i64(p);
+}
+
+__device__ u64 xxh64(const u8* p, i64 len) {
+    const u8* end = p + len;
+    bool aligned = ((u64)p & 7) == 0;
+    u64 h;
+    if (len >= 32) {
+        u64 v1 = P1 + P2, v2 = P2, v3 = 0, v4 = 0 - P1;
+        const u8* limit = end - 32;
+        do {
+            v1 = xxh_round(v1, ld_u64(p, aligned));
+            v2 = xxh_round(v2, ld_u64(p + 8, aligned));
+            v3 = xxh_round(v3, ld_u64(p + 16, aligned));
+            v4 = xxh_round(v4, ld_u64(p + 24, aligned));
+            p += 32;
+        } while (p <= limit);
+        h = rotl64(v1, 1) + rotl64(v2, 7) + rotl64(v3, 12) + rotl64(v4, 18);
+        h = xxh_merge(h, v1); h = xxh_merge(h, v2);
+        h = xxh_merge(h, v3); h = xxh_merge(h, v4);
+    } else {
+        h = P5;
+    }
+    h += (u64)len;
+    while (p + 8 <= end) {
+        h ^= xxh_round(0, ld_u64(p, aligned));
+        h = rotl64(h, 27) * P1 + P4;
+        p += 8;
+    }
+    if (p + 4 <= end) {
+        h ^= (u64)ld_u32(p) * P1;
+        h = rotl64(h, 23) * P2 + P3;
+        p += 4;
+    }
+    while (p < end) {
+        h ^= (u64)(*p) * P5;
+        h = rotl64(h, 11) * P1;
+        ++p;
+    }
+    h ^= h >> 33; h *= P2;
+    h ^= h >> 29; h *= P3;
+    h ^= h >> 32;
+    return h;
+}
+
+extern "C" __global__
+void zv_xxh64(const u64* ptrs, const i64* sizes, int n, u64* out) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    out[i] = xxh64((const u8*)ptrs[i], sizes[i]);
+}
+
+// Decoded buffer i against the 4-byte content checksum ending its frame:
+// ok[i] = 1 when the low 32 bits of its XXH64 match.
+extern "C" __global__
+void zv_zstd_checksum(const u64* ptrs, const i64* sizes, const u64* frame_ends, int n,
+                      u8* ok) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    unsigned int stored = ld_u32((const u8*)frame_ends[i] - 4);
+    ok[i] = (unsigned int)(xxh64((const u8*)ptrs[i], sizes[i]) & 0xFFFFFFFFull) == stored;
 }
 
 // Check one ZVFG fragment-index blob (zarr_vectors.encoding.fragments)
@@ -279,13 +357,32 @@ def unframe(
     return payload.get(), length.get(), status.get()
 
 
-def zstd_walk(ptrs: Any, sizes: Any) -> tuple[np.ndarray, np.ndarray]:
-    """Declared content sizes and structural statuses of zstd frames (host)."""
+def zstd_walk(ptrs: Any, sizes: Any) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Declared content sizes, structural statuses and content-checksum
+    flags of zstd frames (host)."""
     n = int(ptrs.size)
     declared = cp.empty(n, dtype=cp.int64)
     status = cp.empty(n, dtype=cp.int32)
-    _launch("zv_zstd_walk", n, (ptrs, sizes, np.int32(n), declared, status))
-    return declared.get(), status.get()
+    has_checksum = cp.zeros(n, dtype=cp.uint8)
+    _launch("zv_zstd_walk", n, (ptrs, sizes, np.int32(n), declared, status, has_checksum))
+    return declared.get(), status.get(), has_checksum.get().astype(bool)
+
+
+def xxh64(ptrs: Any, sizes: Any) -> np.ndarray:
+    """XXH64 (seed 0) of each device buffer, on the host (``uint64``)."""
+    n = int(ptrs.size)
+    out = cp.empty(n, dtype=cp.uint64)
+    _launch("zv_xxh64", n, (ptrs, sizes, np.int32(n), out))
+    return out.get()
+
+
+def zstd_checksums_match(ptrs: Any, sizes: Any, frame_ends: Any) -> np.ndarray:
+    """Whether each decoded buffer matches the content checksum in the last
+    four bytes before ``frame_ends[i]`` (host, ``bool``)."""
+    n = int(ptrs.size)
+    ok = cp.zeros(n, dtype=cp.uint8)
+    _launch("zv_zstd_checksum", n, (ptrs, sizes, frame_ends, np.int32(n), ok))
+    return ok.get().astype(bool)
 
 
 def gather(ptrs: Any, lengths: np.ndarray, dest: np.ndarray, total: int) -> Any:
@@ -356,4 +453,5 @@ UNFRAME_ERRORS = {
     15: "zstd frame has an invalid block header",
     16: "zstd frame's blocks contradict its declared content size",
     17: "zstd frame does not declare its content size",
+    18: "zstd frame's content checksum does not match its decoded bytes",
 }

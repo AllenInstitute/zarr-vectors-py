@@ -76,6 +76,23 @@ result, element for element, errors included.
 Use `decode="device"` only on stores you trust. nvCOMP does not check the
 inside of a compressed block, and damaged data can kill the CUDA context.
 
+A store can also carry a content checksum in every zstd frame:
+
+```python
+root = zb.create_store(path, bounds=..., chunk_shape=...,
+                       compressor=[{"name": "zstd",
+                                    "configuration": {"level": 3, "checksum": True}}])
+```
+
+The checksum is part of the zstd frame format, so every zstd reader reads
+these frames, and the codec's `checksum` setting is part of the Zarr v3 zstd
+codec. The host decoder verifies it, and so does the device decoder (after
+nvCOMP, one GPU thread per cell): a cell whose decoded bytes do not match is
+an error, not data. A checksum catches wrong bytes only. It cannot stop
+nvCOMP from hanging or crashing on a damaged block, because it is checked
+after decompression. The rule for `decode="device"` still holds. Stores
+written without checksums are unchanged and read as before.
+
 Local files are read into pinned host memory and copied up once. When cuFile
 reports GPUDirect Storage, kvikio reads them straight into device memory.
 `io="kvikio"` or `io="host"` forces the choice for one call, and

@@ -3,9 +3,12 @@
 nvCOMP does not validate its input, so a frame reaches it only after
 :func:`~zarr_vectors.gpu._kernels.zstd_walk` has checked its structure, and
 an output is kept only when its length is the declared content size;
-failures are reported per cell. Damage inside a block can still hang nvCOMP
-or kill the CUDA context, which is why ``read_cells`` decodes on the device
-only under ``decode="device"`` (see ``docs/how_to/gpu.md``). Compression is
+failures are reported per cell. A frame written with a content checksum
+(zstd ``checksum=True``) is verified after decoding, as the host decoder
+does, so wrong bytes are reported rather than returned. Damage inside a
+block can still hang nvCOMP or kill the CUDA context before any check
+runs, which is why ``read_cells`` decodes on the device only under
+``decode="device"`` (see ``docs/how_to/gpu.md``). Compression is
 never done here: device-written stores are compressed on the host.
 """
 
@@ -141,7 +144,7 @@ def decode_frames(
         return outputs, errors
     stream = stream if stream is not None else cp.cuda.get_current_stream()
     with stream:
-        declared, walked = _kernels.zstd_walk(
+        declared, walked, has_checksum = _kernels.zstd_walk(
             cp.asarray(np.asarray(ptrs, dtype=np.uint64)),
             cp.asarray(np.asarray(sizes, dtype=np.int64)),
         )
@@ -172,6 +175,23 @@ def decode_frames(
             errors[j] = f"zstd frame decoded to {got} bytes; its header declares {int(declared[j])}"
             continue
         outputs[j] = d
+    # Frames written with a content checksum (zstd checksum=True) are
+    # checked against it, as the host decoder does: wrong bytes out of a
+    # damaged block become an error rather than data.
+    summed = [j for j in range(n) if outputs[j] is not None and has_checksum[j]]
+    if summed:
+        with stream:
+            ok = _kernels.zstd_checksums_match(
+                cp.asarray(np.array([device_pointer(outputs[j]) for j in summed], np.uint64)),
+                cp.asarray(np.array([device_nbytes(outputs[j]) for j in summed], np.int64)),
+                cp.asarray(np.array(
+                    [int(ptrs[j]) + int(sizes[j]) for j in summed], dtype=np.uint64,
+                )),
+            )
+        for j, good_sum in zip(summed, ok.tolist()):
+            if not good_sum:
+                errors[j] = _kernels.UNFRAME_ERRORS[18]
+                outputs[j] = None
     return outputs, errors
 
 
