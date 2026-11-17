@@ -100,6 +100,7 @@ def _answers(ds):
     return boxes, _sorted(ds.level(0).objects[OBJECTS].positions)
 
 
+@pytest.mark.slow
 @pytest.mark.parametrize("where", ["local", "store"])
 @pytest.mark.parametrize("reader", READERS)
 @pytest.mark.parametrize("codec", list(CODECS))

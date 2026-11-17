@@ -137,6 +137,7 @@ def test_base_oid_truncation(tmp_path: Path):
     np.testing.assert_array_equal(out[n:], new_lengths)
 
 
+@pytest.mark.slow
 def test_chunk_boundary_correctness(tmp_path: Path):
     bucket = OBJECT_INDEX_MANIFEST_BUCKET
     base = bucket - 4  # start just below a bucket boundary

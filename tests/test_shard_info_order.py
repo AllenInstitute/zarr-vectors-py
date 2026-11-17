@@ -11,6 +11,7 @@ from __future__ import annotations
 from collections import defaultdict
 
 import numpy as np
+import pytest
 
 from zarr_vectors.multiresolution.coarsen import build_pyramid
 from zarr_vectors.sharding.io import get_shard_info, shard_store
@@ -39,6 +40,7 @@ def test_arrays_are_sorted_by_level_then_path(tmp_path):
     assert keys == sorted(keys)
 
 
+@pytest.mark.slow
 def test_link_arrays_share_the_level_grid(tmp_path):
     for i, bounds in enumerate((([0.0] * 3, [100.0] * 3), None)):
         sub = tmp_path / str(i)

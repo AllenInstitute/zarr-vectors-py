@@ -91,6 +91,7 @@ def _answer(path, sel, remote):
     return out
 
 
+@pytest.mark.slow
 @pytest.mark.parametrize("kind", ["point_cloud", "mesh", "graph"])
 @pytest.mark.parametrize("shard", [None, 4])
 @pytest.mark.parametrize("remote", [False, True], ids=["local", "remote"])

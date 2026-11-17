@@ -5,12 +5,19 @@ name: Tests
 # maintainer to add the `ci-approved` label before tests will run.
 # Re-running after the label is added is automatic (the `labeled`
 # trigger re-evaluates the gate).
+#
+# Two tiers.  PRs run the fast tier: every test not marked `slow`, in
+# parallel (a few minutes).  Pushes to main, the nightly run and a manual
+# run add the ~30 slow tests (large round trips, octree conversions).
 
 on:
   push:
     branches: [main]
   pull_request:
     types: [opened, synchronize, reopened, labeled]
+  schedule:
+    - cron: '0 6 * * *'   # nightly full tier on main
+  workflow_dispatch:
 
 # Cancel superseded runs on the same ref (avoids piling up jobs when a
 # PR is force-pushed several times in a row).
@@ -27,7 +34,7 @@ jobs:
     name: Approval gate
     runs-on: ubuntu-latest
     if: >-
-      github.event_name == 'push' ||
+      github.event_name != 'pull_request' ||
       github.event.pull_request.author_association == 'OWNER' ||
       github.event.pull_request.author_association == 'MEMBER' ||
       github.event.pull_request.author_association == 'COLLABORATOR' ||
@@ -43,6 +50,8 @@ jobs:
     name: pytest (py${{ matrix.python-version }})
     needs: gate
     runs-on: ubuntu-latest
+    # A hung test fails the job instead of holding it for GitHub's 6 h limit.
+    timeout-minutes: ${{ github.event_name == 'pull_request' && 15 || 30 }}
     strategy:
       fail-fast: false
       matrix:
@@ -70,4 +79,12 @@ jobs:
         run: uv run python schema/regen.py --check
 
       - name: Run tests
-        run: uv run pytest tests/ --ignore=tests/integration -v
+        # -n auto: one worker per core.  --timeout: per test, so one hang
+        # names itself.  --durations: the slowest tests, to spot new ones
+        # that belong under @pytest.mark.slow.
+        env:
+          TIER: ${{ github.event_name == 'pull_request' && 'not slow' || '' }}
+        run: >-
+          uv run pytest tests/ --ignore=tests/integration
+          -n auto --timeout=300 --durations=15 -q -rfE
+          ${TIER:+-m "$TIER"}

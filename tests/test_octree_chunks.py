@@ -189,6 +189,7 @@ def graph_store(request, tmp_path):
     return path, pos, edges, oids
 
 
+@pytest.mark.slow
 def test_round_trip_is_exact(graph_store):
     path = graph_store[0]
     before = _snapshot(path)
@@ -207,6 +208,7 @@ def test_round_trip_is_exact(graph_store):
     assert _no_staging(path)
 
 
+@pytest.mark.slow
 def test_marked_while_octree_and_unmarked_after(graph_store):
     path = graph_store[0]
     to_octree(path, target=300)
@@ -245,6 +247,7 @@ def _uniform_and_octree(graph_store, tmp_path):
     {}, {"bbox": ([50, 50, 50], [180, 160, 170])}, {"bbox": ([0, 0, 0], [30, 30, 30])},
     {"object_ids": [3]}, {"object_ids": [0, 17, 150, 199]},
 ])
+@pytest.mark.slow
 def test_graph_reads_match_the_uniform_level(graph_store, tmp_path, query):
     uni, octr = _uniform_and_octree(graph_store, tmp_path)
     a, b = read_graph(uni, **query), read_graph(octr, **query)
@@ -257,6 +260,7 @@ def test_graph_reads_match_the_uniform_level(graph_store, tmp_path, query):
         assert ka == kb
 
 
+@pytest.mark.slow
 def test_leaves_and_seams_hold_every_link_once(graph_store, tmp_path):
     _, octr = _uniform_and_octree(graph_store, tmp_path)
     path, pos, edges, _ = graph_store
@@ -296,6 +300,7 @@ def _reads(path, monkeypatch, once):
     return out
 
 
+@pytest.mark.slow
 @pytest.mark.parametrize("kind", ["graph", "points"])
 def test_octree_read_once_answers_as_before(graph_store, tmp_path, monkeypatch, kind):
     _, octr = _uniform_and_octree(graph_store, tmp_path)
@@ -347,6 +352,7 @@ def test_uniform_cell_whitelists_are_refused(graph_store, tmp_path):
         read_graph(octr, chunks=[(0, 0, 0)])
 
 
+@pytest.mark.slow
 def test_point_clouds_round_trip_and_read(tmp_path):
     pos = _uneven(seed=4)
     oids = (np.arange(len(pos)) // 100).astype(np.int64)
@@ -414,6 +420,7 @@ def _object_reads(path, ids, reader=read_graph):
     return out
 
 
+@pytest.mark.slow
 @pytest.mark.parametrize("shard", [None, 4])
 def test_sparse_object_ids_are_kept_both_ways(tmp_path, shard):
     path = tmp_path / "sparse.zv"
@@ -558,6 +565,7 @@ _STAGE_FAILURES = [
     *[(*f, None) for f in _STAGE_FAILURES], ("_write_octree_links", 1, _Boom, None),
     ("write_chunk_vertices", 40, KeyboardInterrupt, 4), ("_write_octree_links", 1, _Boom, 4),
 ])
+@pytest.mark.slow
 def test_to_octree_failing_while_staging_leaves_the_level_intact(tmp_path, monkeypatch, shard, name, nth, exc):
     path = tmp_path / "g.zv"
     _small_graph(path, lambda n: np.arange(n) // 40, shard=shard)
@@ -578,6 +586,7 @@ def test_to_octree_failing_while_staging_leaves_the_level_intact(tmp_path, monke
     assert _state(path) == before
 
 
+@pytest.mark.slow
 @pytest.mark.parametrize("name,nth,exc", [*_STAGE_FAILURES, ("write_links", 1, _Boom)])
 def test_to_uniform_failing_while_staging_leaves_the_level_intact(tmp_path, monkeypatch, name, nth, exc):
     path = tmp_path / "g.zv"
@@ -596,6 +605,7 @@ def test_to_uniform_failing_while_staging_leaves_the_level_intact(tmp_path, monk
     assert _state(path) == uniform
 
 
+@pytest.mark.slow
 @pytest.mark.parametrize("nth,shard", [(1, None), (3, 4), (5, None)])
 def test_to_octree_killed_during_the_swap_is_finished_by_the_next_call(tmp_path, monkeypatch, shard, nth):
     path = tmp_path / "g.zv"
@@ -782,6 +792,7 @@ def _cross_deltas(path, level):
     return [d for d in (-1, 1) if list_link_offsets(lg, d)]
 
 
+@pytest.mark.slow
 def test_links_between_levels_are_refused_both_ways(tmp_path):
     path = tmp_path / "pyr.zv"
     _pyramid(path)
@@ -906,6 +917,7 @@ def test_leaf_cap_arguments():
         plan_leaves(cells, counts, target=1200, origin_cell=(1, 0, 0), shard_shape=(4, 4, 4))
 
 
+@pytest.mark.slow
 @pytest.mark.parametrize("shard", SHARDS)
 def test_to_octree_fits_leaves_to_the_shards(tmp_path, shard):
     from zarr_vectors.octree_chunks.convert import array_shard_grid
@@ -963,6 +975,7 @@ def test_max_leaf_cells_on_an_unsharded_level(tmp_path):
     assert _snapshot(path) == before
 
 
+@pytest.mark.slow
 def test_a_level_sharded_by_shard_store_keeps_its_shards(tmp_path):
     """Packing follows the level's arrays, not only the root declaration,
     which ``shard_store`` does not write."""
@@ -981,6 +994,7 @@ def test_a_level_sharded_by_shard_store_keeps_its_shards(tmp_path):
     assert _snapshot(path) == before
 
 
+@pytest.mark.slow
 def test_validate_flags_leaves_a_reshard_splits(tmp_path):
     from zarr_vectors.octree_chunks.convert import array_shard_grid
     from zarr_vectors.sharding.io import reshard
@@ -1096,6 +1110,7 @@ def _graph_for_shards(path, shard):
     return pos, edges
 
 
+@pytest.mark.slow
 @pytest.mark.parametrize("shard,via", [((2, 2, 2), "local"), ((6, 6, 6), "local"),
                                        ((3, 5, 7), "local"), ((3, 5, 7), "wrapper")])
 def test_to_octree_with_fit_shards_false(tmp_path, shard, via):
@@ -1136,6 +1151,7 @@ def test_to_octree_with_fit_shards_false(tmp_path, shard, via):
     assert (path / "zarr.json").read_bytes() == (uniform / "zarr.json").read_bytes()
 
 
+@pytest.mark.slow
 def test_to_octree_fit_shards_false_takes_a_cap_wider_than_the_shards(tmp_path):
     from zarr_vectors.validate import validate
 
@@ -1212,6 +1228,7 @@ def test_root_metadata_round_trips_required_capabilities():
     assert "required_capabilities" not in meta.to_dict()["zarr_vectors"]
 
 
+@pytest.mark.slow
 @pytest.mark.parametrize("rewrite", ["shard_store", "unshard_store", "set_octree", "set_bounds", "coarsen_level"])
 def test_rewrites_of_the_root_keep_required_capabilities(tmp_path, rewrite):
     from zarr_vectors import sharding
@@ -1247,6 +1264,7 @@ def test_rewrites_of_the_root_keep_required_capabilities(tmp_path, rewrite):
     assert _required(path) == ["additive_levels"]
 
 
+@pytest.mark.slow
 def test_validate_warns_on_a_missing_or_stale_octree_capability(tmp_path):
     from zarr_vectors.octree_chunks import refresh_capabilities
     from zarr_vectors.validate import validate
@@ -1281,6 +1299,7 @@ def test_validate_warns_on_a_missing_or_stale_octree_capability(tmp_path):
     assert (path / "zarr.json").read_bytes() == root_json
 
 
+@pytest.mark.slow
 @pytest.mark.parametrize("value", [7, True, "additive_levels", {"a": 1}])
 def test_a_required_capabilities_that_is_not_a_list_is_left_alone(tmp_path, value):
     """Malformed, so not ours to rewrite: the store still opens, reads and
