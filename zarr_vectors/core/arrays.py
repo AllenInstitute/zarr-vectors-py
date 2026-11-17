@@ -37,6 +37,7 @@ from zarr_vectors.constants import (
     VERTEX_FRAGMENTS,
     VERTICES,
 )
+from zarr_vectors.core import convention as _zvc
 
 # Group, not FsGroup: FsGroup is a no-op subclass that create_store and
 # open_store return only when the backing store happens to be a
@@ -750,7 +751,7 @@ def _array_matches_layout(
 
     # A "no" from the manifest can't be trusted (record_presence=False,
     # lost updates), so only that answer is checked against the store.
-    if existing.attrs.get("nonempty_chunks"):
+    if _zvc.get_field(existing.attrs, "nonempty_chunks"):
         has_data = True
     else:
         has_data = level_group._array_has_stored_data(array_name)
@@ -2915,7 +2916,7 @@ def _index_sid_ndim(level_group: Group) -> int:
     from zarr_vectors.core.sources import chunk_sources
 
     if chunk_sources(level_group) is not None:
-        dims = (level_group.attrs.get("zarr_vectors_level") or {}).get("chunk_dims") or []
+        dims = (level_group.attrs.get("zarr_vectors") or {}).get("chunk_dims") or []
         if dims:
             return len(dims)
     return _infer_vert_ndim(level_group)
@@ -3410,7 +3411,7 @@ def write_object_attribute_columns(
     for name, data in host.items():
         full_name = f"{OBJECT_ATTRIBUTES}/{name}"
         node = level_group._lookup_node(full_name)
-        meta = dict(node.attrs) if isinstance(node, zarr.Array) else {}
+        meta = _zvc.unwrap_array_meta(node.attrs) if isinstance(node, zarr.Array) else {}
         shape = tuple(meta.get("shape") or ())
         n0 = int(shape[0]) if shape else 0
         start = n0 if at is None else int(at)
@@ -6772,8 +6773,8 @@ def read_chunk_link_attributes(
 def _infer_vert_ndim(level_group: Group) -> int:
     """Best-effort lookup of the spatial-index dimensionality.
 
-    Reads NGFF ``multiscales[0].axes`` length from root attrs.  Falls
-    back to 3 when unavailable.
+    Reads the length of the root's ``zarr_vectors.axes``.  Falls back to
+    3 when unavailable.
     """
     try:
         # Level groups don't carry root attrs; walk up to root via the
@@ -6781,11 +6782,10 @@ def _infer_vert_ndim(level_group: Group) -> int:
         # the root path.
         from zarr_vectors.core.group import Group
         root_handle = Group._from_backend(level_group._backend, "")
-        ms = root_handle.attrs.to_dict().get("multiscales") or []
-        if ms and isinstance(ms, list):
-            axes = ms[0].get("axes") or []
-            if axes:
-                return len(axes)
+        zv = root_handle.attrs.to_dict().get("zarr_vectors") or {}
+        axes = zv.get("axes") or []
+        if axes:
+            return len(axes)
     except Exception:
         pass
     return 3

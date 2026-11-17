@@ -42,12 +42,12 @@ def _set_flag(store, value=True, level=0):
     """Force the claim, without going through a writer."""
     root = open_store(store, mode="a")
     lg = get_resolution_level(root, level)
-    meta = dict(lg.attrs.get("zarr_vectors_level"))
+    meta = dict(lg.attrs.get("zarr_vectors"))
     if value:
         meta["link_fragments_aligned"] = True
     else:
         meta.pop("link_fragments_aligned", None)
-    lg.attrs.update({"zarr_vectors_level": meta})
+    lg.attrs.update({"zarr_vectors": meta})
 
 
 @pytest.fixture

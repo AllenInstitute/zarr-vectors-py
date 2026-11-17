@@ -26,6 +26,7 @@ import pytest
 
 from zarr_vectors.building import rebuild_presence
 from zarr_vectors.core.arrays import create_vertices_array
+from zarr_vectors.core.convention import set_field
 from zarr_vectors.core.store import create_store, get_resolution_level
 from zarr_vectors.exceptions import ShardedPresenceError
 
@@ -75,7 +76,7 @@ def test_derive_on_sharded_array_recovers_every_cell(tmp_store_path):
     arr = root._sharded_chunk_array(name)
     assert arr.shards == (2, 2, 2)
 
-    arr.attrs["nonempty_chunks"] = []      # as a lost update would leave it
+    set_field(arr.attrs, "nonempty_chunks", [])      # as a lost update would leave it
     assert root.list_chunks(name) == []
 
     assert root.derive_nonempty_chunks(name) == expected
@@ -88,7 +89,7 @@ def test_derive_recovers_a_cell_from_a_partial_edge_shard(tmp_store_path):
     name = _sharded(root, grid_shape=(3, 3, 3), shard_shape=(2, 2, 2))
     expected = _write(root, name, [(2, 2, 2)])
 
-    root._sharded_chunk_array(name).attrs["nonempty_chunks"] = []
+    set_field(root._sharded_chunk_array(name).attrs, "nonempty_chunks", [])
     assert root.derive_nonempty_chunks(name) == expected
 
 
@@ -98,7 +99,7 @@ def test_derive_handles_a_shard_larger_than_the_array(tmp_store_path):
     name = _sharded(root, grid_shape=(2, 2, 2), shard_shape=(8, 8, 8))
     expected = _write(root, name, [(0, 0, 0), (1, 1, 1)])
 
-    root._sharded_chunk_array(name).attrs["nonempty_chunks"] = []
+    set_field(root._sharded_chunk_array(name).attrs, "nonempty_chunks", [])
     assert root.derive_nonempty_chunks(name) == expected
 
 
@@ -109,7 +110,7 @@ def test_derive_excludes_empty_payload_cells(tmp_store_path):
     expected = _write(root, name, [(0, 0, 0)])
     root.write_bytes(name, "0.0.1", b"")
 
-    root._sharded_chunk_array(name).attrs["nonempty_chunks"] = []
+    set_field(root._sharded_chunk_array(name).attrs, "nonempty_chunks", [])
     assert root.derive_nonempty_chunks(name) == expected
 
 
@@ -121,7 +122,7 @@ def test_derive_honours_the_chunk_grid_origin(tmp_store_path):
     )
     expected = _write(root, "sh", [(10, 20, 30), (13, 23, 33)])
 
-    root._sharded_chunk_array("sh").attrs["nonempty_chunks"] = []
+    set_field(root._sharded_chunk_array("sh").attrs, "nonempty_chunks", [])
     assert root.derive_nonempty_chunks("sh") == expected
 
 
@@ -143,7 +144,7 @@ def test_derive_reads_one_object_per_present_shard(tmp_store_path):
     _write(root, name, [
         (i, j, k) for i in (0, 3) for j in (0, 3) for k in (0, 3)
     ])
-    root._sharded_chunk_array(name).attrs["nonempty_chunks"] = []
+    set_field(root._sharded_chunk_array(name).attrs, "nonempty_chunks", [])
 
     store = root._zarr.store
     original = store.get
@@ -183,7 +184,7 @@ def test_on_sharded_skip_returns_the_recorded_manifest(tmp_store_path):
     expected = _write(root, name, [(0, 0, 0)])
     assert root.derive_nonempty_chunks(name, on_sharded="skip") == expected
 
-    root._sharded_chunk_array(name).attrs["nonempty_chunks"] = []
+    set_field(root._sharded_chunk_array(name).attrs, "nonempty_chunks", [])
     assert root.derive_nonempty_chunks(name, on_sharded="skip") == []
 
 
@@ -193,7 +194,7 @@ def test_an_unsharded_array_is_unaffected(tmp_store_path):
     root.create_sharded_chunk_array("flat", (4, 4, 4))
     expected = _write(root, "flat", [(0, 0, 0), (2, 2, 2)])
 
-    root._sharded_chunk_array("flat").attrs["nonempty_chunks"] = []
+    set_field(root._sharded_chunk_array("flat").attrs, "nonempty_chunks", [])
     assert root.derive_nonempty_chunks("flat") == expected
 
 
@@ -206,7 +207,7 @@ def test_rebuild_presence_level_wide_includes_sharded_arrays(tmp_store_path):
     lg.write_bytes("vertices", "0.0.0", b"payload")
     assert lg.list_chunks("vertices") == ["0.0.0"]
 
-    lg._sharded_chunk_array("vertices").attrs["nonempty_chunks"] = []
+    set_field(lg._sharded_chunk_array("vertices").attrs, "nonempty_chunks", [])
     rebuilt = rebuild_presence(lg)
 
     assert "vertices" in rebuilt, f"sharded array was skipped: {rebuilt}"
@@ -218,7 +219,7 @@ def test_rebuild_presence_single_array_form_rebuilds_a_sharded_array(
 ):
     lg = _sharded_level(tmp_store_path)
     lg.write_bytes("vertices", "1.2.3", b"payload")
-    lg._sharded_chunk_array("vertices").attrs["nonempty_chunks"] = []
+    set_field(lg._sharded_chunk_array("vertices").attrs, "nonempty_chunks", [])
 
     assert rebuild_presence(lg, "vertices") == ["1.2.3"]
 
@@ -229,7 +230,7 @@ def test_rebuild_presence_skip_still_leaves_sharded_arrays_alone(
     """And still reports them as not rebuilt."""
     lg = _sharded_level(tmp_store_path)
     lg.write_bytes("vertices", "0.0.0", b"payload")
-    lg._sharded_chunk_array("vertices").attrs["nonempty_chunks"] = []
+    set_field(lg._sharded_chunk_array("vertices").attrs, "nonempty_chunks", [])
 
     rebuilt = rebuild_presence(lg, on_sharded="skip")
     assert "vertices" not in rebuilt

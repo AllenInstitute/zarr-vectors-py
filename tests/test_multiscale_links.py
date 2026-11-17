@@ -281,7 +281,7 @@ def test_default_zv_version_is_09():
     md = _minimal_root_md()
     md.validate()
     assert md.zv_version == FORMAT_VERSION
-    assert FORMAT_VERSION.startswith("0.9")
+    assert FORMAT_VERSION.startswith("0.10")
 
 
 def test_pre_05_zv_version_rejected():
@@ -296,17 +296,7 @@ def test_pre_05_zv_version_rejected_on_roundtrip():
     both freshly-constructed and freshly-loaded stores."""
     md = _minimal_root_md(zv_version="0.4.1")
     md.zv_version = "0.4.1"
-    d = md.to_dict()
-    # 0.5.0 from_dict reads axes from the NGFF multiscales block; inject
-    # a minimal one so the round trip can complete.
-    d["multiscales"] = [{
-        "version": "0.4",
-        "axes": list(md.spatial_index_dims),
-        "datasets": [{"path": "0", "coordinateTransformations": [
-            {"type": "scale", "scale": [1.0] * md.sid_ndim},
-        ]}],
-        "metadata": {"format": "zarr_vectors"},
-    }]
+    d = md.to_dict()  # axes are part of the root object (0.10.0)
     reloaded = RootMetadata.from_dict(d)
     with pytest.raises(MetadataError):
         reloaded.validate()

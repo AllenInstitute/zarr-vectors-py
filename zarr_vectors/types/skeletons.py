@@ -61,7 +61,6 @@ from zarr_vectors.core.arrays import (
     write_links,
 )
 from zarr_vectors.core.metadata import LevelMetadata
-from zarr_vectors.core.multiscale import upsert_level_transform
 from zarr_vectors.core.store import (
     _create_or_open_store,
     _ensure_root_metadata_for_write,
@@ -85,7 +84,7 @@ SEGMENT_ID_ATTR = "segment_id"
 # Stored vertices are shifted by this per-axis offset so the chunk grid
 # (spec convention: chunk = floor(pos / chunk_shape), origin 0) aligns to
 # the source ``.frag`` grid.  World position = stored + coordinate_offset;
-# also mirrored into the NGFF ``translation`` transform on every level.
+# (format 0.10.0 has no NGFF block to mirror it into).
 COORDINATE_OFFSET_KEY = "coordinate_offset"
 
 
@@ -415,10 +414,6 @@ def init_skeleton_store(
             create_attribute_array(level_group, name, dtype=dt)
     if coordinate_offset is not None and any(float(x) != 0 for x in coordinate_offset):
         set_coordinate_offset(root, coordinate_offset)
-        upsert_level_transform(
-            root, 0, scale=[1.0] * ndim,
-            translation=[float(x) for x in coordinate_offset],
-        )
     return root, level_group
 
 

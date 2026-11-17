@@ -80,6 +80,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from zarr_vectors.constants import OCTREE_CODEC_NAMES
+from zarr_vectors.core import convention as _zvc
 from zarr_vectors.core.group import _parse_chunk_coords
 from zarr_vectors.core.store import (
     get_resolution_level,
@@ -287,7 +288,7 @@ def shard_store(
             # re-sharding only repacks cells into shards, it does not
             # change the grid.
             grid_shape = tuple(int(s) for s in existing.shape)
-            raw_origin = existing.attrs.get("chunk_grid_origin")
+            raw_origin = _zvc.get_field(existing.attrs, "chunk_grid_origin")
             origin: tuple[int, ...] | None = (
                 tuple(int(x) for x in raw_origin) if raw_origin else None
             )
@@ -415,7 +416,7 @@ def unshard_store(
                 continue  # already unsharded
 
             grid_shape = tuple(int(s) for s in existing.shape)
-            raw_origin = existing.attrs.get("chunk_grid_origin")
+            raw_origin = _zvc.get_field(existing.attrs, "chunk_grid_origin")
             origin = (
                 tuple(int(x) for x in raw_origin) if raw_origin else None
             )
@@ -706,7 +707,7 @@ def _convert_sharded_array(
     Returns the cell count."""
     grid_shape = tuple(int(s) for s in existing.shape)
     shard_shape = tuple(int(s) for s in existing.shards)
-    raw_origin = existing.attrs.get("chunk_grid_origin")
+    raw_origin = _zvc.get_field(existing.attrs, "chunk_grid_origin")
     origin = tuple(int(x) for x in raw_origin) if raw_origin else None
     inner = list(existing.metadata.codecs[0].codecs[1:])  # after vlen-bytes: the cells' compressors
     chunk_keys = [k for k in level.list_chunks(array_name) if _parse_chunk_coords(k) is not None]

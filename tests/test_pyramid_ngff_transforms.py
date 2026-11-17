@@ -13,10 +13,8 @@ import pytest
 
 from zarr_vectors.core.multiscale import (
     read_level_transform,
-    write_multiscale_metadata,
 )
 from zarr_vectors.core.store import (
-    get_resolution_level,
     open_store,
     read_level_metadata,
 )
@@ -65,38 +63,27 @@ def test_bin_geometry_still_reads_back(pyramid):
         assert lm.bin_shape == pytest.approx((10.0 * ratio,) * 3)
 
 
-def _make_old_layout(store):
-    """Rewrite a store the way it was written before: bins only in NGFF."""
-    root = open_store(store, mode="r+")
-    attrs = root.attrs.to_dict()
-    for ds in attrs["multiscales"][0]["datasets"]:
-        level = int(ds["path"])
-        if level == 0:
-            continue
-        lg = get_resolution_level(root, level)
-        zvl = dict(lg.attrs.to_dict()["zarr_vectors_level"])
-        ratio = zvl.pop("bin_ratio")
-        shape = zvl.pop("bin_shape")
-        # Top-level keys are replaced whole, so this drops the two fields.
-        lg.attrs.update({"zarr_vectors_level": zvl})
-        ds["coordinateTransformations"] = [
-            {"type": "scale", "scale": ratio},
-            {"type": "translation", "translation": [b / 2 for b in shape]},
-        ]
-    root.attrs.update(attrs)
-    return root
+def test_migration_moves_ngff_only_bins_into_the_level():
+    """Stores older than the per-level bin fields kept a coarse level's
+    bins only in its NGFF entry.  Format 0.10.0 drops that block, so the
+    0.10.0 migration copies them into the level's own object."""
+    from zarr_vectors.core.migrate import _migrate_level, _ngff_bins
 
+    root_attrs = {"multiscales": [{"datasets": [
+        {"path": "0", "coordinateTransformations": [
+            {"type": "scale", "scale": [1.0] * 3},
+            {"type": "translation", "translation": [5.0] * 3}]},
+        {"path": "2", "coordinateTransformations": [
+            {"type": "scale", "scale": [4.0] * 3},
+            {"type": "translation", "translation": [20.0] * 3}]},
+    ]}]}
+    bins = _ngff_bins(root_attrs)
+    assert bins == {"2": {"bin_ratio": [4.0] * 3, "bin_shape": [40.0] * 3}}
 
-def test_old_layout_reads_and_regenerates(pyramid):
-    root = _make_old_layout(pyramid)
-    lg = get_resolution_level(root, 2)
-    assert "bin_ratio" not in lg.attrs.to_dict()["zarr_vectors_level"]
-    assert read_level_metadata(root, 2).bin_ratio == pytest.approx((4.0,) * 3)
-
-    write_multiscale_metadata(root)
-    root = open_store(pyramid)
-    s0, t0 = read_level_transform(root, 0)
-    assert read_level_transform(root, 2) == (s0, t0)
-    lm = read_level_metadata(root, 2)
-    assert lm.bin_ratio == pytest.approx((4.0,) * 3)
-    assert lm.bin_shape == pytest.approx((40.0,) * 3)
+    level = _migrate_level("2", {"zarr_vectors_level": {"level": 2}}, bins["2"])
+    assert level["zarr_vectors"] == {
+        "kind": "level", "level": 2, "bin_ratio": [4.0] * 3, "bin_shape": [40.0] * 3,
+    }
+    # A level that already carries its bins keeps them.
+    own = {"zarr_vectors_level": {"level": 2, "bin_ratio": [3.0] * 3}}
+    assert _migrate_level("2", own, bins["2"])["zarr_vectors"]["bin_ratio"] == [3.0] * 3

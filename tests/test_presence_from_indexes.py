@@ -21,6 +21,7 @@ import zarr
 from zarr_vectors import building as zb
 from zarr_vectors.core import _cells_on_disk as cod
 from zarr_vectors.core import arrays as A
+from zarr_vectors.core.convention import get_field, set_field
 from zarr_vectors.exceptions import PresenceMismatchError
 
 
@@ -172,7 +173,7 @@ def test_stored_objects_skip_what_is_not_a_chunk(tmp_path):
 
 
 def _manifest(lg, name="vertices"):
-    return sorted(lg._sharded_chunk_array(name).attrs.get("nonempty_chunks") or [])
+    return sorted(get_field(lg._sharded_chunk_array(name).attrs, "nonempty_chunks") or [])
 
 
 @pytest.mark.parametrize("store", ["local", "memory"])
@@ -182,7 +183,7 @@ def test_exact_claims_pass_and_are_written(tmp_path, store, shard, verify):
     rng = np.random.default_rng(4)
     lg = _level(_stores(tmp_path)[store](), shard=shard)
     written = _fill(lg, rng, 30, empties=4)
-    lg._sharded_chunk_array("vertices").attrs["nonempty_chunks"] = []
+    set_field(lg._sharded_chunk_array("vertices").attrs, "nonempty_chunks", [])
     assert zb.set_presence(lg, {"vertices": written}, verify=verify) == ["vertices"]
     assert _manifest(lg) == written
 

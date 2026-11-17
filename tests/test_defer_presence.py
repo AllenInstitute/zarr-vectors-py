@@ -82,7 +82,7 @@ def test_declaring_drops_the_manifests_and_marks_the_level(tmp_path):
 
     assert "vertices" in names
     assert level.presence_deferred()
-    assert level.zarr_group.attrs[_PRESENCE_DECL_ATTR] == "deferred"
+    assert level.zarr_group.attrs["zarr_vectors"][_PRESENCE_DECL_ATTR] == "deferred"
     assert _NONEMPTY_CHUNKS_ATTR not in level.read_array_meta("vertices")
     # ...and the cell written before the declaration is still found.
     assert level.list_chunks("vertices") == ["0.0.0"]

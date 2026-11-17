@@ -32,8 +32,10 @@ def test_prebuilt_store_gets_writer_bounds():
 # --- Draco: honest encoding stamp, no half-written store -----------------
 
 def _vertices_attrs(path):
+    from zarr_vectors.core.convention import unwrap_array_meta
+
     with open(path / "0" / "vertices" / "zarr.json") as fh:
-        return json.load(fh)["attributes"]
+        return unwrap_array_meta(json.load(fh)["attributes"])
 
 
 def test_draco_on_2d_mesh_is_stamped_raw(tmp_path):

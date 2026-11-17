@@ -34,6 +34,7 @@ from zarr_vectors.constants import (
     VALID_XLEVEL_STORAGE,
 )
 from zarr_vectors.core.metadata import LevelMetadata, RootMetadata
+from zarr_vectors.exceptions import MetadataError
 
 
 SCHEMA_PATH = Path(__file__).resolve().parents[1] / "schema" / "zarr_vectors.schema.json"
@@ -133,7 +134,7 @@ def test_root_metadata_with_dense_int32_manifests_validates(schema):
 
 def test_level_metadata_minimal_validates(schema):
     lm = LevelMetadata(level=0, vertex_count=0, arrays_present=[])
-    wire = lm.to_dict()["zarr_vectors_level"]
+    wire = lm.to_dict()["zarr_vectors"]
     _validate(schema, "LevelMetadata", wire)
 
 
@@ -146,7 +147,7 @@ def test_level_metadata_with_attribute_chunking_validates(schema):
         chunk_attribute_name="gene",
         chunk_attribute_values=["A", "B"],
     )
-    wire = lm.to_dict()["zarr_vectors_level"]
+    wire = lm.to_dict()["zarr_vectors"]
     _validate(schema, "LevelMetadata", wire)
 
 
@@ -161,7 +162,7 @@ def test_level_metadata_with_numeric_bin_labels_validates(schema, values):
         chunk_attribute_name="group",
         chunk_attribute_values=values,
     )
-    wire = lm.to_dict()["zarr_vectors_level"]
+    wire = lm.to_dict()["zarr_vectors"]
     _validate(schema, "LevelMetadata", wire)
 
 
@@ -311,7 +312,7 @@ def test_unknown_geometry_type_rejected(schema):
 
 def test_object_sparsity_out_of_range_rejected(schema):
     lm = LevelMetadata(level=0, vertex_count=0, arrays_present=[])
-    wire = lm.to_dict()["zarr_vectors_level"]
+    wire = lm.to_dict()["zarr_vectors"]
     wire["object_sparsity"] = 2.0
     with pytest.raises(jsonschema.ValidationError):
         _validate(schema, "LevelMetadata", wire)
@@ -385,28 +386,23 @@ def test_constant_set_matches_schema_enum(schema, enum_name, members):
 # ===================================================================
 
 
-def test_format_version_is_0_9_4():
-    """The current ZV writer stamps 0.9.4; bump tests here when bumping."""
+def test_format_version_is_0_10_0():
+    """The current ZV writer stamps 0.10.0; bump tests here when bumping."""
     from zarr_vectors.constants import FORMAT_VERSION
 
-    assert FORMAT_VERSION == "0.9.4", (
+    assert FORMAT_VERSION == "0.10.0", (
         f"FORMAT_VERSION drifted to {FORMAT_VERSION!r}; if intentional "
         f"update this test and the version-cutoff check in "
         f"zarr_vectors.core.metadata.RootMetadata.validate()."
     )
 
 
-@pytest.mark.parametrize("zv_version", ["0.9.0", "0.9.1", "0.9.2", "0.9.3"])
-def test_the_0_9_x_additions_did_not_move_the_read_cutoff(zv_version):
-    """Every 0.9.x addition is additive, so earlier 0.9 stores still read.
-
-    The hard break is at 0.9.0 -- the single-array layout.
-    ``attribute_specs`` (0.9.1), the RFC 8 ``ome`` node (0.9.2) and
-    ``shard_shape`` (0.9.3) and ``manifest_layout`` (0.9.4) each only
-    add an optional root key.  Raising
-    the cutoff alongside the version would strand earlier stores for
-    fields they are entitled not to have.
-    """
+@pytest.mark.parametrize("zv_version", ["0.9.0", "0.9.1", "0.9.2", "0.9.3", "0.9.4"])
+def test_0_10_0_moves_the_read_cutoff(zv_version):
+    """0.10.0 moved every metadata key onto the Zarr Vectors convention,
+    so the cutoff moves with it: a 0.9.x store is migrated in place
+    (``migrate_metadata_0_10``), not read.  Within 0.9 every addition was
+    additive and the cutoff stayed at 0.9.0."""
     from zarr_vectors.core.metadata import RootMetadata
 
     axes = [{"name": n, "type": "space"} for n in "xyz"]
@@ -417,7 +413,8 @@ def test_the_0_9_x_additions_did_not_move_the_read_cutoff(zv_version):
         geometry_types=["point_cloud"],
         zv_version=zv_version,
     )
-    meta.validate()  # must not raise
+    with pytest.raises(MetadataError, match=zv_version):
+        meta.validate()
 
 
 def test_an_absent_shard_shape_reads_as_unsharded():
@@ -427,12 +424,13 @@ def test_an_absent_shard_shape_reads_as_unsharded():
     axes = [{"name": n, "type": "space"} for n in "xyz"]
     meta = RootMetadata.from_dict({
         "zarr_vectors": {
-            "zv_version": "0.9.2",
+            "kind": "root",
+            "zv_version": "0.10.0",
+            "axes": axes,
             "chunk_shape": [100.0] * 3,
             "bounds": [[0.0] * 3, [100.0] * 3],
             "geometry_types": ["point_cloud"],
         },
-        "multiscales": [{"axes": axes}],
     })
     assert meta.shard_shape is None
     assert meta.manifest_layout is None  # absent: the vlen layout
@@ -453,7 +451,8 @@ def test_pre_0_9_0_stores_rejected(stale_version):
         md.validate()
 
 
-def test_0_9_0_store_passes_validate():
+def test_0_9_0_store_is_refused_by_validate():
     md = _minimal_root_md()
     md.zv_version = "0.9.0"
-    md.validate()  # should not raise
+    with pytest.raises(MetadataError, match="0.9.0"):
+        md.validate()

@@ -66,6 +66,15 @@ class MetadataError(ZVError):
     """Raised when metadata is missing, malformed, or fails schema validation."""
 
 
+class UnsupportedFormatVersionError(MetadataError):
+    """The store's format version is not one this package reads.
+
+    Raised on open, before any other metadata is interpreted, so a store
+    written by another format version fails with this rather than with a
+    missing-key error from wherever the layouts first disagree.
+    """
+
+
 class ArrayError(ZVError):
     """Raised when an array has wrong shape, dtype, or cannot be read/written."""
 

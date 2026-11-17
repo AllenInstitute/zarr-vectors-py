@@ -458,7 +458,7 @@ def _validate_octree_level(lg: Any, ndim: int, prefix: str, result: ValidationRe
             f"than the cell table, e.g. leaf {n}: {int(frags[n])} vs {int(cell_frags[n])}"
         )
     total = int(rows.sum())
-    evc = (lg.attrs.get("zarr_vectors_level") or {}).get("vertex_count")
+    evc = (lg.attrs.get("zarr_vectors") or {}).get("vertex_count")
     if evc is not None and int(evc) != total:
         result.add_error(f"{prefix}: metadata vertex_count={evc}, actual={total}")
 

@@ -214,11 +214,28 @@ for kind, p in zip(sys.argv[1::2], sys.argv[2::2]):
 """
 
 
+def _assert_same_graph(a, b):
+    """Same vertices and the same edges between them, in any order."""
+    assert a["node_count"] == b["node_count"] and a["edge_count"] == b["edge_count"]
+    pa, pb = np.asarray(a["positions"]), np.asarray(b["positions"])
+    np.testing.assert_array_equal(pa[np.lexsort(pa.T[::-1])], pb[np.lexsort(pb.T[::-1])])
+
+    def edge_set(g):
+        p = np.asarray(g["positions"])
+        return {tuple(sorted((tuple(p[i]), tuple(p[j])))) for i, j in np.asarray(g["edges"])}
+
+    assert edge_set(a) == edge_set(b)
+
+
 def test_an_older_zarr_vectors_refuses_octree_levels(tmp_path, tmp_path_factory):
     """The reader of commit 467e80e (before octree chunks) raises on an
-    octree level -- points and graphs, sharded or not, every read path --
-    and reads a converted-back store as the original.  Before the marker
-    it returned wrong rows and edges without an error."""
+    octree level -- points and graphs, sharded or not, every read path.
+    Before the marker it returned wrong rows and edges without an error.
+
+    Since format 0.10.0 an older reader cannot find the metadata of any
+    store this build writes, octree or not, so it raises on all of them;
+    the converted-back store is checked against the original with this
+    build instead."""
     old = _old_tree(tmp_path_factory)
     stores = {
         "po": _points(tmp_path / "po.zv"),
@@ -238,16 +255,12 @@ def test_an_older_zarr_vectors_refuses_octree_levels(tmp_path, tmp_path_factory)
                              capture_output=True, text=True, env=env, check=True)
         return [line.split(" ", 3) for line in res.stdout.splitlines()]
 
-    lines = run("p", stores["po"], "g", stores["go"], "g", stores["gs"])
-    assert len(lines) == 11
-    for kind, name, what, rest in lines:
-        assert what == "raised" and rest.startswith("UnknownCodecError"), (kind, name, rest)
-        assert OCTREE_MARKER_CODEC in rest
+    lines = run("p", stores["po"], "g", stores["go"], "g", stores["gs"],
+                "p", stores["pu"], "g", stores["gu"])
+    assert len(lines) == 19
+    assert all(what == "raised" for _, _, what, _ in lines), lines
 
-    lines = run("p", stores["pu"], "g", stores["gu"], "g", str(rt))
-    assert all(what == "read" for _, _, what, _ in lines), lines
-    gu = [rest for kind, name, what, rest in lines[5:8]]
-    assert gu == [rest for kind, name, what, rest in lines[8:11]]  # rt reads as the original
+    _assert_same_graph(read_graph(str(rt)), read_graph(stores["gu"]))  # rt reads as the original
 
 
 @pytest.mark.parametrize("unshard", [False, True])
@@ -421,8 +434,8 @@ def test_group_writes_to_an_octree_level_are_refused_unless_converting(tmp_path)
 def test_a_level_mid_conversion_is_refused_with_how_to_finish(tmp_path):
     p = _points(tmp_path / "p.zv", octree=False)
     lg = get_resolution_level(open_store(p, mode="r+"), 0)
-    level = dict(lg.attrs["zarr_vectors_level"])
-    lg.attrs.update({"zarr_vectors_level": {**level, "octree_chunks": {"converting": "to_octree"}}})
+    level = dict(lg.attrs["zarr_vectors"])
+    lg.attrs.update({"zarr_vectors": {**level, "octree_chunks": {"converting": "to_octree"}}})
     lg = get_resolution_level(open_store(p, mode="r+"), 0)
     assert is_octree_level(lg)
     with pytest.raises(OctreeError, match="part way through to_octree"):
@@ -549,8 +562,8 @@ def test_validate_catches_a_broken_octree_level(tmp_path):
 
     src = _points(tmp_path / "m.zv")
     lg = get_resolution_level(open_store(src, mode="r+"), 0)
-    level = dict(lg.attrs["zarr_vectors_level"])
-    lg.attrs.update({"zarr_vectors_level": {**level, "octree_chunks": {"converting": "to_uniform"}}})
+    level = dict(lg.attrs["zarr_vectors"])
+    lg.attrs.update({"zarr_vectors": {**level, "octree_chunks": {"converting": "to_uniform"}}})
     assert any("part way through to_uniform" in e for e in validate(src, level=3).errors)
 
 

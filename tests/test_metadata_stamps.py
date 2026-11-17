@@ -182,14 +182,13 @@ class TestTheTransformAgreesWithItself:
         return path
 
     def _transform(self, path):
+        from zarr_vectors.core.multiscale import read_level_transform
+
         root = open_store(path, mode="r")
-        for entry in root.attrs.to_dict()["multiscales"][0]["datasets"]:
-            if entry["path"] == "1":
-                return {
-                    t["type"]: (t.get("scale") or t.get("translation"))
-                    for t in entry["coordinateTransformations"]
-                }
-        raise AssertionError("level 1 missing from the multiscales block")
+        layout = root.attrs.to_dict()["multiscales"]["layout"]
+        assert {"asset": "1"} in layout, "level 1 missing from the multiscales block"
+        scale, translation = read_level_transform(root, 1)
+        return {"scale": scale, "translation": translation}
 
     @pytest.mark.parametrize("factor", [1.5, 2.0, 3.0])
     def test_scale_equals_bin_shape_over_root_bin(self, factor):

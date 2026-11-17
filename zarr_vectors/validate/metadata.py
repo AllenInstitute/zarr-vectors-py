@@ -41,31 +41,21 @@ def level_fields(root: Group, li: int, lg: Group) -> dict:
     """The level's metadata fields as stored, uncoerced, so a malformed
     value reaches the check that reports it.
 
-    Precedence: NGFF transform > ``zarr_vectors_level`` > legacy
-    top-level keys (see :func:`read_level_metadata`).
+    Precedence: the level's ``zarr_vectors`` object > legacy top-level
+    keys (see :func:`read_level_metadata`).  Level 0's bin is the root's
+    ``base_bin_shape``, so bin fields on level 0 are dropped.
     """
     attrs = lg.attrs.to_dict()
     out = {k: attrs[k] for k in _LEVEL_FIELDS if k in attrs}
-    block = attrs.get("zarr_vectors_level")
+    block = attrs.get("zarr_vectors")
     if isinstance(block, dict):
         out.update({k: block[k] for k in _LEVEL_FIELDS if k in block})
     if out.get("bin_shape") is None and out.get("bin_size") is not None:
         out["bin_shape"] = out["bin_size"]
     out.pop("bin_size", None)
-    try:
-        from zarr_vectors.core.multiscale import read_level_transform
-        scale, translation = read_level_transform(root, li)
-    except Exception:
-        scale, translation = None, None
-    if scale is not None:
-        # Level 0 inherits the root's base_bin_shape.
-        if li == 0:
-            out.pop("bin_shape", None)
-            out.pop("bin_ratio", None)
-        else:
-            out["bin_ratio"] = list(scale)
-            if translation is not None:
-                out["bin_shape"] = [2.0 * t for t in translation]
+    if li == 0:
+        out.pop("bin_shape", None)
+        out.pop("bin_ratio", None)
     return out
 
 

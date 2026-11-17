@@ -50,6 +50,7 @@ from zarr.core.sync import sync
 from zarr.errors import UnstableSpecificationWarning
 from zarr.storage import LocalStore
 
+from zarr_vectors.core import convention as _zvc
 from zarr_vectors.exceptions import StoreError
 
 # Upper bound on concurrent per-array flushes.  The work is I/O-bound
@@ -139,7 +140,7 @@ def _presence_after(
     """
     from zarr_vectors.core.group import _NONEMPTY_CHUNKS_ATTR
 
-    current = arr.attrs.get(_NONEMPTY_CHUNKS_ATTR)
+    current = _zvc.get_field(arr.attrs, _NONEMPTY_CHUNKS_ATTR)
     if current is None:
         # No manifest: presence is derived from the store, and a list of
         # this batch's keys would hide every cell written before it.
@@ -201,7 +202,7 @@ def _flush_one_array(
 
         arr = _array_on(arr, DurableLocalStore(arr.store, touched))
     ndim = arr.ndim
-    origin_raw = arr.attrs.get(_CHUNK_GRID_ORIGIN_ATTR)
+    origin_raw = _zvc.get_field(arr.attrs, _CHUNK_GRID_ORIGIN_ATTR)
     origin = (
         tuple(int(o) for o in origin_raw) if origin_raw else None
     )
@@ -235,7 +236,7 @@ def _flush_one_array(
     arr.set_coordinate_selection(selection, obj)
     present = _presence_after(arr, cells)
     if present is not None:
-        arr.attrs[_NONEMPTY_CHUNKS_ATTR] = present
+        _zvc.set_field(arr.attrs, _NONEMPTY_CHUNKS_ATTR, present)
         # On a worker thread when several arrays flush at once, which is
         # what ``observe_presence_writes`` promises: the calling thread
         # is whichever one performed the write.
@@ -469,13 +470,15 @@ def _stamp_presence(
         return
     if len(stamps) == 1:
         array_name, arr, present, cells = stamps[0]
-        arr.attrs[_NONEMPTY_CHUNKS_ATTR] = present
+        _zvc.set_field(arr.attrs, _NONEMPTY_CHUNKS_ATTR, present)
         _emit_batch_presence(array_name, cells)
         return
 
     async def _all() -> None:
         await asyncio.gather(*(
-            arr._async_array.update_attributes({_NONEMPTY_CHUNKS_ATTR: present})
+            arr._async_array.update_attributes(
+                _zvc.field_update(arr.attrs, _NONEMPTY_CHUNKS_ATTR, present)
+            )
             for _name, arr, present, _cells in stamps
         ))
 
@@ -485,7 +488,9 @@ def _stamp_presence(
     # old handle would read a stale manifest.
     for array_name, arr, present, cells in stamps:
         try:
-            arr.metadata.attributes[_NONEMPTY_CHUNKS_ATTR] = present
+            arr.metadata.attributes.update(
+                _zvc.field_update(arr.metadata.attributes, _NONEMPTY_CHUNKS_ATTR, present)
+            )
         except Exception:
             pass
         _emit_batch_presence(array_name, cells)
@@ -696,7 +701,9 @@ def _flush_group_metas(
     base_path = zarr_group.path
     base_prefix = f"{base_path.rstrip('/')}/" if base_path else ""
     puts = [
-        (f"{base_prefix}{group_name}/zarr.json", _group_zarr_json_bytes(meta))
+        (f"{base_prefix}{group_name}/zarr.json", _group_zarr_json_bytes(
+            _zvc.wrap_array_meta(meta) if "zv_array" in meta else meta
+        ))
         for group_name, meta in sorted(array_metas.items())
     ]
     sync(_async_put_chunks(zarr_group.store, puts))

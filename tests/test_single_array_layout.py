@@ -18,6 +18,7 @@ import pytest
 
 from zarr_vectors.constants import VERTICES
 from zarr_vectors.core.arrays import list_chunk_keys
+from zarr_vectors.core.convention import get_field
 from zarr_vectors.core.store import get_resolution_level, open_store
 from zarr_vectors.types.points import read_points, write_points
 
@@ -64,7 +65,7 @@ def test_nonempty_chunks_matches_list_chunk_keys() -> None:
     write_points(store, pts, chunk_shape=(100.0, 100.0, 100.0))
 
     meta = _vmeta(store)
-    manifest = set(meta["attributes"]["nonempty_chunks"])
+    manifest = set(get_field(meta["attributes"], "nonempty_chunks"))
 
     lg = get_resolution_level(open_store(store), 0)
     listed = {".".join(map(str, c)) for c in list_chunk_keys(lg, VERTICES)}
@@ -91,7 +92,7 @@ def test_negative_coordinates_round_trip() -> None:
     write_points(store, pts, chunk_shape=(100.0, 100.0, 100.0))
 
     meta = _vmeta(store)
-    origin = meta["attributes"].get("chunk_grid_origin")
+    origin = get_field(meta["attributes"], "chunk_grid_origin")
     assert origin is not None and min(origin) < 0
 
     out = np.asarray(read_points(store)["positions"])

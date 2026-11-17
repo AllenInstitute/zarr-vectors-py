@@ -1,27 +1,29 @@
-"""OME-Zarr compatible multiscale metadata for zarr vectors stores.
+"""The root ``multiscales`` block: the registered multiscales convention.
 
-Generates and reads ``multiscales`` metadata blocks in the root
-``zarr.json`` attributes, following the OME-NGFF spec (v0.4).  This allows
-OME-Zarr-aware viewers to discover the resolution pyramid structure.
+Format 0.10.0 lists the resolution levels with the multiscales convention
+(https://github.com/zarr-conventions/multiscales, v0.1)::
 
-NGFF v0.5 nests OME metadata under ``attributes.ome`` inside Zarr v3
-``zarr.json``; ZV writes ``multiscales`` at bare root, which matches
-the v0.4 layout — hence the ``version: "0.4"`` declaration.
+    "multiscales": {"layout": [{"asset": "0"}, {"asset": "1"}, ...]}
 
-The ZV format discriminator lives in
-``multiscales[].metadata.format = "zarr_vectors"``, NOT in
-``multiscales[].type`` — NGFF reserves ``type`` for the downsampling
-method (``"gaussian"``, ``"nearest"``, ...).
+Each entry names a level group and carries nothing else.  The convention's
+``transform`` describes how *coordinates* change between levels, and in a
+Zarr Vectors store they do not: every level's vertices are stored in
+level-0 coordinates.  Bin geometry is Zarr Vectors' own and is stored
+once, outside this block -- level 0's bin is the root ``base_bin_shape``,
+and a coarse level's ``bin_shape`` / ``bin_ratio`` sit in its own
+``zarr_vectors`` level object.
 
-The metadata is informational and coexists with zarr vectors-specific
-metadata — it does not replace the ``zarr_vectors_level`` entries.
+Until 0.10.0 this block was a bare-root OME-NGFF 0.4 ``multiscales`` list
+whose every dataset repeated level 0's transform (``scale = 1``,
+``translation = base_bin_shape / 2``).  :func:`read_level_transform` keeps
+returning exactly that pair, derived from the root, so callers written
+against the NGFF block are unchanged.
 """
 
 from __future__ import annotations
 
 from typing import Any
 
-from zarr_vectors.constants import RESOLUTION_PREFIX
 from zarr_vectors.core.store import (
     FsGroup,
     list_resolution_levels,
@@ -29,250 +31,101 @@ from zarr_vectors.core.store import (
 )
 
 
+def empty_multiscales() -> dict[str, Any]:
+    """The block a new store starts with: level 0 only."""
+    return {"layout": [{"asset": "0"}]}
+
+
+def _block(root: FsGroup) -> dict[str, Any] | None:
+    ms = root.attrs.to_dict().get("multiscales")
+    return dict(ms) if isinstance(ms, dict) else None
+
+
+def _assets(block: dict[str, Any] | None) -> list[str]:
+    if not block:
+        return []
+    return [
+        str(e.get("asset")) for e in block.get("layout") or []
+        if isinstance(e, dict) and "asset" in e
+    ]
+
+
+def _write_levels(root: FsGroup, levels: list[int]) -> dict[str, Any]:
+    block = _block(root) or {}
+    kept = {
+        str(e["asset"]): dict(e) for e in block.get("layout") or []
+        if isinstance(e, dict) and "asset" in e
+    }
+    layout = [kept.get(str(lv), {"asset": str(lv)}) for lv in sorted(set(levels))]
+    block["layout"] = layout
+    root.attrs.update({"multiscales": block})
+    return block
+
+
 def upsert_level_transform(
     root: FsGroup,
     level: int,
     *,
-    scale: list[float],
+    scale: list[float] | None = None,
     translation: list[float] | None = None,
 ) -> None:
-    """Upsert one level's entry in the NGFF ``multiscales[0].datasets`` list.
+    """Ensure ``level`` is listed in the multiscales layout.
 
-    This is the **authoritative** writer for per-level spatial transforms
-    in a store: ``bin_ratio`` lives as the ``scale`` factor
-    and ``bin_shape / 2`` lives as the ``translation`` offset.  Callers
-    in :mod:`zarr_vectors.core.store` invoke this inside
-    :func:`create_resolution_level` and :func:`add_resolution_level`
-    after writing the level's other attrs.
-
-    Args:
-        root: Root store group.
-        level: Resolution level index (``0`` for full resolution).
-        scale: Per-axis scale factor (= ``bin_ratio`` for that level).
-        translation: Optional per-axis translation offset (= ``bin_shape / 2``).
-            When all entries are zero, the translation transform is omitted.
+    ``scale`` and ``translation`` are accepted for compatibility and not
+    stored: in format 0.10.0 every level's transform is level 0's, which
+    is derived from the root's ``base_bin_shape`` (see the module
+    docstring).
     """
-    attrs = root.attrs.to_dict()
-    ms = attrs.get("multiscales") or []
-    if not ms or not isinstance(ms, list):
-        # No NGFF block yet — nothing to upsert into.  This shouldn't
-        # happen for stores created by the current ``create_store`` (it
-        # seeds the block at create time), but handle it gracefully.
+    del scale, translation
+    block = _block(root)
+    if block is None:
         return
-    ms_entry = dict(ms[0])
-    datasets = list(ms_entry.get("datasets") or [])
+    if str(level) in _assets(block):
+        return
+    levels = [int(a) for a in _assets(block) if a.isdigit()]
+    _write_levels(root, [*levels, int(level)])
 
-    transforms: list[dict[str, Any]] = [
-        {"type": "scale", "scale": [float(s) for s in scale]},
-    ]
-    if translation is not None and any(t != 0 for t in translation):
-        transforms.append({
-            "type": "translation",
-            "translation": [float(t) for t in translation],
-        })
 
-    path = f"{RESOLUTION_PREFIX}{level}"
-    new_entry = {"path": path, "coordinateTransformations": transforms}
-    found = False
-    for i, ds in enumerate(datasets):
-        if ds.get("path") == path:
-            datasets[i] = new_entry
-            found = True
-            break
-    if not found:
-        datasets.append(new_entry)
-        # Keep datasets sorted by level for deterministic on-disk output.
-        datasets.sort(key=lambda d: int(d.get("path", "0").lstrip(RESOLUTION_PREFIX) or 0))
-
-    ms_entry["datasets"] = datasets
-    attrs["multiscales"] = [ms_entry] + list(ms[1:])
-    root.attrs.update(attrs)
+def _level0_transform(root: FsGroup) -> tuple[list[float], list[float] | None]:
+    meta = read_root_metadata(root)
+    ndim = meta.sid_ndim
+    base_bin = meta.effective_bin_shape
+    translation = [float(b) / 2.0 for b in base_bin] if base_bin else None
+    if translation is not None and not any(t != 0 for t in translation):
+        translation = None
+    return [1.0] * ndim, translation
 
 
 def read_level_transform(
     root: FsGroup,
     level: int,
 ) -> tuple[list[float] | None, list[float] | None]:
-    """Read ``(scale, translation)`` for a level from the NGFF block.
-
-    Returns ``(None, None)`` when the level has no entry in the NGFF
-    ``multiscales[0].datasets`` list — callers should fall back to the
-    legacy ``zarr_vectors_level.bin_ratio`` / ``bin_shape`` fields on
-    the level's own attrs.
-    """
-    ms = read_multiscale_metadata(root)
-    if ms is None:
+    """``(scale, translation)`` for a level: level 0's transform when the
+    level is listed, ``(None, None)`` when it is not."""
+    if str(level) not in _assets(_block(root)):
         return None, None
-    path = f"{RESOLUTION_PREFIX}{level}"
-    for ms_entry in ms:
-        for ds in ms_entry.get("datasets", []):
-            if ds.get("path") != path:
-                continue
-            scale: list[float] | None = None
-            translation: list[float] | None = None
-            for t in ds.get("coordinateTransformations", []):
-                if t.get("type") == "scale":
-                    scale = [float(s) for s in t.get("scale") or []]
-                elif t.get("type") == "translation":
-                    translation = [float(s) for s in t.get("translation") or []]
-            return scale, translation
-    return None, None
+    return _level0_transform(root)
 
 
-def write_multiscale_metadata(root: FsGroup) -> list[dict[str, Any]]:
-    """Generate and write OME-Zarr multiscale metadata to the root attributes.
-
-    Reads all existing resolution levels and their bin shapes to
-    compute scale and translation transforms.
-
-    Args:
-        root: Root store group.
+def write_multiscale_metadata(root: FsGroup) -> dict[str, Any]:
+    """Rewrite the layout to list exactly the store's resolution levels.
 
     Returns:
-        The ``multiscales`` list written to the root attributes.
+        The ``multiscales`` block written to the root attributes.
     """
-    meta = read_root_metadata(root)
-    base_bin = meta.effective_bin_shape
-    ndim = meta.sid_ndim
-    levels = list_resolution_levels(root)
-
-    # Build axes from spatial_index_dims.  ``unit`` is omitted unless
-    # the source axis carries a non-empty value — NGFF requires units to
-    # be UDUNITS-2 names (no placeholder strings).
-    axes: list[dict[str, str]] = []
-    for ax in meta.spatial_index_dims:
-        out: dict[str, str] = {
-            "name": ax.get("name", f"dim{len(axes)}"),
-            "type": ax.get("type", "space"),
-        }
-        unit = ax.get("unit")
-        if unit:
-            out["unit"] = unit
-        axes.append(out)
-
-    # Build datasets array (one per level).  Every level's vertices are
-    # in level-0 coordinates, so every level gets level 0's transform.
-    scale0 = [1.0] * ndim
-    translation0 = [bs / 2.0 for bs in base_bin]
-    transforms0: list[dict[str, Any]] = [{"type": "scale", "scale": scale0}]
-    if any(t != 0 for t in translation0):
-        transforms0.append({"type": "translation", "translation": translation0})
-
-    datasets: list[dict[str, Any]] = []
-    for lvl in levels:
-        if lvl != 0:
-            # Older stores kept a coarse level's bins only in this entry.
-            _migrate_level_bins(root, lvl)
-        datasets.append({
-            "path": f"{RESOLUTION_PREFIX}{lvl}",
-            "coordinateTransformations": [dict(t) for t in transforms0],
-        })
-
-    multiscales = [{
-        "version": "0.4",
-        "name": "default",
-        "axes": axes,
-        "datasets": datasets,
-        # NGFF reserves ``type`` for the downsampling method
-        # (``"gaussian"``, ``"nearest"``, ...).  Stash the ZV format
-        # discriminator under ``metadata.format`` instead.
-        "metadata": {"format": "zarr_vectors"},
-    }]
-
-    # Write to root attrs (alongside existing zarr_vectors metadata)
-    attrs = root.attrs.to_dict()
-    attrs["multiscales"] = multiscales
-    root.attrs.update(attrs)
-
-    return multiscales
+    return _write_levels(root, list_resolution_levels(root))
 
 
-def _migrate_level_bins(root: FsGroup, level: int) -> None:
-    """Copy a coarse level's NGFF-encoded bin geometry into its own block.
-
-    No-op when the level already carries ``bin_shape`` / ``bin_ratio``.
-    """
-    from zarr_vectors.core.store import get_resolution_level
-
-    try:
-        lg = get_resolution_level(root, level)
-        attrs = lg.attrs.to_dict()
-        zvl = dict(attrs.get("zarr_vectors_level") or {})
-        if not zvl or zvl.get("bin_shape") or zvl.get("bin_ratio"):
-            return
-        scale, translation = read_level_transform(root, level)
-    except Exception:
-        return
-    if scale is None:
-        return
-    zvl["bin_ratio"] = [float(x) for x in scale]
-    if translation is not None:
-        zvl["bin_shape"] = [2.0 * float(t) for t in translation]
-    lg.attrs.update({"zarr_vectors_level": zvl})
+def read_multiscale_metadata(root: FsGroup) -> dict[str, Any] | None:
+    """The root's ``multiscales`` block, or None if it has none."""
+    return _block(root)
 
 
-def read_multiscale_metadata(root: FsGroup) -> list[dict[str, Any]] | None:
-    """Read OME-Zarr multiscale metadata from the root attributes.
-
-    Args:
-        root: Root store group.
-
-    Returns:
-        The ``multiscales`` list, or None if not present.
-    """
-    attrs = root.attrs.to_dict()
-    return attrs.get("multiscales")
+def get_level_scale(root: FsGroup, level: int) -> list[float] | None:
+    """A level's scale (level 0's, ``[1.0] * ndim``), or None if unlisted."""
+    return read_level_transform(root, level)[0]
 
 
-def get_level_scale(
-    root: FsGroup,
-    level: int,
-) -> list[float] | None:
-    """Get the scale factors for a specific level from multiscale metadata.
-
-    Args:
-        root: Root store group.
-        level: Resolution level index.
-
-    Returns:
-        List of scale factors per dimension, or None if not available.
-    """
-    ms = read_multiscale_metadata(root)
-    if ms is None:
-        return None
-
-    path = f"{RESOLUTION_PREFIX}{level}"
-    for ms_entry in ms:
-        for ds in ms_entry.get("datasets", []):
-            if ds.get("path") == path:
-                for t in ds.get("coordinateTransformations", []):
-                    if t.get("type") == "scale":
-                        return t.get("scale")
-    return None
-
-
-def get_level_translation(
-    root: FsGroup,
-    level: int,
-) -> list[float] | None:
-    """Get the translation offset for a specific level.
-
-    Args:
-        root: Root store group.
-        level: Resolution level index.
-
-    Returns:
-        List of translation offsets per dimension, or None.
-    """
-    ms = read_multiscale_metadata(root)
-    if ms is None:
-        return None
-
-    path = f"{RESOLUTION_PREFIX}{level}"
-    for ms_entry in ms:
-        for ds in ms_entry.get("datasets", []):
-            if ds.get("path") == path:
-                for t in ds.get("coordinateTransformations", []):
-                    if t.get("type") == "translation":
-                        return t.get("translation")
-    return None
+def get_level_translation(root: FsGroup, level: int) -> list[float] | None:
+    """A level's translation (``base_bin_shape / 2``), or None if unlisted."""
+    return read_level_transform(root, level)[1]

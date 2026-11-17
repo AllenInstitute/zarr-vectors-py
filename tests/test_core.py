@@ -262,19 +262,9 @@ class TestRootMetadata:
             links_convention=LINKS_IMPLICIT_SEQUENTIAL,
             reduction_factor=8,
         )
+        # Format 0.10.0: axes are part of the root object, so to_dict alone
+        # round-trips.
         d = m.to_dict()
-        # 0.5.0+: axes live in NGFF ``multiscales[0].axes`` rather
-        # than under ``zarr_vectors.spatial_index_dims``, so a round
-        # trip through to_dict / from_dict requires injecting the
-        # NGFF block on the side.
-        d["multiscales"] = [{
-            "version": "0.4",
-            "axes": list(m.spatial_index_dims),
-            "datasets": [{"path": "0", "coordinateTransformations": [
-                {"type": "scale", "scale": [1.0] * m.sid_ndim},
-            ]}],
-            "metadata": {"format": "zarr_vectors"},
-        }]
         m2 = RootMetadata.from_dict(d)
         assert m2.zv_version == m.zv_version
         assert m2.chunk_shape == m.chunk_shape
@@ -381,7 +371,7 @@ class TestLevelMetadata:
 
     def test_missing_key(self) -> None:
         try:
-            LevelMetadata.from_dict({"zarr_vectors_level": {"level": 0}})
+            LevelMetadata.from_dict({"zarr_vectors": {"level": 0}})
             assert False
         except MetadataError:
             pass
@@ -440,8 +430,8 @@ class TestParametricTypes:
 
     def test_serialise_round_trip(self) -> None:
         d = serialise_parametric_types(DEFAULT_PARAMETRIC_TYPES)
-        assert "parametric_types" in d
-        assert "0" in d["parametric_types"]
+        assert d["zarr_vectors"]["kind"] == "parametric"
+        assert "0" in d["zarr_vectors"]["parametric_types"]
         types = deserialise_parametric_types(d)
         assert len(types) == 3
         assert types[0].name == "plane"
@@ -567,10 +557,12 @@ class TestStoreCreate:
         assert zv["zv_version"]
         assert zv["bounds"] == [[0.0, 0.0, 0.0], [128.0, 128.0, 128.0]]
         assert zv["chunk_shape"] == [128.0, 128.0, 128.0]
-        # Axes now live in the NGFF multiscales block, not under
+        # Axes live in the root object (format 0.10.0), not under
         # zarr_vectors.spatial_index_dims (0.5.0+).
         assert "spatial_index_dims" not in zv
-        assert len(attrs["multiscales"][0]["axes"]) == 3
+        assert len(zv["axes"]) == 3
+        assert zv["kind"] == "root"
+        assert attrs["multiscales"] == {"layout": [{"asset": "0"}]}
         assert zv["geometry_types"] == []
         assert "0" in root
         assert "parametric" not in root
@@ -584,8 +576,8 @@ class TestStoreCreate:
         attrs = root.attrs.to_dict()
         zv = attrs["zarr_vectors"]
         assert zv["bounds"] == [[0.0, 0.0], [128.0, 128.0]]
-        # Axes live in NGFF ``multiscales[0].axes`` as of format 0.5.0.
-        assert len(attrs["multiscales"][0]["axes"]) == 2
+        # Axes live in the root object as of format 0.10.0.
+        assert len(attrs["zarr_vectors"]["axes"]) == 2
 
     def test_create_store_explicit_bounds(self, tmp_store_path: Path) -> None:
         """Explicit bounds kwarg overrides the default."""
@@ -721,7 +713,7 @@ class TestStoreInfo:
         write_parametric_types(root, [PARAMETRIC_PLANE])
 
         info = store_info(root)
-        assert info["zv_version"].startswith("0.9")
+        assert info["zv_version"].startswith("0.10")
         assert info["geometry_types"] == ["point_cloud", "skeleton"]
         assert info["chunk_shape"] == [100.0, 100.0, 100.0]
         assert len(info["levels"]) == 1

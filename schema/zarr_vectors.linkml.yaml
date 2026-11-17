@@ -2,13 +2,16 @@ id: https://w3id.org/zarr-vectors/schema/0.9
 name: zarr_vectors
 title: Zarr Vectors (ZV) format
 description: >
-  Reference schema for the Zarr Vectors (ZV) on-disk metadata (0.9.4).
-  Covers the root ``zarr.json`` attributes block (``zarr_vectors`` envelope),
-  the NGFF ``multiscales`` block (which carries the canonical axes list),
-  the per-resolution-level attributes block (``zarr_vectors_level``
-  envelope), and the per-array attributes shapes emitted by the
-  writers in ``zarr_vectors/core/arrays.py`` (discriminator slot
-  ``zv_array``).
+  Reference schema for the Zarr Vectors (ZV) metadata payloads (0.10.0).
+  Covers the root object (``zarr_vectors`` with ``kind: root``, which
+  carries the canonical axes list), the per-resolution-level object
+  (``zarr_vectors`` with ``kind: level``), and the per-array metadata
+  in the flat in-memory shape the writers in
+  ``zarr_vectors/core/arrays.py`` build (discriminator slot ``zv_array``).
+  On disk, format 0.10.0 nests the per-array fields under
+  ``zarr_vectors`` with ``kind`` (see ``zarr_vectors/core/convention.py``);
+  the normative on-disk definition is the Zarr Vectors convention's JSON
+  schema, https://github.com/AllenInstitute/zarr-vectors-convention.
 license: BSD-3-Clause
 
 prefixes:
@@ -294,15 +297,15 @@ classes:
       Root-level attributes payload, persisted under the key
       ``zarr_vectors``.  Validates the runtime
       :class:`zarr_vectors.core.metadata.RootMetadata` dataclass.
-      Note: the canonical axis list lives in
-      ``multiscales[0].axes`` at root level (NGFF-style), NOT under
-      ``zarr_vectors`` — see ``MultiscalesMetadata``.
+      Format 0.10.0: carries ``kind: root`` and the canonical axis list;
+      a CRS is the proj convention's ``proj:projjson`` beside it.
     slots:
+      - kind
       - zv_version
+      - axes
       - chunk_shape
       - bounds
       - geometry_types
-      - crs
       - links_convention
       - object_index_convention
       - cross_chunk_strategy
@@ -320,9 +323,12 @@ classes:
   LevelMetadata:
     description: >
       Per-resolution-level attributes payload, persisted under the key
-      ``zarr_vectors_level``.  Validates the runtime
+      ``zarr_vectors`` with ``kind: level`` (``zarr_vectors_level``
+      before format 0.10.0).  Validates the runtime
       :class:`zarr_vectors.core.metadata.LevelMetadata` dataclass.
     slots:
+      - kind
+      - presence
       - level
       - vertex_count
       - arrays_present
@@ -577,6 +583,27 @@ slots:
     multivalued: true
     required: true
     minimum_cardinality: 1
+  kind:
+    description: >
+      Format 0.10.0 discriminator of a ``zarr_vectors`` object: ``root``
+      on the store root, ``level`` on a resolution-level group.
+    range: string
+    pattern: "^(root|level)$"
+  axes:
+    description: >
+      The store's coordinate axes, in the order ``time -> channel ->
+      custom -> space`` (moved from NGFF ``multiscales[0].axes`` in
+      format 0.10.0).
+    range: Axis
+    multivalued: true
+    inlined_as_list: true
+  presence:
+    description: >
+      ``"deferred"`` while the level's per-chunk arrays carry no
+      ``nonempty_chunks`` (top-level ``zarr_vectors_presence`` before
+      format 0.10.0).
+    range: string
+    pattern: "^deferred$"
   crs:
     description: >
       Optional coordinate reference system metadata (free-form dict

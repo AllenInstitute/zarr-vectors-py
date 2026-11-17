@@ -220,9 +220,10 @@ def _set_level_bins(root, level, bin_shape, base_bin) -> None:
     """Set a coarse level's ``bin_shape`` and float ``bin_ratio``."""
     lg = get_resolution_level(root, level)
     attrs = lg.attrs.to_dict()
-    block = dict(attrs.get("zarr_vectors_level", {}))
+    block = dict(attrs.get("zarr_vectors", {}))
+    block.setdefault("kind", "level")
     block["bin_shape"] = [float(b) for b in bin_shape]
     block["bin_ratio"] = [
         float(b) / float(bb) if bb else 1.0 for b, bb in zip(bin_shape, base_bin)
     ]
-    lg.attrs.update({"zarr_vectors_level": block})
+    lg.attrs.update({"zarr_vectors": block})

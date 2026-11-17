@@ -47,7 +47,7 @@ __all__ = ["rechunk_spatial", "suggest_chunk_shape"]
 #: Vertex-attribute meta keys the writer sets itself; the rest is copied.
 _ATTR_META_OWNED = frozenset({
     "zv_array", "name", "dtype", "channel_names", "row_shape",
-    "nonempty_chunks", "zarr_vectors_presence",
+    "nonempty_chunks", "presence",
 })
 
 

@@ -44,7 +44,7 @@ def cloud(tmp_path: Path):
 
 def _level_block(path, level):
     return json.loads((Path(path) / str(level) / "zarr.json").read_text())[
-        "attributes"]["zarr_vectors_level"]
+        "attributes"]["zarr_vectors"]
 
 
 def test_level_zero_rebin_updates_root_and_ngff_only(cloud):
@@ -52,7 +52,7 @@ def test_level_zero_rebin_updates_root_and_ngff_only(cloud):
     rebin_level(path, (10.0,) * 3)
     block = _level_block(path, 0)
     assert "bin_shape" not in block and "bin_ratio" not in block
-    LevelMetadata.from_dict({"zarr_vectors_level": block}).validate()
+    LevelMetadata.from_dict({"zarr_vectors": block}).validate()
     root = open_store(str(path), mode="r")
     assert read_root_metadata(root).base_bin_shape == (10.0,) * 3
     assert read_level_transform(root, 0) == ([1.0] * 3, [5.0] * 3)

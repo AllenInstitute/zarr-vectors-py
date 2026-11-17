@@ -62,6 +62,7 @@ import zarr
 
 from zarr_vectors._engine.execute import aexecute
 from zarr_vectors._engine.fetch import AsyncFetcher
+from zarr_vectors.core import convention as _zvc
 from zarr_vectors.core.group import _ABSENT, Group
 
 T = TypeVar("T")
@@ -245,7 +246,7 @@ def _implied_chunks(nodes: dict[str, Any]) -> set[tuple[str, str]]:
     for path, node in nodes.items():
         if not isinstance(node, zarr.Array):
             continue
-        present = node.attrs.get(_NONEMPTY_CHUNKS_ATTR)
+        present = _zvc.get_field(node.attrs, _NONEMPTY_CHUNKS_ATTR)
         if not present:
             continue
         for chunk_key in present:
