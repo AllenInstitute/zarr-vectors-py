@@ -41,7 +41,6 @@ from zarr_vectors.multiresolution.coarsen import build_pyramid, coarsen_level
 from zarr_vectors.spatial.chunking import neighbouring_chunk_keys
 from zarr_vectors.types.polylines import write_polylines
 
-
 # ===================================================================
 # Fixture helpers
 # ===================================================================

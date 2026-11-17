@@ -1007,14 +1007,17 @@ class LevelMetadata:
             chunk_dims=list(cd) if cd else None,
             chunk_attribute_name=lv.get("chunk_attribute_name"),
             chunk_attribute_values=list(cav) if cav is not None else None,
-            chunk_sources=(list(lv["chunk_sources"])
-                           if lv.get("chunk_sources") is not None else None),
+            chunk_sources=(
+                list(lv["chunk_sources"]) if lv.get("chunk_sources") is not None else None
+            ),
             preserves_object_ids=bool(lv.get("preserves_object_ids", False)),
             inherited_num_objects=lv.get("inherited_num_objects"),
             shared_fragments=bool(lv.get("shared_fragments", False)),
             fragments_tile=bool(lv.get("fragments_tile", False)),
             link_fragments_aligned=bool(lv.get("link_fragments_aligned", False)),
-            octree_chunks=dict(lv["octree_chunks"]) if isinstance(lv.get("octree_chunks"), dict) else None,
+            octree_chunks=dict(lv["octree_chunks"])
+            if isinstance(lv.get("octree_chunks"), dict)
+            else None,
         )
 
     def validate(self) -> None:

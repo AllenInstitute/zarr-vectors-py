@@ -6,14 +6,12 @@ import numpy as np
 
 from zarr_vectors.encoding.ragged import (
     decode_ragged_blob,
-    decode_ragged_ints,
     decode_ragged_floats,
+    decode_ragged_ints,
     encode_ragged_blob,
-    encode_ragged_ints,
     encode_ragged_floats,
+    encode_ragged_ints,
 )
-from zarr_vectors.exceptions import ArrayError
-
 
 # ---------------------------------------------------------------------------
 # Fragment round-trips

@@ -35,7 +35,9 @@ def _leaf_indices(table: LeafTable, leaves: Iterable[int | str]) -> npt.NDArray[
     return np.unique(np.asarray(out, dtype=np.int64))
 
 
-def leaves_in_box(table: LeafTable, bbox: Any, chunk_shape: Sequence[float]) -> npt.NDArray[np.int64]:
+def leaves_in_box(
+    table: LeafTable, bbox: Any, chunk_shape: Sequence[float]
+) -> npt.NDArray[np.int64]:
     """Leaves meeting the world-space box ``(lo, hi)``."""
     cs = np.asarray(chunk_shape, dtype=np.float64)
     lo = np.floor(np.asarray(bbox[0], dtype=np.float64) / cs).astype(np.int64)
@@ -43,7 +45,9 @@ def leaves_in_box(table: LeafTable, bbox: Any, chunk_shape: Sequence[float]) -> 
     return table.overlapping(lo, hi)
 
 
-def _open(store: Any, level: int, backend: str | None) -> tuple[Any, Any, LeafTable, Any, tuple[float, ...]]:
+def _open(
+    store: Any, level: int, backend: str | None
+) -> tuple[Any, Any, LeafTable, Any, tuple[float, ...]]:
     root = open_store(store, backend=backend)
     level_group = get_resolution_level(root, level)
     meta = read_root_metadata(root)
@@ -51,8 +55,14 @@ def _open(store: Any, level: int, backend: str | None) -> tuple[Any, Any, LeafTa
     return root, level_group, leaf_table(level_group), meta, chunk_shape
 
 
-def read_leaves(level_group: Any, table: LeafTable, leaves: npt.ArrayLike, *, with_links: bool = True,
-                dtype: np.dtype | None = None) -> dict[str, Any]:
+def read_leaves(
+    level_group: Any,
+    table: LeafTable,
+    leaves: npt.ArrayLike,
+    *,
+    with_links: bool = True,
+    dtype: np.dtype | None = None,
+) -> dict[str, Any]:
     """Vertices of ``leaves`` and the links wholly among them.
 
     Returns ``positions``, ``leaf`` (each row's leaf index), ``row`` (its
@@ -67,7 +77,9 @@ def read_leaves(level_group: Any, table: LeafTable, leaves: npt.ArrayLike, *, wi
     running = 0
     with level_group.batched_reads([(VERTICES, keys), (VERTEX_FRAGMENTS, keys)], tolerant=True):
         for n in leaves.tolist():
-            gl = read_chunk_vertices(level_group, tuple(anchors[n].tolist()), dtype=dtype, ndim=3, _leaf=True)
+            gl = read_chunk_vertices(
+                level_group, tuple(anchors[n].tolist()), dtype=dtype, ndim=3, _leaf=True
+            )
             block = np.concatenate(gl) if gl else np.zeros((0, 3), dtype=dtype)
             offsets[n] = running
             positions.append(block)
@@ -141,7 +153,9 @@ def _box_filter(out: dict[str, Any], bbox: Any) -> None:
         out["edges"] = e[(e >= 0).all(axis=1)]
 
 
-def _read_objects(level_group: Any, table: LeafTable, object_ids: Sequence[int], *, bbox: Any = None) -> dict[str, Any]:
+def _read_objects(
+    level_group: Any, table: LeafTable, object_ids: Sequence[int], *, bbox: Any = None
+) -> dict[str, Any]:
     wanted = list(dict.fromkeys(int(o) for o in object_ids))
     manifests = read_object_manifests(level_group, ids=wanted) if wanted else {}
     anchors = table.anchors()
@@ -162,8 +176,12 @@ def _read_objects(level_group: Any, table: LeafTable, object_ids: Sequence[int],
     positions, owners, leaf_col, row_col = [], [], [], []
     running = 0
     with level_group.batched_reads([(VERTICES, keys), (VERTEX_FRAGMENTS, keys)], tolerant=True):
-        blocks = {n: read_chunk_vertices(level_group, tuple(anchors[n].tolist()), dtype=dtype, ndim=3, _leaf=True)
-                  for n in leaves}
+        blocks = {
+            n: read_chunk_vertices(
+                level_group, tuple(anchors[n].tolist()), dtype=dtype, ndim=3, _leaf=True
+            )
+            for n in leaves
+        }
         for oid, n, f in entries:
             fi = read_vertex_fragment_index(level_group, tuple(anchors[n].tolist()))
             start, count = fi.range(f)
@@ -175,12 +193,22 @@ def _read_objects(level_group: Any, table: LeafTable, object_ids: Sequence[int],
             leaf_col.append(np.full(count, n, dtype=np.int64))
             row_col.append(np.arange(start, start + count, dtype=np.int64))
             running += count
-    out: dict[str, Any] = {"positions": np.concatenate(positions), "object_ids": np.concatenate(owners),
-                           "leaf": np.concatenate(leaf_col), "row": np.concatenate(row_col)}
+    out: dict[str, Any] = {
+        "positions": np.concatenate(positions),
+        "object_ids": np.concatenate(owners),
+        "leaf": np.concatenate(leaf_col),
+        "row": np.concatenate(row_col),
+    }
     if is_graph:
         src, r_src, oth, r_oth = read_octree_link_cells(level_group, table, leaves)
-        a = np.array([row_maps[s][r] if s in row_maps else -1 for s, r in zip(src.tolist(), r_src.tolist())], np.int64)
-        b = np.array([row_maps[o][r] if o in row_maps else -1 for o, r in zip(oth.tolist(), r_oth.tolist())], np.int64)
+        a = np.array(
+            [row_maps[s][r] if s in row_maps else -1 for s, r in zip(src.tolist(), r_src.tolist())],
+            np.int64,
+        )
+        b = np.array(
+            [row_maps[o][r] if o in row_maps else -1 for o, r in zip(oth.tolist(), r_oth.tolist())],
+            np.int64,
+        )
         keep = (a >= 0) & (b >= 0)
         out["edges"] = np.column_stack([a[keep], b[keep]]).astype(np.int64)
     if bbox is not None:
@@ -188,7 +216,9 @@ def _read_objects(level_group: Any, table: LeafTable, object_ids: Sequence[int],
     return out
 
 
-def read_seams(store: Any, leaf: int | str, *, level: int = 0, backend: str | None = None) -> dict[str, Any]:
+def read_seams(
+    store: Any, leaf: int | str, *, level: int = 0, backend: str | None = None
+) -> dict[str, Any]:
     """Links between one leaf and the leaves around it.
 
     Returns ``row`` (the endpoint's row in the leaf), ``other_leaf`` and
@@ -242,4 +272,11 @@ def read_graph_octree(root: Any, *, level: int, bbox: Any, object_ids: Any, chun
     return res
 
 
-__all__ = ["read_graph_octree", "read_points_octree", "leaves_in_box", "read_leaves", "read_octree", "read_seams"]
+__all__ = [
+    "read_graph_octree",
+    "read_points_octree",
+    "leaves_in_box",
+    "read_leaves",
+    "read_octree",
+    "read_seams",
+]

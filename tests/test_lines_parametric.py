@@ -6,10 +6,9 @@ from pathlib import Path
 
 import numpy as np
 
-from zarr_vectors.types.lines import write_lines, read_lines
-from zarr_vectors.types.parametric import write_parametric_objects, read_parametric_objects
 from zarr_vectors.exceptions import ArrayError
-
+from zarr_vectors.types.lines import read_lines, write_lines
+from zarr_vectors.types.parametric import read_parametric_objects, write_parametric_objects
 
 # ===================================================================
 # Finite lines

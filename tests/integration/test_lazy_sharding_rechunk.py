@@ -47,8 +47,8 @@ class TestLazyFilterChain:
     """Lazy API: open → filter by group → filter by bbox → compute."""
 
     def test_lazy_filter_pipeline(self, tmp_path: Path) -> None:
-        from zarr_vectors.types.polylines import write_polylines
         from tests._deprecated import open_zv
+        from zarr_vectors.types.polylines import write_polylines
 
         rng = np.random.default_rng(42)
         polys = _make_streamlines(rng, 100)
@@ -90,8 +90,8 @@ class TestLazyDaskParallel:
         # the same convention the obstore / fsspec / icechunk /
         # jsonschema tests already use.
         dask = pytest.importorskip("dask")
-        from zarr_vectors.types.points import write_points
         from tests._deprecated import open_zv
+        from zarr_vectors.types.points import write_points
 
         rng = np.random.default_rng(42)
         store = str(tmp_path / "pts.zv")
@@ -120,10 +120,10 @@ class TestShardReshardChain:
     """
 
     def test_shard_chain(self, tmp_path: Path) -> None:
-        import json
         import zarr
-        from zarr_vectors.types.points import write_points, read_points
-        from zarr_vectors.sharding import reshard, is_sharded, get_shard_info
+
+        from zarr_vectors.sharding import get_shard_info, is_sharded, reshard
+        from zarr_vectors.types.points import read_points, write_points
         from zarr_vectors.validate import validate
 
         rng = np.random.default_rng(42)
@@ -177,7 +177,8 @@ class TestBornShardedWrites:
 
     def test_points_born_sharded(self, tmp_path: Path) -> None:
         import zarr
-        from zarr_vectors.types.points import write_points, read_points
+
+        from zarr_vectors.types.points import read_points, write_points
 
         rng = np.random.default_rng(0)
         store = str(tmp_path / "pts.zv")
@@ -203,7 +204,8 @@ class TestBornShardedWrites:
 
     def test_graph_born_sharded(self, tmp_path: Path) -> None:
         import zarr
-        from zarr_vectors.types.graphs import write_graph, read_graph
+
+        from zarr_vectors.types.graphs import read_graph, write_graph
 
         store = str(tmp_path / "g.zv")
         # Three clusters of nodes in three distinct chunks, with edges
@@ -265,10 +267,10 @@ class TestShardedPyramid:
     """Build pyramid then shard — all levels survive."""
 
     def test_pyramid_then_shard(self, tmp_path: Path) -> None:
-        from zarr_vectors.types.points import write_points, read_points
+        from zarr_vectors.core.store import list_resolution_levels, open_store
         from zarr_vectors.multiresolution.coarsen import build_pyramid
-        from zarr_vectors.sharding import reshard, is_sharded
-        from zarr_vectors.core.store import open_store, list_resolution_levels
+        from zarr_vectors.sharding import is_sharded, reshard
+        from zarr_vectors.types.points import read_points, write_points
         from zarr_vectors.validate import validate
 
         rng = np.random.default_rng(42)
@@ -299,10 +301,10 @@ class TestRechunkByGroup:
     """Rechunk by group → prefix-scan reads."""
 
     def test_group_rechunk(self, tmp_path: Path) -> None:
-        from zarr_vectors.types.polylines import write_polylines
-        from zarr_vectors.rechunk import rechunk, RechunkSpec
-        from zarr_vectors.core.store import open_store
         from zarr_vectors.core.arrays import list_chunk_keys, read_chunk_vertices
+        from zarr_vectors.core.store import open_store
+        from zarr_vectors.rechunk import RechunkSpec, rechunk
+        from zarr_vectors.types.polylines import write_polylines
 
         rng = np.random.default_rng(42)
         polys = _make_streamlines(rng, 60)
@@ -337,10 +339,10 @@ class TestRechunkByAttribute:
     """Rechunk by attribute:length with explicit bins."""
 
     def test_length_rechunk(self, tmp_path: Path) -> None:
-        from zarr_vectors.types.polylines import write_polylines
-        from zarr_vectors.rechunk import rechunk, RechunkSpec
-        from zarr_vectors.core.store import open_store
         from zarr_vectors.core.arrays import list_chunk_keys
+        from zarr_vectors.core.store import open_store
+        from zarr_vectors.rechunk import RechunkSpec, rechunk
+        from zarr_vectors.types.polylines import write_polylines
 
         rng = np.random.default_rng(42)
         polys = _make_streamlines(rng, 80)
@@ -389,8 +391,8 @@ class TestRechunkViaLazy:
     """Rechunk via lazy API: zv[0].rechunk()."""
 
     def test_lazy_rechunk(self, tmp_path: Path) -> None:
-        from zarr_vectors.types.polylines import write_polylines
         from tests._deprecated import open_zv
+        from zarr_vectors.types.polylines import write_polylines
 
         rng = np.random.default_rng(42)
         polys = _make_streamlines(rng, 40)
@@ -414,10 +416,10 @@ class TestCompositeStore:
     """Composite: points + graph + mesh in one store."""
 
     def test_composite_pipeline(self, tmp_path: Path) -> None:
-        from zarr_vectors.types.points import write_points, read_points
-        from zarr_vectors.composite import add_geometry, read_composite
-        from zarr_vectors.validate import validate
         from tests._deprecated import open_zv
+        from zarr_vectors.composite import add_geometry, read_composite
+        from zarr_vectors.types.points import read_points, write_points
+        from zarr_vectors.validate import validate
 
         rng = np.random.default_rng(42)
         store = str(tmp_path / "brain.zv")
@@ -458,13 +460,13 @@ class TestBackwardCompat:
     """All original store types work unchanged with new code."""
 
     def test_all_types(self, tmp_path: Path) -> None:
-        from zarr_vectors.types.points import write_points, read_points
-        from zarr_vectors.types.lines import write_lines, read_lines
-        from zarr_vectors.types.polylines import write_polylines, read_polylines
-        from zarr_vectors.types.meshes import write_mesh, read_mesh
-        from zarr_vectors.types.graphs import write_graph, read_graph
-        from zarr_vectors.validate import validate
         from zarr_vectors.multiresolution.coarsen import build_pyramid
+        from zarr_vectors.types.graphs import read_graph, write_graph
+        from zarr_vectors.types.lines import read_lines, write_lines
+        from zarr_vectors.types.meshes import read_mesh, write_mesh
+        from zarr_vectors.types.points import read_points, write_points
+        from zarr_vectors.types.polylines import read_polylines, write_polylines
+        from zarr_vectors.validate import validate
 
         rng = np.random.default_rng(42)
 

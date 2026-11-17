@@ -358,8 +358,6 @@ def test_validate_metadata_calls_the_per_level_validator(
         bounds=([0.0, 0.0, 0.0], [400.0, 400.0, 400.0]),
     )
 
-    real = vm.read_level_metadata if hasattr(vm, "read_level_metadata") else None
-
     def fake_read_level_metadata(root, li):
         # 150 is not an integer multiple of the root chunk_shape 100.
         return LevelMetadata(

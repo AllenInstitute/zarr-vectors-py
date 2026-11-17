@@ -62,7 +62,7 @@ def validate_chunk_sources(sources: Any, chunk_dims: Any) -> None:
             raise MetadataError(f"chunk_sources[{i}].fingerprint must be a dict")
 
 
-def chunk_sources(level_group) -> "list[dict] | None":
+def chunk_sources(level_group) -> list[dict] | None:
     """The level's source table, or ``None`` for an ordinary level."""
     lv = level_group.attrs.get(_LEVEL_KEY) or {}
     got = lv.get("chunk_sources") if isinstance(lv, dict) else None
@@ -73,7 +73,7 @@ def is_composite(level_group) -> bool:
     return chunk_sources(level_group) is not None
 
 
-def verify_chunk_sources(level_group) -> "list[dict] | None":
+def verify_chunk_sources(level_group) -> list[dict] | None:
     """Open every source of a composite level now, raising if one cannot be read as recorded.
 
     For readers that tolerate unreadable cells and so would not notice a
@@ -243,7 +243,7 @@ class _Resolver:
         return np.ascontiguousarray(out.astype(out_dtype)).tobytes()
 
 
-def resolver_for(group) -> "_Resolver | None":
+def resolver_for(group) -> _Resolver | None:
     """The group's resolver when it is a composite level, cached on the group; else ``None``."""
     state = getattr(group, "_chunk_sources_state", None)
     if state is None:
@@ -253,7 +253,7 @@ def resolver_for(group) -> "_Resolver | None":
     return state or None
 
 
-def split_source_key(chunk_key: str) -> "tuple[int, str] | None":
+def split_source_key(chunk_key: str) -> tuple[int, str] | None:
     """``(source, spatial key)`` of a composite cell key ``s.z.y.x``; ``None`` if malformed."""
     head, sep, rest = chunk_key.partition(".")
     if not sep:

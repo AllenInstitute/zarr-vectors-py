@@ -116,8 +116,8 @@ class TestAttributeFamilies:
         the whole mapping against ``constants`` is what stops the next
         one.
         """
-        from zarr_vectors.api.level import _ATTR_GROUPS, attribute_families
         from zarr_vectors import constants
+        from zarr_vectors.api.level import _ATTR_GROUPS, attribute_families
 
         defined = {
             constants.VERTEX_ATTRIBUTES, constants.FRAGMENT_ATTRIBUTES,

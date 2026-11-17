@@ -46,6 +46,21 @@ jobs:
           echo "Author association: ${{ github.event.pull_request.author_association }}"
           echo "Labels: ${{ join(github.event.pull_request.labels.*.name, ', ') }}"
 
+  lint:
+    # ruff over the package and the tests; config in pyproject.toml.
+    # Pinned so a ruff release cannot fail CI on code nobody touched
+    # (same pin as zarr-octree).
+    name: ruff
+    needs: gate
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install uv
+        uses: astral-sh/setup-uv@v4
+      - name: ruff check
+        run: uvx ruff@0.17.5 check zarr_vectors tests
+
   test:
     name: pytest (py${{ matrix.python-version }})
     needs: gate

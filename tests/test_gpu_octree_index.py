@@ -50,7 +50,9 @@ def fetch_module():
 
         yield _fetch
     finally:
-        for n in [n for n in sys.modules if n == "cupy" or n.startswith(("cupy.", "zarr_vectors.gpu"))]:
+        for n in [
+            n for n in sys.modules if n == "cupy" or n.startswith(("cupy.", "zarr_vectors.gpu"))
+        ]:
             del sys.modules[n]
         sys.modules.update(saved)
         if had_gpu:
@@ -64,9 +66,13 @@ def _serializer(kind: str):
     if kind == "dense_end":
         return ShardingCodec(chunk_shape=(1, 1, 1), codecs=inner)
     if kind == "dense_start_nocrc":
-        return ShardingCodec(chunk_shape=(1, 1, 1), codecs=inner, index_codecs=[BytesCodec()], index_location="start")
+        return ShardingCodec(
+            chunk_shape=(1, 1, 1), codecs=inner, index_codecs=[BytesCodec()], index_location="start"
+        )
     if kind == "octree":
-        return zarr_octree_codec.OctreeShardingCodec(chunk_shape=(1, 1, 1), codecs=inner, target=2_000)
+        return zarr_octree_codec.OctreeShardingCodec(
+            chunk_shape=(1, 1, 1), codecs=inner, target=2_000
+        )
     return zarr_octree_codec.OctreeShardingCodec(
         chunk_shape=(1, 1, 1), codecs=inner, layout="runs", min_weight=100, max_weight=2_000,
     )
@@ -98,9 +104,12 @@ def stored(request, tmp_path):
     data = np.empty(len(vals), dtype=object)
     data[:] = list(vals.values())
     arr.vindex[tuple(idx)] = data
-    local = cell_source("a", zarr.open_array(LocalStore(str(tmp_path / kind), read_only=True), path="a"))
+    local = cell_source(
+        "a", zarr.open_array(LocalStore(str(tmp_path / kind), read_only=True), path="a")
+    )
     wrapped = cell_source(
-        "a", zarr.open_array(WrapperStore(LocalStore(str(tmp_path / kind), read_only=True)), path="a"),
+        "a",
+        zarr.open_array(WrapperStore(LocalStore(str(tmp_path / kind), read_only=True)), path="a"),
     )
     assert local is not None and wrapped is not None and wrapped.local_root is None
     assert wrapped.index_format == ("zarr_octree" if kind.startswith("octree") else "dense")
@@ -166,7 +175,9 @@ def test_a_corrupt_octree_index_is_an_error_per_cell_not_a_garbage_range(fetch_m
     blob = bytearray(path.read_bytes())
     blob[-20] ^= 0xFF  # inside the index body: its checksum fails
     path.write_bytes(bytes(blob))
-    src = cell_source("a", zarr.open_array(WrapperStore(LocalStore(str(tmp_path), read_only=True)), path="a"))
+    src = cell_source(
+        "a", zarr.open_array(WrapperStore(LocalStore(str(tmp_path), read_only=True)), path="a")
+    )
     cells = _all_cells()
     ranges, errors = fetch_module.locate_store(src, cells)
     in_bad = (cells < 4).all(axis=1)

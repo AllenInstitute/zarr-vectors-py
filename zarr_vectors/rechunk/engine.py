@@ -65,7 +65,6 @@ from zarr_vectors.rechunk.spatial import _ATTR_META_OWNED
 from zarr_vectors.rechunk.spec import DimensionMapper, RechunkSpec
 from zarr_vectors.typing import ChunkCoords, ObjectManifest
 
-
 #: Level-0 families :func:`rechunk` carries into the output.
 _CARRIED = {
     VERTICES, VERTEX_FRAGMENTS, OBJECT_INDEX, VERTEX_ATTRIBUTES,

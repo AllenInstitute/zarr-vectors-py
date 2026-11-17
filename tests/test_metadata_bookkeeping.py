@@ -9,7 +9,6 @@ import pytest
 
 from zarr_vectors.exceptions import ArrayError, DracoError
 
-
 # --- pre-built Zarr stores keep the writer's create kwargs --------------
 
 def test_prebuilt_store_gets_writer_bounds():

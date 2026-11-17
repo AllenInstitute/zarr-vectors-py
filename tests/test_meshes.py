@@ -7,8 +7,8 @@ from pathlib import Path
 import numpy as np
 import pytest
 
-from zarr_vectors.types.meshes import write_mesh, read_mesh
 from zarr_vectors.exceptions import ArrayError
+from zarr_vectors.types.meshes import read_mesh, write_mesh
 
 
 class TestMeshBasic:
@@ -25,7 +25,7 @@ class TestMeshBasic:
         rng = np.random.default_rng(42)
         v = rng.uniform(0, 80, size=(200, 3)).astype(np.float32)
         f = rng.integers(0, 200, size=(400, 3)).astype(np.int64)
-        s = write_mesh(str(tmp_path / "m.zv"), v, f, chunk_shape=(100.,100.,100.))
+        write_mesh(str(tmp_path / "m.zv"), v, f, chunk_shape=(100.,100.,100.))
         r = read_mesh(str(tmp_path / "m.zv"))
         assert r["vertex_count"] == 200 and r["face_count"] == 400
 
@@ -33,7 +33,7 @@ class TestMeshBasic:
         v = np.array([[0,0,0],[10,0,0],[10,10,0],[0,10,0],
                        [0,0,10],[10,0,10],[10,10,10],[0,10,10]], dtype=np.float32)
         f = np.array([[0,1,2,3],[4,5,6,7],[0,1,5,4],[2,3,7,6],[0,3,7,4],[1,2,6,5]], dtype=np.int64)
-        s = write_mesh(str(tmp_path / "m.zv"), v, f, chunk_shape=(100.,100.,100.))
+        write_mesh(str(tmp_path / "m.zv"), v, f, chunk_shape=(100.,100.,100.))
         r = read_mesh(str(tmp_path / "m.zv"))
         assert r["face_count"] == 6 and r["faces"].shape[1] == 4
 
@@ -51,7 +51,9 @@ class TestMeshCrossChunk:
         c1 = rng.uniform(0, 50, size=(50, 3)).astype(np.float32)
         c2 = rng.uniform(100, 150, size=(50, 3)).astype(np.float32)
         v = np.vstack([c1, c2])
-        f = np.vstack([rng.integers(0,50,size=(30,3)), rng.integers(50,100,size=(30,3))]).astype(np.int64)
+        f = np.vstack(
+            [rng.integers(0, 50, size=(30, 3)), rng.integers(50, 100, size=(30, 3))]
+        ).astype(np.int64)
         s = write_mesh(str(tmp_path / "m.zv"), v, f, chunk_shape=(100.,100.,100.))
         assert s["intra_face_count"] == 60
 

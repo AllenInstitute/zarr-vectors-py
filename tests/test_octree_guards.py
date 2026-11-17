@@ -359,8 +359,8 @@ def test_the_per_cell_readers_refuse_an_octree_level(tmp_path):
         read_chunk_vertices(level, (0, 0, 0))
     with pytest.raises(OctreeError, match="read_chunk_links"):
         read_chunk_links(level, (0, 0, 0))
-    from zarr_vectors.core.arrays import list_chunk_keys
     from zarr_vectors.constants import VERTICES
+    from zarr_vectors.core.arrays import list_chunk_keys
     u = get_resolution_level(open_store(_graph(tmp_path / "u.zv", octree=False)), 0)
     assert read_chunk_vertices(u, list_chunk_keys(u, VERTICES)[0])
 
@@ -483,7 +483,9 @@ def _octree_arrays(path):
     for p in Path(path).rglob("zarr.json"):
         d = json.loads(p.read_text())
         if d.get("node_type") == "array" and d.get("codecs"):
-            names.add("octree" if d["codecs"][0]["name"] in OCTREE_CODEC_NAMES else d["codecs"][0]["name"])
+            names.add(
+                "octree" if d["codecs"][0]["name"] in OCTREE_CODEC_NAMES else d["codecs"][0]["name"]
+            )
     return names
 
 
@@ -525,9 +527,9 @@ def test_validate_passes_a_correct_octree_level(tmp_path, make, shard):
 
 
 def test_validate_catches_a_broken_octree_level(tmp_path):
-    from zarr_vectors.validate import validate
-
     import zarr
+
+    from zarr_vectors.validate import validate
 
     src = _graph(tmp_path / "g.zv")
     leaves = zarr.open_array(f"{src}/0/octree_chunks/leaves", mode="r+")
@@ -546,7 +548,9 @@ def test_validate_catches_a_broken_octree_level(tmp_path):
     src = _points(tmp_path / "m.zv")
     lg = get_resolution_level(open_store(src, mode="r+"), 0)
     level = dict(lg.attrs["zarr_vectors_level"])
-    lg.attrs.update({"zarr_vectors_level": {**level, "octree_chunks": {"converting": "to_uniform"}}})
+    lg.attrs.update(
+        {"zarr_vectors_level": {**level, "octree_chunks": {"converting": "to_uniform"}}}
+    )
     assert any("part way through to_uniform" in e for e in validate(src, level=3).errors)
 
 

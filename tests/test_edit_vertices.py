@@ -34,7 +34,6 @@ from zarr_vectors.ops import (
 )
 from zarr_vectors.types.points import write_points
 
-
 # ---------------------------------------------------------------------
 # Fixtures
 # ---------------------------------------------------------------------
@@ -365,7 +364,7 @@ class TestChunkCrossMove:
         new_oid = report.oid_remap[0]
 
         # The new OID's vertex still carries intensity=3.14.
-        from zarr_vectors.core.arrays import read_object_manifest, read_chunk_attributes
+        from zarr_vectors.core.arrays import read_chunk_attributes, read_object_manifest
         manifest = read_object_manifest(root["0"], new_oid)
         assert len(manifest) == 1
         new_cc, new_frag = manifest[0]

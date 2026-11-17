@@ -12,7 +12,6 @@ from zarr_vectors.core.arrays import read_all_object_manifests
 from zarr_vectors.core.store import (
     get_resolution_level,
     open_store,
-    read_root_metadata,
 )
 from zarr_vectors.types.points import read_points, write_points
 

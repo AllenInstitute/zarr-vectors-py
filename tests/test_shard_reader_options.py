@@ -86,7 +86,9 @@ def _write(path, codec):
 def _open(path, where):
     if where == "local":
         return zv.open(str(path))
-    return zv.open(WrapperStore(LocalStore(str(path), read_only=True)))  # not a LocalStore: the object-store path
+    return zv.open(
+        WrapperStore(LocalStore(str(path), read_only=True))
+    )  # not a LocalStore: the object-store path
 
 
 def _sorted(p):
@@ -151,19 +153,35 @@ def test_optimised_reader_reads_store_backed_shards_itself(tmp_path, monkeypatch
 
 
 @pytest.mark.parametrize("codec", list(CODECS))
-def test_standard_reader_reads_store_backed_shards_through_zarr_as_before(tmp_path, monkeypatch, codec):
+def test_standard_reader_reads_store_backed_shards_through_zarr_as_before(
+    tmp_path, monkeypatch, codec
+):
     """``standard``: one range per cell, and a store that is not local read
     through zarr, never by the optimised reader."""
     _write(tmp_path / "s.zv", codec)
     monkeypatch.setenv("ZARR_VECTORS_SHARD_READER", "standard")
-    monkeypatch.setenv("ZARR_VECTORS_COALESCE", "gap:1000000:100000000")  # ignored by the standard reader
+    monkeypatch.setenv(
+        "ZARR_VECTORS_COALESCE", "gap:1000000:100000000"
+    )  # ignored by the standard reader
     assert _batch_reader.shard_reader() == "standard"
     assert _cells_on_disk._coalescing()[0] == "none"
     seen = []
     real = _cells_on_disk.read_cells
-    monkeypatch.setattr(_cells_on_disk, "read_cells", lambda reqs: seen.append([s.local_root for s, _ in reqs]) or real(reqs))
+    monkeypatch.setattr(
+        _cells_on_disk,
+        "read_cells",
+        lambda reqs: seen.append([s.local_root for s, _ in reqs]) or real(reqs),
+    )
     for where in ("store", "local"):
-        assert len(_open(tmp_path / "s.zv", where).select(bbox=([0, 0, 0], [BOX, BOX, BOX])).read().positions) == 3_000
+        assert (
+            len(
+                _open(tmp_path / "s.zv", where)
+                .select(bbox=([0, 0, 0], [BOX, BOX, BOX]))
+                .read()
+                .positions
+            )
+            == 3_000
+        )
     assert all(root is not None for batch in seen for root in batch)  # only ever local files
 
 
@@ -206,7 +224,10 @@ def test_a_marked_store_writes_every_sharded_array_octree(tmp_path, kind):
     if kind != "point_cloud":
         assert any("/links/" in a for a in codecs)
     root = _root(p)
-    assert root["octree_sharding"] == {"target": 2_000} and "octree_sharding" in root["format_capabilities"]
+    assert (
+        root["octree_sharding"] == {"target": 2_000}
+        and "octree_sharding" in root["format_capabilities"]
+    )
     assert zv.Schema.from_store(zv.open(str(p))._root_meta).layout.octree == {"target": 2_000}
 
 
@@ -245,8 +266,12 @@ def test_set_octree_converts_both_ways_and_back_is_the_unmarked_store(tmp_path, 
     assert set(_codecs(b).values()) == {"octree"}
     assert _root(b)["octree_sharding"] == {"target": 3_000}
     got = _answers(zv.open(str(b)))
-    assert all(np.array_equal(x, y) for x, y in zip(got[0], want[0])) and np.array_equal(got[1], want[1])
-    assert set_octree(str(b), {"target": 3_000})["arrays_repacked"] == 0  # re-running finishes, never redoes
+    assert all(np.array_equal(x, y) for x, y in zip(got[0], want[0])) and np.array_equal(
+        got[1], want[1]
+    )
+    assert (
+        set_octree(str(b), {"target": 3_000})["arrays_repacked"] == 0
+    )  # re-running finishes, never redoes
 
     set_octree(str(b), False)
     for f in (p.relative_to(a) for p in a.rglob("*") if p.is_file()):
@@ -256,15 +281,23 @@ def test_set_octree_converts_both_ways_and_back_is_the_unmarked_store(tmp_path, 
             assert ra == rb
         else:
             assert filecmp.cmp(a / f, b / f, shallow=False), f
-    assert sorted(p.relative_to(a) for p in a.rglob("*")) == sorted(p.relative_to(b) for p in b.rglob("*"))
+    assert sorted(p.relative_to(a) for p in a.rglob("*")) == sorted(
+        p.relative_to(b) for p in b.rglob("*")
+    )
 
 
 def test_set_octree_needs_a_sharded_store(tmp_path):
     from zarr_vectors.sharding import set_octree
 
     p = tmp_path / "s.zv"
-    zv.create(str(p), schema=zv.Schema(bounds=([0, 0, 0], [BOX, BOX, BOX]), kind="point_cloud",
-                                       layout=zv.Layout(cells=8, shard_cells=None))).add_points(*_points()[:1])
+    zv.create(
+        str(p),
+        schema=zv.Schema(
+            bounds=([0, 0, 0], [BOX, BOX, BOX]),
+            kind="point_cloud",
+            layout=zv.Layout(cells=8, shard_cells=None),
+        ),
+    ).add_points(*_points()[:1])
     with pytest.raises(ValueError, match="sharded"):
         set_octree(str(p))
 
@@ -290,7 +323,8 @@ _WITHOUT_OCTREE = textwrap.dedent("""
     counts = {}
     for reader in ("standard", "zarr", "optimised"):
         os.environ["ZARR_VECTORS_SHARD_READER"] = reader
-        counts[reader] = len(zv.open(root + "/a.zv").select(bbox=([0, 0, 0], [50, 50, 50])).read().positions)
+        query = zv.open(root + "/a.zv").select(bbox=([0, 0, 0], [50, 50, 50]))
+        counts[reader] = len(query.read().positions)
     marked = zv.Schema(bounds=([0, 0, 0], [100, 100, 100]), kind="point_cloud",
                        layout=zv.Layout(cells=8, shard_cells=4, compression="zstd", octree=True))
     try:
@@ -305,9 +339,17 @@ _WITHOUT_OCTREE = textwrap.dedent("""
 
 def test_zarr_octree_is_optional(tmp_path):
     env = {k: v for k, v in os.environ.items() if not k.startswith("ZARR_VECTORS_SHARD_")}
-    r = subprocess.run([sys.executable, "-c", _WITHOUT_OCTREE, str(tmp_path)], capture_output=True, text=True, env=env)
+    r = subprocess.run(
+        [sys.executable, "-c", _WITHOUT_OCTREE, str(tmp_path)],
+        capture_output=True,
+        text=True,
+        env=env,
+    )
     assert r.returncode == 0, r.stderr[-3000:]
     out = json.loads(r.stdout.strip().splitlines()[-1])
     assert out["counts"] == {"standard": out["want"], "zarr": out["want"], "optimised": out["want"]}
     assert not out["imported"]
-    assert out["asked"].startswith("ValueError") and "github.com/Andrew-Keenlyside/zarr-octree" in out["asked"], out["asked"]
+    assert (
+        out["asked"].startswith("ValueError")
+        and "github.com/Andrew-Keenlyside/zarr-octree" in out["asked"]
+    ), out["asked"]

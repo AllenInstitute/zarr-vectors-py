@@ -10,7 +10,6 @@ from __future__ import annotations
 from pathlib import Path
 
 import numpy as np
-import pytest
 
 from zarr_vectors.core.arrays import (
     read_links,
@@ -81,7 +80,8 @@ class TestDecompose:
 class TestPerChunkWrite:
     def test_vertices_and_links_round_trip(self, tmp_path: Path) -> None:
         from zarr_vectors.core.arrays import (
-            read_chunk_links, read_chunk_vertices,
+            read_chunk_links,
+            read_chunk_vertices,
         )
 
         root, lg = _init(tmp_path)

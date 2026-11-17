@@ -24,7 +24,6 @@ from zarr_vectors.types.lines import read_lines, write_lines
 from zarr_vectors.types.meshes import read_mesh, write_mesh
 from zarr_vectors.types.polylines import read_polylines, write_polylines
 
-
 CHUNK = (200.0, 200.0, 200.0)
 BIN = (50.0, 50.0, 50.0)
 
