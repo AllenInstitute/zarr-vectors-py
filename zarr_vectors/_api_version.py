@@ -31,7 +31,7 @@ from __future__ import annotations
 #: Version of the Python API surface.  Bump the minor when a supported
 #: name is added, the major when one is removed or changes meaning.
 #: Independent of both ``__version__`` and the on-disk format.
-__api_version__ = (1, 5)
+__api_version__ = (1, 7)
 
 #: Capabilities a caller may branch on, each True only when usable.
 FEATURES: frozenset[str] = frozenset({
@@ -122,6 +122,14 @@ FEATURES: frozenset[str] = frozenset({
     # fsynced before the block returns; building.cell_objects names the
     # object (or shard) holding each cell.
     "durable-writes",
+    # durable="deferred" on shard_transaction / batched_writes /
+    # open_write_session: atomic writes with no fsync, made durable later by
+    # building.sync_store (one syncfs of the store's filesystem). API 1.6.
+    "durable-deferred",
+    # shard_transaction(prefetch=True), merge mode: owned shards read whole
+    # in the background on entry; owned-cell reads and the publish's merge
+    # served from them; a fully rewritten shard not read at all. API 1.7.
+    "transaction-prefetch",
     # building.store_layout: a store's layout resolved from what it holds,
     # with min_reader, the oldest zarr-vectors that reads all of it.
     "store-layout",
