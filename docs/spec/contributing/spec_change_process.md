@@ -67,8 +67,9 @@ The implementation pull request updates:
   `tests/test_linkml_schema.py`). The docstring is the format history;
   there is no changelog file;
 - the validator in `zarr_vectors/validate/`, when a rule changes;
-- `schema/zarr_vectors.linkml.yaml`, then `python schema/regen.py` (see
-  [Machine-readable schema](../schema.md));
+- when the metadata changes, the LinkML model in `convention/` of
+  AllenInstitute/zarr_vectors; copy it to `schema/` and run
+  `python schema/regen.py` (see [Machine-readable schema](../schema.md));
 - tests (see [Compliance testing](test_compliance.md));
 - the affected pages under `docs/spec/`.
 

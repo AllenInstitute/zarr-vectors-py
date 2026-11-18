@@ -102,9 +102,11 @@ dev = [
     # Build-time-only schema toolchain.  End users never need these;
     # CI uses them to regenerate `schema/zarr_vectors.schema.json` and
     # `schema/reference.md` from the LinkML source.  The `jsonschema`
-    # package is also used by `tests/test_linkml_schema.py` to verify
-    # that the hand-written dataclasses round-trip against the schema.
-    "linkml>=1.7,<2",
+    # package is also used by `tests/test_linkml_schema.py` and
+    # `tests/test_convention_conformance.py` to validate written metadata.
+    # LinkML is pinned to the version AllenInstitute/zarr_vectors uses, so
+    # the generated schema matches the convention's byte for byte.
+    "linkml>=1.12.1,<2",
     "jsonschema>=4.0,<5",
 ]
 

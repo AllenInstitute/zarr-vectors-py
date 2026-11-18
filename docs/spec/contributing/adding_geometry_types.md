@@ -46,7 +46,7 @@ format change, so propose it in an RFC first (see
 | Step | Where | What |
 |---|---|---|
 | Type string | `zarr_vectors/constants.py` | Add `GEOM_<NAME>` to `VALID_GEOMETRY_TYPES`. `RootMetadata.validate` rejects any other type. |
-| Schema | `schema/zarr_vectors.linkml.yaml` | Add the value to the `GeometryType` enum, then run `python schema/regen.py` (`--check` reports drift, as CI does). `test_constant_set_matches_schema_enum` fails until both agree. |
+| Schema | none | The convention's schema accepts any geometry type string, so a new type needs no schema change. Document it in the format spec and the convention README. |
 | Writer and reader | `zarr_vectors/types/<module>.py` | Add `write_<type>` and `read_<type>`, following the closest existing type (below). |
 | Validator | `zarr_vectors/validate/conformance.py` | Add the type to `GEOMETRY_LINK_REQ` with its allowed links conventions; a missing type gives the warning `Unknown geometry type: '<type>'`. Add type-specific rules in `validate_conformance`. Levels 1 to 3 need a change only for a new array or key. |
 | `Dataset` facade | `zarr_vectors/api/level.py`, `result.py`, `dataset.py` | Add a `_READERS` entry; a `ReadResult.from_<type>` constructor if none fits; a `Dataset.add_<type>` method if users write the type through the facade. |
