@@ -16,7 +16,7 @@ root, on each level and on each array (discriminated by `kind`). It has
 no class for the `multiscales` block, `zarr_conventions`,
 `proj:projjson` or the `ome` node; see
 [Root metadata](layout/root_metadata.md) for those. The
-[Zarr Vectors convention](https://github.com/AllenInstitute/zarr-vectors-convention)
+[Zarr Vectors convention](https://github.com/Andrew-Keenlyside/zarr-vectors)
 publishes its own JSON Schema for the same metadata; where the two
 disagree, the convention's schema wins.
 

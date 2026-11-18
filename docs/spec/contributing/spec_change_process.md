@@ -95,7 +95,7 @@ additive change should offer an in-place upgrade where it can, as
 rewriting data.
 
 A change to the metadata layout also changes the
-[Zarr Vectors convention](https://github.com/AllenInstitute/zarr-vectors-convention),
+[Zarr Vectors convention](https://github.com/Andrew-Keenlyside/zarr-vectors),
 which lists the format versions each convention version covers.
 
 A change that only some readers can handle can be a format capability

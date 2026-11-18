@@ -1,6 +1,6 @@
 # Zarr Vectors (ZV) format
 
-Reference schema for the Zarr Vectors (ZV) metadata payloads (0.10.0). Covers the root object (``zarr_vectors`` with ``kind: root``, which carries the canonical axes list), the per-resolution-level object (``zarr_vectors`` with ``kind: level``), and the per-array metadata in the flat in-memory shape the writers in ``zarr_vectors/core/arrays.py`` build (discriminator slot ``zv_array``). On disk, format 0.10.0 nests the per-array fields under ``zarr_vectors`` with ``kind`` (see ``zarr_vectors/core/convention.py``); the normative on-disk definition is the Zarr Vectors convention's JSON schema, https://github.com/AllenInstitute/zarr-vectors-convention.
+Reference schema for the Zarr Vectors (ZV) metadata payloads (0.10.0). Covers the root object (``zarr_vectors`` with ``kind: root``, which carries the canonical axes list), the per-resolution-level object (``zarr_vectors`` with ``kind: level``), and the per-array metadata in the flat in-memory shape the writers in ``zarr_vectors/core/arrays.py`` build (discriminator slot ``zv_array``). On disk, format 0.10.0 nests the per-array fields under ``zarr_vectors`` with ``kind`` (see ``zarr_vectors/core/convention.py``); the normative on-disk definition is the Zarr Vectors convention's JSON schema, https://github.com/Andrew-Keenlyside/zarr-vectors.
 
 
 URI: https://w3id.org/zarr-vectors/schema/0.9
@@ -13080,7 +13080,7 @@ minimum_value: 0
 
 # zarr_vectors 
 
-Reference schema for the Zarr Vectors (ZV) metadata payloads (0.10.0). Covers the root object (``zarr_vectors`` with ``kind: root``, which carries the canonical axes list), the per-resolution-level object (``zarr_vectors`` with ``kind: level``), and the per-array metadata in the flat in-memory shape the writers in ``zarr_vectors/core/arrays.py`` build (discriminator slot ``zv_array``). On disk, format 0.10.0 nests the per-array fields under ``zarr_vectors`` with ``kind`` (see ``zarr_vectors/core/convention.py``); the normative on-disk definition is the Zarr Vectors convention's JSON schema, https://github.com/AllenInstitute/zarr-vectors-convention.
+Reference schema for the Zarr Vectors (ZV) metadata payloads (0.10.0). Covers the root object (``zarr_vectors`` with ``kind: root``, which carries the canonical axes list), the per-resolution-level object (``zarr_vectors`` with ``kind: level``), and the per-array metadata in the flat in-memory shape the writers in ``zarr_vectors/core/arrays.py`` build (discriminator slot ``zv_array``). On disk, format 0.10.0 nests the per-array fields under ``zarr_vectors`` with ``kind`` (see ``zarr_vectors/core/convention.py``); the normative on-disk definition is the Zarr Vectors convention's JSON schema, https://github.com/Andrew-Keenlyside/zarr-vectors.
 
 
 URI: https://w3id.org/zarr-vectors/schema/0.9

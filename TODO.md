@@ -12,15 +12,12 @@ decided. Grouped by when it should land.
 
 ## Before the next release
 
-**Publish the convention where the stores point.** Format 0.10.0 stamps
+**Tag the convention where the stores point.** Format 0.10.0 stamps
 every root with the convention's `schema_url` and `spec_url`
-(`core/convention.py`, `CONVENTION_CMO`):
-`github.com/AllenInstitute/zarr-vectors-convention`, tag `v0.1.0`. That
-repository does not exist yet; the convention is on the `schema-fixes`
-branch of `Andrew-Keenlyside/zarr-vectors`. Every store written keeps
-these URLs, so create the repository and tag (or change the URLs) before
-releasing 0.10.0. Its README also still says 0.10.0's cells match 0.9.2
-(they match 0.9.4) and that format versions have no in-place migration.
+(`core/convention.py`, `CONVENTION_CMO`), which point at tag `v0.1.0` of
+`github.com/Andrew-Keenlyside/zarr-vectors`. Every store keeps these
+URLs, so merge the convention's `schema-fixes` branch and push the tag
+before releasing 0.10.0.
 
 **The LinkML schema still describes 0.9.** `schema/zarr_vectors.linkml.yaml`
 keeps the id `.../schema/0.9`, models array metadata in the flat

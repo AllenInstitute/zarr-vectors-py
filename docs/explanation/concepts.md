@@ -34,7 +34,7 @@ object storage. By convention its name ends in `.zarrvectors`. The root
 `attributes.multiscales` listing the pyramid's levels. Every node with
 Zarr Vectors metadata keeps it in one `zarr_vectors` attribute whose `kind`
 says what the node is (`root`, `level`, `vertices`, …), and registers the
-[Zarr Vectors convention](https://github.com/AllenInstitute/zarr-vectors-convention)
+[Zarr Vectors convention](https://github.com/Andrew-Keenlyside/zarr-vectors)
 in `zarr_conventions`.
 
 ```

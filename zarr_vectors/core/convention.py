@@ -4,7 +4,7 @@ Format 0.10.0 stores every Zarr Vectors property of a node in one
 attribute, ``zarr_vectors``, discriminated by ``kind``, and registers the
 convention in ``zarr_conventions`` on every node that carries it (the Zarr
 Conventions specification requires registration per node).  See
-https://github.com/AllenInstitute/zarr-vectors-convention.
+https://github.com/Andrew-Keenlyside/zarr-vectors.
 
 Inside the package, array metadata keeps its historical *flat* shape --
 ``{"zv_array": "vertices", "dtype": ..., "nonempty_chunks": [...]}`` --
@@ -41,11 +41,11 @@ CONVENTION_VERSION = "0.1.0"
 #: Full convention metadata object, written on the store root.
 CONVENTION_CMO: dict[str, str] = {
     "schema_url": (
-        "https://raw.githubusercontent.com/AllenInstitute/"
-        f"zarr-vectors-convention/refs/tags/v{CONVENTION_VERSION}/schema.json"
+        "https://raw.githubusercontent.com/Andrew-Keenlyside/"
+        f"zarr-vectors/refs/tags/v{CONVENTION_VERSION}/schema.json"
     ),
     "spec_url": (
-        "https://github.com/AllenInstitute/zarr-vectors-convention/"
+        "https://github.com/Andrew-Keenlyside/zarr-vectors/"
         f"blob/v{CONVENTION_VERSION}/README.md"
     ),
     "uuid": CONVENTION_UUID,

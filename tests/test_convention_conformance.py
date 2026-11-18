@@ -1,7 +1,7 @@
 """Every node the writers produce conforms to the Zarr Vectors convention.
 
 ``tests/data/zarr_vectors_convention_v0.1.0.schema.json`` is a copy of the
-convention's JSON schema (https://github.com/AllenInstitute/zarr-vectors-convention,
+convention's JSON schema (https://github.com/Andrew-Keenlyside/zarr-vectors,
 tag v0.1.0).  It is the normative definition of the on-disk metadata of
 format 0.10.0, so a writer change that drifts from it fails here rather
 than in someone else's reader.  Update the copy when the convention is

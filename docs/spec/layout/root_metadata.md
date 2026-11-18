@@ -12,7 +12,7 @@ This page lists every key in the root attributes of a Zarr Vectors store.
 **Convention registration**
 : An entry in `zarr_conventions` naming a convention the node follows.
   Format 0.10.0 stores its metadata as the
-  [Zarr Vectors convention](https://github.com/AllenInstitute/zarr-vectors-convention)
+  [Zarr Vectors convention](https://github.com/Andrew-Keenlyside/zarr-vectors)
   (v0.1.0), and every node that carries a `zarr_vectors` attribute
   registers it.
 
@@ -127,8 +127,8 @@ The root registers the Zarr Vectors convention with its full entry:
 
 ```json
 {
-  "schema_url": "https://raw.githubusercontent.com/AllenInstitute/zarr-vectors-convention/refs/tags/v0.1.0/schema.json",
-  "spec_url": "https://github.com/AllenInstitute/zarr-vectors-convention/blob/v0.1.0/README.md",
+  "schema_url": "https://raw.githubusercontent.com/Andrew-Keenlyside/zarr-vectors/refs/tags/v0.1.0/schema.json",
+  "spec_url": "https://github.com/Andrew-Keenlyside/zarr-vectors/blob/v0.1.0/README.md",
   "uuid": "66268a61-7833-4995-bbcb-233bb417dae5",
   "name": "zarr_vectors",
   "description": "Spatially chunked, multi-resolution N-dimensional vector data (point clouds, meshes, skeletons, streamlines, graphs)"

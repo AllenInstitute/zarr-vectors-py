@@ -98,7 +98,7 @@ names the schema only: no code reads it, and the format version is
 `zv_version` in the root attributes.
 
 [LinkML]:                       https://linkml.io/
-[Zarr Vectors convention]:      https://github.com/AllenInstitute/zarr-vectors-convention
+[Zarr Vectors convention]:      https://github.com/Andrew-Keenlyside/zarr-vectors
 [OME-Zarr NGFF]:                https://ngff.openmicroscopy.org/
 [Schema.org]:                   https://schema.org/
 [`zarr_vectors/core/metadata.py`]: ../zarr_vectors/core/metadata.py

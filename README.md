@@ -20,7 +20,7 @@ OBJ, ...) and their command-line tool are in the companion package
 `zarr-vectors-tools`; this package installs no console scripts.
 
 Stores are written in format 0.10.0, whose metadata follows the
-[Zarr Vectors convention](https://github.com/AllenInstitute/zarr-vectors-convention).
+[Zarr Vectors convention](https://github.com/Andrew-Keenlyside/zarr-vectors).
 A store written by 0.9.x is refused until you migrate it in place; only
 its metadata is rewritten:
 

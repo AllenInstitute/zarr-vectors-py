@@ -11,7 +11,7 @@ description: >
   On disk, format 0.10.0 nests the per-array fields under
   ``zarr_vectors`` with ``kind`` (see ``zarr_vectors/core/convention.py``);
   the normative on-disk definition is the Zarr Vectors convention's JSON
-  schema, https://github.com/AllenInstitute/zarr-vectors-convention.
+  schema, https://github.com/Andrew-Keenlyside/zarr-vectors.
 license: BSD-3-Clause
 
 prefixes:

@@ -9,7 +9,7 @@ validated. Each page has **Terms**, an **Introduction** and a
 It describes format version **0.10.0**
 (`zarr_vectors.constants.FORMAT_VERSION`, whose docstring records the
 version history). Its metadata is the
-[Zarr Vectors convention](https://github.com/AllenInstitute/zarr-vectors-convention)
+[Zarr Vectors convention](https://github.com/Andrew-Keenlyside/zarr-vectors)
 v0.1.0. 0.9.x stores are refused until migrated in place with
 `zarr_vectors.building.migrate_metadata_0_10` (see
 [Migrating from 0.9.x](layout/root_metadata.md#migrating-from-09x));
@@ -42,7 +42,7 @@ and the code disagree, the code is authoritative. Start with
 | Specification | Relationship |
 |---------------|-------------|
 | [Zarr v3 core spec](https://zarr-specs.readthedocs.io/en/latest/v3/core/v3.0.html) | Every store is a Zarr v3 hierarchy. |
-| [Zarr Vectors convention](https://github.com/AllenInstitute/zarr-vectors-convention) | Since 0.10.0, every node's metadata is this convention's `zarr_vectors` attribute, registered in `zarr_conventions`. |
+| [Zarr Vectors convention](https://github.com/Andrew-Keenlyside/zarr-vectors) | Since 0.10.0, every node's metadata is this convention's `zarr_vectors` attribute, registered in `zarr_conventions`. |
 | [Zarr conventions: multiscales](https://github.com/zarr-conventions/multiscales), [proj](https://github.com/zarr-conventions/proj) | The root's `multiscales` block lists the levels; a CRS is `proj:projjson`. |
 | [OME-Zarr NGFF](https://ngff.openmicroscopy.org/) | The root carries an RFC 8 `ome` node (since 0.9.2) and no NGFF `multiscales`. See [OME-Zarr comparison](../explanation/comparisons/ome_zarr.md). |
 | [Allen Institute Zarr Vectors specification](https://github.com/AllenInstitute/zarr_vectors) | The specification by Forrest Collman that `zarr-vectors-py` implements and extends. |

@@ -13,7 +13,7 @@ FORMAT_VERSION: str = "0.10.0"
 """Current ZV specification version.
 
 0.10.0: the metadata moves onto the Zarr Vectors convention
-(https://github.com/AllenInstitute/zarr-vectors-convention, v0.1.0).
+(https://github.com/Andrew-Keenlyside/zarr-vectors, v0.1.0).
 Cell payloads are byte-for-byte those of 0.9.4; only where metadata lives
 changes, so 0.9.x stores migrate in place with
 :func:`zarr_vectors.building.migrate_metadata_0_10` and no data is rewritten.
