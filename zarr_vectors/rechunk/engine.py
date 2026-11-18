@@ -32,6 +32,7 @@ from zarr_vectors.constants import (
     VERTICES,
 )
 from zarr_vectors.core.arrays import (
+    carry_link_element,
     create_groupings_attributes_array,
     create_links_family,
     create_object_attributes_array,
@@ -363,6 +364,7 @@ def rechunk(
                 write_links(out_level, [], ndim + 1, delta=0,
                             link_width=link_width, _arrays=(link_c, link_v),
                             **kw)
+            carry_link_element(src_level, out_level, delta=0)
             n_links = int(len(link_v))
 
     update_level_metadata(out_level, vertex_count=int(total_vertices))

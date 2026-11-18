@@ -142,6 +142,7 @@ from zarr_vectors.core.arrays import (
     read_object_manifests_csr,
     read_object_vertices,
     read_vertex_fragment_index,
+    stamp_link_element,
     # --- writing ---
     write_chunk_attributes,
     write_chunk_fragment_attributes,
@@ -168,6 +169,7 @@ from zarr_vectors.core.cells import (
     read_cells,
     read_neighbourhood,
 )
+from zarr_vectors.core.elements import ELEMENT_WIDTH, boundary_faces, signed_volumes
 from zarr_vectors.core.group import (
     _NONEMPTY_CHUNKS_ATTR,
     _PRESENCE_DECL_ATTR,
@@ -1511,6 +1513,10 @@ __all__ = [
     "write_link_cells",
     "write_links",
     "write_mesh",
+    "stamp_link_element",
+    "ELEMENT_WIDTH",
+    "boundary_faces",
+    "signed_volumes",
     "write_multiscale_metadata",
     "write_object_attribute_columns",
     "write_object_attributes",

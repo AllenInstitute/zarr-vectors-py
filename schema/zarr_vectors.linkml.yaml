@@ -31,6 +31,13 @@ imports:
 # ===================================================================
 
 enums:
+  LinkElement:
+    description: Volume elements a links family can hold, VTK vertex order.
+    permissible_values:
+      tetra:
+      pyramid:
+      wedge:
+      hexahedron:
   LinksConvention:
     description: >
       How intra-chunk links are represented for a polyline/graph/mesh.
@@ -390,7 +397,7 @@ classes:
       it, and readers then recover offsets from each array's own
       ``offsets`` meta.
     slots: [zv_array, level_delta, link_width, directed, store, sid_ndim,
-            num_links, num_physical_records]
+            num_links, num_physical_records, element]
     slot_usage:
       zv_array:
         equals_string: links_family
@@ -863,6 +870,15 @@ slots:
       ``link_attributes/<name>/<delta>/`` group created without data.
     range: integer
     minimum_value: 0
+    required: false
+  element:
+    description: >
+      What each record of a ``delta = 0`` links family is, when it is a
+      volume element: ``tetra`` (4 vertices), ``pyramid`` (5), ``wedge``
+      (6) or ``hexahedron`` (8), its vertices in VTK order.  Absent, a
+      record is an edge (``link_width`` 2) or a polygon face (3 or more).
+      Must agree with ``link_width``.
+    range: LinkElement
     required: false
   num_physical_records:
     description: >

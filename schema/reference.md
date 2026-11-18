@@ -57,6 +57,7 @@ Name: zarr_vectors
 | [crs](crs.md) | Optional coordinate reference system metadata (free-form dict matching whatev... |
 | [directed](directed.md) | When true, endpoint order is meaningful and preserved (no canonical sort): ``... |
 | [dtype](dtype.md) | Numpy dtype string of the array's value type (e |
+| [element](element.md) | What each record of a ``delta = 0`` links family is, when it is a volume elem... |
 | [encoding](encoding.md) | How the chunk bytes are encoded |
 | [format_capabilities](format_capabilities.md) | Optional 0 |
 | [fragments_tile](fragments_tile.md) | True when every chunk in this level has a vertex fragment index that tiles it... |
@@ -109,6 +110,7 @@ Name: zarr_vectors
 | [Encoding](Encoding.md) | Per-array encoding of vertex data |
 | [FormatCapability](FormatCapability.md) | Optional feature tokens a store advertises in :attr:`RootMetadata |
 | [GeometryType](GeometryType.md) | The kind of geometry a store (or one of its sub-types) holds |
+| [LinkElement](LinkElement.md) | Volume elements a links family can hold, VTK vertex order |
 | [LinksConvention](LinksConvention.md) | How intra-chunk links are represented for a polyline/graph/mesh |
 | [ManifestBlockDtype](ManifestBlockDtype.md) | Integer dtype a store creates new dense indexes' ``manifest_blocks`` in |
 | [ManifestLayout](ManifestLayout.md) | Object-index layout a store creates new indexes in |
@@ -4015,6 +4017,93 @@ search:
 ---
 
 
+# Enum: LinkElement 
+
+
+
+
+_Volume elements a links family can hold, VTK vertex order._
+
+
+
+<div data-search-exclude markdown="1">
+
+URI: [zv:LinkElement](https://w3id.org/zarr-vectors/schema/0.9/LinkElement)
+
+## Permissible Values
+| Value | Meaning | Description |
+| --- | --- | --- |
+| tetra | None |  |
+| pyramid | None |  |
+| wedge | None |  |
+| hexahedron | None |  |
+
+
+
+
+## Slots
+
+| Name | Description |
+| ---  | --- |
+| [element](element.md) | What each record of a ``delta = 0`` links family is, when it is a volume elem... |
+
+
+
+
+
+
+
+
+
+
+## Identifier and Mapping Information
+
+
+
+
+
+### Schema Source
+
+
+* from schema: https://w3id.org/zarr-vectors/schema/0.9
+
+
+
+
+
+
+## LinkML Source
+
+<details>
+```yaml
+name: LinkElement
+description: Volume elements a links family can hold, VTK vertex order.
+from_schema: https://w3id.org/zarr-vectors/schema/0.9
+rank: 1000
+permissible_values:
+  tetra:
+    text: tetra
+  pyramid:
+    text: pyramid
+  wedge:
+    text: wedge
+  hexahedron:
+    text: hexahedron
+
+```
+</details>
+
+</div>
+
+
+---
+
+---
+search:
+  boost: 2.0
+---
+
+
 # Enum: LinksConvention 
 
 
@@ -4136,6 +4225,17 @@ URI: [zv:LinksFamilyMeta](https://w3id.org/zarr-vectors/schema/0.9/LinksFamilyMe
     click LinksFamilyMeta href "../LinksFamilyMeta/"
       LinksFamilyMeta : directed
         
+      LinksFamilyMeta : element
+        
+          
+    
+        
+        
+        LinksFamilyMeta --> "0..1" LinkElement : element
+        click LinkElement href "../LinkElement/"
+    
+
+        
       LinksFamilyMeta : level_delta
         
       LinksFamilyMeta : link_width
@@ -4188,6 +4288,7 @@ URI: [zv:LinksFamilyMeta](https://w3id.org/zarr-vectors/schema/0.9/LinksFamilyMe
 | [sid_ndim](sid_ndim.md) | 0..1 <br/> [Integer](Integer.md) | Number of spatial-index dimensions encoded in chunk keys and in each offset | direct |
 | [num_links](num_links.md) | 0..1 <br/> [Integer](Integer.md) | Family-wide *logical* link count — one per input record, however many physica... | direct |
 | [num_physical_records](num_physical_records.md) | 0..1 <br/> [Integer](Integer.md) | On-disk record row count across every offsets array and cell of a ``links/<de... | direct |
+| [element](element.md) | 0..1 <br/> [LinkElement](LinkElement.md) | What each record of a ``delta = 0`` links family is, when it is a volume elem... | direct |
 
 
 
@@ -4267,6 +4368,7 @@ slots:
 - sid_ndim
 - num_links
 - num_physical_records
+- element
 slot_usage:
   zv_array:
     name: zv_array
@@ -4459,6 +4561,21 @@ attributes:
     range: integer
     required: false
     minimum_value: 0
+  element:
+    name: element
+    description: 'What each record of a ``delta = 0`` links family is, when it is
+      a volume element: ``tetra`` (4 vertices), ``pyramid`` (5), ``wedge`` (6) or
+      ``hexahedron`` (8), its vertices in VTK order.  Absent, a record is an edge
+      (``link_width`` 2) or a polygon face (3 or more). Must agree with ``link_width``.
+
+      '
+    from_schema: https://w3id.org/zarr-vectors/schema/0.9
+    rank: 1000
+    owner: LinksFamilyMeta
+    domain_of:
+    - LinksFamilyMeta
+    range: LinkElement
+    required: false
 
 ```
 </details></div>
@@ -8975,6 +9092,113 @@ domain_of:
 - LinkAttributeMeta
 range: string
 required: true
+
+```
+</details></div>
+
+
+---
+
+---
+search:
+  boost: 5.0
+---
+
+# Slot: element 
+
+
+_What each record of a ``delta = 0`` links family is, when it is a volume element: ``tetra`` (4 vertices), ``pyramid`` (5), ``wedge`` (6) or ``hexahedron`` (8), its vertices in VTK order.  Absent, a record is an edge (``link_width`` 2) or a polygon face (3 or more). Must agree with ``link_width``._
+
+__
+
+
+
+<div data-search-exclude markdown="1">
+
+
+
+URI: [zv:element](https://w3id.org/zarr-vectors/schema/0.9/element)
+<!-- no inheritance hierarchy -->
+
+
+
+
+
+## Applicable Classes
+
+| Name | Description | Modifies Slot |
+| --- | --- | --- |
+| [LinksFamilyMeta](LinksFamilyMeta.md) | Attributes for a ``links/<delta>/`` **group** — the family-wide policy every ... |  no  |
+
+
+
+
+
+
+## Properties
+
+### Type and Range
+
+| Property | Value |
+| --- | --- |
+| Range | [LinkElement](LinkElement.md) |
+| Domain Of | [LinksFamilyMeta](LinksFamilyMeta.md) |
+
+### Cardinality and Requirements
+
+| Property | Value |
+| --- | --- |
+
+
+
+
+
+
+
+
+
+
+## Identifier and Mapping Information
+
+
+
+
+
+### Schema Source
+
+
+* from schema: https://w3id.org/zarr-vectors/schema/0.9
+
+
+
+
+## Mappings
+
+| Mapping Type | Mapped Value |
+| ---  | ---  |
+| self | zv:element |
+| native | zv:element |
+
+
+
+
+## LinkML Source
+
+<details>
+```yaml
+name: element
+description: 'What each record of a ``delta = 0`` links family is, when it is a volume
+  element: ``tetra`` (4 vertices), ``pyramid`` (5), ``wedge`` (6) or ``hexahedron``
+  (8), its vertices in VTK order.  Absent, a record is an edge (``link_width`` 2)
+  or a polygon face (3 or more). Must agree with ``link_width``.
+
+  '
+from_schema: https://w3id.org/zarr-vectors/schema/0.9
+rank: 1000
+domain_of:
+- LinksFamilyMeta
+range: LinkElement
+required: false
 
 ```
 </details></div>

@@ -308,6 +308,26 @@ def validate_consistency(store_path: str | Path | Group) -> ValidationResult:
                 continue
             if link_sid_ndim == 0:
                 continue
+            element = family_meta.get("element")
+            if element is not None:
+                from zarr_vectors.core.elements import ELEMENT_WIDTH
+
+                if element not in ELEMENT_WIDTH:
+                    result.add_error(
+                        f"{prefix}: links[delta={d}] element {element!r} is not "
+                        f"one of {sorted(ELEMENT_WIDTH)}"
+                    )
+                elif ELEMENT_WIDTH[element] != link_width:
+                    result.add_error(
+                        f"{prefix}: links[delta={d}] element {element!r} has "
+                        f"{ELEMENT_WIDTH[element]} vertices but link_width is "
+                        f"{link_width}"
+                    )
+                if d != 0:
+                    result.add_error(
+                        f"{prefix}: links[delta={d}] declares element {element!r}; "
+                        f"volume elements join vertices of one level (delta 0)"
+                    )
 
             # Under the offset layout the canonical-sort invariant is a
             # property of the *directory name*, so it costs one parse per

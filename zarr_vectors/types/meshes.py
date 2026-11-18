@@ -36,6 +36,7 @@ from zarr_vectors.constants import (
     VERTICES,
 )
 from zarr_vectors.core.arrays import (
+    _family_has_records,
     chunk_vertex_count,
     create_attribute_array,
     create_links_array,
@@ -53,6 +54,7 @@ from zarr_vectors.core.arrays import (
     read_vertex_fragment_index,
     resolve_chunk_keys,
     stamp_fragments_tile,
+    stamp_link_element,
     stamp_link_fragments_aligned,
     vertex_range_requests,
     write_chunk_attributes,
@@ -65,6 +67,7 @@ from zarr_vectors.core.attr_chunking import (
     assign_attribute_bins,
     compute_chunk_dim_names,
 )
+from zarr_vectors.core.elements import check_element, family_element, signed_volumes
 from zarr_vectors.core.metadata import (
     LevelMetadata,
     get_level_chunk_shape,
@@ -123,13 +126,16 @@ def write_mesh(
     out_of_bounds: str = DEFAULT_OOB_POLICY,
     compressor: Any = None,
     shard_shape: int | tuple[int, ...] | None | Literal["inherit"] = "inherit",
+    element: str | None = None,
+    check_orientation: bool = True,
 ) -> dict[str, Any]:
     """Write a mesh to a new zarr vectors store.
 
     Args:
         store_path: Path for the new store.
         vertices: ``(V, D)`` vertex positions.
-        faces: ``(F, L)`` face index array (L=3 triangles, L=4 quads).
+        faces: ``(F, L)`` index array: polygon faces (L=3 triangles,
+            L=4 quads, ...), or volume cells when ``element`` is given.
         chunk_shape: Spatial chunk size per dimension.
         encoding: ``"raw"`` or ``"draco"`` (3-D triangles only; other
             vertices are written raw).
@@ -138,6 +144,15 @@ def write_mesh(
             If None, all vertices belong to object 0.
         dtype: Numpy dtype for positions.
         draco_quantization_bits: For Draco encoding only.
+        element: ``None`` (default) when ``faces`` are polygon faces of a
+            surface.  ``"tetra"``, ``"pyramid"``, ``"wedge"`` or
+            ``"hexahedron"`` when each row is one solid cell of a volume
+            mesh, its vertices in VTK order (see
+            :mod:`zarr_vectors.core.elements`); ``L`` must be the
+            element's width, and the links family records the element.
+        check_orientation: With ``element`` and 3-D positions, refuse
+            cells whose signed volume is not positive (inverted, or not
+            in VTK order) before anything is written.
 
     Returns:
         Summary dict.
@@ -150,6 +165,8 @@ def write_mesh(
 
     if faces.ndim != 2 or link_width < 3:
         raise ArrayError(f"faces must be (F, L) with L≥3, got shape {faces.shape}")
+    if element is not None:
+        _check_volume_cells(vertices, faces, element, check_orientation)
 
     if object_ids is None:
         # When attribute-chunking, each vertex becomes its own object so
@@ -283,6 +300,8 @@ def write_mesh(
         chunk_attribute_values=attr_bin_values,
     )
     level_group = create_resolution_level(root, 0, level_meta)
+    # Before any write: records already in the family keep their meaning.
+    _refuse_retyping(level_group, element)
 
     # Assign vertices to chunks.  When attribute-chunked, prefix each
     # spatial chunk key with the per-vertex bin.
@@ -487,6 +506,8 @@ def write_mesh(
     stamp_fragments_tile(level_group, ndim)
     if fragment_starts:
         stamp_link_fragments_aligned(level_group)
+    if element is not None:
+        stamp_link_element(level_group, element, _records_are_new=True)
     _finalize_write(root, "write_mesh")
     return {
         "vertex_count": n_verts,
@@ -498,7 +519,40 @@ def write_mesh(
         "intra_face_count": int(np.count_nonzero(is_intra_face)),
         "cross_face_count": int(np.count_nonzero(~is_intra_face)),
         "encoding": encoding,
+        "element": element,
     }
+
+
+def _check_volume_cells(
+    vertices: npt.NDArray, cells: npt.NDArray, element: str, check_orientation: bool,
+) -> None:
+    check_element(element, cells.shape[1])
+    if not check_orientation or vertices.shape[1] != 3 or cells.shape[0] == 0:
+        return
+    if cells.min() < 0 or cells.max() >= vertices.shape[0]:
+        raise ArrayError("cells reference vertices that do not exist")
+    vol = signed_volumes(vertices, cells, element)
+    bad = np.flatnonzero(vol <= 0)
+    if bad.size:
+        raise ArrayError(
+            f"{bad.size} of {cells.shape[0]} {element} cells have non-positive "
+            f"signed volume (first: {bad[:5].tolist()}): inverted, degenerate, "
+            f"or not in VTK vertex order. Reorder them, or pass "
+            f"check_orientation=False to store them as given."
+        )
+
+
+def _refuse_retyping(level_group: FsGroup, element: str | None) -> None:
+    """Refuse a write whose element contradicts records already stored."""
+    fam = links_group_path(0)
+    if not level_group.array_exists(fam):
+        return
+    existing = family_element(level_group.read_array_meta(fam) or {})
+    if existing != element and (existing is not None or _family_has_records(level_group, 0)):
+        raise ArrayError(
+            f"{fam}: holds records written as {existing or 'polygon faces'!r}; "
+            f"cannot add {element or 'polygon faces'!r} to it"
+        )
 
 
 def read_mesh(
@@ -534,6 +588,9 @@ def read_mesh(
         - ``vertices``: ``(V, D)`` positions
         - ``faces``: ``(F, L)`` face indices (remapped to output vertex order)
         - ``vertex_count``, ``face_count``
+        - ``element``: None when ``faces`` are polygon faces, or the
+          volume element each row is (``"tetra"``, ...; see
+          :mod:`zarr_vectors.core.elements`)
         - ``object_ids``: ``(V,)`` owning object of each vertex -- only
           when ``object_ids=`` was given.  Vertices come back grouped by
           object, in the order the ids were asked for.
@@ -553,7 +610,7 @@ def read_mesh(
         if object_ids is not None:
             nodes.append(f"{prefix}/{OBJECT_INDEX}")
         root.prime_nodes(nodes)
-        return _read_mesh(
+        result = _read_mesh(
             root,
             level=level,
             bbox=bbox,
@@ -561,6 +618,17 @@ def read_mesh(
             chunks=chunks,
             attribute_filter=attribute_filter,
         )
+        result["element"] = _level_element(root, level)
+        return result
+
+
+def _level_element(root: FsGroup, level: int) -> str | None:
+    """The element of a level's ``links/0`` family; None for polygon faces."""
+    try:
+        level_group = get_resolution_level(root, level)
+        return family_element(level_group.read_array_meta(links_group_path(0)) or {})
+    except Exception:
+        return None
 
 
 def _read_mesh(

@@ -5841,6 +5841,70 @@ def stamp_fragments_tile(level_group: Group, ndim: int) -> bool:
     return True
 
 
+def _family_has_records(level_group: Group, delta: int) -> bool:
+    """True when any offsets array of ``links/<delta>/`` holds a cell."""
+    for segment in list_link_offsets(level_group, delta):
+        path = f"{links_group_path(delta)}/{segment}"
+        if level_group.array_exists(path) and level_group.list_chunks(path):
+            return True
+    return False
+
+
+def stamp_link_element(
+    level_group: Group,
+    element: str | None,
+    *,
+    delta: int = 0,
+    _records_are_new: bool = False,
+) -> None:
+    """Declare what each record of ``links/<delta>/`` is.
+
+    ``element`` names a volume element (``"tetra"``, ``"pyramid"``,
+    ``"wedge"``, ``"hexahedron"``; see :mod:`zarr_vectors.core.elements`)
+    or is None for edges / polygon faces, the meaning of a family that
+    records none.  The family must exist with a matching ``link_width``.
+
+    Refuses to change the meaning of records already written: a declared
+    element is never replaced, and an undeclared family that already
+    holds records (edges or polygon faces) is not retyped.  Drop the
+    family and write it again instead.  A writer that has just written
+    the records itself passes ``_records_are_new``.
+    """
+    from zarr_vectors.core.elements import ELEMENT_KEY, check_element, family_element
+
+    family = links_group_path(delta)
+    policy = link_family_policy(level_group, delta)
+    if policy is None:
+        raise ArrayError(f"{family}: no links family to declare an element on")
+    if element is not None:
+        check_element(element, policy[0])
+    existing = family_element(level_group.read_array_meta(family) or {})
+    if existing == element:
+        return
+    if existing is not None or (
+        not _records_are_new and _family_has_records(level_group, delta)
+    ):
+        raise ArrayError(
+            f"{family}: its records are already written as "
+            f"{existing or 'edges/faces'!r}; cannot redeclare them as "
+            f"{element or 'edges/faces'!r}. Drop the family and write it again."
+        )
+    level_group.write_array_meta(family, {ELEMENT_KEY: element})
+
+
+def carry_link_element(src_group: Group, out_group: Group, *, delta: int = 0) -> None:
+    """Give ``out_group``'s ``links/<delta>/`` the element ``src_group``'s
+    declares, for a writer that rebuilds a family from another (rechunk)."""
+    from zarr_vectors.core.elements import family_element
+
+    family = links_group_path(delta)
+    if not src_group.array_exists(family) or not out_group.array_exists(family):
+        return
+    element = family_element(src_group.read_array_meta(family) or {})
+    if element is not None:
+        stamp_link_element(out_group, element, delta=delta, _records_are_new=True)
+
+
 def stamp_link_fragments_aligned(level_group: Group) -> bool:
     """Record that every intra-chunk link cell is grouped by vertex fragment.
 

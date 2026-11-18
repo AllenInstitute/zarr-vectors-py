@@ -111,6 +111,44 @@ store raises `ArrayError`.
 OBJ, STL and PLY converters are in
 [zarr-vectors-tools](https://zarr-vectors-tools.readthedocs.io/en/latest/convert/meshes.html).
 
+### Volume meshes
+
+A mesh can also hold solid cells: one tetrahedron, pyramid, wedge or
+hexahedron per record instead of one polygon face. Pass `element=` to
+`write_mesh`; the `links/0/` family records it, and `read_mesh` returns
+it as `element` (None for a surface mesh):
+
+```python
+write_mesh(path, vertices, tets, chunk_shape=(40.0,) * 3, element="tetra")
+read_mesh(path)["element"]   # "tetra"
+```
+
+| `element` | `link_width` | Vertex order (VTK) |
+|-----------|--------------|--------------------|
+| `tetra` | 4 | `0, 1, 2` a triangle whose right-hand normal points towards `3` |
+| `pyramid` | 5 | base quad `0-3` whose right-hand normal points towards the apex `4` |
+| `wedge` | 6 | triangle `0, 1, 2` facing away from triangle `3, 4, 5`; `i` joined to `i + 3` |
+| `hexahedron` | 8 | quad `0-3` facing towards quad `4-7`; `i` joined to `i + 4` |
+
+In that order every cell has positive volume. `write_mesh` refuses
+cells with non-positive signed volume before writing anything; pass
+`check_orientation=False` to store them as given. Vertex order survives
+storage: records are stored sorted, with a permutation column
+(`has_perm`) that restores the order on read.
+
+- One element type per level: a family has one `link_width`. Mixed
+  volume meshes need one store (or level) per type for now.
+- Draco encodes triangles only, so volume meshes are written `raw`.
+- Per-cell values (material, quality) are link attributes.
+- `building.boundary_faces(cells, element)` returns the faces that
+  belong to one cell only, wound outward: the volume's surface.
+  `building.signed_volumes(vertices, cells, element)` returns each
+  cell's signed volume.
+- An element is declared once. `building.stamp_link_element` refuses to
+  retype records already written, for example quads as tetrahedra.
+- Pyramid levels keep no faces or cells, for surface and volume meshes
+  alike.
+
 ### Validation
 
 The [common checks](index.md#validation) apply, plus:
@@ -118,6 +156,7 @@ The [common checks](index.md#validation) apply, plus:
 | Level | Check |
 |-------|-------|
 | L3 | When the level claims `link_fragments_aligned`, a chunk whose intra-chunk faces are not filed by vertex fragment is an error |
+| L3 | An `element` that is unknown, does not match `link_width`, or sits on a `delta != 0` family is an error |
 | L4 | `links/0/` with `link_width` 1 or 2 is an error; no readable link metadata is a warning |
 
-No level checks degenerate faces, watertightness or winding consistency.
+No level checks degenerate faces, watertightness or winding consistency; volume cells' orientation is checked when they are written.

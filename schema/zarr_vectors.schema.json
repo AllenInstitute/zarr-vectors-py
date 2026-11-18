@@ -538,6 +538,17 @@
       "title": "LinkAttributeMeta",
       "type": "object"
     },
+    "LinkElement": {
+      "description": "Volume elements a links family can hold, VTK vertex order.",
+      "enum": [
+        "tetra",
+        "pyramid",
+        "wedge",
+        "hexahedron"
+      ],
+      "title": "LinkElement",
+      "type": "string"
+    },
     "LinksConvention": {
       "description": "How intra-chunk links are represented for a polyline/graph/mesh.",
       "enum": [
@@ -558,6 +569,10 @@
             "boolean",
             "null"
           ]
+        },
+        "element": {
+          "$ref": "#/$defs/LinkElement",
+          "description": "What each record of a ``delta = 0`` links family is, when it is a volume element: ``tetra`` (4 vertices), ``pyramid`` (5), ``wedge`` (6) or ``hexahedron`` (8), its vertices in VTK order.  Absent, a record is an edge (``link_width`` 2) or a polygon face (3 or more). Must agree with ``link_width``.\n"
         },
         "level_delta": {
           "description": "Pyramid-level delta between the source side (the level that owns this array) and the target side of the edges.  ``0`` for intra-level arrays, ``+N`` for edges from this level to ``this_level + N`` (coarser), ``-N`` for edges to ``this_level - N`` (finer).\n",
