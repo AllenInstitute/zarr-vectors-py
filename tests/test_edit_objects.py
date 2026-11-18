@@ -8,7 +8,6 @@ import numpy as np
 import pytest
 
 from zarr_vectors.core.arrays import (
-    read_chunk_vertices,
     read_object_manifest,
     read_object_vertices,
 )

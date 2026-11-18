@@ -9,7 +9,6 @@ import pytest
 
 from zarr_vectors.exceptions import ArrayError, DracoError
 
-
 # --- pre-built Zarr stores keep the writer's create kwargs --------------
 
 def test_prebuilt_store_gets_writer_bounds():
@@ -136,7 +135,7 @@ def _writers():
     edges = np.array([[i, i + 1] for i in range(39)])
     return {
         "points": lambda p, c: PT.write_points(
-            p, pos, chunk_shape=c, attributes=va,
+            p, pos, chunk_shape=c, vertex_attributes=va,
             object_ids=np.repeat(np.arange(8), 5),
             object_attributes={"s": np.ones(8, "f4")},
             groups={0: [0, 1]}, group_attributes={"g": np.ones(1, "f4")}),

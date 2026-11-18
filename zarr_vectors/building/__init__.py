@@ -72,6 +72,8 @@ from zarr_vectors.constants import (
     XLEVEL_EXPLICIT,
     XLEVEL_NONE,
 )
+from zarr_vectors.core import dense_manifests as dense
+from zarr_vectors.core._batch_writer import _stamp_presence
 from zarr_vectors.core.arrays import (
     OBJECT_INDEX_LAYOUT_DENSE,
     OBJECT_INDEX_LAYOUT_V1,
@@ -79,6 +81,7 @@ from zarr_vectors.core.arrays import (
     OBJECT_INDEX_MANIFEST_BUCKET,
     OBJECT_SHARD_ROW_MULTIPLE,
     ManifestCSR,
+    _is_per_chunk_array,
     attribute_layout,
     # --- links ---
     cell_endpoint_chunks,
@@ -164,9 +167,6 @@ from zarr_vectors.core.cells import (
     read_cells,
     read_neighbourhood,
 )
-from zarr_vectors.core import dense_manifests as dense
-from zarr_vectors.core._batch_writer import _stamp_presence
-from zarr_vectors.core.arrays import _is_per_chunk_array
 from zarr_vectors.core.group import (
     _NONEMPTY_CHUNKS_ATTR,
     _PRESENCE_DECL_ATTR,
@@ -180,15 +180,7 @@ from zarr_vectors.core.group import (
     _parse_chunk_coords,
     observe_presence_writes,
 )
-from zarr_vectors.core.user_metadata import Metadata
-from zarr_vectors.core.sources import (
-    SOURCE_AXIS,
-    chunk_sources,
-    is_composite,
-    set_chunk_sources,
-    source_fingerprint,
-    verify_chunk_sources,
-)
+from zarr_vectors.core.manifest_writer import ObjectManifestWriter, object_manifest_writer
 from zarr_vectors.core.metadata import (
     LevelMetadata,
     RootMetadata,
@@ -225,6 +217,14 @@ from zarr_vectors.core.paths import (
     links_path,
     parse_offsets,
 )
+from zarr_vectors.core.sources import (
+    SOURCE_AXIS,
+    chunk_sources,
+    is_composite,
+    set_chunk_sources,
+    source_fingerprint,
+    verify_chunk_sources,
+)
 from zarr_vectors.core.store import (
     commit,
     create_resolution_level,
@@ -240,8 +240,8 @@ from zarr_vectors.core.store import (
     update_level_metadata,
     update_root_metadata,
 )
-from zarr_vectors.core.manifest_writer import ObjectManifestWriter, object_manifest_writer
 from zarr_vectors.core.streaming import ObjectIndexAppender
+from zarr_vectors.core.user_metadata import Metadata
 from zarr_vectors.encoding.fragments import (
     decode_fragments,
     decode_object_manifest_blocks,
@@ -254,6 +254,7 @@ from zarr_vectors.exceptions import (
     PresenceMismatchError,
     ShardOwnershipError,
     StoreError,
+    ZVDeprecationWarning,
 )
 from zarr_vectors.multiresolution.registry import (
     register_coarsen_strategy,
@@ -686,7 +687,7 @@ def is_sharded(level_group: Group, array_name: str) -> bool:
         "collided with sharding.io.is_sharded(store_path), which answers a "
         "different question over a different argument, and swapping the two "
         "returned False instead of raising.",
-        DeprecationWarning,
+        ZVDeprecationWarning,
         stacklevel=2,
     )
     return array_is_sharded(level_group, array_name)

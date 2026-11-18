@@ -14,17 +14,17 @@ class TestImports:
 
     def test_import_exceptions(self) -> None:
         from zarr_vectors.exceptions import (
-            ZVFError,
-            StoreError,
-            MetadataError,
             ArrayError,
             ChunkingError,
-            ConventionError,
-            ValidationError,
-            IngestError,
-            ExportError,
             CoarseningError,
+            ConventionError,
             DracoError,
+            ExportError,
+            IngestError,
+            MetadataError,
+            StoreError,
+            ValidationError,
+            ZVFError,
         )
         # All should be subclasses of ZVFError
         for exc_class in [
@@ -36,16 +36,16 @@ class TestImports:
 
     def test_import_typing(self) -> None:
         from zarr_vectors.typing import (
-            Vertices, Faces, Edges, ParentArray,
-            ChunkCoords, ChunkShape, BoundingBox,
-            FragmentRef, ObjectManifest, CrossChunkLink,
+            ChunkCoords,  # noqa: F401
+            FragmentRef,  # noqa: F401
+            Vertices,  # noqa: F401
         )
 
     def test_import_constants(self) -> None:
         from zarr_vectors.constants import (
-            FORMAT_VERSION, VERTICES, LINKS, OBJECT_INDEX,
-            LINKS_EXPLICIT, LINKS_IMPLICIT_SEQUENTIAL,
-            OBJIDX_STANDARD, OBJIDX_IDENTITY,
+            FORMAT_VERSION,  # noqa: F401
+            LINKS_EXPLICIT,  # noqa: F401
+            OBJIDX_STANDARD,  # noqa: F401
             VALID_GEOMETRY_TYPES,
         )
         assert FORMAT_VERSION.startswith("0.10")
@@ -67,7 +67,7 @@ class TestExceptionHierarchy:
             pass  # should be caught
 
     def test_specific_not_caught_by_sibling(self) -> None:
-        from zarr_vectors.exceptions import StoreError, MetadataError
+        from zarr_vectors.exceptions import MetadataError, StoreError
         try:
             raise StoreError("test")
         except MetadataError:

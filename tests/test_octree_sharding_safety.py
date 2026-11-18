@@ -44,8 +44,11 @@ TARGET = {"target": 2_000}
 
 
 def _schema(octree=False, kind="point_cloud", shard_cells=4):
-    return zv.Schema(bounds=([0, 0, 0], [BOX, BOX, BOX]), kind=kind,
-                     layout=zv.Layout(cells=8, shard_cells=shard_cells, compression="zstd", octree=octree))
+    return zv.Schema(
+        bounds=([0, 0, 0], [BOX, BOX, BOX]),
+        kind=kind,
+        layout=zv.Layout(cells=8, shard_cells=shard_cells, compression="zstd", octree=octree),
+    )
 
 
 def _points(n=1_500, seed=0):
@@ -126,7 +129,9 @@ class _FaultyLocal(LocalStore):
         return await _go(self.faults, "set", key, lambda: LocalStore.set(self, key, value))
 
     async def delete_dir(self, prefix):
-        return await _go(self.faults, "delete_dir", prefix, lambda: LocalStore.delete_dir(self, prefix))
+        return await _go(
+            self.faults, "delete_dir", prefix, lambda: LocalStore.delete_dir(self, prefix)
+        )
 
 
 class _FaultyObject(WrapperStore):
@@ -237,9 +242,15 @@ def test_an_interrupted_set_octree_loses_nothing_and_a_rerun_finishes_it(
     assert set(_codecs(p).values()) == {codec} and len(_codecs(p)) == n_arrays
     assert _no_scratch(p)
     if direction == "mark":
-        assert _root(p)["octree_sharding"] == TARGET and "octree_sharding" in _root(p)["format_capabilities"]
+        assert (
+            _root(p)["octree_sharding"] == TARGET
+            and "octree_sharding" in _root(p)["format_capabilities"]
+        )
     else:
-        assert "octree_sharding" not in _root(p) and "octree_sharding" not in _root(p)["format_capabilities"]
+        assert (
+            "octree_sharding" not in _root(p)
+            and "octree_sharding" not in _root(p)["format_capabilities"]
+        )
     # The array the first run had finished copying is swapped in, not redone.
     assert out["arrays_repacked"] == n_arrays - (step not in ("copy_cells", "stamp_complete"))
     assert set_octree(str(p), config)["arrays_repacked"] == 0
@@ -277,7 +288,10 @@ def test_an_interrupted_swap_of_a_links_array_is_finished(tmp_path, monkeypatch,
             _crash_once_moved_aside(m, lambda path: path.endswith(target))
             set_octree(str(p), TARGET)
         else:
-            set_octree(_faulty(p, where, _Faults("delete_dir", lambda k: k == target, 1, after=True)), TARGET)
+            set_octree(
+                _faulty(p, where, _Faults("delete_dir", lambda k: k == target, 1, after=True)),
+                TARGET,
+            )
     assert not (p / target / "zarr.json").exists()  # the source is gone, the copy is in scratch
     set_octree(str(p), TARGET)
     assert (p / target / "zarr.json").exists() and _codecs(p)[target] == "octree"
@@ -317,17 +331,28 @@ def test_set_octree_with_arrays_leaves_the_marker_until_every_array_is_converted
     set_octree(str(p), False, arrays=[names[0].split("/", 1)[1]])
     # One array is sharding_indexed, the rest still octree: the store is
     # still marked, and still needs zarr-octree.
-    assert _root(p)["octree_sharding"] == TARGET and "octree_sharding" in _root(p)["format_capabilities"]
+    assert (
+        _root(p)["octree_sharding"] == TARGET
+        and "octree_sharding" in _root(p)["format_capabilities"]
+    )
     set_octree(str(p), False, arrays=[n.split("/", 1)[1] for n in names[1:]])
     assert set(_codecs(p).values()) == {"sharding_indexed"}
-    assert "octree_sharding" not in _root(p) and "octree_sharding" not in _root(p)["format_capabilities"]
+    assert (
+        "octree_sharding" not in _root(p)
+        and "octree_sharding" not in _root(p)["format_capabilities"]
+    )
 
     # And the other way: one array octree in an unmarked store says
     # zarr-octree is needed, before the marker is there.
     set_octree(str(p), TARGET, arrays=[names[0].split("/", 1)[1]])
-    assert "octree_sharding" not in _root(p) and "octree_sharding" in _root(p)["format_capabilities"]
+    assert (
+        "octree_sharding" not in _root(p) and "octree_sharding" in _root(p)["format_capabilities"]
+    )
     set_octree(str(p), TARGET, arrays=[n.split("/", 1)[1] for n in names[1:]])
-    assert _root(p)["octree_sharding"] == TARGET and "octree_sharding" in _root(p)["format_capabilities"]
+    assert (
+        _root(p)["octree_sharding"] == TARGET
+        and "octree_sharding" in _root(p)["format_capabilities"]
+    )
     assert len(_positions(p)) == 1_500
 
 
@@ -339,7 +364,10 @@ def test_unshard_store_unmarks_a_marked_store(tmp_path):
     want = _positions(p)
     unshard_store(str(p))
     assert not _codecs(p)
-    assert "octree_sharding" not in _root(p) and "octree_sharding" not in _root(p)["format_capabilities"]
+    assert (
+        "octree_sharding" not in _root(p)
+        and "octree_sharding" not in _root(p)["format_capabilities"]
+    )
     assert np.array_equal(_positions(p), want)
 
 
@@ -350,7 +378,10 @@ def test_unshard_store_with_arrays_keeps_the_marker_while_octree_arrays_remain(t
     p = _make(tmp_path / "s.zv", octree=TARGET)
     unshard_store(str(p), arrays=["vertices"])
     assert "octree" in _codecs(p).values()
-    assert _root(p)["octree_sharding"] == TARGET and "octree_sharding" in _root(p)["format_capabilities"]
+    assert (
+        _root(p)["octree_sharding"] == TARGET
+        and "octree_sharding" in _root(p)["format_capabilities"]
+    )
 
 
 def test_unshard_store_leaves_an_unmarked_root_alone(tmp_path):
@@ -478,7 +509,9 @@ def test_layout_octree_as_an_empty_mapping_shards_an_auto_store(tmp_path):
     # Round-tripped through Schema.from_store and resolved again.
     sch = zv.Schema.from_store(zv.open(str(p))._root_meta)
     assert sch.layout.octree == {}
-    again = zv.Schema(bounds=sch.bounds, kind=sch.kind, layout=zv.Layout(cells=8, octree=sch.layout.octree))
+    again = zv.Schema(
+        bounds=sch.bounds, kind=sch.kind, layout=zv.Layout(cells=8, octree=sch.layout.octree)
+    )
     assert again.layout.resolve(again).shard_shape is not None
 
 
@@ -555,7 +588,12 @@ _WITHOUT_OCTREE = textwrap.dedent("""
 
 def test_without_zarr_octree_a_marked_create_fails_before_the_store_exists(tmp_path):
     env = {k: v for k, v in os.environ.items() if not k.startswith("ZARR_VECTORS_SHARD_")}
-    r = subprocess.run([sys.executable, "-c", _WITHOUT_OCTREE, str(tmp_path)], capture_output=True, text=True, env=env)
+    r = subprocess.run(
+        [sys.executable, "-c", _WITHOUT_OCTREE, str(tmp_path)],
+        capture_output=True,
+        text=True,
+        env=env,
+    )
     assert r.returncode == 0, r.stderr[-3000:]
     out = json.loads(r.stdout.strip().splitlines()[-1])
     assert out["asked"].startswith("ValueError") and "zarr-octree" in out["asked"], out["asked"]

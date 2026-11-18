@@ -416,8 +416,10 @@ def _validate_octree_level(lg: Any, ndim: int, prefix: str, result: ValidationRe
     anchors = [tuple(a) for a in table.anchors().tolist()]
     leaf_at = {a: n for n, a in enumerate(anchors)}
     stored = {tuple(int(c) for c in ck) for ck in list_chunk_keys(lg)}
-    for what, bad in (("leaf anchors with no vertex chunk", [a for a in anchors if a not in stored]),
-                      ("vertex chunks at no leaf's anchor", sorted(stored - set(anchors)))):
+    for what, bad in (
+        ("leaf anchors with no vertex chunk", [a for a in anchors if a not in stored]),
+        ("vertex chunks at no leaf's anchor", sorted(stored - set(anchors))),
+    ):
         if bad:
             result.add_error(f"{prefix}: octree chunks: {len(bad)} {what}, e.g. {bad[0]}")
 
@@ -527,7 +529,8 @@ def _check_octree_shards(lg: Any, table: Any, prefix: str, result: ValidationRes
         n = int(np.argmax(sides))
         result.add_error(
             f"{prefix}: octree chunks: {int((sides > cap).sum())} leaves are wider than the "
-            f"level's max_leaf_cells={cap}, e.g. leaf {table.key(n)} ({int(sides[n])} cells per side)"
+            f"level's max_leaf_cells={cap}, e.g. leaf {table.key(n)} "
+            f"({int(sides[n])} cells per side)"
         )
     if not table.fit_shards:
         return

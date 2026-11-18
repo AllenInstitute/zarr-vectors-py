@@ -7,12 +7,10 @@ large enough to exercise multi-chunk and boundary logic.
 
 from __future__ import annotations
 
-import tempfile
 from pathlib import Path
 
 import numpy as np
 import pytest
-
 
 # ---------------------------------------------------------------------------
 # Temporary store paths
@@ -127,7 +125,6 @@ def simple_skeleton(rng: np.random.Generator) -> dict:
     parents[0] = -1  # root
     positions[0] = rng.uniform(0, 100, size=3)
 
-    idx = 1
     branch_points = [0, 10, 20, 30, 40]
 
     for i in range(1, n_nodes):
@@ -284,3 +281,18 @@ def _forced_manifest_layout(request, monkeypatch):
 
         monkeypatch.setattr(dense_manifests, "store_default", lambda _lg: layout)
     yield
+
+
+def pytest_sessionstart(session):
+    """With ``ZV_REQUIRE_OCTREE=1`` (CI, where zarr-octree is installed), a
+    missing zarr-octree fails the run instead of silently skipping its tests."""
+    import os
+
+    if os.environ.get("ZV_REQUIRE_OCTREE"):
+        try:
+            import zarr_octree  # noqa: F401
+        except ImportError as exc:
+            pytest.exit(
+                f"ZV_REQUIRE_OCTREE is set but zarr-octree is not importable: {exc}",
+                returncode=4,
+            )

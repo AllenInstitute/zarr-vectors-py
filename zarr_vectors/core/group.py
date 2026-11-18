@@ -88,9 +88,10 @@ _MISS_ROW = "row"
 
 
 def _shard_codec(ndim: int, compressors: list[Any], octree: dict[str, Any] | None) -> Any:
-    """zarr-octree's ``octree_sharding`` codec (``zarr_octree_sharding`` before 0.4) configured by the store's
-    ``octree`` marker (:data:`zarr_vectors.constants.CAP_OCTREE_SHARDING`), or
-    None for ``sharding_indexed`` (zarr-octree is then never imported)."""
+    """zarr-octree's ``octree_sharding`` codec (``zarr_octree_sharding`` before
+    0.4) configured by the store's ``octree`` marker
+    (:data:`zarr_vectors.constants.CAP_OCTREE_SHARDING`), or None for
+    ``sharding_indexed`` (zarr-octree is then never imported)."""
     if octree is None:
         return None
     from zarr.codecs import VLenBytesCodec

@@ -12,10 +12,10 @@ from zarr_vectors.core.store import open_store
 from zarr_vectors.exceptions import EditError
 from zarr_vectors.ops import (
     FragmentRef,
+    VertexRef,
     add_fragment,
     edit_fragment,
     remove_fragment,
-    VertexRef,
 )
 from zarr_vectors.types.points import write_points
 

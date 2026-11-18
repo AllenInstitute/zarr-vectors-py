@@ -7,7 +7,6 @@ pass-through of pre-built ``zarr.abc.store.Store`` and
 
 from __future__ import annotations
 
-import numpy as np
 import pytest
 from zarr.abc.store import Store as _ZStore
 from zarr.storage import LocalStore as _ZarrLocalStore
@@ -20,7 +19,6 @@ from zarr_vectors.core.store import (
     create_store,
 )
 from zarr_vectors.exceptions import StoreError
-
 
 obstore = pytest.importorskip("obstore")
 
@@ -89,7 +87,6 @@ def test_create_then_open_via_obstore_local(tmp_path):
     local paths it's silently a no-op.  This test asserts the round-trip
     works, not the underlying store class.
     """
-    from zarr_vectors.core.store import create_store
 
     url = f"file://{tmp_path / 'obstore_local.zarr'}"
     root = create_store(url, backend="obstore")
@@ -104,7 +101,6 @@ def test_create_then_open_via_obstore_local(tmp_path):
 def test_open_store_read_mode_makes_store_read_only(tmp_path):
     """``mode='r'`` on the obstore backend must produce a read_only zarr
     store regardless of underlying scheme."""
-    from zarr_vectors.core.store import create_store
 
     url = f"file://{tmp_path / 'ro.zarr'}"
     create_store(url, backend="obstore")
@@ -115,7 +111,6 @@ def test_open_store_read_mode_makes_store_read_only(tmp_path):
 
 def test_open_store_accepts_prebuilt_local_store(tmp_path):
     """Caller can construct a zarr LocalStore and pass it directly."""
-    from zarr_vectors.core.store import create_store
 
     store_dir = tmp_path / "prebuilt.zarr"
     create_store(str(store_dir))

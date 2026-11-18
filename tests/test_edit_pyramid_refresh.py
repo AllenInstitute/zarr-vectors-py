@@ -12,7 +12,6 @@ from __future__ import annotations
 from pathlib import Path
 
 import numpy as np
-import pytest
 
 from zarr_vectors.core.arrays import read_chunk_vertices
 from zarr_vectors.core.store import (

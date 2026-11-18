@@ -808,7 +808,8 @@ def _sharded_spec(node: Any) -> _ShardedSpec | None:
     src = cell_source("", node, any_codecs=True)
     if src is None or src.shard_shape is None:
         return None
-    if shard_reader_for(src, mode) == "standard" and src.local_root is None:  # other stores: through zarr, as always
+    # Other stores: through zarr, as always.
+    if shard_reader_for(src, mode) == "standard" and src.local_root is None:
         return None
     meta = node.metadata
     inner = tuple(meta.codecs[0].codecs[1:])

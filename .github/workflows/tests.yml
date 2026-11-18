@@ -21,6 +21,10 @@ on:
 
 # Cancel superseded runs on the same ref (avoids piling up jobs when a
 # PR is force-pushed several times in a row).
+env:
+  # zarr-octree commit the octree tests run against (bump with zarr-octree).
+  ZARR_OCTREE_REF: b4c389a4e5154e1925c9cef34b860d7cfb4c487a
+
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
@@ -45,6 +49,21 @@ jobs:
           echo "Event: ${{ github.event_name }}"
           echo "Author association: ${{ github.event.pull_request.author_association }}"
           echo "Labels: ${{ join(github.event.pull_request.labels.*.name, ', ') }}"
+
+  lint:
+    # ruff over the package and the tests; config in pyproject.toml.
+    # Pinned so a ruff release cannot fail CI on code nobody touched
+    # (same pin as zarr-octree).
+    name: ruff
+    needs: gate
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install uv
+        uses: astral-sh/setup-uv@v4
+      - name: ruff check
+        run: uvx ruff@0.17.5 check zarr_vectors tests
 
   test:
     name: pytest (py${{ matrix.python-version }})
@@ -72,6 +91,14 @@ jobs:
       - name: Sync dependencies (frozen, all extras + dev)
         run: uv sync --frozen --extra all --extra dev
 
+      - name: Install zarr-octree (octree sharding tests)
+        # Not on PyPI yet, so not a declared extra: pinned here by commit.
+        # It needs Python >= 3.12, so the 3.11 job skips the octree tests.
+        if: matrix.python-version != '3.11'
+        run: >-
+          uv pip install
+          "zarr-octree @ git+https://github.com/Andrew-Keenlyside/zarr-octree@${ZARR_OCTREE_REF}"
+
       - name: Check schema artefacts are in sync
         # The JSON Schema and reference.md are GENERATED from the LinkML
         # source. Nothing regenerated them in CI, which is how they drifted
@@ -84,6 +111,8 @@ jobs:
         # that belong under @pytest.mark.slow.
         env:
           TIER: ${{ github.event_name == 'pull_request' && 'not slow' || '' }}
+          # Where zarr-octree is installed, its tests must run, not skip.
+          ZV_REQUIRE_OCTREE: ${{ matrix.python-version != '3.11' && '1' || '' }}
         run: >-
           uv run pytest tests/ --ignore=tests/integration
           -n auto --timeout=300 --durations=15 -q -rfE

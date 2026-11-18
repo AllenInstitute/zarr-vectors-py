@@ -230,13 +230,15 @@ def open_zv(
     """
     import warnings
 
+    from zarr_vectors.exceptions import ZVDeprecationWarning
+
     warnings.warn(
         "open_zv() is superseded by zarr_vectors.open(), which returns a "
         "Dataset. The lazy layer reads chunk-by-chunk in Python and opens no "
         "batched-read block, so against an object store it is slower than the "
         "eager path it was meant to improve on; Dataset drives the batching "
         "engine instead.",
-        DeprecationWarning,
+        ZVDeprecationWarning,
         stacklevel=2,
     )
 

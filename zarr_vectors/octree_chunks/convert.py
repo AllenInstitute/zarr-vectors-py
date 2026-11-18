@@ -145,11 +145,15 @@ def _level_packing(root_meta: Any, level_group: Any, chunk_shape: tuple[float, .
     shape (else the root's declaration) and the grid origin of the level's bounds."""
     origin, _ = level_grid_layout(root_meta.bounds, chunk_shape)
     found = array_shard_grid(level_group)
-    shard = found[0] if found is not None else normalise_shard_shape(root_meta.shard_shape, len(origin))
+    shard = (
+        found[0] if found is not None else normalise_shard_shape(root_meta.shard_shape, len(origin))
+    )
     return (None if shard is None else tuple(int(c) for c in shard)), tuple(int(o) for o in origin)
 
 
-def _check_staged_packing(stage: Any, shard: tuple[int, ...] | None, origin: tuple[int, ...]) -> None:
+def _check_staged_packing(
+    stage: Any, shard: tuple[int, ...] | None, origin: tuple[int, ...]
+) -> None:
     """Refuse staged arrays not packed on the shard grid the leaves were planned for."""
     found = array_shard_grid(stage)
     if found is None:
@@ -175,7 +179,9 @@ def _level_compressors(level_group: Any) -> list[dict[str, Any]] | None:
 
 def _marked(compressor: Any, octree: bool) -> list[dict[str, Any]] | None:
     """``compressor`` as a codec list, ending in the octree marker codec only when ``octree``."""
-    codecs = [c for c in codecs_for_create_array(resolve_compressor(compressor)) if not is_marker(c)]
+    codecs = [
+        c for c in codecs_for_create_array(resolve_compressor(compressor)) if not is_marker(c)
+    ]
     if octree:
         codecs.append({"name": OCTREE_MARKER_CODEC})
     return codecs or None
@@ -186,7 +192,8 @@ def _check_convertible(root: Any, level_group: Any, level: int) -> tuple[Any, tu
     kinds = set(meta.geometry_types)
     if not kinds <= {GEOM_POINT_CLOUD, GEOM_GRAPH}:
         raise OctreeError(
-            f"octree chunks support point clouds and graphs so far; this store holds {sorted(kinds)}"
+            "octree chunks support point clouds and graphs so far; "
+            f"this store holds {sorted(kinds)}"
         )
     if meta.sid_ndim != 3:
         raise OctreeError(f"octree chunks need 3 spatial index dimensions, not {meta.sid_ndim}")
@@ -195,8 +202,14 @@ def _check_convertible(root: Any, level_group: Any, level: int) -> tuple[Any, tu
             raise OctreeError(f"converting a level with {name} is not supported yet")
     if level_group.array_exists(f"{LINKS}/0"):
         fam = level_group.read_array_meta(f"{LINKS}/0") or {}
-        if fam.get("directed") or fam.get("store", "canonical") != "canonical" or int(fam.get("link_width", 2)) != 2:
-            raise OctreeError("octree chunks support undirected two-endpoint links stored once (canonical)")
+        if (
+            fam.get("directed")
+            or fam.get("store", "canonical") != "canonical"
+            or int(fam.get("link_width", 2)) != 2
+        ):
+            raise OctreeError(
+                "octree chunks support undirected two-endpoint links stored once (canonical)"
+            )
     level_meta = _level_meta(root, level)
     if level_meta is not None and level_meta.chunk_dims:
         raise OctreeError("an attribute-chunked level cannot be converted")
@@ -329,7 +342,9 @@ def _locate(table: npt.ArrayLike, query: npt.ArrayLike) -> npt.NDArray[np.int64]
     return out
 
 
-def _read_cells(level_group: Any, cells: list[tuple[int, ...]], dtype: np.dtype) -> list[list[npt.NDArray]]:
+def _read_cells(
+    level_group: Any, cells: list[tuple[int, ...]], dtype: np.dtype
+) -> list[list[npt.NDArray]]:
     """Each cell's fragments, checked to tile its rows in order."""
     keys = [_chunk_key(c) for c in cells]
     out: list[list[npt.NDArray]] = []
@@ -376,13 +391,21 @@ def _read_objects(level_group: Any) -> _Objects | None:
     shard_rows = object_shard_rows(level_group)
     if not int(meta.get("num_objects", 0) or 0) or "sid_ndim" not in meta:
         z = np.zeros(0, np.int64)
-        return _Objects(meta, z, np.zeros(1, np.int64), np.zeros((0, 3), np.int64), z, None, None, shard_rows)
+        return _Objects(
+            meta, z, np.zeros(1, np.int64), np.zeros((0, 3), np.int64), z, None, None, shard_rows
+        )
     if int(meta["sid_ndim"]) != 3:
-        raise OctreeError(f"the object index has {meta['sid_ndim']} spatial index dimensions, not 3")
+        raise OctreeError(
+            f"the object index has {meta['sid_ndim']} spatial index dimensions, not 3"
+        )
     csr = read_all_object_manifests_csr(level_group)
     offsets = np.asarray(csr.offsets, dtype=np.int64).reshape(-1)
     n = len(offsets) - 1
-    ids = np.arange(n, dtype=np.int64) if csr.object_ids is None else np.asarray(csr.object_ids, np.int64)
+    ids = (
+        np.arange(n, dtype=np.int64)
+        if csr.object_ids is None
+        else np.asarray(csr.object_ids, np.int64)
+    )
     if len(ids) != n:
         raise OctreeError(f"the object id table has {len(ids)} rows for {n} objects")
     if n > 1 and (np.diff(ids) <= 0).any():
@@ -408,7 +431,9 @@ def _write_objects(group: Any, objs: _Objects, coords: npt.NDArray[np.int64],
         oid: [(tuple(cl[m]), int(fl[m])) for m in range(off[o], off[o + 1])]
         for o, oid in enumerate(objs.ids.tolist())
     }
-    write_object_index(group, manifests, sid_ndim=3, layout=objs.layout, block_dtype=objs.block_dtype)
+    write_object_index(
+        group, manifests, sid_ndim=3, layout=objs.layout, block_dtype=objs.block_dtype
+    )
 
 
 def _shard_objects_like(group: Any, objs: _Objects | None) -> None:
@@ -432,12 +457,19 @@ class _LinkPlan:
     r_oth: npt.NDArray[np.int64]
 
 
-def _plan_octree_links(table: LeafTable, leaf_a: npt.NDArray[np.int64], row_a: npt.NDArray[np.int64],
-                       leaf_b: npt.NDArray[np.int64], row_b: npt.NDArray[np.int64]) -> _LinkPlan:
+def _plan_octree_links(
+    table: LeafTable,
+    leaf_a: npt.NDArray[np.int64],
+    row_a: npt.NDArray[np.int64],
+    leaf_b: npt.NDArray[np.int64],
+    row_b: npt.NDArray[np.int64],
+) -> _LinkPlan:
     """Choose each link's source leaf and segment; raises (before anything is
     written) when a link joins leaves that are not adjacent."""
     leaf_a, leaf_b = np.asarray(leaf_a, np.int64), np.asarray(leaf_b, np.int64)
-    a_src = (leaf_a == leaf_b) | (table.link_source(leaf_a, leaf_b) if len(leaf_a) else np.zeros(0, bool))
+    a_src = (leaf_a == leaf_b) | (
+        table.link_source(leaf_a, leaf_b) if len(leaf_a) else np.zeros(0, bool)
+    )
     src = np.where(a_src, leaf_a, leaf_b)
     oth = np.where(a_src, leaf_b, leaf_a)
     off = np.zeros((len(src), 3), dtype=np.int64)
@@ -480,13 +512,21 @@ def _write_octree_links(level_group: Any, table: LeafTable, plan: _LinkPlan) -> 
         cells = []
         for leaf, rows_idx in zip(leaves.tolist(), np.split(order, starts[1:])):
             rows = np.column_stack([plan.r_src[rows_idx], plan.r_oth[rows_idx]]).astype(np.int64)
-            cells.append((_chunk_key(tuple(anchors[leaf].tolist())), encode_ragged_blob([rows], np.dtype(np.int64))))
+            cells.append(
+                (
+                    _chunk_key(tuple(anchors[leaf].tolist())),
+                    encode_ragged_blob([rows], np.dtype(np.int64)),
+                )
+            )
         level_group.write_cells(path, cells)
     return int(len(src))
 
 
-def read_octree_link_cells(level_group: Any, table: LeafTable, leaves: npt.ArrayLike | None = None
-                           ) -> tuple[npt.NDArray[np.int64], npt.NDArray[np.int64], npt.NDArray[np.int64], npt.NDArray[np.int64]]:
+def read_octree_link_cells(
+    level_group: Any, table: LeafTable, leaves: npt.ArrayLike | None = None
+) -> tuple[
+    npt.NDArray[np.int64], npt.NDArray[np.int64], npt.NDArray[np.int64], npt.NDArray[np.int64]
+]:
     """Links filed under ``leaves`` (all when ``None``) as ``(src_leaf, src_row,
     other_leaf, other_row)``; ``other_leaf`` is ``-1`` where it is not stored."""
     family = f"{LINKS}/0"
@@ -511,7 +551,9 @@ def read_octree_link_cells(level_group: Any, table: LeafTable, leaves: npt.Array
             intra = off == (0, 0, 0) and dlt == 0
             for key in keys:
                 src = anchor_leaf[_parse_chunk_key(key)]
-                blocks = decode_ragged_blob(level_group.read_bytes(path, key), np.dtype(np.int64), ncols=2)
+                blocks = decode_ragged_blob(
+                    level_group.read_bytes(path, key), np.dtype(np.int64), ncols=2
+                )
                 if not blocks:
                     continue
                 rows = np.concatenate([np.asarray(b).reshape(-1, 2) for b in blocks])
@@ -541,7 +583,9 @@ def _open_staging(level_group: Any) -> Any:
     return stage
 
 
-def _seal(stage: Any, direction: str, block: dict[str, Any] | None, summary: dict[str, Any]) -> None:
+def _seal(
+    stage: Any, direction: str, block: dict[str, Any] | None, summary: dict[str, Any]
+) -> None:
     """Record that ``stage`` is complete, with the level metadata it implies."""
     level = dict(stage.attrs.get(LEVEL_META_KEY) or {})
     level.pop(LEVEL_KEY, None)
@@ -631,7 +675,11 @@ def _resume(root: Any, level_group: Any) -> dict[str, Any] | None:
             level_group.delete_subtree(STAGING)
         return None
     rec = stage.attrs.get(_STAGING_KEY)
-    if not (isinstance(rec, dict) and rec.get("complete") and rec.get("direction") == block["converting"]):
+    if not (
+        isinstance(rec, dict)
+        and rec.get("complete")
+        and rec.get("direction") == block["converting"]
+    ):
         raise OctreeError(
             f"this level was part way through {block['converting']} but its staged arrays "
             f"are incomplete, so it cannot be finished"
@@ -672,7 +720,9 @@ def to_octree(store: Any, *, target: float, level: int = 0, balanced: bool = Tru
     meta, chunk_shape = _check_convertible(root, level_group, level)
     _check_no_cross_level_links(root, level)
     shard, grid_origin = _level_packing(meta, level_group, chunk_shape)
-    leaf_cap(max_leaf_cells, shard if fit_shards else None)  # a bad cap is refused before the level is read
+    leaf_cap(
+        max_leaf_cells, shard if fit_shards else None
+    )  # a bad cap is refused before the level is read
     dtype = _vertex_dtype(level_group)
     comp = _marked(_level_compressors(level_group) if compressor == "inherit" else compressor, True)
 
@@ -714,7 +764,11 @@ def to_octree(store: Any, *, target: float, level: int = 0, balanced: bool = Tru
     obj_coords = obj_frags = None
     if objs is not None:
         n = _locate(cell_arr, objs.coords)
-        bad = (n < 0) | (objs.frags < 0) | (objs.frags >= n_frag[np.maximum(n, 0)] if len(n_frag) else True)
+        bad = (
+            (n < 0)
+            | (objs.frags < 0)
+            | (objs.frags >= n_frag[np.maximum(n, 0)] if len(n_frag) else True)
+        )
         if np.any(bad):
             m = int(np.flatnonzero(bad)[0])
             raise OctreeError(
@@ -726,12 +780,20 @@ def to_octree(store: Any, *, target: float, level: int = 0, balanced: bool = Tru
 
     link_plan = None
     if had_links:
-        ch, vi = links if links is not None else (np.zeros((0, 2, 3), np.int64), np.zeros((0, 2), np.int64))
+        ch, vi = (
+            links
+            if links is not None
+            else (np.zeros((0, 2, 3), np.int64), np.zeros((0, 2), np.int64))
+        )
         ch = np.asarray(ch, dtype=np.int64).reshape(-1, 2, 3)
         vi = np.asarray(vi, dtype=np.int64).reshape(-1, 2)
         cn_a, cn_b = _locate(cell_arr, ch[:, 0]), _locate(cell_arr, ch[:, 1])
         for cn, end in ((cn_a, 0), (cn_b, 1)):
-            bad = (cn < 0) | (vi[:, end] < 0) | (vi[:, end] >= counts[np.maximum(cn, 0)] if len(counts) else True)
+            bad = (
+                (cn < 0)
+                | (vi[:, end] < 0)
+                | (vi[:, end] >= counts[np.maximum(cn, 0)] if len(counts) else True)
+            )
             if np.any(bad):
                 r = int(np.flatnonzero(bad)[0])
                 raise OctreeError(
@@ -741,12 +803,15 @@ def to_octree(store: Any, *, target: float, level: int = 0, balanced: bool = Tru
         link_plan = _plan_octree_links(table, leaf_of[cn_a], row_off[cn_a] + vi[:, 0],
                                        leaf_of[cn_b], row_off[cn_b] + vi[:, 1])
 
-    summary = {"leaves": len(table), "cells": len(cells),
-               "links": int(len(link_plan.src)) if link_plan is not None else 0,
-               "max_leaf_vertices": int(table.weight.max()) if len(table) else 0,
-               "max_cell_vertices": int(counts.max()) if len(counts) else 0,
-               "depths": {int(d): int(k) for d, k in zip(*np.unique(table.depth, return_counts=True))},
-               "max_leaf_cells": table.max_leaf_cells}
+    summary = {
+        "leaves": len(table),
+        "cells": len(cells),
+        "links": int(len(link_plan.src)) if link_plan is not None else 0,
+        "max_leaf_vertices": int(table.weight.max()) if len(table) else 0,
+        "max_cell_vertices": int(counts.max()) if len(counts) else 0,
+        "depths": {int(d): int(k) for d, k in zip(*np.unique(table.depth, return_counts=True))},
+        "max_leaf_cells": table.max_leaf_cells,
+    }
     block = {**table.meta(), "weight": "vertices", "leaves": len(table)}
 
     # -- write the octree layout beside the level, then swap it in.
@@ -767,7 +832,9 @@ def to_octree(store: Any, *, target: float, level: int = 0, balanced: bool = Tru
             _shard_objects_like(stage, objs)
             leaf_rows = table.to_rows()
             stage.write_array(LEAVES_TABLE, leaf_rows, chunks=(max(len(leaf_rows), 1), 5))
-            stage.write_array(CELLS_TABLE, cell_rows.astype(np.int64), chunks=(max(len(cell_rows), 1), 6))
+            stage.write_array(
+                CELLS_TABLE, cell_rows.astype(np.int64), chunks=(max(len(cell_rows), 1), 6)
+            )
             _seal(stage, "to_octree", block, summary)
         _swap(root, level_group, stage)
     _finalize_write(root, "to_octree")
@@ -794,7 +861,9 @@ def to_uniform(store: Any, *, level: int = 0, compressor: Any = "inherit",
     chunk_shape = tuple(get_level_chunk_shape(meta, _level_meta(root, level)))
     shard, _ = _level_packing(meta, level_group, chunk_shape)
     dtype = _vertex_dtype(level_group)
-    comp = _marked(_level_compressors(level_group) if compressor == "inherit" else compressor, False)
+    comp = _marked(
+        _level_compressors(level_group) if compressor == "inherit" else compressor, False
+    )
     anchors = table.anchors()
 
     # -- plan: everything that can fail on the input, before any write.
@@ -811,9 +880,13 @@ def to_uniform(store: Any, *, level: int = 0, compressor: Any = "inherit",
     cell_groups: dict[tuple[int, ...], list[npt.NDArray]] = {}
     with level_group.batched_reads([(VERTICES, keys), (VERTEX_FRAGMENTS, keys)]):
         for leaf in range(len(table)):
-            gl = read_chunk_vertices(level_group, tuple(anchors[leaf].tolist()), dtype=dtype, ndim=3, _leaf=True)
+            gl = read_chunk_vertices(
+                level_group, tuple(anchors[leaf].tolist()), dtype=dtype, ndim=3, _leaf=True
+            )
             for n in np.flatnonzero(leaf_col == leaf).tolist():
-                cell_groups[tuple(cells_t[n, :3].tolist())] = gl[frag_off[n]:frag_off[n] + cells_t[n, 5]]
+                cell_groups[tuple(cells_t[n, :3].tolist())] = gl[
+                    frag_off[n] : frag_off[n] + cells_t[n, 5]
+                ]
 
     def run_of(leaf: npt.NDArray[np.int64], at: npt.NDArray[np.int64], start: npt.NDArray[np.int64],
                size: npt.NDArray[np.int64], what: str) -> npt.NDArray[np.int64]:

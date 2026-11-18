@@ -29,8 +29,6 @@ except Exception:  # pragma: no cover - older/newer zarr without the class
 # The codec an octree-chunked level's arrays carry, so that zarr readers
 # without octree chunks refuse them (see the module).  Registered before
 # anything here can open an array.
-from zarr_vectors.encoding import octree_marker as _octree_marker  # noqa: E402,F401
-
 # The data-oriented API.  Prefer these: they describe the data, and they
 # are the surface that stays stable when the storage layer changes.
 # The builder surface, as an attribute of the package.  ``import
@@ -95,6 +93,7 @@ from zarr_vectors.core.store import (  # noqa: F401
     open_store,
     rebind,
 )
+from zarr_vectors.encoding import octree_marker as _octree_marker  # noqa: E402,F401
 from zarr_vectors.lazy.writer import ZVWriter  # noqa: F401
 from zarr_vectors.rechunk import (  # noqa: F401
     RechunkSpec,

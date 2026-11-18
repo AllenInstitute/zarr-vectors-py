@@ -14,7 +14,6 @@ from zarr_vectors.encoding.fragments import (
 )
 from zarr_vectors.exceptions import ArrayError
 
-
 # ---------------------------------------------------------------------------
 # Round-trip basics
 # ---------------------------------------------------------------------------
@@ -54,11 +53,11 @@ def test_single_explicit() -> None:
 
 def test_mixed_bitmap() -> None:
     fragments = [
-        (10, 5),                       # 0 range
-        np.array([100, 101, 200]),     # 1 explicit (not arange because 200)
-        (50, 1),                       # 2 range
-        np.array([7]),                 # 3 explicit (single elem, but auto-detected as range arange(7,8))
-        (0, 0),                        # 4 empty range
+        (10, 5),  # 0 range
+        np.array([100, 101, 200]),  # 1 explicit (not arange because 200)
+        (50, 1),  # 2 range
+        np.array([7]),  # 3 explicit (single elem, but auto-detected as range arange(7,8))
+        (0, 0),  # 4 empty range
         np.array([], dtype=np.int64),  # 5 empty explicit
     ]
     fi = _roundtrip(fragments)

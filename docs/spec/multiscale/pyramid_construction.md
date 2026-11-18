@@ -82,8 +82,14 @@ The level's [`multiscales`](multiscale_metadata.md) entry repeats level
 
 `coarsen_level` raises `CoarseningError` if the target level exists. If
 a step fails part way, it removes the target level, any `links/+1`
-family it added to the source level, and the root attributes it set.
-`build_pyramid` keeps the levels finished before a failing step.
+family it added to the source level, and the root attributes it set. A
+`links/+1` family the source level already had (a half-removed pyramid
+leaves one) is put back as it was. A registered method gets the same
+rollback.
+
+`build_pyramid` is all or nothing: if any step or the cross-level pass
+fails, it removes every level it created and restores the root's and the
+existing levels' attributes and cross-level link families, then raises.
 
 ### `build_pyramid` and `coarsen_level`
 

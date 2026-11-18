@@ -37,7 +37,6 @@ from zarr_vectors.core.arrays import (
     read_chunk_links,
     read_link_attributes,
     read_links,
-    write_chunk_link_attributes,
     write_chunk_links,
     write_chunk_vertices,
     write_link_attributes,
@@ -327,8 +326,6 @@ def test_invalid_cross_level_depth_rejected():
 zarr = pytest.importorskip("zarr")
 
 from zarr_vectors.core.store import (  # noqa: E402
-    create_store,
-    get_resolution_level,
     list_resolution_levels,
     open_store,
     read_root_metadata,

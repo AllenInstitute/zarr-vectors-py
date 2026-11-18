@@ -23,12 +23,11 @@ from zarr_vectors.exceptions import (
     ConventionError,
     MetadataError,
     StoreError,
+    ValidationError,
     ZVError,
     ZVFError,
-    ValidationError,
 )
 from zarr_vectors.types.points import write_points
-
 
 # ===================================================================
 # Exception aliasing

@@ -3,14 +3,10 @@
 WHY THIS EXISTS ALONGSIDE ``rechunk.engine.rechunk``
 ---------------------------------------------------
 ``engine.rechunk`` rechunks along a NON-spatial dimension (group, object id,
-attribute value) and prefixes every chunk key with a bin index. In doing so it
-copies only ``vertices``, ``object_index`` and ``groupings``: it never reads or
-writes the ``links`` family. For a point cloud that is lossless, but every
-other geometry kind carries its topology in links, so a mesh comes back as a
-vertex soup with no faces, a skeleton or graph loses every edge, and a polyline
-loses its segments. It also reads level 0 only, so a pyramid is dropped, and it
-renumbers objects through a running counter, so ids no longer join back to the
-source.
+attribute value) and prefixes every chunk key with a bin index. It reads level
+0 through this module's vertex table and re-addresses ``links/0`` with
+``_map_links``, keeping object ids, but it writes level 0 only (a pyramid is
+refused) and cannot store a fragment shared by objects in different bins.
 
 This function does the other job -- change the SPATIAL chunk grid, keep
 everything else -- for any geometry kind:
@@ -135,7 +131,10 @@ def _list_names(group, family: str) -> list[str]:
         return []
 
 
-def _read_level(src_group, ndim: int) -> _Level:
+def _read_level(src_group, ndim: int, *, any_rank: bool = False) -> _Level:
+    """Read a level as a vertex table.  ``any_rank`` accepts chunk keys
+    with leading axes (an attribute-chunked level), which a spatial
+    rechunk refuses but a re-binning rechunk reads like any other."""
     from zarr_vectors.constants import VERTEX_ATTRIBUTES, VERTICES
     from zarr_vectors.core.arrays import (
         list_chunk_keys,
@@ -159,7 +158,7 @@ def _read_level(src_group, ndim: int) -> _Level:
     dtype = None
     for cc in sorted(tuple(int(x) for x in c)
                      for c in list_chunk_keys(src_group, VERTICES)):
-        if len(cc) != ndim:
+        if len(cc) != ndim and not any_rank:
             raise ValueError(
                 f"rechunk_spatial: chunk key {cc} has {len(cc)} axes but the "
                 f"store has {ndim} spatial axes; a store chunked by an "
@@ -260,10 +259,12 @@ def _endpoint_rows(lv: _Level, chunks, vi) -> npt.NDArray[np.int64]:
 # ===================================================================
 
 def _write_level(level_group, lv: _Level, chunk_shape, ndim: int,
-                 total_objects: int):
+                 total_objects: int, *, cells=None, merge_private: bool = True):
     """Cut each fragment into per-new-chunk runs and write them; shared
     fragments are written once, private runs merge with same-chunk
-    neighbours.  Returns ``(new_chunk, new_local)`` per row and the
+    neighbours unless ``merge_private`` is false.  ``cells`` gives each
+    row's output chunk key (any rank) instead of ``floor(pos /
+    chunk_shape)``.  Returns ``(new_chunk, new_local)`` per row and the
     vertex count."""
     from zarr_vectors.core.arrays import (
         create_attribute_array,
@@ -274,8 +275,12 @@ def _write_level(level_group, lv: _Level, chunk_shape, ndim: int,
 
     n = int(lv.pos.shape[0])
     cs = np.asarray(chunk_shape, np.float64)
-    new_cc = (np.floor(lv.pos / cs).astype(np.int64) if n
-              else np.zeros((0, ndim), np.int64))
+    if cells is not None:
+        new_cc = np.asarray(cells, np.int64)
+    else:
+        new_cc = (np.floor(lv.pos / cs).astype(np.int64) if n
+                  else np.zeros((0, ndim), np.int64))
+    key_rank = int(new_cc.shape[1]) if new_cc.ndim == 2 else ndim
     new_local = np.full(n, -1, np.int64)
 
     refs = np.zeros(len(lv.frags), np.int64)
@@ -312,7 +317,8 @@ def _write_level(level_group, lv: _Level, chunk_shape, ndim: int,
                 open_private = None
                 continue
             for cc, r in runs(k):
-                if open_private is not None and open_private[0] == cc:
+                if (merge_private and open_private is not None
+                        and open_private[0] == cc):
                     lst = chunk_frags[cc]
                     lst[open_private[1]] = np.concatenate(
                         [lst[open_private[1]], r])
@@ -351,31 +357,31 @@ def _write_level(level_group, lv: _Level, chunk_shape, ndim: int,
             write_chunk_attributes(level_group, name, cc,
                                    [data[r] for r in frs], dtype=data.dtype)
 
-    write_object_index(level_group, manifests, sid_ndim=ndim,
+    write_object_index(level_group, manifests, sid_ndim=key_rank,
                        total_objects=total_objects)
     return new_cc, new_local, written
 
 
-def _carry_links(out_group, src_group, delta: int, src_lv: _Level,
-                 dst_lv: _Level, src_map, dst_map, ndim: int) -> tuple[int, int]:
-    """Re-address one ``links/<delta>`` family; returns ``(written,
-    dropped)``, dropping records with an unresolvable source endpoint."""
-    from zarr_vectors.core.arrays import (
-        create_links_family,
-        link_family_policy,
-        read_link_arrays,
-        write_links,
-    )
+def _map_links(src_group, delta: int, src_lv: _Level, dst_lv: _Level,
+               src_map, dst_map):
+    """Re-address one ``links/<delta>`` family onto new rows.
+
+    Returns ``(policy, new_chunks, new_vi, dropped)``; ``policy`` is
+    ``None`` when the family does not exist.  Records with an endpoint
+    that names no source row are dropped.  The new key rank is the maps'.
+    """
+    from zarr_vectors.core.arrays import link_family_policy, read_link_arrays
 
     pol = link_family_policy(src_group, delta)
+    rank = int(src_map[0].shape[1])
+    empty = (np.zeros((0, 2, rank), np.int64), np.zeros((0, 2), np.int64))
     if pol is None:
-        return 0, 0
-    link_width, _sid, directed, store = pol
-    create_links_family(out_group, delta=delta, link_width=link_width,
-                        sid_ndim=ndim, directed=directed, store=store)
+        return None, *empty, 0
+    link_width, _sid, _directed, store = pol
     chunks, vi = read_link_arrays(src_group, delta=delta)
     if vi.shape[0] == 0:
-        return 0, 0
+        return (pol, np.zeros((0, link_width, rank), np.int64),
+                np.zeros((0, link_width), np.int64), 0)
     rows = np.empty_like(vi)
     rows[:, :1] = _endpoint_rows(src_lv, chunks[:, :1], vi[:, :1])
     rows[:, 1:] = _endpoint_rows(dst_lv, chunks[:, 1:], vi[:, 1:])
@@ -386,17 +392,33 @@ def _carry_links(out_group, src_group, delta: int, src_lv: _Level,
         # makes those copies again.
         _, first = np.unique(rows, axis=0, return_index=True)
         rows = rows[np.sort(first)]
-    new_c = np.empty(rows.shape + (ndim,), np.int64)
+    new_c = np.empty(rows.shape + (rank,), np.int64)
     new_v = np.empty(rows.shape, np.int64)
     new_c[:, 0] = src_map[0][rows[:, 0]]
     new_v[:, 0] = src_map[1][rows[:, 0]]
     if link_width > 1:
         new_c[:, 1:] = dst_map[0][rows[:, 1:]]
         new_v[:, 1:] = dst_map[1][rows[:, 1:]]
-    if len(rows):
+    return pol, new_c, new_v, int((~ok).sum())
+
+
+def _carry_links(out_group, src_group, delta: int, src_lv: _Level,
+                 dst_lv: _Level, src_map, dst_map, ndim: int) -> tuple[int, int]:
+    """Re-address one ``links/<delta>`` family; returns ``(written,
+    dropped)``, dropping records with an unresolvable source endpoint."""
+    from zarr_vectors.core.arrays import create_links_family, write_links
+
+    pol, new_c, new_v, dropped = _map_links(
+        src_group, delta, src_lv, dst_lv, src_map, dst_map)
+    if pol is None:
+        return 0, 0
+    link_width, _sid, directed, store = pol
+    create_links_family(out_group, delta=delta, link_width=link_width,
+                        sid_ndim=ndim, directed=directed, store=store)
+    if len(new_v):
         write_links(out_group, [], ndim, delta=delta, link_width=link_width,
                     directed=directed, store=store, _arrays=(new_c, new_v))
-    return int(len(rows)), int((~ok).sum())
+    return int(len(new_v)), dropped
 
 
 # ===================================================================

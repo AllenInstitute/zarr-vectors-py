@@ -2,34 +2,37 @@
 
 from __future__ import annotations
 
-import json
 from pathlib import Path
 
-import numpy as np
-
+from zarr_vectors.constants import (
+    CROSS_CHUNK_EXPLICIT,
+    LINKS_EXPLICIT,
+    LINKS_IMPLICIT_BRANCHES,
+    LINKS_IMPLICIT_SEQUENTIAL,
+    OBJIDX_IDENTITY,
+    OBJIDX_STANDARD,
+)
 from zarr_vectors.core.metadata import (
+    DEFAULT_PARAMETRIC_TYPES,
+    PARAMETRIC_LINE,
+    PARAMETRIC_PLANE,
+    PARAMETRIC_SPHERE,
     ArrayMetadata,
     LevelMetadata,
-    ParametricTypeDef,
     RootMetadata,
     build_axes_metadata,
     build_coordinate_transforms,
     deserialise_parametric_types,
+    requires_links_array,
+    requires_object_index,
     serialise_parametric_types,
     validate_axes,
     validate_conventions,
-    requires_links_array,
-    requires_object_index,
-    DEFAULT_PARAMETRIC_TYPES,
-    PARAMETRIC_PLANE,
-    PARAMETRIC_LINE,
-    PARAMETRIC_SPHERE,
 )
 from zarr_vectors.core.store import (
     FsGroup,
     create_resolution_level,
     create_store,
-    get_parametric_group,
     get_resolution_level,
     list_resolution_levels,
     open_store,
@@ -40,16 +43,7 @@ from zarr_vectors.core.store import (
     store_info,
     write_parametric_types,
 )
-from zarr_vectors.constants import (
-    LINKS_EXPLICIT,
-    LINKS_IMPLICIT_SEQUENTIAL,
-    LINKS_IMPLICIT_BRANCHES,
-    OBJIDX_IDENTITY,
-    OBJIDX_STANDARD,
-    CROSS_CHUNK_EXPLICIT,
-)
 from zarr_vectors.exceptions import ConventionError, MetadataError, StoreError
-
 
 # ===================================================================
 # Helpers
@@ -538,7 +532,7 @@ class TestStoreCreate:
         root = create_store(tmp_store_path, **_root_kwargs())
         assert tmp_store_path.is_dir()
         assert "zarr_vectors" in root.attrs.to_dict()
-        assert f"0" in root
+        assert "0" in root
         # /parametric is no longer auto-created; it is created lazily by
         # get_parametric_group() on first use.
         assert "parametric" not in root

@@ -128,6 +128,20 @@ class ConcurrentEditError(ZVError):
     """
 
 
+
+class ZVDeprecationWarning(DeprecationWarning):
+    """A zarr-vectors API that is deprecated.
+
+    Every deprecation the package raises uses this category, so a test
+    suite (this one included) can turn the package's own deprecations into
+    errors without also failing on third-party ones:
+    ``filterwarnings = ["error::zarr_vectors.exceptions.ZVDeprecationWarning"]``.
+    A module-based filter cannot do this: it matches the module the warning
+    is *attributed* to, which ``stacklevel=2`` makes the caller's.
+    It subclasses :class:`DeprecationWarning`, so existing filters and
+    ``pytest.warns(DeprecationWarning)`` still match it.
+    """
+
 # Deprecated alias for code that imported the old name.  Aliasing the
 # class object means ``isinstance`` checks against either name keep
 # working.  (This said "remove in 0.4" against a package that is on

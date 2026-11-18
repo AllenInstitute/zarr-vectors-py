@@ -3,7 +3,8 @@
 The rechunked store has an extra prefix dimension on its chunk keys:
 ``(prefix_bin, z, y, x)`` instead of ``(z, y, x)``.  All objects in
 the same prefix bin are physically contiguous, enabling O(1) group
-or attribute-based filtering.
+or attribute-based filtering.  Object ids, attributes and links are
+carried (see :func:`rechunk`).
 """
 
 from __future__ import annotations
@@ -31,24 +32,19 @@ from zarr_vectors.constants import (
     VERTICES,
 )
 from zarr_vectors.core.arrays import (
-    create_attribute_array,
     create_groupings_attributes_array,
+    create_links_family,
     create_object_attributes_array,
     create_object_index_array,
     create_vertices_array,
     list_link_deltas,
-    read_all_object_manifests,
-    read_chunk_attributes,
     read_groupings_attributes,
     read_object_attributes,
     read_object_vertices,
     vertices_dtype,
-    write_chunk_attributes,
-    write_chunk_vertices,
     write_groupings_attributes,
     write_links,
     write_object_attributes,
-    write_object_index,
 )
 from zarr_vectors.core.metadata import LevelMetadata
 from zarr_vectors.core.store import (
@@ -61,10 +57,8 @@ from zarr_vectors.core.store import (
     read_root_metadata,
     update_level_metadata,
 )
-from zarr_vectors.rechunk.spatial import _ATTR_META_OWNED
+from zarr_vectors.rechunk.spatial import _map_links, _read_level, _write_level
 from zarr_vectors.rechunk.spec import DimensionMapper, RechunkSpec
-from zarr_vectors.typing import ChunkCoords, ObjectManifest
-
 
 #: Level-0 families :func:`rechunk` carries into the output.
 _CARRIED = {
@@ -89,15 +83,11 @@ def _check_carried(src_root: FsGroup, src_meta: Any) -> None:
     )
     if extra:
         problems.append(f"level-0 families {extra}")
-    if list_link_deltas(lg) and (
-        src_meta.links_convention != LINKS_IMPLICIT_SEQUENTIAL
-        or list_link_deltas(lg) != [0]
-    ):
+    stale = [d for d in list_link_deltas(lg) if d != 0]
+    if stale:
         problems.append(
-            f"explicit links (links_convention="
-            f"{src_meta.links_convention!r}, deltas {list_link_deltas(lg)}); "
-            f"use rechunk_spatial to change the chunk grid of a store with "
-            f"topology")
+            f"cross-level link families {stale} on level 0 with no level "
+            f"to point at (remove them, or rebuild the pyramid)")
     if problems:
         raise NotImplementedError(
             "rechunk() cannot carry " + "; ".join(problems)
@@ -119,10 +109,14 @@ def rechunk(
     an output store where chunk keys have a prefix dimension
     ``(bin, z, y, x)``.
 
-    Objects are renumbered densely in bin order; attributes, groupings
-    and ``implicit_sequential`` bridge links are carried.  Levels above
-    0, explicit links and fragment/link attributes raise
-    ``NotImplementedError`` before anything is written.
+    Object ids are preserved, so object attributes, groupings and group
+    attributes copy verbatim.  Vertex attributes follow their vertices,
+    shared fragments stay shared, and ``links/0`` is re-addressed onto the
+    new keys whatever its ``link_width`` (a link may join two bins).  Under
+    ``implicit_sequential``, a fragment the new grid cuts gets a bridge
+    link across each cut.  Levels above 0, link/fragment attributes, a
+    fragment shared by objects in different bins, and vertices no object
+    names raise ``NotImplementedError`` before anything is written.
     ``by="spatial"`` is handed to
     :func:`~zarr_vectors.rechunk.spatial.rechunk_spatial`.
 
@@ -135,7 +129,9 @@ def rechunk(
 
     Returns:
         Summary dict with ``objects_rechunked``, ``bins_created``,
-        ``output_path``.
+        ``total_vertices``, ``rechunk_dims``, ``output_path``, ``links``
+        (records written to ``links/0``) and ``dropped_links`` (source
+        records naming no vertex, which cannot be carried).
     """
     store_path = Path(store_path)
 
@@ -171,21 +167,17 @@ def rechunk(
     refuse_octree_read(get_resolution_level(src_root, 0), "rechunk")
     _check_carried(src_root, src_meta)
 
-    if output_path.exists():
-        shutil.rmtree(output_path)
-
     chunk_shape = spec.spatial_chunk_shape or src_meta.chunk_shape
 
-    # Read level 0 data
+    # Level 0 as a vertex table with its fragments and manifests, as
+    # rechunk_spatial reads it: links address rows of that table, so they
+    # can be re-addressed once the rows have new homes.  Keys of any rank:
+    # an attribute-chunked store can be re-binned.
     src_level = get_resolution_level(src_root, 0)
-
-    # Read object manifests
-    try:
-        manifests = read_all_object_manifests(src_level)
-        n_objects = len(manifests)
-    except Exception:
-        manifests = []
-        n_objects = 0
+    lv = _read_level(src_level, ndim, any_rank=True)
+    ids = lv.object_ids
+    present_ids = [int(o) for o, m in zip(ids.tolist(), lv.manifests) if m]
+    n_objects = int(ids.max()) + 1 if ids.size else 0
 
     # Read groupings
     groupings: list[list[int]] | None = None
@@ -217,13 +209,15 @@ def rechunk(
     # Map objects to rechunk bins
     mapper = DimensionMapper(spec)
     if n_objects > 0:
-        raw_bins = mapper.map_objects(
+        all_bins = mapper.map_objects(
             n_objects=n_objects,
             groupings=groupings,
             object_attributes=object_attributes,
         )
+        # Only objects with vertices take a bin: an empty bin is never
+        # allocated, nor labelled.
+        raw_bins = {oid: all_bins[oid] for oid in present_ids}
     else:
-        # No objects — rechunk spatially only
         raw_bins = {}
 
     # Renumber the bins densely before anything consumes them.  The
@@ -239,9 +233,10 @@ def rechunk(
     renumber = {old: new for new, old in enumerate(used)}
     obj_to_bin = {oid: renumber[b] for oid, b in raw_bins.items()}
     unique_bins = list(range(len(used))) or [0]
-    by_bin: dict[int, list[int]] = {b: [] for b in unique_bins}
-    for oid in sorted(obj_to_bin):
-        by_bin[obj_to_bin[oid]].append(oid)
+
+    # Each vertex row goes to its object's bin.  Object ids are kept, so
+    # nothing else (attributes, groupings, links) needs renumbering.
+    cells = _row_cells(lv, obj_to_bin, np.asarray(chunk_shape, np.float64))
 
     # Create output store
     spatial_dim_names = [
@@ -250,6 +245,14 @@ def rechunk(
     ]
     rechunk_dims = [spec.dimension_name, *spatial_dim_names]
 
+    from zarr_vectors.constants import CAP_PRESERVED_OBJECT_IDS, CAP_SHARED_FRAGMENTS
+
+    # Everything that can refuse has run; only now replace an output.
+    if output_path.exists():
+        shutil.rmtree(output_path)
+
+    caps = [c for c in (src_meta.format_capabilities or [])
+            if c in (CAP_PRESERVED_OBJECT_IDS, CAP_SHARED_FRAGMENTS)]
     out_root = create_store(
         str(output_path),
         axes=src_meta.spatial_index_dims,
@@ -266,6 +269,7 @@ def rechunk(
         object_index_convention=src_meta.object_index_convention,
         cross_chunk_strategy=src_meta.cross_chunk_strategy,
         base_bin_shape=src_meta.base_bin_shape,
+        format_capabilities=caps or None,
     )
 
     # One label per bin, in bin order: what a reader's attribute_filter
@@ -275,10 +279,9 @@ def rechunk(
     chunk_attribute_name: str | None = None
     chunk_attribute_values: list[Any] | None = None
     if obj_to_bin and spec.by != "spatial":
-        chunk_attribute_name = (
-            spec.by.split(":", 1)[1] if spec.by.startswith("attribute:")
-            else spec.dimension_name
-        )
+        # The same name as chunk_dims[0]: the leading axis is the bin
+        # axis, and a reader's attribute_filter keys on this name.
+        chunk_attribute_name = spec.dimension_name
         chunk_attribute_values = [mapper.labels[old] for old in used]
 
     # Create level 0
@@ -314,166 +317,81 @@ def rechunk(
         origin=(0, *_spatial_origin),
     )
 
-    # Read at the dtype the source declares: a float64 cell read as
-    # float32 decodes to garbage at twice the row count.
-    vdtype = vertices_dtype(src_level)
-    cs = np.asarray(chunk_shape, dtype=np.float64)
-
-    vattrs = {
-        name: dict(src_level.read_array_meta(f"{VERTEX_ATTRIBUTES}/{name}") or {})
-        for name in _names(src_level, VERTEX_ATTRIBUTES)
-    }
-    # A path store always gets bridges: a smaller grid can split a path.
-    write_bridges = bool(list_link_deltas(src_level)) or (
-        src_meta.links_convention == LINKS_IMPLICIT_SEQUENTIAL
-        and bool(set(src_meta.geometry_types)
-                 & {GEOM_LINE, GEOM_POLYLINE, GEOM_STREAMLINE})
+    # A path store always gets bridges: a cell boundary that cuts one of
+    # the source's fragments makes two, joined by nothing else.
+    bridge_splits = src_meta.links_convention == LINKS_IMPLICIT_SEQUENTIAL and (
+        bool(list_link_deltas(src_level))
+        or bool(set(src_meta.geometry_types)
+                & {GEOM_LINE, GEOM_POLYLINE, GEOM_STREAMLINE})
     )
-    chunk_cache: dict[tuple, dict[str, list]] = {}
-
-    def _attr_fragments(cc: tuple, f: int) -> dict[str, npt.NDArray]:
-        got = chunk_cache.get(cc)
-        if got is None:
-            got = {}
-            for name, meta in vattrs.items():
-                adt = np.dtype(meta.get("dtype", "float32"))
-                rs = meta.get("row_shape") or []
-                ncols = int(rs[0]) if rs else max(
-                    1, len(meta.get("channel_names") or []))
-                got[name] = read_chunk_attributes(
-                    src_level, name, cc, dtype=adt, ncols=ncols)
-            chunk_cache.clear()
-            chunk_cache[cc] = got
-        return {name: np.asarray(groups[f]) for name, groups in got.items()}
-
-    total_vertices = 0
-    object_manifests_out: dict[int, ObjectManifest] = {}
-    # Source id -> output id, for objects that were written.  An object
-    # with no vertices gets no manifest, so it gets no id either.
-    old_to_new: dict[int, int] = {}
+    n_links = dropped_links = 0
 
     with _rechunk_session:
-        create_vertices_array(out_level, dtype=vdtype.name)
+        create_vertices_array(out_level, dtype=lv.dtype.name)
         create_object_index_array(out_level)
-        for name, meta in vattrs.items():
-            rs = meta.get("row_shape") or []
-            extra = {k: v for k, v in meta.items()
-                     if k not in _ATTR_META_OWNED}
-            create_attribute_array(
-                out_level, name, dtype=str(meta.get("dtype", "float32")),
-                channel_names=meta.get("channel_names"),
-                ncols=int(rs[0]) if rs else None, extra_meta=extra or None,
-            )
-        bridge_chunks: list = []
-        bridge_rows: list = []
+        # Each object keeps its own fragments, one per run of a source
+        # fragment inside one output cell, never merged with a neighbour:
+        # the source's links (and bridges) address those runs' ends.
+        # Shared fragments stay shared.
+        new_cc, new_local, total_vertices = _write_level(
+            out_level, lv, chunk_shape, ndim,
+            n_objects if present_ids else 0,
+            cells=cells, merge_private=False,
+        )
+        maps = (new_cc, new_local)
 
-        for bin_idx in unique_bins:
-            # Each object keeps its own fragments: one per run of its
-            # vertices inside one cell, as the type writers lay them out.
-            # Merging a cell into one fragment made every manifest name
-            # fragment 0, so reading one object returned the whole cell.
-            cells: dict[ChunkCoords, list[npt.NDArray]] = {}
-            cell_attrs: dict[str, dict[ChunkCoords, list]] = {
-                name: {} for name in vattrs}
-            for oid in by_bin[bin_idx]:
-                try:
-                    fragments = read_object_vertices(
-                        src_level, oid, dtype=vdtype, ndim=ndim,
-                    )
-                except Exception:
-                    fragments = []
-                src_manifest = manifests[oid] if vattrs and fragments else []
-                manifest: ObjectManifest = []
-                for i, fragment in enumerate(fragments):
-                    attrs = (_attr_fragments(tuple(src_manifest[i][0]),
-                                             int(src_manifest[i][1]))
-                             if vattrs else {})
-                    for cell, a, b in _runs_by_cell(fragment, cs):
-                        key: ChunkCoords = (bin_idx, *cell)
-                        runs = cells.setdefault(key, [])
-                        manifest.append((key, len(runs)))
-                        runs.append(fragment[a:b])
-                        for name, arr in attrs.items():
-                            cell_attrs[name].setdefault(key, []).append(arr[a:b])
-                if not manifest:
-                    continue
-                old_to_new[oid] = len(object_manifests_out)
-                object_manifests_out[old_to_new[oid]] = manifest
-
-            starts: dict[ChunkCoords, list[int]] = {}
-            for key in sorted(cells):
-                write_chunk_vertices(out_level, key, cells[key], dtype=vdtype)
-                for name in vattrs:
-                    write_chunk_attributes(
-                        out_level, name, key, cell_attrs[name][key],
-                        dtype=np.dtype(vattrs[name].get("dtype", "float32")),
-                    )
-                lens = [len(r) for r in cells[key]]
-                starts[key] = np.concatenate([[0], np.cumsum(lens)]).tolist()
-                total_vertices += sum(lens)
-
-            # Bridge: last vertex of a fragment -> first of the next.
-            if write_bridges:
-                for oid in by_bin[bin_idx]:
-                    man = object_manifests_out.get(old_to_new.get(oid, -1), [])
-                    for (ka, fa), (kb, fb) in zip(man, man[1:]):
-                        bridge_chunks.append((ka, kb))
-                        bridge_rows.append((starts[ka][fa + 1] - 1,
-                                            starts[kb][fb]))
-
-        if bridge_rows:
-            write_links(
-                out_level, [], ndim + 1, delta=0, link_width=2,
-                _arrays=(np.asarray(bridge_chunks, np.int64),
-                         np.asarray(bridge_rows, np.int64)),
-            )
-
-        # The manifests use (prefix, z, y, x) coords — ndim+1 dimensions
-        if object_manifests_out:
-            write_object_index(
-                out_level, object_manifests_out, sid_ndim=ndim + 1,
-            )
+        pol, link_c, link_v, dropped_links = _map_links(
+            src_level, 0, lv, lv, maps, maps)
+        if bridge_splits:
+            bc, bv = _split_bridges(lv, maps)
+            if len(bv):
+                if pol is not None and pol[0] != 2:
+                    raise NotImplementedError(
+                        f"rechunk: links/0 has link_width {pol[0]}, but a "
+                        f"cell boundary splitting an implicit_sequential "
+                        f"fragment needs a 2-wide bridge")
+                link_c = np.concatenate([link_c, bc])
+                link_v = np.concatenate([link_v, bv])
+        if pol is not None or len(link_v):
+            link_width, _sid, directed, store = pol or (2, None, None, None)
+            kw = {k: v for k, v in (("directed", directed), ("store", store))
+                  if v is not None}
+            if pol is not None:
+                create_links_family(out_level, delta=0, link_width=link_width,
+                                    sid_ndim=ndim + 1, **kw)
+            if len(link_v):
+                write_links(out_level, [], ndim + 1, delta=0,
+                            link_width=link_width, _arrays=(link_c, link_v),
+                            **kw)
+            n_links = int(len(link_v))
 
     update_level_metadata(out_level, vertex_count=int(total_vertices))
     present = [VERTICES, OBJECT_INDEX]
-    if vattrs:
+    if lv.vattr_meta:
         present.append(VERTEX_ATTRIBUTES)
     if out_level.array_exists(LINKS):
         present.append(LINKS)
     update_level_metadata(out_level, arrays_present=present)
 
-    # Object attributes follow their objects to the new ids.
-    new_to_old = np.array(
-        [old for old, _new in sorted(old_to_new.items(), key=lambda t: t[1])],
-        dtype=np.int64,
-    )
+    # Ids are preserved, so per-object and per-group data copy verbatim.
     for name in _names(src_level, OBJECT_ATTRIBUTES):
         data = np.asarray(read_object_attributes(src_level, name))
         create_object_attributes_array(out_level, name, dtype=str(data.dtype))
-        write_object_attributes(out_level, name, data[new_to_old])
+        write_object_attributes(out_level, name, data)
 
-    # Group attributes are per group, and group ids are unchanged.
     for name in _names(src_level, GROUP_ATTRIBUTES):
         data = np.asarray(read_groupings_attributes(src_level, name))
         create_groupings_attributes_array(out_level, name, dtype=str(data.dtype))
         write_groupings_attributes(out_level, name, data)
 
-    # Groupings, remapped to the new ids.
     if groupings:
         from zarr_vectors.core.arrays import (
             create_groupings_array,
             write_groupings,
         )
 
-        new_groupings: dict[int, list[int]] = {}
-        for gid, members in enumerate(groupings):
-            new_members = [old_to_new[m] for m in members if m in old_to_new]
-            if new_members:
-                new_groupings[gid] = new_members
-
-        if new_groupings:
-            create_groupings_array(out_level)
-            write_groupings(out_level, new_groupings)
+        create_groupings_array(out_level)
+        write_groupings(out_level, {g: list(m) for g, m in enumerate(groupings)})
 
     # In-place: replace source with output
     if in_place:
@@ -484,11 +402,13 @@ def rechunk(
         output_path = store_path
 
     return {
-        "objects_rechunked": len(object_manifests_out),
+        "objects_rechunked": len(present_ids),
         "bins_created": len(unique_bins),
-        "total_vertices": total_vertices,
+        "total_vertices": int(total_vertices),
         "rechunk_dims": rechunk_dims,
         "output_path": str(output_path),
+        "links": n_links,
+        "dropped_links": int(dropped_links),
     }
 
 
@@ -529,27 +449,73 @@ def _rechunk_spatial(
     }
 
 
-def _runs_by_cell(
-    positions: npt.NDArray, cs: npt.NDArray[np.float64],
-) -> list[tuple[tuple[int, ...], int, int]]:
-    """Split ``positions`` into maximal runs of vertices sharing a cell.
+def _row_cells(
+    lv: Any, obj_to_bin: dict[int, int], cs: npt.NDArray[np.float64],
+) -> npt.NDArray[np.int64]:
+    """Each row's output key ``(bin, *floor(position / chunk_shape))``.
 
-    A fragment is one contiguous run of an object's vertices inside one
-    cell; a polyline that leaves a cell and comes back is two fragments
-    there, not one with a segment invented across the gap.  Cells are
-    ``floor(position / chunk_shape)``, as
-    :func:`~zarr_vectors.spatial.chunking.assign_chunks` computes them.
+    A row's bin is its object's.  Raises ``NotImplementedError`` for a
+    fragment shared by objects in different bins (a vertex has one home,
+    and a bin read must find all of its objects' vertices) and for
+    vertices no object names (they have no bin).
     """
-    if len(positions) == 0:
-        return []
-    cells = np.floor(positions / cs).astype(np.int64)
-    breaks = (np.flatnonzero(np.any(cells[1:] != cells[:-1], axis=1)) + 1).tolist()
-    starts = [0, *breaks]
-    ends = [*breaks, len(positions)]
-    return [
-        (tuple(cells[a].tolist()), a, b)
-        for a, b in zip(starts, ends)
-    ]
+    n = int(lv.pos.shape[0])
+    row_bin = np.full(n, -1, np.int64)
+    for oid, seq in zip(lv.object_ids.tolist(), lv.manifests):
+        b = obj_to_bin.get(int(oid))
+        if b is None:
+            continue
+        for k in seq:
+            rows = lv.frags[k]
+            held = row_bin[rows]
+            if np.any((held >= 0) & (held != b)):
+                raise NotImplementedError(
+                    f"rechunk: object {oid} shares a fragment with an object "
+                    f"in another bin; a shared vertex can be stored in one "
+                    f"bin only. Use rechunk_spatial, or bin so that objects "
+                    f"sharing fragments fall together.")
+            row_bin[rows] = b
+    named = np.zeros(n, bool)
+    for k, rows in enumerate(lv.frags):
+        named[rows] = True
+    orphan = named & (row_bin < 0)
+    if orphan.any():
+        raise NotImplementedError(
+            f"rechunk: level 0 holds {int(orphan.sum())} vertices in fragments "
+            f"no object names, so they have no bin; use rechunk_spatial.")
+    spatial = (np.floor(lv.pos / cs).astype(np.int64) if n
+               else np.zeros((0, len(cs)), np.int64))
+    return np.concatenate([row_bin[:, None], spatial], axis=1)
+
+
+def _split_bridges(lv: Any, maps: tuple) -> tuple[npt.NDArray, npt.NDArray]:
+    """Bridges across the cuts the new grid makes inside source fragments.
+
+    Under ``implicit_sequential`` consecutive rows of a fragment are
+    joined implicitly; once a cell boundary splits a fragment into runs,
+    the step between runs needs an explicit link: last row of one run to
+    the first of the next.  Joins the source already had between its own
+    fragments come across with its links.
+    """
+    new_cc, new_local = maps
+    rank = int(new_cc.shape[1])
+    a_rows: list[npt.NDArray] = []
+    b_rows: list[npt.NDArray] = []
+    for rows in lv.frags:
+        if rows.size < 2:
+            continue
+        c = new_cc[rows]
+        cut = np.flatnonzero(np.any(c[1:] != c[:-1], axis=1))
+        if cut.size:
+            a_rows.append(rows[cut])
+            b_rows.append(rows[cut + 1])
+    if not a_rows:
+        return np.zeros((0, 2, rank), np.int64), np.zeros((0, 2), np.int64)
+    a = np.concatenate(a_rows)
+    b = np.concatenate(b_rows)
+    chunks = np.stack([new_cc[a], new_cc[b]], axis=1)
+    vi = np.stack([new_local[a], new_local[b]], axis=1)
+    return chunks, vi
 
 
 def _compute_object_lengths(

@@ -41,7 +41,8 @@ from zarr_vectors.core.paths import (
 from zarr_vectors.core.store import create_store, get_resolution_level
 from zarr_vectors.exceptions import ArrayError
 from zarr_vectors.spatial.boundary import (
-    apply_perm_inverse, canonical_sort,
+    apply_perm_inverse,
+    canonical_sort,
 )
 
 
@@ -212,8 +213,8 @@ class TestCanonicalSortInvariant:
     """The validator must flag a store whose offsets segment isn't canonical."""
 
     def _graph_store(self, tmp_path: Path):
+        from zarr_vectors.core.store import get_resolution_level, open_store
         from zarr_vectors.types.graphs import write_graph
-        from zarr_vectors.core.store import open_store, get_resolution_level
 
         store_path = tmp_path / "store.zv"
         positions = np.array([
@@ -267,9 +268,9 @@ class TestCanonicalSortInvariant:
         # A canonical L=3 record sorts its endpoints, so its offsets are
         # non-decreasing.  "0.0.+1_0.0.0" descends — the direct analogue of
         # the pre-merge unsorted cell key.
-        from zarr_vectors.validate.consistency import validate_consistency
-        from zarr_vectors.core.store import open_store, get_resolution_level
+        from zarr_vectors.core.store import get_resolution_level, open_store
         from zarr_vectors.types.meshes import write_mesh
+        from zarr_vectors.validate.consistency import validate_consistency
 
         store_path = tmp_path / "mesh.zv"
         verts = np.array([
@@ -321,8 +322,8 @@ class TestValidatorModeAware:
     """Directed / duplicate families must not trip the canonical-sort check."""
 
     def _graph_store(self, tmp_path: Path):
+        from zarr_vectors.core.store import get_resolution_level, open_store
         from zarr_vectors.types.graphs import write_graph
-        from zarr_vectors.core.store import open_store, get_resolution_level
 
         store_path = tmp_path / "store.zv"
         positions = np.array([

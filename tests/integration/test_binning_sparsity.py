@@ -20,9 +20,9 @@ class TestPointCloudSubChunkBins:
     """1. Point cloud with sub-chunk bins."""
 
     def test_50k_points_with_bins(self, tmp_path: Path) -> None:
-        from zarr_vectors.types.points import write_points, read_points
-        from zarr_vectors.validate import validate
         from zarr_vectors.core.store import open_store, read_root_metadata
+        from zarr_vectors.types.points import read_points, write_points
+        from zarr_vectors.validate import validate
 
         rng = np.random.default_rng(42)
         store = str(tmp_path / "pts.zv")
@@ -59,9 +59,9 @@ class TestStreamlinesWithSparsity:
     """2. Streamlines with sparsity pyramid."""
 
     def test_streamline_sparsity(self, tmp_path: Path) -> None:
+        from zarr_vectors.multiresolution.coarsen import build_pyramid
         from zarr_vectors.types.polylines import write_polylines
         from zarr_vectors.validate import validate
-        from zarr_vectors.multiresolution.coarsen import build_pyramid
 
         rng = np.random.default_rng(42)
         store = str(tmp_path / "tracts.zv")
@@ -85,7 +85,9 @@ class TestStreamlinesWithSparsity:
         assert summary["levels_created"] == 1
         # sparsity_factor=2.0 → keep_frac=0.5 ≈ object_sparsity=0.5.
         # Approximate check: at least one object was dropped.
-        assert summary["level_specs"][0]["objects_kept"] < summary["level_specs"][0]["source_objects"]
+        assert (
+            summary["level_specs"][0]["objects_kept"] < summary["level_specs"][0]["source_objects"]
+        )
 
         assert validate(store, level=5).ok
 
@@ -94,8 +96,8 @@ class TestMeshBinning:
     """3. Mesh with binning only."""
 
     def test_mesh_coarsening(self, tmp_path: Path) -> None:
-        from zarr_vectors.types.meshes import write_mesh, read_mesh
         from zarr_vectors.multiresolution.coarsen import coarsen_level
+        from zarr_vectors.types.meshes import read_mesh, write_mesh
         from zarr_vectors.validate import validate
 
         rng = np.random.default_rng(42)
@@ -124,11 +126,13 @@ class TestSkeletonManualLevels:
     """5. Manual level creation."""
 
     def test_multiple_manual_ratios(self, tmp_path: Path) -> None:
-        from zarr_vectors.types.points import write_points
-        from zarr_vectors.multiresolution.coarsen import coarsen_level
         from zarr_vectors.core.store import (
-            open_store, list_resolution_levels, list_available_ratios,
+            list_available_ratios,
+            list_resolution_levels,
+            open_store,
         )
+        from zarr_vectors.multiresolution.coarsen import coarsen_level
+        from zarr_vectors.types.points import write_points
         from zarr_vectors.validate import validate
 
         rng = np.random.default_rng(42)
@@ -162,7 +166,7 @@ class TestBackwardCompat:
     """6. Backward compatibility — step 15 tests pass unchanged."""
 
     def test_simple_point_cloud(self, tmp_path: Path) -> None:
-        from zarr_vectors.types.points import write_points, read_points
+        from zarr_vectors.types.points import read_points, write_points
         from zarr_vectors.validate import validate
 
         rng = np.random.default_rng(42)
@@ -174,8 +178,8 @@ class TestBackwardCompat:
         assert validate(store, level=5).ok
 
     def test_pyramid_backward_compat(self, tmp_path: Path) -> None:
-        from zarr_vectors.types.points import write_points
         from zarr_vectors.multiresolution.coarsen import build_pyramid
+        from zarr_vectors.types.points import write_points
         from zarr_vectors.validate import validate
 
         rng = np.random.default_rng(42)
@@ -188,7 +192,7 @@ class TestBackwardCompat:
         assert validate(store, level=5).ok
 
     def test_streamlines(self, tmp_path: Path) -> None:
-        from zarr_vectors.types.polylines import write_polylines, read_polylines
+        from zarr_vectors.types.polylines import read_polylines, write_polylines
         from zarr_vectors.validate import validate
 
         rng = np.random.default_rng(42)
@@ -207,13 +211,15 @@ class TestOMEZarrMetadata:
     """7. OME-Zarr multiscale metadata round-trip."""
 
     def test_multiscale_roundtrip(self, tmp_path: Path) -> None:
-        from zarr_vectors.types.points import write_points
-        from zarr_vectors.multiresolution.coarsen import build_pyramid
         from zarr_vectors.core.multiscale import (
-            write_multiscale_metadata, read_multiscale_metadata,
-            get_level_scale, get_level_translation,
+            get_level_scale,
+            get_level_translation,
+            read_multiscale_metadata,
+            write_multiscale_metadata,
         )
         from zarr_vectors.core.store import open_store
+        from zarr_vectors.multiresolution.coarsen import build_pyramid
+        from zarr_vectors.types.points import write_points
 
         rng = np.random.default_rng(42)
         store = str(tmp_path / "ms.zv")

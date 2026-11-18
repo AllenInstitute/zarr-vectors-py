@@ -83,7 +83,9 @@ def test_objects_read_exactly_their_nodes_and_edges(store, wanted):
     assert list(dict.fromkeys(got["object_ids"].tolist())) == order
     for oid in order:
         mine = got["object_ids"] == oid
-        assert {_key(p) for p in got["positions"][mine]} == {_key(p) for p in positions[oids == oid]}
+        assert {_key(p) for p in got["positions"][mine]} == {
+            _key(p) for p in positions[oids == oid]
+        }
 
 
 def test_objects_span_several_chunks(store):
@@ -201,7 +203,9 @@ def test_skeleton_object_read_survives_an_empty_last_fragment(tmp_path):
     writer, an edit).  Taken last, its start equalled the row count and
     the skeleton rebuild indexed past the end."""
     from zarr_vectors.core.arrays import (
-        read_chunk_vertices, read_object_manifests, write_chunk_vertices,
+        read_chunk_vertices,
+        read_object_manifests,
+        write_chunk_vertices,
         write_object_index,
     )
     from zarr_vectors.core.store import get_resolution_level, open_store

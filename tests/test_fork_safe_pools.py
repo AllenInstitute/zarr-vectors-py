@@ -33,6 +33,15 @@ def _child(name: str, out) -> None:
     out.put(_use(pool_of))
 
 
+# Forking while a pool thread is alive is the scenario under test (a user's
+# own fork, or multiprocessing's "fork" start method, the default on Linux
+# before 3.14), so Python 3.12+'s "multi-threaded, use of fork()" warning is
+# expected here and nowhere else; the child's 60 s join catches the
+# deadlock it warns about.
+@pytest.mark.filterwarnings(
+    r"ignore:This process \(pid=\d+\) is multi-threaded, use of fork\(\)"
+    r":DeprecationWarning"
+)
 @pytest.mark.parametrize("name", ["read", "write"])
 def test_a_forked_child_uses_a_fresh_pool(name):
     pool_of = {"read": _batch_reader._read_pool, "write": _batch_writer._write_pool}[name]

@@ -14,6 +14,7 @@ from typing import TYPE_CHECKING, Any
 from zarr.abc.codec import BytesBytesCodec
 from zarr.core.common import parse_named_configuration
 from zarr.registry import register_codec
+
 from zarr_vectors.constants import OCTREE_CODEC_NAMES
 
 if TYPE_CHECKING:

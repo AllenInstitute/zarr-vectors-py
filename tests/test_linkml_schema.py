@@ -25,7 +25,7 @@ import pytest
 
 jsonschema = pytest.importorskip("jsonschema")
 
-from zarr_vectors.constants import (
+from zarr_vectors.constants import (  # noqa: E402
     VALID_CROSS_CHUNK_STRATEGIES,
     VALID_ENCODINGS,
     VALID_GEOMETRY_TYPES,
@@ -33,8 +33,8 @@ from zarr_vectors.constants import (
     VALID_OBJIDX_CONVENTIONS,
     VALID_XLEVEL_STORAGE,
 )
-from zarr_vectors.core.metadata import LevelMetadata, RootMetadata
-from zarr_vectors.exceptions import MetadataError
+from zarr_vectors.core.metadata import LevelMetadata, RootMetadata  # noqa: E402
+from zarr_vectors.exceptions import MetadataError  # noqa: E402
 
 
 SCHEMA_PATH = Path(__file__).resolve().parents[1] / "schema" / "zarr_vectors.schema.json"

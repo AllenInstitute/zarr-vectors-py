@@ -30,7 +30,6 @@ from zarr_vectors.encoding.compression import (
 )
 from zarr_vectors.types.points import read_points, write_points
 
-
 CHUNK = (200.0, 200.0, 200.0)
 BIN = (50.0, 50.0, 50.0)
 

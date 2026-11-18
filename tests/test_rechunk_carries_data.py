@@ -9,6 +9,7 @@ it deleted an existing ``output`` directory without asking.
 
 from __future__ import annotations
 
+from collections import Counter
 from pathlib import Path
 
 import numpy as np
@@ -29,7 +30,7 @@ from zarr_vectors.core.store import (
     read_level_metadata,
 )
 from zarr_vectors.rechunk import RechunkSpec, rechunk
-from zarr_vectors.types.polylines import write_polylines
+from zarr_vectors.types.polylines import read_polylines, write_polylines
 from zarr_vectors.validate import validate
 
 
@@ -148,18 +149,156 @@ def test_a_pyramid_is_refused_before_anything_is_written(lines, tmp_path):
     assert not out.exists()
 
 
-def test_explicit_links_are_refused(tmp_path):
+def _link_positions(path) -> Counter:
+    """Every ``links/0`` record as its endpoints' positions, rotated to
+    start at the smallest (so a face keeps its winding)."""
+    lg = get_resolution_level(open_store(str(path), mode="r"), 0)
+    chunks, vi = read_link_arrays(lg, delta=0)
+    cache: dict[tuple, np.ndarray] = {}
+
+    def at(c, v):
+        key = tuple(int(x) for x in c)
+        if key not in cache:
+            cache[key] = np.concatenate(read_chunk_vertices(lg, key, ndim=3))
+        return tuple(np.round(cache[key][int(v)], 4).tolist())
+
+    out: Counter = Counter()
+    for cs, vs in zip(chunks, vi):
+        ends = [at(c, v) for c, v in zip(cs, vs)]
+        k = ends.index(min(ends))
+        out[tuple(ends[k:] + ends[:k])] += 1
+    return out
+
+
+def test_graph_edges_are_carried_across_bins(tmp_path):
+    """Explicit links used to be refused. Edges between objects that land
+    in different bins become links between bins."""
     from zarr_vectors.types.graphs import write_graph
 
     rng = np.random.default_rng(0)
     src = tmp_path / "graph.zarr"
+    oids = np.arange(40) % 4
     write_graph(src, positions=rng.uniform(0, 100, (40, 3)).astype(np.float32),
                 edges=np.array([[i, (i * 7 + 3) % 40] for i in range(40)]),
-                object_ids=np.zeros(40, np.int64), chunk_shape=(25.0,) * 3,
+                object_ids=oids, chunk_shape=(25.0,) * 3,
+                object_attributes={"w": np.array([4.0, 3.0, 2.0, 1.0])},
                 bounds=([0.0] * 3, [100.0] * 3))
-    with pytest.raises(NotImplementedError, match="links"):
-        rechunk(str(src), RechunkSpec(by="object_id", bins=[0, 1]),
-                output=str(tmp_path / "out.zarr"))
+    out = tmp_path / "out.zarr"
+
+    summary = rechunk(str(src), RechunkSpec(by="attribute:w"), output=str(out))
+
+    assert summary["bins_created"] == 4
+    assert summary["links"] == 40 and summary["dropped_links"] == 0
+    norm = lambda c: Counter({tuple(sorted(k)): n for k, n in c.items()})  # noqa: E731
+    assert norm(_link_positions(out)) == norm(_link_positions(src))
+    chunks, _ = read_link_arrays(
+        get_resolution_level(open_store(str(out), mode="r"), 0), delta=0)
+    assert chunks.shape[1:] == (2, 4)
+    assert (chunks[:, 0, 0] != chunks[:, 1, 0]).any()   # some cross bins
+    assert validate(str(out), level=5).ok, validate(str(out), level=5).summary()
+
+
+@pytest.mark.slow
+def test_mesh_faces_keep_their_winding(tmp_path):
+    from zarr_vectors.types.meshes import write_mesh
+
+    rng = np.random.default_rng(3)
+    # Two meshes, objects 0 and 1, each with faces of its own vertices.
+    verts = rng.uniform(1.0, 99.0, size=(200, 3)).astype(np.float32)
+    faces = np.concatenate([
+        np.stack([rng.permutation(100)[:3] for _ in range(150)]),
+        100 + np.stack([rng.permutation(100)[:3] for _ in range(150)]),
+    ])
+    src = tmp_path / "mesh.zarr"
+    write_mesh(src, verts, faces, chunk_shape=(25.0,) * 3,
+               object_ids=np.repeat([0, 1], 100),
+               bounds=([0.0] * 3, [100.0] * 3))
+    out = tmp_path / "out.zarr"
+
+    summary = rechunk(str(src), RechunkSpec(by="object_id"), output=str(out),)
+
+    assert summary["bins_created"] == 2 and summary["links"] == 300
+    assert _link_positions(out) == _link_positions(src)
+    assert validate(str(out), level=5).ok, validate(str(out), level=5).summary()
+
+
+def test_object_ids_and_their_data_are_preserved(lines, tmp_path):
+    """Bins interleave the ids, which used to be renumbered in bin order."""
+    src, polys = lines
+    root = open_store(str(src), mode="r+")
+    lg = get_resolution_level(root, 0)
+    from zarr_vectors.core.arrays import write_groupings
+
+    groups = [[1, 3, 5, 7, 9, 11], [0, 2, 4, 6, 8, 10]]
+    write_groupings(lg, dict(enumerate(groups)))
+    out = tmp_path / "out.zarr"
+
+    rechunk(str(src), RechunkSpec(by="group"), output=str(out))
+
+    objs, out_lg = _objects(out)
+    assert sorted(objs) == list(range(12))
+    score = np.asarray(read_object_attributes(out_lg, "score")).ravel()
+    for oid, (pts, t) in objs.items():
+        np.testing.assert_array_equal(pts, polys[oid])
+        np.testing.assert_array_equal(t, np.arange(len(pts)) + 100 * oid)
+        assert score[oid] == pytest.approx(oid * 1.5)
+    assert [sorted(g) for g in read_all_groupings(out_lg)] == groups
+    # Bin 0 is group 0: the odd ids.
+    got = read_polylines(str(out), attribute_filter={"group": 0})
+    assert sorted(got["object_ids"]) == groups[0]
+
+
+def test_sparse_object_ids_are_kept(tmp_path):
+    from zarr_vectors.types.points import read_points, write_points
+
+    pos = np.array([[5, 5, 5], [60, 5, 5], [5, 60, 5]], np.float32)
+    src = tmp_path / "pts.zarr"
+    write_points(str(src), pos, chunk_shape=(50.0,) * 3,
+                 object_ids=np.array([2, 5, 9]))
+    out = tmp_path / "out.zarr"
+
+    rechunk(str(src), RechunkSpec(by="object_id"), output=str(out))
+
+    lg = get_resolution_level(open_store(str(out), mode="r"), 0)
+    ids, mans = read_object_manifest_rows(lg)
+    assert sorted(i for i, m in zip(ids.tolist(), mans) if m) == [2, 5, 9]
+    for oid, p in zip((2, 5, 9), pos):
+        got = read_points(str(out), object_ids=[oid])
+        np.testing.assert_array_equal(got["positions"], [p])
+
+
+def test_a_rechunked_store_can_be_rebinned(lines, tmp_path):
+    src, polys = lines
+    mid, out = tmp_path / "mid.zarr", tmp_path / "out.zarr"
+    rechunk(str(src), RechunkSpec(by="group"), output=str(mid))
+
+    rechunk(str(mid), RechunkSpec(by="attribute:score", bins=[0, 5, 100]),
+            output=str(out))
+
+    objs, _ = _objects(out)
+    for oid, (pts, _t) in objs.items():
+        np.testing.assert_array_equal(pts, polys[oid])
+    assert validate(str(out), level=4).ok
+
+
+def test_a_fragment_shared_across_bins_is_refused(lines, tmp_path):
+    """A vertex has one home; two objects in two bins cannot both own it."""
+    from zarr_vectors.core.arrays import write_object_index
+
+    src, _ = lines
+    lg = get_resolution_level(open_store(str(src), mode="r+"), 0)
+    ids, mans = read_object_manifest_rows(lg)
+    shared = {int(i): list(m) for i, m in zip(ids.tolist(), mans)}
+    shared[1] = shared[0][:1] + shared[1]
+    write_object_index(lg, shared, sid_ndim=3)
+    out = tmp_path / "out.zarr"
+    out.mkdir()
+    (out / "keep.txt").write_text("x")
+
+    with pytest.raises(NotImplementedError, match="shares a fragment"):
+        rechunk(str(src), RechunkSpec(by="object_id"), output=str(out),
+                overwrite=True)
+    assert (out / "keep.txt").exists()
 
 
 def test_by_spatial_is_lossless_on_a_pyramid(tmp_path):

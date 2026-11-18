@@ -20,8 +20,8 @@ import numpy.typing as npt
 from zarr_vectors.core.arrays import (
     read_all_object_manifests,
     read_chunk_vertices,
-    read_fragment,
     read_object_vertices,
+    vertices_dtype,
 )
 from zarr_vectors.core.metadata import LevelMetadata, RootMetadata
 from zarr_vectors.core.store import FsGroup
@@ -143,7 +143,12 @@ class ZVView:
             # a wide box materialised one tuple per allocated cell to
             # build a set used only for membership tests against chunks
             # that exist. The keys are in hand, so this needs no I/O.
-            cs = np.asarray(self._root_meta.chunk_shape, dtype=np.float64)
+            # The LEVEL's grid: a level may override the root chunk_shape.
+            from zarr_vectors.core.metadata import get_level_chunk_shape
+            cs = np.asarray(
+                get_level_chunk_shape(self._root_meta, self._level_meta),
+                dtype=np.float64,
+            )
             lo_c = np.floor(new_spec.bbox[0] / cs).astype(np.int64)
             hi_c = np.floor(new_spec.bbox[1] / cs).astype(np.int64)
             nd = len(cs)
@@ -155,17 +160,12 @@ class ZVView:
                 )
             }
 
-            # If bins are available, compute bin-level targets
-            bins_per_chunk = self._root_meta.bins_per_chunk
-            if any(b > 1 for b in bins_per_chunk):
-                from zarr_vectors.spatial.chunking import (
-                    bins_intersecting_bbox,
-                )
-                effective_bin = self._root_meta.effective_bin_shape
-                target_bins = set(bins_intersecting_bbox(
-                    new_spec.bbox[0], new_spec.bbox[1], effective_bin,
-                ))
-                new_spec.target_bins = target_bins
+            # No bin-level targets: reading fragment k as bin k holds only
+            # on a level written one fragment per bin, and a level with an
+            # object index (one fragment per object per chunk) or a leading
+            # attribute axis is not one.  The view reads the touched
+            # chunks whole and the box mask in ``_compute_spatial`` makes
+            # that exact -- the same answer ``read_points`` gives.
 
         if object_ids is not None:
             new_spec.target_object_ids = set(object_ids)
@@ -200,7 +200,9 @@ class ZVView:
             ``object_ids``.
         """
         ndim = self._root_meta.sid_ndim
-        dtype = np.float32
+        # The dtype the level declares: a float64 cell read as float32
+        # decodes to garbage at twice the row count.
+        dtype = vertices_dtype(self._group)
 
         # Path 1: object-ID based read
         if self._spec.target_object_ids is not None:
@@ -249,12 +251,7 @@ class ZVView:
         }
 
     def _compute_spatial(self, ndim: int, dtype: np.dtype) -> dict[str, Any]:
-        """Read by spatial targeting (bins or chunks)."""
-        bins_per_chunk = self._root_meta.bins_per_chunk
-        has_bins = any(b > 1 for b in bins_per_chunk)
-
-        # Determine which chunks to read
-        chunk_keys_set = set(self._all_chunk_keys)
+        """Read the targeted chunks whole; the bbox mask below cuts them."""
         if self._spec.target_chunks is not None:
             active_chunks = [ck for ck in self._all_chunk_keys
                             if ck in self._spec.target_chunks]
@@ -262,41 +259,12 @@ class ZVView:
             active_chunks = self._all_chunk_keys
 
         all_positions: list[npt.NDArray] = []
-
-        if has_bins and self._spec.target_bins is not None:
-            # Bin-level read
-            from zarr_vectors.spatial.chunking import bin_to_chunk, bin_to_fragment_index
-            chunk_fragment_targets: dict[ChunkCoords, list[int]] = {}
-            for bc in self._spec.target_bins:
-                cc = bin_to_chunk(bc, bins_per_chunk)
-                fragment_index = bin_to_fragment_index(bc, cc, bins_per_chunk)
-                if cc not in chunk_fragment_targets:
-                    chunk_fragment_targets[cc] = []
-                chunk_fragment_targets[cc].append(fragment_index)
-
-            for cc, fragment_indices in chunk_fragment_targets.items():
-                if cc not in chunk_keys_set:
-                    continue
-                for fragment_index in fragment_indices:
-                    try:
-                        fragment = read_fragment(
-                            self._group, cc, fragment_index,
-                            dtype=dtype, ndim=ndim,
-                        )
-                        if len(fragment) > 0:
-                            all_positions.append(fragment)
-                    except Exception:
-                        continue
-        else:
-            # Chunk-level read
-            for ck in active_chunks:
-                try:
-                    groups = read_chunk_vertices(self._group, ck, dtype=dtype, ndim=ndim)
-                    for fragment in groups:
-                        if len(fragment) > 0:
-                            all_positions.append(fragment)
-                except Exception:
-                    continue
+        for ck in active_chunks:
+            try:
+                groups = read_chunk_vertices(self._group, ck, dtype=dtype, ndim=ndim)
+            except Exception:
+                continue
+            all_positions.extend(g for g in groups if len(g) > 0)
 
         if not all_positions:
             return {"positions": np.zeros((0, ndim), dtype=dtype), "vertex_count": 0}
@@ -522,16 +490,17 @@ def _read_polyline(
     ndim: int,
 ) -> npt.NDArray[np.floating]:
     """Read and reconstruct a single polyline from its manifest."""
+    dtype = vertices_dtype(group)
     try:
         verts_list = read_object_vertices(
-            group, object_id, dtype=np.float32, ndim=ndim,
+            group, object_id, dtype=dtype, ndim=ndim,
         )
         non_empty = [v for v in verts_list if len(v) > 0]
         if not non_empty:
-            return np.zeros((0, ndim), dtype=np.float32)
+            return np.zeros((0, ndim), dtype=dtype)
         return np.concatenate(non_empty, axis=0)
     except Exception:
-        return np.zeros((0, ndim), dtype=np.float32)
+        return np.zeros((0, ndim), dtype=dtype)
 
 
 def _delayed_read_polyline(group: FsGroup, object_id: int, ndim: int) -> Any:

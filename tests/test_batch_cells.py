@@ -94,7 +94,9 @@ def test_prefetch_is_the_same_cells_and_the_same_reads(tmp_path, monkeypatch, ra
     plan = _plan(lg)
     batched = []
     real = _batch_reader._sharded_read_batched
-    monkeypatch.setattr(_batch_reader, "_sharded_read_batched", lambda *a, **k: batched.append(1) or real(*a, **k))
+    monkeypatch.setattr(
+        _batch_reader, "_sharded_read_batched", lambda *a, **k: batched.append(1) or real(*a, **k)
+    )
     (off, off_reads), (on, on_reads) = _both(
         monkeypatch, ranges, lambda: _batch_reader.flush_prefetch(lg.zarr_group, plan),
     )
@@ -108,7 +110,9 @@ def test_few_cells_an_array_take_the_per_cell_reader(tmp_path, monkeypatch):
     _on(monkeypatch, True)
     called = []
     real = _batch_reader._sharded_read_batched
-    monkeypatch.setattr(_batch_reader, "_sharded_read_batched", lambda *a, **k: called.append(1) or real(*a, **k))
+    monkeypatch.setattr(
+        _batch_reader, "_sharded_read_batched", lambda *a, **k: called.append(1) or real(*a, **k)
+    )
     few = [(name, keys[:_batch_reader._BATCH_CELLS - 1]) for name, keys in _plan(lg)]
     _batch_reader.flush_prefetch(lg.zarr_group, few)
     assert not called
@@ -116,7 +120,9 @@ def test_few_cells_an_array_take_the_per_cell_reader(tmp_path, monkeypatch):
     assert called
 
 
-@pytest.mark.parametrize("coalesce", ["auto", "none", "runs", "gap:0:100000", "gap:65536:300", "gap:200:1"])
+@pytest.mark.parametrize(
+    "coalesce", ["auto", "none", "runs", "gap:0:100000", "gap:65536:300", "gap:200:1"]
+)
 def test_every_coalescing_reads_the_same_ranges(tmp_path, monkeypatch, ranges, coalesce):
     """Including reads capped below one cell (``gap:200:1``), each then a cell alone."""
     monkeypatch.setenv("ZARR_VECTORS_COALESCE", coalesce)
@@ -139,7 +145,9 @@ def test_a_missing_shard_reads_as_empty_cells(tmp_path, monkeypatch, ranges):
     lg = _level(tmp_path / "s.zv")
     os.remove(_shard_files(lg)[0])
     plan = [p for p in _plan(lg) if p[0] == "vertices"]
-    (off, _), (on, _) = _both(monkeypatch, ranges, lambda: _batch_reader.flush_prefetch(lg.zarr_group, plan))
+    (off, _), (on, _) = _both(
+        monkeypatch, ranges, lambda: _batch_reader.flush_prefetch(lg.zarr_group, plan)
+    )
     assert on == off and b"" in on.values()
 
 
@@ -150,7 +158,9 @@ def test_a_shard_index_that_fails_its_checksum(tmp_path, monkeypatch, ranges):
         fh.write(b"\xff\xff")
     plan = [p for p in _plan(lg) if p[0] == "vertices"]
     (off, _), (on, _) = _both(
-        monkeypatch, ranges, lambda: _batch_reader.flush_prefetch(lg.zarr_group, plan, tolerant=True),
+        monkeypatch,
+        ranges,
+        lambda: _batch_reader.flush_prefetch(lg.zarr_group, plan, tolerant=True),
     )
     assert on == off and "0.0.0" not in on and on
     _on(monkeypatch, True)
@@ -165,7 +175,9 @@ def test_a_corrupt_cell_is_left_out_or_raises(tmp_path, monkeypatch, ranges):
     with open(victim, "r+b") as fh:
         fh.write(b"\x00" * 64)  # the first cells' zstd frames
     (off, _), (on, _) = _both(
-        monkeypatch, ranges, lambda: _batch_reader.flush_prefetch(lg.zarr_group, plan, tolerant=True),
+        monkeypatch,
+        ranges,
+        lambda: _batch_reader.flush_prefetch(lg.zarr_group, plan, tolerant=True),
     )
     assert on == off and on
     for on_ in (False, True):
@@ -197,10 +209,17 @@ def _store(path, codec):
         pytest.skip("zarr-octree is not installed")
     rng = np.random.default_rng(0)
     centres = rng.uniform(20, 80, (3, 3))
-    pts = np.clip(centres[rng.integers(0, 3, 3_000)] + rng.standard_t(3, (3_000, 3)) * 6, 0, BOX - 1e-3)
-    schema = zv.Schema(bounds=([0, 0, 0], [BOX] * 3), kind="point_cloud",
-                       layout=zv.Layout(cells=8, shard_cells=4, compression="zstd", octree=CODECS[codec]))
-    zv.create(str(path), schema=schema).add_points(pts.astype(np.float32), object_ids=np.arange(3_000) // 50)
+    pts = np.clip(
+        centres[rng.integers(0, 3, 3_000)] + rng.standard_t(3, (3_000, 3)) * 6, 0, BOX - 1e-3
+    )
+    schema = zv.Schema(
+        bounds=([0, 0, 0], [BOX] * 3),
+        kind="point_cloud",
+        layout=zv.Layout(cells=8, shard_cells=4, compression="zstd", octree=CODECS[codec]),
+    )
+    zv.create(str(path), schema=schema).add_points(
+        pts.astype(np.float32), object_ids=np.arange(3_000) // 50
+    )
 
 
 def _answers(ds):
@@ -226,7 +245,11 @@ def test_queries_answer_and_read_the_same(tmp_path, monkeypatch, ranges, codec, 
         _on(monkeypatch, on)
         ranges.clear()
         _GETS.clear()
-        store = _Requests(LocalStore(str(tmp_path / "s.zv"), read_only=True)) if where == "store" else None
+        store = (
+            _Requests(LocalStore(str(tmp_path / "s.zv"), read_only=True))
+            if where == "store"
+            else None
+        )
         ds = zv.open(str(tmp_path / "s.zv") if store is None else store)
         got.append((_answers(ds), sorted(ranges), sorted(_GETS)))
     assert got[1][0] == got[0][0] and got[0][0][0]
@@ -236,7 +259,20 @@ def test_queries_answer_and_read_the_same(tmp_path, monkeypatch, ranges, codec, 
 
 def test_keys_parse_as_one_by_one():
     src = SimpleNamespace(shape=(4, 5, 6), origin=(-2, 0, 1))
-    keys = ["-2.0.1", "1.4.6", "2.0.1", "-3.0.1", "0.5.1", "1.1", "1.1.1.1", "x.1.1", "1..1", " 1.+2.3", "1_0.0.1", ""]
+    keys = [
+        "-2.0.1",
+        "1.4.6",
+        "2.0.1",
+        "-3.0.1",
+        "0.5.1",
+        "1.1",
+        "1.1.1.1",
+        "x.1.1",
+        "1..1",
+        " 1.+2.3",
+        "1_0.0.1",
+        "",
+    ]
     cells, kept = _batch_reader._cells_of(src, keys)
     want = []
     for k in keys:

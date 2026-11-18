@@ -26,15 +26,14 @@ import pytest
 
 icechunk = pytest.importorskip("icechunk")
 
-from zarr_vectors.core.store import (
+from zarr_vectors.core.store import (  # noqa: E402
     commit,
     create_store,
     discard_changes,
     open_store,
     session_for,
 )
-from zarr_vectors.exceptions import StoreError
-
+from zarr_vectors.exceptions import StoreError  # noqa: E402
 
 # ===================================================================
 # Fixtures
@@ -212,6 +211,7 @@ def test_write_points_auto_commits(ic_repo_path: str) -> None:
     """``write_points(..., backend="icechunk")`` must persist data without
     requiring a follow-up explicit commit."""
     import numpy as np
+
     from zarr_vectors.types.points import read_points, write_points
 
     rng = np.random.default_rng(0)
