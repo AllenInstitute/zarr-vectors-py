@@ -117,6 +117,18 @@ groupings and links. It refuses, before touching an existing output:
 `rechunk_spatial` is the lossless path for such stores. Lift a refusal
 only when a real store needs it.
 
+### Volume meshes (zarr_vectors#10)
+
+Elements (one type or `mixed`), coarse cells with boundary snapping,
+surface clustering, carried-down face/cell attributes and
+`write_mesh_level` are in. Left:
+- **Edges and corners** of a coarse volume round off by up to a bin
+  (snapping moves each boundary vertex to its bin's fine-surface
+  centroid, which fixes faces, not creases). A per-bin quadric fit
+  (dual contouring) would keep sharp features.
+- **`rechunk_spatial` refuses levels with link attributes**, so a mesh
+  with face attributes cannot be rechunked spatially yet.
+
 ### When OME-Zarr RFC 8 settles
 
 RFC 8 is under review (R1), unimplemented and without a JSON Schema.
