@@ -1,5 +1,10 @@
 """Regenerate the JSON Schema + Markdown reference from the LinkML source.
 
+``zarr_vectors.linkml.yaml`` and ``build.py`` are copies of
+``convention/`` in AllenInstitute/zarr_vectors, where the convention's
+LinkML model is maintained.  The JSON Schema comes from ``build.build()``,
+so it is the same schema the Zarr Vectors convention publishes.
+
 Usage::
 
     python schema/regen.py            # regenerate artefacts in place
@@ -13,10 +18,7 @@ re-runs without ``--check`` and commits the result.
 from __future__ import annotations
 
 import argparse
-import json
-import os
 import re
-import shutil
 import sys
 import tempfile
 from pathlib import Path
@@ -39,15 +41,15 @@ DOC_OUT = SCHEMA_DIR / "reference.md"
 
 
 def _gen_json_schema(source: Path, out: Path) -> None:
-    """Render the LinkML schema as JSON Schema (Draft 2020-12)."""
-    from linkml.generators.jsonschemagen import JsonSchemaGenerator
-
-    gen = JsonSchemaGenerator(str(source))
-    rendered = gen.serialize()
-    # LinkML returns a string; round-trip through json to normalise
-    # whitespace so diffs aren't noisy.
-    parsed = json.loads(rendered)
-    out.write_text(json.dumps(parsed, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    """Render the LinkML schema as the convention's JSON Schema (Draft 2020-12)."""
+    sys.path.insert(0, str(SCHEMA_DIR))
+    try:
+        import build
+    finally:
+        sys.path.pop(0)
+    if build.SOURCE != source:
+        raise SystemExit(f"build.py reads {build.SOURCE}, not {source}")
+    out.write_text(build.build(), encoding="utf-8")
 
 
 def _gen_doc(source: Path, out: Path) -> None:

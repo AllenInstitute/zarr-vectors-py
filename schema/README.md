@@ -1,23 +1,27 @@
 # `schema/`: machine-readable reference
 
-A schema for the Zarr Vectors on-disk metadata, for tools that do not
-use the Python package. The source of truth is
-[`zarr_vectors/core/metadata.py`]; these files describe the same
-metadata in [LinkML] and JSON Schema. The normative on-disk definition of
-format 0.10.0 metadata is the JSON Schema of the
-[Zarr Vectors convention]; where the two disagree, the convention wins.
+The LinkML model and JSON Schema of the
+[Zarr Vectors convention] v0.1.0, the metadata of format 0.10.0, for
+tools that do not use the Python package. The model is maintained in
+[`convention/` of AllenInstitute/zarr_vectors][upstream], beside the
+format specification; this directory holds a copy. The convention
+repository publishes the same generated schema at its `schema_url`, and
+that published schema is the normative definition. The runtime source of
+truth for what this package writes is [`zarr_vectors/core/metadata.py`].
 
 | File | Status | Purpose |
 |---|---|---|
-| `zarr_vectors.linkml.yaml` | hand-edited | [LinkML] source. Edit this to change the schema. |
-| `zarr_vectors.schema.json` | generated | JSON Schema (Draft 2019-09), for downstream validators. |
-| `reference.md`             | generated | Markdown reference. |
-| `regen.py`                 | hand-edited | Runs the generators. |
+| `zarr_vectors.linkml.yaml` | copied | [LinkML] model of one node's `zarr.json`. Edit it upstream, not here. |
+| `build.py` | copied | The upstream generator; `regen.py` calls its `build()`. |
+| `zarr_vectors.schema.json` | generated | JSON Schema (Draft 2020-12): the convention's schema. |
+| `reference.md` | generated | Markdown reference. |
+| `regen.py` | hand-edited | Runs the generators. |
 
-## Regenerating
+## Updating
 
-From the repository root, with the `dev` extra installed
-(`pip install "zarr-vectors[dev]"`):
+When the model changes upstream, copy `convention/zarr_vectors.linkml.yaml`
+and `convention/build.py` here, then, from the repository root with the
+`dev` extra installed (`pip install "zarr-vectors[dev]"`):
 
 ```bash
 python schema/regen.py            # regenerate both files in place
@@ -26,51 +30,33 @@ python schema/regen.py --check    # exit 1 if the JSON Schema is stale
 
 `--check` compares only the JSON Schema, byte for byte; `reference.md`
 is not compared because its row order is not fixed. The test workflow
-runs `--check`. If it fails, run `regen.py` and commit the result.
+runs `--check`. The generator is pinned through `uv.lock` (LinkML
+1.12.1, as upstream), so the output matches upstream byte for byte.
+
+`tests/test_linkml_schema.py` checks that the generated schema equals the
+convention's published schema (the copy in `tests/data/` that
+`tests/test_convention_conformance.py` validates written stores
+against), that the metadata the writers emit validates against the class
+for its `kind`, and that the `VALID_*` constant sets match the schema
+enums.
 
 ## Coverage
 
-| Schema item | Source |
-|---|---|
-| `RootMetadata` | `RootMetadata`: the root's `zarr_vectors` object (`kind: "root"`), including `axes` |
-| `LevelMetadata` | `LevelMetadata`: each level's `zarr_vectors` object (`kind: "level"`), including `presence` |
-| 11 per-array classes (`VerticesMeta` to `LinkAttributeMeta`) | array and group metadata written by `zarr_vectors/core/arrays.py`, in the flat in-memory form; discriminator slot `zv_array` |
-| Enums | `zarr_vectors.constants` `VALID_*` sets and `CAP_*` tokens |
-
-The schema has no class for the `multiscales` block, `zarr_conventions`,
-`proj:projjson`, the RFC 8 `ome` node, or the parametric object registry
-(`ParametricTypeDef`); see
-[Root metadata](../docs/spec/layout/root_metadata.md) for those.
-
-The schema maps three items to outside vocabularies: `Axis` →
-`ngff:Axis` ([OME-Zarr NGFF] 0.4), `zv_version` → `schema:version` and
-`crs` → `schema:coordinateReferenceSystem` ([Schema.org]). `crs` is no
-longer a slot of `RootMetadata`: a CRS is the root attribute
-`proj:projjson`, outside the `zarr_vectors` object.
-
-## Stored form and schema form
-
-The schema models the object inside the `zarr_vectors` key. On disk an
-array's object carries `kind` and its fields; the per-array classes
-model the flat in-memory form instead, with the role in `zv_array` and
-the two renamed tags (`attribute` for `kind: "vertex_attribute"`,
-`groupings_attribute` for `kind: "group_attribute"`).
-`zarr_vectors.core.convention.unwrap_array_meta` converts stored
-attributes to that form. Two slots are shaped differently:
-
-| Slot | Stored | Schema |
-|---|---|---|
-| `bounds` | `[[min...], [max...]]` | `BoundingBox` with `min_corner`, `max_corner` |
-| `shard_shape` | an integer when every axis agrees | a list |
-
-`_to_linkml_logical_form` in `tests/test_linkml_schema.py` is the
-reference conversion.
+The schema validates a whole `zarr.json` (`#/$defs/ZarrNode`, the
+document root): the `zarr_conventions` registrations, the root's
+`multiscales` layout, and the `zarr_vectors` object, which must match
+exactly one kind class (`RootMetadata`, `LevelMetadata`,
+`VerticesMetadata`, `LinksMetadata`, …). Other attributes, such as
+`proj:projjson`, are allowed but not checked. `geometry_types` is a list
+of free strings, so a store with a newer geometry type still validates;
+`RootMetadata.validate` checks the names this package knows. Rules that
+span several nodes (axis counts, bin divisibility, the `parent_level`
+chain, link offsets) are not checked by the schema; see the convention
+README.
 
 ## Validating from other languages
 
-Every class is under `$defs`. To validate a root block, read
-`zarr_vectors` from the root `zarr.json` attributes, convert it as
-above, and validate against `#/$defs/RootMetadata`:
+Validate each node's `zarr.json` against the schema as it is:
 
 ```python
 import json
@@ -78,27 +64,15 @@ import json
 import jsonschema
 
 schema = json.load(open("schema/zarr_vectors.schema.json"))
-root = json.load(open("my_store.zarrvectors/zarr.json"))
-block = dict(root["attributes"]["zarr_vectors"])
-
-lo, hi = block["bounds"]
-block["bounds"] = {"min_corner": lo, "max_corner": hi}
-if isinstance(block.get("shard_shape"), int):
-    block["shard_shape"] = [block["shard_shape"]]
-
-jsonschema.validate(
-    block,
-    {"$schema": schema["$schema"], "$defs": schema["$defs"],
-     "$ref": "#/$defs/RootMetadata"},
-)
+node = json.load(open("my_store.zarrvectors/zarr.json"))
+jsonschema.Draft202012Validator(schema).validate(node)
 ```
 
-The schema `$id` is `https://w3id.org/zarr-vectors/schema/0.9`. It
-names the schema only: no code reads it, and the format version is
-`zv_version` in the root attributes.
+To check only a `zarr_vectors` object, validate it against its class,
+for example `{"$schema": schema["$schema"], "$defs": schema["$defs"],
+"$ref": "#/$defs/RootMetadata"}`.
 
 [LinkML]:                       https://linkml.io/
 [Zarr Vectors convention]:      https://github.com/Andrew-Keenlyside/zarr-vectors
-[OME-Zarr NGFF]:                https://ngff.openmicroscopy.org/
-[Schema.org]:                   https://schema.org/
+[upstream]:                     https://github.com/AllenInstitute/zarr_vectors/tree/main/convention
 [`zarr_vectors/core/metadata.py`]: ../zarr_vectors/core/metadata.py

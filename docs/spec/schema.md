@@ -6,21 +6,23 @@ are in the [`schema/` directory](https://github.com/AllenInstitute/zarr-vectors-
 
 | File | Content |
 |---|---|
-| `zarr_vectors.linkml.yaml` | The [LinkML](https://linkml.io/) source, edited by hand. |
+| `zarr_vectors.linkml.yaml` | The [LinkML](https://linkml.io/) model, copied from [`convention/` in AllenInstitute/zarr_vectors](https://github.com/AllenInstitute/zarr_vectors/tree/main/convention), where it is maintained. |
 | `zarr_vectors.schema.json` | JSON Schema generated from it. |
 | `reference.md` | Markdown reference generated from it. |
-| `README.md` | Coverage, how stored attributes map onto the schema, and how to regenerate it. |
+| `README.md` | Coverage, how to validate a node, and how to update the copy. |
 
-The schema models the contents of the `zarr_vectors` attribute on the
-root, on each level and on each array (discriminated by `kind`). It has
-no class for the `multiscales` block, `zarr_conventions`,
-`proj:projjson` or the `ome` node; see
-[Root metadata](layout/root_metadata.md) for those. The
+The generated JSON Schema is the schema the
 [Zarr Vectors convention](https://github.com/Andrew-Keenlyside/zarr-vectors)
-publishes its own JSON Schema for the same metadata; where the two
-disagree, the convention's schema wins.
+publishes. It validates one node's whole `zarr.json`: the convention
+registrations, the root's `multiscales` layout and the `zarr_vectors`
+object, which must match exactly one `kind`. It does not check rules
+that span several nodes, or `proj:projjson` and the `ome` node; see
+[Root metadata](layout/root_metadata.md) for those.
 
-The source of truth is the dataclasses in
+The source of truth for what the package writes is the dataclasses in
 `zarr_vectors/core/metadata.py`. `tests/test_linkml_schema.py` checks
-that written metadata validates against the JSON Schema. The test
-workflow runs `python schema/regen.py --check` to catch a stale schema.
+that written metadata validates against the JSON Schema and that the
+generated schema equals the convention's published one;
+`tests/test_convention_conformance.py` validates every node of stores the
+writers produce. The test workflow runs `python schema/regen.py --check`
+to catch a stale schema.
