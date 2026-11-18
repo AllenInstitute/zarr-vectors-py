@@ -98,7 +98,7 @@ def get_coordinate_offset(root, ndim: int) -> npt.NDArray[np.float64]:
 
 
 def set_coordinate_offset(root, offset: Sequence[float]) -> None:
-    """Record the stored→world coordinate offset + mirror to NGFF translation."""
+    """Record the stored→world coordinate offset in the root object."""
     attrs = root.attrs.to_dict()
     zv = dict(attrs.get("zarr_vectors", {}))
     zv[COORDINATE_OFFSET_KEY] = [float(x) for x in offset]
@@ -346,8 +346,8 @@ def init_skeleton_store(
     ``coordinate_offset`` (optional) is the world position of the stored
     coordinate origin: stored vertices are expected to be
     ``world - coordinate_offset`` so the spec's origin-0 chunk grid
-    aligns to the source grid.  It is recorded in metadata and mirrored
-    to the NGFF ``translation`` transform.
+    aligns to the source grid.  It is recorded in the root
+    ``zarr_vectors.coordinate_offset``.
 
     ``shard_shape`` (optional, in units of spatial chunks) wraps each
     per-chunk array's cells in Zarr v3's ``sharding_indexed`` codec, so

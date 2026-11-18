@@ -33,10 +33,10 @@ changes, so 0.9.x stores migrate in place with
 * The bare-root OME-NGFF 0.4 ``multiscales`` list -- which pointed
   ``datasets`` at groups and reused ``scale`` / ``translation`` for bin
   geometry -- is replaced by the registered multiscales convention's
-  ``{"layout": [{"asset": "<level>", ...}]}``.  Each entry carries the
-  level's bin geometry as ``zarr_vectors:bin_ratio`` and
-  ``zarr_vectors:bin_shape`` and no ``transform``: vertex coordinates are
-  the same at every level, so there is no coordinate transform to state.
+  ``{"layout": [{"asset": "<level>"}]}``, with no ``transform``: vertex
+  coordinates are the same at every level, so there is no coordinate
+  transform to state.  A coarse level's ``bin_shape`` and ``bin_ratio``
+  live only in its own ``zarr_vectors`` object.
 * ``crs`` leaves the root object for the proj convention's
   ``proj:projjson``.
 
@@ -82,7 +82,8 @@ Also in 0.9.3, both additive in the same sense:
   reader that looks for ``name`` finds it unchanged.
 * A per-chunk array may omit ``nonempty_chunks``, meaning presence is
   not recorded and a reader takes it from the store.  That happens only
-  while a level declares ``zarr_vectors_presence: "deferred"`` -- a
+  while a level declares presence ``"deferred"`` (from 0.10.0 the
+  level object's ``presence`` field) -- a
   build-time state that the coordinator's rebuild ends, restoring every
   manifest -- so a finished store is readable by a 0.9.2 reader.  One
   caught mid-build is not: that reader treats the missing manifest as an

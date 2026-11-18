@@ -36,7 +36,6 @@ from zarr_vectors.constants import (  # noqa: E402
 from zarr_vectors.core.metadata import LevelMetadata, RootMetadata  # noqa: E402
 from zarr_vectors.exceptions import MetadataError  # noqa: E402
 
-
 SCHEMA_PATH = Path(__file__).resolve().parents[1] / "schema" / "zarr_vectors.schema.json"
 
 

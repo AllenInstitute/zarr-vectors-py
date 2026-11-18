@@ -72,6 +72,7 @@ from zarr_vectors.constants import (
     XLEVEL_EXPLICIT,
     XLEVEL_NONE,
 )
+from zarr_vectors.core import convention as _zvc
 from zarr_vectors.core import dense_manifests as dense
 from zarr_vectors.core._batch_writer import _stamp_presence
 from zarr_vectors.core.arrays import (
@@ -316,7 +317,6 @@ from zarr_vectors.types.skeletons import (
     write_skeleton_chunk,
     write_skeleton_cross_chunk_links,
 )
-from zarr_vectors.core import convention as _zvc
 
 from .mesh_reader import MeshChunkInfo, MeshReader
 

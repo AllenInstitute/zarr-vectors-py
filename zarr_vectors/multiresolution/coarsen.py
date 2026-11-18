@@ -16,7 +16,6 @@ between objects, and per-object OIDs are preserved across levels.
 from __future__ import annotations
 
 import copy
-
 from contextlib import contextmanager, nullcontext
 from pathlib import Path
 from typing import TYPE_CHECKING, Any

@@ -78,12 +78,6 @@ PROJ_CMO: dict[str, str] = {
 #: Root attribute holding a CRS, from the proj convention.
 PROJ_PROJJSON_KEY = "proj:projjson"
 
-#: Keys on a ``multiscales.layout`` entry carrying a level's bin geometry.
-#: The convention keeps them prefixed because they extend another
-#: convention's object.
-LAYOUT_BIN_RATIO_KEY = "zarr_vectors:bin_ratio"
-LAYOUT_BIN_SHAPE_KEY = "zarr_vectors:bin_shape"
-
 # In-memory ``zv_array`` tag -> on-disk ``kind``.  Two tags are renamed;
 # every other tag is its own kind.
 _TAG_TO_KIND: dict[str, str] = {

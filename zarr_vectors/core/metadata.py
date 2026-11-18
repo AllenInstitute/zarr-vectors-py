@@ -383,6 +383,8 @@ def check_root_layout(zv: Any) -> None:
         raise MetadataError(
             f"expected the store root, found a 'zarr_vectors' object of kind {kind!r}"
         )
+    if version != "?" and not _version_tuple(version):
+        raise MetadataError(f"zv_version {version!r} is not a valid X.Y[.Z] string")
     # A newer format may have moved anything; refuse it here.  An older
     # version string on a 0.10.0-layout root is malformed rather than
     # unreadable, and :meth:`RootMetadata.validate` reports it.
@@ -409,10 +411,8 @@ class RootMetadata:
             ``format_version`` in 0.5.0 to disambiguate from Zarr v3's
             ``zarr_format`` field).
         spatial_index_dims: Axes definitions (NGFF / OME-Zarr style).
-            On disk, axes live in ``multiscales[0].axes`` (NGFF) and
-            are NOT duplicated under the ``zarr_vectors`` namespace as
-            of 0.5.0.  This Python attribute remains the canonical
-            in-memory accessor.
+            On disk (format 0.10.0), axes live in the root
+            ``zarr_vectors.axes``.
         chunk_shape: Spatial chunk size per dimension.
         bounds: Global bounding box as ``(min_corner, max_corner)``.
         geometry_types: List of geometry types in the store.
@@ -558,13 +558,10 @@ class RootMetadata:
         if (major, minor, patch) < (0, 10, 0):
             raise MetadataError(
                 f"store zv_version is {self.zv_version}; this build "
-                f"requires {FORMAT_VERSION} — no backwards-compat shim. "
-                f"Pre-0.9.0 stores wrote each per-spatial-chunk array "
-                f"(vertices, fragments, links, attribute arrays) as a Zarr "
-                f"group of single-chunk ``uint8`` sub-arrays, one per chunk "
-                f"key; 0.9.0 collapses each to a single vlen-bytes Zarr "
-                f"array whose cells are spatial chunks — the old layout "
-                f"cannot be read.  Rewrite from source."
+                f"reads {FORMAT_VERSION}.  A 0.9.x store migrates in place "
+                f"with zarr_vectors.building.migrate_metadata_0_10(path); "
+                f"an older store cannot be read and must be rewritten "
+                f"from source."
             )
 
         if self.cross_level_storage not in VALID_XLEVEL_STORAGE:
@@ -674,10 +671,8 @@ class RootMetadata:
     def to_dict(self) -> dict[str, Any]:
         """Serialise to a JSON-compatible dict.
 
-        Returns the **non-axis** fields only — under 0.5.0 axes live in
-        the NGFF ``multiscales[0].axes`` block, written separately by
-        :func:`zarr_vectors.core.multiscale.write_multiscale_metadata`.
-        Combine the two when writing root attrs.
+        Returns the **non-axis** fields only; :func:`_write_root_attrs`
+        adds ``axes`` (and ``kind``) to the root object.
 
         ``format_capabilities`` (possibly empty) is always written; ``crs``
         and the other optional keys only when they carry a value.
@@ -733,11 +728,10 @@ class RootMetadata:
 
         Args:
             d: The full root-attrs dict — must contain a
-                ``"zarr_vectors"`` key for ZV-specific fields and
-                (when ``strict``) a top-level ``"multiscales"`` key
-                holding the NGFF axes.
+                ``"zarr_vectors"`` key for ZV-specific fields, axes
+                included.
             strict: When True (default), every structural field
-                (axes via ``multiscales[0].axes``, ``chunk_shape``,
+                (``axes``, ``chunk_shape``,
                 ``bounds``, ``geometry_types``) must be present.  When
                 False, missing structural fields fall through as
                 ``None``/``[]`` so a freshly-warmed store can

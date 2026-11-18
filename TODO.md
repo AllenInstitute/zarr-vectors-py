@@ -12,6 +12,30 @@ decided. Grouped by when it should land.
 
 ## Before the next release
 
+**Publish the convention where the stores point.** Format 0.10.0 stamps
+every root with the convention's `schema_url` and `spec_url`
+(`core/convention.py`, `CONVENTION_CMO`):
+`github.com/AllenInstitute/zarr-vectors-convention`, tag `v0.1.0`. That
+repository does not exist yet; the convention is on the `schema-fixes`
+branch of `Andrew-Keenlyside/zarr-vectors`. Every store written keeps
+these URLs, so create the repository and tag (or change the URLs) before
+releasing 0.10.0. Its README also still says 0.10.0's cells match 0.9.2
+(they match 0.9.4) and that format versions have no in-place migration.
+
+**The LinkML schema still describes 0.9.** `schema/zarr_vectors.linkml.yaml`
+keeps the id `.../schema/0.9`, models array metadata in the flat
+in-memory `zv_array` shape rather than the 0.10.0 `zarr_vectors` object,
+keeps a `crs` slot the root no longer has, and tags `groupings/` as
+`groupings` where the writers stamp `groups`. On-disk conformance is
+checked against the convention's JSON Schema
+(`tests/test_convention_conformance.py`); bring the LinkML in line, or
+generate it from the convention.
+
+**Format 0.10.0 is a cut-over for BRIDGE.** 0.9.x packages refuse 0.10.0
+stores, and 0.10.0 refuses 0.9.x stores until
+`building.migrate_metadata_0_10` has run on them. Move BRIDGE's pinned
+zarr-vectors to 0.10.0 first, then migrate its stores.
+
 **Publish zarr-octree to PyPI, then declare it.** zarr-octree is not on
 PyPI, so it is not a dependency or an extra: users get a git URL from an
 error message, and CI installs it from a pinned commit
