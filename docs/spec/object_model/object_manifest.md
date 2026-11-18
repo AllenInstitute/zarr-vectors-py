@@ -41,7 +41,8 @@ independently. Links between vertices are stored separately
 | `vlen_manifests_v1` | `manifests` | object `k` |
 | `dense_manifests_v1` | `manifest_spans`, `manifest_blocks`, `object_ids` | id `object_ids[k]` |
 
-A reader dispatches on the `layout` attribute of `object_index/`. A
+A reader dispatches on the `layout` key of the `zarr_vectors` object of
+`object_index/`. A
 missing or unknown `layout` raises `ArrayError`.
 
 The dense layout is new in 0.9.4; a 0.9.3 reader rejects it by its
@@ -74,18 +75,23 @@ manifest:
 
 ```json
 {
-  "zv_array": "object_index",
-  "num_objects": 3,
-  "num_present": 2,
-  "sid_ndim": 3,
-  "layout": "vlen_manifests_v2",
-  "object_ids_sorted": true
+  "zarr_conventions": [{"uuid": "66268a61-7833-4995-bbcb-233bb417dae5"}],
+  "zarr_vectors": {
+    "kind": "object_index",
+    "num_objects": 3,
+    "num_present": 2,
+    "sid_ndim": 3,
+    "layout": "vlen_manifests_v2",
+    "object_ids_sorted": true
+  }
 }
 ```
 
+Keys of the `zarr_vectors` object:
+
 | Key | Meaning |
 |-----|---------|
-| `zv_array` | `"object_index"` |
+| `kind` | `"object_index"` |
 | `layout` | One of the layouts above |
 | `sid_ndim` | Number of chunk coordinates in a block |
 | `num_objects` | Number of object rows |

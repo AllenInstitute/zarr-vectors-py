@@ -38,7 +38,7 @@ straight to a pull request. If unsure, open an issue and ask.
 | Changing an array's data type, shape, cell encoding or meaning | New ingest or export formats |
 | Adding a geometry type (see [Adding a geometry type](adding_geometry_types.md)) | New API functions |
 | Adding or changing a validation rule, or anything that changes the validator's result on an existing store | Performance work that leaves the stored bytes unchanged |
-| Changing the `multiscales` block or the `ome` node | Documentation |
+| Changing the `multiscales` block, the `zarr_conventions` registrations or the `ome` node | Documentation |
 
 ### Process
 
@@ -63,7 +63,7 @@ The implementation pull request updates:
 - the code under `zarr_vectors/`;
 - `FORMAT_VERSION` in `zarr_vectors/constants.py` (written to
   `zv_version` in the root attributes), with a note in its docstring,
-  and the test that pins it (`test_format_version_is_0_9_4` in
+  and the test that pins it (`test_format_version_is_0_10_0` in
   `tests/test_linkml_schema.py`). The docstring is the format history;
   there is no changelog file;
 - the validator in `zarr_vectors/validate/`, when a rule changes;
@@ -83,13 +83,20 @@ differs from `FORMAT_VERSION`.
 ### Breaking changes and capabilities
 
 `RootMetadata.validate` (`zarr_vectors/core/metadata.py`) raises
-`MetadataError` for a store whose `zv_version` is older than `0.9.0`,
-the oldest layout this package reads. A breaking change moves that
-bound, ships no compatibility shim, and its RFC must say how users
-rewrite their stores. There is no migrate command. An additive change
-should offer an in-place upgrade where it can, as
+`MetadataError` for a store whose `zv_version` is older than `0.10.0`,
+the oldest layout this package reads, and reading a 0.9.x root raises
+`UnsupportedFormatVersionError`. A breaking change moves that bound and
+its RFC must say how users rewrite their stores. When only metadata
+moves, ship an in-place migration, as
+`zarr_vectors.building.migrate_metadata_0_10` does for 0.9.x stores (see
+[Root metadata](../layout/root_metadata.md#migrating-from-09x)). An
+additive change should offer an in-place upgrade where it can, as
 `zarr_vectors.building.stamp_ome_node` adds the 0.9.2 `ome` node without
 rewriting data.
+
+A change to the metadata layout also changes the
+[Zarr Vectors convention](https://github.com/AllenInstitute/zarr-vectors-convention),
+which lists the format versions each convention version covers.
 
 A change that only some readers can handle can be a format capability
 instead. The store lists it in `format_capabilities`, and also in

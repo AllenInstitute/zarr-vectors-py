@@ -11,11 +11,14 @@ are in the [`schema/` directory](https://github.com/AllenInstitute/zarr-vectors-
 | `reference.md` | Markdown reference generated from it. |
 | `README.md` | Coverage, how stored attributes map onto the schema, and how to regenerate it. |
 
-The schema models the payload of the root `zarr_vectors` attribute, of
-each level's `zarr_vectors_level` attribute and of each array's
-attributes (discriminated by `zv_array`). It has no class for the NGFF
-`multiscales` block or the `ome` node; see
-[Root metadata](layout/root_metadata.md) for those.
+The schema models the contents of the `zarr_vectors` attribute on the
+root, on each level and on each array (discriminated by `kind`). It has
+no class for the `multiscales` block, `zarr_conventions`,
+`proj:projjson` or the `ome` node; see
+[Root metadata](layout/root_metadata.md) for those. The
+[Zarr Vectors convention](https://github.com/AllenInstitute/zarr-vectors-convention)
+publishes its own JSON Schema for the same metadata; where the two
+disagree, the convention's schema wins.
 
 The source of truth is the dataclasses in
 `zarr_vectors/core/metadata.py`. `tests/test_linkml_schema.py` checks

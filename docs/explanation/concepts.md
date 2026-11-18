@@ -30,14 +30,18 @@ directly.
 A **store** is a Zarr v3 group: a directory on disk or a prefix in cloud
 object storage. By convention its name ends in `.zarrvectors`. The root
 `zarr.json` holds the format's metadata in its attributes:
-`attributes.zarr_vectors` for store-level fields and `attributes.multiscales`
-for the pyramid.
+`attributes.zarr_vectors` for store-level fields, including the axes, and
+`attributes.multiscales` listing the pyramid's levels. Every node with
+Zarr Vectors metadata keeps it in one `zarr_vectors` attribute whose `kind`
+says what the node is (`root`, `level`, `vertices`, …), and registers the
+[Zarr Vectors convention](https://github.com/AllenInstitute/zarr-vectors-convention)
+in `zarr_conventions`.
 
 ```
 scan.zarrvectors/
-├── zarr.json              root attributes: zarr_vectors, multiscales
+├── zarr.json              root attributes: zarr_vectors, multiscales, ome
 ├── 0/                     level 0, full resolution
-│   ├── zarr.json          level attributes: zarr_vectors_level
+│   ├── zarr.json          level attributes: zarr_vectors (kind "level")
 │   ├── vertices/          vertex positions, one cell per occupied chunk
 │   ├── vertex_fragments/  fragment index into vertices/
 │   ├── vertex_attributes/ one array per attribute name
@@ -158,20 +162,18 @@ no `vertex_attributes`, `groups`, `group_attributes`, `link_attributes` or
 `link_fragments`. See
 [Building pyramids](../tutorials/multiscale/building_pyramids.md).
 
-## OME-Zarr multiscale metadata
+## Multiscale metadata
 
 The root `attributes.multiscales` block follows the
-[OME-Zarr NGFF specification](https://ngff.openmicroscopy.org/), version 0.4,
-so OME-Zarr viewers can find the levels. It has one `datasets` entry per
-level. Every level stores its vertices in level-0 coordinates, so every entry
-carries level 0's transform: `scale` 1 and a `translation` of half the level-0
-bin shape. Zarr Vectors marks the block with
-`multiscales[0].metadata.format == "zarr_vectors"`.
+[multiscales convention](https://github.com/zarr-conventions/multiscales),
+so tools that know it can find the levels:
+`{"layout": [{"asset": "0"}, {"asset": "1"}, ...]}`. Every level stores its
+vertices in level-0 coordinates, so the block has no transform.
 
-Format-specific fields stay outside this block: `bounds`, `chunk_shape` and
-`base_bin_shape` in `attributes.zarr_vectors`, and `vertex_count`,
-`bin_shape`, `bin_ratio`, `object_sparsity` and others in each level's
-`attributes.zarr_vectors_level`.
+Format-specific fields stay outside this block: `axes`, `bounds`,
+`chunk_shape` and `base_bin_shape` in the root `attributes.zarr_vectors`,
+and `vertex_count`, `bin_shape`, `bin_ratio`, `object_sparsity` and others
+in each level's `attributes.zarr_vectors`.
 
 ## Geometry types
 
@@ -193,9 +195,9 @@ chunked layout. Types other than point clouds also have `object_index/` and
 
 Coordinates are stored as given, and chunk and bin shapes use the same
 units. The schema's `axes` (for example `zv.Axis("x", unit="micrometer")`)
-name the axes and units in the `multiscales` block, so NGFF tools show the
-data at the right physical scale. An optional coordinate reference system,
-`crs` in `attributes.zarr_vectors`, is written with
+name the axes and units in the root `zarr_vectors.axes` and in the `ome`
+node. An optional coordinate reference system, a PROJJSON object in the
+root attribute `proj:projjson`, is written with
 `zarr_vectors.building.create_store(..., crs=...)`; `Schema` does not take
 one.
 

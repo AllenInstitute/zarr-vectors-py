@@ -36,17 +36,20 @@ Each object attribute is a plain Zarr array:
 | Shape | `[num_objects]`, or `[num_objects, K]` for `K` columns |
 | Chunk shape | `[65536]`, or `[65536, K]` |
 | `fill_value` | The absent sentinel (see below) |
-| Attributes | `zv_array: "object_attribute"`, `name`, `dtype`, `shape`, `fill_sentinel_meaning: "absent"` |
+| `zarr_vectors` keys | `kind: "object_attribute"`, `name`, `dtype`, `shape`, `fill_sentinel_meaning: "absent"` |
 
-A `float32` attribute of five objects:
+The attributes of a `float32` attribute of five objects:
 
 ```json
 {
-  "zv_array": "object_attribute",
-  "name": "mean_fa",
-  "dtype": "float32",
-  "shape": [5],
-  "fill_sentinel_meaning": "absent"
+  "zarr_conventions": [{"uuid": "66268a61-7833-4995-bbcb-233bb417dae5"}],
+  "zarr_vectors": {
+    "kind": "object_attribute",
+    "name": "mean_fa",
+    "dtype": "float32",
+    "shape": [5],
+    "fill_sentinel_meaning": "absent"
+  }
 }
 ```
 
@@ -120,10 +123,10 @@ absent (see [Object sparsity](../multiscale/sparsity.md)).
 
 ### Groups and group attributes
 
-| Array | Shape | Contents | Attributes |
+| Array | Shape | Contents | `zarr_vectors` keys |
 |-------|-------|----------|------------|
-| `groups` | `[num_groups]`, `variable_length_bytes` | cell `g`: group `g`'s object ids as `int64` | `zv_array: "groups"`, `num_groups`, optional `group_ranges` |
-| `group_attributes/<name>` | `[num_groups]` | one value per group | `zv_array: "groupings_attribute"`, `name`, `dtype`, `shape` |
+| `groups` | `[num_groups]`, `variable_length_bytes` | cell `g`: group `g`'s object ids as `int64` | `kind: "groups"`, `num_groups`, optional `group_ranges` |
+| `group_attributes/<name>` | `[num_groups]` | one value per group | `kind: "group_attribute"` (in-memory tag `groupings_attribute`), `name`, `dtype`, `shape` |
 
 Group ids run from `0` with no gaps; a missing id is an empty group. A
 group given as a `range` (step 1) is stored as `[start, stop)` under its

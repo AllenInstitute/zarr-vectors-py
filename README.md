@@ -19,6 +19,17 @@ Requires Python 3.11 or later. File-format converters (LAS, PLY, TRK, SWC,
 OBJ, ...) and their command-line tool are in the companion package
 `zarr-vectors-tools`; this package installs no console scripts.
 
+Stores are written in format 0.10.0, whose metadata follows the
+[Zarr Vectors convention](https://github.com/AllenInstitute/zarr-vectors-convention).
+A store written by 0.9.x is refused until you migrate it in place; only
+its metadata is rewritten:
+
+```python
+from zarr_vectors.building import migrate_metadata_0_10
+
+migrate_metadata_0_10("my_store.zarrvectors")
+```
+
 ## Documentation
 
 Full documentation: https://zarr-vectors-py.readthedocs.io/en/latest

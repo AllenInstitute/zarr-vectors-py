@@ -91,8 +91,8 @@ codec whose inner chunk is one cell:
 
 Shard objects sit at `0/vertices/c/<i>/<j>/<k>`, indexed by shard: this
 array has `ceil(5 / 4)³ = 8` shard objects in place of 125 cell objects.
-Array attributes (`nonempty_chunks`, `chunk_grid_origin`, `zv_array`) are
-kept, so listing a level's chunks reads no shard index.
+The array's `zarr_vectors` object (`kind`, `nonempty_chunks`,
+`chunk_grid_origin`, …) is kept, so listing a level's chunks reads no shard index.
 
 ### Octree shards
 

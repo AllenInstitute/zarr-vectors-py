@@ -10,8 +10,8 @@ array. You then decode fragments, manifests and links yourself, so use
 
 ### How does Zarr Vectors relate to OME-Zarr?
 
-It uses the OME-Zarr `multiscales` metadata, so OME-Zarr viewers can find its
-levels. OME-Zarr is for dense images; Zarr Vectors is for sparse geometry. See
+Its root carries an OME-Zarr RFC 8 `ome` node, so an OME collection can name
+the store, but no NGFF `multiscales` image metadata. OME-Zarr is for dense images; Zarr Vectors is for sparse geometry. See
 [Zarr Vectors and OME-Zarr](comparisons/ome_zarr.md).
 
 ### Is the `.zarrvectors` extension required?
