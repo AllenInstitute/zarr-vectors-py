@@ -875,7 +875,7 @@ URI: [xsd:boolean](http://www.w3.org/2001/XMLSchema#boolean)
 | Mapping Type | Mapped Value |
 | ---  | ---  |
 | self | xsd:boolean |
-| native | zv:Boolean |
+| native | zv:boolean |
 | exact | schema:Boolean |
 
 
@@ -1519,7 +1519,7 @@ URI: [xsd:string](http://www.w3.org/2001/XMLSchema#string)
 | Mapping Type | Mapped Value |
 | ---  | ---  |
 | self | xsd:string |
-| native | zv:Curie |
+| native | zv:curie |
 
 
 
@@ -1584,7 +1584,7 @@ URI: [xsd:date](http://www.w3.org/2001/XMLSchema#date)
 | Mapping Type | Mapped Value |
 | ---  | ---  |
 | self | xsd:date |
-| native | zv:Date |
+| native | zv:date |
 | exact | schema:Date |
 
 
@@ -1649,7 +1649,7 @@ URI: [linkml:DateOrDatetime](https://w3id.org/linkml/DateOrDatetime)
 | Mapping Type | Mapped Value |
 | ---  | ---  |
 | self | linkml:DateOrDatetime |
-| native | zv:DateOrDatetime |
+| native | zv:date_or_datetime |
 
 
 
@@ -1713,7 +1713,7 @@ URI: [xsd:dateTime](http://www.w3.org/2001/XMLSchema#dateTime)
 | Mapping Type | Mapped Value |
 | ---  | ---  |
 | self | xsd:dateTime |
-| native | zv:Datetime |
+| native | zv:datetime |
 | exact | schema:DateTime |
 
 
@@ -1777,7 +1777,7 @@ URI: [xsd:decimal](http://www.w3.org/2001/XMLSchema#decimal)
 | Mapping Type | Mapped Value |
 | ---  | ---  |
 | self | xsd:decimal |
-| native | zv:Decimal |
+| native | zv:decimal |
 | broad | schema:Number |
 
 
@@ -1841,7 +1841,7 @@ URI: [xsd:double](http://www.w3.org/2001/XMLSchema#double)
 | Mapping Type | Mapped Value |
 | ---  | ---  |
 | self | xsd:double |
-| native | zv:Double |
+| native | zv:double |
 | close | schema:Float |
 
 
@@ -1988,7 +1988,7 @@ URI: [xsd:float](http://www.w3.org/2001/XMLSchema#float)
 | Mapping Type | Mapped Value |
 | ---  | ---  |
 | self | xsd:float |
-| native | zv:Float |
+| native | zv:float |
 | exact | schema:Float |
 
 
@@ -2889,7 +2889,7 @@ URI: [xsd:integer](http://www.w3.org/2001/XMLSchema#integer)
 | Mapping Type | Mapped Value |
 | ---  | ---  |
 | self | xsd:integer |
-| native | zv:Integer |
+| native | zv:integer |
 | exact | schema:Integer |
 
 
@@ -2954,7 +2954,7 @@ URI: [xsd:string](http://www.w3.org/2001/XMLSchema#string)
 | Mapping Type | Mapped Value |
 | ---  | ---  |
 | self | xsd:string |
-| native | zv:Jsonpath |
+| native | zv:jsonpath |
 
 
 
@@ -3018,7 +3018,7 @@ URI: [xsd:string](http://www.w3.org/2001/XMLSchema#string)
 | Mapping Type | Mapped Value |
 | ---  | ---  |
 | self | xsd:string |
-| native | zv:Jsonpointer |
+| native | zv:jsonpointer |
 
 
 
@@ -5004,7 +5004,7 @@ URI: [xsd:string](http://www.w3.org/2001/XMLSchema#string)
 | Mapping Type | Mapped Value |
 | ---  | ---  |
 | self | xsd:string |
-| native | zv:Ncname |
+| native | zv:ncname |
 
 
 
@@ -5068,7 +5068,7 @@ URI: [shex:nonLiteral](http://www.w3.org/ns/shex#nonLiteral)
 | Mapping Type | Mapped Value |
 | ---  | ---  |
 | self | shex:nonLiteral |
-| native | zv:Nodeidentifier |
+| native | zv:nodeidentifier |
 
 
 
@@ -5743,7 +5743,7 @@ URI: [shex:iri](http://www.w3.org/ns/shex#iri)
 | Mapping Type | Mapped Value |
 | ---  | ---  |
 | self | shex:iri |
-| native | zv:Objectidentifier |
+| native | zv:objectidentifier |
 
 
 
@@ -6359,7 +6359,7 @@ URI: [xsd:string](http://www.w3.org/2001/XMLSchema#string)
 | Mapping Type | Mapped Value |
 | ---  | ---  |
 | self | xsd:string |
-| native | zv:Sparqlpath |
+| native | zv:sparqlpath |
 
 
 
@@ -6422,7 +6422,7 @@ URI: [xsd:string](http://www.w3.org/2001/XMLSchema#string)
 | Mapping Type | Mapped Value |
 | ---  | ---  |
 | self | xsd:string |
-| native | zv:String |
+| native | zv:string |
 | exact | schema:Text |
 
 
@@ -6488,7 +6488,7 @@ URI: [xsd:time](http://www.w3.org/2001/XMLSchema#time)
 | Mapping Type | Mapped Value |
 | ---  | ---  |
 | self | xsd:time |
-| native | zv:Time |
+| native | zv:time |
 | exact | schema:Time |
 
 
@@ -6557,7 +6557,7 @@ URI: [xsd:anyURI](http://www.w3.org/2001/XMLSchema#anyURI)
 | Mapping Type | Mapped Value |
 | ---  | ---  |
 | self | xsd:anyURI |
-| native | zv:Uri |
+| native | zv:uri |
 | close | schema:URL |
 
 
@@ -6622,7 +6622,7 @@ URI: [xsd:anyURI](http://www.w3.org/2001/XMLSchema#anyURI)
 | Mapping Type | Mapped Value |
 | ---  | ---  |
 | self | xsd:anyURI |
-| native | zv:Uriorcurie |
+| native | zv:uriorcurie |
 
 
 
@@ -7025,14 +7025,13 @@ URI: [zv:arrays_present](https://w3id.org/zarr-vectors/schema/0.9/arrays_present
 | --- | --- |
 | Range | [String](String.md) |
 | Domain Of | [LevelMetadata](LevelMetadata.md) |
+
 ### Cardinality and Requirements
 
 | Property | Value |
 | --- | --- |
 | Required | Yes |
 | Multivalued | Yes |
-
-
 
 
 
@@ -7131,6 +7130,11 @@ URI: [zv:attribute_specs](https://w3id.org/zarr-vectors/schema/0.9/attribute_spe
 | --- | --- |
 | Range | [AttributeSpecs](AttributeSpecs.md) |
 | Domain Of | [RootMetadata](RootMetadata.md) |
+
+### Cardinality and Requirements
+
+| Property | Value |
+| --- | --- |
 
 
 
@@ -7236,13 +7240,12 @@ URI: [zv:axes](https://w3id.org/zarr-vectors/schema/0.9/axes)
 | --- | --- |
 | Range | [Axis](Axis.md) |
 | Domain Of | [RootMetadata](RootMetadata.md) |
+
 ### Cardinality and Requirements
 
 | Property | Value |
 | --- | --- |
 | Multivalued | Yes |
-
-
 
 
 
@@ -7345,13 +7348,12 @@ URI: [zv:base_bin_shape](https://w3id.org/zarr-vectors/schema/0.9/base_bin_shape
 | --- | --- |
 | Range | [Float](Float.md) |
 | Domain Of | [RootMetadata](RootMetadata.md) |
+
 ### Cardinality and Requirements
 
 | Property | Value |
 | --- | --- |
 | Multivalued | Yes |
-
-
 
 
 
@@ -7451,13 +7453,12 @@ URI: [zv:bin_ratio](https://w3id.org/zarr-vectors/schema/0.9/bin_ratio)
 | --- | --- |
 | Range | [Integer](Integer.md) |
 | Domain Of | [LevelMetadata](LevelMetadata.md) |
+
 ### Cardinality and Requirements
 
 | Property | Value |
 | --- | --- |
 | Multivalued | Yes |
-
-
 
 
 
@@ -7555,13 +7556,12 @@ URI: [zv:bin_shape](https://w3id.org/zarr-vectors/schema/0.9/bin_shape)
 | --- | --- |
 | Range | [Float](Float.md) |
 | Domain Of | [LevelMetadata](LevelMetadata.md) |
+
 ### Cardinality and Requirements
 
 | Property | Value |
 | --- | --- |
 | Multivalued | Yes |
-
-
 
 
 
@@ -7660,13 +7660,12 @@ URI: [zv:bounds](https://w3id.org/zarr-vectors/schema/0.9/bounds)
 | --- | --- |
 | Range | [BoundingBox](BoundingBox.md) |
 | Domain Of | [RootMetadata](RootMetadata.md) |
+
 ### Cardinality and Requirements
 
 | Property | Value |
 | --- | --- |
 | Required | Yes |
-
-
 
 
 
@@ -7763,13 +7762,12 @@ URI: [zv:channel_names](https://w3id.org/zarr-vectors/schema/0.9/channel_names)
 | --- | --- |
 | Range | [String](String.md) |
 | Domain Of | [AttributeMeta](AttributeMeta.md), [FragmentAttributeMeta](FragmentAttributeMeta.md) |
+
 ### Cardinality and Requirements
 
 | Property | Value |
 | --- | --- |
 | Multivalued | Yes |
-
-
 
 
 
@@ -7867,6 +7865,11 @@ URI: [zv:chunk_attribute_name](https://w3id.org/zarr-vectors/schema/0.9/chunk_at
 | Range | [String](String.md) |
 | Domain Of | [LevelMetadata](LevelMetadata.md) |
 
+### Cardinality and Requirements
+
+| Property | Value |
+| --- | --- |
+
 
 
 
@@ -7962,13 +7965,12 @@ URI: [zv:chunk_attribute_values](https://w3id.org/zarr-vectors/schema/0.9/chunk_
 | --- | --- |
 | Range | [BinLabel](BinLabel.md)&nbsp;or&nbsp;<br />[String](String.md)&nbsp;or&nbsp;<br />[Integer](Integer.md)&nbsp;or&nbsp;<br />[Float](Float.md) |
 | Domain Of | [LevelMetadata](LevelMetadata.md) |
+
 ### Cardinality and Requirements
 
 | Property | Value |
 | --- | --- |
 | Multivalued | Yes |
-
-
 <details>
 <summary>Expressions & Logic</summary>
 #### Any Of
@@ -8088,13 +8090,12 @@ URI: [zv:chunk_dims](https://w3id.org/zarr-vectors/schema/0.9/chunk_dims)
 | --- | --- |
 | Range | [String](String.md) |
 | Domain Of | [LevelMetadata](LevelMetadata.md) |
+
 ### Cardinality and Requirements
 
 | Property | Value |
 | --- | --- |
 | Multivalued | Yes |
-
-
 
 
 
@@ -8194,14 +8195,13 @@ URI: [zv:chunk_shape](https://w3id.org/zarr-vectors/schema/0.9/chunk_shape)
 | --- | --- |
 | Range | [Float](Float.md) |
 | Domain Of | [RootMetadata](RootMetadata.md), [LevelMetadata](LevelMetadata.md) |
+
 ### Cardinality and Requirements
 
 | Property | Value |
 | --- | --- |
 | Required | Yes |
 | Multivalued | Yes |
-
-
 
 
 
@@ -8300,6 +8300,11 @@ URI: [zv:coarsening_method](https://w3id.org/zarr-vectors/schema/0.9/coarsening_
 | Range | [String](String.md) |
 | Domain Of | [LevelMetadata](LevelMetadata.md) |
 
+### Cardinality and Requirements
+
+| Property | Value |
+| --- | --- |
+
 
 
 
@@ -8388,6 +8393,11 @@ URI: [zv:cross_chunk_strategy](https://w3id.org/zarr-vectors/schema/0.9/cross_ch
 | --- | --- |
 | Range | [CrossChunkStrategy](CrossChunkStrategy.md) |
 | Domain Of | [RootMetadata](RootMetadata.md) |
+
+### Cardinality and Requirements
+
+| Property | Value |
+| --- | --- |
 
 
 
@@ -8483,6 +8493,11 @@ URI: [zv:cross_level_depth](https://w3id.org/zarr-vectors/schema/0.9/cross_level
 | --- | --- |
 | Range | [Integer](Integer.md) |
 | Domain Of | [RootMetadata](RootMetadata.md) |
+
+### Cardinality and Requirements
+
+| Property | Value |
+| --- | --- |
 ### Value Constraints
 
 | Property | Value |
@@ -8593,6 +8608,11 @@ URI: [zv:cross_level_storage](https://w3id.org/zarr-vectors/schema/0.9/cross_lev
 | Range | [CrossLevelStorage](CrossLevelStorage.md) |
 | Domain Of | [RootMetadata](RootMetadata.md) |
 
+### Cardinality and Requirements
+
+| Property | Value |
+| --- | --- |
+
 
 
 
@@ -8683,6 +8703,11 @@ URI: [schema:coordinateReferenceSystem](http://schema.org/coordinateReferenceSys
 | --- | --- |
 | Range | [CRS](CRS.md) |
 | Slot URI | [schema:coordinateReferenceSystem](http://schema.org/coordinateReferenceSystem) |
+
+### Cardinality and Requirements
+
+| Property | Value |
+| --- | --- |
 
 
 
@@ -8782,6 +8807,11 @@ URI: [zv:directed](https://w3id.org/zarr-vectors/schema/0.9/directed)
 | --- | --- |
 | Range | [Boolean](Boolean.md) |
 | Domain Of | [LinksFamilyMeta](LinksFamilyMeta.md) |
+
+### Cardinality and Requirements
+
+| Property | Value |
+| --- | --- |
 
 
 
@@ -8887,13 +8917,12 @@ URI: [zv:dtype](https://w3id.org/zarr-vectors/schema/0.9/dtype)
 | --- | --- |
 | Range | [String](String.md) |
 | Domain Of | [VerticesMeta](VerticesMeta.md), [LinksMeta](LinksMeta.md), [AttributeMeta](AttributeMeta.md), [FragmentAttributeMeta](FragmentAttributeMeta.md), [ObjectAttributeMeta](ObjectAttributeMeta.md), [GroupingsAttributeMeta](GroupingsAttributeMeta.md), [LinkAttributeMeta](LinkAttributeMeta.md) |
+
 ### Cardinality and Requirements
 
 | Property | Value |
 | --- | --- |
 | Required | Yes |
-
-
 
 
 
@@ -8996,6 +9025,11 @@ URI: [zv:encoding](https://w3id.org/zarr-vectors/schema/0.9/encoding)
 | Range | [Encoding](Encoding.md) |
 | Domain Of | [VerticesMeta](VerticesMeta.md) |
 
+### Cardinality and Requirements
+
+| Property | Value |
+| --- | --- |
+
 
 
 
@@ -9089,13 +9123,12 @@ URI: [zv:format_capabilities](https://w3id.org/zarr-vectors/schema/0.9/format_ca
 | --- | --- |
 | Range | [FormatCapability](FormatCapability.md) |
 | Domain Of | [RootMetadata](RootMetadata.md) |
+
 ### Cardinality and Requirements
 
 | Property | Value |
 | --- | --- |
 | Multivalued | Yes |
-
-
 
 
 
@@ -9193,6 +9226,11 @@ URI: [zv:fragments_tile](https://w3id.org/zarr-vectors/schema/0.9/fragments_tile
 | --- | --- |
 | Range | [Boolean](Boolean.md) |
 | Domain Of | [LevelMetadata](LevelMetadata.md) |
+
+### Cardinality and Requirements
+
+| Property | Value |
+| --- | --- |
 
 
 
@@ -9294,6 +9332,7 @@ URI: [zv:geometry_types](https://w3id.org/zarr-vectors/schema/0.9/geometry_types
 | --- | --- |
 | Range | [GeometryType](GeometryType.md) |
 | Domain Of | [RootMetadata](RootMetadata.md) |
+
 ### Cardinality and Requirements
 
 | Property | Value |
@@ -9301,8 +9340,6 @@ URI: [zv:geometry_types](https://w3id.org/zarr-vectors/schema/0.9/geometry_types
 | Required | Yes |
 | Multivalued | Yes |
 | Minimum Cardinality | 1 |
-
-
 
 
 
@@ -9402,13 +9439,12 @@ URI: [zv:has_perm](https://w3id.org/zarr-vectors/schema/0.9/has_perm)
 | --- | --- |
 | Range | [Boolean](Boolean.md) |
 | Domain Of | [LinksMeta](LinksMeta.md) |
+
 ### Cardinality and Requirements
 
 | Property | Value |
 | --- | --- |
 | Required | Yes |
-
-
 
 
 
@@ -9513,6 +9549,11 @@ URI: [zv:inherited_num_objects](https://w3id.org/zarr-vectors/schema/0.9/inherit
 | --- | --- |
 | Range | [Integer](Integer.md) |
 | Domain Of | [LevelMetadata](LevelMetadata.md) |
+
+### Cardinality and Requirements
+
+| Property | Value |
+| --- | --- |
 ### Value Constraints
 
 | Property | Value |
@@ -9621,6 +9662,11 @@ URI: [zv:kind](https://w3id.org/zarr-vectors/schema/0.9/kind)
 | --- | --- |
 | Range | [String](String.md) |
 | Domain Of | [RootMetadata](RootMetadata.md), [LevelMetadata](LevelMetadata.md) |
+
+### Cardinality and Requirements
+
+| Property | Value |
+| --- | --- |
 ### Value Constraints
 
 | Property | Value |
@@ -9730,6 +9776,11 @@ URI: [zv:layout](https://w3id.org/zarr-vectors/schema/0.9/layout)
 | Range | [ObjectIndexLayout](ObjectIndexLayout.md) |
 | Domain Of | [ObjectIndexMeta](ObjectIndexMeta.md) |
 
+### Cardinality and Requirements
+
+| Property | Value |
+| --- | --- |
+
 
 
 
@@ -9827,13 +9878,12 @@ URI: [zv:level](https://w3id.org/zarr-vectors/schema/0.9/level)
 | --- | --- |
 | Range | [Integer](Integer.md) |
 | Domain Of | [LevelMetadata](LevelMetadata.md) |
+
 ### Cardinality and Requirements
 
 | Property | Value |
 | --- | --- |
 | Required | Yes |
-
-
 ### Value Constraints
 
 | Property | Value |
@@ -9942,13 +9992,12 @@ URI: [zv:level_delta](https://w3id.org/zarr-vectors/schema/0.9/level_delta)
 | --- | --- |
 | Range | [Integer](Integer.md) |
 | Domain Of | [LinksFamilyMeta](LinksFamilyMeta.md), [LinksMeta](LinksMeta.md), [LinkAttributeFamilyMeta](LinkAttributeFamilyMeta.md), [LinkAttributeMeta](LinkAttributeMeta.md) |
+
 ### Cardinality and Requirements
 
 | Property | Value |
 | --- | --- |
 | Required | Yes |
-
-
 
 
 
@@ -10055,13 +10104,12 @@ URI: [zv:link_width](https://w3id.org/zarr-vectors/schema/0.9/link_width)
 | --- | --- |
 | Range | [Integer](Integer.md) |
 | Domain Of | [LinksFamilyMeta](LinksFamilyMeta.md), [LinksMeta](LinksMeta.md) |
+
 ### Cardinality and Requirements
 
 | Property | Value |
 | --- | --- |
 | Required | Yes |
-
-
 ### Value Constraints
 
 | Property | Value |
@@ -10165,6 +10213,11 @@ URI: [zv:links_convention](https://w3id.org/zarr-vectors/schema/0.9/links_conven
 | Range | [LinksConvention](LinksConvention.md) |
 | Domain Of | [RootMetadata](RootMetadata.md) |
 
+### Cardinality and Requirements
+
+| Property | Value |
+| --- | --- |
+
 
 
 
@@ -10259,6 +10312,11 @@ URI: [zv:manifest_block_dtype](https://w3id.org/zarr-vectors/schema/0.9/manifest
 | --- | --- |
 | Range | [ManifestBlockDtype](ManifestBlockDtype.md) |
 | Domain Of | [RootMetadata](RootMetadata.md) |
+
+### Cardinality and Requirements
+
+| Property | Value |
+| --- | --- |
 
 
 
@@ -10361,6 +10419,11 @@ URI: [zv:manifest_layout](https://w3id.org/zarr-vectors/schema/0.9/manifest_layo
 | Range | [ManifestLayout](ManifestLayout.md) |
 | Domain Of | [RootMetadata](RootMetadata.md) |
 
+### Cardinality and Requirements
+
+| Property | Value |
+| --- | --- |
+
 
 
 
@@ -10459,14 +10522,13 @@ URI: [zv:max_corner](https://w3id.org/zarr-vectors/schema/0.9/max_corner)
 | --- | --- |
 | Range | [Float](Float.md) |
 | Domain Of | [BoundingBox](BoundingBox.md) |
+
 ### Cardinality and Requirements
 
 | Property | Value |
 | --- | --- |
 | Required | Yes |
 | Multivalued | Yes |
-
-
 
 
 
@@ -10563,14 +10625,13 @@ URI: [zv:min_corner](https://w3id.org/zarr-vectors/schema/0.9/min_corner)
 | --- | --- |
 | Range | [Float](Float.md) |
 | Domain Of | [BoundingBox](BoundingBox.md) |
+
 ### Cardinality and Requirements
 
 | Property | Value |
 | --- | --- |
 | Required | Yes |
 | Multivalued | Yes |
-
-
 
 
 
@@ -10674,13 +10735,12 @@ URI: [schema:name](http://schema.org/name)
 | Range | [String](String.md) |
 | Domain Of | [Axis](Axis.md), [AttributeMeta](AttributeMeta.md), [FragmentAttributeMeta](FragmentAttributeMeta.md), [ObjectAttributeMeta](ObjectAttributeMeta.md), [GroupingsAttributeMeta](GroupingsAttributeMeta.md), [LinkAttributeFamilyMeta](LinkAttributeFamilyMeta.md), [LinkAttributeMeta](LinkAttributeMeta.md) |
 | Slot URI | [schema:name](http://schema.org/name) |
+
 ### Cardinality and Requirements
 
 | Property | Value |
 | --- | --- |
 | Required | Yes |
-
-
 
 
 
@@ -10783,13 +10843,12 @@ URI: [zv:num_groups](https://w3id.org/zarr-vectors/schema/0.9/num_groups)
 | --- | --- |
 | Range | [Integer](Integer.md) |
 | Domain Of | [GroupingsMeta](GroupingsMeta.md) |
+
 ### Cardinality and Requirements
 
 | Property | Value |
 | --- | --- |
 | Required | Yes |
-
-
 ### Value Constraints
 
 | Property | Value |
@@ -10896,6 +10955,11 @@ URI: [zv:num_links](https://w3id.org/zarr-vectors/schema/0.9/num_links)
 | --- | --- |
 | Range | [Integer](Integer.md) |
 | Domain Of | [LinksFamilyMeta](LinksFamilyMeta.md), [LinkAttributeFamilyMeta](LinkAttributeFamilyMeta.md) |
+
+### Cardinality and Requirements
+
+| Property | Value |
+| --- | --- |
 ### Value Constraints
 
 | Property | Value |
@@ -11004,13 +11068,12 @@ URI: [zv:num_objects](https://w3id.org/zarr-vectors/schema/0.9/num_objects)
 | --- | --- |
 | Range | [Integer](Integer.md) |
 | Domain Of | [ObjectIndexMeta](ObjectIndexMeta.md) |
+
 ### Cardinality and Requirements
 
 | Property | Value |
 | --- | --- |
 | Required | Yes |
-
-
 ### Value Constraints
 
 | Property | Value |
@@ -11116,6 +11179,11 @@ URI: [zv:num_physical_records](https://w3id.org/zarr-vectors/schema/0.9/num_phys
 | --- | --- |
 | Range | [Integer](Integer.md) |
 | Domain Of | [LinksFamilyMeta](LinksFamilyMeta.md) |
+
+### Cardinality and Requirements
+
+| Property | Value |
+| --- | --- |
 ### Value Constraints
 
 | Property | Value |
@@ -11219,6 +11287,11 @@ URI: [zv:object_index_convention](https://w3id.org/zarr-vectors/schema/0.9/objec
 | Range | [ObjectIndexConvention](ObjectIndexConvention.md) |
 | Domain Of | [RootMetadata](RootMetadata.md) |
 
+### Cardinality and Requirements
+
+| Property | Value |
+| --- | --- |
+
 
 
 
@@ -11311,6 +11384,11 @@ URI: [zv:object_sparsity](https://w3id.org/zarr-vectors/schema/0.9/object_sparsi
 | --- | --- |
 | Range | [Float](Float.md) |
 | Domain Of | [LevelMetadata](LevelMetadata.md) |
+
+### Cardinality and Requirements
+
+| Property | Value |
+| --- | --- |
 ### Value Constraints
 
 | Property | Value |
@@ -11418,13 +11496,12 @@ URI: [zv:offsets](https://w3id.org/zarr-vectors/schema/0.9/offsets)
 | --- | --- |
 | Range | [Integer](Integer.md) |
 | Domain Of | [LinksMeta](LinksMeta.md), [LinkAttributeMeta](LinkAttributeMeta.md) |
+
 ### Cardinality and Requirements
 
 | Property | Value |
 | --- | --- |
 | Required | Yes |
-
-
 <details>
 <summary>Advanced Properties</summary>
 **Array Configuration:**
@@ -11540,6 +11617,11 @@ URI: [zv:parent_level](https://w3id.org/zarr-vectors/schema/0.9/parent_level)
 | --- | --- |
 | Range | [Integer](Integer.md) |
 | Domain Of | [LevelMetadata](LevelMetadata.md) |
+
+### Cardinality and Requirements
+
+| Property | Value |
+| --- | --- |
 ### Value Constraints
 
 | Property | Value |
@@ -11644,6 +11726,11 @@ URI: [zv:presence](https://w3id.org/zarr-vectors/schema/0.9/presence)
 | --- | --- |
 | Range | [String](String.md) |
 | Domain Of | [LevelMetadata](LevelMetadata.md) |
+
+### Cardinality and Requirements
+
+| Property | Value |
+| --- | --- |
 ### Value Constraints
 
 | Property | Value |
@@ -11752,6 +11839,11 @@ URI: [zv:preserves_object_ids](https://w3id.org/zarr-vectors/schema/0.9/preserve
 | Range | [Boolean](Boolean.md) |
 | Domain Of | [LevelMetadata](LevelMetadata.md) |
 
+### Cardinality and Requirements
+
+| Property | Value |
+| --- | --- |
+
 
 
 
@@ -11850,6 +11942,11 @@ URI: [zv:reduction_factor](https://w3id.org/zarr-vectors/schema/0.9/reduction_fa
 | --- | --- |
 | Range | [Integer](Integer.md) |
 | Domain Of | [RootMetadata](RootMetadata.md) |
+
+### Cardinality and Requirements
+
+| Property | Value |
+| --- | --- |
 ### Value Constraints
 
 | Property | Value |
@@ -11954,13 +12051,12 @@ URI: [zv:required_capabilities](https://w3id.org/zarr-vectors/schema/0.9/require
 | --- | --- |
 | Range | [FormatCapability](FormatCapability.md) |
 | Domain Of | [RootMetadata](RootMetadata.md) |
+
 ### Cardinality and Requirements
 
 | Property | Value |
 | --- | --- |
 | Multivalued | Yes |
-
-
 
 
 
@@ -12062,13 +12158,12 @@ URI: [zv:row_shape](https://w3id.org/zarr-vectors/schema/0.9/row_shape)
 | --- | --- |
 | Range | [Integer](Integer.md) |
 | Domain Of | [LinkAttributeMeta](LinkAttributeMeta.md) |
+
 ### Cardinality and Requirements
 
 | Property | Value |
 | --- | --- |
 | Multivalued | Yes |
-
-
 
 
 
@@ -12170,14 +12265,13 @@ URI: [zv:shape](https://w3id.org/zarr-vectors/schema/0.9/shape)
 | --- | --- |
 | Range | [Integer](Integer.md) |
 | Domain Of | [ObjectAttributeMeta](ObjectAttributeMeta.md), [GroupingsAttributeMeta](GroupingsAttributeMeta.md) |
+
 ### Cardinality and Requirements
 
 | Property | Value |
 | --- | --- |
 | Required | Yes |
 | Multivalued | Yes |
-
-
 
 
 
@@ -12277,13 +12371,12 @@ URI: [zv:shard_shape](https://w3id.org/zarr-vectors/schema/0.9/shard_shape)
 | --- | --- |
 | Range | [Integer](Integer.md) |
 | Domain Of | [RootMetadata](RootMetadata.md) |
+
 ### Cardinality and Requirements
 
 | Property | Value |
 | --- | --- |
 | Multivalued | Yes |
-
-
 ### Value Constraints
 
 | Property | Value |
@@ -12400,6 +12493,11 @@ URI: [zv:shared_fragments](https://w3id.org/zarr-vectors/schema/0.9/shared_fragm
 | Range | [Boolean](Boolean.md) |
 | Domain Of | [LevelMetadata](LevelMetadata.md) |
 
+### Cardinality and Requirements
+
+| Property | Value |
+| --- | --- |
+
 
 
 
@@ -12498,13 +12596,12 @@ URI: [zv:sid_ndim](https://w3id.org/zarr-vectors/schema/0.9/sid_ndim)
 | --- | --- |
 | Range | [Integer](Integer.md) |
 | Domain Of | [LinksFamilyMeta](LinksFamilyMeta.md), [ObjectIndexMeta](ObjectIndexMeta.md) |
+
 ### Cardinality and Requirements
 
 | Property | Value |
 | --- | --- |
 | Required | Yes |
-
-
 ### Value Constraints
 
 | Property | Value |
@@ -12612,6 +12709,11 @@ URI: [zv:store](https://w3id.org/zarr-vectors/schema/0.9/store)
 | Range | [CrossChunkStore](CrossChunkStore.md) |
 | Domain Of | [LinksFamilyMeta](LinksFamilyMeta.md) |
 
+### Cardinality and Requirements
+
+| Property | Value |
+| --- | --- |
+
 
 
 
@@ -12709,13 +12811,12 @@ URI: [zv:type](https://w3id.org/zarr-vectors/schema/0.9/type)
 | --- | --- |
 | Range | [String](String.md) |
 | Domain Of | [Axis](Axis.md) |
+
 ### Cardinality and Requirements
 
 | Property | Value |
 | --- | --- |
 | Required | Yes |
-
-
 
 
 
@@ -12812,6 +12913,11 @@ URI: [zv:unit](https://w3id.org/zarr-vectors/schema/0.9/unit)
 | Range | [String](String.md) |
 | Domain Of | [Axis](Axis.md) |
 
+### Cardinality and Requirements
+
+| Property | Value |
+| --- | --- |
+
 
 
 
@@ -12905,13 +13011,12 @@ URI: [zv:vertex_count](https://w3id.org/zarr-vectors/schema/0.9/vertex_count)
 | --- | --- |
 | Range | [Integer](Integer.md) |
 | Domain Of | [LevelMetadata](LevelMetadata.md) |
+
 ### Cardinality and Requirements
 
 | Property | Value |
 | --- | --- |
 | Required | Yes |
-
-
 ### Value Constraints
 
 | Property | Value |
@@ -13037,13 +13142,12 @@ URI: [zv:zv_array](https://w3id.org/zarr-vectors/schema/0.9/zv_array)
 | --- | --- |
 | Range | [ZvArrayTag](ZvArrayTag.md) |
 | Domain Of | [VerticesMeta](VerticesMeta.md), [LinksFamilyMeta](LinksFamilyMeta.md), [LinksMeta](LinksMeta.md), [AttributeMeta](AttributeMeta.md), [FragmentAttributeMeta](FragmentAttributeMeta.md), [ObjectIndexMeta](ObjectIndexMeta.md), [ObjectAttributeMeta](ObjectAttributeMeta.md), [GroupingsMeta](GroupingsMeta.md), [GroupingsAttributeMeta](GroupingsAttributeMeta.md), [LinkAttributeFamilyMeta](LinkAttributeFamilyMeta.md), [LinkAttributeMeta](LinkAttributeMeta.md) |
+
 ### Cardinality and Requirements
 
 | Property | Value |
 | --- | --- |
 | Required | Yes |
-
-
 
 
 
@@ -13155,13 +13259,12 @@ URI: [schema:version](http://schema.org/version)
 | Range | [String](String.md) |
 | Domain Of | [RootMetadata](RootMetadata.md) |
 | Slot URI | [schema:version](http://schema.org/version) |
+
 ### Cardinality and Requirements
 
 | Property | Value |
 | --- | --- |
 | Required | Yes |
-
-
 ### Value Constraints
 
 | Property | Value |

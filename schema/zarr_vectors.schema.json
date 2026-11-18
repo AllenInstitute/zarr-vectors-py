@@ -500,11 +500,15 @@
         },
         "offsets": {
           "items": {
-            "items": {
-              "description": "The ``link_width - 1`` relative offsets naming this array, each of ``sid_ndim`` signed components, as a list of integer lists. Offsets are relative to the record's SOURCE chunk: ``vi_k`` is local to ``src + o_k``.  The implicit ``o_0 = 0`` (the source itself) is never encoded, so ``link_width == 1`` carries an empty list.  Redundant with the path segment that encodes the same offsets, but stamping it lets readers decode without knowing ``sid_ndim``.\n",
-              "type": "integer"
-            },
-            "type": "array"
+            "additionalProperties": true,
+            "type": [
+              "null",
+              "boolean",
+              "object",
+              "number",
+              "string",
+              "array"
+            ]
           },
           "type": "array"
         },
@@ -589,14 +593,7 @@
           ]
         },
         "store": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/CrossChunkStore"
-            },
-            {
-              "type": "null"
-            }
-          ],
+          "$ref": "#/$defs/CrossChunkStore",
           "description": "Cell-duplication policy for a links family; see CrossChunkStore. Family-wide; defaults to ``canonical``.\n"
         },
         "zv_array": {
@@ -636,11 +633,15 @@
         },
         "offsets": {
           "items": {
-            "items": {
-              "description": "The ``link_width - 1`` relative offsets naming this array, each of ``sid_ndim`` signed components, as a list of integer lists. Offsets are relative to the record's SOURCE chunk: ``vi_k`` is local to ``src + o_k``.  The implicit ``o_0 = 0`` (the source itself) is never encoded, so ``link_width == 1`` carries an empty list.  Redundant with the path segment that encodes the same offsets, but stamping it lets readers decode without knowing ``sid_ndim``.\n",
-              "type": "integer"
-            },
-            "type": "array"
+            "additionalProperties": true,
+            "type": [
+              "null",
+              "boolean",
+              "object",
+              "number",
+              "string",
+              "array"
+            ]
           },
           "type": "array"
         },
@@ -737,14 +738,7 @@
       "description": "Attributes for ``object_index/``.",
       "properties": {
         "layout": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/ObjectIndexLayout"
-            },
-            {
-              "type": "null"
-            }
-          ],
+          "$ref": "#/$defs/ObjectIndexLayout",
           "description": "The object index's storage layout: ``vlen_manifests_v1`` (vlen blobs, rows are ids), ``vlen_manifests_v2`` (vlen blobs, ids in ``object_ids``) or ``dense_manifests_v1`` (``manifest_spans`` into ``manifest_blocks``, ids in ``object_ids``; 0.9.4).\n"
         },
         "num_objects": {
@@ -818,14 +812,7 @@
           "type": "array"
         },
         "cross_chunk_strategy": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/CrossChunkStrategy"
-            },
-            {
-              "type": "null"
-            }
-          ]
+          "$ref": "#/$defs/CrossChunkStrategy"
         },
         "cross_level_depth": {
           "description": "Maximum absolute level delta for which cross-pyramid-level link arrays are materialized.  ``0`` = none (no ``+N`` or ``-N`` arrays), ``N`` = generate up to ``\u00b1N`` (or ``+N`` only when ``cross_level_storage=\"implicit\"``), ``-1`` = all available pyramid levels.  Default ``1``.\n",
@@ -836,14 +823,7 @@
           ]
         },
         "cross_level_storage": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/CrossLevelStorage"
-            },
-            {
-              "type": "null"
-            }
-          ],
+          "$ref": "#/$defs/CrossLevelStorage",
           "description": "Whether cross-level link arrays are written in both directions (``explicit``: ``+N`` at the finer level AND ``-N`` at the coarser level) or only positive deltas (``implicit``: only ``+N``, with ``-N`` reconstructed on read).  Default ``explicit``.\n"
         },
         "format_capabilities": {
@@ -873,46 +853,18 @@
           ]
         },
         "links_convention": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/LinksConvention"
-            },
-            {
-              "type": "null"
-            }
-          ]
+          "$ref": "#/$defs/LinksConvention"
         },
         "manifest_block_dtype": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/ManifestBlockDtype"
-            },
-            {
-              "type": "null"
-            }
-          ],
+          "$ref": "#/$defs/ManifestBlockDtype",
           "description": "``int32`` when dense object indexes are created with ``int32`` ``manifest_blocks``, absent for the ``int64`` default. A default for indexes created later; each index's ``manifest_blocks`` dtype (its ``zarr.json``) is the truth about it, and every reader widens the blocks to ``int64``. Optional and additive.\n"
         },
         "manifest_layout": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/ManifestLayout"
-            },
-            {
-              "type": "null"
-            }
-          ],
+          "$ref": "#/$defs/ManifestLayout",
           "description": "``dense`` when object indexes are created in the dense layout (``manifest_spans`` + ``manifest_blocks``: fixed-width integer arrays), absent for the vlen default of one blob per object. Optional and additive from 0.9.4. A default for indexes created later; an existing index's own ``layout`` is the truth about it.\n"
         },
         "object_index_convention": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/ObjectIndexConvention"
-            },
-            {
-              "type": "null"
-            }
-          ]
+          "$ref": "#/$defs/ObjectIndexConvention"
         },
         "reduction_factor": {
           "description": "Multi-resolution coarsening factor (\u2265 2).",
@@ -967,14 +919,7 @@
           "type": "string"
         },
         "encoding": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/Encoding"
-            },
-            {
-              "type": "null"
-            }
-          ],
+          "$ref": "#/$defs/Encoding",
           "description": "How the chunk bytes are encoded."
         },
         "zv_array": {
@@ -1014,7 +959,7 @@
   "$id": "https://w3id.org/zarr-vectors/schema/0.9",
   "$schema": "https://json-schema.org/draft/2019-09/schema",
   "additionalProperties": true,
-  "metamodel_version": "1.12.0",
+  "metamodel_version": "1.11.0",
   "title": "zarr_vectors",
   "type": "object",
   "version": null
