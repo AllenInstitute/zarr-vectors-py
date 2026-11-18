@@ -15,6 +15,7 @@ Supports two encoding modes:
 
 from __future__ import annotations
 
+import itertools
 from typing import TYPE_CHECKING, Any, Literal
 
 import numpy as np
@@ -128,6 +129,8 @@ def write_mesh(
     shard_shape: int | tuple[int, ...] | None | Literal["inherit"] = "inherit",
     element: str | None = None,
     check_orientation: bool = True,
+    _level: int = 0,
+    _level_fields: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Write a mesh to a new zarr vectors store.
 
@@ -224,6 +227,7 @@ def write_mesh(
         # one keeps its own declaration. "inherit" means the caller said
         # nothing, so there is nothing to declare on a fresh store.
         shard_shape=None if shard_shape == "inherit" else shard_shape,
+        level=_level,
     )
     vertices, _ = _apply_out_of_bounds_policy(
         root, vertices, policy=out_of_bounds,
@@ -286,7 +290,7 @@ def write_mesh(
         )
 
     level_meta = LevelMetadata(
-        level=0,
+        level=_level,
         vertex_count=n_verts,
         # ``links`` always exists: the backstop below creates it.
         arrays_present=[
@@ -298,8 +302,9 @@ def write_mesh(
         chunk_dims=level_chunk_dims,
         chunk_attribute_name=chunk_by_attribute,
         chunk_attribute_values=attr_bin_values,
+        **(_level_fields or {}),
     )
-    level_group = create_resolution_level(root, 0, level_meta)
+    level_group = create_resolution_level(root, _level, level_meta)
     # Before any write: records already in the family keep their meaning.
     _refuse_retyping(level_group, element)
 
@@ -1123,3 +1128,266 @@ def _write_draco_chunk(
         VERTEX_FRAGMENTS, key,
         encode_fragments([(0, num_positions)]),
     )
+
+
+# ---------------------------------------------------------------------------
+# Writing a coarse level from a mesh decimated elsewhere
+# ---------------------------------------------------------------------------
+
+
+def write_mesh_level(
+    store_path: WriteTarget,
+    level: int,
+    vertices: npt.NDArray[np.floating],
+    faces: npt.NDArray[np.integer],
+    *,
+    object_ids: npt.NDArray[np.integer] | None = None,
+    element: str | None = None,
+    parent_level: int | None = None,
+    bin_shape: BinShape | None = None,
+    chunk_shape: ChunkShape | None = None,
+    link_parents: bool = True,
+    check_orientation: bool = True,
+    dtype: str = "float32",
+    vertex_attributes: dict[str, npt.NDArray] | None = None,
+) -> dict[str, Any]:
+    """Write a mesh decimated elsewhere as coarse level ``level``.
+
+    For a pyramid built outside this package -- a volume mesh coarsened by
+    edge collapse, a surface simplified by quadric decimation -- each
+    coarse mesh is written as its own level, marked
+    ``coarsening_method: "manual"``.  The store and ``parent_level``
+    must exist and ``level`` must not.  Vertices are in level-0
+    coordinates, as at every level.
+
+    Args:
+        store_path: An existing store (path or open root group).
+        level: The level to create (> 0).
+        vertices: ``(V, D)`` positions, in level-0 coordinates.
+        faces: ``(F, L)`` polygon faces, or volume cells with ``element``.
+        object_ids: ``(V,)`` object of each vertex, in the parent's object
+            id space; ``None`` puts every vertex in object 0.
+        element: As for :func:`write_mesh`.
+        parent_level: The level this one was made from; default
+            ``level - 1``.
+        bin_shape: The level's nominal resolution, recorded as its
+            ``bin_shape`` (with ``bin_ratio`` against the root's base
+            bin); default twice the parent level's.  At least the root's
+            base bin on every axis.  Also sets the search radius for
+            ``link_parents``.
+        chunk_shape: The level's chunk shape; default the parent's.  Each
+            axis must be an integer multiple of the root's.
+        link_parents: Link each parent-level vertex to the nearest vertex
+            of the same object at this level (``links/+delta`` on the
+            parent level, and ``links/-delta`` on this one), so readers
+            can move between the levels as they do on a built pyramid.
+            A parent vertex whose object has no vertex near it here
+            (within ~2 bins) is left unlinked.
+        check_orientation: As for :func:`write_mesh`.
+        dtype: Position dtype.
+        vertex_attributes: Per-vertex attributes ``{name: (V,) or (V, C)}``.
+
+    Returns:
+        :func:`write_mesh`'s summary, plus ``level``, ``parent_level`` and
+        ``parent_links`` (parent vertices linked).
+    """
+    from zarr_vectors.core.store import list_resolution_levels
+
+    root = open_store(store_path, mode="r+")
+    levels = list_resolution_levels(root)
+    level = int(level)
+    if level <= 0:
+        raise ArrayError(f"write_mesh_level writes a coarse level (> 0), got {level}")
+    if level in levels:
+        raise ArrayError(f"level {level} already exists; remove it first")
+    parent = level - 1 if parent_level is None else int(parent_level)
+    if parent not in levels or parent >= level:
+        raise ArrayError(
+            f"parent_level {parent} must be an existing level below {level}"
+        )
+
+    root_meta = read_root_metadata(root)
+    parent_meta = read_level_metadata(root, parent)
+    level_chunk = tuple(float(c) for c in (
+        chunk_shape if chunk_shape is not None
+        else get_level_chunk_shape(root_meta, parent_meta)
+    ))
+    vertices = np.asarray(vertices)
+    if object_ids is None:
+        object_ids = np.zeros(vertices.shape[0], dtype=np.int64)
+    object_ids = np.asarray(object_ids, dtype=np.int64)
+
+    parent_group = get_resolution_level(root, parent)
+    try:
+        parent_ids = set(read_object_manifests(parent_group).keys())
+    except Exception:
+        parent_ids = set()
+    unknown = sorted(set(np.unique(object_ids).tolist()) - parent_ids)
+    if parent_ids and unknown:
+        raise ArrayError(
+            f"object ids {unknown[:5]} are not objects of level {parent}; a "
+            f"coarse level keeps its parent's object ids"
+        )
+
+    fields: dict[str, Any] = {
+        "parent_level": parent,
+        "coarsening_method": "manual",
+        "object_sparsity": (
+            max(len(np.unique(object_ids)), 1) / max(len(parent_ids), 1)
+            if parent_ids else 1.0
+        ),
+    }
+    if bin_shape is None:
+        # A coarse level must record its bins; default to twice its parent's.
+        parent_bin = getattr(parent_meta, "bin_shape", None) or root_meta.effective_bin_shape
+        bin_shape = tuple(2.0 * float(b) for b in parent_bin)
+    if bin_shape is not None:
+        bs = tuple(float(b) for b in np.broadcast_to(bin_shape, (root_meta.sid_ndim,)))
+        fields["bin_shape"] = bs
+        fields["bin_ratio"] = tuple(
+            b / float(r) for b, r in zip(bs, root_meta.effective_bin_shape)
+        )
+    root_chunk = tuple(float(c) for c in root_meta.chunk_shape)
+    if any(abs(a - b) > 1e-9 for a, b in zip(level_chunk, root_chunk)):
+        fields["chunk_shape"] = level_chunk
+
+    summary = write_mesh(
+        root, vertices, faces,
+        chunk_shape=level_chunk,
+        object_ids=object_ids,
+        element=element,
+        check_orientation=check_orientation,
+        dtype=dtype,
+        vertex_attributes=vertex_attributes,
+        _level=level,
+        _level_fields=fields,
+    )
+    summary.update(level=level, parent_level=parent, parent_links=0)
+    if link_parents and vertices.shape[0]:
+        summary["parent_links"] = _link_to_parent_level(
+            root, parent=parent, level=level,
+            radius=2.0 * (
+                float(max(fields["bin_shape"])) if "bin_shape" in fields
+                else _spacing(vertices)
+            ),
+        )
+    return summary
+
+
+def _spacing(positions: npt.NDArray) -> float:
+    """A typical vertex spacing: the side of the cube each vertex would
+    own if they filled their bounding box evenly."""
+    ext = np.ptp(positions, axis=0)
+    ext = ext[ext > 0]
+    if ext.size == 0:
+        return 1.0
+    return float((np.prod(ext) / max(positions.shape[0], 1)) ** (1.0 / ext.size))
+
+
+def _level_vertex_table(
+    level_group: FsGroup, ndim: int,
+) -> tuple[npt.NDArray[np.float64], npt.NDArray[np.int64], dict, int]:
+    """Every vertex of a level in global (chunk-major) order: positions,
+    owning object (-1 for none; the first, for a shared vertex), and the
+    chunk assignments the cross-level writer takes."""
+    from zarr_vectors.multiresolution.coarsen import _reconstruct_chunk_assignments
+
+    assignments, total = _reconstruct_chunk_assignments(level_group, ndim)
+    positions = np.zeros((total, ndim), dtype=np.float64)
+    owner = np.full(total, -1, dtype=np.int64)
+    frag_rows: dict[ChunkCoords, list[tuple[int, int]]] = {}
+    for cc, idx in assignments.items():
+        frags = read_chunk_vertices(level_group, cc, ndim=ndim)
+        start = int(idx[0])
+        rows = []
+        for f in frags:
+            f = np.asarray(f).reshape(-1, ndim)
+            positions[start:start + len(f)] = f
+            rows.append((start, start + len(f)))
+            start += len(f)
+        frag_rows[cc] = rows
+    try:
+        manifests = read_object_manifests(level_group)
+    except Exception:
+        manifests = {}
+    for oid in sorted(manifests, reverse=True):  # lowest id wins a shared vertex
+        for cc, frag in manifests[oid]:
+            rows = frag_rows.get(tuple(cc))
+            if rows is not None and frag < len(rows):
+                a, b = rows[frag]
+                owner[a:b] = oid
+    return positions, owner, assignments, total
+
+
+def _nearest_within(
+    fine: npt.NDArray, fine_obj: npt.NDArray, coarse: npt.NDArray,
+    coarse_obj: npt.NDArray, radius: float,
+) -> npt.NDArray[np.int64]:
+    """For each fine vertex, the nearest coarse vertex of the same object
+    within the 3**D grid cells (side ``radius``) around it; -1 if none."""
+    ndim = fine.shape[1]
+    parent = np.full(fine.shape[0], -1, dtype=np.int64)
+    best = np.full(fine.shape[0], np.inf)
+    if coarse.shape[0] == 0 or fine.shape[0] == 0:
+        return parent
+    lo = np.minimum(fine.min(0), coarse.min(0))
+    cell_c = np.floor((coarse - lo) / radius).astype(np.int64)
+    cell_f = np.floor((fine - lo) / radius).astype(np.int64)
+    dims = np.maximum(cell_c.max(0), cell_f.max(0)) + 3
+    obj_vals, obj_c = np.unique(np.r_[coarse_obj, fine_obj], return_inverse=True)
+    obj_c, obj_f = obj_c[: len(coarse_obj)], obj_c[len(coarse_obj):]
+
+    def key(cells, objs):
+        return np.ravel_multi_index((cells + 1).T, dims) * len(obj_vals) + objs
+
+    kc = key(cell_c, obj_c)
+    order = np.argsort(kc, kind="stable")
+    kc_sorted = kc[order]
+    starts = np.searchsorted(kc_sorted, kc_sorted, side="left")
+    counts = np.searchsorted(kc_sorted, kc_sorted, side="right") - starts
+    max_occ = int(counts.max())
+    for off in itertools.product((-1, 0, 1), repeat=ndim):
+        kf = key(cell_f + np.asarray(off), obj_f)
+        first = np.searchsorted(kc_sorted, kf, side="left")
+        last = np.searchsorted(kc_sorted, kf, side="right")
+        for r in range(max_occ):
+            pos = first + r
+            ok = pos < last
+            if not ok.any():
+                break
+            cand = order[np.minimum(pos, len(order) - 1)]
+            d = np.where(ok, ((fine - coarse[cand]) ** 2).sum(1), np.inf)
+            better = d < best
+            best[better] = d[better]
+            parent[better] = cand[better]
+    return parent
+
+
+def _link_to_parent_level(root: FsGroup, *, parent: int, level: int, radius: float) -> int:
+    """Write ``links/+delta`` (and ``-delta``) between ``parent`` and
+    ``level``: each parent vertex to its nearest same-object vertex."""
+    from zarr_vectors.constants import CAP_MULTISCALE_LINKS, XLEVEL_EXPLICIT
+    from zarr_vectors.multiresolution.coarsen import (
+        _stamp_root_capability,
+        _write_cross_level_edges,
+    )
+
+    ndim = read_root_metadata(root).sid_ndim
+    f_pos, f_obj, f_assn, n_f = _level_vertex_table(get_resolution_level(root, parent), ndim)
+    c_pos, c_obj, c_assn, n_c = _level_vertex_table(get_resolution_level(root, level), ndim)
+    nearest = _nearest_within(f_pos, f_obj, c_pos, c_obj, radius)
+    if not (nearest >= 0).any():
+        return 0
+    _write_cross_level_edges(
+        root,
+        fine_level=parent,
+        delta=level - parent,
+        fine_chunk_assignments=f_assn,
+        coarse_chunk_assignments=c_assn,
+        n_fine=n_f,
+        n_coarse=n_c,
+        parent=nearest,
+        storage=XLEVEL_EXPLICIT,
+    )
+    _stamp_root_capability(root, CAP_MULTISCALE_LINKS)
+    return int((nearest >= 0).sum())

@@ -126,6 +126,25 @@ groupings and links. It refuses, before touching an existing output:
 `rechunk_spatial` is the lossless path for such stores. Lift a refusal
 only when a real store needs it.
 
+### Volume meshes (zarr_vectors#10)
+
+`element` on a links family, the bin-lattice pyramid and
+`write_mesh_level` are in. Still open:
+- **Mixed element types in one level.** A family has one `link_width`,
+  so tets and hexes cannot share a level. Needs named link families
+  (composite stores already use `links_mesh/`) or padding.
+- **Per-cell attributes at coarse levels.** Link attributes are not
+  carried down. Volume-weighted mean for numbers and majority by volume
+  for categories, mapping each fine cell to the coarse block holding
+  its centroid.
+- **A better default boundary.** The lattice shrinks the volume by up to
+  half a bin per side per level. Snapping boundary metavertices to the
+  fine surface, or a Delaunay option clipped to the fine volume, would
+  fix it at more cost.
+- **Surface meshes** still get no faces at coarse levels.
+- **The convention schema** (now generated from the LinkML model in the
+  spec repo) should define `element` and the width it fixes.
+
 ### When OME-Zarr RFC 8 settles
 
 RFC 8 is under review (R1), unimplemented and without a JSON Schema.

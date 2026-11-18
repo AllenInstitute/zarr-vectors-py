@@ -146,8 +146,46 @@ storage: records are stored sorted, with a permutation column
   cell's signed volume.
 - An element is declared once. `building.stamp_link_element` refuses to
   retype records already written, for example quads as tetrahedra.
-- Pyramid levels keep no faces or cells, for surface and volume meshes
-  alike.
+- Cells cross chunk boundaries like any link record. What `element`
+  is limited to is one level: every vertex of a cell is on the same
+  pyramid level.
+
+#### Pyramids of a volume mesh
+
+`build_pyramid` gives each coarse level its own cells, built on the
+level's bins. Each coarse vertex is the centroid of one bin. For each
+object, every 2 x 2 x 2 block of bins the object fills becomes one
+hexahedron (from a hexahedral mesh) or six tetrahedra (from any other
+element), joining those eight vertices. Cells that would be inverted at
+the vertices' real positions are dropped; the build summary counts them
+as `cells_dropped_inverted`.
+
+The cells fill the occupied volume with no gaps, and each block depends
+only on its own bins, so the build stays chunk-local. The surface is
+accurate to about one bin: the volume shrinks by up to half a bin at
+the boundary, and a feature thinner than two bins has no cells at that
+level. Surface meshes still get no faces at coarse levels.
+
+#### Coarse levels decimated elsewhere
+
+For a better coarse mesh than the bin lattice (edge collapse,
+TetGen, quadric decimation), make it with another tool and write it as
+its own level:
+
+```python
+from zarr_vectors.building import write_mesh_level
+
+write_mesh_level(path, 1, coarse_vertices, coarse_tets, element="tetra",
+                 bin_shape=(20.0, 20.0, 20.0))
+```
+
+The level is marked `coarsening_method: "manual"` with `parent_level`
+(default `level - 1`), and its `bin_shape` (default twice the
+parent's) and `bin_ratio`. Its object ids must be ids of the parent
+level. With `link_parents=True` (the default), every parent-level
+vertex is linked to the nearest vertex of the same object on the new
+level, within about two bins, in `links/+delta` and `links/-delta`, as
+`build_pyramid` links its levels.
 
 ### Validation
 

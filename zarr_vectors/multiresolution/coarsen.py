@@ -633,6 +633,8 @@ def _per_object_coarsen(
         # We need to map each source vertex back to its metavertex_index.
         # Walk per-object slices of the flat ``inverse`` array.
         cursor = 0
+        volume_element = _volume_element(src_group) if not leading and ndim == 3 else None
+        object_mvs: list[npt.NDArray[np.int64]] = []
         new_manifests: dict[int, list[tuple[ChunkCoords, int]]] = {}
 
         def _id_of(row: int) -> int:
@@ -648,6 +650,8 @@ def _per_object_coarsen(
                 continue
             mv_seq = inverse[cursor:cursor + n]
             cursor += n
+            if volume_element is not None:
+                object_mvs.append(np.unique(mv_seq))
             # Drop consecutive duplicates, preserving order -- vectorised,
             # because this runs once per source vertex across the level.
             if mv_seq.size > 1:
@@ -677,6 +681,21 @@ def _per_object_coarsen(
                 level_group,
                 {int(oid): new_manifests.get(int(oid), []) for oid in ids_for_index},
                 sid_ndim=key_ndim,
+            )
+
+        # --- Step 9b: a volume mesh's cells, built on the bin lattice -------
+        volume_summary: dict[str, Any] = {}
+        if volume_element is not None and n_metavertices:
+            volume_summary = _write_lattice_cells(
+                level_group,
+                source_element=volume_element,
+                unique_keys=unique_keys,
+                meta_positions=meta_positions,
+                object_mvs=object_mvs,
+                chunk_slots=chunk_slots,
+                mv_chunk_slot=mv_chunk_slot,
+                mv_fragment_idx=mv_fragment_idx,
+                ndim=ndim,
             )
 
         # --- Step 10: per-object attributes with present_mask ---------------
@@ -738,7 +757,58 @@ def _per_object_coarsen(
         "method": COARSEN_PER_OBJECT,
         "preserves_object_ids": True,
         "shared_fragments": True,
+        **volume_summary,
     }
+
+
+def _volume_element(src_group) -> str | None:
+    """The element of the source level's ``links/0`` family, if any."""
+    from zarr_vectors.core.elements import family_element
+    from zarr_vectors.core.paths import links_group_path
+
+    family = links_group_path(0)
+    if not src_group.array_exists(family):
+        return None
+    return family_element(src_group.read_array_meta(family) or {})
+
+
+def _write_lattice_cells(
+    level_group,
+    *,
+    source_element: str,
+    unique_keys: npt.NDArray,
+    meta_positions: npt.NDArray[np.floating],
+    object_mvs: list[npt.NDArray[np.int64]],
+    chunk_slots: list[ChunkCoords],
+    mv_chunk_slot: npt.NDArray[np.int64],
+    mv_fragment_idx: npt.NDArray[np.int64],
+    ndim: int,
+) -> dict[str, Any]:
+    """Write a coarse volume mesh's cells (see
+    :mod:`zarr_vectors.multiresolution.volume`); returns summary fields."""
+    from zarr_vectors.core.arrays import stamp_link_element, write_links
+    from zarr_vectors.multiresolution.volume import coarse_element, lattice_cells
+
+    element = coarse_element(source_element)
+    # Each metavertex is the centroid of one bin; ``unique_keys`` are the
+    # bins' int64 coordinates, one row per metavertex, as np.unique left them.
+    mv_bins = np.frombuffer(
+        np.ascontiguousarray(unique_keys).tobytes(), dtype=np.int64,
+    ).reshape(-1, ndim)
+    cells, dropped = lattice_cells(mv_bins, meta_positions, object_mvs, element)
+    if cells.shape[0]:
+        # One metavertex per fragment, so its row in the chunk is its
+        # fragment index.
+        slot_chunks = np.asarray(chunk_slots, dtype=np.int64).reshape(-1, ndim)
+        cc = slot_chunks[mv_chunk_slot[cells]]
+        vi = mv_fragment_idx[cells]
+        write_links(
+            level_group, [], ndim, delta=0, link_width=cells.shape[1],
+            _arrays=(cc, vi),
+        )
+        stamp_link_element(level_group, element, _records_are_new=True)
+    return {"element": element, "cell_count": int(cells.shape[0]),
+            "cells_dropped_inverted": dropped}
 
 
 _PATH_GEOMETRIES = frozenset({
