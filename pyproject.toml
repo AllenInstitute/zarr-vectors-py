@@ -100,8 +100,9 @@ dev = [
     "ruff>=0.4",
     "mypy>=1.10",
     # Build-time-only schema toolchain.  End users never need these;
-    # CI uses them to regenerate `schema/zarr_vectors.schema.json` and
-    # `schema/reference.md` from the LinkML source.  The `jsonschema`
+    # CI uses them to regenerate `schema/zarr_vectors.schema.json` from
+    # the LinkML source (`regen.py` also writes an uncommitted
+    # `schema/reference.md`).  The `jsonschema`
     # package is also used by `tests/test_linkml_schema.py` and
     # `tests/test_convention_conformance.py` to validate written metadata.
     # LinkML is pinned to the version AllenInstitute/zarr_vectors uses, so

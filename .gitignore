@@ -36,3 +36,4 @@ htmlcov/
 
 docs/_build
 *.prof
+schema/reference.md
