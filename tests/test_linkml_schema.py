@@ -5,20 +5,22 @@
 LinkML model is maintained; ``schema/regen.py`` generates
 ``schema/zarr_vectors.schema.json`` from them.  These tests check that:
 
-* the generated schema is the one the convention publishes (the copy in
-  ``tests/data`` that ``test_convention_conformance.py`` validates stores
-  against), so the LinkML copy here has not drifted from it;
+* the generated schema is the one the convention publishes (by a hash
+  of its canonical JSON, so the LinkML copy here has not drifted from
+  it);
 * the ``zarr_vectors`` objects ``to_dict()`` and the array writers emit
   validate against the class for their ``kind``, and broken ones do not;
 * every member of every ``VALID_*`` constant set is a member of the
   matching schema enum, and the reverse.
 
 If the LinkML source changes upstream, copy it (and ``build.py``) here,
-run ``python schema/regen.py`` and commit the regenerated files.
+run ``python schema/regen.py``, commit the regenerated schema, and set
+``PUBLISHED_SHA256`` to the hash the failing test prints.
 """
 
 from __future__ import annotations
 
+import hashlib
 import json
 from pathlib import Path
 
@@ -39,9 +41,16 @@ from zarr_vectors.exceptions import MetadataError  # noqa: E402
 
 ROOT = Path(__file__).resolve().parents[1]
 SCHEMA_PATH = ROOT / "schema" / "zarr_vectors.schema.json"
-CONVENTION_SCHEMA_PATH = (
-    Path(__file__).resolve().parent / "data" / "zarr_vectors_convention_v0.1.0.schema.json"
-)
+#: SHA-256 of the convention's published schema.json as canonical JSON
+#: (sorted keys, no whitespace): the convention repository reformats it
+#: with Prettier, so equality is as JSON, not bytes.
+PUBLISHED_SHA256 = "9b55eebc443313688f60ea93cdb40b2c05c934cf7d885b8915e204f537442102"
+
+
+def canonical_sha256(doc: dict) -> str:
+    return hashlib.sha256(
+        json.dumps(doc, sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()
 
 
 @pytest.fixture(scope="module")
@@ -62,12 +71,12 @@ def _validate(schema: dict, defs_name: str, instance: dict) -> None:
 def test_generated_schema_is_the_published_convention_schema(schema):
     """The convention repository publishes the schema generated from the
     same LinkML (reformatted by Prettier), so the two are equal as JSON."""
-    published = json.loads(CONVENTION_SCHEMA_PATH.read_text(encoding="utf-8"))
-    assert schema == published, (
+    got = canonical_sha256(schema)
+    assert got == PUBLISHED_SHA256, (
         "schema/zarr_vectors.schema.json differs from the convention's "
         "schema.json: re-copy convention/ from AllenInstitute/zarr_vectors "
-        "and run `python schema/regen.py`, or update tests/data from the "
-        "convention repository"
+        "and run `python schema/regen.py`; if the convention itself moved, "
+        f"set PUBLISHED_SHA256 = {got!r}"
     )
 
 

@@ -14,7 +14,7 @@ truth for what this package writes is [`zarr_vectors/core/metadata.py`].
 | `zarr_vectors.linkml.yaml` | copied | [LinkML] model of one node's `zarr.json`. Edit it upstream, not here. |
 | `build.py` | copied | The upstream generator; `regen.py` calls its `build()`. |
 | `zarr_vectors.schema.json` | generated | JSON Schema (Draft 2020-12): the convention's schema. |
-| `reference.md` | generated | Markdown reference. |
+| `reference.md` | generated, not committed | Markdown reference; `regen.py` writes it locally. |
 | `regen.py` | hand-edited | Runs the generators. |
 
 ## Updating
@@ -28,15 +28,16 @@ python schema/regen.py            # regenerate both files in place
 python schema/regen.py --check    # exit 1 if the JSON Schema is stale
 ```
 
-`--check` compares only the JSON Schema, byte for byte; `reference.md`
-is not compared because its row order is not fixed. The test workflow
+`--check` compares only the JSON Schema, byte for byte. `reference.md`
+is not committed: its row order is not fixed, so it could not be
+checked, and the convention's README and the LinkML model are the
+readable reference. The test workflow
 runs `--check`. The generator is pinned through `uv.lock` (LinkML
 1.12.1, as upstream), so the output matches upstream byte for byte.
 
 `tests/test_linkml_schema.py` checks that the generated schema equals the
-convention's published schema (the copy in `tests/data/` that
-`tests/test_convention_conformance.py` validates written stores
-against), that the metadata the writers emit validates against the class
+convention's published schema (by a hash of its canonical JSON,
+`PUBLISHED_SHA256`), that the metadata the writers emit validates against the class
 for its `kind`, and that the `VALID_*` constant sets match the schema
 enums.
 

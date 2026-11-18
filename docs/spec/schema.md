@@ -8,7 +8,6 @@ are in the [`schema/` directory](https://github.com/AllenInstitute/zarr-vectors-
 |---|---|
 | `zarr_vectors.linkml.yaml` | The [LinkML](https://linkml.io/) model, copied from [`convention/` in AllenInstitute/zarr_vectors](https://github.com/AllenInstitute/zarr_vectors/tree/main/convention), where it is maintained. |
 | `zarr_vectors.schema.json` | JSON Schema generated from it. |
-| `reference.md` | Markdown reference generated from it. |
 | `README.md` | Coverage, how to validate a node, and how to update the copy. |
 
 The generated JSON Schema is the schema the
