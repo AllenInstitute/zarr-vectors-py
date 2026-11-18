@@ -131,7 +131,7 @@ class ShardTransaction:
         *,
         arrays: Iterable[str] | None,
         mode: Literal["replace", "merge"],
-        durable: bool,
+        durable: bool | str,
         io_threads: int | None = None,
     ) -> None:
         from zarr_vectors.core.group import _grid_origin
@@ -146,7 +146,11 @@ class ShardTransaction:
         self.level_group = level_group
         self.shard_coords = tuple(int(s) for s in shard_coords)
         self.mode = mode
-        self.durable = bool(durable)
+        from zarr_vectors.core._durable import fsyncs
+
+        # True fsyncs each object and directory on publish; False and
+        # "deferred" publish atomically without (see _durable.sync_store).
+        self.durable = fsyncs(durable)
         self.io_threads = io_threads
         self.written: dict[str, list[str]] = {}
         self.published: list[str] = []
@@ -355,14 +359,20 @@ class ShardTransaction:
             key, value, written = self._encode_one(name)
             tmp = None
             if isinstance(value, bytes):
+                # Not fsynced here: every partial is written first, then all
+                # are fsynced together below, before any rename (group commit).
                 tmp = _write_partial(
                     str(root / key), value,
-                    durable=self.durable, touched=touched, partials=partials,
+                    durable=False, touched=touched, partials=partials,
                 )
             return (key, value, written), tmp
 
         try:
             staged = _map_lanes(stage, list(self._owned), self._threads())
+            if self.durable:
+                from zarr_vectors.core._durable import _fsync_path
+
+                _map_lanes(_fsync_path, [tmp for _e, tmp in staged if tmp], self._threads())
         except BaseException:
             _remove_all(partials)
             raise

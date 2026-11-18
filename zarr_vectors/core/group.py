@@ -978,7 +978,7 @@ class Group:
 
     @contextmanager
     def batched_writes(
-        self, compressor: Any = None, *, durable: bool = False,
+        self, compressor: Any = None, *, durable: bool | str = False,
     ) -> Iterator[None]:
         """Defer every :meth:`write_bytes` and :meth:`write_array_meta`
         call inside the block and flush them in a single
@@ -1005,6 +1005,9 @@ class Group:
                 documents written and every directory changed. For a
                 caller whose own record of "done" is durable. A no-op on
                 an object store, where a returned PUT already is.
+                ``"deferred"``: written atomically but not fsynced; the
+                caller makes them durable later with
+                :func:`zarr_vectors.building.sync_store`.
 
         Nesting is not supported and raises :class:`StoreError`.  Reads
         inside the block are unaffected and execute synchronously.
@@ -1045,6 +1048,9 @@ class Group:
         # handles are dropped rather than left to go stale.  See
         # :meth:`_lookup_node`.
         self._node_cache = {}
+        from zarr_vectors.core._durable import fsyncs
+
+        fsyncs(durable)  # reject a bad value before the block runs
         try:
             yield
             pending_writes = self._pending_writes
@@ -1061,7 +1067,7 @@ class Group:
                     pending_writes,
                     array_metas=pending_metas,
                     codecs=codecs,
-                    durable=durable,
+                    durable=fsyncs(durable),
                 )
         finally:
             # On normal exit the queues are already None.  On an
@@ -1082,7 +1088,7 @@ class Group:
         *,
         arrays: Iterable[str] | None = None,
         mode: Literal["replace", "merge"] = "replace",
-        durable: bool = True,
+        durable: bool | str = True,
         io_threads: int | None = None,
         sweep: bool = True,
     ) -> Iterator[Any]:

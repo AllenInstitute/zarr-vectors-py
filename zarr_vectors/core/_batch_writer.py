@@ -577,6 +577,10 @@ def _flush_native_cells(
     with warnings.catch_warnings():
         warnings.simplefilter("ignore", UnstableSpecificationWarning)
         _direct_write_many(direct_jobs, touched)
+        if touched is not None:
+            # Group commit: the cells are on disk and in place before any
+            # presence stamp names them.
+            touched.land()
         _stamp_presence(stamps)
 
         if not general:
@@ -584,6 +588,8 @@ def _flush_native_cells(
         if len(general) == 1 or _NO_THREADS:
             for array_name, (arr, cells) in general.items():
                 _flush_one_array(zarr_group, array_name, cells, arr=arr, touched=touched)
+            if touched is not None:
+                touched.land()
             return stamped
         with ThreadPoolExecutor(
             max_workers=min(_FLUSH_MAX_WORKERS, len(general)),
@@ -598,6 +604,8 @@ def _flush_native_cells(
             for future in futures:
                 # Re-raise the first failure, after every worker settles.
                 future.result()
+        if touched is not None:
+            touched.land()
     return stamped
 
 
@@ -648,11 +656,18 @@ def flush_batch(
     if durable and isinstance(zarr_group.store, LocalStore):
         from zarr_vectors.core._durable import Touched
 
-        touched = Touched()
+        # Group commit: cell objects are fsynced together, then renamed
+        # (see :mod:`._durable`).
+        touched = Touched(defer=True)
 
     stamped: list[str] = []
     if cells:
-        stamped = _flush_native_cells(zarr_group, cells, touched)
+        try:
+            stamped = _flush_native_cells(zarr_group, cells, touched)
+        except BaseException:
+            if touched is not None:
+                touched.discard()
+            raise
 
     if array_metas:
         _flush_group_metas(zarr_group, array_metas)
