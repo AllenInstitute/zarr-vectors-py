@@ -213,3 +213,27 @@ def test_frames_without_a_checksum_are_not_checked():
     outputs, errors = decode_zstd([frame])
     assert errors == {}   # undetectable without one: why checksum=True is worth it
     assert outputs[0].get().tobytes() != noise
+
+
+# Empty content ----------------------------------------------------------
+
+
+@pytest.mark.parametrize("checksum", [False, True])
+def test_an_empty_frame_decodes_to_nothing_beside_others(checksum):
+    """nvCOMP refuses the null buffer an empty output gets, which failed the
+    whole batch: empty frames are produced without it, alone or among others."""
+    raw = [b"", *_raw(2), b""]
+    frames = [cupy.asarray(np.frombuffer(Zstd(level=3, checksum=checksum).encode(r), np.uint8))
+              for r in raw]
+    outputs, errors = decode_zstd(frames)
+    assert errors == {}
+    assert [o.get().tobytes() for o in outputs] == raw
+    alone, errors = decode_zstd(frames[:1])
+    assert errors == {} and alone[0].size == 0
+
+
+def test_an_empty_frame_with_a_wrong_checksum_is_reported():
+    frame = np.frombuffer(Zstd(level=3, checksum=True).encode(b""), np.uint8).copy()
+    frame[-1] ^= 0xFF                                   # the last byte of the 4-byte checksum
+    outputs, errors = decode_zstd([cupy.asarray(frame)])
+    assert outputs == [None] and "checksum" in errors[0]
