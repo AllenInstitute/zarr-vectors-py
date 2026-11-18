@@ -126,6 +126,23 @@ groupings and links. It refuses, before touching an existing output:
 `rechunk_spatial` is the lossless path for such stores. Lift a refusal
 only when a real store needs it.
 
+### When OME-Zarr RFC 8 settles
+
+RFC 8 is under review (R1), unimplemented and without a JSON Schema.
+The root `ome` node (`core/ome.py`) meets its current text, but:
+- **Levels are not reachable.** Each `zv:level` entry has only `type`
+  and `name`, and level groups carry no `ome` node, so a generic RFC 8
+  resolver sees opaque names it cannot follow. Add a `path` to each
+  entry (the level group, e.g. `"0"`) once RFC 8 fixes what a node's
+  `path` looks like (the draft has both a string and a
+  `{"type": "zarr", "path": ...}` object). Additive: stamp it in place
+  with `building.stamp_ome_node`, no format bump.
+- **`version: "0.6"`** is a guess at the NGFF release RFC 8 lands in
+  (the draft says `"0.x"`); change it to the real one.
+- **Axes in `scene.coordinateSystems`** are RFC 5 objects; the draft's
+  table says strings. Follow whichever the final text keeps.
+- Validate the node against RFC 8's schema once one is published.
+
 ### GPU
 
 - **Readers still on the host:** `read_chunk_attribute_rows` (its row
