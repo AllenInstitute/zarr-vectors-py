@@ -38,6 +38,7 @@ enums:
       pyramid:
       wedge:
       hexahedron:
+      mixed:
   LinksConvention:
     description: >
       How intra-chunk links are represented for a polyline/graph/mesh.
@@ -397,7 +398,7 @@ classes:
       it, and readers then recover offsets from each array's own
       ``offsets`` meta.
     slots: [zv_array, level_delta, link_width, directed, store, sid_ndim,
-            num_links, num_physical_records, element]
+            num_links, num_physical_records, element, element_types]
     slot_usage:
       zv_array:
         equals_string: links_family
@@ -875,10 +876,19 @@ slots:
     description: >
       What each record of a ``delta = 0`` links family is, when it is a
       volume element: ``tetra`` (4 vertices), ``pyramid`` (5), ``wedge``
-      (6) or ``hexahedron`` (8), its vertices in VTK order.  Absent, a
+      (6) or ``hexahedron`` (8), its vertices in VTK order, or ``mixed``
+      (see ``element_types``).  Absent, a
       record is an edge (``link_width`` 2) or a polygon face (3 or more).
       Must agree with ``link_width``.
     range: LinkElement
+    required: false
+  element_types:
+    description: >
+      A ``mixed`` family's element types.  Records are as wide as the
+      widest; a shorter cell repeats its last vertex, so a record's run
+      of distinct vertices (4, 5, 6 or 8) names its type.
+    range: LinkElement
+    multivalued: true
     required: false
   num_physical_records:
     description: >

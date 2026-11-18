@@ -564,6 +564,30 @@ def _per_object_coarsen(
             / np.maximum(bin_counts, 1)
         )
 
+    # --- Step 3b: a mesh's coarse faces or cells ------------------------
+    # Planned before the metavertices are placed, since a volume mesh's
+    # boundary metavertices move (mesh_coarsen); written at step 9b.
+    mesh_plan = None
+    if not leading and n_metavertices:
+        from zarr_vectors.multiresolution.mesh_coarsen import plan_coarse_mesh
+
+        object_mvs: list[npt.NDArray[np.int64]] = []
+        _cursor = 0
+        for oid in keep_oids:
+            n = per_object_count[oid]
+            object_mvs.append(np.unique(inverse[_cursor:_cursor + n]))
+            _cursor += n
+        mesh_plan = plan_coarse_mesh(
+            src_group,
+            ndim=ndim,
+            mv_bins=np.frombuffer(
+                np.ascontiguousarray(unique_keys).tobytes(), dtype=np.int64,
+            ).reshape(-1, ndim),
+            bin_shape=bin_shape_arr,
+            meta_positions=meta_positions,
+            object_mvs=object_mvs,
+        )
+
     # --- Step 4: chunk-assign metavertices ------------------------------
     chunk_assignments = assign_chunks(meta_positions, chunk_shape)
     if mv_bin is not None:
@@ -633,8 +657,6 @@ def _per_object_coarsen(
         # We need to map each source vertex back to its metavertex_index.
         # Walk per-object slices of the flat ``inverse`` array.
         cursor = 0
-        volume_element = _volume_element(src_group) if not leading and ndim == 3 else None
-        object_mvs: list[npt.NDArray[np.int64]] = []
         new_manifests: dict[int, list[tuple[ChunkCoords, int]]] = {}
 
         def _id_of(row: int) -> int:
@@ -650,8 +672,6 @@ def _per_object_coarsen(
                 continue
             mv_seq = inverse[cursor:cursor + n]
             cursor += n
-            if volume_element is not None:
-                object_mvs.append(np.unique(mv_seq))
             # Drop consecutive duplicates, preserving order -- vectorised,
             # because this runs once per source vertex across the level.
             if mv_seq.size > 1:
@@ -683,19 +703,14 @@ def _per_object_coarsen(
                 sid_ndim=key_ndim,
             )
 
-        # --- Step 9b: a volume mesh's cells, built on the bin lattice -------
-        volume_summary: dict[str, Any] = {}
-        if volume_element is not None and n_metavertices:
-            volume_summary = _write_lattice_cells(
-                level_group,
-                source_element=volume_element,
-                unique_keys=unique_keys,
-                meta_positions=meta_positions,
-                object_mvs=object_mvs,
-                chunk_slots=chunk_slots,
-                mv_chunk_slot=mv_chunk_slot,
-                mv_fragment_idx=mv_fragment_idx,
-                ndim=ndim,
+        # --- Step 9b: the mesh's faces or cells, as planned at step 3b -----
+        mesh_summary: dict[str, Any] = {}
+        if mesh_plan is not None:
+            from zarr_vectors.multiresolution.mesh_coarsen import write_coarse_mesh
+
+            mesh_summary = write_coarse_mesh(
+                level_group, mesh_plan, ndim=ndim, chunk_slots=chunk_slots,
+                mv_chunk_slot=mv_chunk_slot, mv_fragment_idx=mv_fragment_idx,
             )
 
         # --- Step 10: per-object attributes with present_mask ---------------
@@ -757,58 +772,8 @@ def _per_object_coarsen(
         "method": COARSEN_PER_OBJECT,
         "preserves_object_ids": True,
         "shared_fragments": True,
-        **volume_summary,
+        **mesh_summary,
     }
-
-
-def _volume_element(src_group) -> str | None:
-    """The element of the source level's ``links/0`` family, if any."""
-    from zarr_vectors.core.elements import family_element
-    from zarr_vectors.core.paths import links_group_path
-
-    family = links_group_path(0)
-    if not src_group.array_exists(family):
-        return None
-    return family_element(src_group.read_array_meta(family) or {})
-
-
-def _write_lattice_cells(
-    level_group,
-    *,
-    source_element: str,
-    unique_keys: npt.NDArray,
-    meta_positions: npt.NDArray[np.floating],
-    object_mvs: list[npt.NDArray[np.int64]],
-    chunk_slots: list[ChunkCoords],
-    mv_chunk_slot: npt.NDArray[np.int64],
-    mv_fragment_idx: npt.NDArray[np.int64],
-    ndim: int,
-) -> dict[str, Any]:
-    """Write a coarse volume mesh's cells (see
-    :mod:`zarr_vectors.multiresolution.volume`); returns summary fields."""
-    from zarr_vectors.core.arrays import stamp_link_element, write_links
-    from zarr_vectors.multiresolution.volume import coarse_element, lattice_cells
-
-    element = coarse_element(source_element)
-    # Each metavertex is the centroid of one bin; ``unique_keys`` are the
-    # bins' int64 coordinates, one row per metavertex, as np.unique left them.
-    mv_bins = np.frombuffer(
-        np.ascontiguousarray(unique_keys).tobytes(), dtype=np.int64,
-    ).reshape(-1, ndim)
-    cells, dropped = lattice_cells(mv_bins, meta_positions, object_mvs, element)
-    if cells.shape[0]:
-        # One metavertex per fragment, so its row in the chunk is its
-        # fragment index.
-        slot_chunks = np.asarray(chunk_slots, dtype=np.int64).reshape(-1, ndim)
-        cc = slot_chunks[mv_chunk_slot[cells]]
-        vi = mv_fragment_idx[cells]
-        write_links(
-            level_group, [], ndim, delta=0, link_width=cells.shape[1],
-            _arrays=(cc, vi),
-        )
-        stamp_link_element(level_group, element, _records_are_new=True)
-    return {"element": element, "cell_count": int(cells.shape[0]),
-            "cells_dropped_inverted": dropped}
 
 
 _PATH_GEOMETRIES = frozenset({

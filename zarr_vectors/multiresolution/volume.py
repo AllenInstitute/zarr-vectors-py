@@ -26,6 +26,7 @@ one set of cells.
 from __future__ import annotations
 
 import itertools
+from typing import Any
 
 import numpy as np
 import numpy.typing as npt
@@ -88,7 +89,9 @@ def lattice_cells(
     positions: npt.NDArray[np.floating],
     objects: list[npt.NDArray[np.int64]],
     element: str,
-) -> tuple[npt.NDArray[np.int64], int]:
+    *,
+    return_blocks: bool = False,
+) -> Any:
     """Cells over the occupied 2 x 2 x 2 blocks of the bin lattice.
 
     Args:
@@ -100,7 +103,8 @@ def lattice_cells(
     Returns:
         ``(cells, dropped)``: ``(K, 4)`` or ``(K, 8)`` metavertex indices
         in VTK order, positive volume, no duplicates; and how many cells
-        were dropped for non-positive volume.
+        were dropped for non-positive volume.  With ``return_blocks``,
+        also each cell's block, as the ``(K, 3)`` bin of its first corner.
     """
     template = HEX_TEMPLATE if element == "hexahedron" else TET_TEMPLATE
     width = template.shape[1]
@@ -128,9 +132,13 @@ def lattice_cells(
         if present.any():
             blocks.append(corner_mv[present])
     if not blocks:
-        return np.zeros((0, width), dtype=np.int64), 0
+        empty = np.zeros((0, width), dtype=np.int64)
+        return (empty, 0, np.zeros((0, 3), np.int64)) if return_blocks else (empty, 0)
     corners = np.unique(np.concatenate(blocks), axis=0)
     cells = corners[:, template].reshape(-1, width)
+    block_of = np.repeat(mv_bins[corners[:, 0]], template.shape[0], axis=0)
     vol = signed_volumes(np.asarray(positions, dtype=np.float64), cells, element)
     keep = vol > 0
+    if return_blocks:
+        return cells[keep], int((~keep).sum()), block_of[keep]
     return cells[keep], int((~keep).sum())

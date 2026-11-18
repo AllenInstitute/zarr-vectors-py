@@ -128,22 +128,18 @@ only when a real store needs it.
 
 ### Volume meshes (zarr_vectors#10)
 
-`element` on a links family, the bin-lattice pyramid and
-`write_mesh_level` are in. Still open:
-- **Mixed element types in one level.** A family has one `link_width`,
-  so tets and hexes cannot share a level. Needs named link families
-  (composite stores already use `links_mesh/`) or padding.
-- **Per-cell attributes at coarse levels.** Link attributes are not
-  carried down. Volume-weighted mean for numbers and majority by volume
-  for categories, mapping each fine cell to the coarse block holding
-  its centroid.
-- **A better default boundary.** The lattice shrinks the volume by up to
-  half a bin per side per level. Snapping boundary metavertices to the
-  fine surface, or a Delaunay option clipped to the fine volume, would
-  fix it at more cost.
-- **Surface meshes** still get no faces at coarse levels.
-- **The convention schema** (now generated from the LinkML model in the
-  spec repo) should define `element` and the width it fixes.
+Elements (one type or `mixed`), coarse cells with boundary snapping,
+surface clustering, carried-down face/cell attributes and
+`write_mesh_level` are in. Left:
+- **Edges and corners** of a coarse volume round off by up to a bin
+  (snapping moves each boundary vertex to its bin's fine-surface
+  centroid, which fixes faces, not creases). A per-bin quadric fit
+  (dual contouring) would keep sharp features.
+- **`rechunk_spatial` refuses levels with link attributes**, so a mesh
+  with face attributes cannot be rechunked spatially yet.
+- **`tests/data/zarr_vectors_convention_v0.1.0.schema.json`** is the
+  convention schema from before `element`; refresh it from the spec
+  repo's `convention/schema.json` when that is published.
 
 ### When OME-Zarr RFC 8 settles
 

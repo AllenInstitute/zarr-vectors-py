@@ -48,15 +48,17 @@ def test_a_volume_pyramid_keeps_cells_at_every_level(tmp_path):
     specs = summary["level_specs"]
     assert [s["element"] for s in specs] == ["tetra", "tetra"]
     assert all(s["cells_dropped_inverted"] == 0 for s in specs)
-    # Bin centroids at 5..80 (level 1, bins of 20) and 15..80 (level 2,
-    # bins of 40): the lattice fills exactly the box they span.
-    expected = {0: 80.0 ** 3, 1: 75.0 ** 3, 2: 65.0 ** 3}
-    for level, vol in expected.items():
+    # Bin centroids span 5..80 (level 1, bins of 20) and 15..80 (level 2,
+    # bins of 40), so the unsnapped lattice holds 75**3 and 65**3;
+    # snapping the boundary out to the fine surface recovers more.
+    assert _volume(read_mesh(out, level=0)) == pytest.approx(80.0 ** 3)
+    for level, unsnapped in ((1, 75.0 ** 3), (2, 65.0 ** 3)):
         m = read_mesh(out, level=level)
         assert m["element"] == "tetra"
         assert m["face_count"] > 0
         assert np.all(zb.signed_volumes(m["vertices"], m["faces"], "tetra") > 0)
-        assert _volume(m) == pytest.approx(vol)
+        assert unsnapped < _volume(m) <= 80.0 ** 3 + 1e-6
+    assert _volume(read_mesh(out, level=1)) > 0.9 * 80.0 ** 3
     assert validate_consistency(out).ok
 
 

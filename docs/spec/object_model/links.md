@@ -261,7 +261,8 @@ Each node below stores these keys in its `zarr_vectors` attribute, beside
 policy only when it is missing.
 
 A `delta = 0` family MAY also carry `element`, naming a volume element
-that each record is (see [Volume meshes](../geometry_types/mesh.md#volume-meshes)).
+that each record is, or `"mixed"` with `element_types` (see
+[Volume meshes](../geometry_types/mesh.md#volume-meshes)).
 Absent, a record is an edge (`link_width` 2) or a polygon face (3 or
 more). The element fixes `link_width`, and is never declared on a
 `delta != 0` family: a cell's vertices are all on one level, though

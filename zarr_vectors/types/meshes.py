@@ -60,6 +60,7 @@ from zarr_vectors.core.arrays import (
     vertex_range_requests,
     write_chunk_attributes,
     write_chunk_vertices,
+    write_link_attributes,
     write_links,
     write_object_attributes,
     write_object_index,
@@ -68,7 +69,15 @@ from zarr_vectors.core.attr_chunking import (
     assign_attribute_bins,
     compute_chunk_dim_names,
 )
-from zarr_vectors.core.elements import check_element, family_element, signed_volumes
+from zarr_vectors.core.elements import (
+    MIXED,
+    check_distinct,
+    check_element,
+    family_element,
+    pack_mixed,
+    signed_volumes,
+    unpack_mixed,
+)
 from zarr_vectors.core.metadata import (
     LevelMetadata,
     get_level_chunk_shape,
@@ -129,6 +138,7 @@ def write_mesh(
     shard_shape: int | tuple[int, ...] | None | Literal["inherit"] = "inherit",
     element: str | None = None,
     check_orientation: bool = True,
+    face_attributes: dict[str, npt.NDArray] | None = None,
     _level: int = 0,
     _level_fields: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
@@ -139,6 +149,8 @@ def write_mesh(
         vertices: ``(V, D)`` vertex positions.
         faces: ``(F, L)`` index array: polygon faces (L=3 triangles,
             L=4 quads, ...), or volume cells when ``element`` is given.
+            A dict ``{element: (N, W)}`` writes a volume mesh of several
+            element types (``element="mixed"``, implied).
         chunk_shape: Spatial chunk size per dimension.
         encoding: ``"raw"`` or ``"draco"`` (3-D triangles only; other
             vertices are written raw).
@@ -156,12 +168,27 @@ def write_mesh(
         check_orientation: With ``element`` and 3-D positions, refuse
             cells whose signed volume is not positive (inverted, or not
             in VTK order) before anything is written.
+        face_attributes: Per-face (per-cell) values ``{name: (F,) or
+            (F, C)}``, in the order of ``faces`` (for a dict of cells:
+            each type's cells in turn, in the dict's order).  Stored as
+            link attributes; not with ``encoding="draco"``.
 
     Returns:
         Summary dict.
     """
     np_dtype = np.dtype(dtype)
     vertices = np.asarray(vertices, dtype=np_dtype)
+    element_types: list[str] | None = None
+    if isinstance(faces, dict):
+        if element not in (None, MIXED):
+            raise ArrayError(
+                f"faces given by element type need element='mixed' (or None), "
+                f"got {element!r}"
+            )
+        faces, element_types = pack_mixed(faces)
+        element = MIXED
+    elif element == MIXED:
+        raise ArrayError("element='mixed' takes faces as a dict {element: cells}")
     faces = np.asarray(faces, dtype=np.int64)
     n_verts, ndim = vertices.shape
     n_faces, link_width = faces.shape
@@ -170,6 +197,14 @@ def write_mesh(
         raise ArrayError(f"faces must be (F, L) with L≥3, got shape {faces.shape}")
     if element is not None:
         _check_volume_cells(vertices, faces, element, check_orientation)
+    for _name, _vals in (face_attributes or {}).items():
+        if np.asarray(_vals).shape[:1] != (n_faces,):
+            raise ArrayError(
+                f"face attribute {_name!r} has {np.asarray(_vals).shape[:1]} rows; "
+                f"expected {n_faces}, one per face"
+            )
+    if face_attributes and encoding == ENCODING_DRACO:
+        raise ArrayError("face_attributes are not stored with encoding='draco'")
 
     if object_ids is None:
         # When attribute-chunking, each vertex becomes its own object so
@@ -479,8 +514,9 @@ def write_mesh(
         # Intra-chunk faces are filed one link fragment per vertex
         # fragment -- i.e. per object -- so an object read can take its
         # own faces without decoding its neighbours'.
+        partition = None
         if link_buckets:
-            write_links(
+            partition = write_links(
                 level_group, [], idx_ndim, delta=0,
                 link_width=link_width, _prepartitioned=link_buckets,
                 _num_records=len(link_vi),
@@ -495,6 +531,13 @@ def write_mesh(
         create_links_array(
             level_group, link_width=link_width, delta=0, sid_ndim=idx_ndim,
         )
+
+        if face_attributes and partition is not None:
+            for _name, _vals in face_attributes.items():
+                write_link_attributes(
+                    level_group, _name, np.asarray(_vals),
+                    num_links=len(link_vi), partition=partition,
+                )
 
         # Write object index
         write_object_index(level_group, object_manifests, sid_ndim=idx_ndim)
@@ -512,7 +555,9 @@ def write_mesh(
     if fragment_starts:
         stamp_link_fragments_aligned(level_group)
     if element is not None:
-        stamp_link_element(level_group, element, _records_are_new=True)
+        stamp_link_element(
+            level_group, element, element_types=element_types, _records_are_new=True,
+        )
     _finalize_write(root, "write_mesh")
     return {
         "vertex_count": n_verts,
@@ -531,7 +576,9 @@ def write_mesh(
 def _check_volume_cells(
     vertices: npt.NDArray, cells: npt.NDArray, element: str, check_orientation: bool,
 ) -> None:
-    check_element(element, cells.shape[1])
+    if element != MIXED:  # pack_mixed has checked a mixed family's cells
+        check_element(element, cells.shape[1])
+        check_distinct(cells, element)
     if not check_orientation or vertices.shape[1] != 3 or cells.shape[0] == 0:
         return
     if cells.min() < 0 or cells.max() >= vertices.shape[0]:
@@ -595,7 +642,10 @@ def read_mesh(
         - ``vertex_count``, ``face_count``
         - ``element``: None when ``faces`` are polygon faces, or the
           volume element each row is (``"tetra"``, ...; see
-          :mod:`zarr_vectors.core.elements`)
+          :mod:`zarr_vectors.core.elements`), or ``"mixed"``
+        - ``cells``: for a volume mesh, ``{element: (N, W)}``; a mixed
+          family's padded ``faces`` split by type
+        - ``element_types``: a mixed family's types
         - ``object_ids``: ``(V,)`` owning object of each vertex -- only
           when ``object_ids=`` was given.  Vertices come back grouped by
           object, in the order the ids were asked for.
@@ -624,7 +674,22 @@ def read_mesh(
             attribute_filter=attribute_filter,
         )
         result["element"] = _level_element(root, level)
+        if result["element"] == MIXED:
+            types = _level_element_types(root, level)
+            result["element_types"] = types
+            result["cells"] = unpack_mixed(result["faces"], types)
+        elif result["element"] is not None:
+            result["cells"] = {result["element"]: result["faces"]}
         return result
+
+
+def _level_element_types(root: FsGroup, level: int) -> list[str]:
+    """A mixed ``links/0`` family's ``element_types``."""
+    from zarr_vectors.core.elements import ELEMENT_TYPES_KEY
+
+    level_group = get_resolution_level(root, level)
+    meta = level_group.read_array_meta(links_group_path(0)) or {}
+    return list(meta.get(ELEMENT_TYPES_KEY) or [])
 
 
 def _level_element(root: FsGroup, level: int) -> str | None:

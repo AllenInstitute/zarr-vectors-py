@@ -58,6 +58,7 @@ Name: zarr_vectors
 | [directed](directed.md) | When true, endpoint order is meaningful and preserved (no canonical sort): ``... |
 | [dtype](dtype.md) | Numpy dtype string of the array's value type (e |
 | [element](element.md) | What each record of a ``delta = 0`` links family is, when it is a volume elem... |
+| [element_types](element_types.md) | A ``mixed`` family's element types |
 | [encoding](encoding.md) | How the chunk bytes are encoded |
 | [format_capabilities](format_capabilities.md) | Optional 0 |
 | [fragments_tile](fragments_tile.md) | True when every chunk in this level has a vertex fragment index that tiles it... |
@@ -4037,6 +4038,7 @@ URI: [zv:LinkElement](https://w3id.org/zarr-vectors/schema/0.9/LinkElement)
 | pyramid | None |  |
 | wedge | None |  |
 | hexahedron | None |  |
+| mixed | None |  |
 
 
 
@@ -4046,6 +4048,7 @@ URI: [zv:LinkElement](https://w3id.org/zarr-vectors/schema/0.9/LinkElement)
 | Name | Description |
 | ---  | --- |
 | [element](element.md) | What each record of a ``delta = 0`` links family is, when it is a volume elem... |
+| [element_types](element_types.md) | A ``mixed`` family's element types |
 
 
 
@@ -4089,6 +4092,8 @@ permissible_values:
     text: wedge
   hexahedron:
     text: hexahedron
+  mixed:
+    text: mixed
 
 ```
 </details>
@@ -4236,6 +4241,17 @@ URI: [zv:LinksFamilyMeta](https://w3id.org/zarr-vectors/schema/0.9/LinksFamilyMe
     
 
         
+      LinksFamilyMeta : element_types
+        
+          
+    
+        
+        
+        LinksFamilyMeta --> "*" LinkElement : element_types
+        click LinkElement href "../LinkElement/"
+    
+
+        
       LinksFamilyMeta : level_delta
         
       LinksFamilyMeta : link_width
@@ -4289,6 +4305,7 @@ URI: [zv:LinksFamilyMeta](https://w3id.org/zarr-vectors/schema/0.9/LinksFamilyMe
 | [num_links](num_links.md) | 0..1 <br/> [Integer](Integer.md) | Family-wide *logical* link count — one per input record, however many physica... | direct |
 | [num_physical_records](num_physical_records.md) | 0..1 <br/> [Integer](Integer.md) | On-disk record row count across every offsets array and cell of a ``links/<de... | direct |
 | [element](element.md) | 0..1 <br/> [LinkElement](LinkElement.md) | What each record of a ``delta = 0`` links family is, when it is a volume elem... | direct |
+| [element_types](element_types.md) | * <br/> [LinkElement](LinkElement.md) | A ``mixed`` family's element types | direct |
 
 
 
@@ -4369,6 +4386,7 @@ slots:
 - num_links
 - num_physical_records
 - element
+- element_types
 slot_usage:
   zv_array:
     name: zv_array
@@ -4565,8 +4583,9 @@ attributes:
     name: element
     description: 'What each record of a ``delta = 0`` links family is, when it is
       a volume element: ``tetra`` (4 vertices), ``pyramid`` (5), ``wedge`` (6) or
-      ``hexahedron`` (8), its vertices in VTK order.  Absent, a record is an edge
-      (``link_width`` 2) or a polygon face (3 or more). Must agree with ``link_width``.
+      ``hexahedron`` (8), its vertices in VTK order, or ``mixed`` (see ``element_types``).  Absent,
+      a record is an edge (``link_width`` 2) or a polygon face (3 or more). Must agree
+      with ``link_width``.
 
       '
     from_schema: https://w3id.org/zarr-vectors/schema/0.9
@@ -4576,6 +4595,21 @@ attributes:
     - LinksFamilyMeta
     range: LinkElement
     required: false
+  element_types:
+    name: element_types
+    description: 'A ``mixed`` family''s element types.  Records are as wide as the
+      widest; a shorter cell repeats its last vertex, so a record''s run of distinct
+      vertices (4, 5, 6 or 8) names its type.
+
+      '
+    from_schema: https://w3id.org/zarr-vectors/schema/0.9
+    rank: 1000
+    owner: LinksFamilyMeta
+    domain_of:
+    - LinksFamilyMeta
+    range: LinkElement
+    required: false
+    multivalued: true
 
 ```
 </details></div>
@@ -9107,7 +9141,7 @@ search:
 # Slot: element 
 
 
-_What each record of a ``delta = 0`` links family is, when it is a volume element: ``tetra`` (4 vertices), ``pyramid`` (5), ``wedge`` (6) or ``hexahedron`` (8), its vertices in VTK order.  Absent, a record is an edge (``link_width`` 2) or a polygon face (3 or more). Must agree with ``link_width``._
+_What each record of a ``delta = 0`` links family is, when it is a volume element: ``tetra`` (4 vertices), ``pyramid`` (5), ``wedge`` (6) or ``hexahedron`` (8), its vertices in VTK order, or ``mixed`` (see ``element_types``).  Absent, a record is an edge (``link_width`` 2) or a polygon face (3 or more). Must agree with ``link_width``._
 
 __
 
@@ -9189,8 +9223,9 @@ URI: [zv:element](https://w3id.org/zarr-vectors/schema/0.9/element)
 name: element
 description: 'What each record of a ``delta = 0`` links family is, when it is a volume
   element: ``tetra`` (4 vertices), ``pyramid`` (5), ``wedge`` (6) or ``hexahedron``
-  (8), its vertices in VTK order.  Absent, a record is an edge (``link_width`` 2)
-  or a polygon face (3 or more). Must agree with ``link_width``.
+  (8), its vertices in VTK order, or ``mixed`` (see ``element_types``).  Absent, a
+  record is an edge (``link_width`` 2) or a polygon face (3 or more). Must agree with
+  ``link_width``.
 
   '
 from_schema: https://w3id.org/zarr-vectors/schema/0.9
@@ -9199,6 +9234,114 @@ domain_of:
 - LinksFamilyMeta
 range: LinkElement
 required: false
+
+```
+</details></div>
+
+
+---
+
+---
+search:
+  boost: 5.0
+---
+
+# Slot: element_types 
+
+
+_A ``mixed`` family's element types.  Records are as wide as the widest; a shorter cell repeats its last vertex, so a record's run of distinct vertices (4, 5, 6 or 8) names its type._
+
+__
+
+
+
+<div data-search-exclude markdown="1">
+
+
+
+URI: [zv:element_types](https://w3id.org/zarr-vectors/schema/0.9/element_types)
+<!-- no inheritance hierarchy -->
+
+
+
+
+
+## Applicable Classes
+
+| Name | Description | Modifies Slot |
+| --- | --- | --- |
+| [LinksFamilyMeta](LinksFamilyMeta.md) | Attributes for a ``links/<delta>/`` **group** — the family-wide policy every ... |  no  |
+
+
+
+
+
+
+## Properties
+
+### Type and Range
+
+| Property | Value |
+| --- | --- |
+| Range | [LinkElement](LinkElement.md) |
+| Domain Of | [LinksFamilyMeta](LinksFamilyMeta.md) |
+
+### Cardinality and Requirements
+
+| Property | Value |
+| --- | --- |
+| Multivalued | Yes |
+
+
+
+
+
+
+
+
+
+
+## Identifier and Mapping Information
+
+
+
+
+
+### Schema Source
+
+
+* from schema: https://w3id.org/zarr-vectors/schema/0.9
+
+
+
+
+## Mappings
+
+| Mapping Type | Mapped Value |
+| ---  | ---  |
+| self | zv:element_types |
+| native | zv:element_types |
+
+
+
+
+## LinkML Source
+
+<details>
+```yaml
+name: element_types
+description: 'A ``mixed`` family''s element types.  Records are as wide as the widest;
+  a shorter cell repeats its last vertex, so a record''s run of distinct vertices
+  (4, 5, 6 or 8) names its type.
+
+  '
+from_schema: https://w3id.org/zarr-vectors/schema/0.9
+rank: 1000
+domain_of:
+- LinksFamilyMeta
+range: LinkElement
+required: false
+multivalued: true
 
 ```
 </details></div>

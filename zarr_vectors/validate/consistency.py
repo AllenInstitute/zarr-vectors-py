@@ -312,10 +312,24 @@ def validate_consistency(store_path: str | Path | Group) -> ValidationResult:
             if element is not None:
                 from zarr_vectors.core.elements import ELEMENT_WIDTH
 
-                if element not in ELEMENT_WIDTH:
+                if element == "mixed":
+                    types = family_meta.get("element_types") or []
+                    unknown = [t for t in types if t not in ELEMENT_WIDTH]
+                    if not types or unknown or len(set(types)) != len(types):
+                        result.add_error(
+                            f"{prefix}: links[delta={d}] mixed element_types "
+                            f"{types!r} must list distinct known elements"
+                        )
+                    elif max(ELEMENT_WIDTH[t] for t in types) != link_width:
+                        result.add_error(
+                            f"{prefix}: links[delta={d}] element_types {types!r} "
+                            f"need records {max(ELEMENT_WIDTH[t] for t in types)} "
+                            f"wide but link_width is {link_width}"
+                        )
+                elif element not in ELEMENT_WIDTH:
                     result.add_error(
                         f"{prefix}: links[delta={d}] element {element!r} is not "
-                        f"one of {sorted(ELEMENT_WIDTH)}"
+                        f"one of {sorted(ELEMENT_WIDTH)} or 'mixed'"
                     )
                 elif ELEMENT_WIDTH[element] != link_width:
                     result.add_error(

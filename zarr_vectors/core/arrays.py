@@ -45,6 +45,7 @@ from zarr_vectors.core import convention as _zvc
 # every cloud-backed store. Annotation-only change; nothing moves.
 from zarr_vectors.core.group import _LEVEL_META_KEY, Group
 from zarr_vectors.core.paths import (
+    SELF_OFFSETS_SEGMENT,
     format_delta,
     format_offsets,
     intra_offsets,
@@ -4416,8 +4417,15 @@ def write_link_attributes(
             )
         partition = _derive_partition_from_links(level_group, delta)
 
-    link_width = int(fam_meta.get("link_width", 2))
     targeted = sorted({seg for seg, _chunk in partition.cell_indices})
+    if "link_width" in fam_meta:
+        link_width = int(fam_meta["link_width"])
+    elif targeted and targeted[0] != SELF_OFFSETS_SEGMENT:
+        # The family's metadata may still be queued (a write session);
+        # an offsets segment names one offset per endpoint after the first.
+        link_width = len(targeted[0].split("_")) + 1
+    else:
+        link_width = 1 if targeted else 2
 
     if mode == "replace":
         if arr.shape[0] != num_links:
@@ -5855,6 +5863,7 @@ def stamp_link_element(
     element: str | None,
     *,
     delta: int = 0,
+    element_types: Sequence[str] | None = None,
     _records_are_new: bool = False,
 ) -> None:
     """Declare what each record of ``links/<delta>/`` is.
@@ -5869,17 +5878,36 @@ def stamp_link_element(
     holds records (edges or polygon faces) is not retyped.  Drop the
     family and write it again instead.  A writer that has just written
     the records itself passes ``_records_are_new``.
+
+    ``element="mixed"`` declares several types at once; ``element_types``
+    lists them (each record's type is its ``element_type`` link
+    attribute, which the caller writes).
     """
-    from zarr_vectors.core.elements import ELEMENT_KEY, check_element, family_element
+    from zarr_vectors.core.elements import (
+        ELEMENT_KEY,
+        ELEMENT_TYPES_KEY,
+        MIXED,
+        check_element,
+        check_mixed,
+        family_element,
+    )
 
     family = links_group_path(delta)
     policy = link_family_policy(level_group, delta)
     if policy is None:
         raise ArrayError(f"{family}: no links family to declare an element on")
-    if element is not None:
+    if element == MIXED:
+        element_types = list(element_types or [])
+        check_mixed(element_types, policy[0])
+    elif element is not None:
         check_element(element, policy[0])
-    existing = family_element(level_group.read_array_meta(family) or {})
-    if existing == element:
+        if element_types:
+            raise ArrayError("element_types is only for element='mixed'")
+    fam_meta = level_group.read_array_meta(family) or {}
+    existing = family_element(fam_meta)
+    if existing == element and (
+        element != MIXED or list(fam_meta.get(ELEMENT_TYPES_KEY) or []) == element_types
+    ):
         return
     if existing is not None or (
         not _records_are_new and _family_has_records(level_group, delta)
@@ -5889,7 +5917,10 @@ def stamp_link_element(
             f"{existing or 'edges/faces'!r}; cannot redeclare them as "
             f"{element or 'edges/faces'!r}. Drop the family and write it again."
         )
-    level_group.write_array_meta(family, {ELEMENT_KEY: element})
+    meta = {ELEMENT_KEY: element}
+    if element == MIXED:
+        meta[ELEMENT_TYPES_KEY] = element_types
+    level_group.write_array_meta(family, meta)
 
 
 def carry_link_element(src_group: Group, out_group: Group, *, delta: int = 0) -> None:
@@ -5900,9 +5931,15 @@ def carry_link_element(src_group: Group, out_group: Group, *, delta: int = 0) ->
     family = links_group_path(delta)
     if not src_group.array_exists(family) or not out_group.array_exists(family):
         return
-    element = family_element(src_group.read_array_meta(family) or {})
+    from zarr_vectors.core.elements import ELEMENT_TYPES_KEY
+
+    meta = src_group.read_array_meta(family) or {}
+    element = family_element(meta)
     if element is not None:
-        stamp_link_element(out_group, element, delta=delta, _records_are_new=True)
+        stamp_link_element(
+            out_group, element, delta=delta,
+            element_types=meta.get(ELEMENT_TYPES_KEY), _records_are_new=True,
+        )
 
 
 def stamp_link_fragments_aligned(level_group: Group) -> bool:

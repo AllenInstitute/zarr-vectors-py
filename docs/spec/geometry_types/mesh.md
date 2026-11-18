@@ -136,10 +136,17 @@ cells with non-positive signed volume before writing anything; pass
 storage: records are stored sorted, with a permutation column
 (`has_perm`) that restores the order on read.
 
-- One element type per level: a family has one `link_width`. Mixed
-  volume meshes need one store (or level) per type for now.
+- Several element types: pass the cells as a dict,
+  `write_mesh(path, vertices, {"tetra": tets, "hexahedron": hexes})`.
+  The family is `element: "mixed"` with `element_types`; records are as
+  wide as the widest type, and a shorter cell repeats its last vertex
+  (a cell's vertices must be distinct, so the record's width before that
+  run names its type). `read_mesh` returns the padded `faces` and
+  `cells`, a dict of each type's cells.
+- `face_attributes={name: (F,) or (F, C)}` stores per-face or per-cell
+  values (material, quality) as link attributes, in the order of
+  `faces` (for a dict of cells, each type's cells in turn).
 - Draco encodes triangles only, so volume meshes are written `raw`.
-- Per-cell values (material, quality) are link attributes.
 - `building.boundary_faces(cells, element)` returns the faces that
   belong to one cell only, wound outward: the volume's surface.
   `building.signed_volumes(vertices, cells, element)` returns each
@@ -160,11 +167,31 @@ element), joining those eight vertices. Cells that would be inverted at
 the vertices' real positions are dropped; the build summary counts them
 as `cells_dropped_inverted`.
 
+Each coarse vertex on the boundary then moves to the centroid of the
+fine boundary vertices in its bin, so the faces of the volume stay where
+they were (edges and corners round off by up to a bin; the summary
+counts `boundary_vertices_snapped`). A move that would invert a cell is
+undone, and any cell still inverted is dropped.
+
 The cells fill the occupied volume with no gaps, and each block depends
-only on its own bins, so the build stays chunk-local. The surface is
-accurate to about one bin: the volume shrinks by up to half a bin at
-the boundary, and a feature thinner than two bins has no cells at that
-level. Surface meshes still get no faces at coarse levels.
+only on its own bins, so the build stays chunk-local. A feature thinner
+than two bins has no cells at that level. A mixed source coarsens to
+tetrahedra.
+
+#### Surface pyramids and carried-down values
+
+A surface mesh's coarse levels keep faces by vertex clustering: each
+face is re-pointed at the coarse vertices of its vertices' bins, faces
+left with a repeated vertex collapse, and faces over the same vertices
+are kept once, with the first one's winding. The summary reports
+`face_count`.
+
+Face and cell attributes come down too. A coarse face takes the fine
+faces that clustered onto it; a coarse cell takes the fine cells whose
+centroid lies in its block. Floating-point values are averaged, weighted
+by area or volume; integer and boolean values take the value with the
+most area or volume. A coarse cell that no fine cell maps to takes the
+level-wide mean or majority.
 
 #### Coarse levels decimated elsewhere
 
