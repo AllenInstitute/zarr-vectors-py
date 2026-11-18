@@ -28,7 +28,6 @@ import math
 import tempfile
 from pathlib import Path
 
-import numpy as np
 import pytest
 
 # ``building`` throughout, not ``core``: it is the supported surface, and a

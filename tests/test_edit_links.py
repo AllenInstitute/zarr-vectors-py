@@ -10,9 +10,7 @@ import pytest
 
 from zarr_vectors.core.arrays import read_chunk_links, read_links
 from zarr_vectors.core.store import open_store
-from zarr_vectors.exceptions import EditError
 from zarr_vectors.ops import (
-    EditSession,
     LinkRef,
     add_cross_chunk_link,
     add_link,

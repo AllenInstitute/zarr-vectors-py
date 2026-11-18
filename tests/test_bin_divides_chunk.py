@@ -16,8 +16,8 @@ import pytest
 from zarr_vectors.core.metadata import check_bin_shape_tiles_chunk
 from zarr_vectors.core.store import create_store
 from zarr_vectors.exceptions import MetadataError
-from zarr_vectors.types.polylines import write_polylines
 from zarr_vectors.types.points import write_points
+from zarr_vectors.types.polylines import write_polylines
 from zarr_vectors.validate import validate
 
 PTS = np.random.default_rng(0).uniform(0, 100, (500, 3)).astype("f4")

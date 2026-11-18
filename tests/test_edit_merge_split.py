@@ -16,7 +16,6 @@ from zarr_vectors.core.arrays import (
     read_chunk_links,
     read_chunk_vertices,
     read_object_manifest,
-    read_object_vertices,
 )
 from zarr_vectors.core.store import open_store
 from zarr_vectors.exceptions import EditError
@@ -24,7 +23,6 @@ from zarr_vectors.ops import (
     EditSession,
     FragmentRef,
     LinkRef,
-    VertexRef,
     add_link,
     edit_link,
     remove_link,
@@ -32,7 +30,6 @@ from zarr_vectors.ops import (
 )
 from zarr_vectors.types.graphs import write_graph
 from zarr_vectors.types.points import write_points
-
 
 # =====================================================================
 # Fixtures
@@ -317,8 +314,6 @@ class TestSplitInterFragment:
             src=last_lo_local, dst=first_hi_local,
             chunk=(0, 0, 0), fragment=f_lo,
         )
-        # Refresh manifest after the pre-split.
-        m_obj0 = read_object_manifest(root["0"], 0)
 
         # Now remove the bridging edge with update_objects=True.
         report = remove_link(
@@ -459,6 +454,7 @@ class TestEditLinkAndConventions:
         ``"explicit"``, emits a UserWarning, and then succeeds.
         """
         import warnings as _w
+
         from zarr_vectors.core.metadata import RootMetadata
 
         root = open_store(skeleton_chain, mode="r+")

@@ -149,9 +149,11 @@ def add_geometry(
                 "pass only `vertex_attributes`."
             )
         import warnings
+
+        from zarr_vectors.exceptions import ZVDeprecationWarning
         warnings.warn(
             "`attributes` is deprecated; use `vertex_attributes`.",
-            DeprecationWarning, stacklevel=2,
+            ZVDeprecationWarning, stacklevel=2,
         )
         vertex_attributes = attributes
 

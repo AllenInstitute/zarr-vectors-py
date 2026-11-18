@@ -107,7 +107,9 @@ def _snapshot(path, level=0):
     cells = {}
     for k in lg.list_chunks("vertices"):
         cc = _parse_chunk_key(k)
-        cells[cc] = [g.tobytes() for g in read_chunk_vertices(lg, cc, dtype=np.float32, ndim=3, _leaf=True)]
+        cells[cc] = [
+            g.tobytes() for g in read_chunk_vertices(lg, cc, dtype=np.float32, ndim=3, _leaf=True)
+        ]
     # Keyed by the real object id: a row-indexed list would not see ids renumbered.
     man = {}
     meta = lg.read_array_meta("object_index") if lg.array_exists("object_index") else {}
@@ -115,13 +117,20 @@ def _snapshot(path, level=0):
     if n and "sid_ndim" in meta:
         ids = read_object_id_table(lg)
         rows = read_all_object_manifests(lg)[:n]
-        man = {int(ids[r]) if ids is not None else r: [(tuple(int(c) for c in cc), int(f)) for cc, f in m]
-               for r, m in enumerate(rows)}
+        man = {
+            int(ids[r]) if ids is not None else r: [
+                (tuple(int(c) for c in cc), int(f)) for cc, f in m
+            ]
+            for r, m in enumerate(rows)
+        }
     edges = set()
     if octree_meta(lg) is not None:
         from zarr_vectors.octree_chunks.convert import read_octree_link_cells
         src, r_src, oth, r_oth = read_octree_link_cells(lg, leaf_table(lg))
-        edges = {frozenset([(int(a), int(b)), (int(c), int(d))]) for a, b, c, d in zip(src, r_src, oth, r_oth)}
+        edges = {
+            frozenset([(int(a), int(b)), (int(c), int(d))])
+            for a, b, c, d in zip(src, r_src, oth, r_oth)
+        }
     elif list_link_offsets(lg, 0):
         ch, vi = read_link_arrays(lg, delta=0)
         edges = {frozenset([(tuple(ch[r, 0]), int(vi[r, 0])), (tuple(ch[r, 1]), int(vi[r, 1]))])
@@ -169,8 +178,10 @@ def test_link_offsets_follow_the_ancestor_rule():
     # A depth-3 leaf beside a depth-2 one: 3/3.4.4 and 2/2.2.2.
     t = plan_leaves(np.argwhere(np.ones((8, 8, 8))), np.ones(512), target=1)
     from zarr_vectors.octree_chunks.table import LeafTable
-    t = LeafTable.from_arrays(max_depth=3, origin_cell=(0, 0, 0), depth=[3, 2], ijk=[[3, 4, 4], [2, 2, 2]],
-                              weight=[1, 1])
+
+    t = LeafTable.from_arrays(
+        max_depth=3, origin_cell=(0, 0, 0), depth=[3, 2], ijk=[[3, 4, 4], [2, 2, 2]], weight=[1, 1]
+    )
     o, d = t.link_offsets(np.array([0]), np.array([1]))
     assert o.tolist() == [[1, 0, 0]] and d.tolist() == [1]
     assert t.resolve(0, (1, 0, 0), 1) == 1
@@ -184,8 +195,15 @@ def graph_store(request, tmp_path):
     edges = _short_edges(pos)
     oids = (np.arange(len(pos)) // 40).astype(np.int64)
     path = tmp_path / "g.zv"
-    write_graph(path, pos, edges, chunk_shape=(CELL,) * 3, bounds=([0] * 3, [BOX] * 3), object_ids=oids,
-                shard_shape=None if request.param == "unsharded" else 4)
+    write_graph(
+        path,
+        pos,
+        edges,
+        chunk_shape=(CELL,) * 3,
+        bounds=([0] * 3, [BOX] * 3),
+        object_ids=oids,
+        shard_shape=None if request.param == "unsharded" else 4,
+    )
     return path, pos, edges, oids
 
 
@@ -333,8 +351,11 @@ def test_octree_read_once_reads_once(graph_store, tmp_path, monkeypatch):
     box = ([40, 40, 40], [160, 160, 160])
     tables, runs = [], []
     from_rows, execute = LeafTable.from_rows.__func__, engine.execute
-    monkeypatch.setattr(LeafTable, "from_rows",
-                        classmethod(lambda cls, *a, **k: tables.append(1) or from_rows(cls, *a, **k)))
+    monkeypatch.setattr(
+        LeafTable,
+        "from_rows",
+        classmethod(lambda cls, *a, **k: tables.append(1) or from_rows(cls, *a, **k)),
+    )
     monkeypatch.setattr(engine, "execute", lambda *a, **k: runs.append(1) or execute(*a, **k))
     zv.open(octr).level(0).select(bbox=box).read()
     assert (len(tables), len(runs)) == (1, 0)
@@ -403,8 +424,15 @@ def _small_graph(path, oids, *, n=2000, seed=7, shard=None):
     pos = _uneven(n=n, seed=seed)
     edges = _short_edges(pos, seed=seed)
     oids = np.asarray(oids(len(pos)) if callable(oids) else oids, dtype=np.int64)
-    write_graph(path, pos, edges, chunk_shape=(CELL,) * 3, bounds=([0] * 3, [BOX] * 3), object_ids=oids,
-                shard_shape=shard)
+    write_graph(
+        path,
+        pos,
+        edges,
+        chunk_shape=(CELL,) * 3,
+        bounds=([0] * 3, [BOX] * 3),
+        object_ids=oids,
+        shard_shape=shard,
+    )
     return pos, edges, oids
 
 
@@ -460,8 +488,14 @@ def test_sparse_object_ids_on_points(tmp_path):
 def test_repeated_object_ids_in_one_cell(tmp_path, oids):
     pos = np.array([[1, 1, 1], [2, 2, 2], [3, 3, 3]], np.float32)
     path = tmp_path / "one.zv"
-    write_graph(path, pos, np.array([[0, 1], [1, 2]]), chunk_shape=(CELL,) * 3, bounds=([0] * 3, [BOX] * 3),
-                object_ids=np.array(oids))
+    write_graph(
+        path,
+        pos,
+        np.array([[0, 1], [1, 2]]),
+        chunk_shape=(CELL,) * 3,
+        bounds=([0] * 3, [BOX] * 3),
+        object_ids=np.array(oids),
+    )
     asked = sorted(set(oids) | {0, 5})
     before, reads = _snapshot(path), _object_reads(path, asked)
     to_octree(path, target=1)
@@ -556,8 +590,11 @@ def _fail_on(monkeypatch, name, nth=1, exc=_Boom):
 
 # Failures while the new layout is being staged: the level is untouched.
 _STAGE_FAILURES = [
-    ("write_chunk_vertices", 1, _Boom), ("write_chunk_vertices", 40, KeyboardInterrupt),
-    ("write_object_index", 1, _Boom), ("stamp_fragments_tile", 1, _Boom), ("_seal", 1, KeyboardInterrupt),
+    ("write_chunk_vertices", 1, _Boom),
+    ("write_chunk_vertices", 40, KeyboardInterrupt),
+    ("write_object_index", 1, _Boom),
+    ("stamp_fragments_tile", 1, _Boom),
+    ("_seal", 1, KeyboardInterrupt),
 ]
 
 
@@ -566,7 +603,9 @@ _STAGE_FAILURES = [
     ("write_chunk_vertices", 40, KeyboardInterrupt, 4), ("_write_octree_links", 1, _Boom, 4),
 ])
 @pytest.mark.slow
-def test_to_octree_failing_while_staging_leaves_the_level_intact(tmp_path, monkeypatch, shard, name, nth, exc):
+def test_to_octree_failing_while_staging_leaves_the_level_intact(
+    tmp_path, monkeypatch, shard, name, nth, exc
+):
     path = tmp_path / "g.zv"
     _small_graph(path, lambda n: np.arange(n) // 40, shard=shard)
     before = _state(path)
@@ -588,7 +627,9 @@ def test_to_octree_failing_while_staging_leaves_the_level_intact(tmp_path, monke
 
 @pytest.mark.slow
 @pytest.mark.parametrize("name,nth,exc", [*_STAGE_FAILURES, ("write_links", 1, _Boom)])
-def test_to_uniform_failing_while_staging_leaves_the_level_intact(tmp_path, monkeypatch, name, nth, exc):
+def test_to_uniform_failing_while_staging_leaves_the_level_intact(
+    tmp_path, monkeypatch, name, nth, exc
+):
     path = tmp_path / "g.zv"
     _small_graph(path, lambda n: np.arange(n) // 40)
     uniform = _state(path)
@@ -607,7 +648,9 @@ def test_to_uniform_failing_while_staging_leaves_the_level_intact(tmp_path, monk
 
 @pytest.mark.slow
 @pytest.mark.parametrize("nth,shard", [(1, None), (3, 4), (5, None)])
-def test_to_octree_killed_during_the_swap_is_finished_by_the_next_call(tmp_path, monkeypatch, shard, nth):
+def test_to_octree_killed_during_the_swap_is_finished_by_the_next_call(
+    tmp_path, monkeypatch, shard, nth
+):
     path = tmp_path / "g.zv"
     _small_graph(path, lambda n: np.arange(n) // 40, shard=shard)
     before = _state(path)
@@ -695,7 +738,9 @@ def test_a_kill_while_deleting_a_moved_staged_array_loses_nothing(tmp_path, monk
 
 
 @pytest.mark.parametrize("repack", ["shard_store", "unshard_store", "set_octree"])
-def test_the_shard_repackers_refuse_a_level_part_way_through_a_conversion(tmp_path, monkeypatch, repack):
+def test_the_shard_repackers_refuse_a_level_part_way_through_a_conversion(
+    tmp_path, monkeypatch, repack
+):
     # They would repack the live arrays and not the staged ones swapped in
     # later, leaving the level packed two ways.
     from zarr_vectors import sharding
@@ -706,7 +751,11 @@ def test_the_shard_repackers_refuse_a_level_part_way_through_a_conversion(tmp_pa
         to_octree(path, target=150)
     monkeypatch.undo()
     before = _files(path)
-    kwargs = {"shard_store": {"shard_shape": 4}, "unshard_store": {}, "set_octree": {"octree": False}}[repack]
+    kwargs = {
+        "shard_store": {"shard_shape": 4},
+        "unshard_store": {},
+        "set_octree": {"octree": False},
+    }[repack]
     with pytest.raises(OctreeError, match="part way through to_octree"):
         getattr(sharding, repack)(str(path), **kwargs)
     assert _files(path) == before
@@ -770,7 +819,12 @@ def test_a_staged_copy_whose_swap_never_began_is_discarded(tmp_path, monkeypatch
 def _files(path):
     """Every file under ``path`` and its bytes."""
     from pathlib import Path
-    return {str(f.relative_to(path)): f.read_bytes() for f in sorted(Path(path).rglob("*")) if f.is_file()}
+
+    return {
+        str(f.relative_to(path)): f.read_bytes()
+        for f in sorted(Path(path).rglob("*"))
+        if f.is_file()
+    }
 
 
 def _copy(src, dst):
@@ -819,7 +873,9 @@ def test_links_between_levels_are_refused_both_ways(tmp_path):
 
 def test_capability_stays_while_any_level_is_octree(tmp_path):
     path = tmp_path / "cap.zv"
-    write_points(path, _uneven(n=3000, seed=3), chunk_shape=(CELL,) * 3, bounds=([0] * 3, [BOX] * 3))
+    write_points(
+        path, _uneven(n=3000, seed=3), chunk_shape=(CELL,) * 3, bounds=([0] * 3, [BOX] * 3)
+    )
     zv.open(path, mode="r+").build_pyramid(factors=[(2.0, 1.0)], cross_level_storage="none")
 
     def caps():
@@ -907,7 +963,12 @@ def test_leaf_cap_arguments():
     cells, counts = _cells_and_counts()
     t = plan_leaves(cells, counts, target=1200, max_leaf_cells=2)  # unsharded, capped on request
     assert int(t.sides().max()) == 2 and t.max_leaf_cells == 2 and t.shard_shape is None
-    assert plan_leaves(cells, counts, target=1200, max_leaf_cells=1, shard_shape=(4, 4, 4)).sides().max() == 1
+    assert (
+        plan_leaves(cells, counts, target=1200, max_leaf_cells=1, shard_shape=(4, 4, 4))
+        .sides()
+        .max()
+        == 1
+    )
     assert plan_leaves(cells, counts, target=1200).max_leaf_cells is None
     with pytest.raises(OctreeError, match="power of two"):
         plan_leaves(cells, counts, target=1200, max_leaf_cells=3)
@@ -1209,7 +1270,10 @@ def test_required_capabilities_keep_other_entries(tmp_path):
     assert read_root_metadata(open_store(path)).required_capabilities == ["additive_levels"]
     to_octree(path, target=150)
     assert _required(path) == ["additive_levels", CAP_OCTREE_CHUNKS]
-    assert read_root_metadata(open_store(path)).required_capabilities == ["additive_levels", CAP_OCTREE_CHUNKS]
+    assert read_root_metadata(open_store(path)).required_capabilities == [
+        "additive_levels",
+        CAP_OCTREE_CHUNKS,
+    ]
     to_uniform(path)
     assert _required(path) == ["additive_levels"]
     assert (path / "zarr.json").read_bytes() == root_json
@@ -1223,13 +1287,18 @@ def test_root_metadata_round_trips_required_capabilities():
              "multiscales": [{"axes": [{"name": "x", "type": "space"}]}]}
     meta = RootMetadata.from_dict(attrs)
     assert meta.required_capabilities == ["additive_levels", CAP_OCTREE_CHUNKS]
-    assert meta.to_dict()["zarr_vectors"]["required_capabilities"] == ["additive_levels", CAP_OCTREE_CHUNKS]
+    assert meta.to_dict()["zarr_vectors"]["required_capabilities"] == [
+        "additive_levels",
+        CAP_OCTREE_CHUNKS,
+    ]
     meta.required_capabilities = []
     assert "required_capabilities" not in meta.to_dict()["zarr_vectors"]
 
 
 @pytest.mark.slow
-@pytest.mark.parametrize("rewrite", ["shard_store", "unshard_store", "set_octree", "set_bounds", "coarsen_level"])
+@pytest.mark.parametrize(
+    "rewrite", ["shard_store", "unshard_store", "set_octree", "set_bounds", "coarsen_level"]
+)
 def test_rewrites_of_the_root_keep_required_capabilities(tmp_path, rewrite):
     from zarr_vectors import sharding
     from zarr_vectors.core.store import set_bounds
@@ -1239,11 +1308,18 @@ def test_rewrites_of_the_root_keep_required_capabilities(tmp_path, rewrite):
         pytest.importorskip("zarr_octree")
     path = tmp_path / "g.zv"
     if rewrite == "coarsen_level":
-        write_points(path, _uneven(n=3000, seed=3), chunk_shape=(CELL,) * 3, bounds=([0] * 3, [BOX] * 3),
-                     object_ids=np.arange(4000) // 10)
+        write_points(
+            path,
+            _uneven(n=3000, seed=3),
+            chunk_shape=(CELL,) * 3,
+            bounds=([0] * 3, [BOX] * 3),
+            object_ids=np.arange(4000) // 10,
+        )
         zv.open(path, mode="r+").build_pyramid(factors=[(2.0, 1.0)], cross_level_storage="none")
     else:
-        _small_graph(path, lambda n: np.arange(n) // 40, shard=None if rewrite == "shard_store" else 4)
+        _small_graph(
+            path, lambda n: np.arange(n) // 40, shard=None if rewrite == "shard_store" else 4
+        )
     _require(path, ["additive_levels"])
     to_octree(path, target=150)
     want = ["additive_levels", CAP_OCTREE_CHUNKS]
@@ -1305,6 +1381,7 @@ def test_a_required_capabilities_that_is_not_a_list_is_left_alone(tmp_path, valu
     """Malformed, so not ours to rewrite: the store still opens, reads and
     validates, and a conversion and back leaves the root as it was."""
     import json
+
     from zarr_vectors.octree_chunks import refresh_capabilities
     from zarr_vectors.validate import validate
     path = tmp_path / "g.zv"
@@ -1326,7 +1403,9 @@ def test_a_required_capabilities_that_is_not_a_list_is_left_alone(tmp_path, valu
 def test_object_reads_of_a_graph_without_edges(tmp_path):
     path = tmp_path / "g.zv"
     pos = _uneven(n=500)
-    write_graph(path, pos, np.zeros((0, 2), np.int64), chunk_shape=(CELL,) * 3, bounds=([0] * 3, [BOX] * 3))
+    write_graph(
+        path, pos, np.zeros((0, 2), np.int64), chunk_shape=(CELL,) * 3, bounds=([0] * 3, [BOX] * 3)
+    )
     to_octree(path, target=50)
     assert read_graph(path)["node_count"] == len(pos)
     got = read_graph(path, object_ids=[0])

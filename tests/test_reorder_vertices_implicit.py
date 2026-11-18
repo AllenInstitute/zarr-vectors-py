@@ -10,9 +10,7 @@ import numpy as np
 import pytest
 
 from zarr_vectors.core.arrays import (
-    read_chunk_links,
     read_chunk_vertices,
-    read_links,
 )
 from zarr_vectors.core.metadata import RootMetadata
 from zarr_vectors.core.store import get_resolution_level, open_store

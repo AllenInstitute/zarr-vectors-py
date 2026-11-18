@@ -13,13 +13,11 @@ Covers:
 from __future__ import annotations
 
 import numpy as np
-import pytest
 
 from zarr_vectors.core.store import open_store, read_level_metadata
 from zarr_vectors.rechunk import RechunkSpec, rechunk, rechunk_by_attribute
 from zarr_vectors.rechunk.spec import DimensionMapper
 from zarr_vectors.types.points import write_points
-
 
 # ===================================================================
 # DimensionMapper categorical mode

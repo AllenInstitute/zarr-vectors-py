@@ -83,7 +83,7 @@ from zarr_vectors.core.store import (
     read_level_metadata,
     read_root_metadata,
 )
-from zarr_vectors.exceptions import ArrayError
+from zarr_vectors.exceptions import ArrayError, ZVDeprecationWarning
 from zarr_vectors.spatial.boundary import build_vertex_chunk_mapping
 from zarr_vectors.spatial.chunking import (
     assign_chunks,
@@ -171,7 +171,7 @@ def write_graph(
         warnings.warn(
             "`is_tree` is deprecated; use `kind=\"skeleton\"` for trees, "
             "`kind=\"graph\"` (default) for general graphs.",
-            DeprecationWarning, stacklevel=2,
+            ZVDeprecationWarning, stacklevel=2,
         )
         kind = "skeleton" if is_tree else "graph"
     if node_attributes is not None:
@@ -183,7 +183,7 @@ def write_graph(
         import warnings
         warnings.warn(
             "`node_attributes` is deprecated; use `vertex_attributes`.",
-            DeprecationWarning, stacklevel=2,
+            ZVDeprecationWarning, stacklevel=2,
         )
         vertex_attributes = node_attributes
     if edge_attributes is not None:
@@ -195,7 +195,7 @@ def write_graph(
         import warnings
         warnings.warn(
             "`edge_attributes` is deprecated; use `link_attributes`.",
-            DeprecationWarning, stacklevel=2,
+            ZVDeprecationWarning, stacklevel=2,
         )
         link_attributes = edge_attributes
     if kind not in ("graph", "skeleton"):

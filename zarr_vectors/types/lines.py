@@ -67,7 +67,7 @@ from zarr_vectors.core.store import (
     read_level_metadata,
     read_root_metadata,
 )
-from zarr_vectors.exceptions import ArrayError, StoreError
+from zarr_vectors.exceptions import ArrayError, StoreError, ZVDeprecationWarning
 from zarr_vectors.spatial.chunking import (
     compute_bounds,
 )
@@ -131,7 +131,7 @@ def write_lines(
         import warnings
         warnings.warn(
             "`attributes` is deprecated; use `vertex_attributes`.",
-            DeprecationWarning, stacklevel=2,
+            ZVDeprecationWarning, stacklevel=2,
         )
         vertex_attributes = attributes
     if line_attributes is not None:
@@ -143,7 +143,7 @@ def write_lines(
         import warnings
         warnings.warn(
             "`line_attributes` is deprecated; use `object_attributes`.",
-            DeprecationWarning, stacklevel=2,
+            ZVDeprecationWarning, stacklevel=2,
         )
         object_attributes = line_attributes
     # Internal aliases so the rest of the body stays unchanged.

@@ -6,8 +6,8 @@ from pathlib import Path
 
 import numpy as np
 
+from tests._deprecated import open_zv
 from zarr_vectors.headers import HeaderRegistry
-from zarr_vectors.lazy import open_zv
 from zarr_vectors.types.points import write_points
 
 

@@ -184,7 +184,7 @@ def test_empty_append(tmp_path: Path):
     )
     write_object_attributes(store, "length", np.arange(n, dtype=np.int32))
 
-    with ObjectIndexAppender(store, n, SID_NDIM, list(range(n))) as app:
+    with ObjectIndexAppender(store, n, SID_NDIM, list(range(n))):
         pass  # no append → context manager calls close()
 
     meta = store.read_array_meta(OBJECT_INDEX)

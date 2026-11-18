@@ -118,11 +118,17 @@ def plan_leaves(
         shard_shape = shard_origin = None
     cap = leaf_cap(max_leaf_cells, shard_shape)
     shards = None if shard_shape is None else np.asarray(shard_shape, dtype=np.int64).reshape(3)
-    s_origin = np.zeros(3, np.int64) if shard_origin is None else np.asarray(shard_origin, np.int64).reshape(3)
+    s_origin = (
+        np.zeros(3, np.int64)
+        if shard_origin is None
+        else np.asarray(shard_origin, np.int64).reshape(3)
+    )
     if origin_cell is None:
         origin_cell = np.minimum(cells.min(axis=0), 0) if len(cells) else np.zeros(3, np.int64)
         if shards is not None:
-            origin_cell = s_origin + ((np.asarray(origin_cell, np.int64) - s_origin) // shards) * shards
+            origin_cell = (
+                s_origin + ((np.asarray(origin_cell, np.int64) - s_origin) // shards) * shards
+            )
     origin = np.asarray(origin_cell, dtype=np.int64).reshape(3)
     if shards is not None and ((origin - s_origin) % shards).any():
         raise OctreeError(
@@ -318,7 +324,11 @@ class LeafTable:
         at ``shard_origin``, default ``0``): wider than a shard, or across a
         shard boundary."""
         shards = np.asarray(shard_shape, dtype=np.int64).reshape(3)
-        o = np.zeros(3, np.int64) if shard_origin is None else np.asarray(shard_origin, np.int64).reshape(3)
+        o = (
+            np.zeros(3, np.int64)
+            if shard_origin is None
+            else np.asarray(shard_origin, np.int64).reshape(3)
+        )
         lo = self.anchors() - o
         hi = lo + self.sides()[:, None] - 1
         return np.flatnonzero((lo // shards != hi // shards).any(axis=1))
@@ -407,7 +417,9 @@ class LeafTable:
         smaller = ka[rows, first_diff] < kb[rows, first_diff]
         return (da > db) | ((da == db) & smaller)
 
-    def link_offsets(self, src: npt.ArrayLike, other: npt.ArrayLike) -> tuple[npt.NDArray[np.int64], npt.NDArray[np.int64]]:
+    def link_offsets(
+        self, src: npt.ArrayLike, other: npt.ArrayLike
+    ) -> tuple[npt.NDArray[np.int64], npt.NDArray[np.int64]]:
         """``(offset (M, 3), Δ (M,))`` naming ``other`` from ``src``; raises when
         the leaves are not adjacent or ``other`` is the finer of the two."""
         src, other = np.asarray(src, dtype=np.int64), np.asarray(other, dtype=np.int64)

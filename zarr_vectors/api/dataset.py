@@ -339,7 +339,9 @@ class Dataset:
         """
         from zarr_vectors.types.lines import write_lines
 
-        _check_columns("object_attributes", object_attributes, _n_rows(endpoints, "endpoints"), "lines")
+        _check_columns(
+            "object_attributes", object_attributes, _n_rows(endpoints, "endpoints"), "lines"
+        )
 
         return self._write(
             write_lines, endpoints,

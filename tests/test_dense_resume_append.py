@@ -38,7 +38,9 @@ def _old_write(level_group, offsets, coords, frags, *, sid_ndim, mode="replace",
     counts = np.diff(offsets)
     n = int(counts.size)
     new_blocks = np.concatenate([coords, frags[:, None]], axis=1)
-    exists = level_group.array_exists(dense.SPANS_PATH) and level_group.array_exists(dense.BLOCKS_PATH)
+    exists = level_group.array_exists(dense.SPANS_PATH) and level_group.array_exists(
+        dense.BLOCKS_PATH
+    )
     if mode == "replace" or not exists:
         start = 0 if mode == "replace" else int(at or 0)
         spans = np.empty((start + n, 2), dtype=np.int64)

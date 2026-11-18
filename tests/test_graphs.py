@@ -6,8 +6,8 @@ from pathlib import Path
 
 import numpy as np
 
-from zarr_vectors.types.graphs import write_graph, read_graph
 from zarr_vectors.exceptions import ArrayError
+from zarr_vectors.types.graphs import read_graph, write_graph
 
 
 class TestGeneralGraph:
@@ -48,7 +48,9 @@ class TestSkeleton:
         pos = np.array([[50,50,50],[40,40,40],[60,60,60],[30,30,30],
                          [45,35,35],[65,65,65],[25,25,25]], dtype=np.float32)
         edges = np.array([[1,0],[2,0],[3,1],[4,1],[5,2],[6,3]], dtype=np.int64)
-        s = write_graph(str(tmp_path / "s.zv"), pos, edges, chunk_shape=(200.,200.,200.), kind="skeleton")
+        write_graph(
+            str(tmp_path / "s.zv"), pos, edges, chunk_shape=(200.0, 200.0, 200.0), kind="skeleton"
+        )
         r = read_graph(str(tmp_path / "s.zv"))
         assert r["node_count"] == 7 and r["edge_count"] == 6
 
@@ -62,7 +64,9 @@ class TestSkeleton:
     def test_cross_chunk(self, tmp_path: Path) -> None:
         pos = np.array([[10,50,50],[20,50,50],[30,50,50],[110,50,50],[120,50,50]], dtype=np.float32)
         edges = np.array([[1,0],[2,1],[3,2],[4,3]], dtype=np.int64)
-        s = write_graph(str(tmp_path / "s.zv"), pos, edges, chunk_shape=(100.,100.,100.), kind="skeleton")
+        s = write_graph(
+            str(tmp_path / "s.zv"), pos, edges, chunk_shape=(100.0, 100.0, 100.0), kind="skeleton"
+        )
         assert s["cross_edge_count"] >= 1
         r = read_graph(str(tmp_path / "s.zv"))
         assert r["node_count"] == 5
@@ -112,7 +116,7 @@ class TestSkeletonReadOrder:
 
         r = read_graph(store)
         assert r["edge_count"] == 3, "read back an edge that was never written"
-        assert _edge_endpoints(r["positions"], r["edges"]) ==             _edge_endpoints(pos, edges)
+        assert _edge_endpoints(r["positions"], r["edges"]) == _edge_endpoints(pos, edges)
 
     def test_multi_object_forest(self, tmp_path: Path) -> None:
         """Two trees, one object id each -- the supported spelling.
@@ -129,7 +133,7 @@ class TestSkeletonReadOrder:
 
         r = read_graph(store)
         assert r["edge_count"] == 2, "the second tree's root grew a parent"
-        assert _edge_endpoints(r["positions"], r["edges"]) ==             _edge_endpoints(pos, edges)
+        assert _edge_endpoints(r["positions"], r["edges"]) == _edge_endpoints(pos, edges)
 
     def test_multi_object_roots_in_different_chunks(self, tmp_path: Path) -> None:
         pos = np.array([[310,10,10],[10,10,10],[20,20,20],
@@ -141,7 +145,7 @@ class TestSkeletonReadOrder:
 
         r = read_graph(store)
         assert r["edge_count"] == 3
-        assert _edge_endpoints(r["positions"], r["edges"]) ==             _edge_endpoints(pos, edges)
+        assert _edge_endpoints(r["positions"], r["edges"]) == _edge_endpoints(pos, edges)
 
     def test_a_forest_in_one_object_is_refused(self, tmp_path: Path) -> None:
         """Inexpressible, so it raises rather than inventing an edge.
@@ -175,7 +179,7 @@ class TestSkeletonReadOrder:
 
         r = read_graph(store)
         assert r["edge_count"] == 2
-        assert _edge_endpoints(r["positions"], r["edges"]) ==             _edge_endpoints(pos, edges)
+        assert _edge_endpoints(r["positions"], r["edges"]) == _edge_endpoints(pos, edges)
 
 
 class TestMultiObjectLinkIndices:
@@ -200,7 +204,7 @@ class TestMultiObjectLinkIndices:
 
         r = read_graph(store)
         assert r["edge_count"] == 2
-        assert _edge_endpoints(r["positions"], r["edges"]) ==             _edge_endpoints(pos, edges)
+        assert _edge_endpoints(r["positions"], r["edges"]) == _edge_endpoints(pos, edges)
 
 
 class TestBboxFilter:

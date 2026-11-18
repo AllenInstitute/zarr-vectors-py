@@ -31,7 +31,6 @@ from zarr_vectors.core.store import (
 )
 from zarr_vectors.exceptions import StoreError
 
-
 # ===================================================================
 # URL scheme detection
 # ===================================================================
@@ -183,7 +182,7 @@ def test_explicit_backend_honored_on_local_path(monkeypatch):
     from zarr.storage import FsspecStore
 
     store, _ = _make_zarr_store_with_session(
-        str("memory:///z"), backend="fsspec", mode="w",
+        "memory:///z", backend="fsspec", mode="w",
     )
     assert isinstance(store, FsspecStore)
 

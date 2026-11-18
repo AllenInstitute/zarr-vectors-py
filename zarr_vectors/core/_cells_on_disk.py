@@ -400,14 +400,18 @@ def _coalescing(src: CellSource | None = None) -> tuple[str, int, int]:
         _, gap, span = mode.split(":")
         return "gap", int(gap), int(span)
     if mode not in ("runs", "none"):
-        raise ValueError(f"ZARR_VECTORS_COALESCE={mode!r}: expected auto, runs, none or gap:<bytes>:<span>")
+        raise ValueError(
+            f"ZARR_VECTORS_COALESCE={mode!r}: expected auto, runs, none or gap:<bytes>:<span>"
+        )
     return mode, 0, 0
 
 
 _AUTO_GAP, _AUTO_SPAN = 64 << 10, 1 << 20
 
 
-def _spans(rows: list[tuple[int, Any, int, int, int, tuple[str, int, int]]]) -> list[tuple[int, int, list[int]]]:
+def _spans(
+    rows: list[tuple[int, Any, int, int, int, tuple[str, int, int]]],
+) -> list[tuple[int, int, list[int]]]:
     """Group ``rows`` -- (row id, object, offset, size, run, :func:`_coalescing`),
     sorted by object then offset -- into ``(start, stop, row ids)`` reads."""
     out: list[tuple[int, int, list[int]]] = []
@@ -442,7 +446,9 @@ def read_cells(
         for src, cells in requests
     ]
     local = [r for r, (src, _) in enumerate(requests) if src.local_root is not None]
-    rows: list[tuple[int, int, Any, str, int, int, int]] = []  # request, cell, store, where, offset, size, run
+    rows: list[
+        tuple[int, int, Any, str, int, int, int]
+    ] = []  # request, cell, store, where, offset, size, run
     if local:
         flat, errors_of = _locate_local([requests[r] for r in local])
         for r, errors in zip(local, errors_of):
@@ -459,7 +465,11 @@ def read_cells(
         ))
         for i, message in errors.items():
             out[r][i] = ValueError(message)
-        rows += [(r, i, src.store, rng.key, rng.offset, rng.size, rng.run) for i, rng in enumerate(ranges) if rng is not None]
+        rows += [
+            (r, i, src.store, rng.key, rng.offset, rng.size, rng.run)
+            for i, rng in enumerate(ranges)
+            if rng is not None
+        ]
     rows.sort(key=lambda f: (id(f[2]), f[3], f[4]))
     how = [_coalescing(src) for src, _ in requests]
     spans = _spans([(j, (id(f[2]), f[3]), f[4], f[5], f[6], how[f[0]]) for j, f in enumerate(rows)])
@@ -475,11 +485,18 @@ def read_cells(
 
         for ks in by_store.values():
             store = rows[in_store[ks[0]][2][0]][2]
-            got = _store_get_many(store, [
-                (rows[in_store[k][2][0]][3],
-                 RangeByteRequest(in_store[k][0], in_store[k][1]) if in_store[k][1] >= in_store[k][0] else None)
-                for k in ks
-            ])
+            got = _store_get_many(
+                store,
+                [
+                    (
+                        rows[in_store[k][2][0]][3],
+                        RangeByteRequest(in_store[k][0], in_store[k][1])
+                        if in_store[k][1] >= in_store[k][0]
+                        else None,
+                    )
+                    for k in ks
+                ],
+            )
             for k, g in zip(ks, got):
                 store_blobs[k] = g
     for (lo, hi, members), blob in zip(on_disk + in_store, blobs + store_blobs):
@@ -685,15 +702,24 @@ def read_indexes(src: CellSource, keys: list[str]) -> list[np.ndarray | None | E
 
         guess = SuffixByteRequest(index_read_nbytes(src.shard_shape))
         tails = _store_get_many(src.store, [(k, guess) for k in keys])
-        longer = [i for i, t in enumerate(tails) if isinstance(t, bytes) and index_tail_nbytes(t) > len(t)]
+        longer = [
+            i for i, t in enumerate(tails) if isinstance(t, bytes) and index_tail_nbytes(t) > len(t)
+        ]
         if longer:
-            more = _store_get_many(src.store, [(keys[i], SuffixByteRequest(index_tail_nbytes(tails[i]))) for i in longer])
+            more = _store_get_many(
+                src.store,
+                [(keys[i], SuffixByteRequest(index_tail_nbytes(tails[i]))) for i in longer],
+            )
             for i, t in zip(longer, more):
                 tails[i] = t
         rows: list[np.ndarray | None | Exception] = []
         for t in tails:
             try:
-                rows.append(t if t is None or isinstance(t, Exception) else dense_rows(t, src.shard_shape, runs=True))
+                rows.append(
+                    t
+                    if t is None or isinstance(t, Exception)
+                    else dense_rows(t, src.shard_shape, runs=True)
+                )
             except Exception as exc:  # noqa: BLE001 - reported per object
                 rows.append(exc)
         return rows
