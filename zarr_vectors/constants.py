@@ -291,7 +291,7 @@ non-zero offsets segment — so this token now marks only the presence of
 
 CAP_OCTREE_SHARDING: str = "octree_sharding"
 """The store is marked octree: its sharded per-chunk arrays are written with
-zarr-octree's ``octree`` codec (``zarr_octree_sharding`` before 0.4; cells grouped into the leaves of
+zarr-octree's ``octree_sharding`` codec (``zarr_octree_sharding`` before 0.4; cells grouped into the leaves of
 an octree aimed at a target size, and a sparse shard index) instead of
 ``sharding_indexed``.  Stamped with the root's ``octree_sharding`` block (the
 codec's configuration); set at construction (``Layout(octree=...)``) or by
@@ -299,8 +299,8 @@ codec's configuration); set at construction (``Layout(octree=...)``) or by
 or writing such an array needs the zarr-octree package.  Optional and
 additive: absent means ``sharding_indexed``, as every other store."""
 
-OCTREE_CODEC_NAMES: tuple[str, ...] = ("octree", "zarr_octree_sharding")
-"""Names zarr-octree's codec is stored under: ``octree`` (its zarr-extensions
+OCTREE_CODEC_NAMES: tuple[str, ...] = ("octree_sharding", "zarr_octree_sharding")
+"""Names zarr-octree's codec is stored under: ``octree_sharding`` (its zarr-extensions
 registry name, written since zarr-octree 0.4) and ``zarr_octree_sharding``
 (written by zarr-octree 0.3 and earlier, and still read).  An array whose
 first codec has either name is octree-sharded."""
