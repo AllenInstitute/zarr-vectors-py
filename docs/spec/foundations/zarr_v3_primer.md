@@ -41,9 +41,9 @@ A point cloud written with `write_points` has this tree:
 
 ```
 example.zarrvectors/
-    zarr.json                  ← root group: "zarr_vectors", "multiscales", "ome"
+    zarr.json                  ← root group: "zarr_vectors" (kind "root"), "multiscales", "ome"
     0/
-        zarr.json              ← level group: "zarr_vectors_level"
+        zarr.json              ← level group: "zarr_vectors" (kind "level")
         vertices/
             zarr.json          ← array metadata and attributes
             c/0/0/0            ← cell for spatial chunk (0, 0, 0)
@@ -62,8 +62,8 @@ See [Directory structure](../layout/directory_structure.md),
 
 Arrays such as `vertices/` have one cell per spatial chunk. Their shape
 is the spatial chunk grid, their Zarr chunk shape is all ones, and
-their `data_type` is `variable_length_bytes`. The `dtype` attribute
-gives the element type inside each cell. For 500 points in a 200-unit
+their `data_type` is `variable_length_bytes`. The `dtype` key of the
+`zarr_vectors` attribute gives the element type inside each cell. For 500 points in a 200-unit
 cube with `chunk_shape=(100.0, 100.0, 100.0)`, `0/vertices/zarr.json`
 is:
 
@@ -76,10 +76,13 @@ is:
   "fill_value": "",
   "codecs": [{"name": "vlen-bytes", "configuration": {}}],
   "attributes": {
-    "nonempty_chunks": ["0.0.0", "0.0.1", ...],
-    "zv_array": "vertices",
-    "dtype": "float32",
-    "encoding": "raw"
+    "zarr_conventions": [{"uuid": "66268a61-7833-4995-bbcb-233bb417dae5"}],
+    "zarr_vectors": {
+      "kind": "vertices",
+      "nonempty_chunks": ["0.0.0", "0.0.1", ...],
+      "dtype": "float32",
+      "encoding": "raw"
+    }
   },
   ...
 }

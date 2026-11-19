@@ -15,6 +15,7 @@ between objects, and per-object OIDs are preserved across levels.
 
 from __future__ import annotations
 
+import copy
 from contextlib import contextmanager, nullcontext
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -1015,8 +1016,11 @@ def _rollback_level_on_failure(root, source_level: int, target_level: int):
     and put back, since the step's ``write_links(mode="replace")`` rewrites
     it.  A cleanup failure is added as a note on the original error."""
     src = get_resolution_level(root, source_level)
-    root_before = root.attrs.to_dict()
-    src_before = src.attrs.to_dict()
+    # Deep copies: ``to_dict`` is shallow, and the stamps below edit the
+    # nested ``zarr_vectors`` object in place, which would otherwise edit
+    # the snapshot too and leave nothing to roll back to.
+    root_before = copy.deepcopy(root.attrs.to_dict())
+    src_before = copy.deepcopy(src.attrs.to_dict())
     had_links = src.array_exists(LINKS)
     plus_one = links_group_path(1)
     had_plus_one = src.array_exists(plus_one)

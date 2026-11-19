@@ -152,7 +152,7 @@ def test_level_metadata_round_trip_with_chunk_shape() -> None:
         parent_level=0,
     )
     d = lm.to_dict()
-    inner = d["zarr_vectors_level"]
+    inner = d["zarr_vectors"]
     assert inner["chunk_shape"] == [400.0, 400.0, 400.0]
     lm2 = LevelMetadata.from_dict(d)
     assert lm2.chunk_shape == (400.0, 400.0, 400.0)
@@ -167,7 +167,7 @@ def test_level_metadata_round_trip_without_chunk_shape() -> None:
         parent_level=0,
     )
     d = lm.to_dict()
-    assert "chunk_shape" not in d["zarr_vectors_level"]
+    assert "chunk_shape" not in d["zarr_vectors"]
     lm2 = LevelMetadata.from_dict(d)
     assert lm2.chunk_shape is None
 

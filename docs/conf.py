@@ -115,7 +115,6 @@ html_theme_options = {
 
 html_logo = "_static/zarr-vectors-logo.png"
 html_static_path = ["_static"]
-html_extra_path = ["explainer.html"]
 html_css_files = ["custom.css"]
 
 # Show "Edit on GitHub" links

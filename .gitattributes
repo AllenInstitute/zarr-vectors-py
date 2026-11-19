@@ -1,0 +1,6 @@
+# Generated or copied from the convention (AllenInstitute/zarr_vectors convention/):
+# collapsed in GitHub diffs.
+schema/zarr_vectors.schema.json linguist-generated=true
+schema/zarr_vectors.linkml.yaml linguist-generated=true
+schema/build.py linguist-generated=true
+uv.lock linguist-generated=true

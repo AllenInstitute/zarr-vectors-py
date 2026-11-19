@@ -81,8 +81,8 @@ rebin_level(store_path, target_bin_shape, *, level=0) -> dict
 into the new bins and rewrites the fragment index with one fragment per
 occupied bin, in bin order. Fragment `f` is then not the bin with
 row-major index `f`. Chunk files keep their paths and vertices keep their
-dtype. With `level=0` it sets the root `base_bin_shape`, the NGFF
-translation and each coarser level's `bin_ratio`; on another level it
+dtype. With `level=0` it sets the root `base_bin_shape` and each coarser level's
+`bin_ratio`; on another level it
 sets that level's `bin_shape` and `bin_ratio`. It raises:
 
 | Error | When |

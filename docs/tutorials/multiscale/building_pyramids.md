@@ -141,7 +141,7 @@ writes none. [Links](../../spec/object_model/links.md) gives the array layout.
 already exists, so remove the old levels before rebuilding.
 `remove_resolution_level` removes one level and refuses while a coarser level
 sits above it, so remove from the top down. Then rewrite the root
-`multiscales` list from the levels on disk:
+`multiscales` layout from the levels on disk:
 
 ```python
 from zarr_vectors.building import (

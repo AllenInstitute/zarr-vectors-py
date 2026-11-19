@@ -149,7 +149,7 @@ def test_add_face_attribute_round_trip(tmp_path, mode):
     assert got.dtype == np.float64
     np.testing.assert_array_equal(got, values)
     assert not lg.array_exists("face_attributes")
-    lv = lg.attrs.to_dict()["zarr_vectors_level"]
+    lv = lg.attrs.to_dict()["zarr_vectors"]
     assert "link_attributes" in lv["arrays_present"]
 
 

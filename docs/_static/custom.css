@@ -31,20 +31,6 @@
     line-height: 1.6;
 }
 
-/* ── Explainer iframe ────────────────────────────────────────────────────── */
-
-.zv-explainer-wrap {
-    width: 100%;
-    margin: 1.5rem 0;
-}
-
-.zv-explainer-frame {
-    width: 100%;
-    height: 520px;
-    border: none;
-    border-radius: 6px;
-}
-
 /* Brand accent — Zarr Vectors magenta */
 :root {
     --color-brand-primary:   #e0195c;

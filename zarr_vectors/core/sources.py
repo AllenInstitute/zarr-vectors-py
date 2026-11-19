@@ -29,7 +29,7 @@ __all__ = [
 
 #: The name of a composite level's leading chunk axis.
 SOURCE_AXIS = "source"
-_LEVEL_KEY = "zarr_vectors_level"
+_LEVEL_KEY = "zarr_vectors"
 #: Fingerprint keys zarr-vectors computes and checks; any other key a writer
 #: records is carried, not checked.
 _CHECKED = ("object_count",)

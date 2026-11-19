@@ -52,6 +52,7 @@ from zarr.core.sync import sync
 
 from zarr_vectors._engine.plan import ReadPlan, RowRequest
 from zarr_vectors._engine.snapshot import Snapshot
+from zarr_vectors.core import convention as _zvc
 from zarr_vectors.core.group import _ABSENT, Group
 
 
@@ -289,7 +290,7 @@ class GroupFetcher:
             node = nodes.get(path)
             if not isinstance(node, zarr.Array):
                 continue
-            present = node.attrs.get(_NONEMPTY_CHUNKS_ATTR)
+            present = _zvc.get_field(node.attrs, _NONEMPTY_CHUNKS_ATTR)
             if isinstance(present, (list, tuple)):
                 by_array.setdefault(path, []).extend(str(k) for k in present)
         chunks = _sync_fallback(zg, [(k, sorted(set(v))) for k, v in by_array.items()])

@@ -48,7 +48,7 @@ class TestImports:
             OBJIDX_STANDARD,  # noqa: F401
             VALID_GEOMETRY_TYPES,
         )
-        assert FORMAT_VERSION.startswith("0.9")
+        assert FORMAT_VERSION.startswith("0.10")
         assert len(VALID_GEOMETRY_TYPES) == 7
 
 

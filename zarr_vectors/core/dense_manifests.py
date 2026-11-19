@@ -17,6 +17,7 @@ import numpy as np
 import numpy.typing as npt
 
 from zarr_vectors.constants import OBJECT_INDEX
+from zarr_vectors.core import convention as _zvc
 from zarr_vectors.exceptions import ArrayError
 
 if TYPE_CHECKING:  # pragma: no cover
@@ -428,8 +429,10 @@ def _truncate(level_group: Group, path: str, n: int) -> None:
     end = min(n0, -(-n // outer) * outer)
     if end > n:
         node[n:end] = node.fill_value
-    if "shape" in node.attrs:
-        node.metadata.attributes["shape"] = [n, *node.shape[1:]]
+    if _zvc.has_field(node.attrs, "shape"):
+        node.metadata.attributes.update(_zvc.field_update(
+            node.metadata.attributes, "shape", [n, *node.shape[1:]]
+        ))
     node.resize((n, *node.shape[1:]))
     level_group._invalidate_node(path)
 

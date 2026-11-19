@@ -13,7 +13,6 @@ import numpy as np
 import zarr
 
 from zarr_vectors.core.metadata import LevelMetadata
-from zarr_vectors.core.multiscale import read_multiscale_metadata
 from zarr_vectors.core.store import (
     create_resolution_level,
     open_store,
@@ -112,13 +111,11 @@ class TestNGFFScaleFromBinShape:
         return path
 
     def _scale_for(self, path: str, level: str) -> list[float]:
-        ms = read_multiscale_metadata(open_store(path))
-        for d in ms[0]["datasets"]:
-            if d["path"] == level:
-                for t in d["coordinateTransformations"]:
-                    if t["type"] == "scale":
-                        return t["scale"]
-        raise AssertionError(f"no scale for level {level}")
+        from zarr_vectors.core.multiscale import get_level_scale
+
+        scale = get_level_scale(open_store(path), int(level))
+        assert scale is not None, f"no scale for level {level}"
+        return scale
 
     def _ratio_for(self, path: str, level: int) -> tuple[float, ...]:
         return read_level_metadata(open_store(path), level).bin_ratio

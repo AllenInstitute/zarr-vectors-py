@@ -68,7 +68,7 @@ The root attributes then hold:
 Without `bin_shape`, `base_bin_shape` is absent and each chunk is one bin.
 
 A coarser level records `bin_shape` and `bin_ratio` (as floats) in its
-`zarr_vectors_level` attributes. After
+`zarr_vectors` level object. After
 `build_pyramid(store, factors=[(2.0, 1.0)] * 3)` on the store above:
 
 | Level | `bin_ratio` | `bin_shape` | Bins per chunk |
@@ -80,7 +80,7 @@ A coarser level records `bin_shape` and `bin_ratio` (as floats) in its
 
 `zarr_vectors.core.store.read_level_metadata` returns `bin_shape` and
 `bin_ratio`. The [`multiscales`](../multiscale/multiscale_metadata.md)
-transforms are level 0's at every level and do not encode the bins.
+block only names the levels and does not encode the bins.
 
 ### Divisibility
 

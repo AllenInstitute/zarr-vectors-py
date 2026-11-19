@@ -95,7 +95,9 @@ def test_write_array_is_readable_with_stock_zarr(tmp_store_path: Path):
     store = LocalStore(str(tmp_store_path))
     arr = zarr.open_array(store=store, path="object_attributes/intensity", mode="r")
     np.testing.assert_array_equal(np.asarray(arr[:]), data)
-    assert dict(arr.attrs).get("zv_array") == "object_attribute"
+    # What a reader that knows nothing of this package sees: the
+    # convention's single namespaced object.
+    assert dict(arr.attrs)["zarr_vectors"]["kind"] == "object_attribute"
 
 
 def test_write_array_with_nan_fill_round_trips(tmp_store_path: Path):

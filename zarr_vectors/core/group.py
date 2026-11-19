@@ -54,6 +54,7 @@ from zarr_vectors.constants import (
 from zarr_vectors.constants import (
     VERTICES as _VERTICES_ARRAY,
 )
+from zarr_vectors.core import convention as _zvc
 from zarr_vectors.core._local_meta import resolve_local_node
 from zarr_vectors.core._vlen import (
     cell_region as _vlen_cell_region,
@@ -65,7 +66,7 @@ from zarr_vectors.exceptions import ArrayError, ShardedPresenceError, StoreError
 
 # Where ``LevelMetadata`` lives on a level group's attrs.  Duplicated
 # rather than imported because ``core.metadata`` imports this module.
-_LEVEL_META_KEY = "zarr_vectors_level"
+_LEVEL_META_KEY = "zarr_vectors"
 
 # Node-cache sentinel for "this path was probed and is genuinely absent",
 # as distinct from "this path was never prefetched".  Only the async
@@ -1192,7 +1193,7 @@ class Group:
                     f"when they landed; it has been deleted or replaced "
                     f"since. Rebuild with rebuild_presence() instead."
                 )
-            current = arr.attrs.get(_NONEMPTY_CHUNKS_ATTR)
+            current = _zvc.get_field(arr.attrs, _NONEMPTY_CHUNKS_ATTR)
             if current is None:
                 # Deferred level: a list of just these keys would hide
                 # every other cell.
@@ -1204,7 +1205,7 @@ class Group:
                     keys.add(chunk_key)
                 else:
                     keys.discard(chunk_key)
-            arr.attrs[_NONEMPTY_CHUNKS_ATTR] = sorted(keys)
+            _zvc.set_field(arr.attrs, _NONEMPTY_CHUNKS_ATTR, sorted(keys))
             # ``_chunk_listing`` memoizes the manifest; drop the stale entry.
             if self._listing_cache:
                 self._listing_cache.pop(self._full_path(array_name), None)
@@ -1472,7 +1473,7 @@ class Group:
         sharded_arr = self._sharded_chunk_array(array_name)
         if sharded_arr is None:
             return False
-        present = sharded_arr.attrs.get(_NONEMPTY_CHUNKS_ATTR)
+        present = _zvc.get_field(sharded_arr.attrs, _NONEMPTY_CHUNKS_ATTR)
         if present is not None:
             return self._presence_contains(array_name, present, chunk_key)
         # Fall back to inspecting the cell — slow path used when the
@@ -1546,7 +1547,7 @@ class Group:
                 return hit
         arr = self._sharded_chunk_array(array_name)
         present = (
-            arr.attrs.get(_NONEMPTY_CHUNKS_ATTR) if arr is not None else None
+            _zvc.get_field(arr.attrs, _NONEMPTY_CHUNKS_ATTR) if arr is not None else None
         )
         if present is None and arr is not None:
             present = self._derived_listing(array_name, arr)
@@ -1698,7 +1699,7 @@ class Group:
         node = self._lookup_node(array_name)
         if not isinstance(node, (zarr.Group, zarr.Array)):
             return {}
-        return dict(node.attrs)
+        return _zvc.unwrap_array_meta(node.attrs)
 
     def array_exists(self, array_name: str) -> bool:
         return isinstance(
@@ -1835,7 +1836,7 @@ class Group:
         n0 = int(arr.shape[0])
         total = n0 + int(row_data.shape[0])
         stamped = dict(attributes) if attributes else {}
-        if "shape" in arr.attrs:
+        if _zvc.has_field(arr.attrs, "shape"):
             stamped["shape"] = [total, *arr.shape[1:]]
         try:
             if total != n0:
@@ -1846,7 +1847,11 @@ class Group:
                 # it rewrote the document a second time.  Staged before
                 # the rows land, exactly as the grown shape is.
                 if stamped:
-                    arr.metadata.attributes.update(_json_safe(stamped))
+                    staged = _zvc.wrap_array_meta(
+                        _json_safe(stamped), existing=arr.metadata.attributes,
+                    )
+                    arr.metadata.attributes.clear()
+                    arr.metadata.attributes.update(staged)
                 arr.resize((total,) + tuple(arr.shape[1:]))
                 arr[n0:total] = row_data.astype(arr.dtype, copy=False)
             elif stamped:
@@ -2140,9 +2145,7 @@ class Group:
         # and its absence means "coords are array indices".
         if origin is not None and any(int(o) != 0 for o in origin):
             initial_attrs[_CHUNK_GRID_ORIGIN_ATTR] = [int(o) for o in origin]
-        if attributes:
-            initial_attrs.update(_json_safe(attributes))
-        create_kwargs["attributes"] = initial_attrs
+        create_kwargs["attributes"] = _alloc_attrs(initial_attrs, attributes)
 
         self._invalidate_node(array_name)
         with warnings.catch_warnings():
@@ -2255,7 +2258,7 @@ class Group:
             first = self._zarr.create_array(
                 first_name,
                 **base_kwargs,
-                attributes={**base_attrs, **_json_safe(first_attributes or {})},
+                attributes=_alloc_attrs(base_attrs, first_attributes),
             )
         handles: list[tuple[str, zarr.Array]] = [(first_name, first)]
         rest = arrays[1:]
@@ -2267,7 +2270,7 @@ class Group:
             for array_name, attributes in rest:
                 meta = dataclasses.replace(
                     template,
-                    attributes={**base_attrs, **_json_safe(attributes or {})},
+                    attributes=_alloc_attrs(base_attrs, attributes),
                 )
                 store_path = self._zarr.store_path / array_name
                 key = f"{store_path.path}/zarr.json" if store_path.path else "zarr.json"
@@ -2451,7 +2454,8 @@ class Group:
         after the coordinator declares.
         """
         try:
-            return self._zarr.attrs.get(_PRESENCE_DECL_ATTR) == _PRESENCE_DEFERRED
+            level = self._zarr.attrs.get(_LEVEL_META_KEY) or {}
+            return level.get(_PRESENCE_DECL_ATTR) == _PRESENCE_DEFERRED
         except Exception:  # noqa: BLE001 - a node with no readable attrs
             return False
 
@@ -2503,7 +2507,7 @@ class Group:
         shards = getattr(arr, "shards", None)
         if shards is not None:
             if on_sharded == "skip":
-                return sorted(arr.attrs.get(_NONEMPTY_CHUNKS_ATTR, []) or [])
+                return sorted(_zvc.get_field(arr.attrs, _NONEMPTY_CHUNKS_ATTR, []) or [])
             if on_sharded == "raise":
                 raise ShardedPresenceError(
                     f"Cannot derive presence for {array_name!r} in "
@@ -2513,10 +2517,10 @@ class Group:
                     f"'skip' to leave this array's manifest alone."
                 )
             keys = self._derive_presence_sharded(arr, array_name, tuple(shards))
-            arr.attrs[_NONEMPTY_CHUNKS_ATTR] = sorted(keys)
+            _zvc.set_field(arr.attrs, _NONEMPTY_CHUNKS_ATTR, sorted(keys))
             return sorted(keys)
         keys = self._presence_from_store(array_name, arr, verify=True)
-        arr.attrs[_NONEMPTY_CHUNKS_ATTR] = keys
+        _zvc.set_field(arr.attrs, _NONEMPTY_CHUNKS_ATTR, keys)
         return keys
 
     def _stored_cell_keys(self, array_name: str, arr: zarr.Array) -> list[str]:
@@ -2651,7 +2655,7 @@ class Group:
         node = self._lookup_node(path)
         if not isinstance(node, zarr.Array):
             return {}
-        return dict(node.attrs)
+        return _zvc.unwrap_array_meta(node.attrs)
 
     def read_array_fill_value(self, path: str) -> Any:
         """Return the ``fill_value`` of the standard Zarr array at ``path``.
@@ -2852,7 +2856,9 @@ _NONEMPTY_CHUNKS_ATTR = "nonempty_chunks"
 #: readers derive presence from the store instead.  Set by
 #: :func:`zarr_vectors.building.defer_presence`, cleared by the level-wide
 #: :func:`zarr_vectors.building.rebuild_presence`.
-_PRESENCE_DECL_ATTR = "zarr_vectors_presence"
+#: Field of the level's ``zarr_vectors`` block declaring presence deferred
+#: (top-level ``zarr_vectors_presence`` before format 0.10.0).
+_PRESENCE_DECL_ATTR = "presence"
 _PRESENCE_DEFERRED = "deferred"
 
 
@@ -2920,7 +2926,7 @@ _CHUNK_GRID_ORIGIN_ATTR = "chunk_grid_origin"
 
 def _grid_origin(arr: zarr.Array) -> tuple[int, ...] | None:
     """Return the stored chunk-grid origin for a vlen array, or ``None``."""
-    raw = arr.attrs.get(_CHUNK_GRID_ORIGIN_ATTR)
+    raw = _zvc.get_field(arr.attrs, _CHUNK_GRID_ORIGIN_ATTR)
     if not raw:
         return None
     return tuple(int(x) for x in raw)
@@ -3126,7 +3132,7 @@ def _record_nonempty_chunk(
     ``array_name`` is carried only to name the array in the
     :func:`observe_presence_writes` event; ``arr`` is what gets written.
     """
-    current = arr.attrs.get(_NONEMPTY_CHUNKS_ATTR)
+    current = _zvc.get_field(arr.attrs, _NONEMPTY_CHUNKS_ATTR)
     if current is None:
         # An array with no manifest derives presence from the store (see
         # ``_PRESENCE_DECL_ATTR``).  Starting a list here would claim this
@@ -3137,7 +3143,7 @@ def _record_nonempty_chunk(
         keys.add(chunk_key)
     else:
         keys.discard(chunk_key)
-    arr.attrs[_NONEMPTY_CHUNKS_ATTR] = sorted(keys)
+    _zvc.set_field(arr.attrs, _NONEMPTY_CHUNKS_ATTR, sorted(keys))
     _emit_presence(array_name, chunk_key, present)
 
 
@@ -3147,9 +3153,29 @@ def _json_safe(d: dict[str, Any]) -> dict[str, Any]:
 
 def _merge_attributes(node: zarr.Array | zarr.Group, attrs: dict[str, Any]) -> None:
     """Merge ``attrs`` into ``node``'s attributes in ONE ``zarr.json`` write
-    (``attrs.update`` writes once per key); ``node`` stays current."""
-    if attrs:
-        node.update_attributes(attrs)
+    (``attrs.update`` writes once per key); ``node`` stays current.
+
+    ``attrs`` is in-memory (flat) array metadata.  For a Zarr Vectors
+    array or family group it is merged into the node's ``zarr_vectors``
+    block (format 0.10.0) and the whole attribute set is replaced, so a
+    field written before the node had its ``zv_array`` does not linger
+    as a stale top-level copy.
+    """
+    if not attrs:
+        return
+    current = dict(node.attrs)
+    if "zv_array" in attrs or _zvc.is_array_block(current.get(_zvc.ZV_KEY)):
+        node.attrs.put(_zvc.wrap_array_meta(attrs, existing=current))
+        return
+    node.update_attributes(attrs)
+
+
+
+def _alloc_attrs(base: dict[str, Any], attributes: dict[str, Any] | None) -> dict[str, Any]:
+    """Attributes for a newly allocated chunk array: the presence/origin
+    ``base`` plus the caller's metadata, nested when it names a kind."""
+    flat = {**base, **_json_safe(attributes or {})}
+    return _zvc.wrap_array_meta(flat) if "zv_array" in flat else flat
 
 
 def _json_safe_value(v: Any) -> Any:

@@ -51,12 +51,12 @@ def _set_flag(store, value=True, level=0):
     """Force the claim on, without going through a writer."""
     root = open_store(store, mode="a")
     lg = get_resolution_level(root, level)
-    meta = dict(lg.attrs.get("zarr_vectors_level"))
+    meta = dict(lg.attrs.get("zarr_vectors"))
     if value:
         meta["fragments_tile"] = True
     else:
         meta.pop("fragments_tile", None)
-    lg.attrs.update({"zarr_vectors_level": meta})
+    lg.attrs.update({"zarr_vectors": meta})
 
 
 def _sorted_rows(a):

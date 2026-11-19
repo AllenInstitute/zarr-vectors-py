@@ -12,6 +12,18 @@ decided. Grouped by when it should land.
 
 ## Before the next release
 
+**Tag the convention where the stores point.** Format 0.10.0 stamps
+every root with the convention's `schema_url` and `spec_url`
+(`core/convention.py`, `CONVENTION_CMO`), which point at tag `v0.1.0` of
+`github.com/Andrew-Keenlyside/zarr-vectors`. Every store keeps these
+URLs, so merge the convention's `schema-fixes` branch and push the tag
+before releasing 0.10.0.
+
+**Format 0.10.0 is a cut-over for BRIDGE.** 0.9.x packages refuse 0.10.0
+stores, and 0.10.0 refuses 0.9.x stores until
+`building.migrate_metadata_0_10` has run on them. Move BRIDGE's pinned
+zarr-vectors to 0.10.0 first, then migrate its stores.
+
 **Publish zarr-octree to PyPI, then declare it.** zarr-octree is not on
 PyPI, so it is not a dependency or an extra: users get a git URL from an
 error message, and CI installs it from a pinned commit
@@ -104,6 +116,23 @@ groupings and links. It refuses, before touching an existing output:
 - levels above 0, and link or fragment attributes.
 `rechunk_spatial` is the lossless path for such stores. Lift a refusal
 only when a real store needs it.
+
+### When OME-Zarr RFC 8 settles
+
+RFC 8 is under review (R1), unimplemented and without a JSON Schema.
+The root `ome` node (`core/ome.py`) meets its current text, but:
+- **Levels are not reachable.** Each `zv:level` entry has only `type`
+  and `name`, and level groups carry no `ome` node, so a generic RFC 8
+  resolver sees opaque names it cannot follow. Add a `path` to each
+  entry (the level group, e.g. `"0"`) once RFC 8 fixes what a node's
+  `path` looks like (the draft has both a string and a
+  `{"type": "zarr", "path": ...}` object). Additive: stamp it in place
+  with `building.stamp_ome_node`, no format bump.
+- **`version: "0.6"`** is a guess at the NGFF release RFC 8 lands in
+  (the draft says `"0.x"`); change it to the real one.
+- **Axes in `scene.coordinateSystems`** are RFC 5 objects; the draft's
+  table says strings. Follow whichever the final text keeps.
+- Validate the node against RFC 8's schema once one is published.
 
 ### GPU
 

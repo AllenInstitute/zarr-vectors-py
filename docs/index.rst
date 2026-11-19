@@ -29,13 +29,6 @@ specified by Forrest Collman at the Allen Institute for Brain Science.
    memory. **b** — Summary of the Zarr Vectors concept, showing input data
    types, construction, and uses.
 
-.. raw:: html
-
-   <div class="zv-explainer-wrap">
-     <iframe src="explainer.html" class="zv-explainer-frame"
-             frameborder="0" allowfullscreen></iframe>
-   </div>
-
 ----
 
 | `Link to the GitHub repository <https://github.com/AllenInstitute/zarr-vectors-py>`__

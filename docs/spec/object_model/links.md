@@ -225,11 +225,14 @@ Under `store="duplicate"` the partition is required.
 
 ### Metadata
 
+Each node below stores these keys in its `zarr_vectors` attribute, beside
+`"zarr_conventions": [{"uuid": "66268a61-7833-4995-bbcb-233bb417dae5"}]`.
+
 `links/<delta>/` group (family policy):
 
 ```javascript
 {
-  "zv_array":    "links_family",
+  "kind":        "links_family",
   "level_delta": 0,
   "link_width":  2,
   "directed":    false,
@@ -244,8 +247,8 @@ Under `store="duplicate"` the partition is required.
 
 ```javascript
 {
+  "kind":        "links",
   "nonempty_chunks": ["0.0.0", "1.0.0"],
-  "zv_array":    "links",
   "dtype":       "int64",
   "offsets":     [[0, 0, 1]],   // parsed path segment
   "has_perm":    true,          // rows are 1 + L wide
@@ -260,15 +263,15 @@ policy only when it is missing.
 `link_attributes/<name>/<delta>/` group:
 
 ```javascript
-{ "zv_array": "link_attribute_family", "name": "weight", "level_delta": 0, "num_links": 8 }
+{ "kind": "link_attribute_family", "name": "weight", "level_delta": 0, "num_links": 8 }
 ```
 
 `link_attributes/<name>/<delta>/<offsets>/` array:
 
 ```javascript
 {
+  "kind":        "link_attribute",
   "nonempty_chunks": ["0.0.0", "1.0.0"],
-  "zv_array":    "link_attribute",
   "name":        "weight",
   "dtype":       "float32",
   "offsets":     [[1, 0, 0]],

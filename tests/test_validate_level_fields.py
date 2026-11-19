@@ -1,7 +1,7 @@
 """Per-level validation reads the fields where the writer keeps them.
 
-Level fields live under ``zarr_vectors_level`` and the spatial transform
-(``bin_shape`` / ``bin_ratio``) only in the NGFF ``multiscales`` block.
+Level fields, including a coarse level's ``bin_shape`` / ``bin_ratio``,
+live under the level's ``zarr_vectors`` object (format 0.10.0).
 The level-2/3/5 checks used to read the level's top-level attributes,
 found nothing there, and passed every store.
 """
@@ -32,20 +32,9 @@ def pyramid(tmp_path):
 
 def _set(path, level, key, value):
     g = zarr.open_group(path, mode="r+")
-    block = dict(g[str(level)].attrs["zarr_vectors_level"])
+    block = dict(g[str(level)].attrs["zarr_vectors"])
     block[key] = value
-    g[str(level)].attrs["zarr_vectors_level"] = block
-
-
-def _set_transform(path, level, kind, value):
-    g = zarr.open_group(path, mode="r+")
-    ms = g.attrs["multiscales"]
-    for ds in ms[0]["datasets"]:
-        if ds["path"] == str(level):
-            for t in ds["coordinateTransformations"]:
-                if t["type"] == kind:
-                    t[kind] = value
-    g.attrs["multiscales"] = ms
+    g[str(level)].attrs["zarr_vectors"] = block
 
 
 def test_written_pyramid_validates(pyramid):
@@ -82,13 +71,13 @@ def test_object_sparsity_out_of_range_fails(pyramid, value):
 
 
 def test_bin_ratio_below_one_fails(pyramid):
-    _set_transform(pyramid, 1, "scale", [0.5, 2.0, 2.0])
+    _set(pyramid, 1, "bin_ratio", [0.5, 2.0, 2.0])
     r = validate(pyramid, level=2)
     assert any("bin_ratio[0]=0.5 < 1" in e for e in r.errors), r.summary()
 
 
 def test_bin_shape_wrong_rank_fails(pyramid):
-    _set_transform(pyramid, 1, "translation", [25.0, 25.0])
+    _set(pyramid, 1, "bin_shape", [50.0, 50.0])
     r = validate(pyramid, level=2)
     assert any("bin_shape has 2 dims" in e for e in r.errors), r.summary()
 

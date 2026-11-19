@@ -13,7 +13,7 @@ from collections.abc import Iterator
 from contextlib import contextmanager
 from typing import Any
 
-LEVEL_META_KEY = "zarr_vectors_level"   # the level group's metadata attribute
+LEVEL_META_KEY = "zarr_vectors"   # the level group's metadata attribute
 LEVEL_KEY = "octree_chunks"             # the octree block inside it
 _FLAG = "_octree_chunks_converting"     # per-handle nesting count
 

@@ -65,9 +65,9 @@ def rebin_level(
     bin.  Per-vertex attribute arrays are re-sorted with their vertices,
     and vertices keep the store's dtype.
 
-    Level 0 updates the root ``base_bin_shape``, the NGFF translation
-    and every coarser level's ``bin_ratio``; a coarser level updates its
-    own ``bin_shape`` / ``bin_ratio``.
+    Level 0 updates the root ``base_bin_shape`` and every coarser level's
+    ``bin_ratio``; a coarser level updates its own ``bin_shape`` /
+    ``bin_ratio``.
 
     Args:
         store_path: Path or URL to a writable ZV store.
@@ -179,8 +179,8 @@ def rebin_level(
         bins_created += len(new_groups)
 
     # Level 0's bin is the root base_bin_shape (a level-0 bin_shape is
-    # invalid); coarse vertices are in level-0 coordinates, so every
-    # level's NGFF entry repeats level 0's transform.
+    # invalid); coarse vertices are in level-0 coordinates, so no
+    # level has a transform of its own.
     new_bin_shape = tuple(float(b) for b in target_bin_shape)
     if level == 0:
         # Through ``update_root_metadata``, which read-modify-writes the one
@@ -220,9 +220,10 @@ def _set_level_bins(root, level, bin_shape, base_bin) -> None:
     """Set a coarse level's ``bin_shape`` and float ``bin_ratio``."""
     lg = get_resolution_level(root, level)
     attrs = lg.attrs.to_dict()
-    block = dict(attrs.get("zarr_vectors_level", {}))
+    block = dict(attrs.get("zarr_vectors", {}))
+    block.setdefault("kind", "level")
     block["bin_shape"] = [float(b) for b in bin_shape]
     block["bin_ratio"] = [
         float(b) / float(bb) if bb else 1.0 for b, bb in zip(bin_shape, base_bin)
     ]
-    lg.attrs.update({"zarr_vectors_level": block})
+    lg.attrs.update({"zarr_vectors": block})

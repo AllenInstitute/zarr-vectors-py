@@ -9,8 +9,40 @@ everywhere in the package.
 # Format version
 # ---------------------------------------------------------------------------
 
-FORMAT_VERSION: str = "0.9.4"
+FORMAT_VERSION: str = "0.10.0"
 """Current ZV specification version.
+
+0.10.0: the metadata moves onto the Zarr Vectors convention
+(https://github.com/Andrew-Keenlyside/zarr-vectors, v0.1.0).
+Cell payloads are byte-for-byte those of 0.9.4; only where metadata lives
+changes, so 0.9.x stores migrate in place with
+:func:`zarr_vectors.building.migrate_metadata_0_10` and no data is rewritten.
+
+* Every node's Zarr Vectors properties sit under one attribute,
+  ``zarr_vectors``, discriminated by ``kind``: ``root``, ``level``,
+  ``parametric``, or an array kind.  Array fields (``dtype``, ``name``,
+  ``nonempty_chunks``, ...) move inside it, ``zarr_vectors_level`` becomes
+  ``zarr_vectors`` with ``kind: "level"``, and the level's
+  ``zarr_vectors_presence`` becomes its ``presence`` field.  Two array
+  kinds are renamed: ``attribute`` -> ``vertex_attribute`` and
+  ``groupings_attribute`` -> ``group_attribute``.  In memory, array
+  metadata keeps its flat ``zv_array`` shape (:mod:`zarr_vectors.core.convention`).
+* ``zarr_conventions`` registers the convention on every such node, and
+  the multiscales (and, with a CRS, proj) conventions on the root.
+* Axes move from NGFF ``multiscales[0].axes`` into ``zarr_vectors.axes``.
+* The bare-root OME-NGFF 0.4 ``multiscales`` list -- which pointed
+  ``datasets`` at groups and reused ``scale`` / ``translation`` for bin
+  geometry -- is replaced by the registered multiscales convention's
+  ``{"layout": [{"asset": "<level>"}]}``, with no ``transform``: vertex
+  coordinates are the same at every level, so there is no coordinate
+  transform to state.  A coarse level's ``bin_shape`` and ``bin_ratio``
+  live only in its own ``zarr_vectors`` object.
+* ``crs`` leaves the root object for the proj convention's
+  ``proj:projjson``.
+
+A 0.9.x reader cannot read a 0.10.0 store, and this package refuses a
+0.9.x store with :class:`~zarr_vectors.exceptions.UnsupportedFormatVersionError`
+naming the migration.
 
 0.9.4: an optional dense object-index layout, ``"dense_manifests_v1"``:
 ``object_index/manifest_spans`` (``int64 (n_objects, 2)``, start and
@@ -50,7 +82,8 @@ Also in 0.9.3, both additive in the same sense:
   reader that looks for ``name`` finds it unchanged.
 * A per-chunk array may omit ``nonempty_chunks``, meaning presence is
   not recorded and a reader takes it from the store.  That happens only
-  while a level declares ``zarr_vectors_presence: "deferred"`` -- a
+  while a level declares presence ``"deferred"`` (from 0.10.0 the
+  level object's ``presence`` field) -- a
   build-time state that the coordinator's rebuild ends, restoring every
   manifest -- so a finished store is readable by a 0.9.2 reader.  One
   caught mid-build is not: that reader treats the missing manifest as an

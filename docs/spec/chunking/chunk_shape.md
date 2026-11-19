@@ -38,14 +38,14 @@ covers picking values.
 
 ### Declaration
 
-`chunk_shape` is a required key of the root `zarr_vectors` block, for
+`chunk_shape` is a required key of the root `zarr_vectors` object, for
 example `"chunk_shape": [200.0, 200.0, 200.0]`. Its unit is the
 vertices' coordinate unit and its length is the spatial dimensionality
 D. It need not be isotropic. If it is omitted, `create_store` uses one
 chunk covering the bounds, and `write_points` one chunk covering the
 data.
 
-A level other than 0 may record its own `zarr_vectors_level.chunk_shape`,
+A level other than 0 may record its own `chunk_shape` in its `zarr_vectors` level object,
 a positive integer multiple of the root value on each axis, so coarse
 chunks nest over fine ones. `build_pyramid(..., chunk_scale_factors=...)`
 writes these; see [Pyramid construction](../multiscale/pyramid_construction.md).
@@ -77,9 +77,13 @@ shape is the chunk grid and whose Zarr chunks are single cells. Its
   "data_type": "variable_length_bytes",
   "chunk_grid": {"name": "regular", "configuration": {"chunk_shape": [1, 1, 1]}},
   "attributes": {
-    "nonempty_chunks": ["-1.-1.-1", "-1.-1.0", "-1.-1.1", "..."],
-    "chunk_grid_origin": [-1, -1, -1],
-    "zv_array": "vertices"
+    "zarr_vectors": {
+      "kind": "vertices",
+      "nonempty_chunks": ["-1.-1.-1", "-1.-1.0", "-1.-1.1", "..."],
+      "chunk_grid_origin": [-1, -1, -1],
+      ...
+    },
+    ...
   }
 }
 ```

@@ -31,6 +31,7 @@ from zarr_vectors.constants import (
     VERTEX_FRAGMENTS,
     VERTICES,
 )
+from zarr_vectors.core import convention as _zvc
 from zarr_vectors.core.arrays import (
     _chunk_key,
     _ensure_chunk_arrays,
@@ -133,7 +134,7 @@ def array_shard_grid(level_group: Any, name: str = VERTICES
     if codecs and type(codecs[0]).__name__ in ("ShardingCodec", "OctreeShardingCodec"):
         # Cells are the inner chunks, so the outer (stored) chunk is the shard.
         shard = tuple(int(c) for c in meta.chunk_grid.chunk_shape)
-    raw = node.attrs.get("chunk_grid_origin")
+    raw = _zvc.get_field(node.attrs, "chunk_grid_origin")
     origin = tuple(int(o) for o in raw) if raw else (0,) * len(meta.shape)
     return shard, origin
 
@@ -246,6 +247,7 @@ def _check_no_cross_level_links(root: Any, level: int) -> None:
 
 def _set_level_block(level_group: Any, block: dict[str, Any] | None) -> None:
     level = dict(level_group.attrs.get(LEVEL_META_KEY) or {})
+    level.setdefault("kind", "level")
     if block is None:
         level.pop(LEVEL_KEY, None)
     else:
@@ -574,6 +576,7 @@ def _open_staging(level_group: Any) -> Any:
     stage = level_group.require_group(STAGING)
     attrs = dict(level_group.attrs.to_dict())
     level = dict(attrs.get(LEVEL_META_KEY) or {})
+    level.setdefault("kind", "level")
     level.pop(LEVEL_KEY, None)
     attrs[LEVEL_META_KEY] = level
     stage.attrs.update(attrs)

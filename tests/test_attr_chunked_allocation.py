@@ -41,6 +41,7 @@ from zarr_vectors.building import (
     get_resolution_level,
     open_store,
 )
+from zarr_vectors.core.convention import get_field
 from zarr_vectors.exceptions import StoreError
 from zarr_vectors.types.points import write_points
 
@@ -84,9 +85,9 @@ def test_a_lazily_created_attribute_array_matches_the_level_rank(tmp_path):
 
     score = lg._sharded_chunk_array("vertex_attributes/score")
     assert score.shape == vertices.shape
-    assert dict(score.attrs).get("chunk_grid_origin") == dict(
-        vertices.attrs
-    ).get("chunk_grid_origin")
+    assert get_field(score.attrs, "chunk_grid_origin") == get_field(
+        vertices.attrs, "chunk_grid_origin"
+    )
 
 
 def test_a_real_key_round_trips_through_the_lazily_created_array(tmp_path):
@@ -156,9 +157,8 @@ def test_a_nonzero_origin_store_does_not_alias_cells(tmp_path):
     """
     path = _attr_store(tmp_path / "g.zarrvectors", bounds=_OFFSET_BOUNDS)
     lg = _level(path)
-    assert dict(lg._sharded_chunk_array("vertices").attrs).get(
-        "chunk_grid_origin"
-    ), "fixture has a zero origin; the silent branch is unreachable"
+    origin = get_field(lg._sharded_chunk_array("vertices").attrs, "chunk_grid_origin")
+    assert origin, "fixture has a zero origin; the silent branch is unreachable"
 
     create_attribute_array(lg, "score", dtype="float32")
     first, second = "1.2.2.2", "1.2.2.3"        # differ only in the last axis

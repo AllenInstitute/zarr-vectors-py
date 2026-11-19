@@ -172,8 +172,9 @@ class TestAdditive:
         assert set(attrs) >= {"zarr_vectors", "multiscales", OME_ATTRS_KEY}
         # Still the source of truth, still where every reader looks.
         assert attrs["zarr_vectors"]["zv_version"] == FORMAT_VERSION
-        assert attrs["multiscales"][0]["metadata"]["format"] == "zarr_vectors"
-        assert attrs["multiscales"][0]["axes"] == MICRON_AXES
+        assert attrs["zarr_vectors"]["kind"] == "root"
+        assert attrs["zarr_vectors"]["axes"] == MICRON_AXES
+        assert attrs["multiscales"]["layout"][0] == {"asset": "0"}
 
     def test_a_pre_0_9_2_store_still_opens(self, store):
         """The block is additive, so its absence is not an error."""
@@ -457,7 +458,7 @@ class TestWorldUnit:
         attrs = root.attrs.to_dict()
         expected = [{"name": n, "type": "space", "unit": "micrometer"} for n in "xyz"]
         assert _world(attrs)["axes"] == expected
-        assert attrs["multiscales"][0]["axes"] == expected
+        assert attrs["zarr_vectors"]["axes"] == expected
 
     def test_unit_fills_axes_that_carry_none(self, tmp_path):
         root = create_store(

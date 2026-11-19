@@ -44,11 +44,9 @@ The two bin checks run only when `geometry_types` has `point_cloud` and
 no `line`, `polyline`, `streamline`, `graph`, `skeleton` or `mesh`, the
 level has no `object_index/`, and some axis has more than one bin per
 chunk. Bins per chunk come from the level's chunk shape and a bin shape:
-at level 0 the root `base_bin_shape`; at a coarser level the one implied
-by its NGFF transform, which on stores this package writes is level 0's.
-So a coarse point-cloud level is checked against the base bins, not its
-own, and can draw out-of-bin warnings. Bins that do not tile the chunk
-skip both checks.
+at level 0 the root `base_bin_shape`; at a coarser level its own
+`bin_shape`. A coarse level that records no `bin_shape` skips both
+checks, as do bins that do not tile the chunk.
 
 ### Object index
 

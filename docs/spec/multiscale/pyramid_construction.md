@@ -75,8 +75,8 @@ Level attributes:
 | `bin_shape` | The target bin shape |
 | `bin_ratio` | `bin_shape` over the root's effective bin shape, per axis, as a float |
 
-The level's [`multiscales`](multiscale_metadata.md) entry repeats level
-0's transforms. The root's
+The level gets an entry, `{"asset": "<level>"}`, in the root
+[`multiscales`](multiscale_metadata.md) layout. The root's
 `format_capabilities` gains `shared_fragments`, and
 `preserved_object_ids` when the level has an object index.
 

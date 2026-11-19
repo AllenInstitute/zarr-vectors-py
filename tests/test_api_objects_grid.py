@@ -441,7 +441,7 @@ class TestGridOnAnAttributeChunkedLevel:
         path, pos, genes = binned
         level = zv.open(path).level(0)
         ref = next(iter(level.cells()))
-        values = level.store.attrs.to_dict()["zarr_vectors_level"][
+        values = level.store.attrs.to_dict()["zarr_vectors"][
             "chunk_attribute_values"
         ]
 

@@ -1,23 +1,26 @@
-"""Sanity-check: hand-written dataclasses round-trip against the LinkML schema.
+"""Written metadata against the LinkML model of the Zarr Vectors convention.
 
-The LinkML schema in ``schema/zarr_vectors.linkml.yaml`` is a *reference*
-model.  The runtime source of truth is the Python dataclass tree in
-``zarr_vectors/core/metadata.py``.  These tests prevent the two from
-drifting silently:
+``schema/zarr_vectors.linkml.yaml`` (and ``schema/build.py``) are copies of
+``convention/`` in AllenInstitute/zarr_vectors, where the convention's
+LinkML model is maintained; ``schema/regen.py`` generates
+``schema/zarr_vectors.schema.json`` from them.  These tests check that:
 
-* Examples emitted by ``to_dict()`` validate against the generated
-  JSON Schema (modulo a documented representation bridge — see
-  :func:`_to_linkml_logical_form`).
-* Deliberately-broken examples are rejected by the JSON Schema.
-* Every member of every ``VALID_*`` constant appears as an enum
-  member in the schema.
+* the generated schema is the one the convention publishes (by a hash
+  of its canonical JSON, so the LinkML copy here has not drifted from
+  it);
+* the ``zarr_vectors`` objects ``to_dict()`` and the array writers emit
+  validate against the class for their ``kind``, and broken ones do not;
+* every member of every ``VALID_*`` constant set is a member of the
+  matching schema enum, and the reverse.
 
-If the LinkML source changes, run ``python schema/regen.py`` and
-commit the regenerated JSON Schema; this test re-loads it.
+If the LinkML source changes upstream, copy it (and ``build.py``) here,
+run ``python schema/regen.py``, commit the regenerated schema, and set
+``PUBLISHED_SHA256`` to the hash the failing test prints.
 """
 
 from __future__ import annotations
 
+import hashlib
 import json
 from pathlib import Path
 
@@ -26,57 +29,33 @@ import pytest
 jsonschema = pytest.importorskip("jsonschema")
 
 from zarr_vectors.constants import (  # noqa: E402
+    VALID_COARSENING_METHODS,
     VALID_CROSS_CHUNK_STRATEGIES,
     VALID_ENCODINGS,
-    VALID_GEOMETRY_TYPES,
     VALID_LINKS_CONVENTIONS,
     VALID_OBJIDX_CONVENTIONS,
     VALID_XLEVEL_STORAGE,
 )
 from zarr_vectors.core.metadata import LevelMetadata, RootMetadata  # noqa: E402
+from zarr_vectors.exceptions import MetadataError  # noqa: E402
 
-SCHEMA_PATH = Path(__file__).resolve().parents[1] / "schema" / "zarr_vectors.schema.json"
+ROOT = Path(__file__).resolve().parents[1]
+SCHEMA_PATH = ROOT / "schema" / "zarr_vectors.schema.json"
+#: SHA-256 of the convention's published schema.json as canonical JSON
+#: (sorted keys, no whitespace): the convention repository reformats it
+#: with Prettier, so equality is as JSON, not bytes.
+PUBLISHED_SHA256 = "9b55eebc443313688f60ea93cdb40b2c05c934cf7d885b8915e204f537442102"
+
+
+def canonical_sha256(doc: dict) -> str:
+    return hashlib.sha256(
+        json.dumps(doc, sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()
 
 
 @pytest.fixture(scope="module")
 def schema():
     return json.loads(SCHEMA_PATH.read_text(encoding="utf-8"))
-
-
-def _to_linkml_logical_form(root_dict: dict) -> dict:
-    """Bridge wire-format ``.zattrs`` content into the LinkML object model.
-
-    The on-disk dict envelopes the payload under ``zarr_vectors`` /
-    ``zarr_vectors_level``; LinkML models the inner payload directly.
-    A couple of slot representations also differ:
-
-    * ``bounds`` on disk is ``[[min...], [max...]]`` (two parallel lists).
-      LinkML models it as a :class:`BoundingBox` object with
-      ``min_corner`` / ``max_corner`` properties.
-    * ``crs`` on disk may be a dict, scalar, or null; LinkML models it
-      as the open ``CRS`` class (``additionalProperties: true``).  The
-      JSON Schema accepts any of those, so no bridging is needed
-      anymore.
-
-    This is the only place that bridges the two representations; if it
-    grows beyond a handful of lines we should tighten the schema.
-    """
-    out = dict(root_dict)
-    if isinstance(out.get("bounds"), list) and len(out["bounds"]) == 2 \
-            and isinstance(out["bounds"][0], list):
-        out["bounds"] = {
-            "min_corner": list(out["bounds"][0]),
-            "max_corner": list(out["bounds"][1]),
-        }
-    # ``shard_shape`` on disk is a bare int when every axis agrees -- the
-    # compact form ``create_store`` stamps and a reader looks for. LinkML
-    # has no int-or-list union the generator renders cleanly, so the slot
-    # is multivalued and the scalar is widened here.
-    if isinstance(out.get("shard_shape"), int) and not isinstance(
-        out["shard_shape"], bool
-    ):
-        out["shard_shape"] = [out["shard_shape"]]
-    return out
 
 
 def _validate(schema: dict, defs_name: str, instance: dict) -> None:
@@ -86,7 +65,19 @@ def _validate(schema: dict, defs_name: str, instance: dict) -> None:
         "$defs": schema["$defs"],
         "$ref": f"#/$defs/{defs_name}",
     }
-    jsonschema.validate(instance, fragment)
+    jsonschema.Draft202012Validator(fragment).validate(instance)
+
+
+def test_generated_schema_is_the_published_convention_schema(schema):
+    """The convention repository publishes the schema generated from the
+    same LinkML (reformatted by Prettier), so the two are equal as JSON."""
+    got = canonical_sha256(schema)
+    assert got == PUBLISHED_SHA256, (
+        "schema/zarr_vectors.schema.json differs from the convention's "
+        "schema.json: re-copy convention/ from AllenInstitute/zarr_vectors "
+        "and run `python schema/regen.py`; if the convention itself moved, "
+        f"set PUBLISHED_SHA256 = {got!r}"
+    )
 
 
 # ===================================================================
@@ -108,9 +99,8 @@ def _minimal_root_md():
 
 
 def test_root_metadata_round_trip_validates(schema):
-    rm = _minimal_root_md()
-    wire = rm.to_dict()["zarr_vectors"]
-    _validate(schema, "RootMetadata", _to_linkml_logical_form(wire))
+    wire = _minimal_root_md().to_dict()["zarr_vectors"]
+    _validate(schema, "RootMetadata", wire)
 
 
 def test_root_metadata_with_octree_chunks_validates(schema):
@@ -119,7 +109,7 @@ def test_root_metadata_with_octree_chunks_validates(schema):
     rm.required_capabilities = ["octree_chunks"]
     wire = rm.to_dict()["zarr_vectors"]
     assert wire["required_capabilities"] == ["octree_chunks"]
-    _validate(schema, "RootMetadata", _to_linkml_logical_form(wire))
+    _validate(schema, "RootMetadata", wire)
 
 
 def test_root_metadata_with_dense_int32_manifests_validates(schema):
@@ -127,12 +117,20 @@ def test_root_metadata_with_dense_int32_manifests_validates(schema):
     rm.manifest_layout, rm.manifest_block_dtype = "dense", "int32"
     wire = rm.to_dict()["zarr_vectors"]
     assert wire["manifest_block_dtype"] == "int32"
-    _validate(schema, "RootMetadata", _to_linkml_logical_form(wire))
+    _validate(schema, "RootMetadata", wire)
+
+
+@pytest.mark.parametrize("shard_shape", [4, [4, 4, 2]])
+def test_root_metadata_shard_shape_scalar_or_per_axis_validates(schema, shard_shape):
+    """``create_store`` stamps a bare int when every axis agrees."""
+    wire = _minimal_root_md().to_dict()["zarr_vectors"]
+    wire["shard_shape"] = shard_shape
+    _validate(schema, "RootMetadata", wire)
 
 
 def test_level_metadata_minimal_validates(schema):
     lm = LevelMetadata(level=0, vertex_count=0, arrays_present=[])
-    wire = lm.to_dict()["zarr_vectors_level"]
+    wire = lm.to_dict()["zarr_vectors"]
     _validate(schema, "LevelMetadata", wire)
 
 
@@ -145,7 +143,7 @@ def test_level_metadata_with_attribute_chunking_validates(schema):
         chunk_attribute_name="gene",
         chunk_attribute_values=["A", "B"],
     )
-    wire = lm.to_dict()["zarr_vectors_level"]
+    wire = lm.to_dict()["zarr_vectors"]
     _validate(schema, "LevelMetadata", wire)
 
 
@@ -160,93 +158,92 @@ def test_level_metadata_with_numeric_bin_labels_validates(schema, values):
         chunk_attribute_name="group",
         chunk_attribute_values=values,
     )
-    wire = lm.to_dict()["zarr_vectors_level"]
+    wire = lm.to_dict()["zarr_vectors"]
     _validate(schema, "LevelMetadata", wire)
 
 
 # ===================================================================
-# Per-array .zattrs shapes — sampled from the writers in core/arrays.py
+# Per-array ``zarr_vectors`` objects, sampled from core/arrays.py writers
 # ===================================================================
 
 
 @pytest.mark.parametrize(
     "defs_name,instance",
     [
-        ("VerticesMeta",
-         {"zv_array": "vertices", "dtype": "float32", "encoding": "raw"}),
+        ("VerticesMetadata",
+         {"kind": "vertices", "dtype": "float32", "encoding": "raw"}),
         # Intra-chunk (all-zero offsets): rows are L ints, no perm_idx.
-        ("LinksMeta",
-         {"zv_array": "links", "dtype": "int64", "offsets": [[0, 0, 0]],
+        ("LinksMetadata",
+         {"kind": "links", "dtype": "int64", "offsets": [[0, 0, 0]],
           "has_perm": False, "link_width": 2, "level_delta": 0}),
         # Cross-level: source is always input endpoint 0, so no perm_idx.
-        ("LinksMeta",
-         {"zv_array": "links", "dtype": "int64", "offsets": [[0, 0, 0]],
+        ("LinksMetadata",
+         {"kind": "links", "dtype": "int64", "offsets": [[0, 0, 0]],
           "has_perm": False, "link_width": 2, "level_delta": 1}),
         # Non-intra at delta 0, undirected => a non-identity placement is
         # possible, so rows widen to 1 + L with a leading perm_idx.
-        ("LinksMeta",
-         {"zv_array": "links", "dtype": "int64", "offsets": [[0, 0, 1]],
+        ("LinksMetadata",
+         {"kind": "links", "dtype": "int64", "offsets": [[0, 0, 1]],
           "has_perm": True, "link_width": 2, "level_delta": 0}),
         # L=3 triangle face spanning two neighbours.
-        ("LinksMeta",
-         {"zv_array": "links", "dtype": "int64",
+        ("LinksMetadata",
+         {"kind": "links", "dtype": "int64",
           "offsets": [[0, 0, 1], [0, 1, 0]], "has_perm": True,
           "link_width": 3, "level_delta": 0}),
         # link_width == 1 (parent refs): no other endpoint, so the offsets
         # list is empty and the array sits at the ``self`` segment.
-        ("LinksMeta",
-         {"zv_array": "links", "dtype": "int64", "offsets": [],
+        ("LinksMetadata",
+         {"kind": "links", "dtype": "int64", "offsets": [],
           "has_perm": False, "link_width": 1, "level_delta": 1}),
-        ("AttributeMeta",
-         {"zv_array": "attribute", "name": "intensity", "dtype": "float32"}),
-        ("ObjectIndexMeta",
-         {"zv_array": "object_index", "num_objects": 42, "sid_ndim": 3}),
-        ("ObjectAttributeMeta",
-         {"zv_array": "object_attribute", "name": "volume",
+        ("VertexAttributeMetadata",
+         {"kind": "vertex_attribute", "name": "intensity", "dtype": "float32",
+          "row_shape": []}),
+        ("ObjectIndexMetadata",
+         {"kind": "object_index", "num_objects": 42, "sid_ndim": 3,
+          "layout": "vlen_manifests_v2"}),
+        # An index created before any object is written carries only kind.
+        ("ObjectIndexMetadata", {"kind": "object_index"}),
+        ("ObjectAttributeMetadata",
+         {"kind": "object_attribute", "name": "volume",
           "dtype": "float32", "shape": [42]}),
-        ("GroupingsMeta",
-         {"zv_array": "groupings", "num_groups": 5}),
-        ("GroupingsAttributeMeta",
-         {"zv_array": "groupings_attribute", "name": "label",
+        ("GroupsMetadata", {"kind": "groups", "num_groups": 5}),
+        ("GroupAttributeMetadata",
+         {"kind": "group_attribute", "name": "label",
           "dtype": "int32", "shape": [5]}),
         # --- links family group: policy, pre-finalize (no counts yet) ---
-        ("LinksFamilyMeta",
-         {"zv_array": "links_family", "level_delta": 0, "link_width": 2,
+        ("LinksFamilyMetadata",
+         {"kind": "links_family", "level_delta": 0, "link_width": 2,
           "directed": False, "store": "canonical", "sid_ndim": 3}),
         # Post-finalize: duplicate store, physical rows exceed logical.
-        ("LinksFamilyMeta",
-         {"zv_array": "links_family", "level_delta": 0, "link_width": 2,
+        ("LinksFamilyMetadata",
+         {"kind": "links_family", "level_delta": 0, "link_width": 2,
           "directed": False, "store": "duplicate", "sid_ndim": 3,
           "num_links": 12, "num_physical_records": 20}),
-        ("LinksFamilyMeta",
-         {"zv_array": "links_family", "level_delta": -1, "link_width": 1,
+        ("LinksFamilyMetadata",
+         {"kind": "links_family", "level_delta": -1, "link_width": 1,
           "directed": True, "store": "canonical", "sid_ndim": 3,
           "num_links": 5, "num_physical_records": 5}),
         # create_links_family stamps no sid_ndim when it isn't known, and
         # finalize_links preserves that absence rather than inventing one.
-        ("LinksFamilyMeta",
-         {"zv_array": "links_family", "level_delta": 0, "link_width": 2,
+        ("LinksFamilyMetadata",
+         {"kind": "links_family", "level_delta": 0, "link_width": 2,
           "directed": False, "store": "canonical"}),
         # --- link attributes -------------------------------------------
-        ("LinkAttributeMeta",
-         {"zv_array": "link_attribute", "name": "weight", "dtype": "float32",
-          "offsets": [[0, 0, 0]], "level_delta": 0}),
-        # write_link_attributes also stamps row_shape (tail dims per row).
-        ("LinkAttributeMeta",
-         {"zv_array": "link_attribute", "name": "weight", "dtype": "float32",
+        ("LinkAttributeMetadata",
+         {"kind": "link_attribute", "name": "weight", "dtype": "float32",
           "row_shape": [], "offsets": [[0, 0, 1]], "level_delta": 0}),
-        ("LinkAttributeMeta",
-         {"zv_array": "link_attribute", "name": "rgb", "dtype": "uint8",
+        ("LinkAttributeMetadata",
+         {"kind": "link_attribute", "name": "rgb", "dtype": "uint8",
           "row_shape": [3], "offsets": [[0, 0, 0]], "level_delta": 1}),
-        ("LinkAttributeFamilyMeta",
-         {"zv_array": "link_attribute_family", "name": "weight",
+        ("LinkAttributeFamilyMetadata",
+         {"kind": "link_attribute_family", "name": "weight",
           "level_delta": 1}),
-        ("LinkAttributeFamilyMeta",
-         {"zv_array": "link_attribute_family", "name": "weight",
+        ("LinkAttributeFamilyMetadata",
+         {"kind": "link_attribute_family", "name": "weight",
           "level_delta": 1, "num_links": 7}),
     ],
 )
-def test_per_array_zattrs_shapes_validate(schema, defs_name, instance):
+def test_per_array_metadata_validates(schema, defs_name, instance):
     _validate(schema, defs_name, instance)
 
 
@@ -293,65 +290,79 @@ def test_has_perm_rule_matches_shipped_writer(
 # ===================================================================
 
 
-def test_negative_reduction_factor_rejected(schema):
+def test_reduction_factor_below_two_rejected(schema):
     rm = _minimal_root_md()
     rm.reduction_factor = 1  # < 2
-    wire = _to_linkml_logical_form(rm.to_dict()["zarr_vectors"])
+    with pytest.raises(jsonschema.ValidationError):
+        _validate(schema, "RootMetadata", rm.to_dict()["zarr_vectors"])
+
+
+def test_root_without_a_space_axis_rejected(schema):
+    rm = _minimal_root_md()
+    wire = rm.to_dict()["zarr_vectors"]
+    wire["axes"] = [{"name": "t", "type": "time"}]
     with pytest.raises(jsonschema.ValidationError):
         _validate(schema, "RootMetadata", wire)
 
 
-def test_unknown_geometry_type_rejected(schema):
-    wire = _to_linkml_logical_form(_minimal_root_md().to_dict()["zarr_vectors"])
+def test_unknown_geometry_type_accepted(schema):
+    """The convention leaves ``geometry_types`` open, so a reader meeting a
+    newer geometry type is not made to reject the whole store."""
+    wire = _minimal_root_md().to_dict()["zarr_vectors"]
     wire["geometry_types"] = ["pancake"]
-    with pytest.raises(jsonschema.ValidationError):
-        _validate(schema, "RootMetadata", wire)
+    _validate(schema, "RootMetadata", wire)
 
 
 def test_object_sparsity_out_of_range_rejected(schema):
     lm = LevelMetadata(level=0, vertex_count=0, arrays_present=[])
-    wire = lm.to_dict()["zarr_vectors_level"]
+    wire = lm.to_dict()["zarr_vectors"]
     wire["object_sparsity"] = 2.0
     with pytest.raises(jsonschema.ValidationError):
         _validate(schema, "LevelMetadata", wire)
 
 
-def test_per_array_wrong_discriminator_rejected(schema):
-    # Otherwise-valid LinksMeta whose only defect is the tag: zv_array
-    # says "vertices" but LinksMeta has equals_string: links.  Keep every
+def test_per_array_wrong_kind_rejected(schema):
+    # Otherwise-valid links metadata whose only defect is the tag: kind
+    # says "vertices" but LinksMetadata pins kind to "links".  Keep every
     # other slot present so this fails on the discriminator alone and not
     # incidentally on a missing required slot.
-    instance = {"zv_array": "vertices", "dtype": "int64",
+    instance = {"kind": "vertices", "dtype": "int64",
                 "offsets": [[0, 0, 0]], "has_perm": False,
                 "link_width": 2, "level_delta": 0}
     with pytest.raises(jsonschema.ValidationError):
-        _validate(schema, "LinksMeta", instance)
+        _validate(schema, "LinksMetadata", instance)
 
 
-def test_links_family_tag_not_interchangeable_with_links(schema):
+def test_links_family_kind_not_interchangeable_with_links(schema):
     """The family group and its offsets arrays are distinct shapes.
 
     Both live under ``links/<delta>/`` and share slot names, so a reader
     that confused the two would silently decode policy as records.
     """
-    family = {"zv_array": "links_family", "level_delta": 0, "link_width": 2,
+    family = {"kind": "links_family", "level_delta": 0, "link_width": 2,
               "directed": False, "store": "canonical", "sid_ndim": 3}
     with pytest.raises(jsonschema.ValidationError):
-        _validate(schema, "LinksMeta", family)
+        _validate(schema, "LinksMetadata", family)
 
 
-def test_links_meta_missing_has_perm_rejected(schema):
+def test_links_missing_has_perm_rejected(schema):
     """``has_perm`` is the record-width discriminator: rows are L ints, or
     1 + L when true.  A writer that drops it leaves readers guessing a
     width, which mis-parses silently rather than raising."""
-    instance = {"zv_array": "links", "dtype": "int64",
+    instance = {"kind": "links", "dtype": "int64",
                 "offsets": [[0, 0, 1]], "link_width": 2, "level_delta": 0}
     with pytest.raises(jsonschema.ValidationError):
-        _validate(schema, "LinksMeta", instance)
+        _validate(schema, "LinksMetadata", instance)
+
+
+def test_unknown_kind_rejected(schema):
+    """``zarr_vectors`` must match exactly one kind class."""
+    with pytest.raises(jsonschema.ValidationError):
+        _validate(schema, "ZarrVectorsBlock", {"kind": "pancake"})
 
 
 # ===================================================================
-# Constants ↔ schema enum agreement
+# Constants <-> schema enum agreement
 # ===================================================================
 
 
@@ -362,8 +373,8 @@ def test_links_meta_missing_has_perm_rejected(schema):
         ("ObjectIndexConvention", VALID_OBJIDX_CONVENTIONS),
         ("CrossChunkStrategy", VALID_CROSS_CHUNK_STRATEGIES),
         ("CrossLevelStorage", VALID_XLEVEL_STORAGE),
-        ("GeometryType", VALID_GEOMETRY_TYPES),
-        ("Encoding", VALID_ENCODINGS),
+        ("VertexEncoding", VALID_ENCODINGS),
+        ("CoarseningMethod", VALID_COARSENING_METHODS),
     ],
 )
 def test_constant_set_matches_schema_enum(schema, enum_name, members):
@@ -384,28 +395,23 @@ def test_constant_set_matches_schema_enum(schema, enum_name, members):
 # ===================================================================
 
 
-def test_format_version_is_0_9_4():
-    """The current ZV writer stamps 0.9.4; bump tests here when bumping."""
+def test_format_version_is_0_10_0():
+    """The current ZV writer stamps 0.10.0; bump tests here when bumping."""
     from zarr_vectors.constants import FORMAT_VERSION
 
-    assert FORMAT_VERSION == "0.9.4", (
+    assert FORMAT_VERSION == "0.10.0", (
         f"FORMAT_VERSION drifted to {FORMAT_VERSION!r}; if intentional "
         f"update this test and the version-cutoff check in "
         f"zarr_vectors.core.metadata.RootMetadata.validate()."
     )
 
 
-@pytest.mark.parametrize("zv_version", ["0.9.0", "0.9.1", "0.9.2", "0.9.3"])
-def test_the_0_9_x_additions_did_not_move_the_read_cutoff(zv_version):
-    """Every 0.9.x addition is additive, so earlier 0.9 stores still read.
-
-    The hard break is at 0.9.0 -- the single-array layout.
-    ``attribute_specs`` (0.9.1), the RFC 8 ``ome`` node (0.9.2) and
-    ``shard_shape`` (0.9.3) and ``manifest_layout`` (0.9.4) each only
-    add an optional root key.  Raising
-    the cutoff alongside the version would strand earlier stores for
-    fields they are entitled not to have.
-    """
+@pytest.mark.parametrize("zv_version", ["0.9.0", "0.9.1", "0.9.2", "0.9.3", "0.9.4"])
+def test_0_10_0_moves_the_read_cutoff(zv_version):
+    """0.10.0 moved every metadata key onto the Zarr Vectors convention,
+    so the cutoff moves with it: a 0.9.x store is migrated in place
+    (``migrate_metadata_0_10``), not read.  Within 0.9 every addition was
+    additive and the cutoff stayed at 0.9.0."""
     from zarr_vectors.core.metadata import RootMetadata
 
     axes = [{"name": n, "type": "space"} for n in "xyz"]
@@ -416,7 +422,8 @@ def test_the_0_9_x_additions_did_not_move_the_read_cutoff(zv_version):
         geometry_types=["point_cloud"],
         zv_version=zv_version,
     )
-    meta.validate()  # must not raise
+    with pytest.raises(MetadataError, match=zv_version):
+        meta.validate()
 
 
 def test_an_absent_shard_shape_reads_as_unsharded():
@@ -426,12 +433,13 @@ def test_an_absent_shard_shape_reads_as_unsharded():
     axes = [{"name": n, "type": "space"} for n in "xyz"]
     meta = RootMetadata.from_dict({
         "zarr_vectors": {
-            "zv_version": "0.9.2",
+            "kind": "root",
+            "zv_version": "0.10.0",
+            "axes": axes,
             "chunk_shape": [100.0] * 3,
             "bounds": [[0.0] * 3, [100.0] * 3],
             "geometry_types": ["point_cloud"],
         },
-        "multiscales": [{"axes": axes}],
     })
     assert meta.shard_shape is None
     assert meta.manifest_layout is None  # absent: the vlen layout
@@ -452,7 +460,8 @@ def test_pre_0_9_0_stores_rejected(stale_version):
         md.validate()
 
 
-def test_0_9_0_store_passes_validate():
+def test_0_9_0_store_is_refused_by_validate():
     md = _minimal_root_md()
     md.zv_version = "0.9.0"
-    md.validate()  # should not raise
+    with pytest.raises(MetadataError, match="0.9.0"):
+        md.validate()

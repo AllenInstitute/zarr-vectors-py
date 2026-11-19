@@ -46,12 +46,13 @@ apply to 3-D point clouds and graphs. The module `zarr_vectors.octree_chunks` ha
 ### On disk
 
 After `to_octree(store, target=500)` on 5,000 clustered points with
-`chunk_shape = 100`, the level's `zarr_vectors_level` attributes gain an
+`chunk_shape = 100`, the level's `zarr_vectors` object gains an
 `octree_chunks` block:
 
 ```json
 {
-  "zarr_vectors_level": {
+  "zarr_vectors": {
+    "kind": "level",
     "octree_chunks": {
       "max_depth": 4,
       "origin_cell": [0, 0, 0],
