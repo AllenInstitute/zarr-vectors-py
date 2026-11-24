@@ -1091,6 +1091,7 @@ class Group:
         durable: bool | str = True,
         io_threads: int | None = None,
         sweep: bool = True,
+        prefetch: bool = False,
     ) -> Iterator[Any]:
         """Stage one shard's cell writes, and publish them on exit.
 
@@ -1114,16 +1115,20 @@ class Group:
             )
         txn = ShardTransaction(
             self, shard_coords, arrays=arrays, mode=mode, durable=durable,
-            io_threads=io_threads,
+            io_threads=io_threads, prefetch=prefetch,
         )
         if sweep:
             txn.sweep_partials()
-        self._shard_txn = txn
+        txn.start_prefetch()          # after the sweep: no partial is read
         try:
-            yield txn
+            self._shard_txn = txn
+            try:
+                yield txn
+            finally:
+                self._shard_txn = None
+            txn.publish()
         finally:
-            self._shard_txn = None
-        txn.publish()
+            txn.close()
 
     @contextmanager
     def collect_presence(self) -> Iterator[list[tuple[str, str, bool]]]:

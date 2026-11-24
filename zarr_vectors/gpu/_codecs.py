@@ -163,7 +163,14 @@ def decode_frames(
                 f"zstd frame declares {int(declared[j])} bytes; its output "
                 f"holds {device_nbytes(out[j])}"
             )
-    good = [j for j in range(n) if j not in errors]
+    # A frame of empty content decodes to nothing, and nvCOMP refuses the
+    # null buffer such an output gets, failing the whole batch: it is
+    # produced here, after the walk has checked its structure, and its
+    # content checksum (if any) is still verified below.
+    for j in range(n):
+        if j not in errors and int(declared[j]) == 0:
+            outputs[j] = out[j] if out is not None else cp.empty(0, dtype=cp.uint8)
+    good = [j for j in range(n) if j not in errors and int(declared[j]) != 0]
     decoded = zstd_decode(
         [_Frame(int(ptrs[j]), int(sizes[j])) for j in good],
         out=None if out is None else [out[j] for j in good],
