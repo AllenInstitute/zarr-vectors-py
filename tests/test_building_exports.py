@@ -1,4 +1,4 @@
-"""Names BRIDGE reached into internals for, now on the supported surface (A10).
+"""Names FibreGraph reached into internals for, now on the supported surface (A10).
 
 Each is either the internal object itself, re-exported, or a thin form of
 code that already existed; the tests pin that they agree with what they

@@ -1633,7 +1633,7 @@ class Group:
         never on the array's listing: building a listing while presence
         is deferred derives it from the store, which for a sharded array
         reads every shard, and ``batched_reads`` asks for the spec of
-        every array in its plan.  (BRIDGE's graph tasks prefetched their
+        every array in its plan.  (FibreGraph's graph tasks prefetched their
         cells that way, and each task read every shard written so far:
         a 50 um graph stage went from minutes to 9 h.)  Outside a block
         it is derived per call.  ``None`` -- not direct-readable -- is

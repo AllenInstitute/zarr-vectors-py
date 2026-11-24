@@ -38,7 +38,7 @@ _BUCKET = 16_384
 #: one created before; an index keeps its chunking, which zarr.json
 #: holds). Blocks outnumber objects ~10-100 to one and are read in long
 #: runs, so the larger chunk costs a point read little and buys bytes and
-#: files: on two BRIDGE indexes at zstd 9, 0.58-0.61x the bytes of 16,384
+#: files: on two FibreGraph indexes at zstd 9, 0.58-0.61x the bytes of 16,384
 #: rows, and a quarter of the files on an unsharded layer. Equal to the
 #: attribute bucket, so the object layer's shard (a multiple of 65,536
 #: rows) tiles it, and a placed range aligned for rows is for blocks.
@@ -51,7 +51,7 @@ BLOCKS_PATH = f"{OBJECT_INDEX}/{BLOCKS_ARRAY}"
 #: table) are created with. They are long, repetitive integer tables --
 #: ascending spans and ids, coordinates that repeat for every fragment of
 #: a cell -- written in bulk and read in long runs, where zstd keeps
-#: gaining well past the level a cell write can afford: on two BRIDGE
+#: gaining well past the level a cell write can afford: on two FibreGraph
 #: indexes' blocks, level 9 stores 0.71-0.77x the bytes of level 5 at the
 #: same chunk, still encoding at ~250 MB/s.
 MANIFEST_ZSTD_LEVEL = 9
@@ -131,7 +131,7 @@ def store_default(level_group: Group) -> str:
 #: to keep: every write into a narrow index checks its values, and raises
 #: rather than wrapping. Stored, it gains less than the raw halving: zstd
 #: at level 9 over 65,536 rows already drops most of the zero high bytes
-#: (0.93-0.97x of int64 on two BRIDGE indexes; 0.8x at zstd 5 over 16,384
+#: (0.93-0.97x of int64 on two FibreGraph indexes; 0.8x at zstd 5 over 16,384
 #: rows). Spans and ids stay int64 (block offsets pass 2**31 at a few
 #: billion fragments).
 BLOCK_DTYPES = ("int64", "int32")

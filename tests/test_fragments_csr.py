@@ -1,9 +1,9 @@
 """The CSR fragment encoder writes the bytes the per-fragment one does.
 
 ``encode_fragments`` (a list, one Python object per fragment) is the
-definition; ``encode_fragments_csr`` is the array form BRIDGE and the GPU
+definition; ``encode_fragments_csr`` is the array form FibreGraph and the GPU
 path hand arrays to. Every kind of fragment is covered: ranges at any
-start, singletons, empties, BRIDGE's forward path with its reversed twin,
+start, singletons, empties, FibreGraph's forward path with its reversed twin,
 non-contiguous lists, all-explicit and all-range cells, and none at all.
 """
 
@@ -55,7 +55,7 @@ def _random_fragments(rng, num, kinds=_KINDS):
         f = _kind(rng, kinds[int(rng.integers(len(kinds)))])
         frags.append(f.astype(np.int64))
         if kinds is _KINDS and rng.random() < 0.2:
-            frags.append(f[::-1].copy())  # BRIDGE's reversed twin
+            frags.append(f[::-1].copy())  # FibreGraph's reversed twin
     return frags
 
 

@@ -12,21 +12,21 @@
 
 ## Mission
 
-Five small additive changes to `zarr_vectors.core.arrays` that let downstream consumers (BRIDGE in particular) delete ~250 lines of hand-roll, including three process-wide class-level buffer dicts that currently force single-process operation. None of these changes should alter behaviour for existing range-only callers; all are pure additions with default values that preserve the current API.
+Five small additive changes to `zarr_vectors.core.arrays` that let downstream consumers (FibreGraph in particular) delete ~250 lines of hand-roll, including three process-wide class-level buffer dicts that currently force single-process operation. None of these changes should alter behaviour for existing range-only callers; all are pure additions with default values that preserve the current API.
 
 You can land R1–R5 as five separate PRs or one larger PR — they are independent in implementation and review. R6 is a follow-up for a downstream consumer to re-evaluate after R1 ships and is not a deliverable here.
 
 ## Why this matters (consumer context)
 
-BRIDGE (`c:\Users\andre\BRIDGE\`) writes per-chunk concurrent across Dask workers. Per-chunk arrays (`vertices/<chunk>/`, `vertex_fragments/<chunk>/`, etc.) are safe because each worker owns disjoint chunk keys. But store-wide arrays — `object_index/manifests`, `object_attributes/<name>/data`, `cross_chunk_links/<delta>/data`, and the per-chunk `vertex_fragments` / `link_fragments` blobs once Core 1 has already written the canonical range fragment 0 — are not per-chunk: any second `write_*` call replaces the whole blob, clobbering an earlier worker's data.
+FibreGraph writes per-chunk concurrent across Dask workers. Per-chunk arrays (`vertices/<chunk>/`, `vertex_fragments/<chunk>/`, etc.) are safe because each worker owns disjoint chunk keys. But store-wide arrays — `object_index/manifests`, `object_attributes/<name>/data`, `cross_chunk_links/<delta>/data`, and the per-chunk `vertex_fragments` / `link_fragments` blobs once Core 1 has already written the canonical range fragment 0 — are not per-chunk: any second `write_*` call replaces the whole blob, clobbering an earlier worker's data.
 
-Today BRIDGE works around this with three patterns:
+Today FibreGraph works around this with three patterns:
 
 1. **`_append_explicit_fragments` / `_append_explicit_link_fragments`** — read-modify-write of the `vertex_fragments/<chunk>/` and `link_fragments/<chunk>/` blobs to append explicit-mode entries while preserving existing ones. ~107 lines of glue.
 2. **`_global_attr_buffer`** — class-level dict on the writer that accumulates per-chunk attribute values, rewriting the cumulative blob on every flush. O(N²) total bytes written; only works in single-process Dask.
 3. **`_global_cross_chunk_link_buffer` + attr buffer** — same pattern for `cross_chunk_links`. ~90 lines + two class-level dicts.
 
-Append-mode write APIs on these primitives would let BRIDGE delete all three. The class-level dicts go away, which also unblocks multi-process Dask.
+Append-mode write APIs on these primitives would let FibreGraph delete all three. The class-level dicts go away, which also unblocks multi-process Dask.
 
 ## Repository orientation
 
@@ -38,7 +38,7 @@ Append-mode write APIs on these primitives would let BRIDGE delete all three. Th
 | `zarr_vectors/constants.py` | `VERTEX_FRAGMENTS`, `LINK_FRAGMENTS`, etc. — string constants for array names |
 | `zarr_vectors/core/paths.py` | `links_path`, `cross_chunk_links_path`, etc. |
 | `tests/test_arrays.py` | Add tests here (follow existing `TestExplicitFragments` patterns at line 572) |
-| `zarr_vectors/ops/edit.py` / `ops/fragments.py` | Existing high-level edit API — **do not modify**. It's session-based and designed for human-editor workflows. The work here is on the low-level `core/arrays.py` writers that BRIDGE uses directly. |
+| `zarr_vectors/ops/edit.py` / `ops/fragments.py` | Existing high-level edit API — **do not modify**. It's session-based and designed for human-editor workflows. The work here is on the low-level `core/arrays.py` writers that FibreGraph uses directly. |
 
 Existing reference: the recent commit that added explicit-mode dispatch on the read side (`read_fragment`, `read_chunk_link_fragment`, `read_chunk_vertices`, `read_chunk_links`) introduced four shared private helpers — `_reshape_link_buffer`, `_slice_link_range`, `_reshape_vertex_buffer`, `_slice_vertex_range` (around `arrays.py:1816`). Mirror that style for the new append helpers.
 
@@ -194,9 +194,9 @@ In `tests/test_arrays.py`, near the existing `TestExplicitFragments` class (line
 
 Pattern these on the existing `TestExplicitFragments._write_vertex_explicit_index` helper (lines 586-595). Use `_make_level_group(tmp_path)` as the fixture.
 
-### What BRIDGE deletes
+### What FibreGraph deletes
 
-[`bridge/utils/components.py`](c:\Users\andre\BRIDGE\bridge\utils\components.py) lines 507–615 — both `_append_explicit_fragments` and `_append_explicit_link_fragments` collapse to call-site `write_chunk_fragments(level_group, cc, arrays, target="vertex"|"link", mode="append")`. **~107 lines deleted.**
+[`fibregraph/utils/components.py`](fibregraph/utils/components.py) lines 507–615 — both `_append_explicit_fragments` and `_append_explicit_link_fragments` collapse to call-site `write_chunk_fragments(level_group, cc, arrays, target="vertex"|"link", mode="append")`. **~107 lines deleted.**
 
 ---
 
@@ -306,9 +306,9 @@ def write_object_attributes(
 4. **`test_write_object_attributes_append_shape_mismatch`** — Existing `(3, 2)`, append `(2, 3)`; raises `ArrayError`.
 5. **`test_write_object_attributes_append_2d`** — Existing `(2, 3) float32`, append `(1, 3) float32`; result is `(3, 3)` float32 with rows concatenated correctly.
 
-### What BRIDGE deletes
+### What FibreGraph deletes
 
-[`bridge/utils/components.py`](c:\Users\andre\BRIDGE\bridge\utils\components.py) lines 367–413 — `_append_object_attributes_batch` method and `_global_attr_buffer` class-level dict. Call sites switch from `cls._append_object_attributes_batch(level_group, attrs, n_existing=..., store_key=...)` to a loop calling `write_object_attributes(level_group, name, values, mode="append")`. **~50 lines deleted + one class-level buffer dict dropped.**
+[`fibregraph/utils/components.py`](fibregraph/utils/components.py) lines 367–413 — `_append_object_attributes_batch` method and `_global_attr_buffer` class-level dict. Call sites switch from `cls._append_object_attributes_batch(level_group, attrs, n_existing=..., store_key=...)` to a loop calling `write_object_attributes(level_group, name, values, mode="append")`. **~50 lines deleted + one class-level buffer dict dropped.**
 
 ---
 
@@ -374,9 +374,9 @@ For both functions in append mode: handle "no existing array" as `existing = []`
 3. **`test_write_cross_chunk_link_attributes_append`** — Same pattern for the attribute table; verify length-sync check raises when `num_links` mismatches.
 4. **`test_write_cross_chunk_link_attributes_append_misaligned`** — Append an attribute array but pass `num_links` that doesn't match the post-append length; expect `ArrayError`.
 
-### What BRIDGE deletes
+### What FibreGraph deletes
 
-[`bridge/utils/components.py`](c:\Users\andre\BRIDGE\bridge\utils\components.py) lines 375–457 — `_append_cross_chunk_links_to_store` + the two class-level buffer dicts `_global_cross_chunk_link_buffer` and `_global_cross_chunk_link_attr_buffer`. Call sites switch to:
+[`fibregraph/utils/components.py`](fibregraph/utils/components.py) lines 375–457 — `_append_cross_chunk_links_to_store` + the two class-level buffer dicts `_global_cross_chunk_link_buffer` and `_global_cross_chunk_link_attr_buffer`. Call sites switch to:
 
 ```python
 first_new = write_cross_chunk_links(lg, records, sid_ndim=3, mode="append")
@@ -446,9 +446,9 @@ def create_vertices_array(
 2. **`test_create_vertices_array_strict`** — Call once. Call again with `exist_ok=False`; expect `ArrayError`.
 3. **Spot-check 2-3 other create_* helpers** with the same idempotent pattern; full coverage is mechanical.
 
-### What BRIDGE deletes
+### What FibreGraph deletes
 
-`_ensure_array` helper at [`bridge/utils/components.py:168-176`](c:\Users\andre\BRIDGE\bridge\utils\components.py) — 8 lines. Every call site of `_ensure_array(create_X, lg, ...)` unwraps to `create_X(lg, ...)`. ~20 callsite lines simplified.
+`_ensure_array` helper at [`fibregraph/utils/components.py:168-176`](fibregraph/utils/components.py) — 8 lines. Every call site of `_ensure_array(create_X, lg, ...)` unwraps to `create_X(lg, ...)`. ~20 callsite lines simplified.
 
 ---
 
@@ -515,7 +515,7 @@ def read_chunk_link_fragment(
 3. **`test_read_fragment_no_default_still_raises`** — Same setup but without `default`; expect `ArrayError`.
 4. **Same three tests for `read_chunk_link_fragment`**.
 
-### What BRIDGE deletes
+### What FibreGraph deletes
 
 This pass already inlined `try: read_fragment(...); except ArrayError: ...` at two call sites in `cpu_smoke.py` and `tests/test_cpu_e2e.py`. Once R5 lands, those inline try/except blocks collapse to a single one-liner each:
 
@@ -558,6 +558,6 @@ Each PR can land independently. Consider whether to factor the shared `_read_mod
 ## Out of scope
 
 - **`ops/edit.py` / `ops/fragments.py`** session-based APIs — these target a different use case (interactive edits with manifest propagation). Don't touch.
-- **Cross-level (delta != 0) operations** for cross_chunk_links — BRIDGE doesn't use them; keep existing behaviour.
+- **Cross-level (delta != 0) operations** for cross_chunk_links — FibreGraph doesn't use them; keep existing behaviour.
 - **Variable-length object_attributes** (string / object dtype attrs in append mode) — defer until a consumer needs it.
 - **Cross-writer transactional safety** — out of scope for this lib. Document the per-blob single-writer contract loudly; downstream coordinates.

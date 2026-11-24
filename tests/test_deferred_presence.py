@@ -412,7 +412,7 @@ def test_observe_presence_writes_fires_only_at_apply_when_collecting(
 def test_observe_presence_writes_fires_synchronously_on_the_writing_thread(
     tmp_store_path,
 ):
-    """BRIDGE checks its lock depth inside the callback, which only means
+    """FibreGraph checks its lock depth inside the callback, which only means
     anything while the write is happening on the same thread."""
     root = create_store(str(tmp_store_path))
     name = _cell_array(root)

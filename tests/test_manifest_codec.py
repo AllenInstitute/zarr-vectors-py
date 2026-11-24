@@ -102,7 +102,7 @@ def test_every_writer_creates_the_index_at_level_9(tmp_path, writer):
 
 @pytest.mark.parametrize("writer", sorted(WRITERS))
 def test_a_zstd_session_is_raised_to_level_9(tmp_path, writer):
-    """BRIDGE writes inside a session compressing its cells at zstd 5."""
+    """FibreGraph writes inside a session compressing its cells at zstd 5."""
     lg = _level(tmp_path)
     zstd5 = [{"name": "zstd", "configuration": {"level": 5, "checksum": False}}]
     with lg.chunk_array_codecs(zstd5):

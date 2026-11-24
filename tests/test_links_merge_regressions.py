@@ -435,7 +435,7 @@ class TestIntraCellDtypeIsHonoured:
     ``write_chunk_links`` stamps the payload dtype onto the offsets array and
     ``iter_link_cells`` honours it, but ``read_links`` /
     ``read_links_for_tuple`` used to decode every cell at a hard-coded int64.
-    An int32-declared array — which is what BRIDGE stamps for its per-chunk
+    An int32-declared array — which is what FibreGraph stamps for its per-chunk
     node graph via ``create_node_graph_array`` — then yields a quarter of the
     rows on an even element count and raises ``cannot reshape array of size N``
     on an odd one.
