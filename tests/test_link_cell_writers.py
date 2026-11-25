@@ -281,7 +281,7 @@ class TestRepeatBatchesIntoOneCell:
         """A seam's two chunks each write the record, in their own order.
 
         Under canonical storage both land in one cell: this is the write
-        FibreGraph probes before a format-1 seam write, and what
+        a downstream user probes before a format-1 seam write, and what
         ``runtime_capabilities()["link_cells_append"]`` promises.
         """
         from zarr_vectors.building import defer_presence, rebuild_presence

@@ -482,7 +482,7 @@ class ChunkFragmentIndex:
 
         Computed as two reductions over the whole ``_range_table`` /
         ``_csr_indices`` buffers rather than a per-fragment loop, because
-        the number of fragments is unbounded: a FibreGraph chunk carries one
+        the number of fragments is unbounded: a downstream pipeline's chunk carries one
         range fragment plus a path-fragment twin per polyline, and at
         ~187k twins the loop form cost ~0.9 s **per attribute per read**,
         which is what made a neighbourhood load scale with how much of the

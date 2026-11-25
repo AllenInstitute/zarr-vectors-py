@@ -1,7 +1,7 @@
 """``durable="deferred"``: atomic writes, made durable later by ``sync_store``.
 
 A caller that writes many objects from many tasks, and needs them durable
-only at a checkpoint of its own (FibreGraph: the end of a stage, before it
+only at a checkpoint of its own (a downstream pipeline: the end of a stage, before it
 trusts any task's "done"), passes ``durable="deferred"``: the writes land
 exactly as ``durable=False`` would (atomically, by rename, no fsync) and
 one :func:`building.sync_store` later makes everything on the store's

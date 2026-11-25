@@ -1965,7 +1965,7 @@ def write_chunk_links(
     full_name = links_path(delta, offsets)
 
     # NOTE: link groups are no longer required to be 1:1 with the chunk's
-    # vertex fragments. FibreGraph stores streamlines as vertex-fragments and the
+    # vertex fragments. A downstream graph pipeline stores streamlines as vertex-fragments and the
     # node graph as link-fragments, so a chunk legitimately has many vertex
     # fragments (Core-1 range + polyline twins) but few link groups (the node
     # graph). Readers derive per-group link ranges from ``link_fragments/``
@@ -6477,7 +6477,7 @@ def read_chunk_attributes(
     slices, explicit fragments via ``fi.indices(f)`` — exactly as
     :func:`read_chunk_vertices` does.  There is no contiguity
     requirement, so explicit path-fragment vertex-fragments (e.g.
-    FibreGraph's polyline twins appended on top of Core-1's range) read
+    a downstream pipeline's polyline twins appended on top of Core-1's range) read
     correctly.
 
     Args:
@@ -6521,7 +6521,7 @@ def read_chunk_attributes(
     # vertex extent — independent of the requested ``ncols``), then gather
     # each fragment by vertex index exactly as read_chunk_vertices does:
     # range fragments as contiguous slices, explicit fragments (e.g.
-    # FibreGraph's appended path-fragment twins) via ``fi.indices(f)``.  Each
+    # a downstream pipeline's appended path-fragment twins) via ``fi.indices(f)``.  Each
     # gathered group is finally flattened and re-shaped to honour the
     # caller's ``ncols`` (ncols=1 yields a flat 1-D array), matching the
     # historical decode_ragged_floats contract.
@@ -7660,7 +7660,7 @@ def _link_cell_rows(
     ``dtype`` is the *cell's own* declared element type, which
     :func:`write_chunk_links` stamped onto the array and which a caller
     reads back off ``read_array_meta``.  It is not always int64: an
-    int32-declared array (FibreGraph stamps its per-chunk node graph int32 via
+    int32-declared array (a downstream pipeline stamps its per-chunk node graph int32 via
     ``create_node_graph_array``) holds half as many bytes per element, so
     decoding it at a fixed int64 yields a quarter of the rows on an even
     element count and raises ``cannot reshape array of size N`` on an odd
@@ -7811,7 +7811,7 @@ def read_links(
         ncols = (1 + link_width) if has_perm else link_width
         flat = delta == 0 and is_intra(offsets)
         # Per-ARRAY, not per-family: each offsets segment carries its own
-        # element width (FibreGraph's intra node graph is int32 while its seam
+        # element width (a downstream pipeline's intra node graph is int32 while its seam
         # segments are int64), so this must be read inside the segment loop.
         cell_dtype = np.dtype(arr_meta.get("dtype", "int64"))
         segments.append((

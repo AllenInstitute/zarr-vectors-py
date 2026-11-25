@@ -1,4 +1,4 @@
-"""Names FibreGraph reached into internals for, now on the supported surface (A10).
+"""Names a downstream user reached into internals for, now on the supported surface (A10).
 
 Each is either the internal object itself, re-exported, or a thin form of
 code that already existed; the tests pin that they agree with what they
@@ -84,10 +84,10 @@ def test_user_metadata_is_what_the_dataset_offers(tmp_path):
 
     path, lg = _level(tmp_path, "m")
     root = building.open_store(str(path), mode="r+")
-    building.user_metadata(root)["bridge"]["format"] = 2
+    building.user_metadata(root)["pipeline"]["format"] = 2
     ds = zv.open(str(path))
-    assert dict(ds.metadata["bridge"]) == {"format": 2}
-    assert "bridge" in building.user_metadata(root).names()
+    assert dict(ds.metadata["pipeline"]) == {"format": 2}
+    assert "pipeline" in building.user_metadata(root).names()
 
 
 @pytest.mark.parametrize("layout", ["vlen", "dense"])
@@ -143,7 +143,7 @@ def test_no_ids_found_is_an_empty_csr(tmp_path, layout):
 # create_link_segments
 
 
-def _loop_like_bridge(lg, *, directed, store, attributes, intra_attributes):
+def _loop_like_a_pipeline(lg, *, directed, store, attributes, intra_attributes):
     """What a caller did before: one create call per segment and attribute."""
     import itertools
 
@@ -177,7 +177,7 @@ def test_one_call_leaves_the_store_the_loop_leaves(tmp_path, directed, store, n_
     attributes = {"w": ("float32", []), "port": ("int8", [2])}
     intra_attributes = {"len": ("float64", [])}
     ref_path, ref = _level(tmp_path, "ref")
-    assert _loop_like_bridge(
+    assert _loop_like_a_pipeline(
         ref, directed=directed, store=store,
         attributes=attributes, intra_attributes=intra_attributes,
     ) == n_cross

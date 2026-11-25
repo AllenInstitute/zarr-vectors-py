@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import ast
 import collections
+import os
 import pathlib
 import subprocess
 
@@ -28,7 +29,10 @@ from zarr_vectors._stability import INTERNAL as INTERNAL_PREFIXES
 # Where the consuming repositories live when checked out beside this one.
 # Absent in CI, which is why every test that needs them skips rather than
 # fails: a contract test that cannot run is not a contract violation.
-_SIBLINGS = ("zarr-vectors-tools", "BRIDGE", "zv-ngtools")
+# Other consumers are added through ZV_CONSUMER_REPOS: a list separated by
+# os.pathsep, each entry a directory name beside this checkout or a path.
+_SIBLINGS = ("zarr-vectors-tools", "zv-ngtools")
+_EXTRA_CONSUMERS_ENV = "ZV_CONSUMER_REPOS"
 
 # Directories that hold COPIES of source rather than source.  A stale
 # ``build/lib/`` tree is still importable-looking Python, and counting it
@@ -111,7 +115,10 @@ _ALLOWED_UNCOVERED = frozenset({
 
 def _consumer_roots() -> list[pathlib.Path]:
     here = pathlib.Path(__file__).resolve().parents[2]
-    return [here / name for name in _SIBLINGS if (here / name).is_dir()]
+    extra = os.environ.get(_EXTRA_CONSUMERS_ENV, "").split(os.pathsep)
+    names = [*_SIBLINGS, *(e for e in extra if e.strip())]
+    roots = dict.fromkeys((here / pathlib.Path(n).expanduser()).resolve() for n in names)
+    return [root for root in roots if root.is_dir()]
 
 
 def _source_files(root: pathlib.Path) -> list[pathlib.Path]:

@@ -5,7 +5,7 @@
 listing, and building the listing on a deferred level derives presence
 from the store -- for a sharded array, by reading every shard. A task
 prefetching its own few cells therefore read every shard written so far
-(FibreGraph's 50 um graph stage: 9 h). The spec now has a cache of its own,
+(a downstream pipeline's 50 um graph stage: 9 h). The spec now has a cache of its own,
 with the same lifetime and invalidation as the node cache.
 """
 

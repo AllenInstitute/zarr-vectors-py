@@ -19,10 +19,10 @@ every root with the convention's `schema_url` and `spec_url`
 URLs, so merge the convention's `schema-fixes` branch and push the tag
 before releasing 0.10.0.
 
-**Format 0.10.0 is a cut-over for FibreGraph.** 0.9.x packages refuse 0.10.0
+**Format 0.10.0 is a cut-over for downstream users.** 0.9.x packages refuse 0.10.0
 stores, and 0.10.0 refuses 0.9.x stores until
-`building.migrate_metadata_0_10` has run on them. Move FibreGraph's pinned
-zarr-vectors to 0.10.0 first, then migrate its stores.
+`building.migrate_metadata_0_10` has run on them. Move downstream users' pinned
+zarr-vectors to 0.10.0 first, then migrate their stores.
 
 **Publish zarr-octree to PyPI, then declare it.** zarr-octree is not on
 PyPI, so it is not a dependency or an extra: users get a git URL from an
