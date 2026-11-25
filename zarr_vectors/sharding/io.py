@@ -831,11 +831,31 @@ _REPLACED = "__replaced"
 
 
 def _drop_scratch(level: Group) -> None:
+    """Delete the scratch group, tolerating files that vanish (or appear)
+    while it is deleted.
+
+    A ``set_octree`` that raised part-way can leave writes still in
+    flight: zarr sends a shard's cell writes out together, and when one
+    fails the others run on.  A rerun in the same process then deletes
+    the scratch group while they land, and the delete trips over a file
+    that went away under it.  They carry what the rerun rewrites, so
+    retrying the delete is enough.
+    """
+    import time
+
     from zarr.core.sync import sync
 
     zg = level.zarr_group
     level._invalidate_node(_OCTREE_SCRATCH)
-    sync(zg.store.delete_dir(_join(zg.path, _OCTREE_SCRATCH)))
+    path = _join(zg.path, _OCTREE_SCRATCH)
+    for attempt in range(5):
+        try:
+            sync(zg.store.delete_dir(path))
+            return
+        except (FileNotFoundError, OSError):
+            if attempt == 4:
+                raise
+            time.sleep(0.05 * (attempt + 1))
 
 
 def _join(*parts: str) -> str:

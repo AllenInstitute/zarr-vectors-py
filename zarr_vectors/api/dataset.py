@@ -360,8 +360,16 @@ class Dataset:
         object_ids: npt.ArrayLike | None = None,
         layout: Layout | None = None,
         on_out_of_bounds: Literal["raise", "ignore", "expand"] = "raise",
+        element: str | None = None,
+        check_orientation: bool = True,
     ) -> dict[str, Any]:
-        """Write a triangulated surface."""
+        """Write a surface mesh, or a volume mesh with ``element=``.
+
+        ``faces`` are polygon faces by default.  With ``element``
+        (``"tetra"``, ``"pyramid"``, ``"wedge"``, ``"hexahedron"``) each
+        row is one solid cell in VTK vertex order; see
+        :func:`zarr_vectors.types.meshes.write_mesh`.
+        """
         from zarr_vectors.types.meshes import write_mesh
 
         n = _n_rows(vertices, "vertices")
@@ -379,6 +387,7 @@ class Dataset:
             object_attributes=dict(object_attributes or {}) or None,
             object_ids=object_ids,
             layout=layout, out_of_bounds=on_out_of_bounds,
+            element=element, check_orientation=check_orientation,
         )
 
     def add_graph(

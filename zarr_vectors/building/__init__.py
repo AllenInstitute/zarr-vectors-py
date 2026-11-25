@@ -142,6 +142,7 @@ from zarr_vectors.core.arrays import (
     read_object_manifests_csr,
     read_object_vertices,
     read_vertex_fragment_index,
+    stamp_link_element,
     # --- writing ---
     write_chunk_attributes,
     write_chunk_fragment_attributes,
@@ -168,6 +169,7 @@ from zarr_vectors.core.cells import (
     read_cells,
     read_neighbourhood,
 )
+from zarr_vectors.core.elements import ELEMENT_WIDTH, boundary_faces, signed_volumes
 from zarr_vectors.core.group import (
     _NONEMPTY_CHUNKS_ATTR,
     _PRESENCE_DECL_ATTR,
@@ -304,7 +306,7 @@ from zarr_vectors.spatial.chunking import (
 # The READERS are not promoted: ``ReadResult.from_*`` covers all five.
 from zarr_vectors.types.graphs import write_graph
 from zarr_vectors.types.lines import write_lines
-from zarr_vectors.types.meshes import write_mesh
+from zarr_vectors.types.meshes import write_mesh, write_mesh_level
 from zarr_vectors.types.points import write_points
 from zarr_vectors.types.polylines import write_polylines
 from zarr_vectors.types.skeletons import (
@@ -1515,6 +1517,11 @@ __all__ = [
     "write_link_cells",
     "write_links",
     "write_mesh",
+    "write_mesh_level",
+    "stamp_link_element",
+    "ELEMENT_WIDTH",
+    "boundary_faces",
+    "signed_volumes",
     "write_multiscale_metadata",
     "write_object_attribute_columns",
     "write_object_attributes",

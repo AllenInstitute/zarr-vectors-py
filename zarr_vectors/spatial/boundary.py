@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import math
 from collections.abc import Sequence
+from typing import Any
 
 import numpy as np
 import numpy.typing as npt
@@ -784,7 +785,23 @@ def partition_arrays_by_offset(
 #: Endpoint counts the array partitioner handles.  Its permutation
 #: tables are ``L**L`` and ``L!`` entries; past this a record-shaped
 #: family is exotic enough that the per-record path is the right one.
-_MAX_ARRAY_LINK_WIDTH = 6
+_MAX_ARRAY_LINK_WIDTH = 8
+
+#: Widest records whose Lehmer codes come from :func:`_lehmer_table`
+#: (``L**L`` entries); wider ones are computed by :func:`_lehmer_codes`.
+_MAX_TABLE_WIDTH = 6
+
+
+def _lehmer_codes(sigma: Any, xp: Any = np) -> Any:
+    """:func:`_lehmer_encode` of every row of ``sigma`` (``(n, L)``
+    permutations of ``range(L)``), without a table: a value's digit is
+    how many later values are smaller than it."""
+    n, L = sigma.shape
+    code = xp.zeros(n, dtype=xp.int64)
+    for i in range(L - 1):
+        smaller = (sigma[:, i + 1:] < sigma[:, i:i + 1]).sum(axis=1)
+        code = code + smaller.astype(xp.int64) * math.factorial(L - 1 - i)
+    return code
 
 
 def _lehmer_table(link_width: int) -> tuple[npt.NDArray[np.int64], npt.NDArray[np.int64]]:
@@ -946,6 +963,8 @@ def partition_link_arrays(
     placed_vi = vi[rowsel, sigma]                  # (n, L)
     if cross_level or directed or L == 1:
         perm = xp.zeros(n, dtype=xp.int64)
+    elif L > _MAX_TABLE_WIDTH:
+        perm = _lehmer_codes(sigma, xp)
     else:
         table, radix = _lehmer_table(L)
         perm = xp.asarray(table)[(sigma * xp.asarray(radix)).sum(axis=1)]

@@ -44,7 +44,7 @@ SCHEMA_PATH = ROOT / "schema" / "zarr_vectors.schema.json"
 #: SHA-256 of the convention's published schema.json as canonical JSON
 #: (sorted keys, no whitespace): the convention repository reformats it
 #: with Prettier, so equality is as JSON, not bytes.
-PUBLISHED_SHA256 = "9b55eebc443313688f60ea93cdb40b2c05c934cf7d885b8915e204f537442102"
+PUBLISHED_SHA256 = "82c10b17c22386ac67f71c56d3a450e9a78c35eb0a0fe0f0973a44f3e0173d3b"
 
 
 def canonical_sha256(doc: dict) -> str:

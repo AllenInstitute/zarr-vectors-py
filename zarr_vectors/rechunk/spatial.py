@@ -406,7 +406,7 @@ def _carry_links(out_group, src_group, delta: int, src_lv: _Level,
                  dst_lv: _Level, src_map, dst_map, ndim: int) -> tuple[int, int]:
     """Re-address one ``links/<delta>`` family; returns ``(written,
     dropped)``, dropping records with an unresolvable source endpoint."""
-    from zarr_vectors.core.arrays import create_links_family, write_links
+    from zarr_vectors.core.arrays import carry_link_element, create_links_family, write_links
 
     pol, new_c, new_v, dropped = _map_links(
         src_group, delta, src_lv, dst_lv, src_map, dst_map)
@@ -418,6 +418,7 @@ def _carry_links(out_group, src_group, delta: int, src_lv: _Level,
     if len(new_v):
         write_links(out_group, [], ndim, delta=delta, link_width=link_width,
                     directed=directed, store=store, _arrays=(new_c, new_v))
+    carry_link_element(src_group, out_group, delta=delta)
     return int(len(new_v)), dropped
 
 

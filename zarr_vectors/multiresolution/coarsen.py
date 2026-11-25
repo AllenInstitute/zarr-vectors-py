@@ -564,6 +564,30 @@ def _per_object_coarsen(
             / np.maximum(bin_counts, 1)
         )
 
+    # --- Step 3b: a mesh's coarse faces or cells ------------------------
+    # Planned before the metavertices are placed, since a volume mesh's
+    # boundary metavertices move (mesh_coarsen); written at step 9b.
+    mesh_plan = None
+    if not leading and n_metavertices:
+        from zarr_vectors.multiresolution.mesh_coarsen import plan_coarse_mesh
+
+        object_mvs: list[npt.NDArray[np.int64]] = []
+        _cursor = 0
+        for oid in keep_oids:
+            n = per_object_count[oid]
+            object_mvs.append(np.unique(inverse[_cursor:_cursor + n]))
+            _cursor += n
+        mesh_plan = plan_coarse_mesh(
+            src_group,
+            ndim=ndim,
+            mv_bins=np.frombuffer(
+                np.ascontiguousarray(unique_keys).tobytes(), dtype=np.int64,
+            ).reshape(-1, ndim),
+            bin_shape=bin_shape_arr,
+            meta_positions=meta_positions,
+            object_mvs=object_mvs,
+        )
+
     # --- Step 4: chunk-assign metavertices ------------------------------
     chunk_assignments = assign_chunks(meta_positions, chunk_shape)
     if mv_bin is not None:
@@ -679,6 +703,16 @@ def _per_object_coarsen(
                 sid_ndim=key_ndim,
             )
 
+        # --- Step 9b: the mesh's faces or cells, as planned at step 3b -----
+        mesh_summary: dict[str, Any] = {}
+        if mesh_plan is not None:
+            from zarr_vectors.multiresolution.mesh_coarsen import write_coarse_mesh
+
+            mesh_summary = write_coarse_mesh(
+                level_group, mesh_plan, ndim=ndim, chunk_slots=chunk_slots,
+                mv_chunk_slot=mv_chunk_slot, mv_fragment_idx=mv_fragment_idx,
+            )
+
         # --- Step 10: per-object attributes with present_mask ---------------
         src_obj_attr_group_name = f"{OBJECT_ATTRIBUTES}"
         if src_obj_attr_group_name in src_group:
@@ -738,6 +772,7 @@ def _per_object_coarsen(
         "method": COARSEN_PER_OBJECT,
         "preserves_object_ids": True,
         "shared_fragments": True,
+        **mesh_summary,
     }
 
 

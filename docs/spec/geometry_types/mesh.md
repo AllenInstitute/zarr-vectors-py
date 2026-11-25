@@ -111,6 +111,109 @@ store raises `ArrayError`.
 OBJ, STL and PLY converters are in
 [zarr-vectors-tools](https://zarr-vectors-tools.readthedocs.io/en/latest/convert/meshes.html).
 
+### Volume meshes
+
+A mesh can also hold solid cells: one tetrahedron, pyramid, wedge or
+hexahedron per record instead of one polygon face. Pass `element=` to
+`write_mesh`; the `links/0/` family records it, and `read_mesh` returns
+it as `element` (None for a surface mesh):
+
+```python
+write_mesh(path, vertices, tets, chunk_shape=(40.0,) * 3, element="tetra")
+read_mesh(path)["element"]   # "tetra"
+```
+
+| `element` | `link_width` | Vertex order (VTK) |
+|-----------|--------------|--------------------|
+| `tetra` | 4 | `0, 1, 2` a triangle whose right-hand normal points towards `3` |
+| `pyramid` | 5 | base quad `0-3` whose right-hand normal points towards the apex `4` |
+| `wedge` | 6 | triangle `0, 1, 2` facing away from triangle `3, 4, 5`; `i` joined to `i + 3` |
+| `hexahedron` | 8 | quad `0-3` facing towards quad `4-7`; `i` joined to `i + 4` |
+
+In that order every cell has positive volume. `write_mesh` refuses
+cells with non-positive signed volume before writing anything; pass
+`check_orientation=False` to store them as given. Vertex order survives
+storage: records are stored sorted, with a permutation column
+(`has_perm`) that restores the order on read.
+
+- Several element types: pass the cells as a dict,
+  `write_mesh(path, vertices, {"tetra": tets, "hexahedron": hexes})`.
+  The family is `element: "mixed"` with `element_types`; records are as
+  wide as the widest type, and a shorter cell repeats its last vertex
+  (a cell's vertices must be distinct, so the record's width before that
+  run names its type). `read_mesh` returns the padded `faces` and
+  `cells`, a dict of each type's cells.
+- `face_attributes={name: (F,) or (F, C)}` stores per-face or per-cell
+  values (material, quality) as link attributes, in the order of
+  `faces` (for a dict of cells, each type's cells in turn).
+- Draco encodes triangles only, so volume meshes are written `raw`.
+- `building.boundary_faces(cells, element)` returns the faces that
+  belong to one cell only, wound outward: the volume's surface.
+  `building.signed_volumes(vertices, cells, element)` returns each
+  cell's signed volume.
+- An element is declared once. `building.stamp_link_element` refuses to
+  retype records already written, for example quads as tetrahedra.
+- Cells cross chunk boundaries like any link record. What `element`
+  is limited to is one level: every vertex of a cell is on the same
+  pyramid level.
+
+#### Pyramids of a volume mesh
+
+`build_pyramid` gives each coarse level its own cells, built on the
+level's bins. Each coarse vertex is the centroid of one bin. For each
+object, every 2 x 2 x 2 block of bins the object fills becomes one
+hexahedron (from a hexahedral mesh) or six tetrahedra (from any other
+element), joining those eight vertices. Cells that would be inverted at
+the vertices' real positions are dropped; the build summary counts them
+as `cells_dropped_inverted`.
+
+Each coarse vertex on the boundary then moves to the centroid of the
+fine boundary vertices in its bin, so the faces of the volume stay where
+they were (edges and corners round off by up to a bin; the summary
+counts `boundary_vertices_snapped`). A move that would invert a cell is
+undone, and any cell still inverted is dropped.
+
+The cells fill the occupied volume with no gaps, and each block depends
+only on its own bins, so the build stays chunk-local. A feature thinner
+than two bins has no cells at that level. A mixed source coarsens to
+tetrahedra.
+
+#### Surface pyramids and carried-down values
+
+A surface mesh's coarse levels keep faces by vertex clustering: each
+face is re-pointed at the coarse vertices of its vertices' bins, faces
+left with a repeated vertex collapse, and faces over the same vertices
+are kept once, with the first one's winding. The summary reports
+`face_count`.
+
+Face and cell attributes come down too. A coarse face takes the fine
+faces that clustered onto it; a coarse cell takes the fine cells whose
+centroid lies in its block. Floating-point values are averaged, weighted
+by area or volume; integer and boolean values take the value with the
+most area or volume. A coarse cell that no fine cell maps to takes the
+level-wide mean or majority.
+
+#### Coarse levels decimated elsewhere
+
+For a better coarse mesh than the bin lattice (edge collapse,
+TetGen, quadric decimation), make it with another tool and write it as
+its own level:
+
+```python
+from zarr_vectors.building import write_mesh_level
+
+write_mesh_level(path, 1, coarse_vertices, coarse_tets, element="tetra",
+                 bin_shape=(20.0, 20.0, 20.0))
+```
+
+The level is marked `coarsening_method: "manual"` with `parent_level`
+(default `level - 1`), and its `bin_shape` (default twice the
+parent's) and `bin_ratio`. Its object ids must be ids of the parent
+level. With `link_parents=True` (the default), every parent-level
+vertex is linked to the nearest vertex of the same object on the new
+level, within about two bins, in `links/+delta` and `links/-delta`, as
+`build_pyramid` links its levels.
+
 ### Validation
 
 The [common checks](index.md#validation) apply, plus:
@@ -118,6 +221,7 @@ The [common checks](index.md#validation) apply, plus:
 | Level | Check |
 |-------|-------|
 | L3 | When the level claims `link_fragments_aligned`, a chunk whose intra-chunk faces are not filed by vertex fragment is an error |
+| L3 | An `element` that is unknown, does not match `link_width`, or sits on a `delta != 0` family is an error |
 | L4 | `links/0/` with `link_width` 1 or 2 is an error; no readable link metadata is a warning |
 
-No level checks degenerate faces, watertightness or winding consistency.
+No level checks degenerate faces, watertightness or winding consistency; volume cells' orientation is checked when they are written.
