@@ -104,7 +104,7 @@ it, so it is explicit fragment `1 - 1 = 0`, with indices
 ### `vertex_fragments/` and `link_fragments/` arrays
 
 Both are [per-chunk arrays](chunk_arrays.md) with one fragment-index blob
-per cell, and the attributes `zv_array` (`"vertex_fragments"` or
+per cell. Their `zarr_vectors` object has `kind` (`"vertex_fragments"` or
 `"link_fragments"`) and `encoding` `"fragment_index_v1"`.
 
 - `vertex_fragments/` splits the rows of `vertices/`. Every writer creates

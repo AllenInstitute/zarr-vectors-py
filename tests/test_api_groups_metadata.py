@@ -134,8 +134,8 @@ class TestAttributeFamilies:
 class TestUserMetadata:
     def test_round_trips(self, grouped):
         ds = zv.open(grouped, mode="r+")
-        ds.metadata.namespace("bridge")["run_id"] = "abc123"
-        assert zv.open(grouped).metadata.namespace("bridge")["run_id"] == "abc123"
+        ds.metadata.namespace("pipeline")["run_id"] = "abc123"
+        assert zv.open(grouped).metadata.namespace("pipeline")["run_id"] == "abc123"
 
     def test_namespaces_do_not_collide(self, grouped):
         ds = zv.open(grouped, mode="r+")

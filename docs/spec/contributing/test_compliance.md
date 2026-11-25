@@ -37,7 +37,7 @@ nothing yet tests reading stores written by another implementation.
 | `tests/_store_compare.py` | `assert_stores_identical` |
 | `tests/_reference.py` | Frozen copies of write paths, for byte-level comparison |
 | `tests/test_<feature>.py` | One module per feature or geometry type, such as `test_points.py` |
-| `tests/test_linkml_schema.py` | Stored metadata against the JSON Schema; `VALID_*` sets against the schema enums; pins `FORMAT_VERSION` |
+| `tests/test_linkml_schema.py` | Generated schema equals the convention's; written metadata against the JSON Schema; `VALID_*` sets against the schema enums; pins `FORMAT_VERSION` |
 | `tests/integration/` | Longer end-to-end tests, not run by the workflow |
 | `tests/gpu/` | Tests marked `gpu`, skipped without CuPy and a CUDA device |
 

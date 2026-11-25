@@ -1,7 +1,7 @@
 """A per-chunk pipeline written through the array-form calls leaves the store
 the per-object calls leave, and that store validates.
 
-Shaped like BRIDGE's graph stage on top of a polyline store: each "worker
+Shaped like a downstream pipeline's graph stage on top of a polyline store: each "worker
 flush" appends fragments to a cell, manifests for its new objects at the
 committed count, a batch of object attribute columns, and seam links with
 their attributes; a coordinator then finalizes the links and commits the

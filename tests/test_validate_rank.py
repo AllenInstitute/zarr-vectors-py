@@ -79,9 +79,9 @@ def test_a_bin_axis_that_disagrees_with_the_values_is_an_error(tmp_path):
     path = _attr_store(tmp_path / "g.zarrvectors")
     root = open_store(path, mode="r+")
     level_attrs = root["0"].attrs.to_dict()
-    block = dict(level_attrs["zarr_vectors_level"])
+    block = dict(level_attrs["zarr_vectors"])
     block["chunk_attribute_values"] = ["A", "B"]  # the axis has 3
-    root["0"].attrs.update({"zarr_vectors_level": block})
+    root["0"].attrs.update({"zarr_vectors": block})
 
     result = validate_structure(path)
 

@@ -39,7 +39,8 @@ after writing a new kind of store.
 
 There is no sampling option; to bound the cost, run at level 2.
 
-No level checks the `multiscales` block or its coordinate transforms.
+No level checks the `multiscales` block or the `zarr_conventions`
+registrations.
 
 ### Level 4: geometry conventions
 
@@ -66,14 +67,14 @@ checks metadata, not topology or geometry.
 
 `validate_multiresolution` in `zarr_vectors/validate/conformance.py`. A
 store with one level passes. All findings are errors. Level fields are
-read from the level's `zarr_vectors_level` block (legacy flat keys are a
+read from the level's `zarr_vectors` object (top-level keys are a
 fallback).
 
 | Check | Message |
 |-------|---------|
 | Levels are numbered `0, 1, …, n-1` | `Levels [0, 2], expected [0, 1]` |
 | No level has more vertices than the level before. Uses `vertex_count`; a level without one, or with `0`, is counted by decoding its chunks | `resolution_N: <n> > resolution_M (<m>)` |
-| `bin_ratio` volume does not decrease. The ratio comes from the level's NGFF scale, which on stores this package writes is `1` on every level, so this never fires on them | `resolution_N: bin_ratio volume ...` |
+| `bin_ratio` volume does not decrease. The ratio is the level's own `bin_ratio`, truncated to integers per axis; level 0 has none | `resolution_N: bin_ratio volume ...` |
 | `object_sparsity` is in `(0, 1]` | `resolution_N: object_sparsity=... out of range` |
 | Each level can be read | `resolution_N: <exception>` |
 

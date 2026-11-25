@@ -6,7 +6,7 @@ row, all at once, as CSR, as a presence mask -- after full writes,
 appends (with gaps and torn flushes), patches and appender runs. On top
 of that: the arrays are what the spec says, an index keeps its layout,
 and writing a million single-fragment objects builds no Python object
-per object (BRIDGE R4).
+per object (downstream request R4).
 """
 
 from __future__ import annotations
@@ -284,7 +284,7 @@ def test_the_appender_writes_dense_too(tmp_path):
 
 
 def test_a_million_single_fragment_objects_build_no_blob_each(tmp_path, monkeypatch):
-    """BRIDGE R4: the write builds no per-object Python object, and the
+    """Downstream request R4: the write builds no per-object Python object, and the
     CSR read is a gather, not a decode."""
     from zarr_vectors.encoding import fragments
 

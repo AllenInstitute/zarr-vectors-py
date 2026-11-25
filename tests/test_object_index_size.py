@@ -66,7 +66,7 @@ def test_a_declared_space_the_objects_fill_writes(root, low_ceiling, layout):
 
 
 def test_a_patch_of_an_index_past_the_ceiling_writes(root, low_ceiling, layout):
-    # BRIDGE's tombstone: blank a few rows of a large index, and add one.
+    # A downstream pipeline's tombstone: blank a few rows of a large index, and add one.
     n = 4 * CEILING
     write_object_index(
         root, {o: _manifest(o) for o in range(n)}, SID_NDIM, layout=layout,

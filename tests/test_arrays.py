@@ -837,7 +837,7 @@ class TestExplicitFragments:
     # --- Vertex attributes: gather by index for explicit fragments ---
 
     def test_read_chunk_attributes_mixed_scalar(self, tmp_path: Path) -> None:
-        # BRIDGE shape: Core-1 range fragment 0 over all vertices, plus an
+        # A downstream graph pipeline's shape: Core-1 range fragment 0 over all vertices, plus an
         # explicit path-fragment twin referencing a subset.  Previously
         # raised "vertex_fragments fragment N is non-contiguous".
         lg = _make_level_group(tmp_path)
@@ -858,7 +858,7 @@ class TestExplicitFragments:
             lg, "fa", (0, 0, 0), dtype=np.float32, ncols=1,
         )
         assert len(groups) == 2
-        # Fragment 0 is the full per-vertex buffer (what BRIDGE reads as [0]).
+        # Fragment 0 is the full per-vertex buffer (what a downstream user reads as [0]).
         np.testing.assert_array_equal(groups[0], fa)
         assert groups[0].ndim == 1
         # Explicit fragment gathered by vertex index.

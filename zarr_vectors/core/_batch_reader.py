@@ -43,6 +43,8 @@ from zarr.core.array_spec import ArraySpec
 from zarr.core.buffer import default_buffer_prototype
 from zarr.core.sync import sync
 
+from zarr_vectors.core import convention as _zvc
+
 # Leaf module (no other zarr_vectors imports), so importing it here does
 # not reintroduce the import cycle this module otherwise avoids.
 from zarr_vectors.core._vlen import (
@@ -96,7 +98,7 @@ def _apply_origin(
     """Translate an absolute chunk coord to a 0-based cell index using
     the array's stored ``chunk_grid_origin`` (absent → zero origin).
     """
-    origin = attributes.get("chunk_grid_origin")
+    origin = _zvc.get_field(attributes, "chunk_grid_origin")
     if not origin:
         return coords
     return tuple(c - int(o) for c, o in zip(coords, origin))
@@ -297,7 +299,7 @@ def _direct_spec(
         return None
     separator = (cke.get("configuration") or {}).get("separator", "/")
 
-    origin = node.attrs.get("chunk_grid_origin")
+    origin = _zvc.get_field(node.attrs, "chunk_grid_origin")
     prototype = _BUFFER_PROTOTYPE
     try:
         spec = ArraySpec(
@@ -1002,7 +1004,7 @@ def _sync_fallback(
         if not isinstance(node, zarr.Array):
             continue
         shape = node.shape
-        attrs = dict(node.attrs)
+        attrs = _zvc.unwrap_array_meta(node.attrs)
         for chunk_key in chunk_keys:
             coords = _parse_coords(chunk_key)
             if coords is None or len(coords) != len(shape):

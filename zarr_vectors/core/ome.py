@@ -275,9 +275,7 @@ def refresh_root_node(
     if axes is None:
         axes = _axes_from_node(existing)
     if axes is None:
-        multiscales = attrs.get("multiscales") or []
-        if multiscales and isinstance(multiscales, list):
-            axes = multiscales[0].get("axes")
+        axes = (attrs.get("zarr_vectors") or {}).get("axes")
 
     node = build_root_node(
         name=name, axes=axes, levels=list_resolution_levels(root),

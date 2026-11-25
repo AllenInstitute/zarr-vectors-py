@@ -105,9 +105,9 @@ def test_a_count_the_caller_already_has_is_taken(tmp_path, monkeypatch):
 def test_the_commit_merges_into_the_metadata(tmp_path):
     lg = _level(tmp_path, "dense")
     _write(lg, 0, 2)
-    lg.write_array_meta(OBJECT_INDEX, {"bridge_note": "kept"})
+    lg.write_array_meta(OBJECT_INDEX, {"pipeline_note": "kept"})
     commit_object_index(lg, 2, sid_ndim=3)
-    assert lg.read_array_meta(OBJECT_INDEX)["bridge_note"] == "kept"
+    assert lg.read_array_meta(OBJECT_INDEX)["pipeline_note"] == "kept"
 
 
 @pytest.mark.parametrize("ids,sorted_", [([3, 7, 9], True), ([9, 3, 7], False)])

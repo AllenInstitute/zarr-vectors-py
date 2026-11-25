@@ -100,7 +100,7 @@ jobs:
           "zarr-octree @ git+https://github.com/Andrew-Keenlyside/zarr-octree@${ZARR_OCTREE_REF}"
 
       - name: Check schema artefacts are in sync
-        # The JSON Schema and reference.md are GENERATED from the LinkML
+        # The JSON Schema is GENERATED from the LinkML
         # source. Nothing regenerated them in CI, which is how they drifted
         # far enough to omit fields the runtime was already writing.
         run: uv run python schema/regen.py --check

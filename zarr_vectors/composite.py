@@ -420,6 +420,7 @@ def _write_namespaced_vertices(
     level_group.write_array_meta(array_name, {
         "zv_array": VERTICES,
         "dtype": "float32",
+        "encoding": "raw",
         "ndim": ndim,
         "vertex_count": n_verts,
     })

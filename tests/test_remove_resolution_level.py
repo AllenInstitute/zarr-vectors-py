@@ -48,7 +48,7 @@ def pyramid(tmp_path: Path) -> Path:
 
 
 def _ngff_paths(root) -> list[str]:
-    return [d["path"] for d in root.attrs.to_dict()["multiscales"][0]["datasets"]]
+    return [e["asset"] for e in root.attrs.to_dict()["multiscales"]["layout"]]
 
 
 def test_removing_the_top_level_clears_every_reference(pyramid):
@@ -73,7 +73,7 @@ def test_removing_down_to_level_zero_drops_links_plus_one(pyramid):
     lg = get_resolution_level(root, 0)
     assert list_link_deltas(lg) == [0]
     assert _ngff_paths(root) == ["0"]
-    assert LINKS in lg.attrs.to_dict()["zarr_vectors_level"]["arrays_present"]
+    assert LINKS in lg.attrs.to_dict()["zarr_vectors"]["arrays_present"]
     assert validate(str(pyramid), level=5).ok
 
 

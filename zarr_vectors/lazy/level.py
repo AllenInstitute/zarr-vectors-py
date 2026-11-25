@@ -65,7 +65,7 @@ class ZVLevel:
             return self._level_meta.vertex_count
         # Fallback: read from attrs
         attrs = self._group.attrs.to_dict()
-        zvl = attrs.get("zarr_vectors_level", attrs)
+        zvl = attrs.get("zarr_vectors", attrs)
         return zvl.get("vertex_count", 0)
 
     @property

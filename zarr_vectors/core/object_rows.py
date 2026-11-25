@@ -19,6 +19,7 @@ import numpy as np
 import numpy.typing as npt
 
 from zarr_vectors.constants import OBJECT_ATTRIBUTES, OBJECT_INDEX
+from zarr_vectors.core import convention as _zvc
 from zarr_vectors.exceptions import ArrayError
 
 if TYPE_CHECKING:  # pragma: no cover
@@ -123,7 +124,9 @@ def _create_empty(
 
         kwargs["compressors"] = codecs_for_create_array(resolved)
     if attributes:
-        kwargs["attributes"] = attributes
+        kwargs["attributes"] = (
+            _zvc.wrap_array_meta(attributes) if "zv_array" in attributes else attributes
+        )
     with warnings.catch_warnings():
         warnings.simplefilter("ignore", UnstableSpecificationWarning)
         parent.create_array(leaf, **kwargs)
@@ -136,8 +139,10 @@ def _grow(level_group: Group, path: str, n: int) -> bool:
     n0 = int(node.shape[0])
     if n0 >= n:
         return False
-    if "shape" in node.attrs:
-        node.metadata.attributes["shape"] = [n, *node.shape[1:]]
+    if _zvc.has_field(node.attrs, "shape"):
+        node.metadata.attributes.update(_zvc.field_update(
+            node.metadata.attributes, "shape", [n, *node.shape[1:]]
+        ))
     node.resize((n, *node.shape[1:]))
     level_group._invalidate_node(path)
     return True

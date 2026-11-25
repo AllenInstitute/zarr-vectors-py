@@ -51,11 +51,12 @@ vertex attribute array: the leading coordinate and
 ### Level metadata
 
 After writing 3,000 points labelled with three genes, the level's
-`zarr_vectors_level` block includes:
+`zarr_vectors` object includes:
 
 ```json
 {
-  "zarr_vectors_level": {
+  "zarr_vectors": {
+    "kind": "level",
     "chunk_dims": ["gene", "x", "y", "z"],
     "chunk_attribute_name": "gene",
     "chunk_attribute_values": ["Gad1", "Pvalb", "Slc17a7"]
@@ -70,7 +71,7 @@ After writing 3,000 points labelled with three genes, the level's
 | `chunk_attribute_values` | `list` | Bin labels in bin order: entry `i` is the value of bin `i` |
 
 `chunk_dims` is the attribute name followed by the spatial axis names
-from `multiscales[0].axes`. `chunk_attribute_name` and
+from the root `zarr_vectors.axes`. `chunk_attribute_name` and
 `chunk_attribute_values` are both set or both absent, and the values
 list is not empty; creating a level that breaks this raises
 `MetadataError`.

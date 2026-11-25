@@ -199,8 +199,8 @@ the coarsener merges an object's fragments once both ends share a coarser chunk.
 Per-chunk writers never touch shared level metadata, so `finalize_skeleton_store`
 stamps `vertex_count` from the fragment indices.
 
-**Metadata and validation.** `bin_shape` / `bin_ratio` live only in the NGFF
-multiscales block; coarse levels inheriting the root grid need not tile the
+**Metadata and validation.** `bin_shape` / `bin_ratio` live only in the
+level's `zarr_vectors` object; coarse levels inheriting the root grid need not tile the
 chunk. `vertex_count` counts stored vertex rows, not summed fragment lengths,
 since fragments can share rows. `rebuild_pyramid_from_level` drops the coarsest
 level first (levels stay contiguous) and clears cross-level links pointing at

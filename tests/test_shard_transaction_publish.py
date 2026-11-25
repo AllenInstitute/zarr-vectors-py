@@ -1,7 +1,7 @@
 """How a shard transaction publishes: ``io_threads``, ``sweep`` and its opens.
 
 Publishing a transaction is, per object, an encode, a create, a write, an
-fsync and a rename -- about 110 objects per BRIDGE graph task, each step
+fsync and a rename -- about 110 objects per graph task of a downstream pipeline, each step
 a round trip on a network filesystem. ``io_threads`` runs everything but
 the renames from a pool and must change nothing else: the same bytes, the
 same ``published``, each object durable before its rename, and nothing

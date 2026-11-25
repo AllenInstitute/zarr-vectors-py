@@ -72,6 +72,7 @@ from zarr_vectors.constants import (
     XLEVEL_EXPLICIT,
     XLEVEL_NONE,
 )
+from zarr_vectors.core import convention as _zvc
 from zarr_vectors.core import dense_manifests as dense
 from zarr_vectors.core._batch_writer import _stamp_presence
 from zarr_vectors.core.arrays import (
@@ -195,6 +196,7 @@ from zarr_vectors.core.metadata import (
     validate_bin_shape_divides_chunk,
     validate_level_chunk_shape_against_root,
 )
+from zarr_vectors.core.migrate import migrate_metadata_0_10
 from zarr_vectors.core.multiscale import (
     get_level_scale,
     get_level_translation,
@@ -595,7 +597,7 @@ def store_layout(root_or_level: Group, *, level: int = 0) -> StoreLayout:
     moved ``FORMAT_VERSION``.
     """
     group = root_or_level
-    if "zarr_vectors" in (group.attrs.to_dict() or {}):
+    if ((group.attrs.to_dict() or {}).get("zarr_vectors") or {}).get("kind") == "root":
         root = group
         try:
             level_group = get_resolution_level(root, level)
@@ -652,6 +654,7 @@ def shard_transaction(
     durable: bool | str = True,
     io_threads: int | None = None,
     sweep: bool = True,
+    prefetch: bool = False,
 ) -> Any:
     """Stage one shard's cell writes privately, and publish them on exit.
 
@@ -669,12 +672,15 @@ def shard_transaction(
     crash, re-running the task converges. Needs presence deferred
     (:func:`defer_presence`) and every array allocated and sharded first;
     writes no metadata (``tx.written`` feeds :func:`set_presence`). ``sweep``
-    removes a failed attempt's ``.partial`` files on entry. See
+    removes a failed attempt's ``.partial`` files on entry. ``prefetch``
+    (``mode="merge"``) reads every owned shard whole in the background on
+    entry and serves owned-cell reads and the publish's merge from it; a shard
+    whose every cell is rewritten is not read. Same bytes either way. See
     :mod:`zarr_vectors.core.shard_txn`.
     """
     return level_group.shard_transaction(
         tuple(shard_coords), arrays=arrays, mode=mode, durable=durable,
-        io_threads=io_threads, sweep=sweep,
+        io_threads=io_threads, sweep=sweep, prefetch=prefetch,
     )
 
 
@@ -1002,12 +1008,15 @@ def defer_presence(level_group: Group) -> list[str]:
     """
     # Declared first, so an array allocated while the manifests are
     # being dropped is born without one rather than slipping between.
-    level_group.attrs.update({_PRESENCE_DECL_ATTR: _PRESENCE_DEFERRED})
+    level_block = dict(level_group.attrs.get("zarr_vectors") or {})
+    level_block.setdefault("kind", "level")
+    level_block[_PRESENCE_DECL_ATTR] = _PRESENCE_DEFERRED
+    level_group.attrs.update({"zarr_vectors": level_block})
     names = per_chunk_array_paths(level_group)
     for name in names:
         arr = level_group._sharded_chunk_array(name)
-        if arr is not None and _NONEMPTY_CHUNKS_ATTR in arr.attrs:
-            del arr.attrs[_NONEMPTY_CHUNKS_ATTR]
+        if arr is not None and _zvc.has_field(arr.attrs, _NONEMPTY_CHUNKS_ATTR):
+            _zvc.del_field(arr.attrs, _NONEMPTY_CHUNKS_ATTR)
             level_group._invalidate_node(name)
     return names
 
@@ -1076,7 +1085,7 @@ def rebuild_presence(
 def _clear_deferral(level_group: Group) -> None:
     """Remove the level's deferral declaration; the one place that does."""
     if level_group.presence_deferred():
-        del level_group.zarr_group.attrs[_PRESENCE_DECL_ATTR]
+        level_group._drop_level_claim(_PRESENCE_DECL_ATTR)
 
 
 def _array_objects(level_group: Group, arr: Any) -> dict[tuple[int, ...], str]:
@@ -1278,7 +1287,7 @@ def end_presence_deferral(
     lacking = []
     for name in per_chunk_array_paths(level_group):
         arr = level_group._sharded_chunk_array(name)
-        if arr is not None and _NONEMPTY_CHUNKS_ATTR not in arr.attrs:
+        if arr is not None and not _zvc.has_field(arr.attrs, _NONEMPTY_CHUNKS_ATTR):
             lacking.append(name)
     if lacking and missing == "raise":
         raise StoreError(
@@ -1297,6 +1306,7 @@ def end_presence_deferral(
 
 __all__ = [
     "MeshChunkInfo",
+    "migrate_metadata_0_10",
     "MeshReader",
     "CAP_FRAGMENT_INDEX",
     "ArrayRead",

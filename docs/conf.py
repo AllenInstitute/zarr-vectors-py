@@ -10,8 +10,8 @@ sys.path.insert(0, os.path.abspath(".."))
 
 # -- Project information ------------------------------------------------------
 project = "zarr-vectors"
-copyright = "2024, BRIDGE Neuroscience. Aligned to the Zarr Vectors specification by Forrest Collman, Allen Institute for Brain Science."
-author = "BRIDGE Neuroscience"
+copyright = "2024, Andrew Keenlyside and Forrest Collman. Aligned to the Zarr Vectors specification by Forrest Collman, Allen Institute for Brain Science."
+author = "Andrew Keenlyside, Forrest Collman"
 # From the installed package, not a literal: the version comes from the
 # git tag via setuptools-scm and moves with every commit, so a hard-coded
 # one is stale the moment it is written.  It was pinned at "0.1.0" while
@@ -115,7 +115,6 @@ html_theme_options = {
 
 html_logo = "_static/zarr-vectors-logo.png"
 html_static_path = ["_static"]
-html_extra_path = ["explainer.html"]
 html_css_files = ["custom.css"]
 
 # Show "Edit on GitHub" links

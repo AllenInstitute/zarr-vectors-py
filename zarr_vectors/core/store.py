@@ -399,7 +399,8 @@ def create_store(
             :data:`DEFAULT_AXES_NAMES`.
         geometry_types: List of geometry types the store will contain.
             Defaults to ``[]``.
-        crs: Coordinate reference system dict.
+        crs: Coordinate reference system as a PROJJSON object, stored
+            as the root's ``proj:projjson`` (the proj convention).
         ndim: Number of spatial index dimensions.  Useful when no other
             ndim-bearing kwarg is supplied (``axes`` / ``bounds`` /
             ``chunk_shape``).  Defaults to 3.
@@ -492,7 +493,7 @@ def create_store(
         unit: What vertex coordinates are measured in -- an NGFF space
             unit such as ``"micrometer"``.  Declared on every space axis
             (``axes`` as given, or the generated defaults), so it is
-            recorded in ``multiscales[0].axes`` and written into the
+            recorded in the root ``zarr_vectors.axes`` and written into the
             ``world`` coordinate system of the root ``ome`` scene.
             ``None`` (the default) declares nothing and writes exactly
             what a store created without it always has: a unit is a
@@ -697,10 +698,10 @@ def _write_root_attrs(
     manifest_block_dtype: str | None = None,
     name: str | None = None,
 ) -> None:
-    """Write the ``zarr_vectors`` root-attrs block plus the eager NGFF
-    ``multiscales`` block (axes only — ``datasets`` are filled in by
-    :func:`zarr_vectors.core.multiscale.write_multiscale_metadata`
-    when the pyramid is materialised).
+    """Write the root ``zarr_vectors`` object (axes included), the
+    multiscales-convention ``multiscales`` block (level 0 only; levels are
+    added as the pyramid grows), ``proj:projjson`` when there is a CRS,
+    and ``zarr_conventions`` registering all of them.
 
     Also writes the RFC 8 ``ome`` node (0.9.2+), which is what lets an OME
     collection elsewhere name this store by path.  It is additive and
@@ -714,7 +715,10 @@ def _write_root_attrs(
     full_attrs = root.attrs.to_dict()
     existing = full_attrs.get("zarr_vectors", {})
     zv: dict[str, Any] = dict(existing)
+    zv["kind"] = "root"
     zv["zv_version"] = FORMAT_VERSION
+    zv["axes"] = [dict(a) for a in axes]
+    zv.pop("crs", None)  # pre-0.10 location; the CRS is proj's now
     if format_capabilities is not None:
         zv["format_capabilities"] = list(format_capabilities)
     else:
@@ -722,8 +726,6 @@ def _write_root_attrs(
     zv["chunk_shape"] = list(chunk_shape)
     zv["bounds"] = [list(bounds[0]), list(bounds[1])]
     zv["geometry_types"] = list(geometry_types)
-    if crs is not None:
-        zv["crs"] = crs
     if links_convention is not None:
         zv["links_convention"] = links_convention
     if object_index_convention is not None:
@@ -779,27 +781,16 @@ def _write_root_attrs(
         if declared:
             zv["attribute_specs"] = declared
 
-    # Eager NGFF ``multiscales`` block — axes are the canonical axis
-    # store from 0.5.0 on.  We seed datasets with level 0 only; the
-    # multiscale module rewrites datasets when more levels appear.
-    existing_ms = full_attrs.get("multiscales") or []
-    ms_entry: dict[str, Any] = (
-        dict(existing_ms[0]) if existing_ms and isinstance(existing_ms, list)
-        else {}
+    # Multiscales convention block, seeded with level 0; the multiscale
+    # module adds an entry per level as the pyramid grows.  Kept as it is
+    # when the store already has one (a structural update after create).
+    from zarr_vectors.core.multiscale import empty_multiscales
+
+    existing_ms = full_attrs.get("multiscales")
+    multiscales = (
+        dict(existing_ms) if isinstance(existing_ms, dict) and existing_ms.get("layout")
+        else empty_multiscales()
     )
-    ms_entry["version"] = "0.4"
-    ms_entry.setdefault("name", "default")
-    ms_entry["axes"] = list(axes)
-    ms_entry.setdefault(
-        "datasets",
-        [{"path": "0", "coordinateTransformations": [
-            {"type": "scale", "scale": [1.0] * len(axes)},
-        ]}],
-    )
-    md = dict(ms_entry.get("metadata") or {})
-    md["format"] = "zarr_vectors"
-    ms_entry["metadata"] = md
-    multiscales = [ms_entry]
 
     # RFC 8 node.  At create time no level group exists yet, so ``nodes``
     # is empty for as long as it takes ``create_store`` to make level 0 --
@@ -820,9 +811,23 @@ def _write_root_attrs(
         name=ome_name, axes=list(axes), levels=list_resolution_levels(root),
     )
 
-    root.attrs.update({
+    from zarr_vectors.core import convention as zvc
+
+    if crs is not None and not isinstance(crs, dict):
+        raise MetadataError(
+            f"crs must be a PROJJSON object (a dict), got {type(crs).__name__}"
+        )
+    crs_value = crs if crs is not None else full_attrs.get(zvc.PROJ_PROJJSON_KEY)
+    extra = (zvc.MULTISCALES_CMO,) + ((zvc.PROJ_CMO,) if crs_value is not None else ())
+    update: dict[str, Any] = {
         "zarr_vectors": zv, "multiscales": multiscales, OME_ATTRS_KEY: ome,
-    })
+    }
+    if crs_value is not None:
+        update[zvc.PROJ_PROJJSON_KEY] = crs_value
+    root.attrs.update(zvc.with_registration(
+        {zvc.CONVENTIONS_KEY: full_attrs.get(zvc.CONVENTIONS_KEY) or [], **update},
+        full=True, extra=extra,
+    ))
 
 
 def _ensure_root_metadata_for_write(
@@ -849,11 +854,8 @@ def _ensure_root_metadata_for_write(
     zv.setdefault("zv_version", FORMAT_VERSION)
     zv.setdefault("format_capabilities", list(zv.get("format_capabilities") or []))
 
-    # Axes live in NGFF ``multiscales[0].axes`` (0.5.0+).
-    ms = full_attrs.get("multiscales") or []
-    axes_existing = (
-        ms[0].get("axes") if ms and isinstance(ms, list) else None
-    ) or []
+    # Axes live in the root object (format 0.10.0).
+    axes_existing = list(zv.get("axes") or [])
     if not axes_existing or len(axes_existing) != inferred_ndim:
         raise MetadataError(
             f"Store ndim={len(axes_existing)} does not match data "
@@ -887,9 +889,8 @@ def _ensure_root_metadata_for_write(
         zv.setdefault("cross_chunk_strategy", cross_chunk_strategy)
 
     root.attrs.update({"zarr_vectors": zv})
-    # Pass the full attrs (including the NGFF ``multiscales`` block
-    # written by :func:`_write_root_attrs`) so strict parsing finds the
-    # axes block under ``multiscales[0].axes``.
+    # Re-read the full attrs so strict parsing sees the axes and the
+    # CRS written by :func:`_write_root_attrs`.
     return RootMetadata.from_dict(root.attrs.to_dict())
 
 
@@ -1194,8 +1195,8 @@ def _create_or_open(
             # the icechunk / pre-built-Store paths above.  Without this,
             # ``write_points`` (and other type writers) against an
             # existing remote store would silently re-run
-            # ``create_store(mode="w")`` and clobber the NGFF
-            # ``multiscales[0].axes`` block — the writer does not
+            # ``create_store(mode="w")`` and clobber the root's
+            # ``axes`` — the writer does not
             # forward the user's ``axes=`` kwarg, so axis units written
             # at create time would be replaced by unit-less defaults.
             try:
@@ -1541,13 +1542,12 @@ def create_resolution_level(
 ) -> Group:
     """Create a new resolution level group within the store.
 
-    The level's NGFF ``multiscales[0].datasets`` entry is written via
+    The level is listed in the root's ``multiscales`` layout via
     :func:`zarr_vectors.core.multiscale.upsert_level_transform`.  Every
-    level stores its vertices in level-0 coordinates, so a coarse level's
-    entry repeats level 0's transform; a coarse level's ``bin_shape`` and
-    ``bin_ratio`` go in its own ``zarr_vectors_level`` attrs, where
-    :func:`read_level_metadata` reads them (falling back to the NGFF
-    block for stores that encoded them there).
+    level stores its vertices in level-0 coordinates, so the layout entry
+    carries no transform; a coarse level's ``bin_shape`` and ``bin_ratio``
+    go in its own level ``zarr_vectors`` object, where
+    :func:`read_level_metadata` reads them.
     """
     level_metadata.validate()
     if strict:
@@ -1573,8 +1573,8 @@ def create_resolution_level(
         refuse_octree_write(root[group_name], f"writing level {level}")
     level_group = root.require_group(group_name)
     payload = level_metadata.to_dict()
-    payload["zarr_vectors_level"].pop("bin_shape", None)
-    payload["zarr_vectors_level"].pop("bin_ratio", None)
+    payload["zarr_vectors"].pop("bin_shape", None)
+    payload["zarr_vectors"].pop("bin_ratio", None)
 
     from zarr_vectors.core.multiscale import (
         read_level_transform,
@@ -1596,8 +1596,8 @@ def create_resolution_level(
             root, level, scale=scale, translation=translation,
         )
     else:
-        # Vertices are in level-0 coordinates, so the NGFF transform is
-        # level 0's; the bin geometry goes in the level's own block.
+        # Vertices are in level-0 coordinates, so the level has no
+        # transform of its own; the bin geometry goes in its own block.
         if level_metadata.bin_ratio is not None or level_metadata.bin_shape is not None:
             base_bin: tuple[float, ...] | None = None
             try:
@@ -1615,7 +1615,7 @@ def create_resolution_level(
                 ratio = [float(r) for r in level_metadata.bin_ratio]
             else:
                 ratio = None
-            zvl = payload["zarr_vectors_level"]
+            zvl = payload["zarr_vectors"]
             if ratio is not None:
                 zvl["bin_ratio"] = ratio
             if level_metadata.bin_shape is not None:
@@ -1643,7 +1643,7 @@ def create_resolution_level(
 #:
 #: ``bin_shape`` / ``bin_ratio`` are fixed when the level is written:
 #: :func:`create_resolution_level` derives them (into the level block for a
-#: coarse level, into the NGFF block for level 0), and the level's
+#: coarse level, from the root ``base_bin_shape`` for level 0), and the level's
 #: vertices were binned against them.  ``chunk_shape`` and
 #: ``bounds`` are worse than dead -- they feed ``level_grid_layout``, so
 #: changing one after arrays exist would size the NEXT allocated array to a
@@ -1670,7 +1670,7 @@ def update_level_metadata(
     add_arrays_present: str | list[str] | None = None,
     **fields: Any,
 ) -> LevelMetadata:
-    """Read-modify-write one level's ``zarr_vectors_level`` block.
+    """Read-modify-write one level's ``zarr_vectors`` object (``kind: "level"``).
 
     There was nothing between :func:`create_resolution_level` and
     :func:`read_level_metadata`, so a caller needing to correct a count or
@@ -1720,7 +1720,8 @@ def update_level_metadata(
         )
 
     attrs = level_group.attrs.to_dict()
-    block = dict(attrs.get("zarr_vectors_level", {}))
+    block = dict(attrs.get("zarr_vectors", {}))
+    block.setdefault("kind", "level")
 
     if arrays_present is not None and add_arrays_present is not None:
         raise MetadataError(
@@ -1743,12 +1744,12 @@ def update_level_metadata(
     for key, value in fields.items():
         block[key] = value
 
-    level_group.attrs.update({"zarr_vectors_level": block})
+    level_group.attrs.update({"zarr_vectors": block})
     # Built from the level block alone, so the derived fields come back
-    # None -- they live in the root's NGFF transform, which is exactly why
-    # they are refused above.  Use read_level_metadata(root, level) for a
+    # None for level 0, whose bins are the root's ``base_bin_shape`` --
+    # which is exactly why they are refused above.  Use read_level_metadata(root, level) for a
     # fully-resolved view.
-    return LevelMetadata.from_dict({"zarr_vectors_level": block})
+    return LevelMetadata.from_dict({"zarr_vectors": block})
 
 
 def update_root_metadata(
@@ -1789,8 +1790,8 @@ def update_root_metadata(
         block[key] = value
     root.attrs.update({"zarr_vectors": block})
     # Re-read rather than construct: RootMetadata is assembled from the
-    # zarr_vectors block AND the NGFF multiscales axes, so building it
-    # from this block alone raises on the missing half.
+    # whole root attrs (the CRS is outside this block), so building it
+    # from this block alone would drop it.
     return read_root_metadata(root)
 
 
@@ -1842,10 +1843,10 @@ def read_root_metadata(root: Group) -> RootMetadata:
 def read_level_metadata(root: Group, level: int) -> LevelMetadata:
     """Read and parse level metadata.
 
-    ``bin_shape`` and ``bin_ratio`` are read from the NGFF
-    ``multiscales[0].datasets`` block (the authoritative source under
-    0.5+).  Legacy stores that still carry them under
-    ``zarr_vectors_level`` are honoured as a fallback.
+    A coarse level's ``bin_shape`` and ``bin_ratio`` are read from its own
+    ``zarr_vectors`` object.  A coarse level that records none gets level
+    0's (``bin_ratio`` 1, ``bin_shape`` the root ``base_bin_shape``); at
+    level 0 both are None.
 
     Raises:
         StoreError: If the level does not exist.
@@ -1976,7 +1977,7 @@ def add_resolution_level(
         parent_level=parent_level,
     )
     level_meta.validate()
-    # Route through create_resolution_level so the NGFF block is updated
+    # Route through create_resolution_level so the multiscales layout is updated
     # via :func:`zarr_vectors.core.multiscale.upsert_level_transform` in
     # the same way as a writer-driven create.
     return create_resolution_level(root, level_index, level_meta)
@@ -1987,7 +1988,7 @@ def remove_resolution_level(root: Group, level_index: int) -> None:
 
     Level 0 cannot be removed.
     Nor can a level with a coarser one above it (levels must stay
-    contiguous).  Its NGFF ``multiscales`` entry and every ``links/+k`` /
+    contiguous).  Its ``multiscales`` layout entry and every ``links/+k`` /
     ``link_attributes/<name>/+k`` family pointing at it go with it.
 
     Raises:
@@ -2043,7 +2044,7 @@ def remove_resolution_level(root: Group, level_index: int) -> None:
             lg.delete_subtree(LINK_ATTRIBUTES)
             emptied.append(LINK_ATTRIBUTES)
         if emptied:
-            block = dict(lg.attrs.to_dict().get("zarr_vectors_level", {}))
+            block = dict(lg.attrs.to_dict().get("zarr_vectors", {}))
             present = block.get("arrays_present")
             if present is not None:
                 kept = [a for a in present if a not in emptied]
@@ -2052,16 +2053,14 @@ def remove_resolution_level(root: Group, level_index: int) -> None:
 
     root.delete_subtree(group_name)
 
-    # Drop the level's NGFF dataset entry.
+    # Drop the level's multiscales layout entry.
     attrs = root.attrs.to_dict()
     ms = attrs.get("multiscales")
-    if isinstance(ms, list) and ms:
-        entry = dict(ms[0])
-        datasets = list(entry.get("datasets") or [])
-        kept_ds = [d for d in datasets if d.get("path") != group_name]
-        if len(kept_ds) != len(datasets):
-            entry["datasets"] = kept_ds
-            root.attrs.update({"multiscales": [entry] + list(ms[1:])})
+    if isinstance(ms, dict) and ms.get("layout"):
+        layout = list(ms["layout"])
+        kept = [e for e in layout if str(e.get("asset")) != group_name]
+        if len(kept) != len(layout):
+            root.attrs.update({"multiscales": {**ms, "layout": kept}})
 
     from zarr_vectors.core.ome import refresh_root_node
     refresh_root_node(root)

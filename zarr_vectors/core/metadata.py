@@ -37,7 +37,13 @@ from zarr_vectors.constants import (
     VALID_OBJIDX_CONVENTIONS,
     VALID_XLEVEL_STORAGE,
 )
-from zarr_vectors.exceptions import ConventionError, MetadataError, ZVDeprecationWarning
+from zarr_vectors.core.convention import PROJ_PROJJSON_KEY
+from zarr_vectors.exceptions import (
+    ConventionError,
+    MetadataError,
+    UnsupportedFormatVersionError,
+    ZVDeprecationWarning,
+)
 
 
 class NgffAxis(TypedDict, total=False):
@@ -354,6 +360,48 @@ def _capability_list(value: Any) -> list[str]:
     return [c for c in value if isinstance(c, str)]
 
 
+def check_root_layout(zv: Any) -> None:
+    """Refuse a root ``zarr_vectors`` object this package cannot read.
+
+    Format 0.10.0 moved every metadata key (see
+    :mod:`zarr_vectors.core.convention`), so a store written by 0.9.x or
+    earlier is refused with a pointer to the in-place migration rather
+    than failing later on a missing key.
+    """
+    if not isinstance(zv, dict):
+        raise MetadataError("Root 'zarr_vectors' must be an object")
+    kind = zv.get("kind")
+    version = str(zv.get("zv_version", "?"))
+    if kind is None:
+        raise UnsupportedFormatVersionError(
+            f"store zv_version is {version}, written before the 0.10.0 "
+            f"metadata layout; this package reads {FORMAT_VERSION}. "
+            "Migrate it in place (metadata only, no data is rewritten) with "
+            "zarr_vectors.building.migrate_metadata_0_10(path)."
+        )
+    if kind != "root":
+        raise MetadataError(
+            f"expected the store root, found a 'zarr_vectors' object of kind {kind!r}"
+        )
+    if version != "?" and not _version_tuple(version):
+        raise MetadataError(f"zv_version {version!r} is not a valid X.Y[.Z] string")
+    # A newer format may have moved anything; refuse it here.  An older
+    # version string on a 0.10.0-layout root is malformed rather than
+    # unreadable, and :meth:`RootMetadata.validate` reports it.
+    if _version_tuple(version)[:2] > _version_tuple(FORMAT_VERSION)[:2]:
+        raise UnsupportedFormatVersionError(
+            f"store zv_version is {version}, newer than this package's "
+            f"{FORMAT_VERSION}; upgrade zarr-vectors to read it"
+        )
+
+
+def _version_tuple(version: str) -> tuple[int, ...]:
+    try:
+        return tuple(int(p) for p in version.split("."))
+    except ValueError:
+        return ()
+
+
 @dataclass
 class RootMetadata:
     """Root-level metadata for a ZV store.
@@ -363,10 +411,8 @@ class RootMetadata:
             ``format_version`` in 0.5.0 to disambiguate from Zarr v3's
             ``zarr_format`` field).
         spatial_index_dims: Axes definitions (NGFF / OME-Zarr style).
-            On disk, axes live in ``multiscales[0].axes`` (NGFF) and
-            are NOT duplicated under the ``zarr_vectors`` namespace as
-            of 0.5.0.  This Python attribute remains the canonical
-            in-memory accessor.
+            On disk (format 0.10.0), axes live in the root
+            ``zarr_vectors.axes``.
         chunk_shape: Spatial chunk size per dimension.
         bounds: Global bounding box as ``(min_corner, max_corner)``.
         geometry_types: List of geometry types in the store.
@@ -509,16 +555,13 @@ class RootMetadata:
             raise MetadataError(
                 f"zv_version {self.zv_version!r} is not a valid X.Y[.Z] string"
             ) from exc
-        if (major, minor, patch) < (0, 9, 0):
+        if (major, minor, patch) < (0, 10, 0):
             raise MetadataError(
                 f"store zv_version is {self.zv_version}; this build "
-                f"requires {FORMAT_VERSION} — no backwards-compat shim. "
-                f"Pre-0.9.0 stores wrote each per-spatial-chunk array "
-                f"(vertices, fragments, links, attribute arrays) as a Zarr "
-                f"group of single-chunk ``uint8`` sub-arrays, one per chunk "
-                f"key; 0.9.0 collapses each to a single vlen-bytes Zarr "
-                f"array whose cells are spatial chunks — the old layout "
-                f"cannot be read.  Rewrite from source."
+                f"reads {FORMAT_VERSION}.  A 0.9.x store migrates in place "
+                f"with zarr_vectors.building.migrate_metadata_0_10(path); "
+                f"an older store cannot be read and must be rewritten "
+                f"from source."
             )
 
         if self.cross_level_storage not in VALID_XLEVEL_STORAGE:
@@ -628,16 +671,15 @@ class RootMetadata:
     def to_dict(self) -> dict[str, Any]:
         """Serialise to a JSON-compatible dict.
 
-        Returns the **non-axis** fields only — under 0.5.0 axes live in
-        the NGFF ``multiscales[0].axes`` block, written separately by
-        :func:`zarr_vectors.core.multiscale.write_multiscale_metadata`.
-        Combine the two when writing root attrs.
+        Returns the **non-axis** fields only; :func:`_write_root_attrs`
+        adds ``axes`` (and ``kind``) to the root object.
 
         ``format_capabilities`` (possibly empty) is always written; ``crs``
         and the other optional keys only when they carry a value.
         """
-        d = {
+        d: dict[str, Any] = {
             "zarr_vectors": {
+                "kind": "root",
                 "zv_version": self.zv_version,
                 "format_capabilities": list(self.format_capabilities),
                 "chunk_shape": list(self.chunk_shape),
@@ -651,6 +693,8 @@ class RootMetadata:
                 "reduction_factor": self.reduction_factor,
             }
         }
+        if self.spatial_index_dims:
+            d["zarr_vectors"]["axes"] = [dict(a) for a in self.spatial_index_dims]
         if self.base_bin_shape is not None:
             d["zarr_vectors"]["base_bin_shape"] = list(self.base_bin_shape)
         if self.shard_shape is not None:
@@ -666,7 +710,8 @@ class RootMetadata:
         if self.manifest_block_dtype == "int32":
             d["zarr_vectors"]["manifest_block_dtype"] = "int32"
         if self.crs is not None:
-            d["zarr_vectors"]["crs"] = self.crs
+            # Format 0.10.0: a CRS is the proj convention's, on the root.
+            d[PROJ_PROJJSON_KEY] = self.crs
         if self.required_capabilities:
             d["zarr_vectors"]["required_capabilities"] = list(self.required_capabilities)
         if self.attribute_specs:
@@ -683,11 +728,10 @@ class RootMetadata:
 
         Args:
             d: The full root-attrs dict — must contain a
-                ``"zarr_vectors"`` key for ZV-specific fields and
-                (when ``strict``) a top-level ``"multiscales"`` key
-                holding the NGFF axes.
+                ``"zarr_vectors"`` key for ZV-specific fields, axes
+                included.
             strict: When True (default), every structural field
-                (axes via ``multiscales[0].axes``, ``chunk_shape``,
+                (``axes``, ``chunk_shape``,
                 ``bounds``, ``geometry_types``) must be present.  When
                 False, missing structural fields fall through as
                 ``None``/``[]`` so a freshly-warmed store can
@@ -701,12 +745,10 @@ class RootMetadata:
         if "zarr_vectors" not in d:
             raise MetadataError("Root metadata must contain 'zarr_vectors' key")
         zv = d["zarr_vectors"]
+        check_root_layout(zv)
 
-        # Axes now live in NGFF ``multiscales[0].axes`` (0.5.0+).
-        ms = d.get("multiscales") or []
-        axes: list[dict[str, str]] = []
-        if ms and isinstance(ms, list) and ms[0].get("axes"):
-            axes = list(ms[0]["axes"])
+        # Format 0.10.0: axes live in the root object.
+        axes: list[dict[str, str]] = [dict(a) for a in (zv.get("axes") or [])]
 
         if strict:
             required = ["zv_version", "chunk_shape", "bounds", "geometry_types"]
@@ -715,10 +757,7 @@ class RootMetadata:
                     raise MetadataError(f"Missing required root metadata key: '{key}'")
             if not axes:
                 raise MetadataError(
-                    "Missing required root metadata: NGFF "
-                    "``multiscales[0].axes`` block (axes are no longer "
-                    "stored under ``zarr_vectors.spatial_index_dims`` "
-                    "as of format 0.5.0)"
+                    "Missing required root metadata key: 'axes'"
                 )
         elif "zv_version" not in zv:
             raise MetadataError("Missing required root metadata key: 'zv_version'")
@@ -737,7 +776,7 @@ class RootMetadata:
                 else ([], [])
             ),
             geometry_types=zv.get("geometry_types") or [],
-            crs=zv.get("crs"),
+            crs=d.get(PROJ_PROJJSON_KEY),
             links_convention=zv.get("links_convention", LINKS_IMPLICIT_SEQUENTIAL),
             object_index_convention=zv.get("object_index_convention", OBJIDX_STANDARD),
             cross_chunk_strategy=zv.get("cross_chunk_strategy", CROSS_CHUNK_EXPLICIT),
@@ -965,7 +1004,12 @@ class LevelMetadata:
             d["link_fragments_aligned"] = True
         if self.octree_chunks is not None:
             d["octree_chunks"] = dict(self.octree_chunks)
-        return {"zarr_vectors_level": d}
+        from zarr_vectors.core.convention import CONVENTION_CMO_SHORT, CONVENTIONS_KEY
+
+        return {
+            "zarr_vectors": {"kind": "level", **d},
+            CONVENTIONS_KEY: [dict(CONVENTION_CMO_SHORT)],
+        }
 
     @classmethod
     def from_dict(cls, d: dict[str, Any]) -> LevelMetadata:
@@ -977,11 +1021,13 @@ class LevelMetadata:
         Raises:
             MetadataError: If the dict is malformed.
         """
-        if "zarr_vectors_level" not in d:
+        lv = d.get("zarr_vectors")
+        if not isinstance(lv, dict) or lv.get("kind") != "level":
             raise MetadataError(
-                "Level metadata must contain 'zarr_vectors_level' key"
+                "Level metadata must contain a 'zarr_vectors' object with "
+                "kind 'level' (format 0.10.0)"
             )
-        lv = d["zarr_vectors_level"]
+        lv = {k: v for k, v in lv.items() if k != "kind"}
         required = ["level", "vertex_count", "arrays_present"]
         for key in required:
             if key not in lv:
@@ -1455,14 +1501,21 @@ def serialise_parametric_types(
     """Serialise parametric type registry to a dict.
 
     Returns:
-        ``{"parametric_types": {"0": {...}, "1": {...}, ...}}``
+        The ``/parametric/`` group's attributes (format 0.10.0):
+        ``{"zarr_vectors": {"kind": "parametric", "parametric_types":
+        {"0": {...}, ...}}, "zarr_conventions": [...]}``.
     """
-    return {
-        "parametric_types": {
-            str(t.type_id): {"name": t.name, "coefficients": t.coefficients}
-            for t in types
+    from zarr_vectors.core.convention import with_registration
+
+    return with_registration({
+        "zarr_vectors": {
+            "kind": "parametric",
+            "parametric_types": {
+                str(t.type_id): {"name": t.name, "coefficients": t.coefficients}
+                for t in types
+            },
         }
-    }
+    })
 
 
 # ---------------------------------------------------------------------------
@@ -1780,14 +1833,15 @@ def deserialise_parametric_types(
     """Deserialise parametric type registry from a dict.
 
     Args:
-        d: Dict with ``"parametric_types"`` key.
+        d: The ``/parametric/`` group's attributes.
 
     Returns:
         List of ParametricTypeDef objects.
     """
-    if "parametric_types" not in d:
+    block = d.get("zarr_vectors")
+    if not isinstance(block, dict) or "parametric_types" not in block:
         return []
-    registry = d["parametric_types"]
+    registry = block["parametric_types"]
     types: list[ParametricTypeDef] = []
     for tid_str, info in registry.items():
         types.append(ParametricTypeDef(

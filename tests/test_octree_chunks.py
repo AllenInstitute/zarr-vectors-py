@@ -1281,10 +1281,11 @@ def test_required_capabilities_keep_other_entries(tmp_path):
 
 def test_root_metadata_round_trips_required_capabilities():
     from zarr_vectors.core.metadata import RootMetadata
-    attrs = {"zarr_vectors": {"zv_version": "0.9.4", "chunk_shape": [1.0], "bounds": [[0.0], [1.0]],
+    attrs = {"zarr_vectors": {"kind": "root", "zv_version": "0.10.0",
+                              "axes": [{"name": "x", "type": "space"}],
+                              "chunk_shape": [1.0], "bounds": [[0.0], [1.0]],
                               "geometry_types": ["point_cloud"],
-                              "required_capabilities": ["additive_levels", CAP_OCTREE_CHUNKS]},
-             "multiscales": [{"axes": [{"name": "x", "type": "space"}]}]}
+                              "required_capabilities": ["additive_levels", CAP_OCTREE_CHUNKS]}}
     meta = RootMetadata.from_dict(attrs)
     assert meta.required_capabilities == ["additive_levels", CAP_OCTREE_CHUNKS]
     assert meta.to_dict()["zarr_vectors"]["required_capabilities"] == [

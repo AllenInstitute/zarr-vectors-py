@@ -186,9 +186,9 @@ print(skeleton["fragment_count"], skeleton["positions"].shape, skeleton["edges"]
 
 `init_skeleton_store` also takes `shard_shape=`, `compressor=` and
 `backend=`. `coordinate_offset=` records the world position of the stored
-origin as `coordinate_offset` in the root `zarr_vectors` block (stored
-vertices are `world - coordinate_offset`) and as level 0's NGFF
-translation; `read_skeleton_by_segment_id` adds it back.
+origin as `coordinate_offset` in the root `zarr_vectors` object (stored
+vertices are `world - coordinate_offset`); `read_skeleton_by_segment_id`
+adds it back.
 
 ### Validation
 

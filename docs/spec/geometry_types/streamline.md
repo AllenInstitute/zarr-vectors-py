@@ -16,7 +16,7 @@ tells readers the paths are tractography output. `write_polylines` writes
 The format has no root keys for tractography provenance. Store
 per-streamline values (mean FA, length, step size) in `object_attributes/`,
 per-point values (FA, MD) in `vertex_attributes/`, and bundles in
-`groups/`. Units belong to the axes in `multiscales`. Store-wide
+`groups/`. Units belong to the axes in the root `zarr_vectors.axes`. Store-wide
 provenance (step size, seeding, algorithm) can go in a namespace of the
 root `user_metadata` attribute through `Dataset.metadata`, for example
 `zv.open(path, mode="r+").metadata["my_tractography"].update(step_size=0.5)`;

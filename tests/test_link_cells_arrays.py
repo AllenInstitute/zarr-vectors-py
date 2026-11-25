@@ -55,7 +55,7 @@ def _as_records(chunks, vids):
 
 
 @pytest.mark.parametrize("L,directed,store,int32", [
-    (2, False, "canonical", False),   # BRIDGE seams
+    (2, False, "canonical", False),   # a downstream pipeline's seams
     (2, False, "canonical", True),    # an int32-stamped family
     (3, False, "canonical", False),
     (2, True, "canonical", False),

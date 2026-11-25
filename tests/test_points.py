@@ -452,7 +452,7 @@ class TestRemoteUrlPreservesMetadata:
 
         # Axes (with units) must survive the write.
         root = open_store(store_path)
-        axes_after = root.attrs.to_dict()["multiscales"][0]["axes"]
+        axes_after = root.attrs.to_dict()["zarr_vectors"]["axes"]
         for ax in axes_after:
             assert ax.get("unit") == "micrometer", (
                 f"write_points clobbered axis unit; got {axes_after}"

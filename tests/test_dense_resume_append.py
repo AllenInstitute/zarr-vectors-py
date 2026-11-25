@@ -151,7 +151,7 @@ def _build(scenario, rng):
             zb.reserve_object_rows(level, 300, sid_ndim=3, n_blocks=2_000)
             b = _batch(rng, 200, tag=1)
             zb.write_object_manifests(level, **b, mode="place", at=100, block_at=1_000)
-            # As BRIDGE does: the placed ids are their rows.
+            # As a downstream user does: the placed ids are their rows.
             zb.commit_object_index(level, 100, sid_ndim=3, object_ids_sorted=True)
         return level
     return build

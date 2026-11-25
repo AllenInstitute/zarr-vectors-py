@@ -145,10 +145,10 @@ def test_a_bin_axis_without_bin_values_is_carried_too(tmp_path):
     """A rechunk made before labels were recorded has the axis, no values."""
     path = _attr_store(tmp_path / "g.zarrvectors")
     root = open_store(path, mode="r+")
-    block = dict(root["0"].attrs.to_dict()["zarr_vectors_level"])
+    block = dict(root["0"].attrs.to_dict()["zarr_vectors"])
     block.pop("chunk_attribute_name", None)
     block.pop("chunk_attribute_values", None)
-    root["0"].attrs.update({"zarr_vectors_level": block})
+    root["0"].attrs.update({"zarr_vectors": block})
 
     build_pyramid(path, factors=[(2.0, 1.0)])
 

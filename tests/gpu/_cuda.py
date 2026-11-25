@@ -2,7 +2,7 @@
 
 Each GPU test module starts with ``from tests.gpu._cuda import cupy`` and
 ``pytestmark = CUDA``. CI has no GPU, so these run locally, from the repo
-root, in an environment with cupy (e.g. ``bridge-gpu-zv3``).
+root, in an environment with cupy.
 """
 
 from __future__ import annotations

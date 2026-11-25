@@ -427,12 +427,13 @@ class ZVWriter:
     def _touch_arrays_present(self, entry: str) -> None:
         """Add ``entry`` to the level's ``arrays_present`` if missing."""
         attrs = self._group.attrs.to_dict()
-        lv = attrs.get("zarr_vectors_level", {})
+        lv = dict(attrs.get("zarr_vectors", {}))
+        lv.setdefault("kind", "level")
         ap = list(lv.get("arrays_present", []))
         if entry not in ap:
             ap.append(entry)
             lv["arrays_present"] = ap
-            self._group.attrs.update({"zarr_vectors_level": lv})
+            self._group.attrs.update({"zarr_vectors": lv})
 
     # ---------------- true append ---------------------------------------
 
@@ -866,9 +867,10 @@ class ZVWriter:
         """Recompute the level's vertex_count from on-disk data."""
         offsets, _keys, total = chunk_local_to_global_offsets(self._group)
         attrs = self._group.attrs.to_dict()
-        lv = attrs.get("zarr_vectors_level", {})
+        lv = dict(attrs.get("zarr_vectors", {}))
+        lv.setdefault("kind", "level")
         lv["vertex_count"] = int(total)
-        self._group.attrs.update({"zarr_vectors_level": lv})
+        self._group.attrs.update({"zarr_vectors": lv})
 
     # ---------------- sync mirrors --------------------------------------
 

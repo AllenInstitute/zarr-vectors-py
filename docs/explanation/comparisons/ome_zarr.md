@@ -11,22 +11,24 @@ dense, multi-resolution image arrays, with labels and plate layouts for
 high-content screening.
 
 Zarr Vectors stores sparse vector geometry: points, lines, graphs and
-meshes. The two share no array layout, but a store's root attributes
-carry two pieces of OME-Zarr metadata:
+meshes. The two share no array layout. A store's root attributes carry
+one piece of OME-Zarr metadata, an `ome` node (RFC 8, version 0.6) of
+type `collection`, with a `world` coordinate system and one `zv:level`
+node per level, so a store can be listed in an OME collection. Level-1
+validation warns when a store has no `ome` node;
+`zarr_vectors.building.stamp_ome_node(store)` adds one to an older store
+without touching its data.
 
-- a `multiscales` block (NGFF 0.4) listing the resolution levels. Every
-  level stores positions in level-0 coordinates, so every level carries
-  level 0's transform: `scale` 1 and a `translation` of half the level-0
-  bin shape. A level's `bin_ratio` and `bin_shape` are in its
-  `zarr_vectors_level` attributes. See
-  [Multiscale metadata](../../spec/multiscale/multiscale_metadata.md).
-- an `ome` node (RFC 8, version 0.6) of type `collection`, with a
-  `world` coordinate system and one `zv:level` node per level, so a
-  store can be listed in an OME collection. Level-1 validation warns
-  when a store has no `ome` node; `zarr_vectors.building.stamp_ome_node(store)`
-  adds one to an older store without touching its data.
+The store carries no NGFF `multiscales` block. Up to format 0.9.x it
+did, and NGFF viewers could misread it, since NGFF `datasets` must be
+image arrays. Since 0.10.0 the levels are listed by the
+[multiscales convention](https://github.com/zarr-conventions/multiscales)
+instead, with no transform, because every level stores positions in
+level-0 coordinates. A level's `bin_ratio` and `bin_shape` are in its
+`zarr_vectors` level object. See
+[Multiscale metadata](../../spec/multiscale/multiscale_metadata.md).
 
-An OME-Zarr tool can find both blocks but cannot read the arrays as
+An OME-Zarr tool can find the `ome` node but cannot read the arrays as
 images.
 
 ## Comparison
@@ -36,7 +38,7 @@ images.
 | Content | Vertices, links and objects | Dense images |
 | Arrays | One variable-length byte cell per spatial chunk | A value at every index |
 | Positions | World coordinates at every level | Array indices, converted by `scale` |
-| `scale` in `multiscales` | 1 at every level | Converts indices to physical units |
+| Level transform | None: every level is in world coordinates | `scale` in `multiscales` converts indices to physical units |
 | Labels | Vertex or [object attributes](../../spec/object_model/object_attributes.md) | Integer label images |
 | Plates and wells | None | Yes |
 

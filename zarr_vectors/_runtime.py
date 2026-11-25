@@ -12,7 +12,7 @@ import functools
 #: Entry points and guarantees, each True once this build has it. Keys
 #: are only ever added, so a caller can rely on one being present.
 _STATIC: dict[str, bool] = {
-    # Array-form writers and readers (BRIDGE R1/R3/R12).
+    # Array-form writers and readers (downstream requests R1/R3/R12).
     "csr_fragments": True,
     "array_manifests": True,
     "manifests_csr_read": True,

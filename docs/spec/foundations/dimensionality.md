@@ -7,12 +7,12 @@ appears on disk, and what the validator checks.
 
 **Dimensionality (`D`)**
 : The number of axes vertices are positioned and chunked in: the length
-  of `multiscales[0].axes` in the root attributes
+  of `zarr_vectors.axes` in the root attributes
   (`RootMetadata.sid_ndim` in Python). `D` is fixed for the store and
   shared by every level.
 
 **Axis**
-: One entry of `multiscales[0].axes`: a `name`, a `type` (such as
+: One entry of the root `zarr_vectors.axes`: a `name`, a `type` (such as
   `"space"` or `"time"`) and an optional `unit`.
 
 ## Introduction
@@ -45,9 +45,9 @@ The type writers have no `axes` argument. Set names and units with
 
 | Item | Size |
 |------|-------|
-| `multiscales[0].axes` | `D` entries |
-| `chunk_shape`, `bounds[0]`, `bounds[1]`, `base_bin_shape` (root `zarr_vectors` block) | `D` entries each |
-| `bin_shape`, `bin_ratio` (each level's `zarr_vectors_level` block) | `D` entries each |
+| `axes` (root `zarr_vectors` object) | `D` entries |
+| `chunk_shape`, `bounds[0]`, `bounds[1]`, `base_bin_shape` (root `zarr_vectors` object) | `D` entries each |
+| `bin_shape`, `bin_ratio` (each level's `zarr_vectors` object) | `D` entries each |
 | Per-chunk arrays (`vertices`, `vertex_fragments`, links, attributes) | rank `D`; rank `D + 1` when [chunked by an attribute](../chunking/attribute_chunking.md) |
 | Positions in a `vertices` cell | rows of `D` values |
 | `<offsets>` path segment of a links array | `link_width - 1` offsets of `D` components each (see [Links](../object_model/links.md)) |

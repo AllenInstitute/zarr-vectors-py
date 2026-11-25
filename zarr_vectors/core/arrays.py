@@ -37,6 +37,7 @@ from zarr_vectors.constants import (
     VERTEX_FRAGMENTS,
     VERTICES,
 )
+from zarr_vectors.core import convention as _zvc
 
 # Group, not FsGroup: FsGroup is a no-op subclass that create_store and
 # open_store return only when the backing store happens to be a
@@ -770,7 +771,7 @@ def _array_matches_layout(
 
     # A "no" from the manifest can't be trusted (record_presence=False,
     # lost updates), so only that answer is checked against the store.
-    if existing.attrs.get("nonempty_chunks"):
+    if _zvc.get_field(existing.attrs, "nonempty_chunks"):
         has_data = True
     else:
         has_data = level_group._array_has_stored_data(array_name)
@@ -1964,7 +1965,7 @@ def write_chunk_links(
     full_name = links_path(delta, offsets)
 
     # NOTE: link groups are no longer required to be 1:1 with the chunk's
-    # vertex fragments. BRIDGE stores streamlines as vertex-fragments and the
+    # vertex fragments. A downstream graph pipeline stores streamlines as vertex-fragments and the
     # node graph as link-fragments, so a chunk legitimately has many vertex
     # fragments (Core-1 range + polyline twins) but few link groups (the node
     # graph). Readers derive per-group link ranges from ``link_fragments/``
@@ -2938,7 +2939,7 @@ def _index_sid_ndim(level_group: Group) -> int:
     from zarr_vectors.core.sources import chunk_sources
 
     if chunk_sources(level_group) is not None:
-        dims = (level_group.attrs.get("zarr_vectors_level") or {}).get("chunk_dims") or []
+        dims = (level_group.attrs.get("zarr_vectors") or {}).get("chunk_dims") or []
         if dims:
             return len(dims)
     return _infer_vert_ndim(level_group)
@@ -3433,7 +3434,7 @@ def write_object_attribute_columns(
     for name, data in host.items():
         full_name = f"{OBJECT_ATTRIBUTES}/{name}"
         node = level_group._lookup_node(full_name)
-        meta = dict(node.attrs) if isinstance(node, zarr.Array) else {}
+        meta = _zvc.unwrap_array_meta(node.attrs) if isinstance(node, zarr.Array) else {}
         shape = tuple(meta.get("shape") or ())
         n0 = int(shape[0]) if shape else 0
         start = n0 if at is None else int(at)
@@ -5138,21 +5139,29 @@ def _write_link_cells_arrays(
             delta == 0 and is_intra(offsets),
         )
 
-    # One prefetch of every cell this batch touches.
+    # One prefetch of every cell this batch touches -- except those an open
+    # shard transaction answers itself (staged, or prefetched with its shard).
+    txn = level_group._shard_txn
     plan: list[tuple[str, list[str]]] = []
     intra_keys: list[str] = []
+
+    def unserved(name: str, keys: list[str]) -> tuple[str, list[str]]:
+        if txn is None:
+            return name, keys
+        return name, [k for k in keys if not txn.serves(name, k)]
+
     for seg, cells in by_seg.items():
         offsets, _, flat = seg_info[seg]
         keys = [_chunk_key(src) for src, _, _ in cells]
-        plan.append((links_path(delta, offsets), keys))
-        plan += [(link_attributes_path(n, delta, offsets), keys) for n in attrs]
+        plan.append(unserved(links_path(delta, offsets), keys))
+        plan += [unserved(link_attributes_path(n, delta, offsets), keys) for n in attrs]
         if flat:
             intra_keys += keys
     if intra_keys:
-        plan.append((LINK_FRAGMENTS, sorted(set(intra_keys))))
-    cache = flush_prefetch(level_group._zarr, plan)
+        plan.append(unserved(LINK_FRAGMENTS, sorted(set(intra_keys))))
+    plan = [(name, keys) for name, keys in plan if keys]
+    cache = flush_prefetch(level_group._zarr, plan) if plan else {}
     # Cells staged in a shard transaction win over the store prefetch.
-    txn = level_group._shard_txn
 
     def raw(name: str, key: str) -> bytes:
         if txn is not None:
@@ -6468,7 +6477,7 @@ def read_chunk_attributes(
     slices, explicit fragments via ``fi.indices(f)`` — exactly as
     :func:`read_chunk_vertices` does.  There is no contiguity
     requirement, so explicit path-fragment vertex-fragments (e.g.
-    BRIDGE's polyline twins appended on top of Core-1's range) read
+    a downstream pipeline's polyline twins appended on top of Core-1's range) read
     correctly.
 
     Args:
@@ -6512,7 +6521,7 @@ def read_chunk_attributes(
     # vertex extent — independent of the requested ``ncols``), then gather
     # each fragment by vertex index exactly as read_chunk_vertices does:
     # range fragments as contiguous slices, explicit fragments (e.g.
-    # BRIDGE's appended path-fragment twins) via ``fi.indices(f)``.  Each
+    # a downstream pipeline's appended path-fragment twins) via ``fi.indices(f)``.  Each
     # gathered group is finally flattened and re-shaped to honour the
     # caller's ``ncols`` (ncols=1 yields a flat 1-D array), matching the
     # historical decode_ragged_floats contract.
@@ -6795,8 +6804,8 @@ def read_chunk_link_attributes(
 def _infer_vert_ndim(level_group: Group) -> int:
     """Best-effort lookup of the spatial-index dimensionality.
 
-    Reads NGFF ``multiscales[0].axes`` length from root attrs.  Falls
-    back to 3 when unavailable.
+    Reads the length of the root's ``zarr_vectors.axes``.  Falls back to
+    3 when unavailable.
     """
     try:
         # Level groups don't carry root attrs; walk up to root via the
@@ -6804,11 +6813,10 @@ def _infer_vert_ndim(level_group: Group) -> int:
         # the root path.
         from zarr_vectors.core.group import Group
         root_handle = Group._from_backend(level_group._backend, "")
-        ms = root_handle.attrs.to_dict().get("multiscales") or []
-        if ms and isinstance(ms, list):
-            axes = ms[0].get("axes") or []
-            if axes:
-                return len(axes)
+        zv = root_handle.attrs.to_dict().get("zarr_vectors") or {}
+        axes = zv.get("axes") or []
+        if axes:
+            return len(axes)
     except Exception:
         pass
     return 3
@@ -7652,7 +7660,7 @@ def _link_cell_rows(
     ``dtype`` is the *cell's own* declared element type, which
     :func:`write_chunk_links` stamped onto the array and which a caller
     reads back off ``read_array_meta``.  It is not always int64: an
-    int32-declared array (BRIDGE stamps its per-chunk node graph int32 via
+    int32-declared array (a downstream pipeline stamps its per-chunk node graph int32 via
     ``create_node_graph_array``) holds half as many bytes per element, so
     decoding it at a fixed int64 yields a quarter of the rows on an even
     element count and raises ``cannot reshape array of size N`` on an odd
@@ -7803,7 +7811,7 @@ def read_links(
         ncols = (1 + link_width) if has_perm else link_width
         flat = delta == 0 and is_intra(offsets)
         # Per-ARRAY, not per-family: each offsets segment carries its own
-        # element width (BRIDGE's intra node graph is int32 while its seam
+        # element width (a downstream pipeline's intra node graph is int32 while its seam
         # segments are int64), so this must be read inside the segment loop.
         cell_dtype = np.dtype(arr_meta.get("dtype", "int64"))
         segments.append((

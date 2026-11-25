@@ -5,7 +5,7 @@ A store has two nested grids, set separately.
 | | [`chunk_shape`](chunk_shape.md) | [`bin_shape`](bin_shape.md) |
 |---|---|---|
 | Controls | Files, requests, the read unit | Selection inside a chunk; resolution of coarse levels |
-| Stored in | Root `zarr_vectors.chunk_shape`; optional per-level value | Root `zarr_vectors.base_bin_shape`; per-level `zarr_vectors_level.bin_shape` |
+| Stored in | Root `zarr_vectors.chunk_shape`; optional per-level value | Root `zarr_vectors.base_bin_shape`; per-level `bin_shape` in the level's `zarr_vectors` object |
 | Default | Required | Equal to `chunk_shape` |
 | Across levels | Root value, or an integer multiple of it per level | Grows with `bin_ratio` |
 | Changed after writing by | `rechunk_spatial` (new store) | `rebin_level` (point clouds, in place) |

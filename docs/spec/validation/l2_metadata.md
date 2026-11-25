@@ -25,8 +25,8 @@ below are errors unless marked.
 | Check | Message |
 |-------|---------|
 | The store opens; L2 stops if not | `Cannot open store: ...` |
-| The root metadata parses (required keys and types); L2 stops if not | `Cannot read root metadata: ...` |
-| `RootMetadata.validate()` passes: `zv_version` at least 0.9.0, valid conventions and cross-level settings | `Root metadata invalid: ...` |
+| The root metadata parses (required keys and types); L2 stops if not. A 0.9.x store fails here with `UnsupportedFormatVersionError` | `Cannot read root metadata: ...` |
+| `RootMetadata.validate()` passes: `zv_version` at least 0.10.0, valid conventions and cross-level settings | `Root metadata invalid: ...` |
 | `sid_ndim >= 1` | `SID dimensionality is <n>, must be >= 1` |
 | `len(chunk_shape) == sid_ndim` | `chunk_shape has <n> dims, expected <d>` |
 | Every `chunk_shape[i] > 0` | `chunk_shape[i] = <v>, must be > 0` |
@@ -41,12 +41,10 @@ below are errors unless marked.
 
 ### Each level
 
-Level fields are read from the level's `zarr_vectors_level` block, with
-legacy flat keys as a fallback. `bin_shape` and `bin_ratio` come from the
-level's NGFF transform when it has one: at level 0 they are not checked
-(level 0 uses the root `base_bin_shape`), and at coarser levels the
-transform on stores this package writes is level 0's, so the checks see
-`bin_ratio = 1` and the base bin shape, not the level's own bins.
+Level fields are read from the level's `zarr_vectors` object, with
+top-level keys as a fallback. `bin_shape` and `bin_ratio` are not checked
+at level 0, which uses the root `base_bin_shape`; at a coarser level the
+checks see the level's own bins.
 
 | Check | Message |
 |-------|---------|
@@ -75,7 +73,7 @@ Once per store, for each of the root's `format_capabilities` and
 
 - Link families and link attributes.
 - Array metadata: `vertices/` dtype, `vertex_fragments/` encoding.
-- The `multiscales` block and its coordinate transforms.
+- The `multiscales` block, `zarr_conventions` and `proj:projjson`.
 - Rules per geometry type (L4).
 
 ### Example

@@ -53,12 +53,13 @@ level=...)` does the same for a path, a URL or an open store group, and `zvtools
 
 | Problem | How it shows | Fix |
 |---|---|---|
+| The store was written by 0.9.x | `UnsupportedFormatVersionError` on open, naming the migration | `zarr_vectors.building.migrate_metadata_0_10(path)` rewrites the metadata in place; safe to rerun. See [Migrating from 0.9.x](../spec/layout/root_metadata.md#migrating-from-09x) |
 | A required array is missing | `0/vertices/ missing` | Write the level again from source |
 | A root metadata field is wrong | errors naming the field, such as `chunk_shape has 2 dims, expected 3` | `update_root_metadata(root, field=...)` rewrites only the fields you pass; `update_level_metadata` for a level |
 | `arrays_present` misses arrays on disk | readers do not see the array; validation is silent | `refresh_arrays_present(level)` |
 | The presence manifest misses cells | `obj <id> refs non-existent chunk ...` | `rebuild_presence(level)` |
 | Link counts are stale after parallel writes | `num_physical_records=... != ... rows on disk` | `finalize_links(level, delta=0)` |
-| The root `multiscales` list names levels that are gone | `read_multiscale_metadata(root)` | `write_multiscale_metadata(root)` |
+| The root `multiscales` layout names levels that are gone | `read_multiscale_metadata(root)` | `write_multiscale_metadata(root)` |
 | A pyramid level is missing | `Levels [0, 2], expected [0, 1]` | Remove the levels above 0, coarsest first, and build the pyramid again |
 | The object index points at missing data | `obj <id> refs non-existent chunk ...` | `write_object_index` from manifests you rebuild from source |
 

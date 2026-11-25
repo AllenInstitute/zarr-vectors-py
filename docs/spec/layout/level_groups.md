@@ -12,7 +12,7 @@ every key of its attributes.
 
 **Level attributes**
 : The `attributes` of the level group's `zarr.json`. Zarr Vectors keys are
-  under `zarr_vectors_level`; `LevelMetadata` in
+  in the `zarr_vectors` object, with `kind` `"level"`; `LevelMetadata` in
   `zarr_vectors.core.metadata` is the in-memory form.
 
 ## Introduction
@@ -20,7 +20,7 @@ every key of its attributes.
 A level's attributes say how many vertices it holds, which arrays it has,
 how it was made from its parent level and, above level 0, its bin size.
 Every level stores vertices in level-0 coordinates, so its entry in the
-root `multiscales` block repeats level 0's transform (see
+root `multiscales` block names it and carries no transform (see
 [Multiscale metadata](../multiscale/multiscale_metadata.md)).
 
 ## Technical reference
@@ -34,7 +34,9 @@ The `zarr.json` of level 1 of a streamline pyramid built with
 ```javascript
 {
   "attributes": {
-    "zarr_vectors_level": {
+    "zarr_conventions": [{"uuid": "66268a61-7833-4995-bbcb-233bb417dae5"}],
+    "zarr_vectors": {
+      "kind": "level",
       "level": 1,
       "object_sparsity": 0.5,
       "vertex_count": 1,
@@ -56,12 +58,13 @@ Level 0 of the same store has `"level": 0`, `"object_sparsity": 1.0`,
 `"coarsening_method": "none"`, `"parent_level": null` and
 `"fragments_tile": true`.
 
-### `zarr_vectors_level` keys
+### `zarr_vectors` keys
 
 Always written:
 
 | Key | Type | Meaning |
 |-----|------|---------|
+| `kind` | string | `"level"` |
 | `level` | integer | The level index, equal to the group name |
 | `vertex_count` | integer | Vertices at this level |
 | `arrays_present` | list of strings | Array families present (`vertices`, `links`, `object_index`, …), never `<family>/<name>` |
@@ -86,9 +89,12 @@ Written only when set:
 | `octree_chunks` | object | The level has [octree chunks](../chunking/octree_chunks.md) |
 
 Level 0 has no `bin_ratio` or `bin_shape`: its bin is the root
-`base_bin_shape`. Older stores kept a coarse level's bins
-in its `multiscales` entry instead (`scale` = `bin_ratio`, `translation`
-= `bin_shape / 2`); `read_level_metadata` reads either form.
+`base_bin_shape`. The level object is the only place a coarse level's
+bins are stored. A coarse level that records neither reads as level 0's
+(`bin_ratio` 1, `bin_shape` the root `base_bin_shape`). Stores older than
+the per-level bin keys kept them in the 0.9.x NGFF `multiscales` entry;
+`migrate_metadata_0_10` copies them into the level object (see
+[Root metadata](root_metadata.md#migrating-from-09x)).
 `update_level_metadata` refuses to change `bin_ratio`, `bin_shape`,
 `chunk_shape` or `bounds`, which fix the layout of arrays already
 written.
@@ -104,13 +110,14 @@ not false.
 
 ### Build-time keys
 
-`zarr_vectors_presence` sits beside `zarr_vectors_level`, only while the
-level is being written. Its value is `"deferred"`: the level's per-chunk
+`presence` is a key of the level's `zarr_vectors` object, present only
+while the level is being written. Its value is `"deferred"`: the level's per-chunk
 arrays carry no `nonempty_chunks`, so concurrent writers share no state,
 and a reader takes presence from the store (see
 [Chunk arrays](chunk_arrays.md)). `zarr_vectors.building.defer_presence`
 sets it; `zarr_vectors.building.rebuild_presence` writes every array's
-`nonempty_chunks` and removes it.
+`nonempty_chunks` and removes it. Before 0.10.0 this key was a separate
+top-level attribute, `zarr_vectors_presence`.
 
 ### Adding and removing levels
 

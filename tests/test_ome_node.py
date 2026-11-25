@@ -172,8 +172,9 @@ class TestAdditive:
         assert set(attrs) >= {"zarr_vectors", "multiscales", OME_ATTRS_KEY}
         # Still the source of truth, still where every reader looks.
         assert attrs["zarr_vectors"]["zv_version"] == FORMAT_VERSION
-        assert attrs["multiscales"][0]["metadata"]["format"] == "zarr_vectors"
-        assert attrs["multiscales"][0]["axes"] == MICRON_AXES
+        assert attrs["zarr_vectors"]["kind"] == "root"
+        assert attrs["zarr_vectors"]["axes"] == MICRON_AXES
+        assert attrs["multiscales"]["layout"][0] == {"asset": "0"}
 
     def test_a_pre_0_9_2_store_still_opens(self, store):
         """The block is additive, so its absence is not an error."""
@@ -255,7 +256,7 @@ class TestForeignChildren:
     """``refresh_root_node`` owns the ``zv:level`` entries, nothing else."""
 
     BACKREF = {
-        "type": "collection", "name": "bridge_subject",
+        "type": "collection", "name": "pipeline_subject",
         "path": {"type": "zarr", "path": "../"},
     }
 
@@ -270,7 +271,7 @@ class TestForeignChildren:
         refreshed = stamp_ome_node(str(store))
         assert self.BACKREF in refreshed["nodes"]
         assert [n["name"] for n in refreshed["nodes"]] == [
-            "0", "1", "bridge_subject",
+            "0", "1", "pipeline_subject",
         ]
         _assert_rfc8_legal(refreshed, is_root=True)
 
@@ -278,7 +279,7 @@ class TestForeignChildren:
         self._add_child(store, self.BACKREF)
         remove_resolution_level(open_store(store, mode="r+"), 1)
         node = _root_attrs(store)[OME_ATTRS_KEY]
-        assert [n["name"] for n in node["nodes"]] == ["0", "bridge_subject"]
+        assert [n["name"] for n in node["nodes"]] == ["0", "pipeline_subject"]
 
     def test_a_foreign_child_named_like_a_level_is_dropped(self, store):
         # Names are unique within a collection, and the level is owned.
@@ -332,10 +333,10 @@ class TestWorldId:
 #: exists for.  A prefixed leaf, so a generic walker does not follow it
 #: back up into the parent and round again.
 BACKREF = {
-    "type": "bridge:container",
+    "type": "pipeline:container",
     "name": "container",
     "path": {"type": "zarr", "path": "../"},
-    "attributes": {"bridge:role": "graph"},
+    "attributes": {"pipeline:role": "graph"},
 }
 
 
@@ -404,7 +405,7 @@ class TestForeignNodes:
         """Child names are unique within an RFC 8 collection; the level
         list is derived from disk, so it wins -- with a warning, not
         silently."""
-        _add_children(store, {"type": "bridge:container", "name": "1"}, BACKREF)
+        _add_children(store, {"type": "pipeline:container", "name": "1"}, BACKREF)
         with pytest.warns(UserWarning, match="unique within a collection"):
             stamped = stamp_ome_node(str(store))
         assert stamped["nodes"] == [
@@ -432,7 +433,7 @@ class TestForeignNodes:
             ({"type": "zv:level", "name": "0", "attributes": {"x:y": 1}}, True),
             ({"type": "zv:companionImage", "name": "em"}, False),
             ({"type": "collection", "name": "c", "path": {"type": "zarr", "path": "../"}}, False),
-            ({"type": "bridge:container", "name": "container"}, False),
+            ({"type": "pipeline:container", "name": "container"}, False),
             ({"name": "untyped"}, False),
             ("zv:level", False),
         ],
@@ -457,7 +458,7 @@ class TestWorldUnit:
         attrs = root.attrs.to_dict()
         expected = [{"name": n, "type": "space", "unit": "micrometer"} for n in "xyz"]
         assert _world(attrs)["axes"] == expected
-        assert attrs["multiscales"][0]["axes"] == expected
+        assert attrs["zarr_vectors"]["axes"] == expected
 
     def test_unit_fills_axes_that_carry_none(self, tmp_path):
         root = create_store(

@@ -16,6 +16,8 @@ from typing import Any
 
 import numpy as np
 
+from zarr_vectors.core import convention as _zvc
+
 # Windows has no os.pread, and os.open there defaults to text mode.
 _O_READ = os.O_RDONLY | getattr(os, "O_BINARY", 0)
 
@@ -110,7 +112,7 @@ def cell_source(name: str, node: Any, *, any_codecs: bool = False) -> CellSource
     elif rest not in ([], ["ZstdCodec"]):
         return None
     store = node.store_path.store
-    origin = node.attrs.get("chunk_grid_origin")
+    origin = _zvc.get_field(node.attrs, "chunk_grid_origin")
     return CellSource(
         name=name,
         store=store,
